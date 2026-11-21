@@ -18,14 +18,25 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   granularity (`MappingGeometry`), enforces independent R/W/X permissions on
   guest data and instruction fetch (`GuestMemory::fetch`), and bumps
   `ExtentTable` code generations on both guest stores and host writes.
-- **Zero fixture syscall replies (`Hvc2ReplyCensus`)**: dynamic glibc hello
-  (`CARRICK_A64_DYN_ROOT`) and static musl hello (`musl_hello.rs`) run to
-  `exit_group(0)` with `reply_census.fixture_answers == 0` and
-  `reply_census.production_answers == syscalls_dispatched` counted at the
-  `HVC #2` completion boundary. Calls not yet wired for single-process soft
-  bring-up (`set_tid_address` 96 and `prlimit64` 261 pending `#2645`, `rseq`
-  293 per `#1906`, and timer/signal syscalls refused fail-closed with `-ENOSYS`)
-  are sampled in `counted_enosys` rather than faked.
+- **Every reply from a production source (`Hvc2ReplyCensus`)**: the runner
+  has no fixture responder. Each `HVC #2` completion is counted at the
+  completion boundary as `ring_completed`, `kernel_dispatched` (production
+  `SyscallDispatcher`) or `runner_refused`, and the three sum to
+  `syscalls_dispatched`; `sample_el1_routes` adds the ring's served and
+  forwarded totals. Dynamic glibc hello (`CARRICK_A64_DYN_ROOT`), static musl
+  hello (`musl_hello.rs`) and the pinned CPython 3.12.16 startup
+  (`CARRICK_A64_PYTHON_ROOT`) run to `exit_group(0)` this way. Calls not yet
+  wired for single-process soft bring-up (`set_tid_address` 96, `prlimit64`
+  261, the identity getters 174 to 177 and custom `rt_sigaction` handlers
+  pending `#2645`, `rseq` 293 per `#1906`, and timer/signal syscalls refused
+  fail-closed with `-ENOSYS`) are sampled in `counted_enosys` rather than
+  faked; each witness asserts its exact set, decrease-only.
+- **Default signal actions at the guest return boundary**: the runner refuses
+  custom handlers, so a kernel signal left deliverable (for example
+  `SIGPIPE` after a write to a widowed pipe) takes its `SIG_DFL` action
+  before the guest runs again: default-ignore signals and `SIGCONT` are
+  discarded, terminating signals end the process with `128 + signum`, and a
+  stop signal fails the run closed (no job control).
 - **Shared host-carrier alias inventory, first touch, and owner wait**:
   `carrick_kernel::dispatch::carrier_loop` holds the pieces moved out of the
   `carrick-runtime` vCPU loop: alias `FrameInventoryCommit` publication to the
@@ -47,6 +58,7 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
 - Cross-ISA (`x86_64` and `aarch64`):
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_refuses_timer_and_signal_syscalls_with_counted_enosys`
+  - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_pending_kernel_sigpipe_takes_default_death`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_enforces_single_live_aperture_and_compare_clears`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_store_after_mprotect_prot_read_faults_with_segv_accerr`
   - `carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_single_process_access_after_munmap_faults_with_segv_maperr`
@@ -60,3 +72,4 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
 - Native Linux `aarch64` (`soft-aarch64-native`):
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch`
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_static_musl_hello_through_production_dispatch`
+  - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_dynamic_cpython_through_production_dispatch`
