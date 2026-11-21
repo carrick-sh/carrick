@@ -221,13 +221,55 @@ fn refusing_soft_bridges() -> CarrierBridges {
     }
 }
 
-/// Timer and signal syscalls refused with counted `ENOSYS` on the single-process
-/// soft-CPU bring-up runner until `#2645` wires guest signal and timer delivery.
-const fn is_refused_single_process_timer_or_signal_syscall(nr: u64) -> bool {
-    matches!(
-        nr,
-        74 | 85..=87 | 102 | 103 | 107..=111 | 129..=139 | 240 | 408..=411 | 421 | 424
-    )
+/// Determine whether a forwarded timer or signal syscall must fail closed with
+/// counted `ENOSYS` on the single-process soft-CPU bring-up runner before
+/// `#2645` wires guest signal and timer delivery.
+fn should_refuse_single_process_timer_or_signal_syscall<X>(
+    engine: &SoftAarch64Engine<X>,
+    nr: u64,
+    args: &[u64; 6],
+) -> bool
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    match nr {
+        // `rt_sigaction` (134): `SIG_DFL` (0), `SIG_IGN` (1), and read-only
+        // queries (`new_action == 0`) live purely in `carrick-kernel`'s
+        // `SignalTable` (honored for broken-pipe `SIGPIPE = SIG_IGN` -> `-EPIPE`
+        // and default fault death), whereas installing a custom user handler
+        // (`sa_handler` outside `SIG_DFL`/`SIG_IGN`) requires guest signal frame
+        // delivery and must fail closed with `-ENOSYS`.
+        134 => {
+            let new_action = args[1];
+            if new_action == 0 {
+                return false;
+            }
+            let Ok(bytes) = engine.read_bytes(new_action, 8) else {
+                // Let `SyscallDispatcher::rt_sigaction` surface `-EFAULT`.
+                return false;
+            };
+            let Ok(word) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+                return true;
+            };
+            let sa_handler = u64::from_le_bytes(word);
+            sa_handler != carrick_abi::LINUX_SIG_DFL && sa_handler != carrick_abi::LINUX_SIG_IGN
+        }
+        // `rt_sigprocmask` (135) updates only the in-zone thread signal mask.
+        135 => false,
+        74
+        | 85..=87
+        | 102
+        | 103
+        | 107..=111
+        | 129..=133
+        | 136..=139
+        | 240
+        | 408..=411
+        | 421
+        | 424 => true,
+        _ => false,
+    }
 }
 
 /// Parameters for launching one single-process AArch64 guest through the
@@ -265,6 +307,17 @@ pub struct Hvc2ReplyCensus {
     pub production_answers: u64,
 }
 
+/// Terminal synchronous EL0 fault lowered to Linux default signal death when
+/// neither first-touch nor stale-stage-1 fault resolution applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftFaultTermination {
+    pub signum: i32,
+    pub si_code: i32,
+    pub fault_addr: u64,
+    pub elr: u64,
+    pub syndrome: u64,
+}
+
 /// Outcome and post-exit inspection handle for [`run_single_process`].
 pub struct SoftProcessRun<X = HostBlockRunner>
 where
@@ -276,6 +329,7 @@ where
     pub stderr: Vec<u8>,
     pub syscalls_dispatched: u64,
     pub reply_census: Hvc2ReplyCensus,
+    pub terminating_fault: Option<SoftFaultTermination>,
     /// `(aarch64_nr, syscall_name, count)` refused with `ENOSYS` in EL1 ring or host dispatch.
     pub counted_enosys: Vec<(u64, &'static str, u64)>,
     pub vmas: Vec<VmaSummary>,
@@ -616,6 +670,7 @@ where
         stderr: summary.stderr,
         syscalls_dispatched: summary.syscalls_dispatched,
         reply_census: summary.reply_census,
+        terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
         engine,
@@ -641,6 +696,7 @@ where
         stderr: summary.stderr,
         syscalls_dispatched: summary.syscalls_dispatched,
         reply_census: summary.reply_census,
+        terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
         engine,
@@ -653,6 +709,7 @@ struct SingleProcessSummary {
     stderr: Vec<u8>,
     syscalls_dispatched: u64,
     reply_census: Hvc2ReplyCensus,
+    terminating_fault: Option<SoftFaultTermination>,
     counted_enosys: Vec<(u64, &'static str, u64)>,
     vmas: Vec<VmaSummary>,
 }
@@ -787,12 +844,36 @@ where
                 syscall_turns += 1;
                 continue;
             }
-            Err(err @ TrapError::EL0Fault { syndrome, far, .. }) => {
+            Err(
+                err @ TrapError::EL0Fault {
+                    syndrome, elr, far, ..
+                },
+            ) => {
                 if first_touch_faults < max_first_touch_faults
                     && try_resolve_single_process_first_touch(engine, dispatcher, syndrome, far)?
                 {
                     first_touch_faults += 1;
                     continue;
+                }
+                if let Some((signum, si_code, fault_addr)) =
+                    carrick_aarch64::esr::lower_el0_fault(syndrome, elr, far)
+                {
+                    return Ok(finish_single_process_summary(
+                        engine,
+                        dispatcher,
+                        reporter,
+                        &refused_by_runner,
+                        128 + signum,
+                        syscalls_dispatched,
+                        reply_census,
+                        Some(SoftFaultTermination {
+                            signum,
+                            si_code,
+                            fault_addr,
+                            elr,
+                            syndrome,
+                        }),
+                    ));
                 }
                 return Err(format!("engine next_syscall failed: {err}"));
             }
@@ -821,7 +902,7 @@ where
         }
 
         let nr = raw.number.raw();
-        if is_refused_single_process_timer_or_signal_syscall(nr) {
+        if should_refuse_single_process_timer_or_signal_syscall(engine, nr, &raw.args) {
             syscalls_dispatched += 1;
             reply_census.production_answers += 1;
             *refused_by_runner.entry(nr).or_default() += 1;
@@ -945,6 +1026,7 @@ where
                     code,
                     syscalls_dispatched,
                     reply_census,
+                    None,
                 ));
             }
             DispatchOutcome::SignalDeath { signum } => {
@@ -957,6 +1039,7 @@ where
                     128 + signum,
                     syscalls_dispatched,
                     reply_census,
+                    None,
                 ));
             }
             other => {
@@ -973,6 +1056,7 @@ where
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_single_process_summary<X>(
     engine: &SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
@@ -981,6 +1065,7 @@ fn finish_single_process_summary<X>(
     exit_code: i32,
     syscalls_dispatched: u64,
     reply_census: Hvc2ReplyCensus,
+    terminating_fault: Option<SoftFaultTermination>,
 ) -> SingleProcessSummary
 where
     X: ExecuteBlock + Send + 'static,
@@ -1018,6 +1103,7 @@ where
         stderr: dispatcher.stderr(),
         syscalls_dispatched,
         reply_census,
+        terminating_fault,
         counted_enosys,
         vmas,
     }
