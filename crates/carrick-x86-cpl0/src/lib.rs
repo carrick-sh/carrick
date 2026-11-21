@@ -203,6 +203,10 @@ mod test_support {
     /// 0 (and the peer CPU is kicked, so a member queued behind the caller
     /// runs).
     pub const INJECT_GATE_TARGET_PARKED: u64 = 0xffff_ffff_ffff_fe45;
+    /// For a worker whose bounded wait for the armed member ran out: 128 +
+    /// 8 * the member's claim kind (Parked 1, Queued 2, OnCpu 3, other 4)
+    /// + the injection state, as its exit code.
+    pub const INJECT_GATE_TARGET_STATE: u64 = 0xffff_ffff_ffff_fe46;
     const GATE_OPERATION: u8 = 1;
     const GATE_RESULT: u8 = 2;
     const GATE_RAISED: u8 = 3;
@@ -849,6 +853,22 @@ mod test_support {
                     | GATE_POLLS.load(Ordering::Acquire) << 16
                     | GATE_RAISES.load(Ordering::Acquire) << 32,
             ),
+            INJECT_GATE_TARGET_STATE => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                let record = carrick_sched_core::RecordId::from_raw(
+                    GATE_TARGET.load(Ordering::Acquire).wrapping_sub(1),
+                )?;
+                let kind: u64 = match zone.record(record).claim() {
+                    carrick_sched_core::Claim::Parked { .. } => 1,
+                    carrick_sched_core::Claim::Queued { .. } => 2,
+                    carrick_sched_core::Claim::OnCpu { .. } => 3,
+                    _ => 4,
+                };
+                Some(128 + 8 * kind + u64::from(GATE_STATE.load(Ordering::Acquire)))
+            }
             INJECT_GATE_TARGET_PARKED => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
                     carrick_guest_arch::CpuId::new(binding.cpu_slot),

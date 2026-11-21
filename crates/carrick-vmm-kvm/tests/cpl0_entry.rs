@@ -5047,18 +5047,28 @@ census:
     jmp die
 
 worker:
+    /* Every wait for the leader yields its CPU (the leader, CPU 0's root
+     * thread, may run only there) and is bounded: a leader that never parks
+     * or runs fails the run with its claim (INJECT_GATE_TARGET_STATE). */
     /* 1. Once the leader is parked in its read, write the word. */
+    mov $0x100000, %r15
 1:
+    dec %r15
+    jz worker_timeout
     cmpl $1, 0x30(%r12)
     je 2f
-    pause
+    mov $24, %eax /* sched_yield */
+    syscall
     jmp 1b
 2:
+    dec %r15
+    jz worker_timeout
     mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
     syscall
     test %rax, %rax
     jnz 3f
-    pause
+    mov $24, %eax /* sched_yield */
+    syscall
     jmp 2b
 3:
     movabs $0x1122334455667788, %rax
@@ -5072,17 +5082,24 @@ worker:
     jne worker_fail
 
     /* 2. Once the leader is parked in its futex wait, wake it. */
+    mov $0x100000, %r15
 4:
+    dec %r15
+    jz worker_timeout
     cmpl $1, 0x34(%r12)
     je 5f
-    pause
+    mov $24, %eax /* sched_yield */
+    syscall
     jmp 4b
 5:
+    dec %r15
+    jz worker_timeout
     mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
     syscall
     test %rax, %rax
     jnz 6f
-    pause
+    mov $24, %eax /* sched_yield */
+    syscall
     jmp 5b
 6:
     movl $1, 0x38(%r12)
@@ -5099,6 +5116,11 @@ worker_fail:
     mov $60, %eax /* raw SYS_exit on a non-last thread */
     syscall
     ud2
+worker_timeout:
+    mov $-442, %rax /* INJECT_GATE_TARGET_STATE */
+    syscall
+    mov %eax, %edi
+    jmp die
 
 fail_mmap:          mov $80, %edi; jmp die
 fail_pipe:          mov $81, %edi; jmp die
@@ -5129,7 +5151,8 @@ die:
         outcome.run.exit_code,
         7,
         "a gate-refused switch-in must park on the gate's release and resume \
-         its woken wait (exit 101/102: it polled the gate instead): {}",
+         its woken wait (exit 101/102: it polled the gate instead; 128 and \
+         up: the worker's bounded wait for it ran out): {}",
         String::from_utf8_lossy(&outcome.run.stderr)
     );
     assert_eq!(outcome.run.terminating_signal, None);
