@@ -206,7 +206,7 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
     assert_eq!(
         outcome.run.exit_code,
         0,
-        "38=madvise refused, 60..69=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
+        "38=madvise refused, 60..69 and 71..73=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
         load(&counters.served[233]),
         load(&counters.refused[28]),
         counters.anonymous_leaves.each_ref().map(load),
