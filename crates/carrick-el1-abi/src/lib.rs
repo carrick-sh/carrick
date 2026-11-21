@@ -3245,6 +3245,14 @@ pub struct Counters {
     /// commit, source, ordinal, PC, slot, `binding[4]`, `arguments[6]`, syndrome.
     pub syscall_frames: [[AtomicU64; 16]; 32],
     pub syscall_frame_slots: AtomicU64,
+    /// The last [`REFUSED_CALL_RECORDS`] counted refusals, oldest
+    /// overwritten. Word 0 of a row is its generation: `2 * index + 1` while
+    /// logical record `index` is written, `2 * index + 2` once complete.
+    /// Then the native ordinal, flags (bit 0 descendant caller, bit 1
+    /// carrier venue, bit 2 registers retained) and six argument words.
+    pub refused_calls: [[AtomicU64; REFUSED_CALL_WORDS]; REFUSED_CALL_RECORDS],
+    /// Next logical refused-call record index; the count ever published.
+    pub refused_call_next: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3258,6 +3266,97 @@ pub struct Counters {
 pub enum RefusalVenue {
     Ring,
     Carrier,
+}
+
+/// The argument registers a counted refusal retained: x0..x5 on ARM, rdi,
+/// rsi, rdx, r10, r8 and r9 on x86, exactly as the guest issued them. The
+/// record never reads guest memory: a pointer argument stays a pointer.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum RefusalArguments {
+    Registers([u64; 6]),
+    /// The refusing venue holds a decoded request, not the trap frame.
+    Unretained,
+}
+
+/// What the guest asked for when a refusal was counted. Observational only:
+/// it grants no completion authority, and a lost or overwritten record never
+/// changes the census counts.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct RefusedCall {
+    pub ordinal: carrick_guest_arch::NativeOrdinal,
+    pub origin: carrick_core_abi::service::ServiceOrigin,
+    pub venue: RefusalVenue,
+    pub arguments: RefusalArguments,
+}
+
+/// Bounded ring of the most recent counted refusals ([`RefusedCall`]).
+pub const REFUSED_CALL_RECORDS: usize = 64;
+/// Generation, ordinal, flags, then the six argument words.
+const REFUSED_CALL_WORDS: usize = 9;
+const REFUSED_CALL_DESCENDANT: u64 = 1 << 0;
+const REFUSED_CALL_CARRIER: u64 = 1 << 1;
+const REFUSED_CALL_REGISTERS: u64 = 1 << 2;
+
+impl RefusedCall {
+    fn encode(self) -> [u64; REFUSED_CALL_WORDS - 1] {
+        let (retained, arguments) = match self.arguments {
+            RefusalArguments::Registers(arguments) => (REFUSED_CALL_REGISTERS, arguments),
+            RefusalArguments::Unretained => (0, [0; 6]),
+        };
+        let mut flags = retained;
+        if self.origin == carrick_core_abi::service::ServiceOrigin::Descendant {
+            flags |= REFUSED_CALL_DESCENDANT;
+        }
+        if self.venue == RefusalVenue::Carrier {
+            flags |= REFUSED_CALL_CARRIER;
+        }
+        [
+            self.ordinal.raw(),
+            flags,
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+        ]
+    }
+
+    fn decode(words: [u64; REFUSED_CALL_WORDS - 1]) -> Self {
+        let flags = words[1];
+        let mut arguments = [0; 6];
+        arguments.copy_from_slice(&words[2..]);
+        Self {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(words[0]),
+            origin: if flags & REFUSED_CALL_DESCENDANT != 0 {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            },
+            venue: if flags & REFUSED_CALL_CARRIER != 0 {
+                RefusalVenue::Carrier
+            } else {
+                RefusalVenue::Ring
+            },
+            arguments: if flags & REFUSED_CALL_REGISTERS != 0 {
+                RefusalArguments::Registers(arguments)
+            } else {
+                RefusalArguments::Unretained
+            },
+        }
+    }
 }
 
 impl Counters {
@@ -3279,6 +3378,9 @@ impl Counters {
             copy_refusal_slots: AtomicU64::new(0),
             syscall_frames: [const { [const { AtomicU64::new(0) }; 16] }; 32],
             syscall_frame_slots: AtomicU64::new(0),
+            refused_calls: [const { [const { AtomicU64::new(0) }; REFUSED_CALL_WORDS] };
+                REFUSED_CALL_RECORDS],
+            refused_call_next: AtomicU64::new(0),
         }
     }
 
@@ -3350,6 +3452,15 @@ impl Counters {
                 }));
             }
         }
+        for (target, source) in snapshot.refused_calls.iter().zip(&self.refused_calls) {
+            for (target, source) in target.iter().zip(source) {
+                target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        snapshot.refused_call_next.store(
+            self.refused_call_next.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         snapshot
     }
 
@@ -3650,11 +3761,15 @@ impl Counters {
         )
     }
 
+    /// Count one refusal and retain what the guest asked for in the bounded
+    /// [`Self::refused_calls`] ring. Every counted refusal names its
+    /// arguments, so no refusal venue can count without a record.
     pub fn record_refusal(
         &self,
         ordinal: carrick_guest_arch::NativeOrdinal,
         origin: carrick_core_abi::service::ServiceOrigin,
         venue: RefusalVenue,
+        arguments: RefusalArguments,
     ) {
         let bucket = ordinal.raw().min(512) as usize;
         let (total, children) = match venue {
@@ -3665,6 +3780,44 @@ impl Counters {
         if origin == carrick_core_abi::service::ServiceOrigin::Descendant {
             children[bucket].fetch_add(1, Ordering::Relaxed);
         }
+        let _ = arguments;
+    }
+
+    /// Refusals are a slow path; keep the record out of callers' frames.
+    #[inline(never)]
+    #[allow(dead_code)]
+    fn publish_refused_call(&self, call: &RefusedCall) {
+        let Ok(index) =
+            self.refused_call_next
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    n.checked_add(1).filter(|next| *next < u64::MAX / 2)
+                })
+        else {
+            return;
+        };
+        let row = &self.refused_calls[(index % REFUSED_CALL_RECORDS as u64) as usize];
+        row[0].store(index * 2 + 1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
+        for (target, value) in row[1..].iter().zip(call.encode()) {
+            target.store(value, Ordering::Relaxed);
+        }
+        row[0].store(index * 2 + 2, Ordering::Release);
+    }
+
+    /// The retained refused calls, oldest first. A record being written or
+    /// already overwritten is skipped, never returned torn.
+    pub fn refused_calls(&self) -> impl Iterator<Item = RefusedCall> + '_ {
+        let next = self.refused_call_next.load(Ordering::Acquire);
+        (next.saturating_sub(REFUSED_CALL_RECORDS as u64)..next).filter_map(move |index| {
+            let row = &self.refused_calls[(index % REFUSED_CALL_RECORDS as u64) as usize];
+            let complete = index * 2 + 2;
+            if row[0].load(Ordering::Acquire) != complete {
+                return None;
+            }
+            let words = core::array::from_fn(|i| row[i + 1].load(Ordering::Relaxed));
+            core::sync::atomic::fence(Ordering::Acquire);
+            (row[0].load(Ordering::Relaxed) == complete).then(|| RefusedCall::decode(words))
+        })
     }
 
     pub fn record_lifecycle_decline(&self, reason: LifecycleDecline) {
@@ -5619,6 +5772,8 @@ mod tests {
                 + 16 * 23
                 + 1
                 + 32 * 16
+                + 1
+                + REFUSED_CALL_RECORDS * REFUSED_CALL_WORDS
                 + 1)
                 * 8
         );
