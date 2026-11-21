@@ -7161,9 +7161,13 @@ macro_rules! mprotect_shape_witness {
             assert_eq!(
                 (outcome.run.exit_code, outcome.run.terminating_signal),
                 (7, None),
-                "case {} child exit (7 = Linux; else the errno): {:?}",
+                "case {} child exit (7 = Linux; else the errno): {:?}; BackingMultiRun={} EditRefused={}",
                 $case,
-                outcome.run
+                outcome.run,
+                counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::BackingMultiRun as usize]
+                    .load(std::sync::atomic::Ordering::Acquire),
+                counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::EditRefused as usize]
+                    .load(std::sync::atomic::Ordering::Acquire),
             );
             // Served in the ring: no mprotect left it, to the host or as a
             // counted refusal.
@@ -7254,4 +7258,19 @@ mprotect_shape_witness!(
     15,
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
      committed page and the child reserves 1 GiB more."
+);
+mprotect_shape_witness!(
+    production_mprotect_sparse_minimal_to_none,
+    12,
+    "Protect both resident runs and their untouched gap."
+);
+mprotect_shape_witness!(
+    production_mprotect_sparse_chunk_to_none,
+    13,
+    "Protect a fully touched code run and header across guard holes."
+);
+mprotect_shape_witness!(
+    production_mprotect_sparse_chunk_to_rw,
+    14,
+    "Widen a sparse code chunk including its guard holes."
 );

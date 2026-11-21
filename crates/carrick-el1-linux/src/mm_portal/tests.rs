@@ -4499,6 +4499,15 @@ fn anonymous_edit_wait_never_parks_for_metadata_required() {
 /// first-publish permissions.
 #[test]
 fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
+    delegated_mprotect_resident_pages(false);
+}
+
+#[test]
+fn delegated_mprotect_edits_both_resident_runs_across_an_untouched_page() {
+    delegated_mprotect_resident_pages(true);
+}
+
+fn delegated_mprotect_resident_pages(sparse: bool) {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
     use carrick_el1_abi::{Counters, CurrentTask, TrapFrame};
     use carrick_mmu_core::aarch64::descriptor_txn::{
@@ -4512,37 +4521,44 @@ fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
 
     let region = Region::new();
     let spaces = AddressSpaces::new();
-    let _parent = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let _parent = admit(&region, &spaces, 77, ROOT, if sparse { 3 } else { 2 }, 0);
     let parent_tables = Tables::new(ROOT, IPA, 0);
     let child = Tables::new(ROOT + 0x10_0000, 0, 0);
     let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
     let nz = |v| NonZeroU64::new(v).unwrap();
-    let prepared = execute_descriptor_op(
-        &parent_tables.live(&CallerInvalidatesAsid),
-        SubstrateGpa(ROOT),
-        DescriptorOp::Prepare {
-            publication: GuestLeafPublication {
-                va: VA,
-                ipa: IPA,
-                len: 8192,
-                writable: true,
-                executable: false,
+    let (page_offsets, run_len, range_len): (&[u64], u64, u64) = if sparse {
+        (&[0, 8192], 4096, 12288)
+    } else {
+        (&[0], 8192, 8192)
+    };
+    for &offset in page_offsets {
+        let prepared = execute_descriptor_op(
+            &parent_tables.live(&CallerInvalidatesAsid),
+            SubstrateGpa(ROOT),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: VA + offset,
+                    ipa: IPA + offset,
+                    len: run_len,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(VA + offset, run_len),
+                backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
             },
-            resident: PageSpan::new(VA, 8192),
-            backing: BackingIdentity {
-                frame_id: nz(1),
-                mapping_id: nz(2),
-                owner_generation: nz(3),
-                inventory_revision: nz(4),
-            },
-        },
-        &TableGrants::NONE,
-        &mut InlineJournal::new(),
-    );
-    assert!(
-        matches!(prepared, DescriptorOutcome::Applied(_)),
-        "{prepared:?}"
-    );
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        );
+        assert!(
+            matches!(prepared, DescriptorOutcome::Applied(_)),
+            "{prepared:?}"
+        );
+    }
     let arenas = [&parent_tables, &child, &supply];
     let words = ForkWords {
         arenas: &arenas,
@@ -4571,7 +4587,7 @@ fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
             ..TrapFrame::default()
         };
         frame.x[0] = VA;
-        frame.x[1] = 8192;
+        frame.x[1] = range_len;
         frame.x[2] = prot;
         frame.x[8] = 226;
         let mut editor = ForkAnonymousEditor {
@@ -4593,14 +4609,26 @@ fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
         );
         (route, frame.x[0] as i64)
     };
-    for (prot, writable) in [(5, false), (7, true), (3, true)] {
+    let protections: &[u64] = if sparse { &[0, 5, 3] } else { &[5, 7, 3] };
+    for &prot in protections {
         assert_eq!(
             guest_mprotect(prot),
             (DelegatedAnonymous::Served, 0),
-            "prot {prot}"
+            "prot {prot}; BackingMultiRun={}",
+            counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::BackingMultiRun as usize]
+                .load(Ordering::Relaxed)
         );
-        for page in 0..2 {
+        for page in 0..range_len / 4096 {
             let d = leaf(VA + page * 4096);
+            if sparse && page == 1 {
+                assert_eq!(d, 0, "untouched page must remain unbacked");
+                continue;
+            }
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Read),
+                prot != 0,
+                "prot {prot} page {page}"
+            );
             assert_eq!(
                 terminal_descriptor_permits_el0(d, LeafAccess::Execute),
                 prot & 4 != 0,
@@ -4608,7 +4636,7 @@ fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
             );
             assert_eq!(
                 terminal_descriptor_permits_el0(d, LeafAccess::Write),
-                writable,
+                prot & 2 != 0,
                 "prot {prot} page {page}"
             );
         }
