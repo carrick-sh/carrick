@@ -306,6 +306,31 @@ fn serial_host_native_root_and_child_vdso_realtime_matches_raw_clock() {
     );
 }
 
+/// #2618: the x86 root has no vDSO fallback of its own for a raw
+/// `syscall(228, CLOCK_REALTIME)`; the ring serves it (ENOSYS before).
+#[test]
+fn serial_host_native_root_raw_realtime_clock_gettime() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_raw_realtime_clock_gettime",
+        "native_root_realtime.S",
+        &[],
+        8,
+    );
+}
+
+/// #2618: the syscall realtime clock is carrier calibration, not user
+/// memory. The root unmaps its vvar page, then it and a native fork child
+/// must still read the real wall clock.
+#[test]
+fn serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar",
+        "native_root_realtime.S",
+        &["-DUNMAPPED_VVAR=1"],
+        8,
+    );
+}
+
 #[test]
 fn serial_host_native_exec_successor_vdso_realtime_matches_raw_clock() {
     let directory = tempfile::tempdir().expect("successor directory");
