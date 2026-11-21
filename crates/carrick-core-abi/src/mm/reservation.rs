@@ -128,10 +128,10 @@ pub enum ReservationOperation {
     /// Return backing while preserving every node, its protection and its
     /// attributes (`MADV_DONTNEED`): the next touch faults in fresh backing.
     Discard = 6,
-    /// Mark the covered nodes as omitted from a later fork.
-    OmitFromFork = 7,
-    /// Restore fork inheritance while keeping the other attributes.
-    InheritOnFork = 8,
+    /// Set the proposed attributes on the covered nodes.
+    SetAttributes = 7,
+    /// Clear the proposed attributes on the covered nodes.
+    ClearAttributes = 8,
 }
 
 /// The generation is the *current* committed root revision. The pending

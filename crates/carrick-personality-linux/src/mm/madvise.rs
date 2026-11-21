@@ -8,6 +8,7 @@
 //! EINVAL checks precede effects; holes are reported only after covered effects.
 
 use alloc::vec::Vec;
+use carrick_core_abi::ReservationNodeFlags;
 use carrick_guest_arch::{GuestLen, GuestVa};
 use carrick_syscall_abi::{
     LINUX_EINVAL, LINUX_ENOMEM, LINUX_MADV_COLLAPSE, LINUX_MADV_DODUMP, LINUX_MADV_DOFORK,
@@ -59,6 +60,16 @@ impl Advice {
             LINUX_MADV_NOHUGEPAGE => Self::NoHugePage,
             LINUX_MADV_COLLAPSE => Self::Collapse,
             _ => Self::Unsupported,
+        }
+    }
+
+    /// The admitted root can change copy-on-fork policy through its existing
+    /// attribute edit. Other attribute advice still needs its own service.
+    pub const fn fork_attribute_edit(self) -> Option<(ReservationNodeFlags, bool)> {
+        match self {
+            Self::DontFork => Some((ReservationNodeFlags::DONTFORK, true)),
+            Self::DoFork => Some((ReservationNodeFlags::DONTFORK, false)),
+            _ => None,
         }
     }
 
