@@ -4561,6 +4561,47 @@ fn in_zone_child_host_read_is_counted_enosys_not_served_under_root_context() {
     );
 }
 
+/// The x86 twin of the ARM refusal record witness: the forked child's
+/// counted ENOSYS keeps the child's six argument registers (rdi, rsi, rdx,
+/// r10, r8, r9) exactly, with its caller and venue, in the mapped counters.
+#[test]
+fn in_zone_child_counted_refusal_records_the_refused_calls_arguments() {
+    let elf = forward_authority_fixture("CHILD_REFUSED_ARGS");
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the child's read must be answered in ring: {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused_child[0].load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        counters.refused_calls().collect::<Vec<_>>(),
+        [carrick_el1_abi::RefusedCall {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(0),
+            origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+            venue: carrick_el1_abi::RefusalVenue::Ring,
+            arguments: carrick_el1_abi::RefusalArguments::Registers([
+                0,
+                0x5151_0000,
+                0x77,
+                0xa10,
+                0xa08,
+                0xa09
+            ]),
+        }],
+        "the only counted refusal is the child's read, with its registers"
+    );
+}
+
 /// Native child pipe writes use the source-backed shared IPC executor.
 #[test]
 fn in_zone_child_pipe_write_uses_shared_ipc_execution() {
