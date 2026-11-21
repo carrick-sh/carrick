@@ -2843,3 +2843,1252 @@ fn x86_native_child_lost_records_rollback_autoreap_run_failure_and_host_yield() 
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words, 94001);
 }
+
+struct ChildWorkerLane {
+    task: &'static CurrentTask,
+    slot: SlotId,
+    record: RecordRef,
+}
+
+fn activate_member_on_slot<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    process_key: TaskKey,
+    slot: SlotId,
+    task: &CurrentTask,
+    record: RecordRef,
+) -> (AddressContext<RootGpa>, C) {
+    let identity = fixture.zone.record(record.id).identity();
+    let address = fixture.runtime.task_binding(process_key).unwrap().address;
+    fixture.zone.install_space(slot, identity.mm).unwrap();
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid as i32),
+        carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    task.mm.key.store(identity.mm, Ordering::Release);
+    task.mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    let visible_pid = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task(process_key)
+        .unwrap()
+        .metadata()
+        .namespace_pid;
+    task.publish_visible_pid(visible_pid);
+    task.publish_root_generation(address.generation);
+    task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    let saved = unsafe { *fixture.zone.record(record.id).ctx_mut() };
+    (address, saved)
+}
+
+fn spawn_ring_worker_in_process<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    process_key: TaskKey,
+    leader_slot: SlotId,
+    leader_task: &'static CurrentTask,
+    worker_slot: SlotId,
+) -> ChildWorkerLane {
+    use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
+
+    let (page, controls, address, caller_tid, caller_serial, file_table) = {
+        let graph = fixture.runtime.graph.lock();
+        let row = graph.owner.task(process_key).unwrap();
+        let res = row.native().resources();
+        let leader_member = &res.members[0];
+        let leader_id = fixture.zone.record(leader_member.record.id).identity();
+        (
+            res.page,
+            Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            }))) as &'static [ThreadControlSlot],
+            res.address,
+            u32::try_from(leader_id.tid).unwrap(),
+            leader_id.serial,
+            leader_id.file_table,
+        )
+    };
+    let leader_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: leader_slot,
+    };
+    let worker_record = {
+        let mut service = fixture.service();
+        service.waker_slot = leader_slot;
+        service.page = page;
+        service.controls = controls;
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                leader_source,
+                leader_task,
+                address,
+                &(fixture.make_words)(address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.prepare_thread_birth(),
+            ThreadBirthAdmission::Ready
+        ));
+        let mut claimed = Some(page.claim_any().expect("process stock entry"));
+        let entry = claimed.as_ref().unwrap().entry();
+        let identity = page.identity(entry).unwrap();
+        let control_address = page.control_address(entry).unwrap();
+        let worker_control = unsafe { &*(control_address as *const ThreadControlSlot) };
+        assert!(worker_control.publish_visible_tid(identity.visible_tid));
+        let blocked = carrick_el1_abi::BlockedMask(0);
+        let record_id = fixture
+            .zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: u64::from(identity.tid),
+                serial: identity.thread_serial,
+                mm: address.mm.raw().get(),
+                file_table,
+                generation: 0,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: (1u64 << leader_slot.raw()) | (1u64 << worker_slot.raw()),
+                lifecycle_page: core::ptr::from_ref(page).addr() as u64,
+                control_slot: control_address,
+            })
+            .unwrap();
+        let record = fixture.zone.record_ref(record_id);
+        worker_control.reset_for_birth(blocked, 0, entry).unwrap();
+        leader.bind_thread_birth(record, worker_control).unwrap();
+        assert!(fixture.zone.issue_native_birth(record_id));
+        leader
+            .thread_spawned(caller_tid, identity.visible_tid, &mut || {
+                carrick_el1_abi::Lifecycle::thread_born(page).ok_or(-11)?;
+                page.record_born(
+                    claimed.take().unwrap(),
+                    carrick_el1_abi::BornRecord {
+                        caller_task: u64::from(caller_tid),
+                        caller_serial,
+                        clone_flags: 0x003d_0f00,
+                        clear_child_tid: 0,
+                        blocked,
+                    },
+                )
+                .map_err(|_| -11)?;
+                Ok(())
+            })
+            .unwrap();
+        leader.lifecycle_admission_settled().unwrap();
+        assert!(
+            !fixture
+                .registry
+                .register_native_birth(&fixture.runtime, process_key, leader_source, record)
+                .unwrap()
+        );
+        page.publish(entry).unwrap();
+        unsafe { *fixture.zone.record(record_id).ctx_mut() = (fixture.make_words)(address) };
+        fixture
+            .zone
+            .drive(worker_slot, u64::from(worker_slot.raw()) + 1);
+        fixture.zone.publish_slot(worker_slot, 1, Some(0), 1);
+        fixture.zone.enter_guest(worker_slot);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(worker_slot, record_id)
+                .is_queued()
+        );
+        record
+    };
+
+    let selected = fixture.zone.switch_in_full(worker_slot).unwrap();
+    assert_eq!(selected.record, worker_record.id);
+    let worker_task = Box::leak(Box::new(CurrentTask::new()));
+    let (worker_addr, worker_saved) = activate_member_on_slot(
+        fixture,
+        process_key,
+        worker_slot,
+        worker_task,
+        worker_record,
+    );
+    {
+        let mut service = fixture.service();
+        service.waker_slot = worker_slot;
+        service.page = page;
+        let mut worker = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: worker_slot,
+                },
+                worker_task,
+                worker_addr,
+                &worker_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            worker.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+    }
+    ChildWorkerLane {
+        task: worker_task,
+        slot: worker_slot,
+        record: worker_record,
+    }
+}
+
+fn park_worker_on_ipc_pipe_read<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    worker: &ChildWorkerLane,
+    address: AddressContext<RootGpa>,
+) -> (
+    carrick_el1_abi::ipc::IpcRegion<'static>,
+    carrick_el1_abi::ipc::IpcObjectHandle,
+    carrick_el1_abi::ipc::OfdPin,
+) {
+    let (region, object, pin, token) = retained_pipe_read(fixture.zone, worker.slot, worker.task);
+    let key = carrick_el1_abi::ipc::object_wait_key(
+        object,
+        carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+    )
+    .unwrap();
+    let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+        crate::sched::object_wait::deliver_completion(fixture.zone, worker.slot, effects)
+    };
+    let snapshot = {
+        let guard = region
+            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        let observed = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                queue.snapshot(),
+            )
+        };
+        drop(queue);
+        drop(guard);
+        observed
+    };
+    let request =
+        carrick_core::wait::ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+    let mut parked = carrick_core::wait::park_object_record(
+        fixture.zone,
+        worker.slot,
+        request,
+        &completion,
+        || {
+            unsafe {
+                *fixture.zone.record(worker.record.id).ctx_mut() = (fixture.make_words)(address);
+            }
+            Ok((worker.record.id, false))
+        },
+    )
+    .unwrap();
+    assert!(parked.matches(fixture.zone, worker.slot));
+    assert!(parked.take_receipt().is_some());
+    assert!(fixture.zone.slot(worker.slot).current().is_none());
+    assert!(
+        fixture
+            .zone
+            .record(worker.record.id)
+            .has_adapter_operation()
+    );
+    assert!(!matches!(
+        fixture.zone.record(worker.record.id).resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+    ));
+    (region, object, pin)
+}
+
+fn drain_native_completion_handbacks<C: ProcessContext + 'static>(zone: &ZoneTables<C>) {
+    zone.take_completion_handbacks(&carrick_sched_core::ShortLockSpin, &mut |record| {
+        assert!(zone.place_native_handback(record).is_some());
+    });
+}
+
+fn try_switch_in_exact<C: ProcessContext + 'static>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    wanted: carrick_el1_abi::RecordId,
+) -> bool {
+    let bound = zone.slot(slot).queued();
+    for _ in 0..bound {
+        let Some(sel) = zone.switch_in_full(slot) else {
+            break;
+        };
+        if sel.record == wanted {
+            return true;
+        }
+        zone.clear_current(slot);
+        assert!(zone.requeue_preempted(slot, sel.record).is_queued());
+    }
+    false
+}
+
+fn run_exec_on_selected_child<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    child_key: TaskKey,
+    child_slot: SlotId,
+    child_task: &'static CurrentTask,
+    child_record: RecordRef,
+    exec_ordinal: u64,
+    use_x86_exec_call: bool,
+    receipt_raw: u64,
+    root_raw: u64,
+) -> AddressContext<RootGpa> {
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: child_slot,
+    };
+    let (pre_addr, pre_saved) =
+        activate_member_on_slot(fixture, child_key, child_slot, child_task, child_record);
+    let child_control = unsafe {
+        &*(fixture.zone.record(child_record.id).identity().control_slot as *const ThreadControlSlot)
+    };
+    {
+        let mut service = fixture.service();
+        service.waker_slot = child_slot;
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                child_task,
+                pre_addr,
+                &pre_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        let counters = carrick_el1_abi::Counters::new();
+        let call = crate::native_process_runtime::NativeServiceCall::new(
+            carrick_guest_arch::NativeOrdinal::new(exec_ordinal),
+            &counters,
+        );
+        if use_x86_exec_call {
+            let resumed = child
+                .begin_exec_call(test_exec_payload(b"/bin/static"), None, call)
+                .unwrap();
+            assert!(matches!(resumed, NativeResume::Left(None)));
+        } else {
+            let result = child.begin_exec_service(test_exec_payload(b"/bin/static"), None, call);
+            let phase = child.native_service_phase();
+            let settled = child.settle_service_exit(result, NativeServiceExit::Bridge);
+            let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
+            assert!(matches!(resumed, NativeResume::Left(None)));
+        }
+    }
+    publish_test_exec_reply_for(
+        fixture,
+        child_task,
+        child_control,
+        child_slot,
+        receipt_raw,
+        root_raw,
+        false,
+    );
+    assert!(
+        try_switch_in_exact(fixture.zone, child_slot, child_record.id),
+        "exec reply must wake exact child record {:?}",
+        child_record
+    );
+    let (resumed_pre_addr, resumed_saved) =
+        activate_member_on_slot(fixture, child_key, child_slot, child_task, child_record);
+    {
+        let mut service = fixture.service();
+        service.waker_slot = child_slot;
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                child_task,
+                resumed_pre_addr,
+                &resumed_saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+    }
+    let post_addr = fixture.runtime.task_binding(child_key).unwrap().address;
+    child_task.publish_root_generation(post_addr.generation);
+    post_addr
+}
+
+/// #2620 witness (unparked root + non-root comparison): root (`1#1`) forks a
+/// child while root keeps running (not yet in `wait4`); the child execs into
+/// its successor (`commit_exec_successor`), preserving its `TaskKey` and
+/// `parent <-> child` link in `GuestProcessOwner` identically to a non-root
+/// parent's exec'd grandchild (`3#...` under `2#...`); the exec'd child then
+/// spawns a ring-born worker parked on an in-zone IPC `PipeRead` object-wait
+/// queue (`has_adapter_operation() == true`, `continuation == false`) and
+/// calls `exit_group(23)`. The worker must cancel its installed IPC operation
+/// and retire at `resume_checkpoint`, waking the child's closing leader to
+/// publish `Exit` + `ZombiePublished`, and root's `wait4(-1)` must reap
+/// `LinuxWaitStatus::exited(23)`.
+fn root_wait4_reaps_exec_successor_closing_installed_ipc_adapter_worker_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    root_tid: u64,
+    exec_ordinal: u64,
+    use_x86_exec_call: bool,
+) {
+    use carrick_el1_abi::{
+        NativeChildExecOutcome, NativeChildLifecycleEvent, NativeChildLostReason,
+        NativeChildLostSite, NativeChildTerminalReason, NativeParentWakeReason,
+    };
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+
+    let _serial = NATIVE_CHILD_LIFECYCLE_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    carrick_el1_abi::register_native_child_lifecycle_host_hooks(
+        capture_native_child_lifecycle_event,
+        noop_native_child_lifecycle_flush,
+    );
+    while let Some(ev) = carrick_el1_abi::host_fallback_native_child_lifecycle().pop() {
+        capture_native_child_lifecycle_event(ev);
+    }
+    NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let fixture = NativeSignalFixture::<C>::with_identity_for::<B>(
+        true,
+        move |_| {
+            (
+                ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                    generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                },
+                carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                    NonZeroU64::new(root_tid).unwrap(),
+                )),
+                5,
+            )
+        },
+        make_words,
+    );
+    let root_slot = fixture.slot;
+    let root_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: root_slot,
+    };
+    let root_key = fixture.runtime.graph.lock().root_key;
+
+    // 1. Root forks `child` while root remains runnable (NOT parked in `wait4`).
+    {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0
+        ));
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(root_slot, fixture.record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(root_slot);
+
+    let child_selected = fixture.zone.switch_in_full(root_slot).unwrap();
+    let child_record = fixture.zone.record_ref(child_selected.record);
+    assert_ne!(child_record, fixture.record);
+    let child_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.record == child_record)
+        .unwrap()
+        .process;
+
+    // 2. Child execs while root is NOT in `wait4`; verify `TaskKey` + `parent <-> child` survive.
+    let child_post_addr = run_exec_on_selected_child(
+        &fixture,
+        child_key,
+        root_slot,
+        fixture.task,
+        child_record,
+        exec_ordinal,
+        use_x86_exec_call,
+        401,
+        0x190_0000,
+    );
+    {
+        use carrick_sched_core::process::wait::{WaitIdentitySource, WaitLive};
+        let graph = fixture.runtime.graph.lock();
+        let root_row = graph.owner.task(root_key).unwrap();
+        let child_row = graph.owner.task(child_key).unwrap();
+        assert_eq!(child_row.metadata().key, child_key);
+        assert_eq!(child_row.wait_identity().parent, Some(root_key));
+        assert!(root_row.wait_children().contains(&child_key));
+    }
+
+    // 3. Compare non-root parent (`child_key` -> `grandchild_key` fork + exec + exit + wait4).
+    let grandchild_task = Box::leak(Box::new(CurrentTask::new()));
+    let grandchild_key = {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0
+        ));
+        fixture
+            .registry
+            .state
+            .lock()
+            .members
+            .values()
+            .find(|m| m.process != root_key && m.process != child_key)
+            .unwrap()
+            .process
+    };
+    let grandchild_record = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.process == grandchild_key)
+        .unwrap()
+        .record;
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(root_slot, child_record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(root_slot);
+    assert!(try_switch_in_exact(
+        fixture.zone,
+        root_slot,
+        grandchild_record.id
+    ));
+    let gc_post_addr = run_exec_on_selected_child(
+        &fixture,
+        grandchild_key,
+        root_slot,
+        grandchild_task,
+        grandchild_record,
+        exec_ordinal,
+        use_x86_exec_call,
+        402,
+        0x194_0000,
+    );
+    {
+        let mut gc_service = fixture.service();
+        gc_service.waker_slot = root_slot;
+        let mut gc = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                grandchild_task,
+                gc_post_addr,
+                &(fixture.make_words)(gc_post_addr),
+                &mut gc_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            gc.exit_group(42),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(gc.take_handoff_receipt().is_some());
+    }
+    assert!(try_switch_in_exact(
+        fixture.zone,
+        root_slot,
+        child_record.id
+    ));
+    let _ = activate_member_on_slot(&fixture, child_key, root_slot, fixture.task, child_record);
+    {
+        let mut child_wait_service = fixture.service();
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut child_wait_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Returned { result, .. }
+                if result.raw() == i64::from(grandchild_key.id.raw())
+        ));
+        drop(child);
+        assert_eq!(child_wait_service.copies, vec![LinuxWaitStatus::exited(42)]);
+    }
+
+    // 4. Child spawns a ring-born worker parked on IPC `PipeRead` (`has_adapter_operation() == true`),
+    //    then calls `exit_group(23)` (reproducing `npm` `4#10` closing with an active IPC worker).
+    let worker_slot = SlotId::new(1);
+    let worker =
+        spawn_ring_worker_in_process(&fixture, child_key, root_slot, fixture.task, worker_slot);
+    let (region, object, pin) = park_worker_on_ipc_pipe_read(&fixture, &worker, child_post_addr);
+    let child_page = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task(child_key)
+        .unwrap()
+        .native()
+        .resources()
+        .page;
+    assert_eq!(child_page.live(), 2);
+
+    {
+        let mut exit_service = fixture.service();
+        exit_service.native_ipc = Some(region);
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut exit_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(23),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child.take_run_failure().is_none());
+        assert!(child.take_handoff_receipt().is_some());
+    }
+    drain_native_completion_handbacks(fixture.zone);
+
+    // 5. Select the woken IPC worker; `resume_checkpoint` must cancel its IPC operation and retire it!
+    let woken_worker_slot = [worker_slot, root_slot]
+        .into_iter()
+        .find(|s| try_switch_in_exact(fixture.zone, *s, worker.record.id))
+        .expect("cancel_service must wake the IPC-parked worker onto a slot queue");
+    let (worker_addr, worker_saved) = activate_member_on_slot(
+        &fixture,
+        child_key,
+        woken_worker_slot,
+        worker.task,
+        worker.record,
+    );
+    {
+        let mut worker_service = fixture.service();
+        worker_service.waker_slot = woken_worker_slot;
+        worker_service.native_ipc = Some(region);
+        let mut member = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: woken_worker_slot,
+                },
+                worker.task,
+                worker_addr,
+                &worker_saved,
+                &mut worker_service,
+            )
+            .unwrap();
+        let resumed = member.resume_checkpoint(|_| Ok(None));
+        assert!(
+            matches!(resumed, Ok(NativeResume::Left(None))),
+            "closing worker with installed IPC adapter operation must retire instead of retrying EL0 (err={:?})",
+            resumed.as_ref().err()
+        );
+        assert!(member.take_run_failure().is_none());
+        assert!(member.take_handoff_receipt().is_some());
+    }
+    assert_eq!(child_page.live(), 0);
+    assert!(
+        region.observe(object).is_err()
+            && region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing)
+                .is_err(),
+        "closing retirement must release the IPC operation and final pipe OfdPin"
+    );
+
+    // 6. Child's closing leader wakes from `park_pending_exit` and publishes `Exit` + `ZombiePublished`.
+    let woken_leader_slot = [root_slot, worker_slot]
+        .into_iter()
+        .find(|s| try_switch_in_exact(fixture.zone, *s, child_record.id))
+        .expect("retiring the IPC worker must wake the closing child leader");
+    let (leader_addr, leader_saved) = activate_member_on_slot(
+        &fixture,
+        child_key,
+        woken_leader_slot,
+        fixture.task,
+        child_record,
+    );
+    {
+        let mut leader_service = fixture.service();
+        leader_service.waker_slot = woken_leader_slot;
+        leader_service.native_ipc = Some(region);
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: woken_leader_slot,
+                },
+                fixture.task,
+                leader_addr,
+                &leader_saved,
+                &mut leader_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(leader.take_handoff_receipt().is_some());
+    }
+
+    // 7. Root runs and calls `wait4(-1)`, receiving `child_key`'s successor exit status `exited(23)`.
+    let root_run_slot = [root_slot, worker_slot]
+        .into_iter()
+        .find(|s| try_switch_in_exact(fixture.zone, *s, fixture.record.id))
+        .expect("runnable root must remain queued");
+    let (root_addr, root_saved) = activate_member_on_slot(
+        &fixture,
+        root_key,
+        root_run_slot,
+        fixture.task,
+        fixture.record,
+    );
+    {
+        let mut root_wait_service = fixture.service();
+        root_wait_service.waker_slot = root_run_slot;
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: root_run_slot,
+                },
+                fixture.task,
+                root_addr,
+                &root_saved,
+                &mut root_wait_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        assert!(matches!(
+            root.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Returned { result, .. }
+                if result.raw() == i64::from(child_key.id.raw())
+        ));
+        drop(root);
+        assert_eq!(root_wait_service.copies, vec![LinuxWaitStatus::exited(23)]);
+    }
+
+    let events: Vec<NativeChildLifecycleEvent> = NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(events.contains(&NativeChildLifecycleEvent::Exec {
+        task: child_key,
+        outcome: NativeChildExecOutcome::Succeeded,
+    }));
+    assert!(events.contains(&NativeChildLifecycleEvent::Removed {
+        task: child_key,
+        reason: NativeChildLostReason::ClosingMemberRetire,
+        site: NativeChildLostSite::EntryRetireClosingMember,
+        detail: u64::from(worker.record.id.raw()),
+    }));
+    assert!(events.contains(&NativeChildLifecycleEvent::Exit {
+        task: child_key,
+        reason: NativeChildTerminalReason::Exited {
+            status: LinuxWaitStatus::exited(23),
+        },
+    }));
+    assert!(
+        events.contains(&NativeChildLifecycleEvent::ZombiePublished {
+            child: child_key,
+            parent: root_key,
+        })
+    );
+    assert!(events.contains(&NativeChildLifecycleEvent::ParentWake {
+        parent: root_key,
+        reason: NativeParentWakeReason::None,
+        woken: 0,
+    }));
+    assert!(events.contains(&NativeChildLifecycleEvent::Reaped {
+        caller: root_key,
+        child: child_key,
+        status: LinuxWaitStatus::exited(23),
+    }));
+}
+
+#[test]
+fn arm_root_wait4_reaps_exec_successor_closing_installed_ipc_adapter_worker() {
+    root_wait4_reaps_exec_successor_closing_installed_ipc_adapter_worker_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 95001, 221, false);
+}
+
+#[test]
+fn x86_root_wait4_reaps_exec_successor_closing_installed_ipc_adapter_worker() {
+    root_wait4_reaps_exec_successor_closing_installed_ipc_adapter_worker_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 96001, 59, true);
+}
+
+/// #2620 witness (root already parked in `wait4(-1)` during child exec):
+/// root (`1#1`) forks a child and immediately parks in `wait4(-1)` before the
+/// child execs; the child execs into its successor (`commit_exec_successor`),
+/// forks a live grandchild, spawns TWO ring-born workers — one parked on an
+/// IPC `PipeRead` object-wait queue (`has_adapter_operation() == true`) and
+/// one parked in a blocking `wait4(-1)` (`OwnerContinuation(Syscall)` on the
+/// child's `WaitChannel`) — and calls `exit_group(41)`. Both siblings must
+/// wake and retire on group close, the child must publish `Exit` +
+/// `ZombiePublished` + `ParentWake(ChildExit, woken=1)`, and the parked root
+/// `wait4(-1)` must wake and reap `LinuxWaitStatus::exited(41)`.
+fn parked_root_wait4_wakes_when_exec_successor_closes_adapter_and_channel_siblings_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    root_tid: u64,
+    exec_ordinal: u64,
+    use_x86_exec_call: bool,
+) {
+    use carrick_el1_abi::{
+        NativeChildLifecycleEvent, NativeChildTerminalReason, NativeParentWakeReason,
+    };
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+
+    let _serial = NATIVE_CHILD_LIFECYCLE_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    carrick_el1_abi::register_native_child_lifecycle_host_hooks(
+        capture_native_child_lifecycle_event,
+        noop_native_child_lifecycle_flush,
+    );
+    while let Some(ev) = carrick_el1_abi::host_fallback_native_child_lifecycle().pop() {
+        capture_native_child_lifecycle_event(ev);
+    }
+    NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let fixture = NativeSignalFixture::<C>::with_identity_for::<B>(
+        true,
+        move |_| {
+            (
+                ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                    generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                },
+                carrick_core_abi::EntryTaskKey::from_raw(root_tid),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                    NonZeroU64::new(root_tid).unwrap(),
+                )),
+                5,
+            )
+        },
+        make_words,
+    );
+    // `from_fixture_rusage` forks 1 child from root AND parks root in `wait4(-1)` before child execs!
+    let capacity = NativeServiceCapacityFixture::from_fixture_rusage(fixture, 1, UserVa::new(0));
+    let fixture = &capacity.fixture;
+    let root_slot = fixture.slot;
+    let root_key = fixture.runtime.graph.lock().root_key;
+
+    let (child_record, _child_pre_addr, _child_saved) = capacity.select().unwrap();
+    let child_key = fixture
+        .registry
+        .state
+        .lock()
+        .members
+        .values()
+        .find(|m| m.record == child_record)
+        .unwrap()
+        .process;
+
+    // 1. Child execs while root is ALREADY parked in `wait4(-1)`.
+    let child_post_addr = run_exec_on_selected_child(
+        fixture,
+        child_key,
+        root_slot,
+        fixture.task,
+        child_record,
+        exec_ordinal,
+        use_x86_exec_call,
+        501,
+        0x1a0_0000,
+    );
+
+    // 2. Child forks a live grandchild so a sibling `wait4(-1)` in `child_key` blocks on `resources.channel`.
+    {
+        let mut fork_service = fixture.service();
+        fork_service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        fork_service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: root_slot,
+                },
+                fixture.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0
+        ));
+    }
+    // Dequeue the unscheduled grandchild record so slots 0..=2 stay clear for child + 2 workers.
+    let _gc_sel = fixture.zone.switch_in_full(root_slot).unwrap();
+    fixture.zone.clear_current(root_slot);
+    let _ = fixture.zone.requeue_preempted(root_slot, child_record.id);
+    assert_eq!(
+        fixture.zone.switch_in_full(root_slot).unwrap().record,
+        child_record.id
+    );
+    let _ = activate_member_on_slot(fixture, child_key, root_slot, fixture.task, child_record);
+
+    // 3. Spawn Worker A (parked on IPC `PipeRead`) and Worker B (parked in `wait4(-1)` on `resources.channel`).
+    let worker_ipc =
+        spawn_ring_worker_in_process(fixture, child_key, root_slot, fixture.task, SlotId::new(1));
+    let (region, object, pin) = park_worker_on_ipc_pipe_read(fixture, &worker_ipc, child_post_addr);
+
+    let worker_wait =
+        spawn_ring_worker_in_process(fixture, child_key, root_slot, fixture.task, SlotId::new(2));
+    {
+        let mut wait_service = fixture.service();
+        wait_service.waker_slot = worker_wait.slot;
+        let mut waiter = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: worker_wait.slot,
+                },
+                worker_wait.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut wait_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            waiter.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(waiter.take_handoff_receipt().is_some());
+    }
+
+    let child_page = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task(child_key)
+        .unwrap()
+        .native()
+        .resources()
+        .page;
+    assert_eq!(child_page.live(), 3);
+
+    // 4. Child leader calls `exit_group(41)`.
+    {
+        let mut exit_service = fixture.service();
+        exit_service.native_ipc = Some(region);
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: root_slot,
+                },
+                fixture.task,
+                child_post_addr,
+                &(fixture.make_words)(child_post_addr),
+                &mut exit_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(41),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child.take_run_failure().is_none());
+        assert!(child.take_handoff_receipt().is_some());
+    }
+    drain_native_completion_handbacks(fixture.zone);
+
+    // 5. Both Worker A and Worker B must have been woken onto slot queues and must retire cleanly!
+    for expected_worker in [&worker_ipc, &worker_wait] {
+        let slot = [root_slot, SlotId::new(1), SlotId::new(2)]
+            .into_iter()
+            .find(|s| fixture.zone.slot(*s).queued() != 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "begin_closing must wake parked sibling record {:?} onto a slot queue",
+                    expected_worker.record
+                )
+            });
+        let sel = fixture.zone.switch_in_full(slot).unwrap();
+        let active_worker = if sel.record == worker_ipc.record.id {
+            &worker_ipc
+        } else if sel.record == worker_wait.record.id {
+            &worker_wait
+        } else {
+            panic!(
+                "unexpected record {:?} woken before workers retired",
+                sel.record
+            );
+        };
+        let (w_addr, w_saved) = activate_member_on_slot(
+            fixture,
+            child_key,
+            slot,
+            active_worker.task,
+            active_worker.record,
+        );
+        let mut w_service = fixture.service();
+        w_service.waker_slot = slot;
+        w_service.native_ipc = Some(region);
+        let mut member = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot,
+                },
+                active_worker.task,
+                w_addr,
+                &w_saved,
+                &mut w_service,
+            )
+            .unwrap();
+        let resumed = member.resume_checkpoint(|_| Ok(None));
+        assert!(
+            matches!(resumed, Ok(NativeResume::Left(None))),
+            "woken sibling {:?} must retire on close (err={:?})",
+            active_worker.record,
+            resumed.as_ref().err()
+        );
+        assert!(member.take_run_failure().is_none());
+        assert!(member.take_handoff_receipt().is_some());
+    }
+    assert_eq!(child_page.live(), 0);
+    assert!(
+        region.observe(object).is_err()
+            && region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing)
+                .is_err()
+    );
+
+    // 6. Child leader wakes from `park_pending_exit` and publishes `Exit` + `ZombiePublished` + `ParentWake(ChildExit, 1)`.
+    let leader_slot = [root_slot, SlotId::new(1), SlotId::new(2)]
+        .into_iter()
+        .find(|s| fixture.zone.slot(*s).queued() != 0)
+        .expect("retiring last sibling must wake closing child leader");
+    assert_eq!(
+        fixture.zone.switch_in_full(leader_slot).unwrap().record,
+        child_record.id
+    );
+    let (leader_addr, leader_saved) =
+        activate_member_on_slot(fixture, child_key, leader_slot, fixture.task, child_record);
+    {
+        let mut leader_service = fixture.service();
+        leader_service.waker_slot = leader_slot;
+        leader_service.native_ipc = Some(region);
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: leader_slot,
+                },
+                fixture.task,
+                leader_addr,
+                &leader_saved,
+                &mut leader_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(leader.take_handoff_receipt().is_some());
+    }
+
+    // 7. Root (already parked in `wait4(-1)` before child exec!) wakes and receives `exited(41)`!
+    let woken_root_slot = [root_slot, SlotId::new(1), SlotId::new(2)]
+        .into_iter()
+        .find(|s| fixture.zone.slot(*s).queued() != 0)
+        .expect("child exit must wake parked root wait4(-1)");
+    assert_eq!(
+        fixture.zone.switch_in_full(woken_root_slot).unwrap().record,
+        fixture.record.id
+    );
+    let (root_addr, root_saved) = activate_member_on_slot(
+        fixture,
+        root_key,
+        woken_root_slot,
+        fixture.task,
+        fixture.record,
+    );
+    {
+        let mut root_service = fixture.service();
+        root_service.waker_slot = woken_root_slot;
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: woken_root_slot,
+                },
+                fixture.task,
+                root_addr,
+                &root_saved,
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Returned(res) if res.raw() == i64::from(child_key.id.raw())
+        ));
+        drop(root);
+        assert_eq!(root_service.copies, vec![LinuxWaitStatus::exited(41)]);
+    }
+
+    let events: Vec<NativeChildLifecycleEvent> = NATIVE_CHILD_LIFECYCLE_CAPTURED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(events.contains(&NativeChildLifecycleEvent::Exit {
+        task: child_key,
+        reason: NativeChildTerminalReason::Exited {
+            status: LinuxWaitStatus::exited(41),
+        },
+    }));
+    assert!(
+        events.contains(&NativeChildLifecycleEvent::ZombiePublished {
+            child: child_key,
+            parent: root_key,
+        })
+    );
+    assert!(events.contains(&NativeChildLifecycleEvent::ParentWake {
+        parent: root_key,
+        reason: NativeParentWakeReason::ChildExit,
+        woken: 1,
+    }));
+    assert!(events.contains(&NativeChildLifecycleEvent::Reaped {
+        caller: root_key,
+        child: child_key,
+        status: LinuxWaitStatus::exited(41),
+    }));
+}
+
+#[test]
+fn arm_parked_root_wait4_wakes_when_exec_successor_closes_adapter_and_channel_siblings() {
+    parked_root_wait4_wakes_when_exec_successor_closes_adapter_and_channel_siblings_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, 97001, 221, false);
+}
+
+#[test]
+fn x86_parked_root_wait4_wakes_when_exec_successor_closes_adapter_and_channel_siblings() {
+    parked_root_wait4_wakes_when_exec_successor_closes_adapter_and_channel_siblings_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, 98001, 59, true);
+}
