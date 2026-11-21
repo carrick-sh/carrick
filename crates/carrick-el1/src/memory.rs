@@ -1679,14 +1679,23 @@ fn serve_delegated_anonymous_for_origin<
         carrick_guest_arch::UserVa::new(va),
         carrick_guest_arch::GuestLen::new(len),
     );
-    // One editor call is one all-or-nothing step: a range whose backing is
-    // split into several runs by holes goes to the host.
+    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
+    if request.operation == Discard && backing.summary == RangeBacking::Empty {
+        pending
+            .cancel(&mut model)
+            .expect("empty discard owns its reservation proposal");
+        frame.set_result(carrick_guest_arch::NativeReturnWord(0));
+        return DelegatedAnonymous::Served;
+    }
+    // A discard can retire sparse residency in one descriptor transaction:
+    // the retirement planners skip absent entries and validate every
+    // populated terminal before publishing the edit.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
+        _ if request.operation == Discard => Some((va, len)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
-    use carrick_el1_abi::ReservationOperation::{Decommit, Discard, Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no

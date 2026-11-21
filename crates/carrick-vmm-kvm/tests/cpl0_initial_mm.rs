@@ -214,7 +214,11 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
         0,
         "x86 native madvise must not be refused"
     );
-    assert_eq!(load(&counters.served[233]), 7, "all advice calls ran in ring");
+    assert_eq!(
+        load(&counters.served[233]),
+        7,
+        "all advice calls ran in ring"
+    );
 }
 
 // Production child entropy service, including CPL0 entry and host completion.
