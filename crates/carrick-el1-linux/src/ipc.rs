@@ -317,6 +317,7 @@ pub(crate) fn is_zone_releasable_backing(
     )
 }
 
+#[inline(never)]
 pub(crate) fn can_release_backing_in_ring(
     region: &IpcRegion<'_>,
     description: carrick_el1_abi::ipc::fd::Description,
@@ -325,6 +326,16 @@ pub(crate) fn can_release_backing_in_ring(
         Some(IpcBacking::Epoll { object }) => !region.epoll_needs_host_release(object),
         _ => is_zone_releasable_backing(description),
     }
+}
+
+#[inline(never)]
+pub(crate) fn unpin_in_ring(
+    region: &IpcRegion<'_>,
+    pin: OfdPin,
+) -> Result<carrick_el1_abi::ipc::fd::DeferredRelease, carrick_el1_abi::ipc::fd::Error> {
+    region.fd(EL1_WAIT).unpin_filtered(pin, |description| {
+        can_release_backing_in_ring(region, description)
+    })
 }
 
 pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
@@ -1422,9 +1433,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
 /// for readers, EPIPE for writers). Only IPC-backed descriptions are ever
 /// pinned in EL1.
 fn release_pin<E: IpcExecution>(sched: &mut E, pin: OfdPin, region: &IpcRegion<'_>) {
-    let Ok(release) = region.fd(EL1_WAIT).unpin_filtered(pin, |description| {
-        can_release_backing_in_ring(region, description)
-    }) else {
+    let Ok(release) = unpin_in_ring(region, pin) else {
         return;
     };
     let description = match release {
@@ -2173,14 +2182,9 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     let op = region
         .finish_operation(token, || notify_operation_release(region, zone, slot))
         .map_err(|_| NativeProcessError::Stale)?;
-    let release = region
-        .fd(EL1_WAIT)
-        .unpin_filtered(OfdPin::from_raw(op.pin), |description| {
-            can_release_backing_in_ring(region, description)
-        })
-        .map_err(|_| {
-            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationUnpin)
-        })?;
+    let release = unpin_in_ring(region, OfdPin::from_raw(op.pin)).map_err(|_| {
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationUnpin)
+    })?;
     settle_native_release(region, release, Some((zone, slot)), task).map_err(|_| {
         NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationRelease)
     })?;
@@ -2321,14 +2325,9 @@ fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &Ipc
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
-    let release = region
-        .fd(EL1_WAIT)
-        .unpin_filtered(OfdPin::from_raw(op.pin), |description| {
-            can_release_backing_in_ring(region, description)
-        })
-        .unwrap_or_else(|_| {
-            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-        });
+    let release = unpin_in_ring(region, OfdPin::from_raw(op.pin)).unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
     settle_native_release(
         region,
         release,

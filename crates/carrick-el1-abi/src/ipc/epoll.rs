@@ -544,6 +544,7 @@ impl<'a> IpcRegion<'a> {
 
     /// An epoll that has hosted a socket retires its carrier registrations
     /// at the backing's final release, even if its last pin returns in ring.
+    #[inline(never)]
     pub fn epoll_needs_host_release(&self, object: IpcObjectHandle) -> bool {
         self.record(object.index()).is_some_and(|record| {
             record.generation.load(Ordering::Acquire) != u64::from(object.generation())

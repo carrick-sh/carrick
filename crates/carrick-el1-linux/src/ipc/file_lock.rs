@@ -725,14 +725,9 @@ fn drop_hold<E: IpcExecution>(
         finish_native(sched, token, region);
     }
     if let Some(pin) = pin {
-        let release = region
-            .fd(EL1_WAIT)
-            .unpin_filtered(pin, |description| {
-                super::can_release_backing_in_ring(region, description)
-            })
-            .unwrap_or_else(|_| {
-                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-            });
+        let release = super::unpin_in_ring(region, pin).unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
         settle_native_release(
             region,
             release,
