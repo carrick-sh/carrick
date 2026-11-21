@@ -2666,7 +2666,7 @@ fn shared_guest_owner_loads_static_elf_and_exits_seven() {
 }
 
 #[test]
-fn production_static_pie_loads_above_low_stack_and_exits_seven() {
+fn production_static_pie_loads_at_its_high_base_and_exits_seven() {
     let mut elf = tiny_elf();
     elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN without PT_INTERP
     elf[24..32].copy_from_slice(&0xb0u64.to_le_bytes());
@@ -5522,8 +5522,8 @@ fn zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds() {
 /// #1482 P0-2: a merged GiB must settle in one crossing with bounded pauses.
 #[test]
 fn production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell() {
-    // Load above the low initial stack so the production mmap arena has
-    // room for a complete GiB instead of being clipped by that stack.
+    // Loaded at 4 GiB since the days a low initial stack clipped a low
+    // image's arena below a GiB (#2722); any load address has the room now.
     let elf = native_exit_fixture_with_flags(
         "native_owed_return_gib.S",
         &["-Wl,-Ttext-segment=0x100000000"],

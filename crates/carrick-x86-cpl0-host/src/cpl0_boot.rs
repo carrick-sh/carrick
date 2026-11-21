@@ -426,7 +426,10 @@ pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
 pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZE;
 pub const INITIAL_MM_KEY: u64 = 301;
-pub const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
+/// The initial stack's top: the Linux personality's one stack placement,
+/// shared with ARM, above every image base and mmap arena. A stack parked at
+/// 2 GiB clipped a low image's whole arena to under 1 GiB (#2722).
+pub const INITIAL_STACK_TOP: u64 = carrick_mem::memory::LINUX_STACK_TOP;
 pub const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 /// The initial stack's whole reservation: Linux's default `RLIMIT_STACK`
 /// (8 MiB), as on ARM. The carrier builds only the top
@@ -743,8 +746,8 @@ pub fn initial_reservation_layout(
         .ok_or_else(|| fail("initial stack layout"))?;
     let stack = ReservationRange::new(stack_base, stack_top.raw())
         .ok_or_else(|| fail("initial stack layout"))?;
-    // The authenticated break is the highest page-rounded PT_LOAD end. A
-    // static PIE can sit above the low initial stack, so neither reservation
+    // The authenticated break is the highest page-rounded PT_LOAD end. The
+    // production stack sits above every image base, but neither reservation
     // may depend on a fixed split address or assume the stack is above it.
     let ceiling = if initial_break.raw() <= stack.start() {
         stack.start()
@@ -5176,14 +5179,14 @@ mod cpl0_layout_tests {
     }
 
     #[test]
-    fn static_pie_reservations_follow_image_break_above_old_arena_and_stack() {
+    fn static_pie_reservations_follow_image_break_below_the_stack() {
         let elf = static_pie_elf();
         let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
         let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).unwrap();
         let initial_break = image.regions.iter().map(|region| region.end).max().unwrap();
         assert_eq!(initial_break, 0x88_0013_1000);
         assert!(initial_break > 0x4000_0000);
-        assert!(initial_break > INITIAL_STACK_TOP);
+        assert!(initial_break < INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION);
         let layout = initial_reservation_layout(
             UserVa::new(initial_break),
             UserVa::new(INITIAL_STACK_TOP),
@@ -5195,18 +5198,17 @@ mod cpl0_layout_tests {
         assert_eq!(layout.heap.end(), layout.arena.start());
         assert_eq!(layout.heap.end(), 0x88_4000_0000);
         assert_eq!(layout.arena.len(), carrick_mem::memory::LINUX_MMAP_SIZE);
-        assert!(layout.arena.end() <= carrick_guest_arch::USER_CEILING);
+        assert!(layout.arena.end() <= INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION);
         assert!(
             image
                 .regions
                 .iter()
                 .all(|region| region.end <= layout.heap.start())
         );
-        assert!(INITIAL_STACK_TOP <= layout.heap.start());
     }
 
     #[test]
-    fn low_image_reservations_stop_before_stack_and_retain_launch_limits() {
+    fn low_image_reservations_keep_the_whole_arena_below_the_stack_and_retain_launch_limits() {
         let limits = InitialReservationLimits {
             address: carrick_abi::LinuxRlimit::new(0x2000_0000, 0x3000_0000),
             data: carrick_abi::LinuxRlimit::new(0x1000_0000, 0x2000_0000),
@@ -5229,19 +5231,21 @@ mod cpl0_layout_tests {
             assert_eq!(layout.brk, initial_break);
             assert_eq!(layout.heap.start(), initial_break);
             assert!(layout.heap.len() <= INITIAL_ARENA_ALIGNMENT);
-            // Preserve both capacities for every formerly admitted low image.
             if initial_break < 0x4000_0000 {
                 assert_eq!(layout.heap.len(), 0x4000_0000 - initial_break);
-                assert_eq!(
-                    layout.arena.len(),
-                    INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - 0x4000_0000
-                );
             }
             assert_eq!(layout.heap.end(), layout.arena.start());
-            assert_eq!(
-                layout.arena.end(),
-                INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION
-            );
+            let stack_base = INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION;
+            if initial_break < stack_base - 8192 {
+                // #2722: the stack no longer clips a low image's arena, so a
+                // multi-GiB reservation has a gap to land in.
+                assert_eq!(layout.arena.len(), carrick_mem::memory::LINUX_MMAP_SIZE);
+                assert!(layout.arena.end() <= stack_base);
+            } else {
+                // Only a break directly under the stack is clipped by it.
+                assert_eq!(layout.arena.len(), 4096);
+                assert_eq!(layout.arena.end(), stack_base);
+            }
             assert_eq!(layout.address_limit, address_limit);
             assert_eq!(layout.data_limit, data_limit);
             assert_eq!(layout.external_address_bytes, 0);
