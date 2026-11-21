@@ -177,7 +177,21 @@ impl<'a> DescriptorTxn<'a> {
                 ceiling,
             } => DescriptorOp::Protect {
                 span,
-                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                permissions: if !requested.readable
+                    && !requested.writable
+                    && !requested.executable
+                    && !requested.user
+                    && ceiling.is_some()
+                {
+                    // PROT_NONE retains the terminal but clears user access.
+                    Permissions {
+                        writable: false,
+                        executable: false,
+                        user: false,
+                    }
+                } else {
+                    permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?
+                },
                 ceiling,
             },
             EditOperation::ArmCow {
@@ -547,7 +561,12 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         if entry == 0
             && matches!(
                 self.txn.op,
-                DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)
+                DescriptorOp::Unmap(_)
+                    | DescriptorOp::Retire(_)
+                    | DescriptorOp::Protect {
+                        ceiling: Some(_),
+                        ..
+                    }
             )
         {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
@@ -726,7 +745,9 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
             }
             DescriptorOp::Retire(_) => {
-                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 || entry & PRIVATE == 0 {
+                // A private PROT_NONE terminal retains backing and still
+                // belongs to the MM even though its USER bit is clear.
+                if entry & (PRESENT | PREPARED) == 0 || entry & PRIVATE == 0 {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 (entry & !(PRESENT | PREPARED | COW)) | RETIRED

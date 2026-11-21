@@ -362,6 +362,54 @@ fn guest_protect_refuses_host_map_leaf() {
 }
 
 #[test]
+fn sparse_protect_refuses_a_later_host_leaf_without_editing_the_first_run() {
+    let words = Words::new();
+    let va = 0x4000;
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(PageSpan::new(va, PAGE), 0x800000, writable),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            map(va + 2 * PAGE, 0x802000, PAGE, LeafSize::Page),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span: PageSpan::new(va, 3 * PAGE),
+                permissions: Permissions {
+                    writable: false,
+                    ..writable
+                },
+                ceiling: Some(GuestPermissionCeiling {
+                    readable: true,
+                    writable: true,
+                    executable: true,
+                }),
+            },
+            &[],
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
+#[test]
 fn guest_protect_refuses_write_and_execute_widening_past_grant() {
     let words = Words::new();
     let span = PageSpan::new(0x4000, PAGE);
@@ -527,6 +575,24 @@ fn guest_protect_widens_a_private_leaf_to_the_root_ceiling() {
     let (widened, _) =
         read_terminal_descriptor(&words, root(0x1000), UserVa::new(other.va)).unwrap();
     assert_eq!(widened & (WRITE | MAY_WRITE), WRITE | MAY_WRITE);
+    // PROT_NONE removes user access without discarding the private frame.
+    assert!(matches!(
+        protect(
+            Permissions {
+                writable: false,
+                executable: false,
+                user: false,
+            },
+            Some(rwx),
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (USER | WRITE | NX), NX);
+    assert!(matches!(
+        apply(&words, DescriptorOp::Retire(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_ne!(leaf() & RETIRED, 0);
 }
 
 /// #2620: fork arms a read-only private leaf too, with no write intent, so

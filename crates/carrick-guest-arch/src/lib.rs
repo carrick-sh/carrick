@@ -527,8 +527,9 @@ pub enum EditOperation {
     },
     Protect {
         permissions: EditPermissions,
-        /// The root model's ceiling for the range; `None` leaves each leaf's
-        /// recorded ceiling as the bound and refuses COW-armed leaves.
+        /// The reservation root's ceiling. Its coverage lets the editor
+        /// skip absent descriptors inside the range. With `None`, leaf tags
+        /// bound the edit and holes or COW-armed leaves are refused.
         ceiling: Option<GuestPermissionCeiling>,
     },
     ArmCow {
