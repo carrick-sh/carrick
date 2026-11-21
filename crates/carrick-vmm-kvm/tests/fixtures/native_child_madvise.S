@@ -20,6 +20,31 @@ _start:
     js map_failed
     mov %rax, %r12
     movb $0x37, (%r12)
+#ifdef FORK_ADVICE
+    /* One VMA with a retained, omitted and re-enabled page. */
+    xor %edi, %edi
+    mov $0x3000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js map_failed
+    mov %rax, %r15
+    movb $0x71, (%r15)
+    movb $0x72, 0x1000(%r15)
+    movb $0x73, 0x2000(%r15)
+    lea 0x1000(%r15), %rdi
+    mov $0x2000, %esi
+    mov $10, %edx
+    call advise
+    lea 0x2000(%r15), %rdi
+    mov $0x1000, %esi
+    mov $11, %edx
+    call advise
+#endif
     mov $57, %eax
     syscall
     test %eax, %eax
@@ -44,10 +69,28 @@ _start:
     /* The child's discard never reaches the parent's copy. */
     cmpb $0x37, (%r12)
     jne parent_bytes_failed
+#ifdef FORK_ADVICE
+    cmpb $0x72, 0x1000(%r15)
+    jne parent_bytes_failed
+#endif
     xor %edi, %edi
     jmp exit
 
 child:
+#ifdef FORK_ADVICE
+    cmpb $0x71, (%r15)
+    jne fork_advice_failed
+    cmpb $0x73, 0x2000(%r15)
+    jne fork_advice_failed
+    /* Linux mprotect returns ENOMEM when the omitted page is unmapped. */
+    lea 0x1000(%r15), %rdi
+    mov $0x1000, %esi
+    mov $3, %edx
+    mov $10, %eax
+    syscall
+    cmp $-12, %rax
+    jne fork_advice_failed
+#endif
     /* V8's code-range shape: a PROT_NONE NORESERVE reservation, committed RW. */
     xor %edi, %edi
     mov $0x40000, %esi
@@ -220,6 +263,11 @@ einval_failed:
     jmp exit
 sparse_bytes_failed:
     mov $75, %edi
+    jmp exit
+#ifdef FORK_ADVICE
+fork_advice_failed:
+    mov $76, %edi
+#endif
 exit:
     mov $231, %eax
     syscall

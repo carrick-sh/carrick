@@ -194,7 +194,18 @@ fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
 /// copy is unchanged. A refused `madvise` exits with its errno (38).
 #[test]
 fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
-    let elf = native_exit_fixture_with_flags("native_child_madvise.S", &[]);
+    native_child_madvise(&[], 7);
+}
+
+/// DONTFORK removes only the advised page from a real child. DOFORK restores
+/// inheritance of a subrange, and the live parent retains all its bytes.
+#[test]
+fn serial_host_native_child_madvise_dontfork_omits_page() {
+    native_child_madvise(&["-DFORK_ADVICE"], 9);
+}
+
+fn native_child_madvise(flags: &[&str], expected_advice: u64) {
+    let elf = native_exit_fixture_with_flags("native_child_madvise.S", flags);
     let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_IDLE_PEER)
         .expect("native fork and madvise");
     let counters = outcome
@@ -206,7 +217,7 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
     assert_eq!(
         outcome.run.exit_code,
         0,
-        "38=madvise refused, 60..69 and 71..75=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
+        "38=madvise refused, 60..69 and 71..76=fixture stage; madvise served={}, refused={}, anonymous leaves={:?}",
         load(&counters.served[233]),
         load(&counters.refused[28]),
         counters.anonymous_leaves.each_ref().map(load),
@@ -218,7 +229,7 @@ fn serial_host_native_child_madvise_dontneed_stays_in_ring() {
     );
     assert_eq!(
         load(&counters.served[233]),
-        7,
+        expected_advice,
         "all advice calls ran in ring"
     );
 }
