@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #2354: a guest sched_yield is a turn boundary on every ISA. The shared
 # policy is sched-core's `YieldTurn` (rotate while a runnable thread waits on
 # the caller's slot); ARM's EL1 scheduler and x86's native process owner

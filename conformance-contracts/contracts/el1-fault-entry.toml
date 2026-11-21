@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #2480 slice 1 (N1 vocabulary): LeafAccess moved verbatim from
 # carrick-mmu-core aarch64 and LeafSize from x86::descriptor_txn into the
 # neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs);
