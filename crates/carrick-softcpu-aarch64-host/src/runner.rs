@@ -23,7 +23,7 @@ use carrick_guest_mem::{GuestMemory, MappingSharing};
 use carrick_hal::posix_timer::PosixArm;
 use carrick_hal::{
     HostSignalBridge, NO_PENDING_SIGNAL, SyscallTrap, ThreadedEngine, TimerCoreBridge,
-    TimerDelivery, TimerFiring, TimerSpecNs, TrapError,
+    TimerDelivery, TimerFiring, TimerSpecNs,
 };
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
@@ -311,27 +311,19 @@ pub fn run_single_process(
 ) -> Result<SoftProcessRun<HostBlockRunner>, String> {
     let executor =
         HostBlockRunner::new().map_err(|e| format!("HostBlockRunner::new failed: {e:?}"))?;
-    run_single_process_with_executor(
-        config,
-        executor,
-        Arc::new(|| {
-            HostBlockRunner::new()
-                .map_err(|e| TrapError::Hypervisor(format!("HostBlockRunner::new: {e:?}")))
-        }),
-    )
+    run_single_process_with_executor(config, executor)
 }
 
 /// Run a single-process AArch64 Linux ELF to exit over an arbitrary [`ExecuteBlock`].
 pub fn run_single_process_with_executor<X>(
     config: &SoftSingleProcessConfig<'_>,
     executor: X,
-    make_executor: Arc<dyn Fn() -> Result<X, TrapError> + Send + Sync>,
 ) -> Result<SoftProcessRun<X>, String>
 where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
-    run_single_process_with_executor_and_setup(config, executor, make_executor, |_| Ok(()))
+    run_single_process_with_executor_and_setup(config, executor, |_| Ok(()))
 }
 
 /// Run a single-process AArch64 Linux ELF to exit over an arbitrary [`ExecuteBlock`],
@@ -339,7 +331,6 @@ where
 pub fn run_single_process_with_executor_and_setup<X, F>(
     config: &SoftSingleProcessConfig<'_>,
     executor: X,
-    make_executor: Arc<dyn Fn() -> Result<X, TrapError> + Send + Sync>,
     setup: F,
 ) -> Result<SoftProcessRun<X>, String>
 where
@@ -410,7 +401,6 @@ where
         config.el1_elf_override,
         ipc.clone(),
         executor,
-        make_executor,
     )
     .map_err(|e| format!("SoftAarch64Vmm bring-up: {e}"))?;
 
