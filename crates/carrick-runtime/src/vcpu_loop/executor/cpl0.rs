@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
+mod root_exec;
+
 #[cfg(test)]
 mod host_fd_binding_tests {
     use super::*;
@@ -1160,9 +1162,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                                 );
                             },
                             &mut host_file,
-                            &mut |payload| {
+                            &mut |origin, payload| {
                                 crate::runtime::exec::load_native_x86_exec(
                                     &self.dispatcher,
+                                    origin,
                                     payload,
                                 )
                             },
@@ -1175,6 +1178,37 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         status, exited,
                     ))?;
                     Ok(ExecutorExit::Exited)
+                } else if let Some(settled) = self.physical.take_root_exec_settlement() {
+                    // The run root's exec settled on this lane (#2142): its
+                    // Kernel half commits now, and the worker retargets the
+                    // root before this CPU enters the guest again.
+                    let predecessor = Arc::clone(binding);
+                    let killed = {
+                        let dispatcher = self.dispatcher.lock().map_err(|_| {
+                            TrapError::Hypervisor("CPL0 dispatcher poisoned".into())
+                        })?;
+                        root_exec::serve_root_exec(&dispatcher, &predecessor, settled, submission)?
+                    };
+                    match killed {
+                        None => Ok(ExecutorExit::ResumeEl1),
+                        Some(killed) => {
+                            tracing::error!(
+                                target: "carrick::exec",
+                                cause = %killed.cause,
+                                "x86 root exec failed past its point of no return"
+                            );
+                            let signal = carrick_signal_core::policy::ExecPastNoReturn::SIGNAL;
+                            self.publish_exit(InitialProcessExit::OwnedExit {
+                                status:
+                                    carrick_personality_linux::lifecycle::LinuxWaitStatus::signaled(
+                                        signal.number() as u8,
+                                        true,
+                                    ),
+                                exits: exited,
+                            })?;
+                            Ok(ExecutorExit::Exited)
+                        }
+                    }
                 } else {
                     Ok(ExecutorExit::ResumeEl1)
                 }
@@ -1228,9 +1262,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                                 );
                             },
                             &mut host_file,
-                            &mut |payload| {
+                            &mut |origin, payload| {
                                 crate::runtime::exec::load_native_x86_exec(
                                     &self.dispatcher,
+                                    origin,
                                     payload,
                                 )
                             },
@@ -1648,13 +1683,23 @@ impl Cpl0TaskBinding {
                 "CPL0 task binding differs from the issued kernel root".to_owned(),
             ));
         }
+        // At boot the ring's root thread and the Kernel's root thread both
+        // start at the initial execution generation.
+        if arch.task().execution.raw().get() != generation.raw() {
+            return Err(TrapError::Hypervisor(
+                "CPL0 task binding differs from the issued kernel root".to_owned(),
+            ));
+        }
         let binding = Self::issue(context, identity, arch, generation)?;
         binding.validate_task_state(state)?;
         Ok(binding)
     }
 
     /// The binding of `context`'s task at `generation`, loading `identity`
-    /// through the issued x86 `arch` binding.
+    /// through the issued x86 `arch` binding. `arch`'s execution generation
+    /// is the ring thread's, which the Kernel's `generation` need not equal:
+    /// exec advances the ring's, while the Kernel's successor thread starts
+    /// at the initial generation (#2142).
     fn issue(
         context: &KernelContext,
         identity: TaskLoadIdentity,
@@ -1665,7 +1710,6 @@ impl Cpl0TaskBinding {
             || arch.context().mm.raw() != identity.mm.nonzero()
             || arch.context().generation.raw().get() != identity.asid_generation
             || arch.task().task.raw().get() != context.task().key().serial.raw()
-            || arch.task().execution.raw().get() != generation.raw()
         {
             return Err(TrapError::Hypervisor(
                 "CPL0 task binding differs from the issued kernel root".to_owned(),

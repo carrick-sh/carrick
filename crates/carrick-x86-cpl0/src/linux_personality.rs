@@ -1687,12 +1687,17 @@ impl Personality for LinuxPersonality {
                     }
                 };
             }
-            // A fork child's execve/execveat is the native exec service's
-            // (#2235): stage its arguments exactly as ARM's owned entry
-            // does, then hand the payload to the shared owner, which parks
-            // until the carrier has prepared and sealed the successor.
+            // A fork child's execve/execveat (#2235), and the run root's
+            // (#2142), is the native exec service's: stage its arguments
+            // exactly as ARM's owned entry does, then hand the payload to
+            // the shared owner, which parks until the carrier has prepared
+            // and sealed the successor. The carrier consumes the root's
+            // settlement; ARM's root forwards to its host instead.
             if route == CompletionRoute::NativeService
-                && carrick_el1_linux::dispatch::native_exec_claimed(|| process.thread_group_owner())
+                && carrick_el1_linux::dispatch::native_exec_claimed(
+                    carrick_el1_linux::dispatch::RootExecServer::NativeService,
+                    || process.thread_group_owner(),
+                )
                 && let Some(request) =
                     carrick_el1_linux::exec_stage::ExecStageRequest::from_canonical(
                         call.canonical.raw(),
@@ -1937,8 +1942,8 @@ impl Personality for LinuxPersonality {
             // Entropy has been staged above. Any other unwired native service
             // fails closed with a counted refusal.
             CompletionRoute::NativeService => {
-                // A fork child's exec was handed to the native exec service
-                // above; everything else is the counted refusal.
+                // A fork child's or the root's exec was handed to the native
+                // exec service above; everything else is the counted refusal.
                 frame.rax = carrick_el1_linux::dispatch::settle_unwired_native_service(
                     native_process::registry(),
                     source.zone,

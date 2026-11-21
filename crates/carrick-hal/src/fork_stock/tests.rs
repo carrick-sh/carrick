@@ -3300,7 +3300,14 @@ fn a_built_exec_successor_commits_its_linked_tables_and_returns_the_rest() {
     };
     let child = child_of(granted, 43);
     let receipt = stock
-        .replace_child_for_exec_with_tables(child, successor, pages[0], (), used.clone())
+        .replace_for_exec_with_tables(
+            ExecPredecessorForm::Child,
+            child,
+            successor,
+            pages[0],
+            (),
+            used.clone(),
+        )
         .unwrap();
     assert_eq!(stock.child_root(successor_mm), Some(pages[0]));
     let cleared = RefCell::new(Vec::new());
