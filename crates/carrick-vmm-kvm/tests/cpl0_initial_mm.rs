@@ -6350,3 +6350,90 @@ fn native_child_inet_tcp_and_udp_cross_to_the_host_network() {
         outcome.run
     );
 }
+
+/// #2620 part A (x86 twin; x86 has a physical service doorbell so this passes
+/// before and after the neutral host-work mark fix): parent forks, child execs
+/// a program that runs 20 rounds of `poll(fd, POLLIN, 50ms)` on a never-ready
+/// host UDP socket and calls `_exit(7)`, and parent's `wait4(-1)` returns 7
+/// within ~2 s.
+#[test]
+fn native_fork_exec_child_polls_never_ready_host_socket_twenty_rounds() {
+    bounded_witness(
+        "native_fork_exec_child_polls_never_ready_host_socket_twenty_rounds",
+        || {
+            run_x86_fork_exec_poll_witness(false);
+        },
+    );
+}
+
+/// Readiness variant of [`native_fork_exec_child_polls_never_ready_host_socket_twenty_rounds`]:
+/// on each of 20 rounds a loopback UDP responder replies 10 ms after the
+/// child's trigger so `poll` parks on host readiness, wakes on socket
+/// readiness, republishes via `publish_pending_host_file`, drains one byte, and
+/// exits 7 within ~2 s.
+#[test]
+fn native_fork_exec_child_polls_ready_host_socket_twenty_rounds() {
+    bounded_witness(
+        "native_fork_exec_child_polls_ready_host_socket_twenty_rounds",
+        || {
+            run_x86_fork_exec_poll_witness(true);
+        },
+    );
+}
+
+fn run_x86_fork_exec_poll_witness(become_ready: bool) {
+    let dir = tempfile::tempdir_in("/tmp").expect("exec poll fixture directory");
+    let responder_port = become_ready.then(|| {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp responder");
+        let port = sock.local_addr().expect("local addr").port().swap_bytes();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            while let Ok((_, peer)) = sock.recv_from(&mut buf) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let _ = sock.send_to(b"a", peer);
+            }
+        });
+        format!("-DPEER_PORT={port}")
+    });
+
+    let successor_path = dir.path().join("poll-child");
+    let mut succ_flags = vec!["-DSUCCESSOR"];
+    if let Some(ref port_flag) = responder_port {
+        succ_flags.push(port_flag.as_str());
+    }
+    let successor_elf = native_exit_fixture_with_flags("native_exec_poll.S", &succ_flags);
+    carrick_test_support::executable::write_executable_mode(&successor_path, &successor_elf, 0o700);
+
+    let path_define = format!("-DSUCCESSOR_PATH=\"{}\"", successor_path.display());
+    let parent_elf = native_exit_fixture_with_flags("native_exec_poll.S", &[&path_define]);
+    let parent_bin = dir.path().join("poll-parent");
+    carrick_test_support::executable::write_executable_mode(&parent_bin, &parent_elf, 0o700);
+
+    let native_start = std::time::Instant::now();
+    let native_status = std::process::Command::new(&parent_bin)
+        .status()
+        .expect("run native Linux oracle");
+    assert_eq!(
+        native_status.code(),
+        Some(7),
+        "native Linux oracle must reap child _exit(7): {native_status:?}"
+    );
+    assert!(
+        native_start.elapsed() < std::time::Duration::from_secs(2),
+        "native Linux oracle exceeded 2s: {:?}",
+        native_start.elapsed()
+    );
+
+    let carrick_start = std::time::Instant::now();
+    let outcome = run_exec_fixture(&parent_elf, 512);
+    let elapsed = carrick_start.elapsed();
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "parent wait4(-1) must observe child _exit(7): {:?}",
+        outcome.run
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "Carrick KVM fork+exec+20x poll+wait4(-1) must finish within 2s, took {elapsed:?}"
+    );
+}

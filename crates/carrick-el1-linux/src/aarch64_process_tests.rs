@@ -7,6 +7,8 @@ mod born_thread_entry_tests;
 mod native_child_handoff_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod native_exec_pipe_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+mod native_exec_poll_tests;
 #[cfg(test)]
 mod native_fault_supply_tests;
 #[cfg(test)]
