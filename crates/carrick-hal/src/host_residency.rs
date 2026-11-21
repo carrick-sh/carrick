@@ -81,14 +81,23 @@ pub fn install_host_residency_resolver(
     if region_ptr == 0 {
         return;
     }
-    *HOST_RESIDENCY_RESOLVER.lock() = Some((region_ptr, resolver));
+    // Replaced values drop only after the guards are released: their drop
+    // can tear down a carrier mapping, which re-enters the clear path.
+    let old_resolver = HOST_RESIDENCY_RESOLVER
+        .lock()
+        .replace((region_ptr, resolver));
     let mut cache = HOST_RESIDENCY_CACHE.lock();
-    if cache
+    let old_snapshot = if cache
         .as_ref()
         .is_some_and(|snapshot| snapshot.region_ptr != region_ptr)
     {
-        *cache = None;
-    }
+        cache.take()
+    } else {
+        None
+    };
+    drop(cache);
+    drop(old_resolver);
+    drop(old_snapshot);
 }
 
 /// Clear the dynamic-extent resolver and any cached pins belonging to
@@ -97,18 +106,26 @@ pub fn clear_host_residency_resolver(region_ptr: usize) {
     if region_ptr == 0 {
         return;
     }
+    // Removed values drop only after the guards are released (see install).
     let mut resolver = HOST_RESIDENCY_RESOLVER.lock();
-    if resolver.as_ref().is_some_and(|(ptr, _)| *ptr == region_ptr) {
-        *resolver = None;
-    }
+    let old_resolver = if resolver.as_ref().is_some_and(|(ptr, _)| *ptr == region_ptr) {
+        resolver.take()
+    } else {
+        None
+    };
     drop(resolver);
+    drop(old_resolver);
     let mut cache = HOST_RESIDENCY_CACHE.lock();
-    if cache
+    let old_snapshot = if cache
         .as_ref()
         .is_some_and(|snapshot| snapshot.region_ptr == region_ptr)
     {
-        *cache = None;
-    }
+        cache.take()
+    } else {
+        None
+    };
+    drop(cache);
+    drop(old_snapshot);
 }
 
 /// Pinned host view of the carrier's bootstrap and grown residency segments.
@@ -244,7 +261,9 @@ pub fn current_host_residency() -> Option<HostResidencyView> {
             snapshot: Arc::clone(existing),
         });
     }
-    *cache = Some(Arc::clone(&snapshot));
+    let old_snapshot = cache.replace(Arc::clone(&snapshot));
+    drop(cache);
+    drop(old_snapshot);
     Some(HostResidencyView { snapshot })
 }
 
