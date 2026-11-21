@@ -4868,6 +4868,217 @@ die:
     assert_eq!(record.cs & 3, 3);
 }
 
+/// #2660: a woken member whose MM's Gate (the host's exclusion) refuses its
+/// install in `schedule` is "not now": it parks on the Gate's release and
+/// resumes exactly as the refused switch-in would have, never requeued to
+/// poll the gate. Two live threads; the gate is raised once on each case:
+/// 1. a pipe read woken with its adapter operation still pending, which must
+///    return the written word;
+/// 2. a futex wait woken with its result (0), which must return it.
+///
+/// The injected gate is lowered through the MM's release venue once the
+/// refused record parks on it, or once a scheduler pass finds it requeued
+/// (a poll, counted). Busy once, then success: the census must show both
+/// raises, both parks, and no poll.
+#[test]
+fn production_schedule_gate_refusal_parks_and_resumes_the_woken_wait() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* Control + worker stack: 0x4000 bytes RW anonymous. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $0, 0x3000(%r12)
+    /* Join timeout = { 5, 0 } at 0x20(%r12). */
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* pipe2(0x40(%r12), 0): read end at 0x40, write end at 0x44. */
+    lea 0x40(%r12), %rdi
+    xor %esi, %esi
+    mov $293, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+
+    /* Clone the worker thread (CLONE_VM..CLONE_CHILD_CLEARTID|SETTID). */
+    mov $0x013d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz worker
+
+    /* 1. Arm the gate for this member's next switch-in with a pending
+     *    adapter operation, then block in the pipe read. */
+    mov $-446, %rax /* INJECT_GATE_AT_NEXT_OPERATION_SWITCH_IN */
+    syscall
+    test %rax, %rax
+    jnz fail_arm_operation
+    movl $1, 0x30(%r12)
+    mov 0x40(%r12), %edi
+    lea 0x50(%r12), %rsi
+    mov $8, %edx
+    xor %eax, %eax
+    syscall
+    cmp $8, %rax
+    jne fail_read
+    movabs $0x1122334455667788, %rdx
+    cmp %rdx, 0x50(%r12)
+    jne fail_read_value
+
+    /* 2. Arm the gate for this member's next switch-in with a wake result,
+     *    then block in FUTEX_WAIT on 0x38(%r12) == 0. */
+    mov $-445, %rax /* INJECT_GATE_AT_NEXT_RESULT_SWITCH_IN */
+    syscall
+    test %rax, %rax
+    jnz fail_arm_result
+    movl $1, 0x34(%r12)
+futex_wait_loop:
+    lea 0x38(%r12), %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    cmpl $0, 0x38(%r12)
+    je futex_wait_loop
+    test %rax, %rax
+    jnz fail_futex_result
+
+    /* Join the worker. */
+leader_join:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz census
+    mov %r12, %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_join_timeout
+    jmp leader_join
+
+census:
+    cmpq $77, 0x10(%r12)
+    jne fail_worker
+    mov $-444, %rax /* INJECT_GATE_CENSUS */
+    syscall
+    /* raises = 2, polls = 0, parks = 2 */
+    movabs $0x0000000200000002, %rdx
+    cmp %rdx, %rax
+    jne fail_census
+    mov $7, %edi
+    jmp die
+
+worker:
+    /* 1. Once the leader is parked in its read, write the word. */
+1:
+    cmpl $1, 0x30(%r12)
+    je 2f
+    pause
+    jmp 1b
+2:
+    mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
+    syscall
+    test %rax, %rax
+    jnz 3f
+    pause
+    jmp 2b
+3:
+    movabs $0x1122334455667788, %rax
+    mov %rax, 0x58(%r12)
+    mov 0x44(%r12), %edi
+    lea 0x58(%r12), %rsi
+    mov $8, %edx
+    mov $1, %eax
+    syscall
+    cmp $8, %rax
+    jne worker_fail
+
+    /* 2. Once the leader is parked in its futex wait, wake it. */
+4:
+    cmpl $1, 0x34(%r12)
+    je 5f
+    pause
+    jmp 4b
+5:
+    mov $-443, %rax /* INJECT_GATE_TARGET_PARKED */
+    syscall
+    test %rax, %rax
+    jnz 6f
+    pause
+    jmp 5b
+6:
+    movl $1, 0x38(%r12)
+    lea 0x38(%r12), %rdi
+    mov $1, %esi /* FUTEX_WAKE */
+    mov $1, %edx
+    mov $202, %eax
+    syscall
+    cmp $1, %rax
+    jne worker_fail
+    movq $77, 0x10(%r12)
+worker_fail:
+    xor %edi, %edi
+    mov $60, %eax /* raw SYS_exit on a non-last thread */
+    syscall
+    ud2
+
+fail_mmap:          mov $80, %edi; jmp die
+fail_pipe:          mov $81, %edi; jmp die
+fail_clone:         mov $82, %edi; jmp die
+fail_arm_operation: mov $83, %edi; jmp die
+fail_read:          mov $84, %edi; jmp die
+fail_read_value:    mov $85, %edi; jmp die
+fail_arm_result:    mov $86, %edi; jmp die
+fail_futex_result:  mov $87, %edi; jmp die
+fail_join_timeout:  mov $88, %edi; jmp die
+fail_worker:        mov $89, %edi; jmp die
+fail_census:
+    /* 100 + polls: a requeued (polling) refusal is 101 or 102. */
+    shr $16, %rax
+    and $0xffff, %eax
+    lea 100(%rax), %edi
+    jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "a gate-refused switch-in must park on the gate's release and resume \
+         its woken wait (exit 101/102: it polled the gate instead): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
 /// #2660: the busy-loser race with both CPUs faulting in the window at once.
 /// The sibling's in-guest first touch may publish a page of the loser's
 /// applied span before the loser's settlement crossing reads it, and the

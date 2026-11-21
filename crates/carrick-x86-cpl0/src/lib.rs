@@ -178,6 +178,119 @@ mod test_support {
     static SELECTED_SERVE_BUSIES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
 
+    /// The calling member's next switch-in that holds an adapter operation
+    /// (a woken IPC wait) finds its MM's Gate raised, as a host exclusion
+    /// raises it (#2660). The gate is lowered through the MM's release venue
+    /// once a scheduler pass finds the refused record parked on it, or
+    /// requeued instead (the record polled the gate).
+    pub const INJECT_GATE_AT_NEXT_OPERATION_SWITCH_IN: u64 = 0xffff_ffff_ffff_fe42;
+    /// As above, for the next switch-in carrying a wake result and no
+    /// operation (a woken futex wait).
+    pub const INJECT_GATE_AT_NEXT_RESULT_SWITCH_IN: u64 = 0xffff_ffff_ffff_fe43;
+    /// Injected gate census: parks in bits 0..16, polls in bits 16..32,
+    /// raises in bits 32..48.
+    pub const INJECT_GATE_CENSUS: u64 = 0xffff_ffff_ffff_fe44;
+    /// 1 while the armed member is parked (its peer may now wake it), else
+    /// 0 (and the peer CPU is kicked, so a member queued behind the caller
+    /// runs).
+    pub const INJECT_GATE_TARGET_PARKED: u64 = 0xffff_ffff_ffff_fe45;
+    const GATE_OPERATION: u8 = 1;
+    const GATE_RESULT: u8 = 2;
+    const GATE_RAISED: u8 = 3;
+    static GATE_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// The armed member's record, plus one (0: none).
+    static GATE_TARGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static GATE_MM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static GATE_PARKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static GATE_POLLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static GATE_RAISES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    fn arm_gate(
+        kind: u8,
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+            carrick_guest_arch::CpuId::new(binding.cpu_slot),
+        )?;
+        let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+        let record = zone
+            .slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())?;
+        GATE_TARGET.store(record.raw() + 1, Ordering::Release);
+        GATE_STATE
+            .compare_exchange(0, kind, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(0)
+    }
+
+    /// Called once `schedule` switched `selected` in, before it installs
+    /// the record's MM `mm`: raise that MM's Gate for the armed switch-in.
+    pub fn raise_gate_at_switch_in(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+        selected: carrick_sched_core::SwitchedIn,
+        mm: u64,
+    ) {
+        if GATE_TARGET.load(Ordering::Acquire) != selected.record.raw() + 1 {
+            return;
+        }
+        let rec = source.zone.record(selected.record);
+        let kind = if rec.has_adapter_operation() {
+            GATE_OPERATION
+        } else if selected.result.is_some() && !rec.has_object_operation() {
+            GATE_RESULT
+        } else {
+            return;
+        };
+        if GATE_STATE
+            .compare_exchange(kind, GATE_RAISED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(index) = source.zone.spaces.find(mm) else {
+            carrick_x86_carrier::entry::fatal_boot();
+        };
+        GATE_MM.store(mm, Ordering::Release);
+        source.zone.spaces.raise(index);
+        GATE_RAISES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Called at the top of each scheduler pass: once the refused record
+    /// has parked on the raised gate, or was requeued instead, lower the
+    /// gate through the MM's release venue (which wakes a parked record).
+    pub fn lower_injected_gate(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+        slot: carrick_sched_core::SlotId,
+    ) {
+        if GATE_STATE.load(Ordering::Acquire) != GATE_RAISED {
+            return;
+        }
+        let Some(record) = carrick_sched_core::RecordId::from_raw(
+            GATE_TARGET.load(Ordering::Acquire).wrapping_sub(1),
+        ) else {
+            return;
+        };
+        let counter = match source.zone.record(record).claim() {
+            carrick_sched_core::Claim::Parked { .. } => &GATE_PARKS,
+            carrick_sched_core::Claim::Queued { .. } => &GATE_POLLS,
+            _ => return,
+        };
+        if GATE_STATE
+            .compare_exchange(GATE_RAISED, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        counter.fetch_add(1, Ordering::AcqRel);
+        let mm = GATE_MM.load(Ordering::Acquire);
+        let Some(index) = source.zone.spaces.find(mm) else {
+            carrick_x86_carrier::entry::fatal_boot();
+        };
+        carrick_core::wait::space_access(source.zone, slot, crate::native_process::release)
+            .lower(index);
+    }
+
     /// Called after the carrier prepared and submitted `task`'s selected
     /// window, before the guest serves it: hold the editor for exactly the
     /// armed member's serve. The holder releases once the member parks.
@@ -703,6 +816,32 @@ mod test_support {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+                Some(0)
+            }
+            INJECT_GATE_AT_NEXT_OPERATION_SWITCH_IN => arm_gate(GATE_OPERATION, binding),
+            INJECT_GATE_AT_NEXT_RESULT_SWITCH_IN => arm_gate(GATE_RESULT, binding),
+            INJECT_GATE_CENSUS => Some(
+                GATE_PARKS.load(Ordering::Acquire)
+                    | GATE_POLLS.load(Ordering::Acquire) << 16
+                    | GATE_RAISES.load(Ordering::Acquire) << 32,
+            ),
+            INJECT_GATE_TARGET_PARKED => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                let record = carrick_sched_core::RecordId::from_raw(
+                    GATE_TARGET.load(Ordering::Acquire).wrapping_sub(1),
+                )?;
+                if matches!(
+                    zone.record(record).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                ) {
+                    return Some(1);
+                }
+                let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+                carrick_el1::isa::x86::interrupt::send_resched(peer)
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
                 Some(0)
             }
             INJECT_HOLD_NEXT_FORK_COMMIT => FORK_COMMIT_HOLD
