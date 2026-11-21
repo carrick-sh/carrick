@@ -177,7 +177,21 @@ impl<'a> DescriptorTxn<'a> {
                 ceiling,
             } => DescriptorOp::Protect {
                 span,
-                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                permissions: if !requested.readable
+                    && !requested.writable
+                    && !requested.executable
+                    && !requested.user
+                    && ceiling.is_some()
+                {
+                    // PROT_NONE retains backing in an unpublished leaf.
+                    Permissions {
+                        writable: false,
+                        executable: false,
+                        user: false,
+                    }
+                } else {
+                    permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?
+                },
                 ceiling,
             },
             EditOperation::ArmCow {
@@ -363,11 +377,16 @@ pub fn check_leaf_privilege_matches_range(va: UserVa, entry: u64) -> Result<(), 
     }
     if entry & (PRESENT | PREPARED) != 0 {
         let lower_half = va.raw() < (1 << 47);
-        if (entry & USER != 0) != lower_half {
+        if (entry & USER != 0) != lower_half && !(lower_half && is_private_prot_none(entry)) {
             return Err(DescriptorRefusal::PermissionDenied);
         }
     }
     Ok(())
+}
+// An inaccessible private frame stays owned, but must not become a
+// supervisor mapping: guarded user copies rely on lower-half isolation.
+fn is_private_prot_none(entry: u64) -> bool {
+    entry & (PRESENT | PREPARED | USER | WRITE | NX | PRIVATE | RETIRED) == PREPARED | NX | PRIVATE
 }
 fn validate_output(output: FrameGpa, len: u64, alignment: u64) -> Result<(), DescriptorRefusal> {
     if !valid_pa(output.raw())
@@ -547,7 +566,12 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         if entry == 0
             && matches!(
                 self.txn.op,
-                DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)
+                DescriptorOp::Unmap(_)
+                    | DescriptorOp::Retire(_)
+                    | DescriptorOp::Protect {
+                        ceiling: Some(_),
+                        ..
+                    }
             )
         {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
@@ -700,7 +724,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     }
                 }
                 let may_exec = if p.executable { MAY_EXEC } else { 0 };
-                if cow {
+                let updated = if cow {
                     // Still shared: record write intent, never grant WRITE.
                     entry & !(WRITE | USER | NX | MAY_WRITE)
                         | (permissions(p) & (USER | NX | MAY_WRITE))
@@ -709,6 +733,11 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     entry & !(WRITE | USER | NX)
                         | (permissions(p) & (WRITE | USER | NX | MAY_WRITE))
                         | may_exec
+                };
+                if !p.user && !p.writable && !p.executable && ceiling.is_some() {
+                    (updated & !PRESENT) | PREPARED
+                } else {
+                    updated
                 }
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
@@ -726,7 +755,12 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
             }
             DescriptorOp::Retire(_) => {
-                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 || entry & PRIVATE == 0 {
+                // A private PROT_NONE terminal retains backing and still
+                // belongs to the MM even though its USER bit is clear.
+                if entry & (PRESENT | PREPARED) == 0
+                    || entry & PRIVATE == 0
+                    || entry & USER == 0 && !is_private_prot_none(entry)
+                {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 (entry & !(PRESENT | PREPARED | COW)) | RETIRED

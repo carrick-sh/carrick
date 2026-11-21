@@ -975,6 +975,11 @@ fn supply_user_fault(
     }
     use carrick_el1::fault::OwnerFaultSupplyOutcome;
     match supply.outcome() {
+        OwnerFaultSupplyOutcome::ProtectionDeclined => UserFaultSupply::Signal {
+            signum: LINUX_SIGSEGV,
+            code: LINUX_SEGV_ACCERR,
+            address: fault.address,
+        },
         OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
             signum: LINUX_SIGSEGV,
             code: if fault.present {

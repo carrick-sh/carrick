@@ -222,6 +222,14 @@ child:
     add $4096, %rbx
     cmp %r14, %rbx
     jb 2b
+    MPROTECT %r15, %r13, $3
+    /* Opening the range keeps touched bytes and faults in zero for holes. */
+    cmpb $0x5a, (%r15)
+    jne harness
+    cmpb $0, 0x2000(%r15)
+    jne harness
+    cmpb $0x5a, 0x3000(%r15)
+    jne harness
 #endif
     jmp done
 #else
