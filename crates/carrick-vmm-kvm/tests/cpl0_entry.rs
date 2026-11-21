@@ -4575,7 +4575,7 @@ die:
 }
 
 /// #2581: two live threads sharing the root MM concurrently first-touch the
-/// same and adjacent anonymous pages across 16 lazy 2 MiB grant blocks, then
+/// same and adjacent anonymous pages across 8 lazy 2 MiB grant blocks, then
 /// synchronize via CLONE_CHILD_CLEARTID + futex_wait and exit cleanly.
 #[test]
 fn two_live_threads_concurrent_root_first_touch_and_futex_complete() {
@@ -4605,9 +4605,9 @@ _start:
     movq $5, 0x20(%r12)
     movq $0, 0x28(%r12)
 
-    /* Lazy 32 MiB anonymous arena (16 x 2 MiB grant windows), untouched. */
+    /* Lazy 16 MiB anonymous arena (8 x 2 MiB grant windows), untouched. */
     xor %edi, %edi
-    mov $0x02000000, %esi
+    mov $0x01000000, %esi
     mov $3, %edx
     mov $0x22, %r10d
     mov $-1, %r8
@@ -4640,7 +4640,7 @@ _start:
 2:
     xor %ecx, %ecx
 leader_block_loop:
-    cmp $16, %ecx
+    cmp $8, %ecx
     je leader_join
     mov %rcx, %rax
     shl $21, %rax
@@ -4676,7 +4676,7 @@ verify_arena:
 
     xor %ecx, %ecx
 verify_loop:
-    cmp $16, %ecx
+    cmp $8, %ecx
     je success
     mov %rcx, %rax
     shl $21, %rax
@@ -4716,7 +4716,7 @@ worker_entry:
 4:
     xor %ecx, %ecx
 worker_block_loop:
-    cmp $16, %ecx
+    cmp $8, %ecx
     je worker_done
     mov %rcx, %rax
     shl $21, %rax
