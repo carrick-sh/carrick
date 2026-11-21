@@ -409,6 +409,68 @@ fn serial_host_native_root_and_child_realtime_survive_an_unmapped_vvar() {
     );
 }
 
+/// The ring's realtime word follows the container clock after the carrier
+/// published its load-time calibration: the domain is moved to 2100-01-01
+/// after load (the load-time word carries no delta), and raw REALTIME,
+/// REALTIME_COARSE, `gettimeofday` and `time` in the root and in a native
+/// fork child read the moved clock. Each guest then tries `clock_settime`,
+/// which x86 leaves unserved today (#1981); a served set must move every
+/// later read, including the root's after the child's step.
+#[test]
+fn serial_host_native_root_and_child_realtime_follow_clock_settime() {
+    const TEST: &str = "serial_host_native_root_and_child_realtime_follow_clock_settime";
+    const CHILD: &str = "CARRICK_SETTIME_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "15"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, TEST)
+            .output()
+            .expect("bounded native settime witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_realtime_set.S", &[]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("ELF program");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    // The fixture's TARGET: guest realtime is 2100-01-01T00:00:00Z in the
+    // root's container.
+    const TARGET_NS: i128 = 4_102_444_800_000_000_000;
+    let now = std::time::UNIX_EPOCH.elapsed().expect("host realtime");
+    dispatcher
+        .capture_one_task_context()
+        .expect("issued root")
+        .task()
+        .container()
+        .clock()
+        .try_set_realtime_offset_ns((TARGET_NS - now.as_nanos() as i128) as i64)
+        .expect("uncontrolled clock domain");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("settime witness run");
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "realtime after the domain moved (93 means a ring read kept the load-time wall clock)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
 #[test]
 fn serial_host_native_exec_successor_vdso_realtime_matches_raw_clock() {
     let directory = tempfile::tempdir().expect("successor directory");
