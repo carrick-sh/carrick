@@ -67,6 +67,7 @@ const O_CLOEXEC: u64 = 0x80000;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const MAP_PRIVATE: u64 = 2;
+const MAP_SHARED: u64 = 1;
 const MAP_ANONYMOUS: u64 = 0x20;
 const CLOCK_MONOTONIC: u64 = 1;
 
@@ -328,7 +329,8 @@ impl ScriptedHvc2Executor {
                     [obs.opened_fd, DATA_VA + READ_BUF_OFFSET, 64, 0, 0, 0],
                 );
             }
-            // 12: file-backed mmap(0, 0x1000, PROT_READ, MAP_PRIVATE, fd, 0) -> MapHostAlias
+            // 12: file-backed mmap(0, 0x1000, PROT_READ, MAP_SHARED, fd, 0) -> MapHostAlias
+            // (a low-VA `MAP_PRIVATE` file mapping is served by copy, not an alias)
             12 => {
                 if x0 != FILE_PAYLOAD.len() as u64 {
                     return Err(format!("read(/hello.txt) returned {}", x0 as i64));
@@ -336,7 +338,7 @@ impl ScriptedHvc2Executor {
                 Self::set_call(
                     cpu,
                     NR_MMAP,
-                    [0, 0x1000, PROT_READ, MAP_PRIVATE, obs.opened_fd, 0],
+                    [0, 0x1000, PROT_READ, MAP_SHARED, obs.opened_fd, 0],
                 );
             }
             // 13: ldr x3, [x1] from MapHostAlias file mapping
@@ -545,6 +547,14 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         run.counted_enosys.is_empty(),
         "unexpected counted ENOSYS: {:?}",
         run.counted_enosys
+    );
+    assert!(
+        run.frame_inventory.mappings.iter().any(|m| {
+            m.gpa.raw() >= carrick_softcpu_aarch64_host::SOFT_ALIAS_GPA_BASE
+                && m.length.raw() == GUEST_PAGE_BYTES
+        }),
+        "MapHostAlias must publish its stage-2 alias frame into the kernel frame inventory, got {:?}",
+        run.frame_inventory
     );
 
     let final_obs = obs.lock().expect("lock witness observations");
