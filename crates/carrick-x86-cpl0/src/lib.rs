@@ -45,6 +45,16 @@ mod test_support {
     /// Read the injected-copy census: refusals in the high 32 bits, owned
     /// copies that completed after an owned refusal in the low 32 bits.
     pub const INJECT_OWNED_COPY_CENSUS: u64 = 0xffff_ffff_ffff_fe1c;
+    /// Hold the next owned zero-word copy-out (a clear-tid write) once it has
+    /// published to guest memory, until released: the window a descheduled
+    /// vCPU opens between a copy's guest-visible publication and the code
+    /// after it (#2648).
+    pub const INJECT_OWNED_COPY_PUBLISH_GATE: u64 = 0xffff_ffff_ffff_fe2e;
+    /// 1 once the armed copy-out is held after its publication, else 0 (and
+    /// the peer CPU is kicked so a worker queued behind the poller runs).
+    pub const INJECT_OWNED_COPY_PUBLISH_HELD: u64 = 0xffff_ffff_ffff_fe2f;
+    /// Release the held copy-out, or disarm a gate that never engaged.
+    pub const INJECT_RELEASE_OWNED_COPY_PUBLISH: u64 = 0xffff_ffff_ffff_fe30;
     /// The next anonymous replay settlement reports the ownership refusal
     /// (`Stale`) that `take_object_operation` raises, after the mapping edit
     /// has already committed.
@@ -443,6 +453,37 @@ mod test_support {
         refused
     }
 
+    static OWNED_PUBLISH_GATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// About seconds of spinning: a gate nobody releases fails the run
+    /// instead of hanging it.
+    const OWNED_PUBLISH_GATE_SPINS: u64 = 1 << 32;
+
+    /// Called by an owned copy-out right after its bytes reached guest
+    /// memory. An armed gate holds a zero-word copy (a clear-tid write) here.
+    pub fn hold_armed_owned_publication(bytes: &[u8]) {
+        if bytes != [0_u8; 4] {
+            return;
+        }
+        if OWNED_PUBLISH_GATE
+            .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut spins = 0_u64;
+        while OWNED_PUBLISH_GATE.load(Ordering::Acquire) == BIRTH_HELD {
+            spins += 1;
+            if spins > OWNED_PUBLISH_GATE_SPINS {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            if carrick_el1::isa::x86::interrupt::sync_user_memory_generation().is_err() {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            core::hint::spin_loop();
+        }
+        OWNED_PUBLISH_GATE.store(0, Ordering::Release);
+    }
+
     pub fn record_owned_copy_done() {
         if OWNED_COPY_RETAINED.swap(false, Ordering::AcqRel) {
             OWNED_COPY_RERUNS.fetch_add(1, Ordering::AcqRel);
@@ -638,6 +679,37 @@ mod test_support {
             }
             INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE => {
                 (!REPLAY_SETTLEMENT_REFUSAL.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_OWNED_COPY_PUBLISH_GATE => OWNED_PUBLISH_GATE
+                .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_OWNED_COPY_PUBLISH_HELD => {
+                if OWNED_PUBLISH_GATE.load(Ordering::Acquire) == BIRTH_HELD {
+                    return Some(1);
+                }
+                let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+                carrick_el1::isa::x86::interrupt::send_resched(peer)
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                Some(0)
+            }
+            INJECT_RELEASE_OWNED_COPY_PUBLISH => {
+                let _ = OWNED_PUBLISH_GATE
+                    .compare_exchange(
+                        BIRTH_HELD,
+                        BIRTH_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .or_else(|_| {
+                        OWNED_PUBLISH_GATE.compare_exchange(
+                            BIRTH_ARMED,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                    });
+                Some(0)
             }
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)

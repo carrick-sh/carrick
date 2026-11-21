@@ -18,6 +18,15 @@
  * census: every refusal must be followed by a completed rerun of the copy.
  * Exit 3: the census differs.
  *
+ * -DOWNED_COPY_PUBLISH_GATE (#2648): one worker, one round. The worker arms
+ * the refusal as above and also INJECT_OWNED_COPY_PUBLISH_GATE, which holds
+ * its rerun copy-out in the kernel right after the zero reached the CLEARTID
+ * word. The root polls INJECT_OWNED_COPY_PUBLISH_HELD, so the word it then
+ * reads is the published zero, and reads the census while the copy is held:
+ * the refusal's rerun must already be counted, since a joiner that sees the
+ * zero may read the census at once. Exit 3: the census differs; 5: the word
+ * is not the published zero; 100: the gate never engaged.
+ *
  * -DEDITOR_BUSY_ONCE: worker 1 arms INJECT_EDITOR_BUSY_ONCE after the
  * barrier, which holds the next MM editor acquisition until its waiter has
  * parked. A clear-tid copy-out then finds the editor held, so its exit must
@@ -31,6 +40,10 @@
 #define FUTEX_WAKE_PRIVATE 129
 #define INJECT_OWNED_COPY_BUSY_ONCE 0xfffffffffffffe1b
 #define INJECT_OWNED_COPY_CENSUS 0xfffffffffffffe1c
+#define INJECT_OWNED_COPY_PUBLISH_GATE 0xfffffffffffffe2e
+#define INJECT_OWNED_COPY_PUBLISH_HELD 0xfffffffffffffe2f
+#define INJECT_RELEASE_OWNED_COPY_PUBLISH 0xfffffffffffffe30
+#define POLL_LIMIT 0x1000000
 #define INJECT_EDITOR_BUSY_ONCE 0xfffffffffffffe11
 #define INJECT_WAIT_PARK_CENSUS 0xfffffffffffffe13
 .global _start
@@ -49,6 +62,9 @@ _start:
     movl $0, 0x1000(%r12)
     movl $0, 0x2000(%r12)
     movl $0, 0x3000(%r12)
+#ifdef OWNED_COPY_PUBLISH_GATE
+    jmp gate_main
+#endif
     mov $ROUNDS, %r15d
 round:
     movl $0, 0x20(%r12)
@@ -150,3 +166,55 @@ wexit:
     mov $60, %eax
     syscall
     ud2
+
+#ifdef OWNED_COPY_PUBLISH_GATE
+gate_main:
+    mov $0x00350f00, %edi
+    lea 0x1ff0(%r12), %rsi
+    lea 0x3000(%r12), %rdx
+    mov %rdx, %r10
+    xor %r8d, %r8d
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    jz gate_worker
+    mov $POLL_LIMIT, %r15d
+1:  movabs $INJECT_OWNED_COPY_PUBLISH_HELD, %rax
+    syscall
+    test %rax, %rax
+    jnz 2f
+    dec %r15d
+    jnz 1b
+    mov $100, %edi
+    mov $231, %eax
+    syscall
+2:  mov 0x3000(%r12), %r14d
+    movabs $INJECT_OWNED_COPY_CENSUS, %rax
+    syscall
+    mov %rax, %r13
+    movabs $INJECT_RELEASE_OWNED_COPY_PUBLISH, %rax
+    syscall
+    test %r14d, %r14d
+    jz 3f
+    mov $5, %edi
+    mov $231, %eax
+    syscall
+3:  movabs $((1 << 32) | 1), %rcx
+    cmp %rcx, %r13
+    je 4f
+    mov $3, %edi
+    mov $231, %eax
+    syscall
+4:  xor %edi, %edi
+    mov $231, %eax
+    syscall
+gate_worker:
+    movabs $INJECT_OWNED_COPY_BUSY_ONCE, %rax
+    syscall
+    movabs $INJECT_OWNED_COPY_PUBLISH_GATE, %rax
+    syscall
+    xor %edi, %edi
+    mov $60, %eax
+    syscall
+    ud2
+#endif

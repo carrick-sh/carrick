@@ -2974,6 +2974,28 @@ fn production_raw_exit_clear_tid_busy_once_reruns_in_ring() {
     );
 }
 
+/// #2648: the refused clear-tid copy-out's rerun is held right after the zero
+/// reached the CLEARTID word, and the root, which sees that zero, reads the
+/// census then. The rerun must already be counted: nothing orders a joiner
+/// that read the zero in userspace after the copy's own completion. Before,
+/// the completion was recorded after the publication, so a vCPU preempted in
+/// between left the census one short (exit 3), as the sibling test saw once
+/// in CI.
+#[test]
+fn production_raw_exit_clear_tid_rerun_is_counted_before_publication() {
+    let elf =
+        native_exit_fixture_with_flags("native_sibling_raw_exit.S", &["-DOWNED_COPY_PUBLISH_GATE"]);
+    // The injection hooks live only in the test-support image.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("a held clear-tid copy-out publishes after its rerun is counted");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+}
+
 /// #2359 round 4: a thread clone's `CLONE_PARENT_SETTID` copy-out refused
 /// Busy once (`INJECT_OWNED_COPY_BUSY_ONCE`) is "not now": the clone keeps
 /// its call and reruns in ring, and the parent sees the child's tid in its
