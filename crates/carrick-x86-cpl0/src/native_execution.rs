@@ -2,6 +2,7 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
+use carrick_core::wait::RetainedDeferral;
 use carrick_el1::isa::x86::{self, context};
 use carrick_guest_arch::MmuBackend;
 use carrick_sched_core::SlotId;
@@ -70,34 +71,14 @@ pub fn schedule(slot: SlotId) -> ! {
                 leave_space(source);
             }
             // A raised Gate (the host's exclusion of this MM) refuses the
-            // install: this is "not now". Enrol on the Gate's release, probe
-            // once, and either park the record or rerun the install.
-            let mut metadata_consumed = false;
+            // install: this is "not now". The record's wait is already over,
+            // so it parks on the Gate's release keeping everything it resumes
+            // with, and its next switch-in resumes as this one would have.
             while source.zone.install_space(slot, mm_raw).is_none() {
-                if source.zone.spaces.find(mm_raw).is_none() {
-                    fatal_boot();
-                }
-                match park_on_gate(
-                    source,
-                    current,
-                    slot,
-                    selected,
-                    mm_raw,
-                    metadata_consumed,
-                    &mut state.words,
-                ) {
-                    GatePark::Parked => continue 'schedule,
-                    GatePark::Rerun { metadata } => metadata_consumed |= metadata,
-                    GatePark::Held => {
-                        // An adapter or edit operation is pending: its wait
-                        // state cannot ride an object park unchanged, so the
-                        // record goes back to its queue as it is (#2660).
-                        if !source.zone.unswitch(slot, selected.record) {
-                            fatal_boot();
-                        }
-                        core::hint::spin_loop();
-                        continue 'schedule;
-                    }
+                match park_on_gate(source, slot, selected.record, mm_raw) {
+                    RetainedDeferral::Parked => continue 'schedule,
+                    RetainedDeferral::Rerun => {}
+                    RetainedDeferral::Refused => fatal_boot(),
                 }
             }
             settle_current_work(current);
@@ -219,10 +200,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                 state = replaced;
                             }
                             Some(_) => {
-                                if !metadata_resume
-                                    && !metadata_consumed
-                                    && let Some(result) = selected.result
-                                {
+                                if !metadata_resume && let Some(result) = selected.result {
                                     words.set_syscall_return(result);
                                 }
                             }
@@ -433,49 +411,37 @@ fn ticks(backend: &mut x86::X86Backend, ns: u64) -> u64 {
     u64::try_from(u128::from(hz) * u128::from(ns) / 1_000_000_000).unwrap_or(u64::MAX)
 }
 
-/// What a switched-in record does when its MM's Gate refuses the install.
-enum GatePark {
-    /// The record waits on the Gate's release; this CPU schedules again.
-    Parked,
-    /// The release raced the enrolment: install again. `metadata` records a
-    /// consumed metadata wait, whose resume must keep the context's RAX.
-    Rerun { metadata: bool },
-    /// A pending adapter or edit operation cannot ride an object park.
-    Held,
-}
-
-/// Park a switched-in record on its MM's Gate release. Its pending wake rides
-/// in the parked context: a metadata wait is consumed (the saved context is
-/// its replay), and a wake result is folded into the return word, which the
-/// Gate park's metadata resume leaves untouched.
+/// Park the record switched in on `slot` on its MM's Gate release. Only a
+/// raised gate refuses a published entry's install; any other refusal (a
+/// closed, re-keyed or rootless entry) is a broken invariant.
 #[inline(never)]
 fn park_on_gate(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
-    current: &'static carrick_el1_abi::CurrentTask,
     slot: SlotId,
-    selected: carrick_sched_core::SwitchedIn,
+    record: carrick_sched_core::RecordId,
     mm: u64,
-    metadata_consumed: bool,
-    words: &mut carrick_sched_core::ParkedContextWords,
-) -> GatePark {
-    let rec = source.zone.record(selected.record);
-    // SAFETY: switch_in_full gave this slot exclusive ownership of the record.
-    let metadata = metadata_consumed || unsafe { rec.consume_metadata_operation() };
-    if !metadata && rec.has_object_operation() {
-        return GatePark::Held;
+) -> RetainedDeferral {
+    let zone = source.zone;
+    let Some(index) = zone.spaces.find(mm) else {
+        fatal_boot();
+    };
+    let gate_raised = || zone.spaces.gate(index) != 0;
+    if !gate_raised() && zone.spaces.installed_grant(index, mm).is_none() {
+        fatal_boot();
     }
-    if !metadata && let Some(result) = selected.result {
-        words.set_syscall_return(result);
-    }
-    current.mm.key.store(mm, Ordering::Release);
-    match crate::anonymous::park_contended_fault(
-        current,
+    let Some(lease) = core::num::NonZeroU64::new(mm)
+        .and_then(|key| zone.space_entry(key))
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        fatal_boot();
+    };
+    carrick_core::wait::defer_switched_in_record(
+        zone,
         slot,
+        &lease,
         carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
-        words,
-    ) {
-        crate::anonymous::ContendedFault::Parked => GatePark::Parked,
-        crate::anonymous::ContendedFault::Rerun => GatePark::Rerun { metadata },
-        crate::anonymous::ContendedFault::Refused => fatal_boot(),
-    }
+        record,
+        &|effects| native_process::release(zone, carrick_sched_core::Waker::El1 { slot }, effects),
+        gate_raised,
+    )
 }
