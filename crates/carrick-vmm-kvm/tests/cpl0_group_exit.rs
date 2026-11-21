@@ -29,8 +29,40 @@ fn group_exit_with_status(flags: &[&str], test: &str, expected: i32) {
         );
         return;
     }
-    let elf = kvm_pool_fixture::assemble_fixture("native_group_exit.S", flags);
-    let outcome = kvm_pool_fixture::run_pool_fixture(&elf, 256);
+    // An exec variant runs its successor from a host path; it is built from
+    // the same source, with the parent's flags, as the group's process.
+    let directory = tempfile::tempdir().expect("successor directory");
+    let mut flags = flags.to_vec();
+    let define;
+    if flags.contains(&"-DEXEC_SUCCESSOR") {
+        let successor = directory.path().join("successor");
+        let successor_flags: Vec<&str> = flags
+            .iter()
+            .copied()
+            .filter(|flag| *flag != "-DEXEC_SUCCESSOR")
+            .chain(["-DSUCCESSOR"])
+            .collect();
+        let image = kvm_pool_fixture::assemble_fixture("native_group_exit.S", &successor_flags);
+        carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+        define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+        flags.push(&define);
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_group_exit.S", &flags);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        256,
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("production CPL0 group exit");
     assert_eq!(
         outcome.run.exit_code, expected,
         "the group must end with its exact status"
@@ -84,6 +116,46 @@ fn root_leader_abort_ends_run_with_sigabrt_status() {
     group_exit_with_status(
         &["-DABORT_SIGNAL", "-DROOT_ABORT"],
         "root_leader_abort_ends_run_with_sigabrt_status",
+        128 + 6,
+    );
+}
+
+/// #2620 (npm after a V8 fatal): the exec'd fork child's leader aborts while
+/// one worker is parked in `epoll_pwait(-1)` on a ring epoll and another in a
+/// futex wait. The close interrupts the epoll park; the worker must retire,
+/// not replay its wait, so the parent's wait4 sees SIGABRT.
+#[test]
+fn exec_child_abort_retires_epoll_and_futex_workers() {
+    group_exit(
+        &["-DEPOLL_WORKER", "-DABORT_SIGNAL", "-DEXEC_SUCCESSOR"],
+        "exec_child_abort_retires_epoll_and_futex_workers",
+    );
+}
+
+/// #2620: the same exec'd group ended by its leader's `exit_group(5)`.
+#[test]
+fn exec_child_exit_group_retires_epoll_and_futex_workers() {
+    group_exit(
+        &["-DEPOLL_WORKER", "-DEXEC_SUCCESSOR"],
+        "exec_child_exit_group_retires_epoll_and_futex_workers",
+    );
+}
+
+/// #2620 without exec: the fork child itself aborts with the same members.
+#[test]
+fn fork_child_abort_retires_epoll_and_futex_workers() {
+    group_exit(
+        &["-DEPOLL_WORKER", "-DABORT_SIGNAL"],
+        "fork_child_abort_retires_epoll_and_futex_workers",
+    );
+}
+
+/// #2620 as the run's root: the run ends with 128 + SIGABRT.
+#[test]
+fn root_abort_retires_epoll_and_futex_workers() {
+    group_exit_with_status(
+        &["-DEPOLL_WORKER", "-DABORT_SIGNAL", "-DROOT_ABORT"],
+        "root_abort_retires_epoll_and_futex_workers",
         128 + 6,
     );
 }
