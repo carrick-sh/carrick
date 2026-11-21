@@ -109,6 +109,29 @@ pub fn native_entropy_stage(
     (args.address, capacity, args.flags, args.length)
 }
 
+/// Who settles a closing member's installed IPC adapter operation (#2620).
+/// The member's own owner entry settles an object park and retires; it
+/// never replays the parked call. A retained service settles its adapter at
+/// its own service checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosingAdapterOwner {
+    /// No adapter operation is installed.
+    None,
+    /// An in-ring object park (a ring `epoll_pwait`, pipe or eventfd wait)
+    /// woken or interrupted by the close; the entry cancels the operation.
+    ObjectPark,
+    /// A retained service holds the operation and owns its settlement.
+    RetainedService,
+}
+
+impl ClosingAdapterOwner {
+    /// Whether the member retires at this owner entry rather than running
+    /// its saved call again.
+    const fn retires_at_owner_entry(self) -> bool {
+        matches!(self, Self::None | Self::ObjectPark)
+    }
+}
+
 /// Outcome of re-entering the shared process owner after an ISA switches in
 /// a record with retained lifecycle work.
 pub enum NativeResume {
@@ -7216,12 +7239,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
         );
         // Process close requests every member's exit. A ring-born member
-        // that was runnable (queued, not parked in a wait) has no host
-        // thread to honour that request: its next selection is the only
-        // point that can retire it, so it must not return to EL0.
+        // that was runnable (queued, not parked in a wait), or that the close
+        // interrupted out of an in-ring object park, has no host thread to
+        // honour that request: its next selection is the only point that can
+        // retire it, so it must not return to EL0 or replay its wait.
         let member_exit = if owner_exit.is_none()
             && (continuation
-                || (self.control.host_exit_requested() && !record.has_adapter_operation()))
+                || (self.control.host_exit_requested()
+                    && self.closing_adapter_owner().retires_at_owner_entry()))
         {
             self.pending_close_status()
         } else {
@@ -7258,6 +7283,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Their owned operation, rather than a readiness scalar or a new
         // dispatch, decides completion below.
         self.resume_pending_wait()
+    }
+
+    /// Who settles this member's installed IPC adapter operation, if any,
+    /// when its process closes.
+    fn closing_adapter_owner(&self) -> ClosingAdapterOwner {
+        if !self
+            .source
+            .zone
+            .record(self.record.id)
+            .has_adapter_operation()
+        {
+            ClosingAdapterOwner::None
+        } else if self.runtime.graph.lock().has_member_wait(&self.record) {
+            ClosingAdapterOwner::RetainedService
+        } else {
+            ClosingAdapterOwner::ObjectPark
+        }
     }
 
     /// A running member reaches the same terminal owner at its interrupted
