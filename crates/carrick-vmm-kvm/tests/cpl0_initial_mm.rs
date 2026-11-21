@@ -6722,3 +6722,13 @@ fn production_mprotect_refused_on_its_second_run_restores_the_first() {
         "the second run's refused step is the one leave: {leaves:?}"
     );
 }
+
+#[test]
+fn zz_probe() {
+    for case in [94, 95] {
+        let flag = format!("-DCASE={case}");
+        let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&flag]);
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED);
+        eprintln!("PROBE {case} = {:?}", outcome.map(|o| o.run.exit_code).map_err(|e| format!("{e:?}").chars().take(160).collect::<String>()));
+    }
+}

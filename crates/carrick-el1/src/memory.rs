@@ -1538,14 +1538,17 @@ fn serve_delegated_anonymous_for_origin<
         carrick_guest_arch::UserVa::new(va),
         carrick_guest_arch::GuestLen::new(len),
     );
-    // One editor call is one all-or-nothing step: a range whose backing is
-    // split into several runs by holes goes to the host.
+    use carrick_el1_abi::ReservationOperation::{Decommit, Prepare, Protect, Retire};
+    // One editor call is one all-or-nothing step over one backed run. A
+    // permission step covers every run of its range under this one proposal
+    // (`protect_backed_runs`, all or nothing); any other range whose backing
+    // is split into several runs by holes goes to the host.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
+        [(start, _), .., (_, end)] if request.operation == Protect => Some((*start, *end - *start)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
-    use carrick_el1_abi::ReservationOperation::{Decommit, Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no
@@ -1587,8 +1590,8 @@ fn serve_delegated_anonymous_for_origin<
         (_, RangeBacking::Empty, _) | (_, _, None) => None,
         // The permission editor is the descriptor step of an mprotect and
         // of a stock adoption alike (prepared leaves stay invalid).
-        (Protect, RangeBacking::Private | RangeBacking::Prepared, Some((start, run_len)))
-        | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
+        (Protect, RangeBacking::Private | RangeBacking::Prepared, Some(_))
+        | (Prepare, RangeBacking::Prepared, Some(_))
             if request.operation == Protect || adopts_stock =>
         {
             let ceiling = if request.operation == Protect {
@@ -1603,22 +1606,15 @@ fn serve_delegated_anonymous_for_origin<
             } else {
                 None
             };
-            let edit = GuestPermissionEdit {
-                va: start,
-                len: run_len,
-                readable: request.protection.bits() & PROT_READ != 0,
-                writable: request.protection.bits() & PROT_WRITE != 0,
-                executable: request.protection.bits() & PROT_EXEC != 0,
-                ceiling,
-            };
-            match editor.protect_and_invalidate(
+            match protect_backed_runs(
+                editor,
+                &mut model,
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
-                edit,
+                backing.runs(),
+                request.protection,
+                ceiling,
             ) {
                 Ok(()) => None,
-                Err(GuestPermissionEditError::RollbackFailed) => {
-                    panic!("EL1 anonymous permission rollback failed")
-                }
                 Err(_) => return refuse(pending, &mut model, Leave::EditRefused),
             }
         }
@@ -1694,6 +1690,71 @@ fn serve_delegated_anonymous_for_origin<
         }
         Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),
     }
+}
+
+/// The permission step of one proposal over every backed run of its range,
+/// all or nothing. Each run is one editor step; pages between runs have no
+/// terminal and take the root's protection on first touch. When a run's step
+/// refuses, the runs already edited are set back to the protection the root
+/// still records for them (the proposal is not committed), so the refusal
+/// leaves every leaf's guest-visible permission as it was. A restore the
+/// editor refuses is a broken invariant: those leaves were edited under the
+/// same exclusive editor a moment before.
+fn protect_backed_runs<E: AnonymousPermissionEditor + ?Sized, G: ReservationGeometry, C>(
+    editor: &mut E,
+    model: &mut ReservationModel<'_, G, C>,
+    ttbr0: carrick_guest_arch::AddressSpaceRegister,
+    runs: &[(u64, u64)],
+    protection: carrick_el1_abi::ReservationProtection,
+    ceiling: Option<GuestPermissionCeiling>,
+) -> Result<(), GuestPermissionEditError>
+where
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+{
+    let edit = |va: u64, end: u64, protection: carrick_el1_abi::ReservationProtection| {
+        GuestPermissionEdit {
+            va,
+            len: end - va,
+            readable: protection.bits() & PROT_READ != 0,
+            writable: protection.bits() & PROT_WRITE != 0,
+            executable: protection.bits() & PROT_EXEC != 0,
+            ceiling,
+        }
+    };
+    for (done, &(start, end)) in runs.iter().enumerate() {
+        match editor.protect_and_invalidate(ttbr0, edit(start, end, protection)) {
+            Ok(()) => {}
+            Err(GuestPermissionEditError::RollbackFailed) => {
+                panic!("EL1 anonymous permission rollback failed")
+            }
+            Err(refusal) => {
+                for &(start, end) in &runs[..done] {
+                    let restored =
+                        carrick_el1_abi::ReservationRange::new(start, end).is_some_and(|range| {
+                            let mut restored = true;
+                            model
+                                .observe_range(range, &mut |mapping| {
+                                    let va = mapping.range.start().max(start);
+                                    let end = mapping.range.end().min(end);
+                                    restored &= editor
+                                        .protect_and_invalidate(
+                                            ttbr0,
+                                            edit(va, end, mapping.protection),
+                                        )
+                                        .is_ok();
+                                })
+                                .is_ok()
+                                && restored
+                        });
+                    if !restored {
+                        panic!("EL1 anonymous multi-run permission restore failed")
+                    }
+                }
+                return Err(refusal);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The admitted root that owns syscall `nr` when it is a delegated MM's

@@ -358,6 +358,36 @@ refusal_unconsumed:
     lea 0x8000(%r15), %r14
     call *%r14
     jmp done
+#elif CASE == 95
+    MMAP $0x2000, $3, $0x22
+    movb $1, (%r15)
+    MPROTECT %r15, $0x1000, $1
+    EXPECT_FAULT 0x0000, 1
+    movb $1, 0x1000(%r15)
+    jmp done
+#elif CASE == 94
+    MMAP $0x2000, $3, $0x22
+    movb $1, (%r15)
+    MPROTECT %r15, $0x1000, $1
+    EXPECT_FAULT 0x0000, 1
+    jmp done
+#elif CASE == 98
+    TWO_RUNS
+    lea 0x2000(%r15), %r14
+    MPROTECT %r14, $0x1000, $3
+    movb $1, 0x2000(%r15)
+    jmp done
+#elif CASE == 97
+    TWO_RUNS
+    MPROTECT %r15, $0x6000, $3
+    movb $1, 0x2000(%r15)
+    jmp done
+#elif CASE == 96
+    TWO_RUNS
+    lea 0x2000(%r15), %r14
+    MPROTECT %r14, $0x1000, $1
+    movb 0x2000(%r15), %al
+    jmp done
 #else
 #error CASE
 #endif
