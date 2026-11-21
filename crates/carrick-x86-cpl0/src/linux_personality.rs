@@ -734,9 +734,6 @@ fn park_owner_waiting_user_fault(
     wait: carrick_el1_abi::PortalOwnerWait,
 ) -> u64 {
     use carrick_el1::isa::x86::context;
-    if !native_process::is_admitted() {
-        return 9;
-    }
     let Some(address) =
         carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
             .and_then(anonymous::live_words)
@@ -760,6 +757,16 @@ fn park_owner_waiting_user_fault(
     });
     let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
     drop(native);
+    if !native_process::is_admitted()
+        && native_process::admit_root(
+            *saved,
+            carrick_x86_carrier::native_execution::source(prep.slot),
+            carrick_x86_carrier::native_execution::task(),
+        )
+        .is_err()
+    {
+        return 9;
+    }
     match anonymous::park_owner_fault_wait(prep.task, prep.slot, wait, &saved) {
         anonymous::ContendedFault::Parked => {
             drop(saved);
@@ -778,9 +785,6 @@ fn park_contended_user_fault(
     cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
 ) -> u64 {
     use carrick_el1::isa::x86::context;
-    if !native_process::is_admitted() {
-        return 9;
-    }
     let Some(address) =
         carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
             .and_then(anonymous::live_words)
@@ -804,6 +808,16 @@ fn park_contended_user_fault(
     });
     let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
     drop(native);
+    if !native_process::is_admitted()
+        && native_process::admit_root(
+            *saved,
+            carrick_x86_carrier::native_execution::source(prep.slot),
+            carrick_x86_carrier::native_execution::task(),
+        )
+        .is_err()
+    {
+        return 9;
+    }
     match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
         anonymous::ContendedFault::Parked => {
             drop(saved);
@@ -887,7 +901,8 @@ fn native_exec_call(
                     CompletionRoute::Served
                 }
                 UserFaultSupply::MmRelease(cause) => {
-                    match anonymous::park_contended_fault(task, slot, cause, saved) {
+                    let restart = boxed_restarted_syscall_context(saved, ordinal);
+                    match anonymous::park_contended_fault(task, slot, cause, &restart) {
                         anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
                         anonymous::ContendedFault::Rerun => {
                             restart_native_syscall(frame, ordinal);
@@ -897,7 +912,8 @@ fn native_exec_call(
                     }
                 }
                 UserFaultSupply::TypedRelease(wait) => {
-                    match anonymous::park_owner_fault_wait(task, slot, wait, saved) {
+                    let restart = boxed_restarted_syscall_context(saved, ordinal);
+                    match anonymous::park_owner_fault_wait(task, slot, wait, &restart) {
                         anonymous::ContendedFault::Parked => CompletionRoute::Suspended,
                         anonymous::ContendedFault::Rerun => {
                             restart_native_syscall(frame, ordinal);
@@ -943,6 +959,20 @@ fn native_exec_call(
 struct NativeExecResume<'a> {
     ordinal: carrick_guest_arch::NativeOrdinal,
     saved: &'a carrick_sched_core::ParkedContextWords,
+}
+
+/// Box a copy of a syscall's saved context rewound to re-execute `SYSCALL`
+/// with `ordinal` in RAX, keeping `ParkedContextWords` off the CPL0 stack.
+#[inline(never)]
+fn boxed_restarted_syscall_context(
+    saved: &carrick_sched_core::ParkedContextWords,
+    ordinal: carrick_guest_arch::NativeOrdinal,
+) -> rust_alloc::boxed::Box<carrick_sched_core::ParkedContextWords> {
+    use carrick_guest_arch::ProcessContext;
+    let mut restart = rust_alloc::boxed::Box::new(*saved);
+    restart.restart_syscall();
+    restart.set_syscall_return(ordinal.raw());
+    restart
 }
 
 /// How this entry completes a call whose shared service began inline.
@@ -1031,10 +1061,10 @@ fn supply_user_fault(
     let counters = prep.counters;
     let slot = prep.slot;
     let mm_key = task.mm.key.load(Ordering::Acquire);
-    let Some(words) = anonymous::live_words(match carrick_el1_abi::ReservationMm::new(mm_key) {
-        Some(mm) => mm,
-        None => return UserFaultSupply::Unresolved(9),
-    }) else {
+    let Some(reservation_mm) = carrick_el1_abi::ReservationMm::new(mm_key) else {
+        return UserFaultSupply::Unresolved(9);
+    };
+    let Some(words) = anonymous::live_words(reservation_mm) else {
         return UserFaultSupply::Unresolved(9);
     };
     let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
@@ -1057,7 +1087,11 @@ fn supply_user_fault(
         unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
     let roots = carrick_el1::memory::reservations::shared_x86_cpl0_guest();
     let spaces = carrick_core::wait::space_access(zone, slot, native_process::release);
-    let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
+    let handle = native_process::admitted_fault_mm_handle(zone, slot, task, reservation_mm);
+    let supply = match handle {
+        Some(handle) => carrick_el1::fault::OwnerFaultSupply::new(portal).with_handle(handle),
+        None => carrick_el1::fault::OwnerFaultSupply::new(portal),
+    };
     let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else {
         return UserFaultSupply::Unresolved(9);
     };
@@ -1115,7 +1149,12 @@ fn supply_user_fault(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
-            let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
+            let supply = match handle {
+                Some(handle) => {
+                    carrick_el1::fault::OwnerFaultSupply::new(portal).with_handle(handle)
+                }
+                None => carrick_el1::fault::OwnerFaultSupply::new(portal),
+            };
             let mut cow = carrick_el1_linux::cow_resolver::X86CowResolver {
                 words: &words,
                 pool: cow_pool,
@@ -1138,7 +1177,19 @@ fn supply_user_fault(
                 &mut cow,
             );
             if result != Action::Served || cow.completion.is_none() {
-                return UserFaultSupply::Unresolved(9);
+                return match supply.outcome() {
+                    OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
+                        signum: LINUX_SIGSEGV,
+                        code: if fault.present {
+                            LINUX_SEGV_ACCERR
+                        } else {
+                            LINUX_SEGV_MAPERR
+                        },
+                        address: fault.address,
+                    },
+                    OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
+                    _ => UserFaultSupply::Unresolved(9),
+                };
             }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_settle();
@@ -1704,7 +1755,11 @@ impl Personality for LinuxPersonality {
                             // access (no reservation names it): never a
                             // carrier abort.
                             UserFaultSupply::MmRelease(cause) => {
-                                match anonymous::park_contended_fault(task, slot, cause, &words) {
+                                let restart = boxed_restarted_syscall_context(
+                                    &words,
+                                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                                );
+                                match anonymous::park_contended_fault(task, slot, cause, &restart) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
                                     anonymous::ContendedFault::Refused => fatal_boot(),
@@ -1712,7 +1767,11 @@ impl Personality for LinuxPersonality {
                                 None
                             }
                             UserFaultSupply::TypedRelease(wait) => {
-                                match anonymous::park_owner_fault_wait(task, slot, wait, &words) {
+                                let restart = boxed_restarted_syscall_context(
+                                    &words,
+                                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                                );
+                                match anonymous::park_owner_fault_wait(task, slot, wait, &restart) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
                                     anonymous::ContendedFault::Refused => fatal_boot(),
