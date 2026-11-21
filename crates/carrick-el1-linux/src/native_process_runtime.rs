@@ -4948,6 +4948,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let task = graph.owner.task(key).ok()?;
         Some((task.leader_credentials().ok()?.clone(), task.umask))
     }
+    /// The host set pin (#2621) a thread of task `key` retains, if any.
+    #[cfg(test)]
+    pub(crate) fn host_select_set_of_for_test(
+        &self,
+        key: TaskKey,
+    ) -> Option<carrick_el1_abi::ipc::RawOfdPin> {
+        let graph = self.graph.lock();
+        let task = graph.owner.task(key).ok()?;
+        task.native()
+            .resources()
+            .host_select_sets
+            .values()
+            .next()
+            .copied()
+    }
     /// Apply `update` to the leader credentials of the root's child
     /// `visible`, as its own `setresuid`/`setresgid` would.
     #[cfg(test)]

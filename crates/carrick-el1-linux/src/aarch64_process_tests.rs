@@ -18056,6 +18056,17 @@ const ARM_LEAVE_ON_PARK: u64 = u64::MAX - 2;
 #[cfg(test)]
 const ARM_SIBLING_DUP2: u64 = u64::MAX - 3;
 
+/// [`with_arm_process_host_dispatch`]'s pseudo call: the object handle
+/// word of child `a0`'s host set (#2621), or -1 while it has none.
+#[cfg(test)]
+const ARM_HOST_SET: u64 = u64::MAX - 4;
+
+/// [`with_arm_process_host_dispatch`]'s pseudo call: once the carrier
+/// drained the descriptions the ring retired, the items of the epoll whose
+/// handle word is `a0`, or -ESTALE once it is gone.
+#[cfg(test)]
+const ARM_EPOLL_ITEMS: u64 = u64::MAX - 5;
+
 /// [`with_arm_process_host_dispatch`]'s answer for a forwarded call the
 /// host would block in (`DispatchOutcome::WaitOnFds`): the harness has no
 /// carrier waiter to run it.
@@ -18258,6 +18269,43 @@ fn with_arm_process_host_files_on<R>(
         if nr == ARM_LEAVE_ON_PARK {
             leave_on_park = true;
             return (CompletionRoute::Served, 0);
+        }
+        if nr == ARM_HOST_SET {
+            let runtime: &std::sync::Arc<NativeProcessRuntime<'_, _, _>> = runtime
+                .as_ref()
+                .expect("a child exists only after the root's clone");
+            let key = resolve_child(runtime, args[0] as u32);
+            let Some(pin) = runtime.host_select_set_of_for_test(key) else {
+                return (CompletionRoute::Served, -1);
+            };
+            let pin = carrick_el1_abi::ipc::fd::OfdPin::from_raw(pin);
+            let description = owner
+                .region()
+                .fd(carrick_sched_core::ShortLockSpin)
+                .pinned(&pin)
+                .expect("a retained host set");
+            let _ = pin.into_raw();
+            let Some(carrick_el1_abi::ipc::IpcBacking::Epoll { object }) =
+                carrick_el1_abi::ipc::IpcBacking::decode(description.backing)
+            else {
+                panic!("a host set is an epoll");
+            };
+            return (CompletionRoute::Served, object.to_word() as i64);
+        }
+        if nr == ARM_EPOLL_ITEMS {
+            owner.drain_retired_ofds().expect("carrier drain");
+            let object = carrick_el1_abi::ipc::IpcObjectHandle::from_word(args[0]);
+            return (
+                CompletionRoute::Served,
+                match owner
+                    .region()
+                    .epoll_zone_items(object, &carrick_sched_core::ShortLockSpin)
+                {
+                    Ok(items) => i64::from(items),
+                    Err(carrick_el1_abi::ipc::IpcError::Stale) => -116,
+                    Err(error) => panic!("epoll items: {error:?}"),
+                },
+            );
         }
         if nr == ARM_SIBLING_DUP2 {
             let ArmCaller::Child(pid) = caller else {
@@ -19219,6 +19267,158 @@ fn serial_host_native_child_pselect6_mixes_a_zone_pipe_and_a_host_socket() {
         assert_eq!(single.1, 1, "host socket connect wait: {single:?}");
         assert_ne!(single.0, CompletionRoute::Forward);
         assert_eq!(write_set.as_bytes(), &bit(socket));
+    });
+}
+
+/// #2621: a fork child's select set with host members of every kind the
+/// ruling names. A regular file is always readable and writable; a
+/// directory (a host kind no host set holds) leaves the WHOLE call a
+/// counted ENOSYS even with a ready pipe beside it, never a partial
+/// answer; each host member is enrolled once in the thread's host set, and
+/// a member's last close retires its item (no stale registration), so a
+/// new socket at the same number enrols afresh.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pselect6_host_set_members() {
+    use carrick_abi::{
+        LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_RDWR,
+        LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM,
+    };
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp peer");
+    let port = listener.local_addr().expect("tcp peer address").port();
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::new().expect("host-file fixture scratch"),
+    ));
+    with_arm_process_host_files_on(dispatcher, |call, _| {
+        let (_, pid) = call(ArmCaller::Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(pid > 0);
+        let child = ArmCaller::Child(pid as u32);
+        call(child, ARM_RESUME, [0; 6]);
+        let fds = GuestUserBuffer::zeroed(8);
+        assert_eq!(
+            call(child, sys::PIPE2.raw(), [fds.arg(), 0, 0, 0, 0, 0]).1,
+            0
+        );
+        let [reader, writer] = fd_pair_of(&fds);
+        let path = GuestUserBuffer::from_bytes(b"/host-set-member\0");
+        let (_, file) = call(
+            child,
+            sys::OPENAT.raw(),
+            [
+                LINUX_AT_FDCWD,
+                path.arg(),
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o600,
+                0,
+                0,
+            ],
+        );
+        assert!(file >= 0, "child file: {file}");
+        let file = file as u64;
+        let root_dir = GuestUserBuffer::from_bytes(b"/\0");
+        let (_, dir) = call(
+            child,
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, root_dir.arg(), LINUX_O_DIRECTORY, 0, 0, 0],
+        );
+        assert!(dir >= 0, "child directory: {dir}");
+        let dir = dir as u64;
+        let connect = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64)| {
+            let (_, socket) = call(
+                child,
+                sys::SOCKET.raw(),
+                [
+                    LINUX_AF_INET as u64,
+                    (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert!(socket >= 0, "child socket: {socket}");
+            let mut address = [0u8; 16];
+            address[..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+            address[2..4].copy_from_slice(&port.to_be_bytes());
+            address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            let address = GuestUserBuffer::from_bytes(&address);
+            let (_, connected) = call(
+                child,
+                sys::CONNECT.raw(),
+                [socket as u64, address.arg(), 16, 0, 0, 0],
+            );
+            assert!(connected == 0 || connected == -115, "connect: {connected}");
+            socket as u64
+        };
+        let socket = connect(call);
+        let _peer = listener.accept().expect("guest connect");
+        let bits = |fds: &[u64]| {
+            fds.iter()
+                .fold(0u64, |bits, fd| bits | 1 << fd)
+                .to_ne_bytes()
+        };
+        let select = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64),
+                      read: &[u64],
+                      write: &[u64]| {
+            let nfds = read.iter().chain(write).max().unwrap() + 1;
+            let read_set = GuestUserBuffer::from_bytes(&bits(read));
+            let write_set = GuestUserBuffer::from_bytes(&bits(write));
+            let timeout = GuestUserBuffer::from_value([5u64, 0]);
+            let (route, result) = call(
+                child,
+                sys::PSELECT6.raw(),
+                [nfds, read_set.arg(), write_set.arg(), 0, timeout.arg(), 0],
+            );
+            (
+                route,
+                result,
+                u64::from_ne_bytes(read_set.as_bytes().try_into().unwrap()),
+                u64::from_ne_bytes(write_set.as_bytes().try_into().unwrap()),
+            )
+        };
+
+        // A regular file is always readable and writable.
+        let (route, result, read, write) = select(call, &[reader, file], &[file]);
+        assert_ne!(route, CompletionRoute::Forward);
+        assert_eq!((result, read, write), (2, 1 << file, 1 << file));
+        let host_set = call(child, ARM_HOST_SET, [pid as u64, 0, 0, 0, 0, 0]).1;
+        assert!(host_set >= 0, "the child retains a host set");
+        let items = |call: &mut dyn FnMut(ArmCaller, u64, [u64; 6]) -> (CompletionRoute, i64)| {
+            call(child, ARM_EPOLL_ITEMS, [host_set as u64, 0, 0, 0, 0, 0]).1
+        };
+        assert_eq!(items(call), 1, "the file, enrolled once");
+
+        // A directory is no host set member: with the pipe readable, the
+        // whole call is still the counted refusal.
+        let byte = GuestUserBuffer::from_bytes(b"x");
+        assert_eq!(
+            call(child, sys::WRITE.raw(), [writer, byte.arg(), 1, 0, 0, 0]).1,
+            1
+        );
+        let (_, result, _, _) = select(call, &[reader, dir], &[]);
+        assert_eq!(result, -38, "never a partial answer");
+        let (_, result, read, write) = select(call, &[reader], &[socket]);
+        assert_eq!((result, read, write), (2, 1 << reader, 1 << socket));
+        assert_eq!(items(call), 2, "the file and the socket");
+
+        // A member's last close retires its item.
+        assert_eq!(call(child, sys::CLOSE.raw(), [socket, 0, 0, 0, 0, 0]).1, 0);
+        assert_eq!(items(call), 1, "the closed socket left no registration");
+
+        // A new socket at the same number is a new open file: enrolled afresh.
+        let again = connect(call);
+        assert_eq!(again, socket, "the lowest free number");
+        let _again_peer = listener.accept().expect("guest reconnect");
+        let (_, result, _, write) = select(call, &[], &[again]);
+        assert_eq!((result, write), (1, 1 << again));
+        assert_eq!(items(call), 2, "the file and the new socket");
+        assert_eq!(call(child, sys::CLOSE.raw(), [file, 0, 0, 0, 0, 0]).1, 0);
+        assert_eq!(call(child, sys::CLOSE.raw(), [again, 0, 0, 0, 0, 0]).1, 0);
+        assert_eq!(items(call), 0, "the closed members left no registration");
     });
 }
 

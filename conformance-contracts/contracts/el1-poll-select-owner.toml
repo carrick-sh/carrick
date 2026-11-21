@@ -9,6 +9,11 @@
 # #2621: select/pselect6 over several zone descriptors is a client of the
 # zone epoll owner (a transient epoll the operation pins); the multi-fd
 # witnesses are bound below. Guest semantics and budgets are unchanged.
+# #2621 (#2730): a fork child's select set with HOST members (sockets,
+# regular files; a single host descriptor too) reads their levels from the
+# thread's host set, nested in the transient set; any other host kind
+# leaves the whole call a counted ENOSYS. Witnesses bound below; budgets
+# are unchanged.
 schema_version = 1
 id = "kernel.el1.poll-select-owner"
 title = "One readiness owner for zone and mixed waitsets"
@@ -38,6 +43,10 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_pselect6_multi_fd_wakes_on_one_parent_pipe (#2621 apt shape: nfds 9, two read pipes and one write pipe through the transient epoll; immediate, zero timeout, a park ended by the parent's write to ONE read pipe or its drain of the write pipe, and a masked signal)",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_arm_pselect6_set_host_settlement (a parked set settled by the host through the same epoll harvest: timeout, signal, stop that keeps the wait, stop after EOF)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_trap_frame_ppoll_retains_completed_output_across_owner_wait,poll_revents_crossing_a_page_retains_partial_copy_and_fault}",
+  "carrick-el1-abi::ipc::epoll::tests::{a_host_set_member_reads_its_level_from_the_host_set,a_host_set_edge_wakes_its_nest_parent_once_per_edge} (#2621: a host member's level is its host set's; a host edge wakes the nest parent once per edge; no stale level)",
+  "carrick-el1-linux::ipc::tests::pselect6_host_set_busy_once_then_answers (#2621: enrol once, then a carrier-held host set is not now: park on the lock's release, rerun, answer; never forwarded)",
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_child_pselect6_mixes_a_zone_pipe_and_a_host_socket,serial_host_native_child_pselect6_host_set_members} (#2621 native ARM entry: pipe + socket, the connect wait on one socket, a regular file, a directory refused for the whole call, and close-while-member retirement)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{exit_group_releases_each_threads_host_set_once,exec_releases_each_threads_host_set_once} (#2621: the host set is owned by the task lifecycle)",
 ]
 
 embed = [
@@ -45,6 +54,8 @@ embed = [
   "carrick-vmm-kvm::cpl0_shared_entry::native_child_select_timeval_wakes_on_sibling_pipe_write (x86 select timeval normalization, invalid negative fraction, and remaining-time copyout)",
   "carrick-vmm-kvm::cpl0_shared_entry::{native_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_wakes_on_exec_successor_write,native_exec_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends,native_two_children_pselect6_release_default_pool_capacity}",
   "carrick-vmm-kvm::cpl0_initial_mm::native_child_pselect6_wakes_on_sibling_pipe_write (production CPL0 guest; a ready pipe and a parked pselect6 on that same pipe; the sibling writes only after the test has observed enrollment)",
+  "carrick-vmm-kvm::cpl0_shared_entry::{native_child_pselect6_mixed_set_reports_a_connected_host_socket,native_child_pselect6_single_host_socket_connect_wait,native_child_pselect6_mixed_set_reports_a_host_regular_file} (#2621 x86: apt's connect wait, its pipe + socket set and its download-target file)",
+  "carrick-vmm-kvm::cpl0_shared_entry::{native_child_pselect6_mixed_set_wakes_on_a_delayed_connect,native_child_pselect6_mixed_set_wakes_on_host_socket_data,native_child_pselect6_mixed_set_wakes_on_the_zone_pipe,native_child_pselect6_mixed_set_times_out} (#2621 x86: a parked pipe + socket set woken by a host edge or the live parent's write, or its deadline)",
 ]
 
 [bindings.unresolved]
