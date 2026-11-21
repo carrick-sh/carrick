@@ -57,6 +57,8 @@ const NR_SETITIMER: u64 = 103;
 const NR_CLOCK_GETTIME: u64 = 113;
 const NR_TKILL: u64 = 130;
 const NR_RT_SIGACTION: u64 = 134;
+const NR_SHMGET: u64 = 194;
+const NR_SHMAT: u64 = 196;
 const NR_BRK: u64 = 214;
 const NR_MUNMAP: u64 = 215;
 const NR_MMAP: u64 = 222;
@@ -329,8 +331,9 @@ impl ScriptedHvc2Executor {
                     [obs.opened_fd, DATA_VA + READ_BUF_OFFSET, 64, 0, 0, 0],
                 );
             }
-            // 12: file-backed mmap(0, 0x1000, PROT_READ, MAP_SHARED, fd, 0) -> MapHostAlias
-            // (a low-VA `MAP_PRIVATE` file mapping is served by copy, not an alias)
+            // 12: file-backed mmap(0, 0x1000, PROT_READ, MAP_SHARED, fd, 0): a
+            // MapHostAlias where the host can alias a read-only fd (Linux), a
+            // copy where it cannot (Darwin)
             12 => {
                 if x0 != FILE_PAYLOAD.len() as u64 {
                     return Err(format!("read(/hello.txt) returned {}", x0 as i64));
@@ -547,14 +550,6 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         run.counted_enosys.is_empty(),
         "unexpected counted ENOSYS: {:?}",
         run.counted_enosys
-    );
-    assert!(
-        run.frame_inventory.mappings.iter().any(|m| {
-            m.gpa.raw() >= carrick_softcpu_aarch64_host::SOFT_ALIAS_GPA_BASE
-                && m.length.raw() == GUEST_PAGE_BYTES
-        }),
-        "MapHostAlias must publish its stage-2 alias frame into the kernel frame inventory, got {:?}",
-        run.frame_inventory
     );
 
     let final_obs = obs.lock().expect("lock witness observations");
@@ -1016,12 +1011,17 @@ fn soft_carrier_enforces_single_live_aperture_and_compare_clears() {
 enum NegativeMmCase {
     StoreAfterMprotectReadOnly,
     LoadAfterMunmap,
+    /// Not a negative case: a System V segment attached with `shmat` is a
+    /// `MapHostAlias` on every host, the alias whose frame inventory the
+    /// kernel must learn.
+    SysvShmAlias,
 }
 
 struct NegativeMmExecutor {
     mailbox: Arc<AtomicPtr<Aarch64SyscallMailbox>>,
     case: NegativeMmCase,
     mapped_va: Arc<std::sync::atomic::AtomicU64>,
+    shm_id: u64,
     next_seq: u64,
 }
 
@@ -1104,6 +1104,40 @@ impl ExecuteBlock for NegativeMmExecutor {
             let step = (cpu.pc.0 - CODE_VA) / 4;
             let x0 = rx(cpu, 0);
             match (&self.case, step) {
+                // 0: shmget(IPC_PRIVATE, 0x1000, IPC_CREAT | 0600)
+                (NegativeMmCase::SysvShmAlias, 0) => ScriptedHvc2Executor::set_call(
+                    cpu,
+                    NR_SHMGET,
+                    [0, 0x1000, 0o1000 | 0o600, 0, 0, 0],
+                ),
+                // 1: shmat(id, NULL, 0) -> MapHostAlias
+                (NegativeMmCase::SysvShmAlias, 1) => {
+                    if (x0 as i64) < 0 {
+                        return Err(format!("shmget failed: {}", x0 as i64));
+                    }
+                    self.shm_id = x0;
+                    ScriptedHvc2Executor::set_call(cpu, NR_SHMAT, [x0, 0, 0, 0, 0, 0]);
+                }
+                // 2: str x2, [x1] into the attached segment
+                (NegativeMmCase::SysvShmAlias, 2) => {
+                    if (x0 as i64) <= 0 || !x0.is_multiple_of(GUEST_PAGE_BYTES) {
+                        return Err(format!("shmat({}) failed: {x0:#x}", self.shm_id));
+                    }
+                    self.mapped_va.store(x0, Ordering::Release);
+                    wx(cpu, 1, x0);
+                    wx(cpu, 2, 0x5348_4D41_4C49_4153);
+                }
+                // 3: ldr x3, [x1] back through the alias
+                (NegativeMmCase::SysvShmAlias, 3) => {
+                    wx(cpu, 1, self.mapped_va.load(Ordering::Acquire));
+                }
+                // 4: exit_group(0) with the segment still attached
+                (NegativeMmCase::SysvShmAlias, 4) => {
+                    if rx(cpu, 3) != 0x5348_4D41_4C49_4153 {
+                        return Err(format!("shm alias load: {:#x}", rx(cpu, 3)));
+                    }
+                    ScriptedHvc2Executor::set_call(cpu, NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
+                }
                 // 0: mmap(0, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
                 (_, 0) => ScriptedHvc2Executor::set_call(
                     cpu,
@@ -1255,6 +1289,7 @@ fn soft_single_process_store_after_mprotect_prot_read_faults_with_segv_accerr() 
         mailbox: Arc::clone(&mailbox),
         case: NegativeMmCase::StoreAfterMprotectReadOnly,
         mapped_va: Arc::clone(&mapped_va),
+        shm_id: 0,
         next_seq: 1,
     };
     let config = SoftSingleProcessConfig::new(&elf, "/mprotect-readonly-store");
@@ -1356,6 +1391,7 @@ fn soft_single_process_access_after_munmap_faults_with_segv_maperr() {
         mailbox: Arc::clone(&mailbox),
         case: NegativeMmCase::LoadAfterMunmap,
         mapped_va: Arc::clone(&mapped_va),
+        shm_id: 0,
         next_seq: 1,
     };
     let config = SoftSingleProcessConfig::new(&elf, "/munmap-load-fault");
@@ -1392,5 +1428,73 @@ fn soft_single_process_access_after_munmap_faults_with_segv_maperr() {
             elr: CODE_VA + 3 * 4,
             syndrome: 0x9200_0007,
         })
+    );
+}
+
+#[test]
+fn soft_sysv_shm_alias_publishes_kernel_frame_inventory() {
+    let _test_guard = lock_soft_carrier_test();
+
+    // 0: shmget, 1: shmat (MapHostAlias), 2: str, 3: ldr, 4: exit_group(0)
+    let code_words = [
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_STR_X2_X1,
+        A64_LDR_X3_X1,
+        A64_SVC_0,
+    ];
+    let elf = build_witness_elf(&code_words, &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let mapped_va = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let executor = NegativeMmExecutor {
+        mailbox: Arc::clone(&mailbox),
+        case: NegativeMmCase::SysvShmAlias,
+        mapped_va: Arc::clone(&mapped_va),
+        shm_id: 0,
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/sysv-shm-alias");
+    let mb_for_setup = Arc::clone(&mailbox);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
+    .expect("shmat witness should exit cleanly through production kernel");
+
+    assert_ne!(mapped_va.load(Ordering::Acquire), 0);
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(
+        run.reply_census,
+        Hvc2ReplyCensus {
+            fixture_answers: 0,
+            production_answers: 3,
+        }
+    );
+    // Sampled at exit; the soft backend does not yet retire alias inventory
+    // on unmap (#2684), so the attached segment's mapping is still listed.
+    assert!(
+        run.frame_inventory.mappings.iter().any(|m| {
+            m.gpa.raw() >= carrick_softcpu_aarch64_host::SOFT_ALIAS_GPA_BASE
+                // shmat rounds the alias to the host page granule.
+                && m.length.raw() >= GUEST_PAGE_BYTES
+                && m.permissions.write
+        }),
+        "MapHostAlias must publish its stage-2 alias frame into the kernel frame inventory, got {:?}",
+        run.frame_inventory
     );
 }
