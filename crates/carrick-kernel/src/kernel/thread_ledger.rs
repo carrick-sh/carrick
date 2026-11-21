@@ -487,6 +487,11 @@ impl ThreadIdentityPool {
         {
             return false;
         }
+        // Keep identity issuance ahead of the credentials reservation:
+        // both can draw serials from the same kernel source.
+        let Ok(identity) = ThreadIdentity::reserve(kernel, task) else {
+            return false;
+        };
         let Ok(birth_resources) =
             super::objects::ReservedThreadResources::reserve(kernel.object_ids())
         else {
@@ -499,9 +504,6 @@ impl ThreadIdentityPool {
             return false;
         };
         let Some(revisions) = task.reserve_thread_revisions(record.revision) else {
-            return false;
-        };
-        let Ok(identity) = ThreadIdentity::reserve(kernel, task) else {
             return false;
         };
         let adoption = match task.thread_adoption_factory() {
