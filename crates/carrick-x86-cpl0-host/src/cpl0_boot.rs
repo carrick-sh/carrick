@@ -4159,6 +4159,9 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     cow_published: [Option<carrick_hal::fork_stock::GrantExecution>; 2],
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
+    /// Refused or withdrawn backings settled while their MM's exclusion was
+    /// busy: cancelled at that MM's next exclusion.
+    cancelled_backing_pending: Vec<anonymous_owner::PendingPrepare>,
     owner_grant_crossings: u64,
     /// Serializes every settlement of an MM's owed returns (#1369 slice 3).
     return_settlement: carrick_hal::return_settlement::SettlementLock,
@@ -5589,6 +5592,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             anonymous_pending: [None, None],
             cow_published: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
+            cancelled_backing_pending: Vec::new(),
             owner_grant_crossings: 0,
             return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
             return_settlement_counters: Default::default(),
