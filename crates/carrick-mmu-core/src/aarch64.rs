@@ -750,14 +750,7 @@ pub struct GuestLeafPublication {
     pub executable: bool,
 }
 
-/// Mapping protection ceiling (`VM_MAY*`) authorizing a COW-armed private leaf
-/// permission edit when `SW_EL1_MAY_WRITE` carries current write intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestPermissionCeiling {
-    pub readable: bool,
-    pub writable: bool,
-    pub executable: bool,
-}
+pub use carrick_guest_arch::GuestPermissionCeiling;
 
 /// One resident private-anonymous permission transition owned by guest EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,7 +760,11 @@ pub struct GuestPermissionEdit {
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
-    pub cow_ceiling: Option<GuestPermissionCeiling>,
+    /// The mapping's ceiling from the reservation root. When present it
+    /// bounds the edit on every private leaf (prepared, resident or
+    /// COW-armed) and extends the leaf's software ceiling tags; when absent
+    /// those tags bound it and a COW-armed leaf is refused.
+    pub ceiling: Option<GuestPermissionCeiling>,
 }
 
 /// Why EL1 could not own a requested resident-anonymous protection edit.
@@ -1004,9 +1001,9 @@ pub unsafe fn publish_existing_invalid_private_pages(
 /// prepared leaf stays invalid; its AP/UXN govern its later commit and host
 /// buffer access). The complete range, terminal coverage, and permission
 /// ceiling are checked before the first store; COW-armed resident leaves edit
-/// in place under `edit.cow_ceiling` (keeping `SW_EL1_COW` armed, never
+/// in place under `edit.ceiling` (keeping `SW_EL1_COW` armed, never
 /// granting `AP_RW`, and recording write intent in `SW_EL1_MAY_WRITE`) and
-/// report `PermissionWidening` when `cow_ceiling` is `None` or exceeded. This
+/// report `PermissionWidening` when `ceiling` is `None` or exceeded. This
 /// entry point carries no table grants, so a partially covered block is
 /// refused; a host submission carrying grants splits it (see [`descriptor_txn`]).
 /// A rolled-back edit restores every word; the caller still invalidates the
@@ -11345,7 +11342,7 @@ mod tests {
                         readable,
                         writable,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             }
@@ -11387,7 +11384,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: true,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -11436,7 +11433,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -11466,7 +11463,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -11841,7 +11838,7 @@ mod tests {
             readable: true,
             writable: false,
             executable: false,
-            cow_ceiling: None,
+            ceiling: None,
         })
         .expect("RW to RO");
         for page in 0..3 {
@@ -11867,7 +11864,7 @@ mod tests {
             readable: false,
             writable: false,
             executable: false,
-            cow_ceiling: None,
+            ceiling: None,
         })
         .expect("RO to PROT_NONE");
         for page in 0..3 {
@@ -11885,7 +11882,7 @@ mod tests {
             readable: true,
             writable: true,
             executable: false,
-            cow_ceiling: None,
+            ceiling: None,
         })
         .expect("PROT_NONE to RW");
         assert!(
@@ -11904,7 +11901,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 executable: true,
-                cow_ceiling: None,
+                ceiling: None,
             }),
             Err(GuestPermissionEditError::PermissionWidening)
         );
@@ -12169,7 +12166,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 })
                 .expect("permission edit must stay inside the target range");
         }
@@ -12412,7 +12409,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -12437,7 +12434,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        ceiling: ro_ceiling,
                     },
                 )
             },
@@ -12457,7 +12454,7 @@ mod tests {
                         readable: false,
                         writable: false,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        ceiling: ro_ceiling,
                     },
                 )
             },
@@ -12480,7 +12477,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: Some(GuestPermissionCeiling {
+                        ceiling: Some(GuestPermissionCeiling {
                             readable: true,
                             writable: true,
                             executable: false,
@@ -12775,7 +12772,7 @@ mod tests {
                 readable,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             };
             assert_eq!(
                 unsafe {
@@ -12914,7 +12911,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -12971,7 +12968,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             },
@@ -13045,7 +13042,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 };
                 assert_eq!(
                     unsafe {

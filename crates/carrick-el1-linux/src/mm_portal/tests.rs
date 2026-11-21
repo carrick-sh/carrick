@@ -166,7 +166,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: bits != 0,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             }
@@ -230,7 +230,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             }
@@ -4490,6 +4490,136 @@ fn anonymous_edit_wait_never_parks_for_metadata_required() {
         |_, _, _| panic!("metadata has no per-MM release publisher"),
     );
     assert_eq!(outcome, EditWaitOutcome::Refused);
+}
+
+/// #2620 (ARM twin of the x86 KVM `production_mprotect_*` witnesses): the
+/// guest's `mprotect` (nr 226) through the delegated production entry flips
+/// resident private pages first published RW (no execute tag) to R|X, then
+/// R|W|X, in ring: the root's `VM_MAY*` ceiling bounds them, not the leaf's
+/// first-publish permissions.
+#[test]
+fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
+        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let _parent = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let parent_tables = Tables::new(ROOT, IPA, 0);
+    let child = Tables::new(ROOT + 0x10_0000, 0, 0);
+    let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    let prepared = execute_descriptor_op(
+        &parent_tables.live(&CallerInvalidatesAsid),
+        SubstrateGpa(ROOT),
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 8192,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 8192),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        },
+        &TableGrants::NONE,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        matches!(prepared, DescriptorOutcome::Applied(_)),
+        "{prepared:?}"
+    );
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let leaf = |va: u64| -> u64 {
+        let mut table = ROOT;
+        for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+            let descriptor = words.load(table + ((va >> shift) & 511) * 8).unwrap();
+            if level == 3 || descriptor & 3 != 3 {
+                return descriptor;
+            }
+            table = descriptor & 0x0000_ffff_ffff_f000;
+        }
+        unreachable!()
+    };
+    let counters = Box::new(Counters::default());
+    let guest_mprotect = |prot: u64| {
+        let task = CurrentTask::new();
+        task.execution.task.store(177, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(77, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA;
+        frame.x[1] = 8192;
+        frame.x[2] = prot;
+        frame.x[8] = 226;
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: supply.words.as_ptr().cast_mut(),
+                physical_base: supply.base,
+                byte_len: supply.words.len() * 8,
+            },
+        };
+        let route = serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        );
+        (route, frame.x[0] as i64)
+    };
+    for (prot, writable) in [(5, false), (7, true), (3, true)] {
+        assert_eq!(
+            guest_mprotect(prot),
+            (DelegatedAnonymous::Served, 0),
+            "prot {prot}"
+        );
+        for page in 0..2 {
+            let d = leaf(VA + page * 4096);
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Execute),
+                prot & 4 != 0,
+                "prot {prot} page {page}"
+            );
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                writable,
+                "prot {prot} page {page}"
+            );
+        }
+    }
+    assert!(
+        counters
+            .anonymous_leaves
+            .iter()
+            .all(|leave| leave.load(Ordering::Relaxed) == 0),
+        "no mprotect left the ring"
+    );
 }
 
 #[test]

@@ -1757,7 +1757,7 @@ fn serve_delegated_anonymous_for_origin<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
-            let cow_ceiling = if request.operation == Protect {
+            let ceiling = if request.operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
@@ -1775,7 +1775,7 @@ fn serve_delegated_anonymous_for_origin<
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
-                cow_ceiling,
+                ceiling,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -2016,7 +2016,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         readable: prot & PROT_READ != 0,
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
-        cow_ceiling: None,
+        ceiling: None,
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
@@ -2232,7 +2232,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 }
             )]
         );
@@ -3670,7 +3670,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: Some(GuestPermissionCeiling {
+                            ceiling: Some(GuestPermissionCeiling {
                                 readable: true,
                                 writable: true,
                                 executable: true,
@@ -4101,7 +4101,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            ceiling: None,
                         }
                     ),
                 ]
@@ -4182,7 +4182,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     }
                 )]
             );

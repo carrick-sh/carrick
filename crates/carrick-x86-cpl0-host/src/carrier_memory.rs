@@ -1454,15 +1454,26 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         && Self::matches_permissions(entry, permissions)
                 }
                 DescriptorOp::Publish { .. } => entry & PRESENT != 0 && entry & PREPARED == 0,
+                // A COW-armed leaf records write intent and never gains WRITE.
                 DescriptorOp::Protect { permissions, .. } => {
                     entry & (PRESENT | PREPARED) != 0
                         && entry & PRIVATE != 0
                         && (!permissions.writable || entry & MAY_WRITE != 0)
                         && (!permissions.executable || entry & MAY_EXEC != 0)
-                        && Self::matches_permissions(entry, permissions)
+                        && if entry & COW != 0 {
+                            entry & WRITE == 0
+                                && Self::matches_permissions(
+                                    entry | if permissions.writable { WRITE } else { 0 },
+                                    permissions,
+                                )
+                        } else {
+                            Self::matches_permissions(entry, permissions)
+                        }
                 }
+                // Writable leaves carry write intent; a read-only private
+                // leaf is armed without it.
                 DescriptorOp::ArmCow(_) => {
-                    entry & (COW | MAY_WRITE) == (COW | MAY_WRITE) && entry & WRITE == 0
+                    entry & (COW | WRITE) == COW && entry & (MAY_WRITE | PRIVATE) != 0
                 }
                 DescriptorOp::CowRepoint { .. } => {
                     entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
