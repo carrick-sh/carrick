@@ -2344,6 +2344,48 @@ fn registered_root_draws_shared_tables_and_retires_once() {
     stock.register_root(owner, root.context.root).unwrap();
 }
 
+/// A registered root withdraws an unanswered submission exactly like a
+/// child: x86's settle-before-park withdraws the root MM's selected window.
+#[test]
+fn registered_root_withdraws_a_submitted_reservation() {
+    let mut stock = stock(UntaggedRoots, 24, 1);
+    let root = parent();
+    // SAFETY: this fixture owns the admitted root incarnation.
+    let owner =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN) };
+    stock.register_root(owner, root.context.root).unwrap();
+    let before = stock.table_stock().len();
+    let reservation = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root.context.root, 3)
+        .unwrap();
+    let txn = backing_txn(owner, root.context.root, 1, reservation.descriptor_tables());
+    stock
+        .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+        .unwrap();
+    // SAFETY: a distinct admitted generation must not withdraw it.
+    let stale = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::new(2).unwrap())
+    };
+    assert!(matches!(
+        stock.cancel_submitted_native_descriptor_tables(
+            &mut NoTableLedger,
+            stale,
+            root.context.root,
+            txn.id.generation,
+        ),
+        Err(ForkStockServiceError::StaleExecution)
+    ));
+    stock
+        .cancel_submitted_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            root.context.root,
+            txn.id.generation,
+        )
+        .unwrap();
+    assert_eq!(stock.table_stock().len(), before);
+}
+
 #[test]
 fn registered_root_and_child_reserve_disjoint_shared_tables() {
     let mut stock = stock(UntaggedRoots, 40, 1);
