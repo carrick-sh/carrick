@@ -87,6 +87,17 @@ pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
     Some((rt, reg))
 }
 
+/// The stage-1 fault kind of an EL0 data or instruction abort's syndrome;
+/// `None` for any other exception class or fault status.
+#[must_use]
+pub fn el0_fault_kind(esr: u64) -> Option<carrick_mmu_core::aarch64::Stage1FaultKind> {
+    let ec = carrick_hal::aarch64::aarch64_exception_class(esr);
+    if !matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
+        return None;
+    }
+    carrick_mmu_core::aarch64::Stage1FaultKind::from_fault_status(esr & 0x3f)
+}
+
 /// Decode the stage-1 [`carrick_mmu_core::aarch64::LeafAccess`] direction of an
 /// AArch64 EL0 instruction or data abort `ESR_EL1` caused by a translation
 /// (`FSC = 0x04..=0x07`) or permission (`FSC = 0x0c..=0x0f`) fault.
@@ -181,5 +192,25 @@ mod tests {
         );
         assert_eq!(el0_fault_access(esr(0x24) | 0x21), None); // alignment fault
         assert_eq!(el0_fault_access(esr(0x15)), None); // SVC
+    }
+
+    #[test]
+    fn decodes_el0_abort_stage1_fault_kind() {
+        use carrick_mmu_core::aarch64::Stage1FaultKind;
+
+        assert_eq!(
+            el0_fault_kind(esr(0x24) | 0x07),
+            Some(Stage1FaultKind::Translation)
+        );
+        assert_eq!(
+            el0_fault_kind(esr(0x20) | 0x0b),
+            Some(Stage1FaultKind::AccessFlag)
+        );
+        assert_eq!(
+            el0_fault_kind(esr(0x25) | 0x0f),
+            Some(Stage1FaultKind::Permission)
+        );
+        assert_eq!(el0_fault_kind(esr(0x24) | 0x21), None); // alignment fault
+        assert_eq!(el0_fault_kind(esr(0x15) | 0x07), None); // SVC class
     }
 }
