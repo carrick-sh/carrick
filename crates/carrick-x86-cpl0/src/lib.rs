@@ -484,9 +484,24 @@ mod test_support {
         OWNED_PUBLISH_GATE.store(0, Ordering::Release);
     }
 
-    pub fn record_owned_copy_done() {
-        if OWNED_COPY_RETAINED.swap(false, Ordering::AcqRel) {
+    /// Count the rerun of a refused owned copy before it publishes: a joiner
+    /// that reads the published word in userspace may read the census at
+    /// once, so the completion cannot follow the publication (#2648). Returns
+    /// whether this copy took the refusal's retained rerun.
+    pub fn begin_owned_copy() -> bool {
+        let rerun = OWNED_COPY_RETAINED.swap(false, Ordering::AcqRel);
+        if rerun {
             OWNED_COPY_RERUNS.fetch_add(1, Ordering::AcqRel);
+        }
+        rerun
+    }
+
+    /// The copy did not publish (it was refused again): its rerun is still
+    /// owed, and nothing was visible to a joiner.
+    pub fn abort_owned_copy(rerun: bool) {
+        if rerun {
+            OWNED_COPY_RERUNS.fetch_sub(1, Ordering::AcqRel);
+            OWNED_COPY_RETAINED.store(true, Ordering::Release);
         }
     }
 

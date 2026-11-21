@@ -1088,11 +1088,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if crate::test_support::take_owned_copy_busy(true) {
             return Err(NativeProcessError::Busy);
         }
+        #[cfg(feature = "test-support")]
+        let rerun = crate::test_support::begin_owned_copy();
         let copied = self.copy_user_bytes(mm, address, bytes);
         #[cfg(feature = "test-support")]
         if copied.is_ok() {
             crate::test_support::hold_armed_owned_publication(bytes);
-            crate::test_support::record_owned_copy_done();
+        } else {
+            crate::test_support::abort_owned_copy(rerun);
         }
         copied
     }
