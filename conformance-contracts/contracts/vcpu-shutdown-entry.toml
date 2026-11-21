@@ -96,6 +96,8 @@ vm_free = [
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
   "carrick-x86-cpl0-host::carrier_cpu::tests::kicked_child_on_root_executor_keeps_its_issued_root (component: a kicked CPU switched to a registered child root captures that child's issued binding; red before #2581 fix; does not qualify KVM container shutdown)",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_a_registered_child_resolves_its_binding (component, #2581: a fault doorbell from a child CR3 registered with the carrier resolves that child's issued binding instead of the loaded root; red before the fix; does not qualify the KVM container)",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_an_unregistered_child_root_is_refused (component, #2581: an unregistered child root is refused, never bound to the loaded root)",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
