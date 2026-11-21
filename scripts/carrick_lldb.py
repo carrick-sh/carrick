@@ -1203,24 +1203,38 @@ def _refused_call_section(process, target):
     pointer = process.ReadUnsignedFromMemory(address, target.GetAddressByteSize(), error)
     if error.Fail() or pointer == 0:
         return None
+    wanted = ("refused_calls", "refused_call_next", "refused_call_dropped")
     fields = {}
     for index in range(layout.GetNumberOfFields()):
         field = layout.GetFieldAtIndex(index)
-        if field.GetName() in ("refused_calls", "refused_call_next"):
+        if field.GetName() in wanted:
             fields[field.GetName()] = field
-    if set(fields) != {"refused_calls", "refused_call_next"}:
+    if set(fields) != set(wanted):
         return None
     raw_next = process.ReadMemory(
         pointer + fields["refused_call_next"].GetOffsetInBytes(), 8, error
     )
+    raw_dropped = process.ReadMemory(
+        pointer + fields["refused_call_dropped"].GetOffsetInBytes(), 8, error
+    )
     size = fields["refused_calls"].GetType().GetByteSize()
     raw = process.ReadMemory(pointer + fields["refused_calls"].GetOffsetInBytes(), size, error)
-    if error.Fail() or len(raw) != size or len(raw_next) != 8:
+    if error.Fail() or len(raw) != size or len(raw_next) != 8 or len(raw_dropped) != 8:
         return [f"# refused calls unreadable: {error}"]
     next_index = struct.unpack("<Q", raw_next)[0]
-    return [
-        f"# EL1 refused calls: {min(next_index, _REFUSED_CALL_RECORDS)} of {next_index} retained (last {_REFUSED_CALL_RECORDS})"
-    ] + _refused_call_lines(raw, next_index, _syscall_names("aarch64"))
+    dropped = struct.unpack("<Q", raw_dropped)[0]
+    return [_refused_call_header(next_index, dropped)] + _refused_call_lines(
+        raw, next_index, _syscall_names("aarch64")
+    )
+
+
+def _refused_call_header(next_index: int, dropped: int) -> str:
+    """Summary line: records retained, claimed, and dropped because a
+    concurrent or lapped writer held their row."""
+    return (
+        f"# EL1 refused calls: {min(next_index, _REFUSED_CALL_RECORDS)} of {next_index} "
+        f"retained (last {_REFUSED_CALL_RECORDS}), dropped={dropped}"
+    )
 
 
 def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):

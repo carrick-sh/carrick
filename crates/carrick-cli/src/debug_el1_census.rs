@@ -131,10 +131,16 @@ pub(crate) fn run_el1_census(
         );
         // What each refused call asked for: the census counts only numbers.
         for (file, census) in files.iter().zip(&censuses) {
-            if census.refused_calls.is_empty() {
+            if census.refused_calls.is_empty() && census.refused_calls_dropped == 0 {
                 continue;
             }
             println!("\n## refused calls: {}", file.display());
+            if census.refused_calls_dropped != 0 {
+                println!(
+                    "# {} refused-call records dropped (row held by another writer)",
+                    census.refused_calls_dropped
+                );
+            }
             for call in &census.refused_calls {
                 println!("{}", call.line());
             }

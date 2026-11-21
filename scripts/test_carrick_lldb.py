@@ -68,6 +68,10 @@ class CarrickLldbHelperTests(unittest.TestCase):
         self.assertEqual(PLUGIN._syscall_names("x86_64").get(270), "pselect6")
         with self.assertRaises(ValueError):
             PLUGIN._refused_call_lines(rows[:-1], 1)
+        self.assertEqual(
+            PLUGIN._refused_call_header(67, 2),
+            "# EL1 refused calls: 64 of 67 retained (last 64), dropped=2",
+        )
 
     def test_copy_refusals_decode_committed_rows_only(self):
         import struct
