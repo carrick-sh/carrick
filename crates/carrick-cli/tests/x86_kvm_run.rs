@@ -709,6 +709,9 @@ fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
     compare_mounted_assembly_with_native("x86_clear_tid_raise.S", b"S\n");
 }
 
+/// With #2142 serving the x86 run root's execve, mounted static self-exec
+/// replaces the image and matches the native Linux oracle (`"E\n"`, exit 7).
+/// Function name retained until `.github/retired-tests.toml` retires the old name.
 #[test]
 fn mounted_static_x86_native_executable_link_follows_fork_and_exec() {
     if skip_without_kvm() {
@@ -766,8 +769,8 @@ fn mounted_static_x86_exec_refuses_before_replacement_identity() {
         String::from_utf8_lossy(&guest.stderr)
     );
     assert_eq!(
-        guest.stdout, b"F\n",
-        "shared-owner-exec-completion: CPL0 must refuse exec before replacement"
+        guest.stdout, b"E\n",
+        "x86 root self-exec must replace the image and match native stdout"
     );
     assert!(guest.stderr.is_empty());
 }

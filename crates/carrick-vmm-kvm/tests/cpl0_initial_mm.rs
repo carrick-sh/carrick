@@ -954,14 +954,14 @@ fn production_root_exec_twice_runs_the_second_successor() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_successor.S"),
+        native_exit_fixture("native_root_exec_successor.S"),
         0o700,
     );
     let relay = dir.path().join("relay");
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
     carrick_test_support::executable::write_executable_mode(
         &relay,
-        &native_exit_fixture_with_flags("native_root_exec.S", &[&define]),
+        native_exit_fixture_with_flags("native_root_exec.S", &[&define]),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", relay.display());
@@ -1007,7 +1007,7 @@ fn production_root_exec_with_a_running_sibling_thread_runs_the_successor() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_successor.S"),
+        native_exit_fixture("native_root_exec_successor.S"),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
@@ -1036,7 +1036,7 @@ fn production_root_exec_closes_only_close_on_exec_descriptors() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_fds_successor.S"),
+        native_exit_fixture("native_root_exec_fds_successor.S"),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
