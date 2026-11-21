@@ -867,6 +867,29 @@ impl<'a> IpcRegion<'a> {
         Ok(false)
     }
 
+    /// Rewrite the `data` word of every zone item of `epoll` under its lock
+    /// (`update` returns the new word; returning the old one only reads).
+    /// A transient readiness set (poll-family over N descriptors) has no
+    /// guest descriptor, so no `EPOLL_CTL_MOD` races this: it keeps its
+    /// decided answer in the items it already owns.
+    pub fn epoll_update_data<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        wait: &W,
+        mut update: impl FnMut(u64) -> u64,
+    ) -> Result<(), IpcError> {
+        let mut guard = self.lock(epoll, wait)?;
+        let mut cursor = guard.epoll_state()?.interest_head;
+        while let Some(item) = self.item(cursor) {
+            if item.member_kind.load(Ordering::Relaxed) != EpollMember::HostSocket as u32 {
+                let data = item.data.load(Ordering::Relaxed);
+                item.data.store(update(data), Ordering::Relaxed);
+            }
+            cursor = item.interest_next.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Items in the host's half of `epoll` (a lock-held read).
     pub fn epoll_host_items<W: LockWait>(
         &self,

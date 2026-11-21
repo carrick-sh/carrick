@@ -499,7 +499,8 @@ fn readiness_wait(kind: IpcOpKind) -> bool {
     matches!(kind, IpcOpKind::PollWait | IpcOpKind::SelectWait)
 }
 
-/// Complete the admitted single-description readiness wait. Readiness uses the shared
+/// Complete the admitted readiness wait (one description, or a select set
+/// through its transient epoll). Readiness uses the shared
 /// IPC member-level primitive, never a numeric-fd lookup or a new relative
 /// timeout. Once decided, the answer and byte cursor stay in the same arena
 /// record through owner-copyout refusals.
@@ -514,8 +515,11 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
 ) -> Result<IpcHostOutcome, IpcError> {
     use crate::dispatch::copyout::{self, UserSlot};
     use carrick_abi::PollReventsOutput;
+    use carrick_el1_abi::ipc::pipe::WaitFor;
     use carrick_el1_abi::ipc::{IpcBacking, IpcUserVa, WriteProgress, epoll::EpollMember};
-    use carrick_el1_linux::ipc::{WaitCopy, poll_wait_lane, select_copies, select_ready};
+    use carrick_el1_linux::ipc::{
+        SelectReady, WaitCopy, poll_wait_lane, readiness_set, select_copies, select_ready,
+    };
     use carrick_guest_mem::GuestVa;
 
     let complete = |result| IpcHostOutcome::Complete {
@@ -523,6 +527,11 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
         sigpipe: false,
     };
     let select = op.kind == IpcOpKind::SelectWait;
+    // A multi-descriptor select pins a transient epoll: its items are the
+    // set, the epoll's harvest is its probe, and they keep the decided answer.
+    let set = select
+        .then(|| readiness_set::transient_epoll(region, &op, HostIpcWait))
+        .flatten();
     let mut bytes = op.value.0.to_ne_bytes();
     let fd = i32::from_ne_bytes(bytes[..4].try_into().unwrap_or_default());
     if op.progress.len == 0 {
@@ -533,8 +542,27 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
             return Ok(complete(LINUX_EINTR.guest_retval()));
         }
         let clock = wake.counter();
-        let revents = if interrupted || (select && cause == Some(IpcCause::Timeout)) {
-            0
+        let pending = op.deadline.get().is_none_or(|end| clock.now < end);
+        let (revents, ready) = if interrupted || (select && cause == Some(IpcCause::Timeout)) {
+            (0, 0)
+        } else if let Some(epoll) = set {
+            let answer = readiness_set::harvest_ready(region, epoll, &HostIpcWait)?;
+            if answer.is_empty() && pending {
+                return Ok(IpcHostOutcome::Blocked {
+                    token,
+                    object: epoll,
+                    lane: WaitFor::Readable,
+                    deadline: op.deadline.get(),
+                    x0: op.orig_x0,
+                    nr: op.nr,
+                });
+            }
+            readiness_set::record_answer(region, epoll, &answer, &HostIpcWait)?;
+            let ready = answer
+                .iter()
+                .map(|entry| i64::from(entry.ready.count_ones()))
+                .sum();
+            (0, ready)
         } else {
             let pin = OfdPin::from_raw(op.pin);
             let description = region.fd(HostIpcWait).pinned(&pin);
@@ -556,7 +584,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
             } else {
                 level as i16 & (events | carrick_abi::LINUX_POLLERR | carrick_abi::LINUX_POLLHUP)
             };
-            if revents == 0 && op.deadline.get().is_none_or(|end| clock.now < end) {
+            if revents == 0 && pending {
                 return Ok(IpcHostOutcome::Blocked {
                     token,
                     object,
@@ -566,13 +594,13 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
                     nr: op.nr,
                 });
             }
-            revents
+            (revents, i64::from(revents.count_ones()))
         };
         if select {
             op.result = if interrupted {
                 LINUX_EINTR.guest_retval()
             } else {
-                i64::from(revents.count_ones())
+                ready
             };
             op.select.ready = revents;
             op.park_seq = op
@@ -586,7 +614,8 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
                         / u128::from(clock.denom.max(1));
                     u64::try_from(ns).unwrap_or(u64::MAX)
                 });
-            let length = select_copies(op.select, op.buf, op.park_seq, fd, op.result)
+            // Every set is copied whole: its length does not depend on the answer.
+            let length = select_copies(op.select, op.buf, op.park_seq, &[], op.result)
                 .map(|copy| copy.len as u64)
                 .sum();
             op.progress = WriteProgress::new(length);
@@ -610,8 +639,15 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
     };
     let mut offset = op.progress.written as usize;
     let mut window = Vec::new();
+    let answer = match set {
+        Some(epoll) => readiness_set::recorded_answer(region, epoll, &HostIpcWait)?,
+        None => vec![SelectReady {
+            fd,
+            ready: op.select.ready,
+        }],
+    };
     let select_output = select
-        .then(|| select_copies(op.select, op.buf, op.park_seq, fd, op.result))
+        .then(|| select_copies(op.select, op.buf, op.park_seq, &answer, op.result))
         .into_iter()
         .flatten();
     for copy in select_output.chain(poll_output) {
