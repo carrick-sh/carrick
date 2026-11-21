@@ -197,3 +197,9 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   notifications. The #231 "Director lanes" comment (owner, hosts, active
   PRs, in-flight shared changes) is the record, and each session updates
   its own section when its lane changes.
+
+## History rewrite
+
+The SHA map for the 2026-10-14 co-author history rewrite is on the
+`history/coauthor-rewrite-2026-10-14` branch. Use it to translate pre-rewrite
+commit ids cited in old issues, PRs and receipts.
