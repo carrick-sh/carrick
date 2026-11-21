@@ -2178,3 +2178,85 @@ fn soft_carrier_publish_retires_a_reused_frames_resident_code() {
         "publish_user_executable kept the resident incarnation of a rewritten frame"
     );
 }
+
+/// MEASUREMENT ONLY (#2717, do not land): re-run the residency witnesses as
+/// child processes with each invalidation removed and print the red/green
+/// matrix for this host.
+#[test]
+fn measure_residency_mutation_matrix() {
+    let exe = std::env::current_exe().expect("test binary path");
+    for mutation in [
+        "",
+        "generation-compare",
+        "guest-store",
+        "write-gpa",
+        "publish",
+        "write-gpa,publish",
+    ] {
+        let output = std::process::Command::new(&exe)
+            .args(["soft_carrier_", "--test-threads=1"])
+            .env("CARRICK_MEASURE_MUTATION", mutation)
+            .output()
+            .expect("spawn mutation arm");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut verdicts: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("test soft_carrier_")?;
+                let (name, verdict) = rest.split_once(" ... ")?;
+                Some(format!(
+                    "{name}={}",
+                    if verdict == "ok" { "green" } else { "RED" }
+                ))
+            })
+            .collect();
+        verdicts.sort();
+        println!(
+            "mutation-matrix arch={} mutation={} status={} {}",
+            std::env::consts::ARCH,
+            if mutation.is_empty() {
+                "none"
+            } else {
+                mutation
+            },
+            output.status,
+            verdicts.join(" ")
+        );
+    }
+}
+
+/// MEASUREMENT ONLY (#2717, do not land): known-answer runs for the decode
+/// census. Run with and without `CARRICK_MEASURE_BLOCK_CAPACITY=2`.
+#[test]
+fn measure_decode_census_known_answers() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = rewrite_rootfs().expect("create the /patch rootfs");
+    for (label, plan, root) in [
+        ("loop100", ResidencyPlan::Loop { handoffs: 100 }, None),
+        (
+            "rewrite-prot-none",
+            ResidencyPlan::Rewrite(CodeRetirement::ProtNone),
+            Some(rootfs.path()),
+        ),
+    ] {
+        let ResidencyRun { run, prepared, .. } =
+            run_residency(plan, root).expect("residency witness must finish");
+        let census = run
+            .engine
+            .vcpu()
+            .decode_census()
+            .cloned()
+            .expect("cache on");
+        println!(
+            "known-answer {label} capacity={} prepared={prepared} decodes={} evictions={} \
+             ic_clears={} context_clears={} calls={} by_reason={:?}",
+            std::env::var("CARRICK_MEASURE_BLOCK_CAPACITY").unwrap_or_else(|_| "1024".into()),
+            census.decodes,
+            census.evictions,
+            census.ic_clears,
+            census.context_clears,
+            census.calls,
+            census.by_reason
+        );
+    }
+}

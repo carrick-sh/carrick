@@ -2139,6 +2139,10 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
 #[test]
 #[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
+    // MEASUREMENT ONLY (#2717, do not land): keep this load off the census.
+    if std::env::var_os("CARRICK_A64_PYTHON_ROOT").is_some() {
+        return;
+    }
     let root = std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT");
     let root = FixtureRoot::new(root.into());
     let executable = CPYTHON_EXECUTABLE;
@@ -2225,11 +2229,37 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         el1_elf_override: Some(&el1_elf),
         max_syscalls: 4096,
     };
+    let maps_arm = std::env::var_os("CARRICK_MEASURE_MAPS").is_some();
+    let config = if maps_arm {
+        carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+            argv: vec![
+                CPYTHON_EXECUTABLE.as_bytes().to_vec(),
+                b"-c".to_vec(),
+                b"import sys; print(sys.version.split()[0]); print(open('/proc/self/maps').read())"
+                    .to_vec(),
+            ],
+            ..config
+        }
+    } else {
+        config
+    };
     let started = std::time::Instant::now();
     let run = carrick_softcpu_aarch64_host::run_single_process(&config)
         .expect("CPython must complete through production kernel dispatch");
     let elapsed = started.elapsed().as_secs_f64();
     let work = run.engine.vcpu().run_work();
+    print_decode_census(&run, elapsed);
+    if maps_arm {
+        println!(
+            "census-maps stdout:\n{}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        println!(
+            "census-maps stderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        return;
+    }
     let routes = carrick_softcpu_aarch64_host::sample_el1_routes(&run.engine)
         .expect("sample EL1 route counters");
     println!(
@@ -2260,6 +2290,178 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         CPYTHON_COUNTED_ENOSYS,
         "CPython startup",
     );
+}
+
+/// MEASUREMENT ONLY (#2717, do not land): re-run the CPython production
+/// dispatch witness with a 65536-block cache, then once printing
+/// `/proc/self/maps` so the census PCs can be named.
+#[test]
+#[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
+fn measure_cpython_decode_census_arms() {
+    let exe = std::env::current_exe().expect("test binary path");
+    for (label, envs) in [
+        (
+            "capacity=65536",
+            vec![("CARRICK_MEASURE_BLOCK_CAPACITY", "65536")],
+        ),
+        ("maps", vec![("CARRICK_MEASURE_MAPS", "1")]),
+    ] {
+        let mut command = std::process::Command::new(&exe);
+        command.args([
+            "soft_cpu_runs_dynamic_cpython_through_production_dispatch",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        for (k, v) in envs {
+            command.env(k, v);
+        }
+        let output = command.output().expect("spawn census arm");
+        println!(
+            "census-arm {label} status={}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// MEASUREMENT ONLY (#2717, do not land).
+fn print_decode_census(run: &carrick_softcpu_aarch64_host::SoftProcessRun, elapsed: f64) {
+    use carrick_softcpu_aarch64::dispatch::decode_census::{Miss, Stored};
+    let capacity =
+        std::env::var("CARRICK_MEASURE_BLOCK_CAPACITY").unwrap_or_else(|_| "1024".into());
+    let work = run.engine.vcpu().run_work();
+    let Some(census) = run.engine.vcpu().decode_census().cloned() else {
+        println!("census: handoff cache off, no census");
+        return;
+    };
+    println!(
+        "census capacity={capacity} elapsed={elapsed:.3}s executed_blocks={} decoded_blocks={} \
+         census_decodes={} el1_decodes={} crosses_page={} hit_limit={} evictions={} \
+         ic_clears={} ic_cleared_blocks={} context_clears={} context_cleared_blocks={} \
+         calls={} max_resident={} unique_keys_pc={}",
+        work.executed_blocks,
+        work.decoded_blocks,
+        census.decodes,
+        census.el1_decodes,
+        census.crosses_page,
+        census.hit_limit,
+        census.evictions,
+        census.ic_clears,
+        census.ic_cleared_blocks,
+        census.context_clears,
+        census.context_cleared_blocks,
+        census.calls,
+        census.max_resident,
+        census.by_pc.len(),
+    );
+    let mut reasons: Vec<_> = census.by_reason.iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(a.1));
+    for ((miss, stored), count) in &reasons {
+        println!(
+            "census reason miss={miss:?} stored={stored:?} decodes={count} share={:.2}%",
+            **count as f64 * 100.0 / census.decodes.max(1) as f64
+        );
+    }
+    let mut miss_totals = std::collections::BTreeMap::<Miss, u64>::new();
+    let mut stored_totals = std::collections::BTreeMap::<Stored, u64>::new();
+    for ((miss, stored), count) in &census.by_reason {
+        *miss_totals.entry(*miss).or_default() += count;
+        *stored_totals.entry(*stored).or_default() += count;
+    }
+    println!("census miss totals {miss_totals:?}");
+    println!("census stored totals {stored_totals:?}");
+    if let Ok(refusals) = run.engine.backend().measure_mark_refusals() {
+        println!("census mark refusals {refusals:?}");
+    }
+    // Per-PC repeat histogram.
+    let mut buckets = [(0u64, 0u64); 6];
+    for tally in census.by_pc.values() {
+        let bucket = match tally.decodes {
+            1 => 0,
+            2..=10 => 1,
+            11..=100 => 2,
+            101..=1000 => 3,
+            1001..=10000 => 4,
+            _ => 5,
+        };
+        buckets[bucket].0 += 1;
+        buckets[bucket].1 += tally.decodes;
+    }
+    println!(
+        "census per-pc decode histogram (pcs,decodes): 1={:?} 2-10={:?} 11-100={:?} \
+         101-1000={:?} 1001-10000={:?} >10000={:?}",
+        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]
+    );
+    // Decodes by VMA and by stage-2 window.
+    let vma_of = |pc: u64| {
+        run.vmas
+            .iter()
+            .find(|v| v.start.raw() <= pc && pc < v.end.raw())
+            .map(|v| (v.start.raw(), v.end.raw()))
+    };
+    let mut by_vma = std::collections::BTreeMap::<Option<(u64, u64)>, (u64, u64, bool)>::new();
+    let mut by_window = std::collections::BTreeMap::<String, (u64, u64)>::new();
+    for ((pc, el1), tally) in &census.by_pc {
+        let entry = by_vma
+            .entry(if *el1 { None } else { vma_of(*pc) })
+            .or_default();
+        entry.0 += tally.decodes;
+        entry.1 += 1;
+        entry.2 |= *el1;
+        let window = run
+            .engine
+            .backend()
+            .measure_describe_frame(tally.frame)
+            .unwrap_or_else(|e| format!("{e:?}"));
+        let window = format!("{} {}", if *el1 { "el1" } else { "el0" }, window);
+        let w = by_window.entry(window).or_default();
+        w.0 += tally.decodes;
+        w.1 += 1;
+    }
+    let mut by_vma: Vec<_> = by_vma.into_iter().collect();
+    by_vma.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    for (vma, (decodes, pcs, el1)) in by_vma {
+        match vma {
+            Some((start, end)) => {
+                println!("census vma {start:#x}-{end:#x} decodes={decodes} pcs={pcs}")
+            }
+            None => println!(
+                "census vma {} decodes={decodes} pcs={pcs}",
+                if el1 { "el1" } else { "none" }
+            ),
+        }
+    }
+    let mut by_window: Vec<_> = by_window.into_iter().collect();
+    by_window.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    for (window, (decodes, pcs)) in by_window.iter().take(30) {
+        println!("census window {window} decodes={decodes} pcs={pcs}");
+    }
+    let mut hot: Vec<_> = census.by_pc.iter().collect();
+    hot.sort_by(|a, b| b.1.decodes.cmp(&a.1.decodes));
+    for ((pc, el1), tally) in hot.iter().take(40) {
+        println!(
+            "census hot pc={pc:#x} el1={el1} decodes={} frame={:#x} instructions={} \
+             crosses_page={} ttbr0s={} by_miss={:?} by_stored={:?}",
+            tally.decodes,
+            tally.frame,
+            tally.instructions,
+            tally.crosses_page,
+            tally.ttbr0s.len(),
+            tally.by_miss,
+            tally.by_stored
+        );
+    }
+    for v in &run.vmas {
+        println!(
+            "census vma-list {:#x}-{:#x} {:?}",
+            v.start.raw(),
+            v.end.raw(),
+            v.access
+        );
+    }
 }
 
 /// Counted `ENOSYS` the production-dispatch CPython startup still owes, each

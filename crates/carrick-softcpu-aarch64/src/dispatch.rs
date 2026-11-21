@@ -13,6 +13,7 @@ use crate::translate::{
     BlockExit, BlockLimits, CODE_PAGE_BYTES, ExitReason, GuestInstruction, InstructionClass,
     Terminator, TranslateError, TranslatedBlock, emit_block_for_run, split_block_for_run,
 };
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::{sync::Arc, vec::Vec};
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
@@ -360,6 +361,7 @@ struct CacheContext {
 pub struct DispatchCache<C> {
     context: Option<CacheContext>,
     blocks: BlockCache<BlockKey, Arc<ResidentBlock<C>>>,
+    census: CensusState,
 }
 
 impl<C> Default for DispatchCache<C> {
@@ -367,6 +369,7 @@ impl<C> Default for DispatchCache<C> {
         Self {
             context: None,
             blocks: BlockCache::default(),
+            census: CensusState::default(),
         }
     }
 }
@@ -374,8 +377,97 @@ impl<C> Default for DispatchCache<C> {
 impl<C> DispatchCache<C> {
     /// Drop all resident code.
     pub fn clear(&mut self) {
+        self.census
+            .lose_all(&self.blocks, decode_census::Miss::ContextCleared);
         self.context = None;
         self.blocks.clear();
+    }
+}
+
+/// MEASUREMENT ONLY (#2717, do not land): why each key left the cache, and
+/// which keys and PCs the dispatcher has decoded before.
+#[derive(Default)]
+struct CensusState {
+    lost: BTreeMap<BlockKey, decode_census::Miss>,
+    uncached: BTreeSet<BlockKey>,
+    pc_keys: BTreeMap<(u64, bool), BlockKey>,
+    totals: decode_census::DecodeCensus,
+}
+
+impl<C> DispatchCache<C> {
+    /// MEASUREMENT ONLY (#2717, do not land).
+    pub fn decode_census(&self) -> &decode_census::DecodeCensus {
+        &self.census.totals
+    }
+}
+
+impl CensusState {
+    fn lose_all<V>(&mut self, blocks: &BlockCache<BlockKey, V>, why: decode_census::Miss) {
+        match why {
+            decode_census::Miss::IcCleared => {
+                self.totals.ic_clears += 1;
+                self.totals.ic_cleared_blocks += blocks.len() as u64;
+            }
+            _ => {
+                self.totals.context_clears += 1;
+                self.totals.context_cleared_blocks += blocks.len() as u64;
+            }
+        }
+        for key in blocks.keys() {
+            self.lost.insert(*key, why);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        key: BlockKey,
+        ttbr0: u64,
+        frame: u64,
+        miss: decode_census::Miss,
+        stored: decode_census::Stored,
+        instructions: u32,
+        crosses_page: bool,
+        hit_limit: bool,
+        resident: usize,
+    ) {
+        let t = &mut self.totals;
+        t.decodes += 1;
+        *t.by_reason.entry((miss, stored)).or_default() += 1;
+        t.crosses_page += u64::from(crosses_page);
+        t.hit_limit += u64::from(hit_limit);
+        t.el1_decodes += u64::from(key.el1);
+        t.max_resident = t.max_resident.max(resident as u64);
+        let pc = t.by_pc.entry((key.pc, key.el1)).or_default();
+        pc.decodes += 1;
+        pc.el1 = key.el1;
+        pc.frame = frame;
+        pc.ttbr0 = ttbr0;
+        pc.instructions = instructions;
+        pc.crosses_page = crosses_page;
+        *pc.by_miss.entry(miss).or_default() += 1;
+        *pc.by_stored.entry(stored).or_default() += 1;
+        pc.ttbr0s.insert(ttbr0);
+        self.pc_keys.insert((key.pc, key.el1), key);
+        if stored == decode_census::Stored::Cached {
+            self.uncached.remove(&key);
+        } else {
+            self.uncached.insert(key);
+        }
+    }
+
+    fn classify_cold(&mut self, key: BlockKey) -> decode_census::Miss {
+        use decode_census::Miss;
+        if let Some(why) = self.lost.remove(&key) {
+            return why;
+        }
+        if self.uncached.contains(&key) {
+            return Miss::PreviouslyUncached;
+        }
+        match self.pc_keys.get(&(key.pc, key.el1)) {
+            Some(previous) if *previous != key => Miss::Rekeyed,
+            _ => Miss::FirstSight,
+        }
     }
 }
 
@@ -586,10 +678,15 @@ fn run_inner<X: ExecuteBlock>(
         None
     };
     if context.is_none() || residency.context != context {
+        residency
+            .census
+            .lose_all(&residency.blocks, decode_census::Miss::ContextCleared);
         residency.blocks.clear();
     }
     residency.context = context;
     let cache = &mut residency.blocks;
+    let census = &mut residency.census;
+    let census_on = true;
     let initial_undefined = cpu.undefined_el0_deliveries;
     let stop = loop {
         if blocks >= budget {
@@ -648,11 +745,28 @@ fn run_inner<X: ExecuteBlock>(
         };
         let uncached;
         let cached = cache.get(&key);
-        let (resident, (block, executable)) = if let Some(resident) =
-            cached.filter(|r| Some(r.identity) == code)
-        {
+        let frame_only = MEASURE_FRAME_ONLY_COMPARE.load(Ordering::Relaxed);
+        let (resident, (block, executable)) = if let Some(resident) = cached.filter(|r| {
+            if frame_only {
+                code.is_some_and(|c| c.frame == r.identity.frame)
+            } else {
+                Some(r.identity) == code
+            }
+        }) {
             (Some(resident), resident.prepared())
         } else {
+            let miss = if !census_on {
+                decode_census::Miss::FirstSight
+            } else {
+                match (cached, code) {
+                    (Some(_), None) => decode_census::Miss::FrameNotCodeNow,
+                    (Some(r), Some(c)) if r.identity.frame != c.frame => {
+                        decode_census::Miss::FrameChanged
+                    }
+                    (Some(_), Some(_)) => decode_census::Miss::GenerationChanged,
+                    (None, _) => census.classify_cold(key),
+                }
+            };
             if chaining && let Some(stale) = cached {
                 executor.unlink(Some(stale.identity.frame));
             }
@@ -696,8 +810,34 @@ fn run_inner<X: ExecuteBlock>(
             } else {
                 None
             };
+            if census_on {
+                let stored = match identity {
+                    Some(_) => decode_census::Stored::Cached,
+                    None if !retain_blocks => decode_census::Stored::RetainOff,
+                    None if !fetched_whole_block => decode_census::Stored::PartialFetch,
+                    None => decode_census::Stored::MarkRefused,
+                };
+                let instructions = prepared.0.guest().instructions();
+                let last_pc = instructions.last().map_or(cpu.pc.0, |i| i.pc().0);
+                census.record(
+                    key,
+                    cpu.named.ttbr0.0,
+                    frame.raw(),
+                    miss,
+                    stored,
+                    instructions.len() as u32,
+                    (last_pc ^ cpu.pc.0) >= CODE_PAGE_BYTES,
+                    instructions.len() >= limits.max_instructions,
+                    cache.len(),
+                );
+            }
             if let Some(identity) = identity {
-                let resident = cache.insert(key, Arc::new(ResidentBlock { identity, prepared }));
+                let (evicted, resident) =
+                    cache.insert_reporting(key, Arc::new(ResidentBlock { identity, prepared }));
+                if census_on && let Some(evicted) = evicted {
+                    census.lost.insert(evicted, decode_census::Miss::Evicted);
+                    census.totals.evictions += 1;
+                }
                 (Some(resident), resident.prepared())
             } else {
                 uncached = prepared;
@@ -799,6 +939,9 @@ fn run_inner<X: ExecuteBlock>(
                     Outcome::Event(event) => {
                         match event {
                             Event::Ic(_) => {
+                                if census_on {
+                                    census.lose_all(cache, decode_census::Miss::IcCleared);
+                                }
                                 cache.clear();
                                 if chaining {
                                     executor.unlink(None);
@@ -845,6 +988,7 @@ fn run_inner<X: ExecuteBlock>(
         // Without an inventory identity the code is not valid past this call.
         residency.clear();
     }
+    residency.census.totals.calls += 1;
     work.stage1_walks = memory.walks;
     Report {
         blocks,
@@ -1355,5 +1499,81 @@ mod tests {
         );
         assert_eq!(cpu.el1.elr, ProgramCounter(user_entry + 4));
         assert_eq!(cpu.el1.esr.0, (0x15 << 26) | (1 << 25));
+    }
+}
+
+/// MEASUREMENT ONLY (#2717, do not land): compare resident blocks by frame
+/// only, the hosted mutation run's "generation compare removed".
+pub static MEASURE_FRAME_ONLY_COMPARE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// MEASUREMENT ONLY (#2717 diagnosis, do not land): why each decoded block
+/// was not served from the resident cache.
+pub mod decode_census {
+
+    /// Why the block at this key was decoded.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Miss {
+        /// No block with this key or PC was ever decoded in this cache.
+        FirstSight,
+        /// The PC was decoded before under other stage-1 registers or EL.
+        Rekeyed,
+        /// Decoded before but never stored (see `Stored`).
+        PreviouslyUncached,
+        /// Evicted by the cache's FIFO capacity bound.
+        Evicted,
+        /// Dropped by `IC IALLU`/`IC IALLUIS`.
+        IcCleared,
+        /// Dropped when a call started with another context, or by `clear`.
+        ContextCleared,
+        /// Resident, but the frame's code generation advanced.
+        GenerationChanged,
+        /// Resident, but the PC now translates to another frame.
+        FrameChanged,
+        /// Resident, but the frame is no longer an executable code page.
+        FrameNotCodeNow,
+    }
+
+    /// Whether the decoded block was stored.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Stored {
+        Cached,
+        RetainOff,
+        /// A later word of the block did not fetch.
+        PartialFetch,
+        /// The memory owner gave no code generation for the frame.
+        MarkRefused,
+    }
+
+    /// Per-PC decode tally.
+    #[derive(Clone, Debug, Default)]
+    pub struct PcTally {
+        pub decodes: u64,
+        pub el1: bool,
+        pub frame: u64,
+        pub ttbr0: u64,
+        pub instructions: u32,
+        pub crosses_page: bool,
+        pub by_miss: alloc::collections::BTreeMap<Miss, u64>,
+        pub by_stored: alloc::collections::BTreeMap<Stored, u64>,
+        pub ttbr0s: alloc::collections::BTreeSet<u64>,
+    }
+
+    /// Aggregates for one `DispatchCache`.
+    #[derive(Clone, Debug, Default)]
+    pub struct DecodeCensus {
+        pub decodes: u64,
+        pub by_reason: alloc::collections::BTreeMap<(Miss, Stored), u64>,
+        pub crosses_page: u64,
+        pub hit_limit: u64,
+        pub el1_decodes: u64,
+        pub evictions: u64,
+        pub ic_clears: u64,
+        pub ic_cleared_blocks: u64,
+        pub context_clears: u64,
+        pub context_cleared_blocks: u64,
+        pub calls: u64,
+        pub max_resident: u64,
+        pub by_pc: alloc::collections::BTreeMap<(u64, bool), PcTally>,
     }
 }

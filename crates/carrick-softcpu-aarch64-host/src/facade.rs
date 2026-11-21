@@ -197,6 +197,8 @@ pub struct SoftStage2 {
     page_perms: BTreeMap<u64, MemPerms>,
     last_abort: Option<Stage2Abort>,
     _ipc_pin: Option<Arc<dyn IpcWindowBacking>>,
+    /// MEASUREMENT ONLY (#2717, do not land): `mark_code_page` refusals.
+    mark_refusals: BTreeMap<&'static str, u64>,
 }
 
 impl SoftStage2 {
@@ -210,6 +212,7 @@ impl SoftStage2 {
             page_perms: BTreeMap::new(),
             last_abort: None,
             _ipc_pin: None,
+            mark_refusals: BTreeMap::new(),
         })
     }
 
@@ -242,6 +245,30 @@ impl SoftStage2 {
             .get(&frame_gpa)
             .copied()
             .unwrap_or(window.default_perms)
+    }
+
+    /// MEASUREMENT ONLY (#2717, do not land): the window holding `gpa`.
+    fn describe_frame(&self, gpa: u64) -> String {
+        match self.window_for_range(gpa & !(GUEST_PAGE_BYTES - 1), PAGE_BYTES_USIZE) {
+            None => "no-window".to_owned(),
+            Some(win) => {
+                let perms = self.perms_for_frame(win, gpa & !(GUEST_PAGE_BYTES - 1));
+                format!(
+                    "{}{} window {:#x}..{:#x} perms r{}w{}x{}",
+                    if matches!(win._backing, WindowBacking::External) {
+                        "external"
+                    } else {
+                        "owned"
+                    },
+                    if win.shared { " shared" } else { "" },
+                    win.start,
+                    win.end,
+                    u8::from(perms.read),
+                    u8::from(perms.write),
+                    u8::from(perms.exec),
+                )
+            }
+        }
     }
 
     fn check_no_overlap(&self, start: u64, end: u64) -> Result<(), TrapError> {
@@ -659,7 +686,7 @@ impl SoftStage2 {
         let first = gpa & !(GUEST_PAGE_BYTES - 1);
         let last = (end - 1) & !(GUEST_PAGE_BYTES - 1);
         let mut frame = first;
-        while frame <= last {
+        while frame <= last && !measure_mutation("write-gpa") {
             self.extents
                 .invalidate_host_written_page(FrameGpa::new(frame), OWNER)
                 .map_err(|e| {
@@ -817,7 +844,7 @@ impl SoftGuestMemory for SoftStage2 {
             frame += GUEST_PAGE_BYTES;
         }
         let mut frame = first;
-        while frame <= last {
+        while frame <= last && !measure_mutation("guest-store") {
             self.extents
                 .invalidate_host_written_page(FrameGpa::new(frame), OWNER)
                 .map_err(|_| MemoryFault {
@@ -935,13 +962,42 @@ impl SoftGuestMemory for SoftStage2 {
     }
 
     fn mark_code_page(&mut self, frame: FrameGpa) -> Option<CodeGeneration> {
-        let win = self.window_for_range(frame.raw(), PAGE_BYTES_USIZE)?;
-        let perms = self.perms_for_frame(win, frame.raw());
-        if !(perms.read && perms.exec) {
-            return None;
-        }
-        let page = self.extents.authenticate_frame(frame, OWNER)?;
+        let refusal = (|| {
+            let Some(win) = self.window_for_range(frame.raw(), PAGE_BYTES_USIZE) else {
+                return Err("no-window");
+            };
+            let external = matches!(win._backing, WindowBacking::External);
+            let perms = self.perms_for_frame(win, frame.raw());
+            if !(perms.read && perms.exec) {
+                return Err(if external {
+                    "external-not-rx"
+                } else {
+                    "owned-not-rx"
+                });
+            }
+            let Some(page) = self.extents.authenticate_frame(frame, OWNER) else {
+                return Err(if external {
+                    "external-no-auth"
+                } else {
+                    "owned-no-auth"
+                });
+            };
+            Ok(page)
+        })();
+        let page = match refusal {
+            Ok(page) => page,
+            Err(why) => {
+                *self.mark_refusals.entry(why).or_default() += 1;
+                return None;
+            }
+        };
         let generation = self.extents.mark_code_page(page, &mut []);
+        if generation == 0 {
+            *self
+                .mark_refusals
+                .entry("generation-exhausted")
+                .or_default() += 1;
+        }
         (generation != 0).then_some(CodeGeneration(generation))
     }
 
@@ -1053,6 +1109,14 @@ impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
     #[must_use]
     pub const fn run_work(&self) -> RunWork {
         self.work
+    }
+
+    /// MEASUREMENT ONLY (#2717, do not land).
+    #[must_use]
+    pub fn decode_census(
+        &self,
+    ) -> Option<&carrick_softcpu_aarch64::dispatch::decode_census::DecodeCensus> {
+        self.code.as_ref().map(DispatchCache::decode_census)
     }
 
     fn sync_shared_overrides(&mut self) {
@@ -1586,8 +1650,9 @@ where
             cpu,
             monitor: ExclusiveMonitor::default(),
             executor,
-            code: (std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
-                != Some(std::ffi::OsStr::new("0")))
+            code: (!measure_mutation("init")
+                && std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
+                    != Some(std::ffi::OsStr::new("0")))
             .then(DispatchCache::default),
             stage2: Arc::clone(&stage2),
             control: Arc::clone(&control),
@@ -1636,6 +1701,22 @@ impl<X> SoftAarch64Vmm<X> {
 
     pub fn code_generation(&self, frame: FrameGpa) -> Result<Option<CodeGeneration>, TrapError> {
         Ok(self.stage2.try_borrow()?.code_generation(frame))
+    }
+
+    /// MEASUREMENT ONLY (#2717, do not land).
+    pub fn measure_mark_refusals(&self) -> Result<Vec<(&'static str, u64)>, TrapError> {
+        Ok(self
+            .stage2
+            .try_borrow()?
+            .mark_refusals
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect())
+    }
+
+    /// MEASUREMENT ONLY (#2717, do not land).
+    pub fn measure_describe_frame(&self, gpa: u64) -> Result<String, TrapError> {
+        Ok(self.stage2.try_borrow()?.describe_frame(gpa))
     }
 }
 
@@ -1838,7 +1919,7 @@ where
         let first = output & !(GUEST_PAGE_BYTES - 1);
         let last = end.saturating_sub(1) & !(GUEST_PAGE_BYTES - 1);
         let mut frame = first;
-        while frame <= last {
+        while frame <= last && !measure_mutation("publish") {
             let _ = stage2.invalidate_code_frame(FrameGpa::new(frame));
             frame += GUEST_PAGE_BYTES;
         }
@@ -2140,4 +2221,29 @@ where
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
         Arc::new(GenericVcpuRegistry::new())
     }
+}
+
+/// MEASUREMENT ONLY (#2717, do not land): `CARRICK_MEASURE_MUTATION` is a
+/// comma-separated list of invalidations to remove, so the hosted runner can
+/// show each stale-code witness red.
+fn measure_mutation(name: &str) -> bool {
+    static MUTATIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let mutations = MUTATIONS.get_or_init(|| {
+        let list = std::env::var("CARRICK_MEASURE_MUTATION").unwrap_or_default();
+        if let Some(capacity) = std::env::var("CARRICK_MEASURE_BLOCK_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            carrick_softmmu::block_cache::MEASURE_CAPACITY.store(capacity, Ordering::Relaxed);
+        }
+        carrick_softcpu_aarch64::dispatch::MEASURE_FRAME_ONLY_COMPARE.store(
+            list.split(',').any(|m| m == "generation-compare"),
+            Ordering::Relaxed,
+        );
+        list.split(',')
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    mutations.iter().any(|m| m == name)
 }
