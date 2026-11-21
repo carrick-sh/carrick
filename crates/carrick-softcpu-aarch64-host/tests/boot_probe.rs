@@ -1799,15 +1799,30 @@ const GLIBC_LOADER_SHA256: &str =
 const GLIBC_LIBC: &str = "/lib/libc.so.6";
 const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea90641a2c051c51fab7ac";
 
+fn read_counted_enosys(memory: &mut Pages) -> Vec<(u64, &'static str, u64)> {
+    use carrick_el1_abi::{Counters, EL1_COUNTERS_BASE};
+    use carrick_mem::linux_abi::syscall::lookup_aarch64;
+
+    let ring_base = EL1_COUNTERS_BASE + offset_of!(Counters, refused) as u64;
+    let venue_base = EL1_COUNTERS_BASE + offset_of!(Counters, venue_refused) as u64;
+    let mut out = Vec::new();
+    for nr in 0..512_u64 {
+        let count = read_u64(memory, ring_base + 8 * nr) + read_u64(memory, venue_base + 8 * nr);
+        if count != 0 {
+            let name = lookup_aarch64(nr).map_or("unknown", |call| call.name);
+            out.push((nr, name, count));
+        }
+    }
+    out
+}
+
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) against a pinned
-/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`).
-/// HVC #2 replies come from a test fixture (`DynamicRoot` in
-/// `tests/fixtures/dynamic_root.rs`), not from the production
-/// carrick-kernel / carrick-personality-linux dispatch.
+/// `CARRICK_A64_DYN_ROOT` (`scripts/ci/fetch-arm64-cross-libc.sh`), with zero
+/// `HVC #2` syscalls answered by the test fixture (`DynamicRoot`).
 #[test]
 #[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
-fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() {
+fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
     let root = std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT");
     let root = FixtureRoot::new(root.into());
     let hello = root.read("/hello").expect("read dynamic hello");
@@ -1826,10 +1841,106 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     let (mut cpu, mut memory) = stage_dynamic(&program, vec![b"/hello".to_vec()], Vec::new());
     let mut replies = DynamicRoot::new(root, "/hello");
     let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 1_000_000);
+    let counted_enosys = read_counted_enosys(&mut memory);
+    println!(
+        "glibc hello fixture_answered={} counted_enosys={counted_enosys:?}",
+        replies.answered
+    );
     assert_eq!(result, Ok(0));
     assert_eq!(replies.stdout, b"dynamic glibc hello\n");
     assert_glibc_jump_slots(&program, &mut memory, &replies, compiler);
     assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
+    assert_eq!(
+        replies.answered, 0,
+        "fixture answered {} HVC #2 syscalls (counted_enosys={counted_enosys:?}); expected production dispatch",
+        replies.answered,
+    );
+}
+
+/// Engine witness: static musl hello runs to exit on the soft CPU through the
+/// production EL1 vectors and trap path (`CARRICK_A64_ELF`), with zero `HVC #2`
+/// syscalls answered by the test fixture.
+#[test]
+#[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
+fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
+    use carrick_mem::{
+        elf::plan_elf_load_bytes,
+        linux_abi::{LINUX_AT_HWCAP, LINUX_AT_HWCAP2},
+        memory::{
+            LINUX_STACK_SIZE, build_linux_initial_stack, linux_auxv_from_load_plan_with_vdso,
+        },
+    };
+    use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
+    use std::process::Command;
+
+    let elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/musl_hello.rs");
+    let out = std::env::temp_dir().join(format!("carrick-musl-hello-full-{}", std::process::id()));
+    let status = Command::new("rustc")
+        .args([
+            "--target",
+            "aarch64-unknown-linux-musl",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "debuginfo=2",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(&fixture)
+        .status()
+        .expect("compile static musl hello with the pinned toolchain");
+    assert!(status.success());
+    let user_elf = std::fs::read(&out).expect("read musl hello");
+    std::fs::remove_file(&out).expect("remove compiled musl hello");
+
+    let plan = plan_elf_load_bytes(&user_elf).unwrap();
+    let mut auxv = linux_auxv_from_load_plan_with_vdso(&plan, None, false);
+    for entry in &mut auxv {
+        match entry.a_type {
+            LINUX_AT_HWCAP => entry.a_val = GUEST_CPU_PROFILE.hwcap().bits(),
+            LINUX_AT_HWCAP2 => entry.a_val = GUEST_CPU_PROFILE.hwcap2().bits(),
+            _ => {}
+        }
+    }
+    let (stack, sp, _) = build_linux_initial_stack(
+        vec![b"/musl-hello".to_vec()],
+        Vec::new(),
+        &auxv,
+        None,
+        LINUX_STACK_TOP,
+        LINUX_STACK_SIZE,
+    )
+    .unwrap();
+    let (mut cpu, mut memory, _) = enter_carrier_root(&elf, &user_elf);
+    for page in (stack.start..LINUX_STACK_TOP).step_by(PAGE as usize) {
+        memory.map_zero(page);
+    }
+    let (offset, bytes) = stack.shared_initialized_bytes();
+    memory.load(stack.start + offset, &bytes);
+    cpu.sp_el0 = StackPointer(sp);
+    admit_root_task_with_stdio(&mut memory);
+
+    let temp_root = std::env::temp_dir().join(format!("carrick-musl-root-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_root).unwrap();
+    std::fs::write(temp_root.join("musl-hello"), &user_elf).unwrap();
+    let mut replies = DynamicRoot::new(FixtureRoot::new(temp_root.clone()), "/musl-hello");
+    let result = run_dynamic_glibc(&mut cpu, &mut memory, &mut replies, 2_000_000);
+    let _ = std::fs::remove_dir_all(&temp_root);
+    let counted_enosys = read_counted_enosys(&mut memory);
+    println!(
+        "musl hello result={result:?} fixture_answered={} counted_enosys={counted_enosys:?}",
+        replies.answered
+    );
+    assert_eq!(result, Ok(0));
+    assert_eq!(replies.stdout, b"hello, aarch64 world\n");
+    assert_eq!(
+        replies.answered, 0,
+        "fixture answered {} HVC #2 syscalls (counted_enosys={counted_enosys:?}); expected production dispatch",
+        replies.answered,
+    );
 }
 
 /// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
@@ -2134,6 +2245,7 @@ fn run_dynamic_glibc(
         *forwarded.entry(nr).or_default() += 1;
         // exit_group is terminal: the mailbox request supplies its status.
         if name == "exit_group" {
+            replies.count_terminal_exit();
             break Ok(args[0]);
         }
         match replies.reply(memory, name, args) {
