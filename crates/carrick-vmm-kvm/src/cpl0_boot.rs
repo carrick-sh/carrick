@@ -781,8 +781,27 @@ impl Cpl0Carrier {
             env,
             limits,
         )?;
+        // The syscall clock reads this ring-owned copy, never the user page.
+        if let Some(vvar) = vvar {
+            self.publish_realtime_offset(vvar.realtime_offset())?;
+        }
         self.custody
             .set_clock_vvar(vvar.filter(|_| with_vdso.is_some()));
+        Ok(())
+    }
+
+    fn publish_realtime_offset(&self, offset_ns: u64) -> Result<(), TrapError> {
+        let zone = self
+            .custody
+            .ram()
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("realtime calibration zone"))?;
+        // SAFETY: the loaded carrier retains the aligned production zone in
+        // its metadata window; the published word is a single atomic.
+        unsafe { &*zone.cast::<X86Cpl0Zone>() }.publish_realtime_offset(offset_ns);
         Ok(())
     }
 

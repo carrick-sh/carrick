@@ -5938,6 +5938,11 @@ impl HvfVmState {
         // Replacing the syscall base on exec would strand older vvar pages on
         // a different base, allowing successive fast/slow reads to go backwards.
         let realtime_off = crate::vdso::set_realtime_off_ns(unix_ns.wrapping_sub(mono_ns));
+        // The ring's syscall clock reads this carrier-owned copy, never the
+        // user vvar page, which a guest can unmap or replace.
+        if let Some(zone) = carrick_el1_abi::zone_tables() {
+            zone.publish_realtime_offset(realtime_off);
+        }
 
         let base = crate::vdso::LINUX_VVAR_BASE;
         // A load path without the vDSO has no vvar page: the guest then uses
