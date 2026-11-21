@@ -174,6 +174,24 @@ impl crate::file::MemoryValidator for ResidentUser {
     }
 }
 
+struct TaskLifecycleVenue;
+impl crate::lifecycle::LifecycleVenue for TaskLifecycleVenue {
+    fn thread<'a>(
+        &'a self,
+        task: &'a CurrentTask,
+    ) -> Option<crate::lifecycle::LifecycleThread<'a>> {
+        let (page, slot) = task.lifecycle_refs()?;
+        Some(crate::lifecycle::LifecycleThread { page, slot })
+    }
+    fn born_slot(
+        &self,
+        _page: &ThreadLifecyclePage,
+        _entry: carrick_el1_abi::EntryRef,
+    ) -> Option<&ThreadControlSlot> {
+        None
+    }
+}
+
 fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(2);
@@ -596,7 +614,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         };
 
     let mut frame = carrick_el1_abi::TrapFrame {
-        slot: u64::from(fixture.slot.raw()),
+        slot: fixture.slot.index() as u64,
         ..Default::default()
     };
     assert!(
@@ -826,6 +844,11 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     );
     let (page_ref, control_ref) = fixture.task.lifecycle_refs().unwrap();
     let names = carrick_el1_abi::InotifyNameCache::new();
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        crate::common_entry::execution_binding(&fixture.task),
+        successor_binding.address,
+    ));
     {
         let mut arm_service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,
@@ -851,7 +874,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
                 user: &crate::sched::HardwareUserWord,
             }),
             None,
-            None,
+            Some(&TaskLifecycleVenue),
             page_ref,
             control_ref,
             &saved.native,
@@ -868,59 +891,20 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     }
     drain_carrier_service(POLL_ROUNDS);
 
-    // The child's `_exit(7)` woke the host-owned parent parked in `wait4(-1)`.
+    // The child's `_exit(7)` woke the parent parked in `wait4(-1)`;
+    // `Sched::serve_idle_entry` switches the parent in, resumes its `wait4`
+    // checkpoint in ring, and returns `Action::Served` with the reaped child.
     assert!(
-        !run_idle_until_child_or_parent(POLL_ROUNDS, &mut frame),
-        "idle entry must hand the woken host-owned parent back to its executor"
+        run_idle_until_child_or_parent(POLL_ROUNDS, &mut frame),
+        "idle entry must resume the woken parent in wait4(-1)"
     );
-    fixture.zone.drive(fixture.slot, 1);
-    let switched = fixture.zone.switch_in_full(fixture.slot).unwrap();
-    assert_eq!(switched.record, parent_binding.record.id);
-    fixture.task.set(
-        El1TaskId::from_linux_tid(41),
-        carrick_el1_abi::SnapshotGeneration::from_raw(task_serial),
-        root_file_table,
-    );
-    fixture.task.mm.key.store(1, Ordering::Release);
-    fixture
-        .task
-        .mm
-        .thread_generation
-        .store(101, Ordering::Release);
-    fixture
-        .task
-        .publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
-    fixture
-        .task
-        .publish_host_loaded(41, parent_binding.address.generation);
-    {
-        let mut arm_service = Aarch64NativeProcessService::with_crossing(
-            &fixture.task,
-            fixture.slot,
-            fixture.zone,
-            fixture.region.table(),
-            NonZeroU64::MIN,
-            crossing,
-        )
-        .with_words(words);
-        assert_eq!(
-            crate::aarch64_process::resume_production_with_service(
-                fixture.zone,
-                &fixture.task,
-                fixture.slot,
-                parent_binding.record.id,
-                &mut arm_service,
-            ),
-            crate::sched::ResumeAction::Left
-        );
-    }
-    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
-        doorbell.settled();
-    }
-    // SAFETY: yield_current_to_host stored the completed wait4 return in the parent's record.
-    let parent_ctx = unsafe { *fixture.zone.record(parent_binding.record.id).ctx_mut() };
     assert_eq!(
-        parent_ctx.native.x[0],
+        fixture.zone.slot(fixture.slot).current(),
+        Some(parent_binding.record.id),
+        "woken parent must be the running record after wait4(-1) completes"
+    );
+    assert_eq!(
+        frame.x[0],
         u64::from(child_pid),
         "parent wait4(-1) must return the exited child's pid"
     );
