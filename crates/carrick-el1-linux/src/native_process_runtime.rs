@@ -1376,6 +1376,22 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         total
     }
 
+    /// Own `(user, system)` CPU nanoseconds: retired usage and every live
+    /// member sampled at `now`.
+    #[inline(never)]
+    fn process_cpu_nanos(
+        &self,
+        frequency: carrick_guest_arch::CounterFrequency,
+        now: carrick_guest_arch::CounterTick,
+    ) -> (u64, u64) {
+        let ticks = self.process_cpu_ticks(Some(now));
+        let nanos = |time: core::time::Duration| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+        (
+            nanos(self.usage.user_time).saturating_add(ticks.user_nanos(frequency)),
+            nanos(self.usage.system_time).saturating_add(ticks.system_nanos(frequency)),
+        )
+    }
+
     fn member_rusage(&self, record: RecordRef) -> TaskRusage {
         let Some(frequency) = self.zone.counter_frequency() else {
             return TaskRusage::default();
@@ -9541,6 +9557,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(visible.get())
     }
 }
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'_, 'a, M, C, S>
+{
+    /// The ring counter frequency and a sample, after publishing the
+    /// frequency the zone CPU ledger converts with.
+    #[inline(never)]
+    fn cpu_clock(
+        &mut self,
+    ) -> Option<(
+        carrick_guest_arch::CounterFrequency,
+        carrick_guest_arch::CounterTick,
+    )> {
+        let frequency = self.service.signal_frequency().ok()?;
+        let now = self.service.signal_now().ok()?;
+        self.source.zone.publish_counter_frequency(frequency);
+        Some((frequency, now))
+    }
+}
+
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<'a, C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
@@ -9559,9 +9594,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         Some((now, frequency))
     }
     fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
-        let frequency = self.service.signal_frequency().ok()?;
-        let now = self.service.signal_now().ok()?;
-        self.source.zone.publish_counter_frequency(frequency);
+        let (frequency, now) = self.cpu_clock()?;
         if per_thread {
             let ticks = self
                 .source
@@ -9571,18 +9604,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             return Some(self.source.zone.ratchet_record_cpu_ns(self.record, nanos));
         }
         let graph = self.runtime.graph.lock();
-        let task = graph.owner.task(self.key).ok()?;
-        let resources = task.native().resources();
-        let ticks = resources.process_cpu_ticks(Some(now));
-        let base_ns = u64::try_from(
-            resources
-                .usage
-                .user_time
-                .saturating_add(resources.usage.system_time)
-                .as_nanos(),
-        )
-        .unwrap_or(u64::MAX);
-        let nanos = base_ns.saturating_add(ticks.total_nanos(frequency));
+        let resources = graph.owner.task(self.key).ok()?.native().resources();
+        let (user, system) = resources.process_cpu_nanos(frequency, now);
+        let nanos = user.saturating_add(system);
         Some(
             resources
                 .cpu
@@ -9592,27 +9616,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         )
     }
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
-        let frequency = self.service.signal_frequency().ok()?;
-        let now = self.service.signal_now().ok()?;
-        self.source.zone.publish_counter_frequency(frequency);
+        let (frequency, now) = self.cpu_clock()?;
         let graph = self.runtime.graph.lock();
         let task = graph.owner.task(self.key).ok()?;
-        let resources = task.native().resources();
-        let own_ticks = resources.process_cpu_ticks(Some(now));
-        let own_user_ns = u64::try_from(resources.usage.user_time.as_nanos())
-            .unwrap_or(u64::MAX)
-            .saturating_add(own_ticks.user_nanos(frequency));
-        let own_sys_ns = u64::try_from(resources.usage.system_time.as_nanos())
-            .unwrap_or(u64::MAX)
-            .saturating_add(own_ticks.system_nanos(frequency));
+        let (user, system) = task.native().resources().process_cpu_nanos(frequency, now);
         let children = task.children_rusage();
-        let child_user_ns = u64::try_from(children.user_time.as_nanos()).unwrap_or(u64::MAX);
-        let child_sys_ns = u64::try_from(children.system_time.as_nanos()).unwrap_or(u64::MAX);
+        let ticks = |nanos: u64| (nanos / 10_000_000) as i64;
+        let child =
+            |time: core::time::Duration| ticks(u64::try_from(time.as_nanos()).unwrap_or(u64::MAX));
         Some(carrick_syscall_abi::LinuxTms {
-            tms_utime: (own_user_ns / 10_000_000) as i64,
-            tms_stime: (own_sys_ns / 10_000_000) as i64,
-            tms_cutime: (child_user_ns / 10_000_000) as i64,
-            tms_cstime: (child_sys_ns / 10_000_000) as i64,
+            tms_utime: ticks(user),
+            tms_stime: ticks(system),
+            tms_cutime: child(children.user_time),
+            tms_cstime: child(children.system_time),
         })
     }
     fn realtime_counter(
