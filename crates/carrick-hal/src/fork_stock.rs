@@ -1817,7 +1817,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .pending_descriptor_tables
             .get(&pending_key)
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        if self.child_owner(owner.mm()) != Some(owner) || pending.root != root {
+        if !self.descriptor_owner_matches(owner, root) || pending.root != root {
             return Err(ForkStockServiceError::StaleExecution);
         }
         let pending = self
