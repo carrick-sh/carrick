@@ -1062,6 +1062,10 @@ const OBJECT_EXPIRED: u32 = 1;
 const OBJECT_HOST_CONTINUATION: u32 = 2;
 const OWNER_CONTINUATION: u32 = 4;
 const OWNER_EXCEPTION_ENTRY: u32 = 8;
+/// The record is linked by [`ObjectWaitGuard::park_retained_rechecked`]: its
+/// wake, result and operation were settled before the park, which only
+/// defers when it runs. A wake re-queues it without replacing them.
+const RETAINED_WAIT: u32 = 16;
 
 /// The entry whose native context the retained owner parked.
 #[derive(
@@ -1146,6 +1150,13 @@ impl ObjectRecord {
     pub(super) fn reset_completion_flags(&self) {
         self.expired.store(0, Ordering::Relaxed);
     }
+
+    /// Whether the current park is a retained deferral
+    /// ([`ObjectWaitGuard::park_retained_rechecked`]): its wake keeps the
+    /// record's settled handback and result.
+    pub(super) fn retained_wait(&self) -> bool {
+        self.expired.load(Ordering::Acquire) & RETAINED_WAIT != 0
+    }
 }
 
 /// The queue guard also authenticates its zone, index and incarnation. It
@@ -1164,17 +1175,19 @@ struct EnrollmentRollback<'g, 'z, C: Copy + Send + Sync + zerocopy::FromZeros = 
     queue: &'g ObjectWaitGuard<'z, C>,
     record: RecordId,
     armed: bool,
+    /// The park installed its operation (a retained park installed none).
+    installed_operation: bool,
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for EnrollmentRollback<'_, '_, C> {
     fn drop(&mut self) {
         if self.armed {
             self.queue.unlink(self.record);
-            self.queue
-                .zone
-                .record(self.record)
-                .object
-                .operation
-                .store(0, Ordering::Release);
+            let rec = self.queue.zone.record(self.record);
+            if self.installed_operation {
+                rec.object.operation.store(0, Ordering::Release);
+            } else {
+                rec.end_retained_wait();
+            }
         }
     }
 }
@@ -1525,6 +1538,76 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             still_blocked,
         )
     }
+    /// Defer a switched-in record that may not run yet (its address space
+    /// refused the install) until this queue's release, without touching
+    /// what it resumes with. Unlike every other park, the record's wait is
+    /// already over: its operation token, completion flags, deadline,
+    /// handback and result stay exactly as its switch-in found them, and a
+    /// wake only queues it again ([`ZoneTables::mark_woken`]), so its next
+    /// switch-in sees the same resume. A host claim treats it as the woken
+    /// thread it is (`settle_claimed_handback`), never as an interrupted wait.
+    ///
+    /// The record must be `OnCpu` on its slot with no wait registration. A
+    /// false recheck, a moved epoch or a host request that won `OnCpu`
+    /// returns it unchanged to its running owner.
+    pub fn park_retained_rechecked(
+        &self,
+        snapshot: ObjectWaitSnapshot,
+        record: RecordId,
+        still_blocked: impl FnOnce() -> bool,
+    ) -> Result<(), ObjectWaitError> {
+        if snapshot.key != self.key {
+            return Err(ObjectWaitError::Stale);
+        }
+        if snapshot.epoch != self.queue().epoch.load(Ordering::Relaxed) {
+            return Err(ObjectWaitError::Changed);
+        }
+        let rec = self.zone.record(record);
+        let observed = rec.claim();
+        if rec.object.queue.load(Ordering::Relaxed) != 0
+            || rec.entry_count() != 0
+            || !matches!(observed, Claim::OnCpu { .. })
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
+        rec.object
+            .generation
+            .store(self.key.generation, Ordering::Relaxed);
+        rec.object
+            .expired
+            .fetch_or(RETAINED_WAIT, Ordering::Relaxed);
+        let tail = self.queue().tail.load(Ordering::Relaxed);
+        rec.object.prev.store(tail, Ordering::Relaxed);
+        rec.object.next.store(NIL, Ordering::Relaxed);
+        rec.object.queue.store(self.key.index, Ordering::Release);
+        if let Some(tail) = RecordId::from_raw(tail) {
+            self.zone
+                .record(tail)
+                .object
+                .next
+                .store(record.raw(), Ordering::Relaxed);
+        } else {
+            self.queue().head.store(record.raw(), Ordering::Relaxed);
+        }
+        self.queue().tail.store(record.raw(), Ordering::Relaxed);
+        let mut rollback = EnrollmentRollback {
+            queue: self,
+            record,
+            armed: true,
+            installed_operation: false,
+        };
+        if !still_blocked() || snapshot.epoch != self.queue().epoch.load(Ordering::SeqCst) {
+            return Err(ObjectWaitError::Changed);
+        }
+        if !self
+            .zone
+            .publish_retained_park(record, self.zone.next_seq(record), observed)
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
+        rollback.armed = false;
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)] // One enrollment transaction for both execution destinations.
     fn park_until_rechecked(
         &self,
@@ -1580,6 +1663,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             queue: self,
             record,
             armed: true,
+            installed_operation: true,
         };
         if !still_blocked() || snapshot.epoch != self.queue().epoch.load(Ordering::SeqCst) {
             return Err((ObjectWaitError::Changed, operation));
@@ -1849,6 +1933,29 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             operation_generation: self.object.operation_generation.load(Ordering::Relaxed),
         };
         (census.queue != 0 || census.operation != 0).then_some(census)
+    }
+
+    /// End a retained deferral's registration; true when one was set. It
+    /// borrowed only the link, so an anonymous-edit replay token gets back
+    /// the incarnation it was issued for (its token generation, by
+    /// construction), which census checks pair with it.
+    pub(super) fn end_retained_wait(&self) -> bool {
+        if self
+            .object
+            .expired
+            .fetch_and(!RETAINED_WAIT, Ordering::AcqRel)
+            & RETAINED_WAIT
+            == 0
+        {
+            return false;
+        }
+        if self.object_operation_kind() == Some(OperationKind::AnonymousEdit) {
+            self.object.generation.store(
+                self.object.operation_generation.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+        true
     }
 
     pub fn has_object_operation(&self) -> bool {
@@ -2690,6 +2797,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             };
             if rec.object.queue.load(Ordering::Acquire) == index {
                 guard.unlink(record);
+                // The claim owner, not a wake, ended a retained deferral.
+                rec.end_retained_wait();
             }
             return;
         }
@@ -4723,6 +4832,211 @@ mod host_tests {
         );
         // SAFETY: the test owns the switched-in context.
         assert_eq!(unsafe { rec.take_object_operation() }.unwrap().index(), 77);
+    }
+
+    /// A timed object park that expired, then switched in: what a retained
+    /// deferral must hand back unchanged on its next switch-in.
+    fn switched_in_expired_operation(zone: &ZoneTables) -> RecordId {
+        let record = park_home_until(zone, 1, 1_000);
+        assert_eq!(
+            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(true)
+        );
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(switched.result, None);
+        // A word no release writes, so an overwritten result is visible.
+        zone.record(record).result.store(0x66, Ordering::Relaxed);
+        record
+    }
+
+    fn park_retained(
+        zone: &ZoneTables,
+        index: u32,
+        record: RecordId,
+    ) -> Result<(), ObjectWaitError> {
+        let guard = zone
+            .object_wait(key(index), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        let parked = guard.park_retained_rechecked(guard.snapshot(), record, || true);
+        drop(guard);
+        if parked.is_ok() {
+            zone.clear_current(SLOT);
+        }
+        parked
+    }
+
+    /// The wait state a retained deferral must not touch.
+    fn retained_state(rec: &ZoneRecord) -> (Option<Handback>, u64, u64, bool, bool) {
+        (
+            rec.handback(),
+            rec.result(),
+            rec.object.operation.load(Ordering::Acquire),
+            rec.object_wait_expired(),
+            rec.object.retained_wait(),
+        )
+    }
+
+    /// #2660: a record whose space refused its install parks on the release
+    /// queue with its settled wait (operation, expiry, handback, result,
+    /// deadline) untouched, and the host-side release re-queues it so its
+    /// next switch-in resumes exactly as the refused one would have.
+    #[test]
+    fn retained_park_resumes_its_settled_wait_after_a_host_release() {
+        let zone = fixture(true);
+        let record = switched_in_expired_operation(&zone);
+        let rec = zone.record(record);
+        let before = retained_state(rec);
+        let deadline = rec.deadline.load(Ordering::Relaxed);
+        park_retained(&zone, 2, record).unwrap();
+        assert!(matches!(rec.claim(), Claim::Parked { .. }));
+        assert_eq!(
+            zone.timer_deadline(SLOT),
+            None,
+            "no timer for a retained park"
+        );
+        assert_eq!(rec.deadline.load(Ordering::Relaxed), deadline);
+        assert!(rec.object.retained_wait());
+        assert_eq!(
+            notify(&zone, 1).0.visited,
+            0,
+            "not on its operation's queue"
+        );
+        assert_eq!(notify(&zone, 2).0.queued, 1);
+        assert!(matches!(rec.claim(), Claim::Queued { slot, .. } if slot == SLOT));
+        assert_eq!(retained_state(rec), before);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(
+            switched.result, None,
+            "the SVC re-enters with its registers"
+        );
+        // SAFETY: the test owns the switched-in context.
+        assert_eq!(unsafe { rec.take_object_operation() }.unwrap().index(), 77);
+    }
+
+    /// The in-guest release path (an EL1 waker) keeps the settled wait too,
+    /// including a woken scalar wait's result.
+    #[test]
+    fn retained_park_keeps_a_woken_result_through_an_el1_release() {
+        let zone = fixture(true);
+        let record = switched_in_expired_operation(&zone);
+        let rec = zone.record(record);
+        // SAFETY: the test owns the switched-in context.
+        assert!(unsafe { rec.take_object_operation() }.is_some());
+        rec.result.store(0x55, Ordering::Relaxed);
+        rec.handback
+            .store(Handback::Woken as u32, Ordering::Release);
+        park_retained(&zone, 2, record).unwrap();
+        let guard = zone
+            .object_wait(key(2), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        let mut effects = crate::WakeEffects::default();
+        assert_eq!(guard.notify_object(SLOT, &mut effects).unwrap().queued, 1);
+        drop(guard);
+        assert!(!rec.object.retained_wait());
+        assert_eq!(rec.handback(), Some(Handback::Woken));
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(
+            switched.result,
+            Some(0x55),
+            "the wake's result, not the release's"
+        );
+    }
+
+    /// A space release queue is a completion queue: a retained deferral
+    /// parks there too, and its release (placed or handed) still keeps what
+    /// the record resumes with.
+    #[test]
+    fn retained_park_on_a_completion_queue_keeps_the_settled_wait() {
+        let zone = fixture(true);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.into_parts();
+        };
+        zone.bind_object_wait_with_completion(key(5), &SpinForever, &completion)
+            .unwrap();
+        let record = switched_in_expired_operation(&zone);
+        let rec = zone.record(record);
+        let before = retained_state(rec);
+        let guard = zone
+            .object_wait_with_completion(key(5), &SpinForever, &completion)
+            .unwrap();
+        guard
+            .park_retained_rechecked(guard.snapshot(), record, || true)
+            .unwrap();
+        drop(guard);
+        zone.clear_current(SLOT);
+        let guard = zone
+            .object_wait_with_completion(key(5), &SpinForever, &completion)
+            .unwrap();
+        let mut effects = crate::WakeEffects::default();
+        guard.notify_object(SLOT, &mut effects).unwrap();
+        drop(guard);
+        assert!(!matches!(rec.claim(), Claim::Parked { .. }));
+        let (handback, result, operation, expired, _) = before;
+        assert_eq!(
+            retained_state(rec),
+            (handback, result, operation, expired, false)
+        );
+    }
+
+    /// A host claim of a retained deferral treats it as the woken thread it
+    /// is: the claimant's signal follows the resume, the settled operation
+    /// stays, and the marker never outlives the registration.
+    #[test]
+    fn retained_park_host_claim_keeps_the_settled_wait() {
+        let zone = fixture(true);
+        let record = switched_in_expired_operation(&zone);
+        let rec = zone.record(record);
+        // SAFETY: the test owns the switched-in context.
+        assert!(unsafe { rec.take_object_operation() }.is_some());
+        rec.handback
+            .store(Handback::Woken as u32, Ordering::Release);
+        park_retained(&zone, 2, record).unwrap();
+        assert_eq!(
+            zone.claim_for_host(
+                zone.record_ref(record),
+                None,
+                Handback::Signal,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+            ),
+            crate::HostClaim::Claimed
+        );
+        assert_eq!(rec.handback(), Some(Handback::Woken));
+        assert!(!rec.object.retained_wait());
+        assert_eq!(notify(&zone, 2).0.visited, 0, "unlinked");
+    }
+
+    /// A release between the refusal and the enrolment reruns the install:
+    /// the record stays with its running owner, unchanged and unlinked.
+    #[test]
+    fn retained_park_rerun_leaves_the_record_running_unchanged() {
+        let zone = fixture(true);
+        let record = switched_in_expired_operation(&zone);
+        let rec = zone.record(record);
+        let before = retained_state(rec);
+        let guard = zone
+            .object_wait(key(2), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        assert_eq!(
+            guard.park_retained_rechecked(guard.snapshot(), record, || false),
+            Err(ObjectWaitError::Changed)
+        );
+        drop(guard);
+        assert!(matches!(rec.claim(), Claim::OnCpu { .. }));
+        assert_eq!(retained_state(rec), before);
+        assert_eq!(notify(&zone, 2).0.visited, 0);
     }
 
     /// A notification before the deadline wins: the expiry finds nothing to

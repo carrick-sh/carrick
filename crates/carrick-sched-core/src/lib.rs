@@ -3368,6 +3368,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         true
     }
 
+    /// [`Self::publish_object_park`] for a retained deferral
+    /// ([`object_wait::ObjectWaitGuard::park_retained_rechecked`]): the
+    /// record keeps its handback and deadline, and no timer is armed (its
+    /// wait already ended; only the queue's release ends this park).
+    pub(crate) fn publish_retained_park(&self, record: RecordId, seq: u32, from: Claim) -> bool {
+        let rec = self.record(record);
+        if !matches!(from, Claim::OnCpu { .. }) {
+            return false;
+        }
+        let previous_seq = rec.last_seq.load(Ordering::Relaxed);
+        rec.last_seq.store(seq, Ordering::Relaxed);
+        if !rec.cas(from, Claim::Parked { seq }) {
+            rec.last_seq.store(previous_seq, Ordering::Relaxed);
+            return false;
+        }
+        rec.host_wanted.clear();
+        true
+    }
+
     /// Publish a single-entry guest park, or undo its enrollment when a
     /// host request won OnCpu first. The caller owns the running context
     /// and the entry's bucket lock. No record access follows a successful CAS.
@@ -3938,6 +3957,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     fn mark_woken(&self, rec: &ZoneRecord<C>, result: u64) {
+        // A retained deferral resumes with what its own wake settled.
+        if rec.end_retained_wait() {
+            return;
+        }
         rec.result.store(result, Ordering::Relaxed);
         // Readiness schedules the saved operation entry, never a synthetic
         // syscall result. The operation's exact endpoint remains pinned by
@@ -6152,7 +6175,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                         return HostClaim::Stale;
                     }
                     if let Some(transfer) = self.begin_host_transfer(r, claim) {
-                        rec.handback.store(kind as u32, Ordering::Release);
+                        if rec.object.retained_wait() {
+                            // Its wait already ended: as for a queued thread,
+                            // the claimant's action follows its resume.
+                            rec.settle_claimed_handback(kind);
+                        } else {
+                            rec.handback.store(kind as u32, Ordering::Release);
+                        }
                         self.unlink_all(r.id, wait, completion);
                         if let Some(counter) = self.counters.host_claims.get(kind as usize) {
                             counter.fetch_add(1, Ordering::Relaxed);
