@@ -2179,6 +2179,7 @@ mod forward_execution_tests {
         let predecessor = ReservationMm::new(INITIAL_MM_KEY).expect("predecessor MM");
         let successor = ReservationMm::new(INITIAL_MM_KEY + 1).expect("successor MM");
         let predecessor_context = fixture.root_binding.context();
+        let carrier = fixture.custody.0.fork_stock.carrier();
         let execution = carrick_hal::fork_stock::GrantExecution::new(
             carrick_guest_arch::CpuId::new(0),
             carrick_el1_abi::ExecutionBinding {
@@ -2194,12 +2195,58 @@ mod forward_execution_tests {
         // handle only to exercise the production fork-stock adoption path.
         let successor_owner = unsafe {
             carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                fixture.custody.0.fork_stock.carrier(),
+                carrier,
                 successor,
                 NonZeroU64::new(2).expect("successor generation"),
             )
         };
-        let receipt = fixture
+        // The neutral exec owner adopts the exact same predecessor/successor
+        // pair. Its successful RootCustody settlement is the only release
+        // authority the production custody coordinator may accept.
+        let predecessor_owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier,
+                predecessor,
+                predecessor_context.generation.raw(),
+            )
+        };
+        let identity = carrick_core_abi::service::ServiceIdentity {
+            birth: carrick_core_abi::service::ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Initial,
+                process: carrick_sched_core::process::TaskKey {
+                    id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                        core::num::NonZeroI32::new(41).expect("task id"),
+                    ),
+                    serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                        NonZeroU64::new(7).expect("task serial"),
+                    ),
+                },
+                thread: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+                record: carrick_sched_core::RecordRef {
+                    id: carrick_sched_core::RecordId::from_raw(1).expect("record"),
+                    incarnation: 1,
+                },
+                mm: predecessor_owner,
+            },
+            execution: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            sequence: NonZeroU64::MIN,
+        };
+        let mut owner = carrick_hal::exec_owner::ExecPreparations::<()>::default();
+        let adoption_receipt = owner
+            .claim(
+                identity,
+                successor,
+                NonZeroU64::new(2).expect("successor generation"),
+            )
+            .expect("root exec claim")
+            .receipt();
+        owner.stage(adoption_receipt, ()).expect("root exec stage");
+        owner.seal(adoption_receipt).expect("root exec seal");
+        let adoption = owner
+            .adopt(adoption_receipt, predecessor)
+            .expect("root exec adoption");
+
+        let stock_receipt = fixture
             .custody
             .0
             .fork_stock
@@ -2213,9 +2260,13 @@ mod forward_execution_tests {
             )
             .map_err(|(error, _)| error)
             .expect("adopt root exec predecessor");
-        assert_eq!(receipt.predecessor(), predecessor);
-        assert_eq!(receipt.successor(), successor);
-        fixture.custody.0.exec_predecessors.push(receipt);
+        assert_eq!(stock_receipt.predecessor(), predecessor);
+        assert_eq!(stock_receipt.successor(), successor);
+        fixture
+            .custody
+            .0
+            .exec_predecessors
+            .adopt(adoption.mm.receipt(), stock_receipt);
 
         let zone =
             anonymous_owner::retained_cow_zone(&fixture.custody.0.ram).expect("retained zone");
@@ -2235,9 +2286,60 @@ mod forward_execution_tests {
             .settle_exec_predecessors()
             .expect("unrelated quarantine drain");
         assert_eq!(
-            fixture.custody.0.exec_predecessors.len(),
+            fixture.custody.0.exec_predecessors.adopted_len(),
             1,
             "slot absence cannot spend an unsettled exec predecessor receipt"
+        );
+        assert_eq!(
+            fixture.custody.0.exec_predecessors.release_permitted_len(),
+            0,
+            "the unrelated drain cannot grant release authority"
+        );
+
+        let carrick_hal::exec_owner::ExecSettlement::Root(settlement) = owner
+            .settle(
+                predecessor,
+                successor,
+                carrick_el1_abi::ExecCommitEffects::COMPLETE,
+                carrick_hal::exec_owner::ExecSettleLane::RootCustody,
+            )
+            .expect("matching root settlement")
+        else {
+            panic!("initial exec settles as root custody");
+        };
+        assert!(
+            fixture
+                .custody
+                .0
+                .exec_predecessors
+                .permit_release(settlement.settled()),
+            "the exact typed settlement grants release authority"
+        );
+        assert_eq!(fixture.custody.0.exec_predecessors.adopted_len(), 0);
+        assert_eq!(
+            fixture.custody.0.exec_predecessors.release_permitted_len(),
+            1
+        );
+
+        fixture
+            .custody
+            .0
+            .settle_exec_predecessors()
+            .expect("post-settlement predecessor release");
+        assert_eq!(
+            fixture.custody.0.exec_predecessors.release_permitted_len(),
+            0,
+            "the exact fork-stock receipt releases"
+        );
+        fixture
+            .custody
+            .0
+            .settle_exec_predecessors()
+            .expect("second drain has nothing to release");
+        assert_eq!(
+            fixture.custody.0.exec_predecessors.release_permitted_len(),
+            0,
+            "the receipt releases exactly once"
         );
     }
 }
@@ -4289,8 +4391,9 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// the successors staged before their arm, the requests parked on the
     /// fork stock's release, and the adopted execs awaiting settlement.
     exec_owner: exec_service::X86ExecOwner,
-    /// Adopted execs whose predecessor custody awaits its settlement.
-    exec_predecessors: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
+    /// Adopted exec predecessor custody, split before and after the exact
+    /// exec-owner settlement grants release authority.
+    exec_predecessors: exec_service::ExecPredecessorCustody,
     /// The run root's adopted exec awaiting its settlement (#2142): the
     /// successor MM and the loader's Kernel half, which the settlement hands
     /// to the executor. At most one: the root has one thread group.
@@ -5730,7 +5833,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             exec_owner: exec_service::X86ExecOwner::default(),
-            exec_predecessors: Vec::new(),
+            exec_predecessors: exec_service::ExecPredecessorCustody::default(),
             root_exec_load: None,
             anonymous_pending: [None, None],
             cow_published: [None, None],
