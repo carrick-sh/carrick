@@ -552,6 +552,172 @@ fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
     }
 }
 
+/// #2701: a fork leaves a prepared, never-touched leaf to be armed
+/// copy-on-write when it becomes resident. A kernel write (a syscall's
+/// copy-out, a signal frame) commits that leaf inside the owner selection,
+/// which makes it a valid read-only leaf. The selection must then take its
+/// COW arm for the refused write, exactly as it does when the first
+/// translation refuses; before the fix it answered `MmError::Fault`.
+#[test]
+fn committed_inherited_prepared_leaf_takes_the_cow_arm_for_a_kernel_write() {
+    use carrick_el1::fault::{CowResolution, CowResolver, PreparedPageResolver};
+    use carrick_el1_abi::FrameGrantResidencyIdentity;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPreparedCommit, GuestPreparedCommitError, LeafAccess,
+        SubstrateGpa, commit_existing_el1_prepared_page,
+    };
+
+    struct Prepared<'a> {
+        tables: &'a Tables,
+        commits: u32,
+    }
+    impl PreparedPageResolver for Prepared<'_> {
+        fn commit_prepared(
+            &mut self,
+            ttbr0: u64,
+            va: u64,
+            expected_ipa: u64,
+            access: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            self.commits += 1;
+            // SAFETY: Tables owns an aligned, live primary image for this MM.
+            unsafe {
+                commit_existing_el1_prepared_page(
+                    self.tables.words.as_ptr().cast_mut(),
+                    ttbr0,
+                    self.tables.words.len() * 8,
+                    None,
+                    va,
+                    expected_ipa,
+                    access,
+                )
+            }
+        }
+    }
+    /// The pool is empty: the arm must ask for a COW supply window.
+    struct EmptyPool {
+        asked: Vec<u64>,
+    }
+    impl CowResolver for EmptyPool {
+        fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+            false
+        }
+        fn resolve_cow_outcome(&mut self, _: u64, _: u64, far: u64) -> CowResolution {
+            self.asked.push(far);
+            CowResolution::NeedsSupply
+        }
+    }
+
+    /// `SW_FORK_COW_DEFERRED`: the fork's marker on an invalid prepared leaf.
+    const FORK_COW_DEFERRED: u64 = 1 << 59;
+    let (length, page_offset) = (4 * 4096u64, 2 * 4096u64);
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 8, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    let later = VA + page_offset;
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    let outcome = execute_descriptor_op(
+        &words,
+        SubstrateGpa(ROOT),
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: length,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(6),
+                mapping_id: nz(7),
+                owner_generation: nz(8),
+                inventory_revision: nz(9),
+            },
+        },
+        &TableGrants::NONE,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        matches!(outcome, DescriptorOutcome::Applied(_)),
+        "{outcome:?}"
+    );
+    // What the owner fork leaves in the parent and the child for this page.
+    let leaf = &tables.words[1536 + (page_offset / 4096) as usize];
+    let prepared_leaf = leaf.load(Ordering::Acquire);
+    assert_eq!(
+        prepared_leaf & 1,
+        0,
+        "the later page is prepared, not valid"
+    );
+    leaf.store(prepared_leaf | FORK_COW_DEFERRED, Ordering::Release);
+    let residency = residency();
+    residency
+        .publish(FrameGrantResidencyIdentity {
+            mm_key: mm.raw(),
+            semantic_base: VA,
+            physical_ipa: IPA,
+            len: length,
+            mapping_id: 7,
+            frame_id: 6,
+            owner_generation: 8,
+            inventory_revision: 9,
+        })
+        .unwrap();
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(later + 5),
+            8,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let mut prepared = Prepared {
+        tables: &tables,
+        commits: 0,
+    };
+    let mut cow = EmptyPool { asked: Vec::new() };
+    let step = portal.select(
+        &transfer,
+        &words,
+        carrick_core::mm::transaction::SelectionVenues {
+            prepared: &mut prepared,
+            cow: &mut cow,
+            residency: &residency,
+            slot: 0,
+        },
+    );
+    let committed = leaf.load(Ordering::Acquire);
+    assert_eq!(
+        prepared.commits, 1,
+        "the prepared leaf commits exactly once"
+    );
+    assert_eq!(
+        (committed & 1, committed & FORK_COW_DEFERRED),
+        (1, 0),
+        "the commit made the leaf valid and consumed the fork marker: {committed:#x}"
+    );
+    assert_eq!(
+        cow.asked,
+        [later + 5],
+        "the write the committed leaf refuses takes the COW arm once: {step:?}"
+    );
+    assert!(
+        matches!(&step, Ok(TransferStep::CowSupply(window)) if window.fault_page == later),
+        "an empty pool asks for this page's COW supply, never Fault: {step:?}"
+    );
+}
+
 #[test]
 fn owner_grant_rejects_recycled_range_after_host_reconciliation() {
     use carrick_el1::memory::reservations::{Decision, Placement, ReservationFaultPlan};
