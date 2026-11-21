@@ -18,7 +18,27 @@
  *  11 the parent maps RW, writes a marker and makes it R before the fork;
  *     the child widens the inherited page to RW and overwrites it; the
  *     parent's marker must be unchanged (the frame stays private)
+ * #2620 multi-run: one mprotect over a range whose backing is two or more
+ * runs split by never-touched pages (92 = a page's protection afterwards
+ * is wrong, 93 = the injected refusal was not consumed):
+ *  12 pages 0-1 and 3-5 of a PROT_NONE reserve committed RW and touched,
+ *     page 2 never touched; mprotect all six PROT_NONE; every page faults
+ *  13 V8's code chunk (64 pages): header RW touched, guard page PROT_NONE
+ *     never touched, 60 code pages written then R|X, one RW page never
+ *     touched, trailing guard PROT_NONE; the whole chunk to PROT_NONE
+ *  14 as 13, the whole chunk to R|W: every byte kept, every page writable
+ *  15 as 12, all six to PROT_READ: bytes kept, every page read-only
+ *  16 as 15 with the second run's permission step refused (test-support
+ *     injection, Carrick only): ENOSYS and every page's protection as it
+ *     was before the call
+ *  17 a 64-page reserve: page 0 committed RW and touched, pages 8-15
+ *     committed RW, code written, flipped R|X; the whole reserve to R|W
+ *     (bytes kept, holes writable), then to R|X: writes fault and the code
+ *     runs
  * The parent propagates the child's exit status. */
+
+#define INJECT_PROTECT_REFUSAL_AT_SECOND_STEP 0xfffffffffffffe31
+#define INJECT_PROTECT_REFUSAL_CENSUS 0xfffffffffffffe32
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
 .macro MMAP len, prot, flags
@@ -43,6 +63,75 @@
     syscall
     test %rax, %rax
     js fail
+.endm
+/* The page at \off(%r15) must fault on a read (\write = 0) or a write:
+ * a grandchild touches it and must die of SIGSEGV. */
+.macro EXPECT_FAULT off, write
+    mov $57, %eax
+    syscall
+    test %eax, %eax
+    js harness
+    jnz 1f
+    lea \off(%r15), %rdi
+.if \write
+    movb $1, (%rdi)
+.else
+    movb (%rdi), %al
+.endif
+    xor %edi, %edi
+    mov $231, %eax
+    syscall
+    ud2
+1:  mov %eax, %edi
+    lea probe_status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %eax, %eax
+    js harness
+    mov probe_status(%rip), %eax
+    and $127, %eax
+    cmp $11, %eax
+    jne prot_wrong
+.endm
+/* The byte at \off(%r15) must read \value (a fault kills the child). */
+.macro EXPECT_BYTE off, value
+    cmpb $\value, \off(%r15)
+    jne prot_wrong
+.endm
+/* U1: a PROT_NONE reserve of six pages, pages 0-1 and 3-5 committed RW and
+ * marked 0xa5, page 2 never touched. */
+.macro TWO_RUNS
+    MMAP $0x6000, $0, $0x4022
+    MPROTECT %r15, $0x2000, $3
+    movb $0xa5, (%r15)
+    movb $0xa5, 0x1000(%r15)
+    lea 0x3000(%r15), %r14
+    MPROTECT %r14, $0x3000, $3
+    movb $0xa5, 0x3000(%r15)
+    movb $0xa5, 0x4000(%r15)
+    movb $0xa5, 0x5000(%r15)
+.endm
+/* V8's code chunk: page 0 header RW (0xa5), page 1 guard PROT_NONE never
+ * touched, pages 2-61 code (0xc3) then R|X, page 62 RW never touched,
+ * page 63 guard PROT_NONE. Backing: runs [0] and [2, 61]. */
+.macro CODE_CHUNK
+    MMAP $0x40000, $0, $0x4022
+    MPROTECT %r15, $0x40000, $3
+    movb $0xa5, (%r15)
+    lea 0x1000(%r15), %r14
+    MPROTECT %r14, $0x1000, $0
+    lea 0x2000(%r15), %rbx
+    lea 0x3e000(%r15), %r13
+2:  movb $0xc3, (%rbx)
+    add $4096, %rbx
+    cmp %r13, %rbx
+    jb 2b
+    lea 0x2000(%r15), %r14
+    MPROTECT %r14, $0x3c000, $5
+    lea 0x3f000(%r15), %r14
+    MPROTECT %r14, $0x1000, $0
 .endm
 .macro WRITE_CODE addr
     mov \addr, %rdi
@@ -96,6 +185,9 @@ harness:
     jmp exit
 private_lost:
     mov $90, %edi
+    jmp exit
+prot_wrong:
+    mov $92, %edi
     jmp exit
 
 #if CASE == 6
@@ -163,6 +255,109 @@ child:
     cmpb $0xa5, (%r15)
     jne harness
     jmp done
+#elif CASE == 12
+    TWO_RUNS
+    MPROTECT %r15, $0x6000, $0
+    EXPECT_FAULT 0x0000, 0
+    EXPECT_FAULT 0x1000, 0
+    EXPECT_FAULT 0x2000, 0
+    EXPECT_FAULT 0x3000, 0
+    EXPECT_FAULT 0x5000, 0
+    jmp done
+#elif CASE == 13
+    CODE_CHUNK
+    MPROTECT %r15, $0x40000, $0
+    EXPECT_FAULT 0x0000, 0
+    EXPECT_FAULT 0x1000, 0
+    EXPECT_FAULT 0x2000, 0
+    EXPECT_FAULT 0x3d000, 0
+    EXPECT_FAULT 0x3e000, 0
+    EXPECT_FAULT 0x3f000, 0
+    jmp done
+#elif CASE == 14
+    CODE_CHUNK
+    MPROTECT %r15, $0x40000, $3
+    EXPECT_BYTE 0x0000, 0xa5
+    EXPECT_BYTE 0x1000, 0
+    EXPECT_BYTE 0x2000, 0xc3
+    EXPECT_BYTE 0x3d000, 0xc3
+    EXPECT_BYTE 0x3e000, 0
+    EXPECT_BYTE 0x3f000, 0
+    mov %r15, %rbx
+    lea 0x40000(%r15), %r13
+3:  movb $0x5a, (%rbx)
+    cmpb $0x5a, (%rbx)
+    jne prot_wrong
+    add $4096, %rbx
+    cmp %r13, %rbx
+    jb 3b
+    jmp done
+#elif CASE == 15
+    TWO_RUNS
+    MPROTECT %r15, $0x6000, $1
+    EXPECT_BYTE 0x0000, 0xa5
+    EXPECT_BYTE 0x1000, 0xa5
+    EXPECT_BYTE 0x2000, 0
+    EXPECT_BYTE 0x3000, 0xa5
+    EXPECT_BYTE 0x5000, 0xa5
+    EXPECT_FAULT 0x0000, 1
+    EXPECT_FAULT 0x2000, 1
+    EXPECT_FAULT 0x3000, 1
+    EXPECT_FAULT 0x5000, 1
+    jmp done
+#elif CASE == 16
+    TWO_RUNS
+    mov $INJECT_PROTECT_REFUSAL_AT_SECOND_STEP, %rax
+    syscall
+    test %rax, %rax
+    jnz harness
+    mov %r15, %rdi
+    mov $0x6000, %esi
+    mov $1, %edx
+    mov $10, %eax
+    syscall
+    cmp $-38, %rax
+    jne prot_wrong
+    mov $INJECT_PROTECT_REFUSAL_CENSUS, %rax
+    syscall
+    cmp $1, %rax
+    jne refusal_unconsumed
+    /* Run 0 was edited, then restored: pages 0-1 and 3-5 stay RW with
+     * their bytes, page 2 stays PROT_NONE. */
+    EXPECT_BYTE 0x0000, 0xa5
+    EXPECT_BYTE 0x1000, 0xa5
+    EXPECT_BYTE 0x3000, 0xa5
+    EXPECT_BYTE 0x5000, 0xa5
+    movb $0x5a, (%r15)
+    movb $0x5a, 0x1000(%r15)
+    movb $0x5a, 0x3000(%r15)
+    movb $0x5a, 0x5000(%r15)
+    EXPECT_FAULT 0x2000, 0
+    jmp done
+refusal_unconsumed:
+    mov $93, %edi
+    jmp exit
+#elif CASE == 17
+    MMAP $0x40000, $0, $0x4022
+    MPROTECT %r15, $0x1000, $3
+    movb $0xa5, (%r15)
+    lea 0x8000(%r15), %r14
+    MPROTECT %r14, $0x8000, $3
+    WRITE_CODE %r14
+    MPROTECT %r14, $0x8000, $5
+    MPROTECT %r15, $0x40000, $3
+    EXPECT_BYTE 0x0000, 0xa5
+    EXPECT_BYTE 0x8000, 0xbf
+    movb $0x5a, 0x4000(%r15)
+    movb $0x5a, 0x3f000(%r15)
+    EXPECT_BYTE 0x4000, 0x5a
+    MPROTECT %r15, $0x40000, $5
+    EXPECT_FAULT 0x0000, 1
+    EXPECT_FAULT 0x4000, 1
+    EXPECT_FAULT 0x8000, 1
+    lea 0x8000(%r15), %r14
+    call *%r14
+    jmp done
 #else
 #error CASE
 #endif
@@ -184,4 +379,5 @@ exit:
 .section .bss
 .balign 4
 status: .space 4
+probe_status: .space 4
 .section .note.GNU-stack,"",@progbits

@@ -6520,6 +6520,19 @@ fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOut
         .expect("mprotect shape run")
 }
 
+/// The non-zero anonymous-memory leave counters, by [`AnonymousLeave`] index.
+///
+/// [`AnonymousLeave`]: carrick_el1_abi::AnonymousLeave
+fn anonymous_leaves(counters: &carrick_el1_abi::Counters) -> Vec<(usize, u64)> {
+    counters
+        .anonymous_leaves
+        .iter()
+        .enumerate()
+        .map(|(leave, c)| (leave, c.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|(_, c)| *c != 0)
+        .collect()
+}
+
 macro_rules! mprotect_shape_witness {
     ($name:ident, $case:expr, $doc:expr $(, #[$attr:meta])*) => {
         #[doc = $doc]
@@ -6539,9 +6552,11 @@ macro_rules! mprotect_shape_witness {
             let mprotect = |bucket: &[std::sync::atomic::AtomicU64]| {
                 bucket[10].load(std::sync::atomic::Ordering::Acquire)
             };
+            let leaves = anonymous_leaves(&counters);
             eprintln!(
                 "case {} exit {} (x86 nr 9 mmap, 10 mprotect, 11 munmap) served {:?} forwarded {:?} \
-                 refused {:?} refused_child {:?} venue_refused {:?} venue_refused_child {:?}",
+                 refused {:?} refused_child {:?} venue_refused {:?} venue_refused_child {:?} \
+                 anonymous_leaves {:?}",
                 $case,
                 outcome.run.exit_code,
                 at(&counters.served),
@@ -6550,6 +6565,7 @@ macro_rules! mprotect_shape_witness {
                 at(&counters.refused_child),
                 at(&counters.venue_refused),
                 at(&counters.venue_refused_child),
+                leaves,
             );
             assert_eq!(
                 (outcome.run.exit_code, outcome.run.terminating_signal),
@@ -6638,3 +6654,71 @@ mprotect_shape_witness!(
     "The parent makes a marked page R before fork; the child widens it to RW \
      and overwrites it; the parent's marker is unchanged."
 );
+mprotect_shape_witness!(
+    production_mprotect_spans_two_backed_runs_around_an_untouched_page,
+    12,
+    "#2620: pages 0-1 and 3-5 of a reserve committed RW and touched, page 2 \
+     never touched; one mprotect makes all six PROT_NONE and each one faults.",
+    #[ignore = "#2737: x86 refuses PROT_NONE over a backed page (the Protect lowering needs readable)"]
+);
+mprotect_shape_witness!(
+    production_mprotect_frees_a_v8_code_chunk_with_a_guard_hole,
+    13,
+    "#2620: V8's code chunk (header, untouched guard, 60 touched code pages \
+     R|X, an untouched page, guard) set PROT_NONE whole; each page faults.",
+    #[ignore = "#2737: x86 refuses PROT_NONE over a backed page (the Protect lowering needs readable)"]
+);
+mprotect_shape_witness!(
+    production_mprotect_makes_a_v8_code_chunk_with_a_guard_hole_rw,
+    14,
+    "#2620: the same chunk set R|W whole: every byte kept, every page writable.",
+    #[ignore = "#2737: x86 refuses PROT_NONE over a backed page (the Protect lowering needs readable)"]
+);
+mprotect_shape_witness!(
+    production_mprotect_makes_two_backed_runs_read_only,
+    15,
+    "#2620: the two-run range set PROT_READ: bytes kept, writes fault on the \
+     backed pages and on the untouched one."
+);
+
+mprotect_shape_witness!(
+    production_mprotect_flips_a_reserve_with_two_backed_runs_rw_then_rx,
+    17,
+    "#2620: a 64-page reserve with page 0 and an R|X code area backed, the \
+     rest never touched: set R|W whole (bytes kept, holes writable), then R|X \
+     whole (writes fault, the code runs)."
+);
+
+/// #2620: a multi-run mprotect is all or nothing. The test-support injection
+/// refuses the permission step of the second backed run, after the first run
+/// was edited: the call leaves the ring (ENOSYS in a native child) and every
+/// page keeps the protection it had before it (the fixture checks each page;
+/// 93 = the injected refusal never ran).
+#[test]
+fn production_mprotect_refused_on_its_second_run_restores_the_first() {
+    let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &["-DCASE=16"]);
+    // The injection exists only in the test-support build of the production
+    // CPL0 entry.
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .expect("mprotect refusal run");
+    let counters = outcome.physical.syscall_counters().expect("counters");
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Acquire);
+    let leaves = anonymous_leaves(&counters);
+    eprintln!(
+        "case 16 exit {} mprotect refused_child {} anonymous_leaves {:?}",
+        outcome.run.exit_code,
+        load(&counters.refused_child[10]),
+        leaves,
+    );
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 16 child exit (7 = refused whole and restored): {:?}",
+        outcome.run
+    );
+    assert_eq!(
+        load(&counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::EditRefused as usize]),
+        1,
+        "the second run's refused step is the one leave: {leaves:?}"
+    );
+}

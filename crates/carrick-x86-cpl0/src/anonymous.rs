@@ -644,6 +644,10 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
         root: carrick_guest_arch::AddressSpaceRegister,
         edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
     ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::take_protect_refusal() {
+            return Err(carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous);
+        }
         let root = root.raw();
         self.edit(
             RootGpa::page_aligned(FrameGpa::new(root))

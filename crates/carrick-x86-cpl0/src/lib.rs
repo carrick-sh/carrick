@@ -151,6 +151,28 @@ mod test_support {
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE: u64 = 0xffff_ffff_ffff_fe2c;
     /// Owner waits the armed hold refused and released before their park.
     pub const INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe2d;
+    /// The next mprotect's second permission step (its second backed run)
+    /// refuses, so the shared decision must restore the first run (#2620).
+    pub const INJECT_PROTECT_REFUSAL_AT_SECOND_STEP: u64 = 0xffff_ffff_ffff_fe31;
+    /// Permission steps the armed injection refused.
+    pub const INJECT_PROTECT_REFUSAL_CENSUS: u64 = 0xffff_ffff_ffff_fe32;
+    /// Permission steps left before the armed refusal (0: disarmed).
+    static PROTECT_STEPS_BEFORE_REFUSAL: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0);
+    static PROTECT_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Called before each permission step: true refuses this one.
+    pub fn take_protect_refusal() -> bool {
+        let refused = PROTECT_STEPS_BEFORE_REFUSAL
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok_and(|left| left == 1);
+        if refused {
+            PROTECT_REFUSALS.fetch_add(1, Ordering::AcqRel);
+        }
+        refused
+    }
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -667,6 +689,11 @@ mod test_support {
             INJECT_EDITOR_RELEASED_BEFORE_PARK_CENSUS => {
                 Some(EARLY_RELEASES.load(Ordering::Acquire))
             }
+            INJECT_PROTECT_REFUSAL_AT_SECOND_STEP => PROTECT_STEPS_BEFORE_REFUSAL
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_PROTECT_REFUSAL_CENSUS => Some(PROTECT_REFUSALS.load(Ordering::Acquire)),
             INJECT_COW_SETTLE_TIMED_OUT => {
                 Some(u64::from(COW_SETTLE_TIMED_OUT.load(Ordering::Acquire)))
             }

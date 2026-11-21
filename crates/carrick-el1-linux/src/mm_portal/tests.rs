@@ -4422,6 +4422,236 @@ fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
     );
 }
 
+/// #2620 (ARM twin of the KVM `native_child_mprotect_shapes.S` cases 12, 15
+/// and 16): one guest `mprotect` (nr 226) over six pages whose backing is two
+/// runs, pages 0-1 and 3-5, with page 2 never touched, is served in ring
+/// through the delegated production entry: PROT_NONE, then R|W, each applied
+/// to every backed leaf while page 2 stays without a terminal. A refusal of
+/// the second run's step, after the first run was edited, is all or nothing:
+/// the call leaves the ring (`EditRefused`) and every leaf keeps the
+/// protection it had; the root's proposal is withdrawn, so the next call is
+/// served.
+#[test]
+fn delegated_mprotect_spans_two_backed_runs_all_or_nothing() {
+    use carrick_el1::memory::{
+        AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor,
+        DelegatedAnonymous, Stage1Backing, serve_delegated_anonymous,
+    };
+    use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
+        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
+        LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    /// The production test editor, refusing its `refuse_at`-th permission
+    /// step (1-based; 0 never).
+    struct Refusing<'a> {
+        inner: ForkAnonymousEditor<'a>,
+        steps: usize,
+        refuse_at: usize,
+    }
+    impl AnonymousBackingProbe for Refusing<'_> {
+        fn backing(
+            &mut self,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            va: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
+        ) -> Stage1Backing {
+            self.inner.backing(ttbr0, va, len)
+        }
+        fn stock_span(
+            &mut self,
+            mm: carrick_el1_abi::ReservationMm,
+            va: carrick_guest_arch::UserVa,
+        ) -> Option<carrick_guest_arch::UserRange> {
+            self.inner.stock_span(mm, va)
+        }
+    }
+    impl AnonymousPermissionEditor for Refusing<'_> {
+        fn protect_and_invalidate(
+            &mut self,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            edit: GuestPermissionEdit,
+        ) -> Result<(), GuestPermissionEditError> {
+            self.steps += 1;
+            if self.steps == self.refuse_at {
+                return Err(GuestPermissionEditError::NotPrivateAnonymous);
+            }
+            self.inner.protect_and_invalidate(ttbr0, edit)
+        }
+    }
+    impl AnonymousRetirementEditor for Refusing<'_> {
+        fn retire_and_invalidate(
+            &mut self,
+            mm: carrick_el1_abi::ReservationMm,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            address: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
+        ) -> Result<(), GuestRetirementError> {
+            self.inner.retire_and_invalidate(mm, ttbr0, address, len)
+        }
+    }
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let _mm = admit(&region, &spaces, 77, ROOT, 6, 0);
+    let parent_tables = Tables::new(ROOT, IPA, 0);
+    let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    for (n, (offset, len)) in [(0, 0x2000), (0x3000, 0x3000)].into_iter().enumerate() {
+        let n = n as u64 * 4;
+        let prepared = execute_descriptor_op(
+            &parent_tables.live(&CallerInvalidatesAsid),
+            SubstrateGpa(ROOT),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: VA + offset,
+                    ipa: IPA + offset,
+                    len,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(VA + offset, len),
+                backing: BackingIdentity {
+                    frame_id: nz(n + 1),
+                    mapping_id: nz(n + 2),
+                    owner_generation: nz(n + 3),
+                    inventory_revision: nz(n + 4),
+                },
+            },
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        );
+        assert!(
+            matches!(prepared, DescriptorOutcome::Applied(_)),
+            "{prepared:?}"
+        );
+    }
+    let arenas = [&parent_tables, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let leaf = |page: u64| -> u64 {
+        let va = VA + page * 4096;
+        let mut table = ROOT;
+        for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+            let descriptor = words.load(table + ((va >> shift) & 511) * 8).unwrap();
+            if level == 3 || descriptor & 3 != 3 {
+                return descriptor;
+            }
+            table = descriptor & 0x0000_ffff_ffff_f000;
+        }
+        unreachable!()
+    };
+    let counters = Box::new(Counters::default());
+    let guest_mprotect = |prot: u64, refuse_at: usize| {
+        let task = CurrentTask::new();
+        task.execution.task.store(177, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(77, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA;
+        frame.x[1] = 0x6000;
+        frame.x[2] = prot;
+        frame.x[8] = 226;
+        let mut editor = Refusing {
+            inner: ForkAnonymousEditor {
+                arenas: &arenas,
+                pool: TableWindow {
+                    words: supply.words.as_ptr().cast_mut(),
+                    physical_base: supply.base,
+                    byte_len: supply.words.len() * 8,
+                },
+            },
+            steps: 0,
+            refuse_at,
+        };
+        let route = serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        );
+        (route, frame.x[0] as i64, editor.steps)
+    };
+    let leaves = || {
+        counters
+            .anonymous_leaves
+            .iter()
+            .map(|leave| leave.load(Ordering::Relaxed))
+            .collect::<Vec<_>>()
+    };
+    let backed = [0, 1, 3, 4, 5];
+    let assert_access = |what: &str, read: bool, write: bool| {
+        for page in backed {
+            let d = leaf(page);
+            assert_eq!(
+                (
+                    terminal_descriptor_permits_el0(d, LeafAccess::Read),
+                    terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                ),
+                (read, write),
+                "{what}: page {page} descriptor {d:#x}"
+            );
+        }
+        assert_eq!(
+            leaf(2),
+            0,
+            "{what}: the untouched page stays without a terminal"
+        );
+    };
+
+    // One step per run, both served in ring.
+    assert_eq!(
+        guest_mprotect(0, 0),
+        (DelegatedAnonymous::Served, 0, 2),
+        "PROT_NONE over two runs; leaves {:?}",
+        leaves()
+    );
+    assert_access("PROT_NONE", false, false);
+    assert_eq!(
+        guest_mprotect(3, 0),
+        (DelegatedAnonymous::Served, 0, 2),
+        "R|W over two runs; leaves {:?}",
+        leaves()
+    );
+    assert_access("R|W", true, true);
+    assert!(leaves().iter().all(|&n| n == 0), "{:?}", leaves());
+
+    // The second run's step refuses: the first run was made read-only, then
+    // restored to R|W (one restore step), and the call leaves the ring.
+    assert_eq!(
+        guest_mprotect(1, 2),
+        (DelegatedAnonymous::Forward, 0x4000_0000, 3),
+        "refused on its second run"
+    );
+    assert_access("after the refused PROT_READ", true, true);
+    let mut expected = vec![0; AnonymousLeave::COUNT];
+    expected[AnonymousLeave::EditRefused as usize] = 1;
+    assert_eq!(leaves(), expected, "exactly one EditRefused leave");
+
+    // The refused proposal was withdrawn: the same call is served next.
+    assert_eq!(
+        guest_mprotect(1, 0),
+        (DelegatedAnonymous::Served, 0, 2),
+        "PROT_READ after the refusal"
+    );
+    assert_access("PROT_READ", true, false);
+}
+
 #[test]
 fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
