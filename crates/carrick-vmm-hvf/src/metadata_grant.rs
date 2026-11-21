@@ -588,7 +588,12 @@ impl CarrierMetadataAccess {
         let region = access.region().ok()?;
         carrick_hal::host_residency::install_host_residency_resolver(
             region.as_ptr() as usize,
-            Arc::new(access.clone()),
+            Arc::new(
+                carrick_hal::host_residency::WeakHostMetadataPinResolver::new(
+                    &access.carrier,
+                    generation,
+                ),
+            ),
         );
         Some(access)
     }
@@ -706,13 +711,20 @@ impl MetadataExtentResolver for CarrierMetadataAccess {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_hal::host_residency::HostMetadataPinResolver for CarrierMetadataAccess {
-    fn pin_dynamic(
+impl carrick_hal::host_residency::HostMetadataPinOwner for crate::trap::PersistentCarrierMappings {
+    type Generation = crate::trap::CarrierVmGeneration;
+
+    fn pin_dynamic_in(
         &self,
+        generation: crate::trap::CarrierVmGeneration,
         extent: MetadataExtent,
     ) -> Result<carrick_hal::host_residency::DynamicResidencyPin, MetadataResolutionError> {
-        self.pin(extent)
-            .map(carrick_hal::host_residency::DynamicResidencyPin::new)
+        HostMetadataExtentResolver {
+            custody: &self.custody,
+            generation,
+        }
+        .pin(extent)
+        .map(carrick_hal::host_residency::DynamicResidencyPin::new)
     }
 }
 

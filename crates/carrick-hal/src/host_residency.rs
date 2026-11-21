@@ -6,7 +6,7 @@
 //! behind monotonic `Arc` snapshots keyed to the exact live carrier region.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use carrick_el1_abi::{
     EL1_BOOTSTRAP_METADATA_BASE, EL1_BOOTSTRAP_METADATA_OFFSET, EL1_BOOTSTRAP_METADATA_SIZE,
@@ -46,6 +46,51 @@ pub trait HostMetadataPinResolver: Send + Sync {
         &self,
         extent: MetadataExtent,
     ) -> Result<DynamicResidencyPin, MetadataResolutionError>;
+}
+
+/// Owner of dynamic metadata extents for one carrier generation, such as the
+/// carrier mapping set that backs them.
+pub trait HostMetadataPinOwner: Send + Sync + 'static {
+    type Generation: Copy + Send + Sync + 'static;
+
+    fn pin_dynamic_in(
+        &self,
+        generation: Self::Generation,
+        extent: MetadataExtent,
+    ) -> Result<DynamicResidencyPin, MetadataResolutionError>;
+}
+
+/// Resolver for the process-global slot that never keeps its owner alive.
+///
+/// The slot is cleared only when the carrier mapping drops, so a strong
+/// reference from the slot to the carrier would be a cycle through a static:
+/// the carrier would never drop. This resolver holds a `Weak` owner and fails
+/// closed with `StaleOwner` once the owner is gone.
+pub struct WeakHostMetadataPinResolver<O: HostMetadataPinOwner> {
+    owner: Weak<O>,
+    generation: O::Generation,
+}
+
+impl<O: HostMetadataPinOwner> WeakHostMetadataPinResolver<O> {
+    pub fn new(owner: &Arc<O>, generation: O::Generation) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            generation,
+        }
+    }
+}
+
+impl<O: HostMetadataPinOwner> HostMetadataPinResolver for WeakHostMetadataPinResolver<O> {
+    fn pin_dynamic(
+        &self,
+        extent: MetadataExtent,
+    ) -> Result<DynamicResidencyPin, MetadataResolutionError> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        owner.pin_dynamic_in(self.generation, extent)
+    }
 }
 
 struct ResolverAdapter<'a>(Option<&'a dyn HostMetadataPinResolver>);
@@ -481,6 +526,115 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("install must not drop the replaced resolver under its lock");
+    }
+
+    /// Carrier stand-in: pins only in its live generation, and its drop clears
+    /// the global resolver slot the way a carrier mapping teardown does.
+    struct CarrierOwner {
+        region_ptr: usize,
+        live_generation: u64,
+        host: NonNull<u8>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    // SAFETY: `host` is a fixture address that is never dereferenced.
+    unsafe impl Send for CarrierOwner {}
+    unsafe impl Sync for CarrierOwner {}
+    impl HostMetadataPinOwner for CarrierOwner {
+        type Generation = u64;
+        fn pin_dynamic_in(
+            &self,
+            generation: u64,
+            extent: MetadataExtent,
+        ) -> Result<DynamicResidencyPin, MetadataResolutionError> {
+            if generation != self.live_generation {
+                return Err(MetadataResolutionError::StaleOwner);
+            }
+            Ok(DynamicResidencyPin::new(FixturePin(extent, self.host)))
+        }
+    }
+    impl Drop for CarrierOwner {
+        fn drop(&mut self) {
+            clear_host_residency_resolver(self.region_ptr);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    struct FixturePin(MetadataExtent, NonNull<u8>);
+    // SAFETY: the fixture never dereferences `host_base`.
+    unsafe impl Send for FixturePin {}
+    unsafe impl Sync for FixturePin {}
+    unsafe impl PinnedMetadataExtent for FixturePin {
+        fn extent(&self) -> MetadataExtent {
+            self.0
+        }
+        fn host_base(&self) -> NonNull<u8> {
+            self.1
+        }
+    }
+
+    fn carrier_owner(region_ptr: usize) -> (Arc<CarrierOwner>, Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner = Arc::new(CarrierOwner {
+            region_ptr,
+            live_generation: 3,
+            host: NonNull::new(0x4000_0000 as *mut u8).unwrap(),
+            dropped: Arc::clone(&dropped),
+        });
+        (owner, dropped)
+    }
+
+    fn installed_resolver(region_ptr: usize) -> Option<Arc<dyn HostMetadataPinResolver>> {
+        HOST_RESIDENCY_RESOLVER
+            .lock()
+            .as_ref()
+            .and_then(|(ptr, resolver)| (*ptr == region_ptr).then(|| Arc::clone(resolver)))
+    }
+
+    #[test]
+    fn weak_resolver_pins_while_owner_lives_and_fails_closed_after_drop() {
+        let _guard = TEST_REGION_LOCK.lock();
+        let region_ptr = 0x7100_0000;
+        let extent = MetadataExtent::new(0x4000_0000, 0x1000, 9).unwrap();
+        let (owner, _) = carrier_owner(region_ptr);
+        let stale = WeakHostMetadataPinResolver::new(&owner, 2);
+        install_host_residency_resolver(
+            region_ptr,
+            Arc::new(WeakHostMetadataPinResolver::new(&owner, 3)),
+        );
+        let resolver = installed_resolver(region_ptr).expect("installed resolver");
+        let pin = resolver.pin_dynamic(extent).expect("live owner pins");
+        assert_eq!(pin.extent(), extent);
+        assert!(matches!(
+            stale.pin_dynamic(extent),
+            Err(MetadataResolutionError::StaleOwner)
+        ));
+        drop(owner);
+        assert!(matches!(
+            resolver.pin_dynamic(extent),
+            Err(MetadataResolutionError::StaleOwner)
+        ));
+    }
+
+    /// The global slot is cleared only from the owner's drop, so a slot that
+    /// retained its owner would leak it. Installing must leave the caller's
+    /// reference the only strong one, and dropping it must free the owner and
+    /// clear the slot.
+    #[test]
+    fn installed_weak_resolver_does_not_retain_its_owner() {
+        let _guard = TEST_REGION_LOCK.lock();
+        let region_ptr = 0x7200_0000;
+        let (owner, dropped) = carrier_owner(region_ptr);
+        let weak = Arc::downgrade(&owner);
+        install_host_residency_resolver(
+            region_ptr,
+            Arc::new(WeakHostMetadataPinResolver::new(&owner, 3)),
+        );
+        assert_eq!(Arc::strong_count(&owner), 1);
+        assert!(installed_resolver(region_ptr).is_some());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(installed_resolver(region_ptr).is_none());
     }
 
     trait CastResidencyPtr {
