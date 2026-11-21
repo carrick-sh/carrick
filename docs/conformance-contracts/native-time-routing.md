@@ -462,6 +462,20 @@ witnesses check null-output routing with a live parent and child and exact
 realtime/coarse values from the zone calibration with no mapped vvar. ARM
 native exec-successor vvar calibration landed in #2571.
 
+The zone word follows the container clock. A carrier binds it to its one
+container's `ClockDomain` after load (`ClockDomain::bind_ring_realtime`), and
+every offset change (`clock_settime`, `settimeofday`, `clock_adjtime` and
+`adjtimex` steps) republishes `vvar_realtime_off_ns(base, delta)` before the
+changing call returns. An exec's vvar stamp only publishes the initial word,
+so it cannot reset a moved clock. A second binding is refused: the word is
+carrier-wide. The KVM witness moves the root container's clock after load and
+checks raw REALTIME, REALTIME_COARSE, gettimeofday and time in the root and a
+fork child; x86 guests cannot set the clock themselves yet (`clock_settime`
+is unrouted on x86, #1981). The dispatcher witness drives `clock_settime`
+and `clock_adjtime(ADJ_SETOFFSET)` through the production entry against a
+bound word. The signed ARM checks are the `clocksettimevdso` probe
+(`child_shifted raw_shifted`) and `case_ring_clock_child_raw_syscalls`.
+
 ### Realtime aliases
 
 The native gettimeofday and x86 time calls use the same realtime sample as
@@ -477,7 +491,10 @@ shared scheduler zone's per-record user/system counter ledger (`ZoneCpuLedger`).
 Each CPU slot records user vs ring-system execution windows against the
 qualified guest counter and closes the window across idle spins, `wfi`/`hlt`,
 parked waits, and synchronous host crossings so blocked time accrues zero CPU
-ticks. Non-last thread exits fold their retired record ticks into the process's
+ticks. A host crossing keeps the slot's record bound (`cross_to_host`):
+it returns to the same thread, which may be an initial root the scheduler
+never switched in and so names no current record on re-entry. The KVM
+witness polls the root's standard descriptors before burning CPU. Non-last thread exits fold their retired record ticks into the process's
 `NativeResources` total, `CLOCK_THREAD_CPUTIME_ID` and `RUSAGE_THREAD` read the
 calling member's own record ticks, `CLOCK_PROCESS_CPUTIME_ID` and `RUSAGE_SELF`
 sum retired and live members, and reaped children fold into `children_rusage`
