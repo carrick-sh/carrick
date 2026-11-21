@@ -8,6 +8,7 @@ use crate::live_descriptor_words::{DescriptorDiagnostic, DescriptorPlanRefusalSi
 pub use crate::stage1::{LeafAccess as Access, LeafSize};
 use crate::stage1::{LeafSpan, Stage1Leaf, Stage1Walker, WalkError};
 use alloc::{collections::BTreeMap, vec::Vec};
+pub use carrick_guest_arch::GuestPermissionCeiling;
 use carrick_guest_arch::{
     Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,
     EditPermissions, FrameGpa, GuestVa, RootGpa, UserVa,
@@ -71,6 +72,8 @@ pub enum DescriptorOp {
     Protect {
         span: PageSpan,
         permissions: Permissions,
+        /// The reservation root's ceiling; see [`GuestPermissionCeiling`].
+        ceiling: Option<GuestPermissionCeiling>,
     },
     ArmCow(PageSpan),
     CowRepoint {
@@ -187,9 +190,11 @@ impl<'a> DescriptorTxn<'a> {
             },
             EditOperation::Protect {
                 permissions: requested,
+                ceiling,
             } => DescriptorOp::Protect {
                 span,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                ceiling,
             },
             EditOperation::ArmCow {
                 kernel_only: false,
@@ -465,12 +470,19 @@ pub fn split_terminal_descriptor(
     Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
 }
 
+/// Fork's arm of one terminal. A writable leaf becomes COW with write
+/// intent. A private leaf that is not writable is armed too, recording no
+/// write intent: its frame is now shared with the other side, and a later
+/// in-ring `mprotect(PROT_WRITE)` may only record intent, never grant WRITE
+/// onto it.
 pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
     if entry & (PRESENT | PREPARED) == 0 {
         return Err(DescriptorRefusal::MissingTable);
     }
     Ok(if entry & WRITE != 0 {
         (entry & !WRITE) | COW | MAY_WRITE
+    } else if entry & (PRIVATE | COW) == PRIVATE {
+        (entry & !MAY_WRITE) | COW
     } else {
         entry
     })
@@ -681,20 +693,49 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 (entry | PRESENT) & !PREPARED
             }
-            DescriptorOp::Protect { permissions: p, .. } => {
+            DescriptorOp::Protect {
+                permissions: p,
+                ceiling,
+                ..
+            } => {
                 if entry & (PRESENT | PREPARED) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
                 if entry & PRIVATE == 0 {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
-                if entry & COW != 0 {
-                    return Err(DescriptorRefusal::CowArmed);
+                let cow = entry & COW != 0;
+                match ceiling {
+                    // The root model's ceiling is the mapping's `VM_MAY*`:
+                    // the leaf's first-publish permissions do not narrow it.
+                    Some(ceiling) => {
+                        if p.user && !ceiling.readable
+                            || p.writable && !ceiling.writable
+                            || p.executable && !ceiling.executable
+                        {
+                            return Err(DescriptorRefusal::PermissionWidening);
+                        }
+                    }
+                    None if cow => return Err(DescriptorRefusal::CowArmed),
+                    None => {
+                        if p.writable && entry & MAY_WRITE == 0
+                            || p.executable && entry & MAY_EXEC == 0
+                        {
+                            return Err(DescriptorRefusal::PermissionWidening);
+                        }
+                    }
                 }
-                if p.writable && entry & MAY_WRITE == 0 || p.executable && entry & MAY_EXEC == 0 {
-                    return Err(DescriptorRefusal::PermissionWidening);
+                let may_exec = if p.executable { MAY_EXEC } else { 0 };
+                if cow {
+                    // Still shared: record write intent, never grant WRITE.
+                    entry & !(WRITE | USER | NX | MAY_WRITE)
+                        | (permissions(p) & (USER | NX | MAY_WRITE))
+                        | may_exec
+                } else {
+                    entry & !(WRITE | USER | NX)
+                        | (permissions(p) & (WRITE | USER | NX | MAY_WRITE))
+                        | may_exec
                 }
-                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
@@ -818,7 +859,20 @@ impl DescriptorTxn<'_> {
                 },
                 None,
             ),
-            DescriptorOp::Protect { permissions: p, .. } => (0, 0, permissions(p), None),
+            DescriptorOp::Protect {
+                permissions: p,
+                ceiling,
+                ..
+            } => (
+                ceiling.map_or(0, |c| {
+                    1 | u64::from(c.readable) << 1
+                        | u64::from(c.writable) << 2
+                        | u64::from(c.executable) << 3
+                }),
+                0,
+                permissions(p),
+                None,
+            ),
             DescriptorOp::ArmCow(_) => (0, 0, 0, None),
             DescriptorOp::CowRepoint {
                 old, new, backing, ..

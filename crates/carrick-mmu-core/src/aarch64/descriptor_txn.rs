@@ -208,12 +208,13 @@ pub enum DescriptorOp {
         expected_ipa: SubstrateGpa,
         access: LeafAccess,
     },
-    /// Change permissions on prepared and/or resident private leaves. On
-    /// non-COW leaves the software write/execute bits bound the result; on
-    /// COW-armed resident leaves `edit.cow_ceiling` bounds the result in place
-    /// (keeping `SW_EL1_COW` armed, never granting `AP_RW`, and recording new
-    /// write intent in `SW_EL1_MAY_WRITE`), or `CowArmed` is refused when no
-    /// ceiling is supplied. Prepared leaves stay invalid.
+    /// Change permissions on prepared and/or resident private leaves. With
+    /// `edit.ceiling` (the reservation root's `VM_MAY*`) that ceiling bounds
+    /// every leaf, and an admitted write or execute extends the leaf's
+    /// software ceiling tags; a COW-armed resident leaf stays armed, never
+    /// gains `AP_RW`, and records its new write intent in `SW_EL1_MAY_WRITE`.
+    /// Without one the software write/execute bits bound the result and a
+    /// COW-armed leaf is refused (`CowArmed`). Prepared leaves stay invalid.
     Protect(GuestPermissionEdit),
     /// Retire prepared and resident private leaves, retaining outputs for the
     /// host's lease reconciliation.
@@ -605,7 +606,7 @@ impl DescriptorOp {
                 bool_word(edit.readable, 0)
                     | bool_word(edit.writable, 1)
                     | bool_word(edit.executable, 2),
-                edit.cow_ceiling.map_or(0, |ceiling| {
+                edit.ceiling.map_or(0, |ceiling| {
                     1 | bool_word(ceiling.readable, 1)
                         | bool_word(ceiling.writable, 2)
                         | bool_word(ceiling.executable, 3)
@@ -675,7 +676,7 @@ impl DescriptorOp {
                     readable: payload[2] & 1 != 0,
                     writable: payload[2] & 2 != 0,
                     executable: payload[2] & 4 != 0,
-                    cow_ceiling: match payload[3] {
+                    ceiling: match payload[3] {
                         0 => None,
                         w => Some(GuestPermissionCeiling {
                             readable: w & 2 != 0,
@@ -2385,17 +2386,29 @@ impl Executor<'_> {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 let any_el0 = edit.readable || edit.writable || edit.executable;
-                if el1_cow(descriptor) {
-                    let Some(ceiling) = edit.cow_ceiling else {
-                        return Err(DescriptorRefusal::CowArmed);
-                    };
-                    if (any_el0 && !ceiling.readable)
-                        || (edit.writable && !ceiling.writable)
-                        || (edit.executable
-                            && (!ceiling.executable || descriptor & SW_EL1_MAY_EXEC == 0))
-                    {
-                        return Err(DescriptorRefusal::PermissionWidening);
+                let cow = el1_cow(descriptor);
+                match edit.ceiling {
+                    // The root model's ceiling is the mapping's `VM_MAY*`:
+                    // the leaf's first-publish permissions do not narrow it.
+                    Some(ceiling) => {
+                        if (any_el0 && !ceiling.readable)
+                            || (edit.writable && !ceiling.writable)
+                            || (edit.executable && !ceiling.executable)
+                        {
+                            return Err(DescriptorRefusal::PermissionWidening);
+                        }
                     }
+                    None if cow => return Err(DescriptorRefusal::CowArmed),
+                    None => {
+                        if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+                            || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
+                        {
+                            return Err(DescriptorRefusal::PermissionWidening);
+                        }
+                    }
+                }
+                let may_exec = if edit.executable { SW_EL1_MAY_EXEC } else { 0 };
+                if cow {
                     let (ap, uxn) = if !any_el0 {
                         (AP_PRIV_RO, UXN)
                     } else {
@@ -2405,13 +2418,10 @@ impl Executor<'_> {
                     return Ok((descriptor & !AP_MASK & !UXN & !SW_EL1_MAY_WRITE)
                         | ap
                         | uxn
-                        | may_write);
+                        | may_write
+                        | may_exec);
                 }
-                if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
-                    || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
-                {
-                    return Err(DescriptorRefusal::PermissionWidening);
-                }
+                let may_write = if edit.writable { SW_EL1_MAY_WRITE } else { 0 };
                 let (ap, uxn) = if !any_el0 {
                     (AP_PRIV_RO, UXN)
                 } else if edit.writable {
@@ -2423,7 +2433,7 @@ impl Executor<'_> {
                 // its later Publish arms COW whatever AP this records.
                 Ok(settle_deferred_fork_cow(
                     descriptor,
-                    (descriptor & !AP_MASK & !UXN) | ap | uxn,
+                    (descriptor & !AP_MASK & !UXN) | ap | uxn | may_write | may_exec,
                 ))
             }
             DescriptorOp::Retire(_) => match state {
@@ -3105,7 +3115,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: true,
-                cow_ceiling: None,
+                ceiling: None,
             }),
             DescriptorOp::Protect(GuestPermissionEdit {
                 va: 0x6000,
@@ -3113,7 +3123,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 executable: false,
-                cow_ceiling: Some(GuestPermissionCeiling {
+                ceiling: Some(GuestPermissionCeiling {
                     readable: true,
                     writable: true,
                     executable: false,
@@ -3707,7 +3717,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 })
             };
             let setup = |writable: bool| {
@@ -3977,7 +3987,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             };
             applied(run(
                 &words,
@@ -4053,6 +4063,114 @@ mod tests {
             assert_eq!(words.image(), armed);
         }
 
+        /// #2620: the reservation root's ceiling (Linux `VM_MAY*`), not the
+        /// first-publish permissions, bounds a private leaf. A page first
+        /// published RW (no execute tag) flips to RX, and a page first
+        /// published R (prepared and resident) gains write; a narrow ceiling
+        /// (a shared node) still refuses whole.
+        #[test]
+        fn protect_widens_private_leaves_to_the_root_ceiling() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(2, PageSpan::new(VA, PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let rwx = GuestPermissionCeiling {
+                readable: true,
+                writable: true,
+                executable: true,
+            };
+            let edit = |va, writable, executable, ceiling| GuestPermissionEdit {
+                va,
+                len: PT_PAGE,
+                readable: true,
+                writable,
+                executable,
+                ceiling,
+            };
+            for n in 0..2 {
+                assert_eq!(words.get(leaf_pa(VA + n * PT_PAGE)) & SW_EL1_MAY_EXEC, 0);
+            }
+            let before = words.image();
+            for ceiling in [
+                GuestPermissionCeiling {
+                    executable: false,
+                    ..rwx
+                },
+                GuestPermissionCeiling {
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                },
+            ] {
+                assert_eq!(
+                    run(
+                        &words,
+                        DescriptorOp::Protect(edit(VA, false, true, Some(ceiling))),
+                        &TableGrants::NONE
+                    ),
+                    DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+                );
+                assert_eq!(words.image(), before);
+            }
+            // Without a ceiling the leaf tags still bound the edit.
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::Protect(edit(VA, false, true, None)),
+                    &TableGrants::NONE
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+            );
+            // RW to RX on the resident page and the prepared one.
+            for n in 0..2 {
+                let va = VA + n * PT_PAGE;
+                applied(run(
+                    &words,
+                    DescriptorOp::Protect(edit(va, false, true, Some(rwx))),
+                    &TableGrants::NONE,
+                ));
+                let d = words.get(leaf_pa(va));
+                assert_eq!(d & VALID != 0, n == 0, "protection never changes residency");
+                assert_ne!(d & SW_EL1_MAY_EXEC, 0);
+                assert!(terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Execute
+                ));
+                assert!(!terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Write
+                ));
+            }
+
+            // A range first published read-only gains write within the ceiling.
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(2, PageSpan::new(VA, PT_PAGE), false),
+                &TableGrants::NONE,
+            ));
+            for n in 0..2 {
+                let va = VA + n * PT_PAGE;
+                applied(run(
+                    &words,
+                    DescriptorOp::Protect(edit(va, true, false, Some(rwx))),
+                    &TableGrants::NONE,
+                ));
+                let d = words.get(leaf_pa(va));
+                assert_ne!(d & SW_EL1_MAY_WRITE, 0);
+                assert!(terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Write
+                ));
+                assert!(!terminal_descriptor_permits_el0(
+                    d | VALID,
+                    LeafAccess::Execute
+                ));
+            }
+        }
+
         #[test]
         fn protect_edits_cow_armed_resident_leaf_within_ceiling() {
             use super::guest_cow::{
@@ -4065,7 +4183,7 @@ mod tests {
                 prepare(2, PageSpan::new(VA, 2 * PT_PAGE), true),
                 &TableGrants::NONE,
             ));
-            // Give page 1 stage-2 execute authority so exec widening can be tested both ways.
+            // Page 1 already carries an execute ceiling tag; page 0 gains one below.
             let p1 = leaf_pa(VA + PT_PAGE);
             words.set(p1, words.get(p1) | SW_EL1_MAY_EXEC);
 
@@ -4112,7 +4230,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4137,7 +4255,7 @@ mod tests {
                     readable: false,
                     writable: false,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4164,7 +4282,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: none_ceiling,
+                        ceiling: none_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4181,7 +4299,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: ro_ceiling,
+                    ceiling: ro_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4203,7 +4321,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        ceiling: ro_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4211,7 +4329,7 @@ mod tests {
             );
             assert_eq!(words.image(), before);
 
-            // Exec widening past mapping ceiling or past SW_EL1_MAY_EXEC is refused.
+            // Exec widening past the mapping ceiling is refused.
             assert_eq!(
                 run(
                     &words,
@@ -4221,26 +4339,11 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: true,
-                        cow_ceiling: Some(GuestPermissionCeiling {
+                        ceiling: Some(GuestPermissionCeiling {
                             readable: true,
                             writable: true,
                             executable: false,
                         }),
-                    }),
-                    &TableGrants::NONE,
-                ),
-                DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
-            );
-            assert_eq!(
-                run(
-                    &words,
-                    DescriptorOp::Protect(GuestPermissionEdit {
-                        va: VA,
-                        len: PT_PAGE,
-                        readable: true,
-                        writable: false,
-                        executable: true,
-                        cow_ceiling: rwx_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4257,11 +4360,11 @@ mod tests {
                     readable: true,
                     writable: true,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
-            // Exec widening within both ceiling and SW_EL1_MAY_EXEC records UXN=0 on page 1.
+            // Exec widening within the ceiling records UXN=0 on page 1.
             applied(run(
                 &words,
                 DescriptorOp::Protect(GuestPermissionEdit {
@@ -4270,7 +4373,7 @@ mod tests {
                     readable: true,
                     writable: true,
                     executable: true,
-                    cow_ceiling: rwx_ceiling,
+                    ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4357,7 +4460,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             };
             assert_eq!(
                 run(&words, DescriptorOp::Protect(edit), &TableGrants::NONE),
@@ -4474,7 +4577,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             };
             let outcome = run(&words, DescriptorOp::Protect(edit), &grants(&[8]));
             assert_eq!(
@@ -4686,7 +4789,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 }),
                 &TableGrants::NONE,
             ));
@@ -5171,7 +5274,7 @@ mod tests {
                             readable,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            ceiling: None,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5232,7 +5335,7 @@ mod tests {
                             readable: true,
                             writable: true,
                             executable: false,
-                            cow_ceiling: None,
+                            ceiling: None,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5431,7 +5534,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            ceiling: None,
                         },
                     )
                 },
@@ -5900,7 +6003,7 @@ mod carrick_owned_window_tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                ceiling: None,
             }),
             DescriptorOp::Retire(span),
             DescriptorOp::CowRepoint {
