@@ -2785,6 +2785,40 @@ fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
         }]),
         "only the two unrouted removexattr calls refuse in ring: {census}"
     );
+    // #2646: the operator view ranks the child's refusal first, by name,
+    // without anyone reading the counters by hand.
+    let ranked = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .args(["debug", "el1-census", "--refusals"])
+        .arg(&census_dir)
+        .output()
+        .expect("rank census refusals");
+    let table = String::from_utf8_lossy(&ranked.stdout);
+    assert!(
+        ranked.status.success(),
+        "--refusals failed: {}",
+        String::from_utf8_lossy(&ranked.stderr)
+    );
+    let top = table
+        .lines()
+        .find(|line| line.starts_with("| 1 |"))
+        .unwrap_or_else(|| panic!("no ranked refusal row: {table}"));
+    assert_eq!(
+        top, "| 1 | removexattr | x86_64 | 197 | 14 | native_child | 2 | 0 | 2 | yes |",
+        "{table}"
+    );
+    let json = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .args(["debug", "el1-census", "--refusals", "--json"])
+        .arg(&census_dir)
+        .output()
+        .expect("rank census refusals as JSON");
+    assert!(json.status.success());
+    let ranking: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(ranking["complete"], true);
+    assert_eq!(ranking["rows"][0]["name"], "removexattr");
+    assert_eq!(ranking["rows"][0]["caller"], "native_child");
+    assert_eq!(ranking["rows"][0]["unrouted"], 2);
 }
 
 /// #2107: the mounted CLI root must share the host file authority, even
