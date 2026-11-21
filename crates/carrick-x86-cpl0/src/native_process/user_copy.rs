@@ -15,6 +15,21 @@ struct NativeWriteVenue<'a> {
     prepared: carrick_el1::fault::X86PreparedResolver<'a, InitialWords>,
     cow: carrick_el1_linux::cow_resolver::X86CowResolver<'a, InitialWords>,
 }
+impl NativeWriteVenue<'_> {
+    /// Ring this CPU's settlement crossing once the MM has a completed COW
+    /// grant. The host holds a supplied grant as pending on the CPU that
+    /// asked for it, and reads that CPU's next owner-grant crossing as its
+    /// settlement: a selection that resolved a COW must ring it before any
+    /// later crossing asks for a new supply.
+    fn settle_cow_grant(&self, handle: carrick_el1_abi::El1MmHandle) {
+        if self.pool.has_completions_for(handle.mm().raw()) {
+            carrick_x86_carrier::entry::cross_owner_grant(
+                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+                self.address,
+            );
+        }
+    }
+}
 impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
     type Prepared = carrick_el1::fault::X86PreparedResolver<'a, InitialWords>;
     type Cow = carrick_el1_linux::cow_resolver::X86CowResolver<'a, InitialWords>;
@@ -30,12 +45,16 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         }
     }
     fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
-        if self.pool.has_completions_for(request.handle.mm().raw()) {
-            carrick_x86_carrier::entry::cross_owner_grant(
-                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-                self.address,
-            );
-        }
+        self.settle_cow_grant(request.handle);
+        Ok(())
+    }
+    /// A preparation resolves the same COW grants as a write (#2716): it
+    /// owes the host the same settlement before it returns.
+    fn settle_preparation(
+        &mut self,
+        target: &carrick_core::mm::transaction::UserWriteTarget,
+    ) -> Result<(), Self::Error> {
+        self.settle_cow_grant(target.handle);
         Ok(())
     }
     fn supply_cow(
