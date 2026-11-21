@@ -2990,6 +2990,63 @@ fn two_running_vcpus_drop_stale_translation_on_shootdown() {
     }
 }
 
+/// #2579: a capacity decline of an owner-selected grant publication, refused
+/// by the descriptor executor at the production #PF entry, reruns once with
+/// the fault page alone; that page publishes and the access completes, and
+/// the window's other pages are supplied by their own later faults.
+#[test]
+fn production_selected_grant_capacity_decline_reruns_with_the_fault_page() {
+    let elf =
+        kvm_pool_fixture::assemble_fixture("native_selected_grant_decline.S", &["-DCAPACITY"]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "a capacity decline must rerun with the fault page and publish it: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #2579: in a fork child holding inherited prepared outputs, an occupied
+/// decline of a fresh window's publication reruns the access; the replan
+/// publishes a window and the inherited pages keep their parent's data.
+#[test]
+fn production_selected_grant_occupied_decline_replans_in_a_fork_child() {
+    let elf =
+        kvm_pool_fixture::assemble_fixture("native_selected_grant_decline.S", &["-DINHERITED"]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "an occupied decline must replan and publish: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #2579: a terminal descriptor refusal of an owner-selected publication is
+/// the typed unresolved fault (reason 9) for the faulting access at the #PF
+/// entry: no rerun or replan completes the access.
+#[test]
+fn production_selected_grant_terminal_decline_is_not_rerun() {
+    let elf =
+        kvm_pool_fixture::assemble_fixture("native_selected_grant_decline.S", &["-DTERMINAL"]);
+    match try_run_instrumented_pool_fixture(&elf, 64) {
+        Err(error) => {
+            let error = error.to_string();
+            assert!(
+                error.contains("kernel fault policy refused: reason 9")
+                    && error.contains("vector: 14")
+                    && error.contains("error_code: 6"),
+                "a terminal decline must surface as the unresolved write fault: {error}"
+            );
+        }
+        Ok(outcome) => panic!(
+            "a terminal decline was rerun and completed the access: {:?}",
+            outcome.run
+        ),
+    }
+}
+
 #[test]
 fn two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest() {
     let mut editor = Vec::new();

@@ -25,6 +25,15 @@ mod test_support {
     use core::sync::atomic::Ordering;
 
     pub const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    /// The next owner-selected grant's descriptor executor refuses it before
+    /// any store (#2579): for capacity (`TablesExhausted`), for an occupied
+    /// leaf (`Occupied`), or terminally (`StaleRoot`).
+    pub const INJECT_GRANT_CAPACITY_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe50;
+    pub const INJECT_GRANT_OCCUPIED_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe51;
+    pub const INJECT_GRANT_TERMINAL_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe52;
+    /// Injected grant refusals answered in the high 32 bits; the pages of
+    /// the first grant applied after one in the low 32 bits.
+    pub const INJECT_GRANT_REFUSAL_CENSUS: u64 = 0xffff_ffff_ffff_fe53;
     pub const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
     pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
@@ -571,6 +580,21 @@ mod test_support {
             }
             INJECT_ROOT_BUSY_ONCE => {
                 carrick_core::mm::reservation::inject_root_busy_once().then_some(0)
+            }
+            INJECT_GRANT_CAPACITY_REFUSAL_ONCE
+            | INJECT_GRANT_OCCUPIED_REFUSAL_ONCE
+            | INJECT_GRANT_TERMINAL_REFUSAL_ONCE => {
+                use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+                carrick_core::mm::frames::inject_grant_refusal_once(match native {
+                    INJECT_GRANT_CAPACITY_REFUSAL_ONCE => DescriptorRefusal::TablesExhausted,
+                    INJECT_GRANT_OCCUPIED_REFUSAL_ONCE => DescriptorRefusal::Occupied,
+                    _ => DescriptorRefusal::StaleRoot,
+                })
+                .then_some(0)
+            }
+            INJECT_GRANT_REFUSAL_CENSUS => {
+                let (refusals, pages) = carrick_core::mm::frames::injected_grant_refusal_census();
+                Some(refusals << 32 | pages)
             }
             INJECT_EDITOR_BUSY_ONCE => {
                 carrick_sched_core::spaces::inject_editor_busy_once().then_some(0)
