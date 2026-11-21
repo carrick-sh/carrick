@@ -231,7 +231,11 @@ pub(crate) fn settle_declined_owner_fault(
     deliver: impl FnOnce() -> Action,
 ) -> Action {
     if action == Action::Forward
-        && outcome == carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined
+        && matches!(
+            outcome,
+            carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined
+                | carrick_el1::fault::OwnerFaultSupplyOutcome::ProtectionDeclined
+        )
         && matches!(
             venue,
             carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner

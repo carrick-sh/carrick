@@ -1703,13 +1703,13 @@ fn serve_delegated_anonymous_for_origin<
         frame.set_result(carrick_guest_arch::NativeReturnWord(0));
         return DelegatedAnonymous::Served;
     }
-    // A discard can retire sparse residency in one descriptor transaction:
-    // the retirement planners skip absent entries and validate every
-    // populated terminal before publishing the edit.
+    // A discard or a protect covers sparse residency in one descriptor
+    // transaction: the planners skip absent entries and validate every
+    // populated terminal before storing any change.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
-        _ if request.operation == Discard => Some((va, len)),
+        _ if matches!(request.operation, Discard | Protect) => Some((va, len)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
     // A fresh mapping into a root hole over this MM's first-touch stock
