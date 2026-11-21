@@ -7005,9 +7005,10 @@ fn republished_host_file_park_marks_pending_host_work_for<
     let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
     let record = wait.begin(poll, 74, false);
     let fixture = &wait.capacity.fixture;
-    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
-        doorbell.settled();
-    }
+    assert!(
+        !fixture.task.linux.has_pending_host_work(),
+        "trap-boundary host-file park exits straight to the carrier without arming pending_host_work"
+    );
     wait.answer_wait(record);
     if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
         doorbell.settled();

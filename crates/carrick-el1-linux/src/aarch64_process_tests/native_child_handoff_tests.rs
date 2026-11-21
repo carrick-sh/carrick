@@ -572,6 +572,14 @@ fn fork_child_service_ack(
             super::super::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu),
             carrick_el1_abi::Action::Idle
         );
+        // In production (`resume_production`), `resume_selected` returns
+        // `LoadResult::Left` into `Sched::idle`, so publishing the prefix's
+        // `HostFile` notice inside `resume_checkpoint` must ring pending host
+        // work for carrier intake; settle that carrier doorbell as intake does.
+        task.linux
+            .take_host_work_doorbell()
+            .expect("resumed stage-prefix HostFile park must mark pending host work")
+            .settled();
     }
     let selector = task.service_notice.take().unwrap().unwrap();
     let ticket = unsafe {
