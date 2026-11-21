@@ -35,12 +35,12 @@ use carrick_kernel::el1_delegation::{
     get_orig_arg0, publish_current_task, recall_all_delegated, revalidate_current_task,
     settle_el1_boundary_for,
 };
-use carrick_kernel::kernel::VmaSummary;
 use carrick_kernel::kernel::continuation::ipc::{host_window_backing, publish_file_table};
 use carrick_kernel::kernel::exec_transaction::{
     core_file_mappings_from_address_space, proc_maps_from_address_space,
 };
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
+use carrick_kernel::kernel::{FrameInventorySnapshot, Kernel, VmaSummary};
 use carrick_mem::linux_abi::{
     LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, syscall::lookup_aarch64,
 };
@@ -333,6 +333,7 @@ where
     /// `(aarch64_nr, syscall_name, count)` refused with `ENOSYS` in EL1 ring or host dispatch.
     pub counted_enosys: Vec<(u64, &'static str, u64)>,
     pub vmas: Vec<VmaSummary>,
+    pub frame_inventory: FrameInventorySnapshot,
     pub engine: SoftAarch64Engine<X>,
 }
 
@@ -673,6 +674,7 @@ where
         terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
+        frame_inventory: summary.frame_inventory,
         engine,
     })
 }
@@ -699,6 +701,7 @@ where
         terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
+        frame_inventory: summary.frame_inventory,
         engine,
     })
 }
@@ -712,6 +715,7 @@ struct SingleProcessSummary {
     terminating_fault: Option<SoftFaultTermination>,
     counted_enosys: Vec<(u64, &'static str, u64)>,
     vmas: Vec<VmaSummary>,
+    frame_inventory: FrameInventorySnapshot,
 }
 
 fn prot_allows_access(prot: u64, access: Option<carrick_mmu_core::aarch64::LeafAccess>) -> bool {
@@ -821,6 +825,14 @@ where
     let mut reply_census = Hvc2ReplyCensus::default();
     let max_first_touch_faults = max_syscalls.saturating_mul(16).max(65_536);
     let mut first_touch_faults = 0usize;
+    // The frame inventory outlives the exiting task: hold the kernel so the
+    // summary samples it after `exit_group` retires the task leader.
+    let kernel = Arc::clone(
+        dispatcher
+            .capture_one_task_context()
+            .map_err(|e| format!("capture KernelContext for frame inventory: {e}"))?
+            .kernel(),
+    );
     let mut syscall_turns = 0usize;
 
     while syscall_turns < max_syscalls {
@@ -861,6 +873,7 @@ where
                     return Ok(finish_single_process_summary(
                         engine,
                         dispatcher,
+                        &kernel,
                         reporter,
                         &refused_by_runner,
                         128 + signum,
@@ -1021,6 +1034,7 @@ where
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
+                    &kernel,
                     reporter,
                     &refused_by_runner,
                     code,
@@ -1034,6 +1048,7 @@ where
                 return Ok(finish_single_process_summary(
                     engine,
                     dispatcher,
+                    &kernel,
                     reporter,
                     &refused_by_runner,
                     128 + signum,
@@ -1060,6 +1075,7 @@ where
 fn finish_single_process_summary<X>(
     engine: &SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
+    kernel: &Kernel,
     reporter: CompatReporter,
     refused_by_runner: &std::collections::BTreeMap<u64, u64>,
     exit_code: i32,
@@ -1071,6 +1087,7 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
+    let frame_inventory = kernel.frame_inventory().snapshot();
     let vmas = dispatcher
         .vma_snapshot_source()
         .snapshot(Instant::now() + Duration::from_secs(1))
@@ -1106,5 +1123,6 @@ where
         terminating_fault,
         counted_enosys,
         vmas,
+        frame_inventory,
     }
 }
