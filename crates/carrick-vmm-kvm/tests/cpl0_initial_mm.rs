@@ -7176,3 +7176,24 @@ reservation_shape_witness!(
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
      committed page and the child reserves 1 GiB more."
 );
+
+reservation_shape_witness!(
+    production_mprotect_flips_rw_anonymous_to_rx_and_calls_it,
+    2,
+    "RW anonymous page, code written, mprotect R|X, then executed."
+);
+reservation_shape_witness!(
+    production_mprotect_makes_rw_anonymous_rwx_and_calls_it,
+    3,
+    "As the R|X flip, with R|W|X."
+);
+reservation_shape_witness!(
+    production_mprotect_spans_two_adjacent_vmas,
+    4,
+    "One mprotect across the boundary of two adjacent VMAs."
+);
+reservation_shape_witness!(
+    production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
+    5,
+    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run."
+);
