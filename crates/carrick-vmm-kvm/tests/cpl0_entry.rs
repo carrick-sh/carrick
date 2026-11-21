@@ -4360,6 +4360,23 @@ fn production_fork_waits_while_sibling_fork_holds_birth_reservation() {
     );
 }
 
+/// #2581: the leader's fork is held after its parent root is published
+/// fork-pending and write-protected, before its commit, while the worker
+/// thread on the other CPU writes a page the fork protected, as Go's
+/// goroutines do around a `fork/exec`. Contention is "not now": the write
+/// parks on the fork publication's release and reruns, never failing with
+/// `kernel fault policy refused: reason 9`; it lands in the parent only.
+/// The worker's park releases the held fork.
+#[test]
+fn production_sibling_write_waits_while_fork_publication_is_pending() {
+    bounded_contention_witness(
+        "production_sibling_write_waits_while_fork_publication_is_pending",
+        "native_fork_pending_cow_contention.S",
+        &[],
+        "sibling write under a pending fork publication",
+    );
+}
+
 fn legacy_syscalls_run(flags: &[&str], expected: &[u8], expected_refusals: &[(usize, u64)]) {
     let work = tempfile::tempdir().expect("legacy syscall test directory");
     std::fs::write(work.path().join("file"), b"file").expect("regular file");
