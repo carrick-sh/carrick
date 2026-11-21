@@ -377,8 +377,9 @@ fn native_multifd_select(variant: &[&str]) {
                 let mut pids = [0u8; 8];
                 let (count, client) = peer.recv_from(&mut pids).expect("parent gate");
                 assert_eq!(count, pids.len());
-                let tids = [&pids[..4], &pids[4..]]
-                    .map(|pid| u64::from(u32::from_ne_bytes(pid.try_into().unwrap())));
+                let tids = [&pids[..4], &pids[4..]].map(|pid| {
+                    u64::from(u32::from_ne_bytes(pid.try_into().expect("four pid bytes")))
+                });
                 let deadline = Instant::now() + Duration::from_secs(4);
                 let all_parked = loop {
                     let is_enrolled = |tid: u64| {
