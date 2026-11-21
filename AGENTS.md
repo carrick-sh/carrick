@@ -164,15 +164,15 @@ Docker oracle. The scoreboard is the fast smoke check.
 
 ## Debugging
 
-Use real debuggers, never `eprintln!`. `carrick trace` is the tracer: extend
-it; keep `scripts/dtrace/`. Zero events means the probe didn't
-fire. Logs perturb races; USDT doesn't. Deadlock: a real core and
-`bt all`. Heisenbug: the event ring via `carrick-lldb` on the **carrier**.
-After `carrick_fatal!`, read `CARRICK_LAST_FATAL`. A diagnosis is a hypothesis
-until you read real values. **Diagnose before fixing:** a stuck row first
-gets a read-only pass naming its cause in real values; fix briefs
-cite them. → [`docs/diagnostics-and-debugging.md`](docs/diagnostics-and-debugging.md),
-skills `carrick-trace` and `carrick-lldb`.
+Use real debuggers, never `eprintln!`. Extend `carrick trace`; keep
+`scripts/dtrace/`. No events: the probe didn't fire. Logs perturb races;
+USDT doesn't. Hang: `carrick debug zonedump`, a real core, `bt all`. ENOSYS:
+`CARRICK_EL1_CENSUS=<dir>`, `debug el1-census --refusals`. Heisenbug: carrier
+event ring (`carrick-lldb`). `carrick_fatal!`: `CARRICK_LAST_FATAL`. A
+diagnosis is a hypothesis until you read real values. **Diagnose before
+fixing:** a stuck row first gets a read-only pass naming its cause in real
+values; fix briefs cite them.
+→ [docs](docs/diagnostics-and-debugging.md), skills `carrick-trace`, `carrick-lldb`.
 
 ## Shared machines and leases
 
