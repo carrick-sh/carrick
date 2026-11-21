@@ -18,6 +18,9 @@
  *  11 the parent maps RW, writes a marker and makes it R before the fork;
  *     the child widens the inherited page to RW and overwrites it; the
  *     parent's marker must be unchanged (the frame stays private)
+ *  12 two backed runs separated by one untouched page, whole range to NONE
+ *  13 chunk with guard holes and all 60 code pages touched, whole range to NONE
+ *  14 same chunk, whole range to RW
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -163,6 +166,64 @@ child:
     cmpb $0xa5, (%r15)
     jne harness
     jmp done
+#elif CASE >= 12 && CASE <= 14
+#if CASE == 12
+    MMAP $0x6000, $0, $0x4022
+    mov $0x6000, %r13d
+    MPROTECT %r15, $0x2000, $3
+    movb $0x5a, (%r15)
+    movb $0x5a, 0x1000(%r15)
+    lea 0x3000(%r15), %rbx
+    MPROTECT %rbx, $0x3000, $3
+#else
+    MMAP $0x40000, $0, $0x4022
+    mov $0x40000, %r13d
+    MPROTECT %r15, $0x1000, $3
+    movb $0x5a, (%r15)
+    lea 0x3000(%r15), %rbx
+    MPROTECT %rbx, $0x3c000, $3
+#endif
+    lea (%r15,%r13), %r14
+#if CASE != 12
+    sub $0x1000, %r14
+#endif
+1:  movb $0x5a, (%rbx)
+    add $4096, %rbx
+    cmp %r14, %rbx
+    jb 1b
+#if CASE == 14
+    MPROTECT %r15, %r13, $3
+    mov %r15, %rbx
+    lea (%r15,%r13), %r14
+2:  movb $0xa5, (%rbx)
+    cmpb $0xa5, (%rbx)
+    jne harness
+    add $4096, %rbx
+    cmp %r14, %rbx
+    jb 2b
+#else
+    MPROTECT %r15, %r13, $0
+    /* A pipe write must fail with EFAULT for every protected page. */
+    lea pipefd(%rip), %rdi
+    xor %esi, %esi
+    mov $293, %eax               /* pipe2 */
+    syscall
+    test %rax, %rax
+    js fail
+    mov %r15, %rbx
+    lea (%r15,%r13), %r14
+2:  mov pipefd+4(%rip), %edi
+    mov %rbx, %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $-14, %rax
+    jne harness
+    add $4096, %rbx
+    cmp %r14, %rbx
+    jb 2b
+#endif
+    jmp done
 #else
 #error CASE
 #endif
@@ -184,4 +245,5 @@ exit:
 .section .bss
 .balign 4
 status: .space 4
+pipefd: .space 8
 .section .note.GNU-stack,"",@progbits
