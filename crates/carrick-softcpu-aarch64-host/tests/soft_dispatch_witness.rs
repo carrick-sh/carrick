@@ -12,7 +12,7 @@ use carrick_aarch64::mailbox::{
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_mem::GuestMemory as _;
-use carrick_hal::{GuestVmBackend, MemPerms, TrapError};
+use carrick_hal::{GuestVmBackend, MemPerms};
 use carrick_mem::memory::{LINUX_EL1_VECTORS_BASE, LINUX_SYSCALL_MAILBOX_BASE};
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
 use carrick_softcpu_aarch64::handler::GuestMemory as SoftGuestMemory;
@@ -515,44 +515,30 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         obs: Arc::clone(&obs),
         next_seq: 1,
     };
-    let mb_for_factory = Arc::clone(&mailbox_slot);
-    let obs_for_factory = Arc::clone(&obs);
-    let make_executor = Arc::new(move || -> Result<ScriptedHvc2Executor, TrapError> {
-        Ok(ScriptedHvc2Executor {
-            mailbox: Arc::clone(&mb_for_factory),
-            obs: Arc::clone(&obs_for_factory),
-            next_seq: 1,
-        })
-    });
 
     let mut config = SoftSingleProcessConfig::new(&elf, "/witness");
     config.rootfs_dir = Some(temp.path());
 
     let mb_for_setup = Arc::clone(&mailbox_slot);
-    let run = run_single_process_with_executor_and_setup(
-        &config,
-        executor,
-        make_executor,
-        move |engine| {
-            // Install minimal `hvc #2; eret` at EL0 synchronous SVC vector `VBAR_EL1 + 0x400`.
-            let mut vec_stub = [0u8; 8];
-            vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
-            vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
-            engine
-                .backend()
-                .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
-                .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
-            let ptr = engine
-                .backend()
-                .host_ptr(
-                    LINUX_SYSCALL_MAILBOX_BASE,
-                    AARCH64_SYSCALL_MAILBOX_SIZE as usize,
-                )
-                .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
-            mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
-            Ok(())
-        },
-    )
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        // Install minimal `hvc #2; eret` at EL0 synchronous SVC vector `VBAR_EL1 + 0x400`.
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mb_for_setup.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        Ok(())
+    })
     .expect("single-process witness should exit cleanly through production kernel");
 
     assert_eq!(run.exit_code, 0);

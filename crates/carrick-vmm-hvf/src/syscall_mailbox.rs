@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_fatal::carrick_fatal;
 
 use carrick_aarch64::mailbox::{
-    AARCH64_SYSCALL_MAILBOX_MAGIC, AARCH64_SYSCALL_MAILBOX_SIZE, AARCH64_SYSCALL_MAILBOX_VERSION,
-    Aarch64SyscallMailbox, MailboxProtocolError, MailboxRequestMetadata, MailboxResponseAction,
-    MailboxState, PortalSessionWire, PortalState, validate_request_metadata,
+    AARCH64_SYSCALL_MAILBOX_SIZE, Aarch64SyscallMailbox, MailboxProtocolError,
+    MailboxResponseAction, MailboxSlot, PortalPublishError, PortalSessionWire,
 };
-use carrick_guest_mem::Aarch64SyscallFrame;
+pub use carrick_aarch64::mailbox::{
+    ClockKickRestart, MailboxDiagnostics, MailboxRequest, PortalResponse, PortalSnapshot,
+};
 use carrick_hal::threaded::{Aarch64SyscallContinuationV1, NativeOwnerWaitOrigin};
 use carrick_observability::probes::SyscallMailboxPhase;
 
@@ -168,18 +169,6 @@ impl Drop for MailboxSlotLease {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MailboxRequest {
-    pub frame: Aarch64SyscallFrame,
-    pub native_nr: u64,
-    pub resume_pc: u64,
-    pub spsr: u64,
-    pub fp: u64,
-    pub lr: u64,
-    pub sp: u64,
-    pub esr: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MailboxConsumeError {
     #[error("invalid AArch64 syscall mailbox request: {0:?}")]
@@ -203,22 +192,6 @@ pub enum MailboxConsumeError {
     StalePortalSequence { expected: u64, actual: u64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortalSnapshot {
-    pub mailbox_generation: u64,
-    pub sequence: u64,
-    pub state: PortalState,
-    pub session: PortalSessionWire,
-    pub native_nr: u64,
-    pub args: [u64; 6],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortalResponse {
-    Returned(i64),
-    HostBoundary,
-}
-
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn fresh_generation() -> u64 {
@@ -233,20 +206,8 @@ fn fresh_generation() -> u64 {
 #[derive(Debug)]
 pub struct MailboxBinding {
     lease: Option<MailboxSlotLease>,
-    host: NonNull<Aarch64SyscallMailbox>,
-    generation: u64,
-    last_sequence: u64,
+    slot: MailboxSlot,
     transport: HvfSyscallTransport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MailboxDiagnostics {
-    pub generation: u64,
-    pub sequence: u64,
-    pub state: u32,
-    pub response_action: u32,
-    pub native_nr: u64,
-    pub return_value: u64,
 }
 
 // SAFETY: the pointer names a fixed, process-lifetime HVF guest mapping. A
@@ -254,87 +215,12 @@ pub struct MailboxDiagnostics {
 // host thread; guest/host ownership is synchronized by the mailbox state word.
 unsafe impl Send for MailboxBinding {}
 
-/// Original EL0 syscall state to replay after a kick in dormant clock code.
-#[derive(Debug)]
-pub struct ClockKickRestart {
-    pub pc: u64,
-    pub pstate: u64,
-    pub registers: Vec<(u32, u64)>,
-}
-
 impl MailboxBinding {
-    fn require_live_generation(&self, expected_generation: u64) -> Result<(), MailboxConsumeError> {
+    fn require_live_lease(&self) -> Result<(), MailboxConsumeError> {
         if self.lease.is_none() {
             return Err(MailboxConsumeError::NoLiveSlot);
         }
-        let actual = self.generation;
-        if expected_generation != actual {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::StaleGeneration {
-                    expected: actual,
-                    actual: expected_generation,
-                },
-            ));
-        }
-        // SAFETY: the live binding owns the complete slot for this generation.
-        let wire_generation = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).generation))
-        };
-        if wire_generation != actual {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::StaleGeneration {
-                    expected: actual,
-                    actual: wire_generation,
-                },
-            ));
-        }
         Ok(())
-    }
-
-    fn write_portal_session(&self, session: PortalSessionWire) {
-        // SAFETY: callers hold host ownership of a disabled or response-ready
-        // slot and publish the state only after these identity words.
-        unsafe {
-            let mailbox = self.host.as_ptr();
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).portal_executor_generation),
-                session.executor_generation,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).portal_task_serial),
-                session.task_serial,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).portal_mm_generation),
-                session.mm_generation,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).portal_quantum_epoch),
-                session.quantum_epoch,
-            );
-        }
-    }
-
-    fn read_portal_session(&self) -> PortalSessionWire {
-        // SAFETY: an acquire state load precedes every caller and the binding
-        // owns this complete slot.
-        unsafe {
-            let mailbox = self.host.as_ptr();
-            PortalSessionWire {
-                executor_generation: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).portal_executor_generation
-                )),
-                task_serial: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).portal_task_serial
-                )),
-                mm_generation: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).portal_mm_generation
-                )),
-                quantum_epoch: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).portal_quantum_epoch
-                )),
-            }
-        }
     }
 
     pub fn arm_portal(
@@ -342,45 +228,10 @@ impl MailboxBinding {
         expected_generation: u64,
         session: PortalSessionWire,
     ) -> Result<(), MailboxConsumeError> {
-        self.require_live_generation(expected_generation)?;
-        let state = self.state().load(Ordering::Acquire);
-        match PortalState::try_from(state) {
-            Ok(PortalState::Disabled) => {
-                self.write_portal_session(session);
-                self.state()
-                    .store(PortalState::Armed.raw(), Ordering::Release);
-                Ok(())
-            }
-            Ok(PortalState::ResponseReady) => {
-                // SAFETY: the acquire observes the complete host response.
-                let action = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(
-                        (*self.host.as_ptr()).response_action
-                    ))
-                };
-                if action != MailboxResponseAction::NormalReturn.raw() {
-                    return Err(MailboxConsumeError::Protocol(
-                        MailboxProtocolError::UnknownResponseAction(action),
-                    ));
-                }
-                self.write_portal_session(session);
-                // SAFETY: ResponseReady gives the stopped owner exclusive
-                // authority over the response payload before vCPU resume.
-                unsafe {
-                    self.write_volatile(
-                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                        MailboxResponseAction::NormalReturnAndArmPortal.raw(),
-                    );
-                }
-                Ok(())
-            }
-            _ => Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::Idle,
-                    actual: state,
-                },
-            )),
-        }
+        self.require_live_lease()?;
+        self.slot
+            .arm_portal(expected_generation, session)
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn cancel_portal(
@@ -388,64 +239,20 @@ impl MailboxBinding {
         expected_generation: u64,
         next_quantum_epoch: u64,
     ) -> Result<(), MailboxConsumeError> {
-        self.require_live_generation(expected_generation)?;
-        let state = self.state().load(Ordering::Acquire);
-        let portal_state = PortalState::try_from(state).map_err(|unknown| {
-            MailboxConsumeError::Protocol(MailboxProtocolError::UnexpectedState {
-                expected: MailboxState::Idle,
-                actual: unknown.0,
-            })
-        })?;
-        if !matches!(
-            portal_state,
-            PortalState::Armed | PortalState::RequestReady | PortalState::ResponseReady
-        ) {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::Idle,
-                    actual: state,
-                },
-            ));
-        }
-        self.state()
-            .store(PortalState::Cancelling.raw(), Ordering::Release);
-        // SAFETY: cancellation owns the session identity after the helper has
-        // been joined by the runtime owner.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).portal_quantum_epoch),
-                next_quantum_epoch,
-            );
-        }
-        self.state()
-            .store(PortalState::Disabled.raw(), Ordering::Release);
-        Ok(())
+        self.require_live_lease()?;
+        self.slot
+            .cancel_portal(expected_generation, next_quantum_epoch)
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn portal_snapshot(
         &self,
         expected_generation: u64,
     ) -> Result<PortalSnapshot, MailboxConsumeError> {
-        self.require_live_generation(expected_generation)?;
-        let state = self.state().load(Ordering::Acquire);
-        let state = PortalState::try_from(state).map_err(|unknown| {
-            MailboxConsumeError::Protocol(MailboxProtocolError::UnexpectedState {
-                expected: MailboxState::RequestReady,
-                actual: unknown.0,
-            })
-        })?;
-        // SAFETY: the acquire state load observes the guest publication.
-        unsafe {
-            let mailbox = self.host.as_ptr();
-            Ok(PortalSnapshot {
-                mailbox_generation: expected_generation,
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state,
-                session: self.read_portal_session(),
-                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                args: core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args)),
-            })
-        }
+        self.require_live_lease()?;
+        self.slot
+            .portal_snapshot(expected_generation)
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn publish_portal_response(
@@ -455,76 +262,31 @@ impl MailboxBinding {
         expected_session: PortalSessionWire,
         response: PortalResponse,
     ) -> Result<(), MailboxConsumeError> {
-        let snapshot = self.portal_snapshot(expected_generation)?;
-        if snapshot.state != PortalState::RequestReady {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::RequestReady,
-                    actual: snapshot.state.raw(),
-                },
-            ));
-        }
-        if snapshot.sequence != expected_sequence {
-            return Err(MailboxConsumeError::StalePortalSequence {
-                expected: expected_sequence,
-                actual: snapshot.sequence,
-            });
-        }
-        if snapshot.session != expected_session {
-            return Err(MailboxConsumeError::StalePortalSession {
-                expected: expected_session,
-                actual: snapshot.session,
-            });
-        }
-        match response {
-            PortalResponse::Returned(value) => {
-                // SAFETY: validated RequestReady transfers response ownership
-                // to this exact helper session.
-                unsafe {
-                    self.write_volatile(
-                        core::ptr::addr_of_mut!((*self.host.as_ptr()).return_value),
-                        value as u64,
-                    );
-                    self.write_volatile(
-                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                        MailboxResponseAction::NormalReturn.raw(),
-                    );
+        self.require_live_lease()?;
+        self.slot
+            .publish_portal_response(
+                expected_generation,
+                expected_sequence,
+                expected_session,
+                response,
+            )
+            .map_err(|err| match err {
+                PortalPublishError::Protocol(p) => MailboxConsumeError::Protocol(p),
+                PortalPublishError::StaleSession { expected, actual } => {
+                    MailboxConsumeError::StalePortalSession { expected, actual }
                 }
-                self.state()
-                    .store(PortalState::ResponseReady.raw(), Ordering::Release);
-            }
-            PortalResponse::HostBoundary => self
-                .state()
-                .store(PortalState::HostBoundary.raw(), Ordering::Release),
-        }
-        Ok(())
+                PortalPublishError::StaleSequence { expected, actual } => {
+                    MailboxConsumeError::StalePortalSequence { expected, actual }
+                }
+            })
     }
 
     /// The owning vCPU must be stopped throughout this operation.
     pub fn force_clock_host_boundary(&mut self) -> Result<(), MailboxConsumeError> {
-        if self.lease.is_none() {
-            return Err(MailboxConsumeError::NoLiveSlot);
-        }
-        let mailbox = self.host.as_ptr();
-        // SAFETY: an unreleased binding owns this complete slot; stopped vCPU
-        // excludes concurrent guest stores, and other executors cannot use it.
-        unsafe {
-            let generation = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation));
-            if generation != self.generation {
-                return Err(MailboxConsumeError::Protocol(
-                    MailboxProtocolError::StaleGeneration {
-                        expected: self.generation,
-                        actual: generation,
-                    },
-                ));
-            }
-            let flags = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags));
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).flags),
-                flags | carrick_aarch64::mailbox::CLOCK_FORCE_HOST_BOUNDARY,
-            );
-        }
-        Ok(())
+        self.require_live_lease()?;
+        self.slot
+            .force_clock_host_boundary()
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     /// Normalize every instruction boundary, including the completion tail
@@ -536,122 +298,37 @@ impl MailboxBinding {
         spsr: u64,
         esr: u64,
     ) -> Result<Option<ClockKickRestart>, MailboxConsumeError> {
-        self.force_clock_host_boundary()?;
-        let layout = carrick_mem::memory::clock_handler_layout();
-        let in_handler = (layout.start..layout.end).contains(&pc);
-        let in_stub = carrick_mem::memory::is_carrick_el0_clock_stub_va(pc);
-        if !in_handler && !in_stub {
-            return Ok(None);
-        }
-        let mailbox = self.host.as_ptr();
-        // SAFETY: same stopped-vCPU/exclusive-slot contract as the latch above.
-        unsafe {
-            let active = self.state().load(Ordering::Acquire) == MailboxState::ClockActive.raw();
-            if in_stub && !active {
-                return Ok(None);
-            }
-            let saved = active || pc >= layout.completion;
-            let mut registers = Vec::new();
-            let (resume_pc, pstate) = if saved {
-                let args = core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args));
-                registers.extend(args.into_iter().enumerate().map(|(i, v)| (i as u32, v)));
-                registers.extend([
-                    (
-                        8,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                    ),
-                    (
-                        9,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x9)),
-                    ),
-                    (
-                        10,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x10)),
-                    ),
-                    (
-                        11,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x11)),
-                    ),
-                    (
-                        12,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).clock_x12)),
-                    ),
-                    (
-                        16,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
-                    ),
-                    (
-                        17,
-                        core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
-                    ),
-                ]);
-                (
-                    core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
-                    core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
-                )
-            } else {
-                // A kicked ordinary data-abort dispatch must continue its
-                // fault path; its ELR is not a post-SVC return address.
-                if esr >> 26 != 0x15 {
-                    return Ok(None);
-                }
-                for (r, after) in [(16, 4), (17, 8)] {
-                    if pc >= layout.start + after {
-                        let ptr = if r == 16 {
-                            core::ptr::addr_of!((*mailbox).clock_tmp_x16)
-                        } else {
-                            core::ptr::addr_of!((*mailbox).clock_tmp_x17)
-                        };
-                        registers.push((r, core::ptr::read_volatile(ptr)));
-                    }
-                }
-                (elr, spsr)
-            };
-            self.state()
-                .store(MailboxState::Idle.raw(), Ordering::Release);
+        self.require_live_lease()?;
+        let restart = self
+            .slot
+            .clock_kick_restart(pc, elr, spsr, esr)
+            .map_err(MailboxConsumeError::Protocol)?;
+        if restart.is_some() {
             self.trace_lifecycle(SyscallMailboxPhase::ClockRestart);
-            Ok(Some(ClockKickRestart {
-                pc: resume_pc.wrapping_sub(4),
-                pstate,
-                registers,
-            }))
         }
+        Ok(restart)
     }
 
     pub(crate) fn is_released_for_executor_boundary(&self) -> bool {
         self.lease.is_none()
     }
+
     pub fn diagnostics(&self) -> MailboxDiagnostics {
-        let mailbox = self.host.as_ptr();
-        // SAFETY: the binding owns a live complete mailbox slot. Diagnostics are
-        // sampled only while the vCPU is stopped after a protocol failure.
-        unsafe {
-            MailboxDiagnostics {
-                generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state: self.state().load(Ordering::Acquire),
-                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).response_action
-                )),
-                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).return_value
-                )),
-            }
-        }
+        self.slot.diagnostics()
     }
 
     fn trace_lifecycle(&self, phase: SyscallMailboxPhase) {
         carrick_observability::probes::syscall_mailbox_lifecycle_with(phase, || {
             let snapshot = self.diagnostics();
             (
-                self.host.as_ptr() as u64,
+                self.slot.host_ptr().as_ptr() as u64,
                 snapshot.generation,
                 snapshot.sequence,
                 snapshot.state,
             )
         });
     }
+
     /// Bind a Carrick-owned slot to its fixed host mapping.
     ///
     /// # Safety
@@ -663,15 +340,14 @@ impl MailboxBinding {
         host: NonNull<Aarch64SyscallMailbox>,
         transport: HvfSyscallTransport,
     ) -> Self {
-        let mut binding = Self {
+        // SAFETY: upheld by this constructor's caller.
+        let slot = unsafe { MailboxSlot::new(host, fresh_generation()) };
+        let binding = Self {
             lease: Some(lease),
-            host,
-            generation: 0,
-            last_sequence: 0,
+            slot,
             transport,
         };
-        // SAFETY: upheld by this constructor's caller.
-        unsafe { binding.rebind(host, false) };
+        binding.trace_lifecycle(SyscallMailboxPhase::Rebind);
         binding
     }
 
@@ -686,7 +362,7 @@ impl MailboxBinding {
             carrick_fatal!(
                 "hvpatch::mailbox_authority",
                 "mailbox slot identifier accessed without lease on binding: generation={} transport={:?}",
-                self.generation,
+                self.slot.generation(),
                 self.transport
             );
         };
@@ -694,7 +370,7 @@ impl MailboxBinding {
     }
 
     pub const fn generation(&self) -> u64 {
-        self.generation
+        self.slot.generation()
     }
 
     pub const fn transport(&self) -> HvfSyscallTransport {
@@ -702,11 +378,11 @@ impl MailboxBinding {
     }
 
     pub const fn sequence(&self) -> u64 {
-        self.last_sequence
+        self.slot.sequence()
     }
 
     pub(crate) fn host_address(&self) -> usize {
-        self.host.as_ptr() as usize
+        self.slot.host_ptr().as_ptr() as usize
     }
 
     /// Sample a stopped mailbox backing that may not be the binding's current
@@ -718,103 +394,8 @@ impl MailboxBinding {
     pub(crate) unsafe fn diagnostics_at(
         host: NonNull<Aarch64SyscallMailbox>,
     ) -> MailboxDiagnostics {
-        let mailbox = host.as_ptr();
-        // SAFETY: upheld by the caller; the vCPU is stopped at its synchronous
-        // HVC, and the acquire state load observes any guest publication.
-        unsafe {
-            MailboxDiagnostics {
-                generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state: (*mailbox).state.load(Ordering::Acquire),
-                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).response_action
-                )),
-                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).return_value
-                )),
-            }
-        }
-    }
-
-    fn snapshot_outstanding(&self, state: u32) -> Aarch64SyscallContinuationV1 {
-        let mailbox = self.host.as_ptr();
-        // SAFETY: callers stop the vCPU or are handling its synchronous exit;
-        // acquire-loading `state` before this call makes the guest's complete
-        // request publication visible.
-        unsafe {
-            Aarch64SyscallContinuationV1 {
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state,
-                trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
-                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).response_action
-                )),
-                flags: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags)),
-                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                args: core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args)),
-                x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
-                spsr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
-                fp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).fp)),
-                lr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).lr)),
-                sp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sp)),
-                esr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).esr)),
-                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).return_value
-                )),
-                resume_x16: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
-                resume_x17: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
-            }
-        }
-    }
-
-    fn restore_outstanding(&self, parked: Aarch64SyscallContinuationV1) {
-        let mailbox = self.host.as_ptr();
-        // SAFETY: the binding uniquely owns the complete destination slot and
-        // publishes `state` only after every payload word is restored.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).sequence),
-                parked.sequence,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).trap_kind),
-                parked.trap_kind,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).response_action),
-                parked.response_action,
-            );
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).flags), parked.flags);
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).native_nr),
-                parked.native_nr,
-            );
-            self.write_volatile(::core::ptr::addr_of_mut!((*mailbox).args), parked.args);
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).resume_pc),
-                parked.resume_pc,
-            );
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).spsr), parked.spsr);
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).fp), parked.fp);
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).lr), parked.lr);
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).sp), parked.sp);
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).esr), parked.esr);
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).return_value),
-                parked.return_value,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).resume_x16),
-                parked.resume_x16,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).resume_x17),
-                parked.resume_x17,
-            );
-        }
-        self.state().store(parked.state, Ordering::Release);
+        // SAFETY: upheld by caller.
+        unsafe { MailboxSlot::diagnostics_at(host) }
     }
 
     pub fn export_task_continuation(
@@ -824,19 +405,9 @@ impl MailboxBinding {
             return Err(MailboxConsumeError::AlreadyParked);
         }
         self.trace_lifecycle(SyscallMailboxPhase::Capture);
-        let state = self.state().load(Ordering::Acquire);
-        if state == MailboxState::Idle.raw() {
-            return Ok(None);
-        }
-        if state != MailboxState::RequestReady.raw() && state != MailboxState::ResponseReady.raw() {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::RequestReady,
-                    actual: state,
-                },
-            ));
-        }
-        Ok(Some(self.snapshot_outstanding(state)))
+        self.slot
+            .export_task_continuation()
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn import_task_continuation(
@@ -846,27 +417,9 @@ impl MailboxBinding {
         if self.lease.is_none() {
             return Err(MailboxConsumeError::AlreadyParked);
         }
-        let state = self.state().load(Ordering::Acquire);
-        if state != MailboxState::Idle.raw() {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::Idle,
-                    actual: state,
-                },
-            ));
-        }
-        if continuation.state != MailboxState::RequestReady.raw()
-            && continuation.state != MailboxState::ResponseReady.raw()
-        {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::RequestReady,
-                    actual: continuation.state,
-                },
-            ));
-        }
-        self.last_sequence = continuation.sequence;
-        self.restore_outstanding(continuation);
+        self.slot
+            .import_task_continuation(continuation)
+            .map_err(MailboxConsumeError::Protocol)?;
         self.trace_lifecycle(SyscallMailboxPhase::Import);
         Ok(())
     }
@@ -877,10 +430,11 @@ impl MailboxBinding {
         if self.lease.is_none() {
             return Err(MailboxConsumeError::AlreadyParked);
         }
-        let continuation = self.export_task_continuation()?;
-        self.state()
-            .store(MailboxState::Idle.raw(), Ordering::Release);
-        self.last_sequence = 0;
+        self.trace_lifecycle(SyscallMailboxPhase::Capture);
+        let continuation = self
+            .slot
+            .take_task_continuation_for_executor_switch()
+            .map_err(MailboxConsumeError::Protocol)?;
         self.trace_lifecycle(SyscallMailboxPhase::Take);
         Ok(continuation)
     }
@@ -895,45 +449,10 @@ impl MailboxBinding {
         host: NonNull<Aarch64SyscallMailbox>,
         preserve_outstanding: bool,
     ) {
-        let preserved = preserve_outstanding
-            .then(|| {
-                let state = self.state().load(Ordering::Acquire);
-                (state == MailboxState::RequestReady.raw()
-                    || state == MailboxState::ResponseReady.raw())
-                .then(|| self.snapshot_outstanding(state))
-            })
-            .flatten();
-        self.host = host;
-        self.generation = fresh_generation();
-        // SAFETY: the binding owns this mapped mailbox slot.
+        // SAFETY: upheld by caller.
         unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).magic),
-                AARCH64_SYSCALL_MAILBOX_MAGIC,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).version),
-                AARCH64_SYSCALL_MAILBOX_VERSION,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).size),
-                AARCH64_SYSCALL_MAILBOX_SIZE as u32,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).generation),
-                self.generation,
-            );
-            if preserved.is_none() {
-                self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).sequence), 0);
-                self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).flags), 0);
-            }
-        }
-        if let Some(parked) = preserved {
-            self.restore_outstanding(parked);
-        } else {
-            self.last_sequence = 0;
-            self.state()
-                .store(MailboxState::Idle.raw(), Ordering::Release);
+            self.slot
+                .rebind_with_preservation(host, fresh_generation(), preserve_outstanding);
         }
         self.trace_lifecycle(SyscallMailboxPhase::Rebind);
     }
@@ -947,61 +466,19 @@ impl MailboxBinding {
     /// currently leased guest slot and remain valid until the next relocation,
     /// rebind, or drop.
     pub unsafe fn relocate_after_cow(&mut self, host: NonNull<Aarch64SyscallMailbox>) {
-        self.host = host;
+        // SAFETY: upheld by caller.
+        unsafe { self.slot.relocate_after_cow(host) };
     }
 
     pub fn take_request(&mut self) -> Result<Option<MailboxRequest>, MailboxConsumeError> {
-        let state = self.state().load(Ordering::Acquire);
-        if state == MailboxState::Idle.raw() {
+        let Some(request) = self
+            .slot
+            .take_request()
+            .map_err(MailboxConsumeError::Protocol)?
+        else {
             return Ok(None);
-        }
-
-        // SAFETY: acquire ownership above makes the guest-published payload
-        // visible, and all fields stay inside this binding's mapped slot.
-        let (metadata, request) = unsafe {
-            let mailbox = self.host.as_ptr();
-            let metadata = MailboxRequestMetadata {
-                magic: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).magic)),
-                version: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).version)),
-                size: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).size)),
-                generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state,
-                trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
-            };
-            let args = core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args));
-            let request = MailboxRequest {
-                frame: Aarch64SyscallFrame {
-                    x0: args[0],
-                    x1: args[1],
-                    x2: args[2],
-                    x3: args[3],
-                    x4: args[4],
-                    x5: args[5],
-                    x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                },
-                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
-                spsr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
-                fp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).fp)),
-                lr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).lr)),
-                sp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sp)),
-                esr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).esr)),
-            };
-            (metadata, request)
         };
-        validate_request_metadata(metadata, self.generation, self.last_sequence)
-            .map_err(MailboxConsumeError::Protocol)?;
-        self.last_sequence = metadata.sequence;
         self.trace_lifecycle(SyscallMailboxPhase::RequestObserved);
-        // Reaching validated host dispatch satisfies the latched boundary.
-        unsafe {
-            let flags = core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).flags));
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).flags),
-                flags & !carrick_aarch64::mailbox::CLOCK_FORCE_HOST_BOUNDARY,
-            );
-        }
         Ok(Some(request))
     }
 
@@ -1048,21 +525,9 @@ impl MailboxBinding {
         value: i64,
         action: MailboxResponseAction,
     ) -> Result<(), MailboxConsumeError> {
-        self.require_request_ready()?;
-        // SAFETY: the host owns RequestReady and publishes state only after both
-        // payload stores complete.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).return_value),
-                value as u64,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                action.raw(),
-            );
-        }
-        self.state()
-            .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        self.slot
+            .publish_return_with_action(value, action)
+            .map_err(MailboxConsumeError::Protocol)?;
         self.trace_lifecycle(SyscallMailboxPhase::Return);
         Ok(())
     }
@@ -1071,133 +536,28 @@ impl MailboxBinding {
     /// trampoline has not consumed. This is the authoritative x0 source when a
     /// signal replaces a mailbox return before `eret` reaches EL0.
     pub fn pending_normal_return(&self) -> Result<Option<i64>, MailboxConsumeError> {
-        if self.lease.is_none() {
-            return Err(MailboxConsumeError::NoLiveSlot);
-        }
-        let state = self.state().load(Ordering::Acquire);
-        match MailboxState::try_from(state) {
-            Ok(MailboxState::ResponseReady) => {}
-            Ok(MailboxState::Idle | MailboxState::RequestReady | MailboxState::ClockActive) => {
-                return Ok(None);
-            }
-            Err(unknown) => {
-                return Err(MailboxConsumeError::Protocol(
-                    MailboxProtocolError::UnexpectedState {
-                        expected: MailboxState::ResponseReady,
-                        actual: unknown.0,
-                    },
-                ));
-            }
-        }
-        // SAFETY: the acquire above observes the host-published response and
-        // this binding owns the mapped slot for its entire lifetime.
-        let (magic, version, size, generation, sequence, action, value) = unsafe {
-            let mailbox = self.host.as_ptr();
-            (
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).magic)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).version)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).size)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).response_action)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).return_value)),
-            )
-        };
-        if magic != AARCH64_SYSCALL_MAILBOX_MAGIC {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::WrongMagic { actual: magic },
-            ));
-        }
-        if version != AARCH64_SYSCALL_MAILBOX_VERSION {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::WrongVersion { actual: version },
-            ));
-        }
-        if size != AARCH64_SYSCALL_MAILBOX_SIZE as u32 {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::WrongSize { actual: size },
-            ));
-        }
-        if generation != self.generation {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::StaleGeneration {
-                    expected: self.generation,
-                    actual: generation,
-                },
-            ));
-        }
-        if sequence != self.last_sequence {
-            return Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::ResponseSequenceMismatch {
-                    expected: self.last_sequence,
-                    actual: sequence,
-                },
-            ));
-        }
-        match MailboxResponseAction::try_from(action) {
-            Ok(
-                MailboxResponseAction::NormalReturn
-                | MailboxResponseAction::NormalReturnAndArmPortal
-                | MailboxResponseAction::NativeSignalCheckpoint
-                | MailboxResponseAction::NativeSignalCheckpointNoRestart,
-            ) => Ok(Some(value as i64)),
-            Ok(
-                MailboxResponseAction::RegistersPrepared | MailboxResponseAction::NativeOwnerCancel,
-            ) => Ok(None),
-            Err(unknown) => Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnknownResponseAction(unknown.0),
-            )),
-        }
+        self.require_live_lease()?;
+        self.slot
+            .pending_normal_return()
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn publish_native_owner_cancel(
         &mut self,
         origin: NativeOwnerWaitOrigin,
     ) -> Result<(), MailboxConsumeError> {
-        match origin {
-            NativeOwnerWaitOrigin::HostTrap => self.require_request_ready()?,
-            NativeOwnerWaitOrigin::HostEl0 => {
-                // Export authenticates the live lease and rejects all other
-                // non-idle protocol states. EL0 must own no continuation.
-                if self.export_task_continuation()?.is_some() {
-                    return Err(MailboxConsumeError::Protocol(
-                        MailboxProtocolError::UnexpectedState {
-                            expected: MailboxState::Idle,
-                            actual: self.state().load(Ordering::Acquire),
-                        },
-                    ));
-                }
-            }
+        if origin == NativeOwnerWaitOrigin::HostEl0 && self.lease.is_none() {
+            return Err(MailboxConsumeError::AlreadyParked);
         }
-        // SAFETY: the stopped host owns this slot. Only the hook selector is
-        // written; no result is fabricated for either completion origin.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                MailboxResponseAction::NativeOwnerCancel.raw(),
-            );
-        }
-        if origin == NativeOwnerWaitOrigin::HostTrap {
-            self.state()
-                .store(MailboxState::ResponseReady.raw(), Ordering::Release);
-        }
-        // HostEl0 enters the very same hook with an Idle mailbox, like the
-        // mailbox trampoline after it consumes a NativeOwnerCancel response.
-        Ok(())
+        self.slot
+            .publish_native_owner_cancel(origin)
+            .map_err(MailboxConsumeError::Protocol)
     }
 
     pub fn publish_registers_prepared(&mut self) -> Result<(), MailboxConsumeError> {
-        self.require_request_ready()?;
-        // SAFETY: the host owns RequestReady and publishes state only after the
-        // response action store completes. return_value is intentionally untouched.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                MailboxResponseAction::RegistersPrepared.raw(),
-            );
-        }
-        self.state()
-            .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        self.slot
+            .publish_registers_prepared()
+            .map_err(MailboxConsumeError::Protocol)?;
         self.trace_lifecycle(SyscallMailboxPhase::RegisterResume);
         Ok(())
     }
@@ -1207,61 +567,14 @@ impl MailboxBinding {
     /// Internal EL1 maintenance must not call this: it re-enters the same vCPU
     /// while the original syscall request is still awaiting its ordinary result.
     pub fn publish_register_resume_if_outstanding(&mut self) -> Result<(), MailboxConsumeError> {
-        match MailboxState::try_from(self.state().load(Ordering::Acquire)) {
-            Ok(MailboxState::RequestReady | MailboxState::ResponseReady) => {
-                // SAFETY: the vCPU is stopped and the host owns both response
-                // states. Prepared intentionally supersedes a normal payload when
-                // signal delivery replaces the live return context.
-                unsafe {
-                    self.write_volatile(
-                        core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                        MailboxResponseAction::RegistersPrepared.raw(),
-                    );
-                }
-                self.state()
-                    .store(MailboxState::ResponseReady.raw(), Ordering::Release);
-                self.trace_lifecycle(SyscallMailboxPhase::RegisterResume);
-                Ok(())
-            }
-            Ok(MailboxState::Idle) => Ok(()),
-            Ok(MailboxState::ClockActive) => Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::RequestReady,
-                    actual: MailboxState::ClockActive.raw(),
-                },
-            )),
-            Err(unknown) => Err(MailboxConsumeError::Protocol(
-                MailboxProtocolError::UnexpectedState {
-                    expected: MailboxState::RequestReady,
-                    actual: unknown.0,
-                },
-            )),
+        if self
+            .slot
+            .publish_register_resume_if_outstanding()
+            .map_err(MailboxConsumeError::Protocol)?
+        {
+            self.trace_lifecycle(SyscallMailboxPhase::RegisterResume);
         }
-    }
-
-    fn require_request_ready(&self) -> Result<(), MailboxConsumeError> {
-        let actual = self.state().load(Ordering::Acquire);
-        if actual == MailboxState::RequestReady.raw() {
-            return Ok(());
-        }
-        Err(MailboxConsumeError::Protocol(
-            MailboxProtocolError::UnexpectedState {
-                expected: MailboxState::RequestReady,
-                actual,
-            },
-        ))
-    }
-
-    fn state(&self) -> &std::sync::atomic::AtomicU32 {
-        // SAFETY: `host` is guaranteed to point at a live complete mailbox for
-        // this binding, and `state` is naturally aligned by the wire layout.
-        unsafe { &(*self.host.as_ptr()).state }
-    }
-
-    unsafe fn write_volatile<T>(&self, pointer: *mut T, value: T) {
-        // SAFETY: every caller constructs `pointer` from this binding's live
-        // mailbox and names a field wholly contained in the slot.
-        unsafe { core::ptr::write_volatile(pointer, value) };
+        Ok(())
     }
 }
 
@@ -1274,7 +587,7 @@ mod tests {
     use carrick_aarch64::mailbox::{
         AARCH64_SYSCALL_MAILBOX_MAGIC, AARCH64_SYSCALL_MAILBOX_SIZE,
         AARCH64_SYSCALL_MAILBOX_VERSION, Aarch64SyscallMailbox, MailboxResponseAction,
-        MailboxState, MailboxTrapKind,
+        MailboxState, MailboxTrapKind, PortalState,
     };
 
     use super::*;
