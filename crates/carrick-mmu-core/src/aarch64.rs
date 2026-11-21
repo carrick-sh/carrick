@@ -11527,6 +11527,10 @@ mod tests {
                 | SW_EL1_MAY_WRITE,
             Ordering::Relaxed,
         );
+        words[l3 + 2].store(
+            words[l3].load(Ordering::Relaxed) + 2 * PT_PAGE,
+            Ordering::Relaxed,
+        );
         assert_eq!(
             unsafe {
                 retire_existing_el1_private_pages(
@@ -11535,15 +11539,21 @@ mod tests {
                     words.len() * core::mem::size_of::<AtomicU64>(),
                     None,
                     leaf_va,
-                    PT_PAGE,
+                    3 * PT_PAGE,
                 )
             },
-            Ok(1)
+            Ok(3)
         );
-        let retired_leaf = words[l3].load(Ordering::Acquire);
-        assert_eq!(retired_leaf & VALID, 0);
-        assert_ne!(retired_leaf & SW_RETIRED, 0);
-        assert_eq!(retired_leaf & PA_MASK_4KIB, leaf_ipa);
+        assert_eq!(words[l3 + 1].load(Ordering::Acquire), 0);
+        for index in [0, 2] {
+            let retired_leaf = words[l3 + index].load(Ordering::Acquire);
+            assert_eq!(retired_leaf & VALID, 0);
+            assert_ne!(retired_leaf & SW_RETIRED, 0);
+            assert_eq!(
+                retired_leaf & PA_MASK_4KIB,
+                leaf_ipa + index as u64 * PT_PAGE
+            );
+        }
     }
 
     #[test]

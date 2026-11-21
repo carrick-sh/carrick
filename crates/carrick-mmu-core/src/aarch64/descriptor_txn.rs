@@ -2050,6 +2050,9 @@ impl Executor<'_> {
         descriptor: u64,
         base: u64,
     ) -> Result<u64, DescriptorRefusal> {
+        if descriptor == 0 && matches!(self.op, DescriptorOp::Retire(_)) {
+            return Ok(0);
+        }
         let span = entry_span(level);
         if is_table(descriptor, level) {
             return match loc {
