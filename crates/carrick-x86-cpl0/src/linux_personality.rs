@@ -1152,81 +1152,147 @@ fn supply_user_fault(
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
             };
-            // The carrier crossing publishes a window once. A NotNow rerun
-            // retains that exact submitted window and serves it before the
-            // settlement crossing; crossing first would ask custody to settle
-            // a descriptor receipt that does not exist yet.
-            if grant_slot.window().is_none() {
-                cross_owner_grant(
-                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                    fault.address,
+            serve_selected_window(binding, task, fault, grant_slot, residency, &words)
+        }
+    }
+}
+
+/// Serve this CPU's owner-selected window, then settle it through the
+/// carrier before answering. The grant slot is this CPU's custody: a member
+/// that parks may resume on the other CPU, and any later crossing on this one
+/// would find a still-submitted window. So every serve, published or not,
+/// crosses once to settle its receipt or withdraw its window, and a refused
+/// receipt takes the shared publication policy's next action.
+fn serve_selected_window(
+    binding: &CpuBinding,
+    task: &CurrentTask,
+    fault: carrick_guest_arch::FaultInfo,
+    grant_slot: &carrick_el1_abi::PortalGrantSlot,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    words: &carrick_x86_carrier::entry::InitialWords,
+) -> UserFaultSupply {
+    use carrick_core::mm::frames::{
+        GrantServeOutcome, PublicationCompletion, PublicationDecline, PublicationNextAction,
+        SelectedBackingPlan, publication_next_action,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    let cpu = carrick_guest_arch::CpuId::new(binding.cpu_slot);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
+    loop {
+        // The carrier prepares and submits the selected window.
+        cross_owner_grant(cpu, fault.address);
+        let Some(window) = grant_slot.window() else {
+            // No physical backing for a still-authenticated file selection:
+            // EOF/truncation follows Linux backing-fault signal policy.
+            let Some((generation, selected)) =
+                grant_slot.pending_fault_selection(mm_key, fault.address.raw())
+            else {
+                // The carrier met this MM's editor held on the other CPU and
+                // returned the selection unserved: park on its release.
+                return UserFaultSupply::MmRelease(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                );
+            };
+            if selected.host_backing.is_some()
+                && grant_slot.cancel_fault_selection(selected, generation)
+            {
+                return UserFaultSupply::Signal {
+                    signum: carrick_syscall_abi::LINUX_SIGBUS,
+                    code: carrick_syscall_abi::LINUX_BUS_ADRERR,
+                    address: fault.address,
+                };
+            }
+            return UserFaultSupply::Unresolved(9);
+        };
+        let Ok(owner) = native_process::portal() else {
+            cross_owner_grant(cpu, fault.address);
+            return UserFaultSupply::Unresolved(9);
+        };
+        #[cfg(feature = "test-support")]
+        crate::test_support::hold_editor_for_selected_serve(task);
+        // SAFETY: the retained residency table and metadata allocator are
+        // the CPL0 guest venue. The shared helper releases its editor and
+        // descriptor claim before growing or returning NotNow.
+        let outcome = unsafe {
+            carrick_core::mm::frames::serve_grant_with_venue(
+                &owner,
+                grant_slot,
+                residency,
+                &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                binding.cpu_slot,
+                |target, view| {
+                    Ok(carrick_core::mm::frames::try_apply_grant::<
+                        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+                        _,
+                    >(grant_slot, words, view, target, || {}))
+                },
+            )
+        };
+        // Publish an applied receipt; settle a refused one or withdraw an
+        // unserved window. Either way this CPU's slot is idle again.
+        cross_owner_grant(cpu, fault.address);
+        let reason = match outcome {
+            Ok(GrantServeOutcome::Completed(receipt)) => match receipt.outcome {
+                DescriptorOutcome::Applied(_) => return UserFaultSupply::Served,
+                DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => {
+                    reason
+                }
+                DescriptorOutcome::Indeterminate(_) => return UserFaultSupply::Unresolved(9),
+            },
+            Ok(GrantServeOutcome::NotNow(continuation)) => {
+                return match continuation.owner_wait {
+                    Some(wait) => UserFaultSupply::TypedRelease(wait),
+                    None => UserFaultSupply::MmRelease(
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                    ),
+                };
+            }
+            Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                return UserFaultSupply::TypedRelease(wait);
+            }
+            Ok(GrantServeOutcome::Empty) | Err(_) => {
+                return UserFaultSupply::MmRelease(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
                 );
             }
-            let Some(_window) = grant_slot.window() else {
-                // No physical backing for a still-authenticated file selection:
-                // EOF/truncation follows Linux backing-fault signal policy.
-                if let Some((generation, selected)) =
-                    grant_slot.pending_fault_selection(mm_key, fault.address.raw())
-                    && selected.host_backing.is_some()
-                    && grant_slot.cancel_fault_selection(selected, generation)
-                {
-                    return UserFaultSupply::Signal {
-                        signum: carrick_syscall_abi::LINUX_SIGBUS,
-                        code: carrick_syscall_abi::LINUX_BUS_ADRERR,
-                        address: fault.address,
-                    };
-                }
-                return UserFaultSupply::Unresolved(9);
-            };
-            let Ok(owner) = native_process::portal() else {
-                return UserFaultSupply::Unresolved(9);
-            };
-            #[cfg(feature = "test-support")]
-            crate::test_support::hold_editor_for_selected_serve(task);
-            // SAFETY: the retained residency table and metadata allocator are
-            // the CPL0 guest venue. The shared helper releases its editor and
-            // descriptor claim before growing or returning NotNow.
-            let outcome = unsafe {
-                carrick_core::mm::frames::serve_grant_with_venue(
-                    &owner,
-                    grant_slot,
-                    residency,
-                    &carrick_el1::alloc::GLOBAL_ALLOCATOR,
-                    binding.cpu_slot,
-                    |target, view| {
-                        Ok(carrick_core::mm::frames::try_apply_grant::<
-                            carrick_mmu_core::x86::owner_mmu::X86Mmu,
-                            _,
-                        >(
-                            grant_slot, &words, view, target, || {}
-                        ))
-                    },
-                )
-            };
-            match outcome {
-                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt))
-                    if matches!(
-                        receipt.outcome,
-                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
-                    ) =>
-                {
-                    cross_owner_grant(
-                        carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                        fault.address,
-                    );
-                    UserFaultSupply::Served
-                }
-                Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(_))
-                | Err(carrick_core::mm::transaction::MmError::Busy) => UserFaultSupply::MmRelease(
+        };
+        let Ok(selected) = SelectedBackingPlan::new(window.range, window.range, window.fault_page)
+        else {
+            return UserFaultSupply::Unresolved(9);
+        };
+        match publication_next_action(
+            PublicationCompletion::Declined(Some(PublicationDecline::from_descriptor(reason))),
+            selected,
+            mm_key,
+        ) {
+            PublicationNextAction::ParkOnMmRelease { .. } => {
+                return UserFaultSupply::MmRelease(
                     carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
-                ),
-                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                    UserFaultSupply::TypedRelease(wait)
-                }
-                _ => UserFaultSupply::MmRelease(
-                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
-                ),
+                );
             }
+            PublicationNextAction::RerunWith(fallback) => {
+                // One strictly smaller selection: the fault page alone.
+                let mut page = window;
+                page.range = fallback.range();
+                page.host_backing = match window.host_backing {
+                    Some(source) => {
+                        match source.advance(fallback.range().start() - window.range.start()) {
+                            Some(source) => Some(source),
+                            None => return UserFaultSupply::Unresolved(9),
+                        }
+                    }
+                    None => None,
+                };
+                if !grant_slot.publish_fault_selection(window.operation.sequence.get(), page) {
+                    return UserFaultSupply::Unresolved(9);
+                }
+            }
+            // The fault page holds an output already: rerun the access, whose
+            // reselection takes the inherited-Prepared supply or finds it valid.
+            PublicationNextAction::ReplanInheritedPrepared => return UserFaultSupply::Served,
+            PublicationNextAction::TerminalRefusal(_)
+            | PublicationNextAction::Fatal(_)
+            | PublicationNextAction::Published => return UserFaultSupply::Unresolved(9),
         }
     }
 }
