@@ -321,7 +321,9 @@ impl<
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
         let mut outcome = match records {
-            [Some(first), Some(second)] => venue.complete_copyout_spans(alloc::vec![first, second], result),
+            [Some(first), Some(second)] => {
+                venue.complete_copyout_spans(alloc::vec![first, second], result)
+            }
             [Some((address, bytes)), None] | [None, Some((address, bytes))] => {
                 venue.complete_copyout(address, bytes, result)
             }
