@@ -2256,6 +2256,7 @@ impl<
                 | ReservationOperation::Move
                 | ReservationOperation::Protect
                 | ReservationOperation::Decommit
+                | ReservationOperation::Discard
         ) && self.return_owed_within(range)
         {
             return Err(Refusal::Busy);
@@ -2295,7 +2296,11 @@ impl<
                 data += source.len();
             }
         }
-        let added = if operation == ReservationOperation::Retire {
+        // A discard keeps every node as it is: it adds nothing.
+        let added = if matches!(
+            operation,
+            ReservationOperation::Retire | ReservationOperation::Discard
+        ) {
             0
         } else {
             range.len()
@@ -2334,7 +2339,11 @@ impl<
             // between source and destination may need a split at each.
             5
         } else {
-            self.splits_needed(range) + usize::from(operation != ReservationOperation::Retire)
+            match operation {
+                ReservationOperation::Discard => 0,
+                ReservationOperation::Retire => self.splits_needed(range),
+                _ => self.splits_needed(range) + 1,
+            }
         };
         let nodes = self.allocate_spares(needed)?;
         let request = ReservationRequest {
@@ -2762,6 +2771,25 @@ impl<
         })
     }
 
+    /// Discard the backing of a fully covered sub-range (`MADV_DONTNEED`)
+    /// while keeping every node, its protection and its attributes.
+    ///
+    /// The descriptor/backing owner retires the range's backing through the
+    /// same return transaction as munmap; completion edits no node, so the
+    /// next touch faults in fresh backing (zero, or a private file's bytes).
+    pub fn discard_range(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
+        self.proposal(ReservationProposal {
+            range,
+            protection: ReservationProtection::NONE,
+            operation: ReservationOperation::Discard,
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: true,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
+    }
+
     /// Check whether `range` is fully covered by contiguous reservation nodes.
     pub fn is_reserved(&mut self, range: ReservationRange) -> bool {
         let mut cursor = range.start();
@@ -2938,7 +2966,11 @@ impl<
                     .union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
             );
         }
-        let creates = pending.request.operation != ReservationOperation::Retire;
+        let discard = pending.request.operation == ReservationOperation::Discard;
+        let creates = !matches!(
+            pending.request.operation,
+            ReservationOperation::Retire | ReservationOperation::Discard
+        );
         let created_backing = if created_flags.contains(ReservationNodeFlags::FILE)
             && matches!(
                 pending.request.operation,
@@ -2954,23 +2986,27 @@ impl<
         let mut spares = Spares(pending.nodes);
         // The pending proposal excluded every other edit, so these are the
         // splits counted at proposal time; prove it before mutating.
-        let required = pending.request.source.map_or(0, |s| self.splits_needed(s))
-            + self.splits_needed(range)
-            + usize::from(creates);
+        let required = if discard {
+            0
+        } else {
+            pending.request.source.map_or(0, |s| self.splits_needed(s))
+                + self.splits_needed(range)
+                + usize::from(creates)
+        };
         if spares.available() < required {
             return Err(Refusal::Stale);
         }
         if let Some(source) = pending.request.source {
             self.remove_range(source, &mut spares)?;
         }
-        if matches!(
-            pending.request.operation,
-            ReservationOperation::Protect | ReservationOperation::Decommit
-        ) {
+        match pending.request.operation {
+            // Every node stays as it was; only its backing was retired.
+            ReservationOperation::Discard => {}
             // Each covered node keeps its own carried attributes.
-            self.reprotect_range(range, pending.request.protection, &mut spares)?;
-        } else {
-            self.remove_range(range, &mut spares)?;
+            ReservationOperation::Protect | ReservationOperation::Decommit => {
+                self.reprotect_range(range, pending.request.protection, &mut spares)?;
+            }
+            _ => self.remove_range(range, &mut spares)?,
         }
         if creates
             && !matches!(
@@ -3199,7 +3235,7 @@ impl<
         entry.start.store(new_start, Ordering::Relaxed);
         Ok(ChunkAcknowledgement::Advanced)
     }
-    /// Complete a pending `Retire`, `Decommit` (or a `Prepare` replacing resident memory)
+    /// Complete a pending `Retire`, `Decommit`, `Discard` (or a `Prepare` replacing resident memory)
     /// whose stage-1 terminals the guest venue retired, and journal the
     /// range as an owed return in `slot` ([`Self::reserve_return`]).
     /// `completion.backing()` returned nothing yet: the frames stay in the
@@ -3217,6 +3253,7 @@ impl<
                     ReservationOperation::Retire
                         | ReservationOperation::Prepare
                         | ReservationOperation::Decommit
+                        | ReservationOperation::Discard
                 ) && completion.backing().returned_bytes == 0 =>
             {
                 request
@@ -7530,6 +7567,79 @@ mod tests {
 
         assert!(g.is_reserved(reserve_span));
         assert!(!g.is_committed(commit_span));
+    }
+
+    /// `MADV_DONTNEED` (#1846): a discard returns backing through the same
+    /// owed return as a decommit, but every node keeps its protection, its
+    /// bounds and its incarnation, and the proposal takes no spare node.
+    #[test]
+    fn discard_range_keeps_every_node_and_its_protection() {
+        let table = table();
+        let mm = ReservationMm::new(90).unwrap();
+        let mut layout = layout();
+        layout.arena = range(0x100000, 0x8000000);
+        table.publish(0, mm, layout).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        g.finish_import().unwrap();
+        let chunk = range(0x200000, 0x240000);
+        let guard = range(0x201000, 0x202000);
+        let decision = g.reserve_range(chunk).unwrap();
+        complete(&mut g, decision);
+        let decision = g
+            .commit_range(chunk, ReservationProtection::READ_WRITE)
+            .unwrap();
+        complete(&mut g, decision);
+        let decision = g.commit_range(guard, ReservationProtection::NONE).unwrap();
+        complete(&mut g, decision);
+        let nodes = |g: &mut Reservations<'_>| {
+            let mut nodes = Vec::new();
+            g.observe_range(chunk, &mut |mapping| {
+                nodes.push((mapping.range, mapping.protection, mapping.flags))
+            })
+            .unwrap();
+            nodes
+        };
+        let before = nodes(&mut g);
+        assert_eq!(before.len(), 3);
+        let incarnation = g.node(chunk.start()).unwrap().1;
+
+        let Decision::Work(request) = g.discard_range(range(0x200000, 0x203000)).unwrap() else {
+            panic!("expected a discard transaction");
+        };
+        assert_eq!(request.operation, ReservationOperation::Discard);
+        assert_eq!(
+            g.state().pending.as_ref().unwrap().nodes,
+            [0; 5],
+            "no spare node"
+        );
+        let slot = g.reserve_return(request.range).unwrap();
+        // SAFETY: this root fixture models a completed descriptor retirement;
+        // inventory return remains owed until the host acknowledgement below.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        assert_eq!(g.complete_deferring_return(completion, slot), Ok(0));
+        assert_eq!(nodes(&mut g), before, "nodes and protections unchanged");
+        assert_eq!(g.node(chunk.start()).unwrap().1, incarnation);
+        // The owed range refuses a second discard until it settles.
+        assert_eq!(g.discard_range(guard), Err(Refusal::Busy));
+        assert_eq!(settle_all(&mut g), vec![ChunkAcknowledgement::Freed]);
+        let decision = g.discard_range(guard).unwrap();
+        complete(&mut g, decision);
+        assert_eq!(nodes(&mut g), before);
+        // A hole is refused before any proposal.
+        assert_eq!(
+            g.discard_range(range(0x23f000, 0x241000)),
+            Err(Refusal::Hole)
+        );
     }
 
     #[test]
