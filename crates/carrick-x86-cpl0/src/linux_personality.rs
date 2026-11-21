@@ -1217,6 +1217,7 @@ impl Personality for LinuxPersonality {
                 carrick_core_abi::service::ServiceOrigin::Initial
             },
             carrick_el1_abi::RefusalVenue::Ring,
+            carrick_el1_abi::RefusalArguments::Registers(frame.syscall_arguments()),
         );
     }
 
@@ -1566,6 +1567,7 @@ impl Personality for LinuxPersonality {
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
                             origin,
                             carrick_el1_abi::RefusalVenue::Ring,
+                            carrick_el1_abi::RefusalArguments::Registers(frame.syscall_arguments()),
                         );
                         Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
                     }
@@ -1607,6 +1609,7 @@ impl Personality for LinuxPersonality {
             {
                 frame.rax = carrick_el1_linux::dispatch::count_unclaimed_native_refusal(
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    frame.syscall_arguments(),
                     counters,
                 )
                 .0;
@@ -1665,6 +1668,7 @@ impl Personality for LinuxPersonality {
                         .current()
                         .map(|r| source.zone.record_ref(r)),
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    frame.syscall_arguments(),
                     counters,
                 ) as u64;
                 ControlFlow::Return(())

@@ -23,7 +23,7 @@ Commands
     carrick guest-processes              # summarize guest PID/TID host threads
     carrick guest-threads [pid]          # list guest threads, optionally by PID
     carrick eventring [count|start:count]# decode ring (default: last 128)
-    carrick el1-counters                 # ARM mapped syscall counters
+    carrick el1-counters                 # ARM mapped syscall counters + REFUSE records
     carrick mach-exceptions              # correlate DSR Mach exception ports
 
 The plugin caches the state file path between calls so you only have to
@@ -1049,6 +1049,10 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         name, fmt = spec
         out.append(f"{gi:6} {name:8} {fmt(a, b, c)}")
     out[0] += f"  errors={errors}"
+    # EL1 refusals happen in the guest kernel, which cannot write this host
+    # ring: their typed records live in the mapped counters, shown here too.
+    if ring_name == "lifecycle":
+        out.extend(_refused_call_section(process, target) or [])
     result.AppendMessage("\n".join(out))
 
 
@@ -1114,6 +1118,123 @@ def _syscall_frame_lines(raw):
         label = "argument-write-mask" if source == 8 else "esr"
         lines.append(f"syscall-frame sample={sample} source={sources.get(source, 'unknown')} nr={nr} pc={pc:#x} slot={slot} binding[mm={mm},generation={generation},task={task},thread={thread}] args=[{','.join(hex(arg) for arg in args)}] {label}={detail:#x}")
     return lines
+
+
+_REFUSED_CALL_RECORDS = 64
+_REFUSED_CALL_WORDS = 9
+_SYSCALL_NAMES: dict = {}
+
+
+def _syscall_names(isa: str = "aarch64") -> dict:
+    """Native syscall names from carrick-abi's own tables, read from the
+    checkout this plugin lives in; an empty map leaves numbers bare."""
+    if isa in _SYSCALL_NAMES:
+        return _SYSCALL_NAMES[isa]
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if isa == "x86_64":
+        path = os.path.join(root, "crates", "carrick-syscall-abi", "src", "syscall_x86_64.rs")
+        pattern = re.compile(r'^\s*(?:direct|private|native)\((\d+), "([a-z0-9_]+)"')
+    else:
+        path = os.path.join(root, "crates", "carrick-abi", "src", "syscall.rs")
+        pattern = re.compile(r'^\s*\([A-Z0-9_]+, (\d+), "([a-z0-9_]+)"')
+    names = {}
+    try:
+        with open(path, encoding="utf-8") as table:
+            for line in table:
+                match = pattern.match(line)
+                if match:
+                    names.setdefault(int(match.group(1)), match.group(2))
+    except OSError:
+        pass
+    _SYSCALL_NAMES[isa] = names
+    return names
+
+
+def _refused_call_lines(raw, next_index: int, names: Optional[dict] = None):
+    """Decode `Counters::refused_calls`: the last 64 counted refusals with the
+    argument registers each refused call carried, oldest first. A row whose
+    generation is not its logical index's complete value is in flight or
+    overwritten and is reported, never decoded torn."""
+    import struct
+    if len(raw) != _REFUSED_CALL_RECORDS * _REFUSED_CALL_WORDS * 8:
+        raise ValueError("invalid refused call extent")
+    names = {} if names is None else names
+    lines = []
+    for index in range(max(0, next_index - _REFUSED_CALL_RECORDS), next_index):
+        row = struct.unpack_from(
+            f"<{_REFUSED_CALL_WORDS}Q", raw,
+            (index % _REFUSED_CALL_RECORDS) * _REFUSED_CALL_WORDS * 8,
+        )
+        generation, nr, flags, *args = row
+        if generation != index * 2 + 2:
+            lines.append(f"REFUSE #{index} unreadable generation={generation}")
+            continue
+        name = names.get(nr)
+        line = (
+            f"REFUSE nr={nr}({name or '?'}) "
+            f"caller={'child' if flags & 1 else 'root'} "
+            f"venue={'carrier' if flags & 2 else 'ring'}"
+        )
+        if flags & 4:
+            line += " " + " ".join(f"a{i}={arg:#x}" for i, arg in enumerate(args))
+            # select/pselect6 take nfds first; poll/ppoll take it second.
+            # The sets stay in guest memory: read them from a core.
+            if name in ("select", "pselect6"):
+                line += f" nfds={args[0]}"
+            elif name in ("poll", "ppoll"):
+                line += f" nfds={args[1]}"
+        else:
+            line += " args=unretained"
+        lines.append(line)
+    return lines
+
+
+def _refused_call_section(process, target):
+    """The ARM carrier's retained refusal records, or None when this
+    artifact or process has no mapped counters."""
+    import struct
+    address = _static_load_addr(
+        target, "carrick_vmm_hvf::trap::stage2_backend::EL1_COUNTERS_HOST_PTR"
+    )
+    layout = target.FindFirstType("carrick_el1_abi::Counters")
+    if address is None or not layout.IsValid():
+        return None
+    error = lldb.SBError()
+    pointer = process.ReadUnsignedFromMemory(address, target.GetAddressByteSize(), error)
+    if error.Fail() or pointer == 0:
+        return None
+    wanted = ("refused_calls", "refused_call_next", "refused_call_dropped")
+    fields = {}
+    for index in range(layout.GetNumberOfFields()):
+        field = layout.GetFieldAtIndex(index)
+        if field.GetName() in wanted:
+            fields[field.GetName()] = field
+    if set(fields) != set(wanted):
+        return None
+    raw_next = process.ReadMemory(
+        pointer + fields["refused_call_next"].GetOffsetInBytes(), 8, error
+    )
+    raw_dropped = process.ReadMemory(
+        pointer + fields["refused_call_dropped"].GetOffsetInBytes(), 8, error
+    )
+    size = fields["refused_calls"].GetType().GetByteSize()
+    raw = process.ReadMemory(pointer + fields["refused_calls"].GetOffsetInBytes(), size, error)
+    if error.Fail() or len(raw) != size or len(raw_next) != 8 or len(raw_dropped) != 8:
+        return [f"# refused calls unreadable: {error}"]
+    next_index = struct.unpack("<Q", raw_next)[0]
+    dropped = struct.unpack("<Q", raw_dropped)[0]
+    return [_refused_call_header(next_index, dropped)] + _refused_call_lines(
+        raw, next_index, _syscall_names("aarch64")
+    )
+
+
+def _refused_call_header(next_index: int, dropped: int) -> str:
+    """Summary line: records retained, claimed, and dropped because a
+    concurrent or lapped writer held their row."""
+    return (
+        f"# EL1 refused calls: {min(next_index, _REFUSED_CALL_RECORDS)} of {next_index} "
+        f"retained (last {_REFUSED_CALL_RECORDS}), dropped={dropped}"
+    )
 
 
 def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
@@ -1193,6 +1314,7 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
             return
         lines.extend(_syscall_frame_lines(raw))
         lines.append("# syscall frames retain first 32 samples; not a census")
+    lines.extend(_refused_call_section(process, target) or [])
     result.AppendMessage("\n".join(lines))
 
 

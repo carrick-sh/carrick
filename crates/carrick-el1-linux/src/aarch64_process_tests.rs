@@ -18107,7 +18107,25 @@ fn with_arm_process_host_files<R>(
 
 #[cfg(test)]
 fn with_arm_process_host_files_on<R>(
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    body: impl FnOnce(
+        &mut dyn FnMut(
+            ArmCaller,
+            u64,
+            [u64; 6],
+        ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64),
+        &std::sync::Arc<carrick_kernel::kernel::FileTable>,
+    ) -> R,
+) -> (R, Vec<u8>) {
+    with_arm_process_host_counted(dispatcher, &carrick_el1_abi::Counters::new(), body)
+}
+
+/// [`with_arm_process_host_files_on`] publishing into `counters`, for a
+/// witness that reads the census the calls left behind.
+#[cfg(test)]
+fn with_arm_process_host_counted<R>(
     mut dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    counters: &carrick_el1_abi::Counters,
     body: impl FnOnce(
         &mut dyn FnMut(
             ArmCaller,
@@ -18204,7 +18222,6 @@ fn with_arm_process_host_files_on<R>(
     )
     .with_words(words);
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let mut host_mem = HostPointerMemory;
     let reporter = carrick_kernel::compat::CompatReporter::default();
@@ -18335,7 +18352,7 @@ fn with_arm_process_host_files_on<R>(
         let ArmCaller::Child(pid) = caller else {
             let route = super::dispatch::dispatch_arm_syscall_with_native_process(
                 &mut frame,
-                &counters,
+                counters,
                 core::slice::from_ref(&fixture.task),
                 crossing.fd_map(),
                 &[],
@@ -18439,7 +18456,7 @@ fn with_arm_process_host_files_on<R>(
         }
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
-            &counters,
+            counters,
             core::slice::from_ref(&fixture.task),
             crossing.fd_map(),
             &[],
@@ -18716,6 +18733,71 @@ fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
         ));
         assert_eq!(read_set.as_bytes(), &mask);
     });
+}
+
+/// The dev-shell row's `Select has failed (38)`: a native child's pselect6
+/// over two descriptors is a counted refusal (the ring serves one), and its
+/// REFUSE record keeps nfds and the set pointers the guest passed.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_refused_pselect6_records_nfds_and_sets() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    let counters = carrick_el1_abi::Counters::new();
+    let (record, _) = with_arm_process_host_counted(
+        carrick_kernel::dispatch::SyscallDispatcher::new(),
+        &counters,
+        |call, _| {
+            let pipe = GuestUserBuffer::zeroed(8);
+            assert_eq!(
+                call(Root, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
+                0
+            );
+            let read = u32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
+            let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
+            let (_, child) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+            assert!(child > 0);
+            let child = ArmCaller::Child(child as u32);
+            call(child, ARM_RESUME, [0; 6]);
+            let read_set =
+                GuestUserBuffer::from_bytes(&((1u64 << read) | (1u64 << write)).to_ne_bytes());
+            let write_set = GuestUserBuffer::zeroed(8);
+            let zero_ts = GuestUserBuffer::from_value([0u64, 0]);
+            let args = [
+                u64::from(read.max(write)) + 1,
+                read_set.arg(),
+                write_set.arg(),
+                0,
+                zero_ts.arg(),
+                0,
+            ];
+            let refused = call(child, sys::PSELECT6.raw(), args);
+            assert_eq!(
+                refused.1,
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                "two-descriptor pselect6: {refused:?}"
+            );
+            assert_ne!(refused.0, CompletionRoute::Forward);
+            args
+        },
+    );
+    let ordinal = sys::PSELECT6.raw() as usize;
+    assert_eq!(
+        counters.refused_child[ordinal].load(core::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        counters.refused_calls().collect::<Vec<_>>(),
+        [carrick_el1_abi::RefusedCall {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(ordinal as u64),
+            origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+            venue: carrick_el1_abi::RefusalVenue::Ring,
+            arguments: carrick_el1_abi::RefusalArguments::Registers(record),
+        }],
+        "the refused pselect6 keeps nfds and the set pointers"
+    );
 }
 
 /// #2588: a fork child calls `pselect6` on a zone pipe its direct parent

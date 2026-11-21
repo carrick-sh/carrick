@@ -142,6 +142,7 @@ impl NativeService {
             ordinal,
             self.request().identity.birth.origin,
             carrick_el1_abi::RefusalVenue::Carrier,
+            carrick_el1_abi::RefusalArguments::Unretained,
         );
     }
 
@@ -480,6 +481,7 @@ impl NativeService {
                             payload.ordinal(),
                             request.identity.birth.origin,
                             carrick_el1_abi::RefusalVenue::Carrier,
+                            carrick_el1_abi::RefusalArguments::Unretained,
                         );
                     }
                     custody.retire_native_exec(

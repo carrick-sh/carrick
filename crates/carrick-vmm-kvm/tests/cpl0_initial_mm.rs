@@ -3486,6 +3486,102 @@ fn in_zone_child_host_read_is_counted_enosys_not_served_under_root_context() {
     );
 }
 
+/// The x86 twin of the ARM refusal record witness: the forked child's
+/// counted ENOSYS keeps the child's six argument registers (rdi, rsi, rdx,
+/// r10, r8, r9) exactly, with its caller and venue, in the mapped counters.
+#[test]
+fn in_zone_child_counted_refusal_records_the_refused_calls_arguments() {
+    let elf = forward_authority_fixture("CHILD_REFUSED_ARGS");
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the child's read must be answered in ring: {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused_child[0].load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        counters.refused_calls().collect::<Vec<_>>(),
+        [carrick_el1_abi::RefusedCall {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(0),
+            origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+            venue: carrick_el1_abi::RefusalVenue::Ring,
+            arguments: carrick_el1_abi::RefusalArguments::Registers([
+                0,
+                0x5151_0000,
+                0x77,
+                0xa10,
+                0xa08,
+                0xa09
+            ]),
+        }],
+        "the only counted refusal is the child's read, with its registers"
+    );
+}
+
+/// The x86 twin of the ARM refused-select witness: the forked child's
+/// pselect6 over two descriptors is a counted refusal in ring, and its record
+/// keeps nfds and the set pointers (rdi, rsi, rdx, r10, r8, r9) the child
+/// passed, read back from the fixture's own symbols.
+#[test]
+fn in_zone_child_refused_pselect6_records_nfds_and_set_pointers() {
+    let elf = forward_authority_fixture("CHILD_REFUSED_SELECT");
+    let symbol = |name: &str| {
+        let parsed = goblin::elf::Elf::parse(&elf).expect("fixture ELF");
+        parsed
+            .syms
+            .iter()
+            .find(|sym| parsed.strtab.get_at(sym.st_name) == Some(name))
+            .map(|sym| sym.st_value)
+            .unwrap_or_else(|| panic!("fixture symbol {name}"))
+    };
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the child's pselect6 must be answered in ring: {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "91 = the child's status was not ENOSYS: {:?}",
+        outcome.run
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused_child[270].load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        counters.refused_calls().collect::<Vec<_>>(),
+        [carrick_el1_abi::RefusedCall {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(270),
+            origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+            venue: carrick_el1_abi::RefusalVenue::Ring,
+            arguments: carrick_el1_abi::RefusalArguments::Registers([
+                2,
+                symbol("select_read"),
+                symbol("select_write"),
+                0,
+                symbol("select_timeout"),
+                0,
+            ]),
+        }],
+        "the refused pselect6 keeps nfds and the set pointers"
+    );
+}
+
 /// Native child pipe writes use the source-backed shared IPC executor.
 #[test]
 fn in_zone_child_pipe_write_uses_shared_ipc_execution() {

@@ -12,6 +12,15 @@
  *                         answers it with a counted ENOSYS (#2157). The
  *                         child exits with the negated result, the parent
  *                         reaps status 38<<8 and the run exits 7.
+ *   CHILD_REFUSED_ARGS    as CHILD_STDIN_READ, with every argument
+ *                         register distinct (rsi an unmapped address the
+ *                         refusal never reads), so the counted refusal's
+ *                         record can be checked register by register.
+ *   CHILD_REFUSED_SELECT  child pselect6(2, {0, 1}, {}, NULL, &{0, 0}, NULL):
+ *                         two descriptors in one set is a counted ENOSYS in
+ *                         ring (apt's `Select has failed (38)`), whose
+ *                         record keeps nfds and the set pointers. The child
+ *                         exits 38, the parent reaps 38<<8, the run exits 7.
  *   CHILD_POLL_WAIT       child ppoll({1, POLLIN}, 50 ms): stdout never
  *                         becomes readable, so the host readiness crossing
  *                         must wait, and a wait needs the child's own
@@ -82,7 +91,8 @@ _start:
     js failure
 #ifdef CHILD_EXIT_STATUS
     cmpl $0x300, status(%rip)
-#elif defined(CHILD_STDIN_READ)
+#elif defined(CHILD_STDIN_READ) || defined(CHILD_REFUSED_ARGS) \
+    || defined(CHILD_REFUSED_SELECT)
     cmpl $0x2600, status(%rip)
 #else
     cmpl $0, status(%rip)
@@ -101,6 +111,32 @@ child:
     lea buffer(%rip), %rsi
     mov $1, %edx
     xor %eax, %eax
+    syscall
+    neg %rax
+    mov %eax, %edi
+    jmp exit
+#endif
+#ifdef CHILD_REFUSED_ARGS
+    xor %edi, %edi
+    mov $0x51510000, %esi
+    mov $0x77, %edx
+    mov $0xa10, %r10d
+    mov $0xa08, %r8d
+    mov $0xa09, %r9d
+    xor %eax, %eax
+    syscall
+    neg %rax
+    mov %eax, %edi
+    jmp exit
+#endif
+#ifdef CHILD_REFUSED_SELECT
+    mov $2, %edi
+    lea select_read(%rip), %rsi
+    lea select_write(%rip), %rdx
+    xor %r10d, %r10d
+    lea select_timeout(%rip), %r8
+    xor %r9d, %r9d
+    mov $270, %eax
     syscall
     neg %rax
     mov %eax, %edi
@@ -174,3 +210,8 @@ pollfd: .long 1
 pipefd: .long 3, 4
 status: .long 0
 buffer: .long 0
+.balign 8
+.global select_read, select_write, select_timeout
+select_read: .quad 3                /* fds 0 and 1 */
+select_write: .quad 0
+select_timeout: .quad 0, 0
