@@ -359,6 +359,8 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     /// exact call `ordinal` again once the carrier enrolled the member; a
     /// refused or failed enrolment is the call's answer. `None`: this venue
     /// has no host-file service.
+    // The record is boxed storage the service publishes by address.
+    #[allow(clippy::boxed_local)]
     fn begin_host_set_enrol(
         &mut self,
         _record: alloc::boxed::Box<[u8]>,
