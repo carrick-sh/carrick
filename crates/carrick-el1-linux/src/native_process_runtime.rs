@@ -9628,33 +9628,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn realtime_counter(
         &mut self,
     ) -> Option<carrick_personality_linux::lifecycle::RealtimeCounter> {
-        // The vvar mapping has already been installed by the MM publisher.
-        // Read its calibrated words through the exact caller-MM copy path.
-        #[cfg(not(target_os = "none"))]
-        {
-            // The host fixture has no vvar mapping at the guest address.
-            None
-        }
-        #[cfg(target_os = "none")]
-        {
-            use carrick_abi::{LINUX_VVAR_BASE, VVAR_OFF_FREQ, VVAR_OFF_REALTIME_OFF_NS};
-
-            const WORD: usize = size_of::<u64>();
-            const OFFSET: usize = VVAR_OFF_REALTIME_OFF_NS - VVAR_OFF_FREQ;
-            let mut words = [0; OFFSET + WORD];
-            self.copy_syscall_input(
-                UserVa::new(LINUX_VVAR_BASE + VVAR_OFF_FREQ as u64),
-                &mut words,
-            )
-            .ok()?;
-            let frequency = u64::from_le_bytes(words[..WORD].try_into().ok()?);
-            let frequency = carrick_guest_arch::CounterFrequency::new(NonZeroU64::new(frequency)?);
-            Some(carrick_personality_linux::lifecycle::RealtimeCounter {
-                tick: self.service.signal_now().ok()?,
-                frequency,
-                offset_ns: u64::from_le_bytes(words[OFFSET..].try_into().ok()?),
-            })
-        }
+        // The carrier publishes its calibration into the zone; a guest can
+        // unmap or replace its vvar page, so the syscall clock never reads it.
+        let offset_ns = self.source.zone.realtime_offset()?;
+        Some(carrick_personality_linux::lifecycle::RealtimeCounter {
+            tick: self.service.signal_now().ok()?,
+            frequency: self.service.signal_frequency().ok()?,
+            offset_ns,
+        })
     }
     fn owns_descriptor_namespace(&self) -> bool {
         self.source.zone.record(self.record.id).is_native_owned()
