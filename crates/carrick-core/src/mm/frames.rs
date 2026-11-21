@@ -775,6 +775,74 @@ pub fn serve_grant<
     ))
 }
 
+#[cfg(feature = "test-support")]
+static INJECTED_GRANT_REFUSAL: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "test-support")]
+static INJECTED_GRANT_REFUSALS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Pages of the first owner-selected grant applied after an injected
+/// refusal, or 0.
+#[cfg(feature = "test-support")]
+static GRANT_PAGES_AFTER_REFUSAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// The next owner-selected `Prepare` grant's descriptor executor answers
+/// `reason` before any store, as a refusing executor does: the grant's
+/// residency row is retired and its receipt carries the refusal. This symbol
+/// does not exist in an ordinary Carrick guest image.
+#[cfg(feature = "test-support")]
+pub fn inject_grant_refusal_once(
+    reason: carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+) -> bool {
+    use core::sync::atomic::Ordering;
+    INJECTED_GRANT_REFUSAL
+        .compare_exchange(0, reason as u32, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Injected refusals answered so far, and the pages of the first grant
+/// applied after one (0 while none has applied).
+#[cfg(feature = "test-support")]
+pub fn injected_grant_refusal_census() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        INJECTED_GRANT_REFUSALS.load(Ordering::Acquire),
+        GRANT_PAGES_AFTER_REFUSAL.load(Ordering::Acquire),
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn take_injected_grant_refusal() -> Option<carrick_mmu_core::descriptor_refusal::DescriptorRefusal>
+{
+    use core::sync::atomic::Ordering;
+    let reason = carrick_mmu_core::descriptor_refusal::DescriptorRefusal::from_code(
+        INJECTED_GRANT_REFUSAL.swap(0, Ordering::AcqRel),
+    )?;
+    INJECTED_GRANT_REFUSALS.fetch_add(1, Ordering::AcqRel);
+    Some(reason)
+}
+
+#[cfg(feature = "test-support")]
+fn note_grant_after_injected_refusal(
+    outcome: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome,
+    len: u64,
+) {
+    use core::sync::atomic::Ordering;
+    if matches!(
+        outcome,
+        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+    ) && INJECTED_GRANT_REFUSALS.load(Ordering::Acquire) != 0
+    {
+        let _ = GRANT_PAGES_AFTER_REFUSAL.compare_exchange(
+            0,
+            len / 4096,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 /// Attempt one grant application under `target`'s MM editor. On residency
 /// capacity exhaustion, releases both the descriptor claim (`SUBMITTED`) and
 /// the MM editor without publishing a terminal refusal receipt.
@@ -989,7 +1057,15 @@ fn apply_grant_inner<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                 ));
             }
         };
+        #[cfg(feature = "test-support")]
+        let outcome = match take_injected_grant_refusal() {
+            Some(reason) => DescriptorOutcome::Refused(reason),
+            None => B::execute_grant(words, grant.ttbr0, txn),
+        };
+        #[cfg(not(feature = "test-support"))]
         let outcome = B::execute_grant(words, grant.ttbr0, txn);
+        #[cfg(feature = "test-support")]
+        note_grant_after_injected_refusal(&outcome, publication.len);
         if let DescriptorOutcome::Applied(_) = outcome {
             if let Some(page) = residency.lookup(mm.raw(), window.fault_page) {
                 residency.record_commit(page);
