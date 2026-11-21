@@ -1053,6 +1053,7 @@ surfaces = [
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.signal.temporary-wait-mask" },
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "process.exec.native-exe-link" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0/root_exec.rs", contract = "process.exec.custody" },
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.el1.guest-run-queue" },
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.mm.address-space-occupancy" },
   { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.scheduler.runnable-progress" },

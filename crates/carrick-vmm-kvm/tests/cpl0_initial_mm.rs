@@ -956,14 +956,14 @@ fn production_root_exec_twice_runs_the_second_successor() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_successor.S"),
+        native_exit_fixture("native_root_exec_successor.S"),
         0o700,
     );
     let relay = dir.path().join("relay");
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
     carrick_test_support::executable::write_executable_mode(
         &relay,
-        &native_exit_fixture_with_flags("native_root_exec.S", &[&define]),
+        native_exit_fixture_with_flags("native_root_exec.S", &[&define]),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", relay.display());
@@ -1009,7 +1009,7 @@ fn production_root_exec_with_a_running_sibling_thread_runs_the_successor() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_successor.S"),
+        native_exit_fixture("native_root_exec_successor.S"),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
@@ -1038,7 +1038,7 @@ fn production_root_exec_closes_only_close_on_exec_descriptors() {
     let successor = dir.path().join("successor");
     carrick_test_support::executable::write_executable_mode(
         &successor,
-        &native_exit_fixture("native_root_exec_fds_successor.S"),
+        native_exit_fixture("native_root_exec_fds_successor.S"),
         0o700,
     );
     let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
@@ -6316,4 +6316,21 @@ fn native_child_inet_tcp_and_udp_cross_to_the_host_network() {
         "child inet stage (100 + stage = ENOSYS; see native_child_inet.S): {:?}",
         outcome.run
     );
+}
+
+#[test]
+fn zz_diag_root_exec_on_idle_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(&successor, native_exit_fixture("native_root_exec_successor.S"), 0o700);
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/")).unwrap()));
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(&program, 256, ROOT_AFFINITY_IDLE_PEER, |_| {}, dispatcher);
+    match outcome {
+        Ok(outcome) => panic!("diag exit={} stdout={:?} census={:?}", outcome.run.exit_code, outcome.run.stdout, outcome.physical.exec_owner_census()),
+        Err(failure) => panic!("diag error={:?}", failure.error),
+    }
 }

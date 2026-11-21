@@ -231,7 +231,13 @@ fn x86_root_exec_identity(
 }
 
 /// Whose filesystem authority resolves a native exec request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum NativeExecAuthority {
     /// The caller's own cwd and credentials, which its ring owner sealed
     /// into the request from the caller's task row (#1392).
