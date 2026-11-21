@@ -178,6 +178,9 @@ gate_main:
     syscall
     test %rax, %rax
     jz gate_worker
+    /* The clone's own copy-out is done: only now may the worker arm the
+     * refusal, or the clone's parent-tid write could take it. */
+    movl $1, 0x20(%r12)
     mov $POLL_LIMIT, %r15d
 1:  movabs $INJECT_OWNED_COPY_PUBLISH_HELD, %rax
     syscall
@@ -209,6 +212,11 @@ gate_main:
     mov $231, %eax
     syscall
 gate_worker:
+1:  cmpl $0, 0x20(%r12)
+    jne 2f
+    pause
+    jmp 1b
+2:
     movabs $INJECT_OWNED_COPY_BUSY_ONCE, %rax
     syscall
     movabs $INJECT_OWNED_COPY_PUBLISH_GATE, %rax
