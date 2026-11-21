@@ -358,6 +358,411 @@ pub const fn portal_scalar_eligible(native_nr: u64) -> bool {
     matches!(native_nr, 62 | 28)
 }
 
+/// Decoded `Aarch64SyscallMailbox` request payload published before `HVC #2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxRequest {
+    pub frame: carrick_guest_mem::Aarch64SyscallFrame,
+    pub native_nr: u64,
+    pub resume_pc: u64,
+    pub spsr: u64,
+    pub fp: u64,
+    pub lr: u64,
+    pub sp: u64,
+    pub esr: u64,
+}
+
+/// Snapshot of a stopped `Aarch64SyscallMailbox` slot for error reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxDiagnostics {
+    pub generation: u64,
+    pub sequence: u64,
+    pub state: u32,
+    pub response_action: u32,
+    pub native_nr: u64,
+    pub return_value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxSlotError {
+    Protocol(MailboxProtocolError),
+    MissingRequest,
+}
+
+impl core::fmt::Display for MailboxSlotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(err) => write!(f, "aarch64 syscall mailbox protocol error: {err:?}"),
+            Self::MissingRequest => write!(f, "aarch64 syscall mailbox was idle on HVC #2"),
+        }
+    }
+}
+
+/// Architectural `HVC #imm` carrier exit classification shared across AArch64
+/// backends (`carrick_hal::aarch64` syndrome immediates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvcImmediateKind {
+    /// `hvc #1`: stage-1 TLBI maintenance trampoline finished.
+    Maintenance,
+    /// `hvc #2`: EL1 syscall forward or non-SVC lower-EL synchronous fault.
+    SyscallOrFault,
+    /// `hvc #3`: unexpected current-EL synchronous exception trap.
+    CurrentElFault,
+    /// `hvc #4`: lower-EL IRQ kick boundary trap.
+    Kick,
+    /// `hvc #5`: in-guest scheduler idle exit.
+    Idle,
+    /// `hvc #6`: EL1 dynamic metadata extent grant/return hypercall.
+    MetadataGrant,
+    /// `hvc #7`: host-driven EL1 service return or effect yield.
+    ServiceReturn,
+    /// Any unallocated `HVC` immediate.
+    Unknown(u16),
+}
+
+#[must_use]
+pub const fn classify_hvc_immediate(immediate: u16) -> HvcImmediateKind {
+    match immediate {
+        1 => HvcImmediateKind::Maintenance,
+        2 => HvcImmediateKind::SyscallOrFault,
+        3 => HvcImmediateKind::CurrentElFault,
+        4 => HvcImmediateKind::Kick,
+        5 => HvcImmediateKind::Idle,
+        6 => HvcImmediateKind::MetadataGrant,
+        7 => HvcImmediateKind::ServiceReturn,
+        other => HvcImmediateKind::Unknown(other),
+    }
+}
+
+/// Portable single-slot `Aarch64SyscallMailbox` host binding.
+///
+/// Owns protocol generation and sequence tracking over a caller-pinned 256-byte
+/// `Aarch64SyscallMailbox` mapping so non-HVF backends (the soft AArch64 VMM)
+/// consume and answer `HVC #2` publications identically to HVF.
+pub struct MailboxSlot {
+    host: core::ptr::NonNull<Aarch64SyscallMailbox>,
+    generation: u64,
+    last_sequence: u64,
+}
+
+// SAFETY: `MailboxSlot` owns stopped-vCPU protocol state for a pinned
+// `Aarch64SyscallMailbox` slot whose backing outlives the vCPU; moving the
+// binding between host threads while the vCPU is stopped preserves exclusive
+// host ownership.
+unsafe impl Send for MailboxSlot {}
+
+impl MailboxSlot {
+    /// Initialize `host` as an idle `Aarch64SyscallMailbox` slot at `generation`.
+    ///
+    /// # Safety
+    ///
+    /// `host` must point to a valid, 64-byte-aligned, exclusively owned
+    /// 256-byte `Aarch64SyscallMailbox` allocation that outlives all operations
+    /// on this `MailboxSlot` until the next `rebind` or drop, and the vCPU
+    /// sharing this slot must be stopped during `new` / `rebind`.
+    pub unsafe fn new(host: core::ptr::NonNull<Aarch64SyscallMailbox>, generation: u64) -> Self {
+        let generation = if generation == 0 { 1 } else { generation };
+        let mut slot = Self {
+            host,
+            generation,
+            last_sequence: 0,
+        };
+        // SAFETY: upheld by caller.
+        unsafe { slot.rebind(host, generation) };
+        slot
+    }
+
+    /// Re-initialize the slot header at `host` with `generation`.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::new`].
+    pub unsafe fn rebind(
+        &mut self,
+        host: core::ptr::NonNull<Aarch64SyscallMailbox>,
+        generation: u64,
+    ) {
+        let generation = if generation == 0 {
+            next_nonzero_generation(self.generation)
+        } else {
+            generation
+        };
+        self.host = host;
+        self.generation = generation;
+        self.last_sequence = 0;
+        let ptr = self.host.as_ptr();
+        // SAFETY: caller guarantees exclusive stopped access to a valid 256B slot.
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).magic),
+                AARCH64_SYSCALL_MAILBOX_MAGIC,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).version),
+                AARCH64_SYSCALL_MAILBOX_VERSION,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).size),
+                AARCH64_SYSCALL_MAILBOX_SIZE as u32,
+            );
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).generation), generation);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).sequence), 0);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).flags), 0);
+            (*ptr).state.store(
+                MailboxState::Idle.raw(),
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
+    fn state(&self) -> &core::sync::atomic::AtomicU32 {
+        // SAFETY: `self.host` points to a live `Aarch64SyscallMailbox`.
+        unsafe { &(*self.host.as_ptr()).state }
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> MailboxDiagnostics {
+        let ptr = self.host.as_ptr();
+        let state = self.state().load(core::sync::atomic::Ordering::Acquire);
+        // SAFETY: `self.host` points to a live slot sampled while the vCPU is stopped.
+        unsafe {
+            MailboxDiagnostics {
+                generation: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).generation)),
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).sequence)),
+                state,
+                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*ptr).response_action
+                )),
+                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).native_nr)),
+                return_value: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).return_value)),
+            }
+        }
+    }
+
+    /// Validate and observe a guest-published `RequestReady` payload on `HVC #2`.
+    /// Returns `Ok(None)` when the slot is `Idle` (a non-SVC synchronous fault).
+    pub fn take_request(&mut self) -> Result<Option<MailboxRequest>, MailboxSlotError> {
+        let state = self.state().load(core::sync::atomic::Ordering::Acquire);
+        if state == MailboxState::Idle.raw() {
+            return Ok(None);
+        }
+        let ptr = self.host.as_ptr();
+        // SAFETY: acquire load of `state` synchronizes with the guest's release
+        // publication while the vCPU is stopped at synchronous `HVC #2`.
+        let (metadata, request) = unsafe {
+            let metadata = MailboxRequestMetadata {
+                magic: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic)),
+                version: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).version)),
+                size: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).size)),
+                generation: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).generation)),
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).sequence)),
+                state,
+                trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).trap_kind)),
+            };
+            let args = core::ptr::read_volatile(&raw const (*ptr).args);
+            let native_nr = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).native_nr));
+            let request = MailboxRequest {
+                frame: carrick_guest_mem::Aarch64SyscallFrame {
+                    x0: args[0],
+                    x1: args[1],
+                    x2: args[2],
+                    x3: args[3],
+                    x4: args[4],
+                    x5: args[5],
+                    x8: native_nr,
+                },
+                native_nr,
+                resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).resume_pc)),
+                spsr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).spsr)),
+                fp: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).fp)),
+                lr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).lr)),
+                sp: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).sp)),
+                esr: core::ptr::read_volatile(core::ptr::addr_of!((*ptr).esr)),
+            };
+            (metadata, request)
+        };
+        validate_request_metadata(metadata, self.generation, self.last_sequence)
+            .map_err(MailboxSlotError::Protocol)?;
+        self.last_sequence = metadata.sequence;
+        // Clear any latched host-clock boundary once host dispatch observes the request.
+        unsafe {
+            let flags = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).flags));
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).flags),
+                flags & !CLOCK_FORCE_HOST_BOUNDARY,
+            );
+        }
+        Ok(Some(request))
+    }
+
+    fn require_request_ready(&self) -> Result<(), MailboxSlotError> {
+        let state = self.state().load(core::sync::atomic::Ordering::Acquire);
+        if state != MailboxState::RequestReady.raw() {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: state,
+                },
+            ));
+        }
+        let ptr = self.host.as_ptr();
+        // SAFETY: stopped slot owned by this binding.
+        let (magic, version, size, generation, sequence) = unsafe {
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).magic)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).version)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).size)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).generation)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).sequence)),
+            )
+        };
+        if magic != AARCH64_SYSCALL_MAILBOX_MAGIC {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::WrongMagic { actual: magic },
+            ));
+        }
+        if version != AARCH64_SYSCALL_MAILBOX_VERSION {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::WrongVersion { actual: version },
+            ));
+        }
+        if size != AARCH64_SYSCALL_MAILBOX_SIZE as u32 {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::WrongSize { actual: size },
+            ));
+        }
+        if generation != self.generation {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::StaleGeneration {
+                    expected: self.generation,
+                    actual: generation,
+                },
+            ));
+        }
+        if sequence != self.last_sequence {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::ResponseSequenceMismatch {
+                    expected: self.last_sequence,
+                    actual: sequence,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn publish_return_with_action(
+        &mut self,
+        value: i64,
+        action: MailboxResponseAction,
+    ) -> Result<(), MailboxSlotError> {
+        self.require_request_ready()?;
+        let ptr = self.host.as_ptr();
+        // SAFETY: `RequestReady` ownership verified above; `ResponseReady` is
+        // published with Release ordering after both payload words complete.
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).return_value), value as u64);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).response_action),
+                action.raw(),
+            );
+        }
+        self.state().store(
+            MailboxState::ResponseReady.raw(),
+            core::sync::atomic::Ordering::Release,
+        );
+        Ok(())
+    }
+
+    pub fn publish_normal_return(&mut self, value: i64) -> Result<(), MailboxSlotError> {
+        self.publish_return_with_action(value, MailboxResponseAction::NormalReturn)
+    }
+
+    pub fn publish_native_signal_return(
+        &mut self,
+        value: i64,
+        restart_eligible: bool,
+    ) -> Result<(), MailboxSlotError> {
+        self.publish_return_with_action(
+            value,
+            if restart_eligible {
+                MailboxResponseAction::NativeSignalCheckpoint
+            } else {
+                MailboxResponseAction::NativeSignalCheckpointNoRestart
+            },
+        )
+    }
+
+    pub fn pending_normal_return(&self) -> Result<Option<i64>, MailboxSlotError> {
+        let state = self.state().load(core::sync::atomic::Ordering::Acquire);
+        match MailboxState::try_from(state) {
+            Ok(MailboxState::ResponseReady) => {}
+            Ok(MailboxState::Idle | MailboxState::RequestReady | MailboxState::ClockActive) => {
+                return Ok(None);
+            }
+            Err(unknown) => {
+                return Err(MailboxSlotError::Protocol(
+                    MailboxProtocolError::UnexpectedState {
+                        expected: MailboxState::ResponseReady,
+                        actual: unknown.0,
+                    },
+                ));
+            }
+        }
+        let ptr = self.host.as_ptr();
+        // SAFETY: `ResponseReady` acquired above.
+        let (action, value) = unsafe {
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).response_action)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*ptr).return_value)),
+            )
+        };
+        if action == MailboxResponseAction::NormalReturn.raw()
+            || action == MailboxResponseAction::NormalReturnAndArmPortal.raw()
+        {
+            Ok(Some(value as i64))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn prepare_register_resume(&mut self) -> Result<(), MailboxSlotError> {
+        let state = self.state().load(core::sync::atomic::Ordering::Acquire);
+        if state == MailboxState::Idle.raw() {
+            return Ok(());
+        }
+        if state != MailboxState::RequestReady.raw() && state != MailboxState::ResponseReady.raw() {
+            return Err(MailboxSlotError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: state,
+                },
+            ));
+        }
+        let ptr = self.host.as_ptr();
+        // SAFETY: stopped slot owned by this binding.
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*ptr).response_action),
+                MailboxResponseAction::RegistersPrepared.raw(),
+            );
+        }
+        self.state().store(
+            MailboxState::ResponseReady.raw(),
+            core::sync::atomic::Ordering::Release,
+        );
+        Ok(())
+    }
+}
+
 const _: () = assert!(
     ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9 as usize
@@ -609,5 +1014,62 @@ mod tests {
                 "unexpected syscall {native_nr}"
             );
         }
+    }
+
+    #[test]
+    fn hvc_immediates_classify_canonically() {
+        assert_eq!(classify_hvc_immediate(1), HvcImmediateKind::Maintenance);
+        assert_eq!(classify_hvc_immediate(2), HvcImmediateKind::SyscallOrFault);
+        assert_eq!(classify_hvc_immediate(3), HvcImmediateKind::CurrentElFault);
+        assert_eq!(classify_hvc_immediate(4), HvcImmediateKind::Kick);
+        assert_eq!(classify_hvc_immediate(5), HvcImmediateKind::Idle);
+        assert_eq!(classify_hvc_immediate(6), HvcImmediateKind::MetadataGrant);
+        assert_eq!(classify_hvc_immediate(7), HvcImmediateKind::ServiceReturn);
+        assert_eq!(classify_hvc_immediate(9), HvcImmediateKind::Unknown(9));
+    }
+
+    #[test]
+    fn mailbox_slot_round_trips_request_and_response() {
+        // SAFETY: `Aarch64SyscallMailbox` is `#[repr(C)]` of integer and `AtomicU32`
+        // fields for which all-zero bytes are valid.
+        let mut backing: Box<Aarch64SyscallMailbox> = unsafe { Box::new_zeroed().assume_init() };
+        let ptr = core::ptr::NonNull::from(backing.as_mut());
+        // SAFETY: `backing` is a pinned 64-byte-aligned 256-byte mailbox owned by this test.
+        let mut slot = unsafe { MailboxSlot::new(ptr, 7) };
+        assert_eq!(slot.generation(), 7);
+        assert_eq!(slot.take_request(), Ok(None));
+
+        // Simulate guest EL1 vector publishing RequestReady for `write(1, 0x4000, 12)`.
+        backing.sequence = 1;
+        backing.trap_kind = MailboxTrapKind::Syscall.raw();
+        backing.native_nr = 64;
+        backing.args = [1, 0x4000, 12, 0, 0, 0];
+        backing.resume_pc = 0x21_0134;
+        backing.sp = 0xffff_ff00;
+        backing.flags = CLOCK_FORCE_HOST_BOUNDARY;
+        backing.state.store(
+            MailboxState::RequestReady.raw(),
+            core::sync::atomic::Ordering::Release,
+        );
+
+        let request = slot.take_request().unwrap().unwrap();
+        assert_eq!(request.native_nr, 64);
+        assert_eq!(request.frame.x0, 1);
+        assert_eq!(request.frame.x1, 0x4000);
+        assert_eq!(request.frame.x2, 12);
+        assert_eq!(request.resume_pc, 0x21_0134);
+        assert_eq!(request.sp, 0xffff_ff00);
+        assert_eq!(backing.flags & CLOCK_FORCE_HOST_BOUNDARY, 0);
+
+        slot.publish_normal_return(12).unwrap();
+        assert_eq!(slot.pending_normal_return(), Ok(Some(12)));
+        assert_eq!(
+            backing.state.load(core::sync::atomic::Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+        assert_eq!(
+            backing.response_action,
+            MailboxResponseAction::NormalReturn.raw()
+        );
     }
 }
