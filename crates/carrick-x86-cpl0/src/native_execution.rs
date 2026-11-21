@@ -37,6 +37,8 @@ pub fn schedule(slot: SlotId) -> ! {
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
+        #[cfg(feature = "test-support")]
+        crate::test_support::lower_injected_gate(source, slot);
         expire_timers(slot);
         // Drain any APIC timer or reschedule vector latched while IF was masked
         // on the outgoing thread before selecting and preparing the next one;
@@ -55,6 +57,12 @@ pub fn schedule(slot: SlotId) -> ! {
                 continue;
             };
             let identity = source.zone.record(selected.record).identity();
+            #[cfg(feature = "test-support")]
+            crate::test_support::raise_gate_at_switch_in(
+                source,
+                selected,
+                state.address.mm.raw().get(),
+            );
             // Resuming the MM already installed here needs no detour through
             // the maintenance root (the context install reloads CR3 once).
             let mm_raw = state.address.mm.raw().get();
