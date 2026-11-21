@@ -507,7 +507,13 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
 /// The residency rows one fork publishes: a one-page row in the parent and
 /// in the child for each inherited page no parent grant window covers, and
 /// one child row per covering window.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct ForkResidencyDemand {
     rows: usize,
 }
