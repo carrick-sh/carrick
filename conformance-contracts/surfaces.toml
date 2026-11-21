@@ -1540,6 +1540,7 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_entropy.S", contract = "kernel.native.entropy" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_inet.S", contract = "kernel.el1.epoll-zone" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_inet.S", contract = "kernel.native.host-network-venue" },
+  { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_madvise.S", contract = "kernel.mm.anonymous-discard" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_mmap_hint.S", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_child_mprotect_shapes.S", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_cwd.S", contract = "kernel.native.host-file-venue" },

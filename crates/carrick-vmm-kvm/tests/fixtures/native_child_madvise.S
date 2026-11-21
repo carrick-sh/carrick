@@ -48,17 +48,6 @@ _start:
     jmp exit
 
 child:
-    /* An inherited, written RW page reads zero after its discard. */
-    mov %r12, %rdi
-    mov $4096, %esi
-    mov $4, %edx
-    call advise
-    cmpb $0, (%r12)
-    jne inherited_bytes_failed
-    movb $0x51, (%r12)
-    cmpb $0x51, (%r12)
-    jne inherited_bytes_failed
-
     /* V8's code-range shape: a PROT_NONE NORESERVE reservation, committed RW. */
     xor %edi, %edi
     mov $0x40000, %esi
@@ -98,6 +87,17 @@ child:
     call protect
     cmpb $0, 0x1000(%r14)
     jne guard_bytes_failed
+
+    /* An inherited, written RW page reads zero after its discard. */
+    mov %r12, %rdi
+    mov $4096, %esi
+    mov $4, %edx
+    call advise
+    cmpb $0, (%r12)
+    jne inherited_bytes_failed
+    movb $0x51, (%r12)
+    cmpb $0x51, (%r12)
+    jne inherited_bytes_failed
 
     /* A touched RW page keeps RW and reads zero, then takes new bytes. */
     movb $0x42, (%r14)
