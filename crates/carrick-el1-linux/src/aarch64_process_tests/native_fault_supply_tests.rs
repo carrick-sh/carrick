@@ -289,10 +289,9 @@ fn native_fork_child_advisory_mmap_stays_in_ring() {
     child_thread_admission(0, 0, ChildStockCase::AdvisoryMmap);
 }
 
-/// #1846 (V8's `Check failed: 0 == ret`): a live native fork child's
-/// `madvise` is served in ring through the production entry, never refused:
-/// V8's guard page (PROT_NONE, then `MADV_DONTNEED`), hint advice and the
-/// plan's EINVAL. The discard keeps every node's protection.
+/// A live native fork child runs `madvise` through the production entry
+/// (#1846). Discard keeps every node's protection. Unserved DONTDUMP gets a
+/// counted ENOSYS.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_madvise_stays_in_ring() {
@@ -491,6 +490,51 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                     (guard + 0x1000, mapped + CHUNK, 3)
                 ],
                 "MADV_DONTNEED keeps every node and its protection"
+            );
+            use crate::dispatch::{
+                NativeUnstagedExit, arm_thread_group_owner, native_unstaged_exit,
+            };
+            use carrick_el1_abi::{Action, AnonymousLeave};
+            use carrick_personality_linux::dispatch::CompletionRoute;
+            use carrick_syscall_abi::{LINUX_ENOSYS, LINUX_MADV_DONTDUMP};
+
+            frame.esr = 0x15 << 26;
+            frame.x[8] = 233;
+            frame.x[..6].copy_from_slice(&[mapped, 4096, LINUX_MADV_DONTDUMP, 0, 0, 0]);
+            assert_eq!(
+                loan_call_with_anonymous(
+                    fixture,
+                    &fixture.task,
+                    &mut frame,
+                    &mut cpu,
+                    &mut service,
+                    &counters,
+                    Some(&mut editor),
+                ),
+                CompletionRoute::Forward
+            );
+            // SAFETY: the selected child retains its lifecycle page.
+            let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+            assert_eq!(
+                native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    Action::Forward,
+                    || arm_thread_group_owner(fixture.zone, &fixture.task, page),
+                    &counters,
+                ),
+                NativeUnstagedExit::Refused(Action::Served)
+            );
+            assert_eq!(frame.x[0] as i64, LINUX_ENOSYS.guest_retval());
+            assert_eq!(counters.refused[233].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.refused_child[233].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.venue_refused[233].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.venue_refused_child[233].load(Ordering::Relaxed), 0);
+            assert_eq!(
+                counters.anonymous_leaves[AnonymousLeave::RootDeclined as usize]
+                    .load(Ordering::Relaxed),
+                1,
+                "the shared reservation owner declined the advice"
             );
             return;
         }

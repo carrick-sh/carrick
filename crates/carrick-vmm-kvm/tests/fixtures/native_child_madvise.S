@@ -77,6 +77,21 @@ _start:
     jmp exit
 
 child:
+#ifdef UNROUTED_ADVICE
+    /* MADV_DONTDUMP on an inherited private page has no ring handler. */
+    mov %r12, %rdi
+    mov $4096, %esi
+    mov $16, %edx
+    mov $28, %eax
+    syscall
+    cmp $-38, %rax
+    je refused_in_ring
+    mov $77, %edi
+    jmp exit
+refused_in_ring:
+    xor %edi, %edi
+    jmp exit
+#endif
 #ifdef FORK_ADVICE
     cmpb $0x71, (%r15)
     jne fork_advice_failed

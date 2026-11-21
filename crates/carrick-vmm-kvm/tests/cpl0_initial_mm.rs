@@ -204,6 +204,36 @@ fn serial_host_native_child_madvise_dontfork_omits_page() {
     native_child_madvise(&["-DFORK_ADVICE"], 9);
 }
 
+#[test]
+fn serial_host_native_child_madvise_dontdump_is_counted_enosys() {
+    const NR: usize = 28;
+    let elf = native_exit_fixture_with_flags("native_child_madvise.S", &["-DUNROUTED_ADVICE"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_IDLE_PEER)
+        .expect("native fork and MADV_DONTDUMP");
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    let census = (
+        load(&counters.refused[NR]),
+        load(&counters.refused_child[NR]),
+        load(&counters.venue_refused[NR]),
+        load(&counters.venue_refused_child[NR]),
+    );
+    assert_eq!(
+        (outcome.run.exit_code, census),
+        (0, (1, 1, 0, 0)),
+        "77 means the child did not receive -ENOSYS; census is (ring, child ring, venue, child venue)"
+    );
+    assert_eq!(
+        load(&counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::RootDeclined as usize]),
+        1,
+        "the shared reservation owner declined the advice"
+    );
+}
+
 fn native_child_madvise(flags: &[&str], expected_advice: u64) {
     let elf = native_exit_fixture_with_flags("native_child_madvise.S", flags);
     let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_IDLE_PEER)
