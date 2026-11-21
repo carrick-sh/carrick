@@ -1277,9 +1277,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                     "refused frame grant cannot roll back backing: {error}"
                                 ))
                             });
-                        use carrick_core::mm::frames::{
-                            PublicationCompletion, PublicationNextAction,
-                        };
+                        use carrick_core::mm::frames::PublicationCompletion;
                         let policy_completion = match completed {
                             FrameGrantCompletion::PublicationDeclined => {
                                 PublicationCompletion::Declined(publication_decline.take())
@@ -1295,71 +1293,38 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             }
                             FrameGrantCompletion::Published => unreachable!(),
                         };
-                        match carrick_core::mm::frames::publication_next_action(
+                        use carrick_kernel::dispatch::carrier_loop::{
+                            DeclinedFrameGrantStep, settle_declined_frame_grant,
+                        };
+                        let retained = held_plan.borrow_mut().take();
+                        match settle_declined_frame_grant(
+                            dispatcher,
+                            &permit,
+                            mailbox,
+                            request,
                             policy_completion,
                             selected,
-                            request.mm_key,
+                            retained,
                         ) {
-                            PublicationNextAction::Published => fail_publication(
-                                "non-published frame grant reached the published policy action"
-                                    .into(),
-                            ),
-                            PublicationNextAction::ParkOnMmRelease { mm_key } => {
-                                if mm_key != request.mm_key {
-                                    fail_publication(
-                                        "contended frame grant changed its MM identity".into(),
-                                    );
-                                }
-                                if !mailbox.release_declined_publication(request) {
-                                    fail_publication(
-                                        "rolled-back frame grant lost its exact mailbox claim"
-                                            .into(),
-                                    );
-                                }
-                                let wait = dispatcher
-                                        .frame_grant_release_wait(&permit)
-                                        .unwrap_or_else(|error| {
-                                            fail_publication(format!(
-                                                "contended frame grant lost its MM release source: {error:?}"
-                                            ))
-                                        });
+                            Ok(DeclinedFrameGrantStep::ParkOnMmRelease(wait)) => {
                                 return Ok(Err(wait));
                             }
-                            PublicationNextAction::RerunWith(fallback) => {
-                                let retained = held_plan.borrow_mut().take().unwrap_or_else(|| {
-                                    fail_publication(
-                                        "capacity decline lost its unsettled frame plan".into(),
-                                    )
-                                });
-                                plan = retained.narrow_to(fallback).unwrap_or_else(|refusal| {
-                                    fail_publication(format!(
-                                        "capacity fallback cannot narrow semantic plan: {refusal:?}"
-                                    ))
-                                });
+                            Ok(DeclinedFrameGrantStep::RerunWith {
+                                plan: narrowed,
+                                selected: fallback,
+                            }) => {
+                                plan = *narrowed;
                                 selected = fallback;
                                 service.semantic_base = fallback.range().start();
                                 service.len = fallback.range().len();
                                 drop(prepared);
                                 continue 'capacity_fallback;
                             }
-                            PublicationNextAction::ReplanInheritedPrepared => {
-                                if !mailbox.release_declined_publication(request) {
-                                    fail_publication(
-                                        "inherited frame grant lost its exact mailbox claim".into(),
-                                    );
-                                }
-                                return Ok(Ok(true));
-                            }
-                            PublicationNextAction::TerminalRefusal(_) => {
-                                publish_frame_grant_refusal(
-                                    mailbox,
-                                    request,
-                                    carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                                );
-                                return Ok(Ok(true));
-                            }
-                            PublicationNextAction::Fatal(invariant) => fail_publication(format!(
-                                "accepted owner frame grant broke its mailbox invariant: {invariant:?}"
+                            Ok(
+                                DeclinedFrameGrantStep::Replan | DeclinedFrameGrantStep::Refused(_),
+                            ) => return Ok(Ok(true)),
+                            Err(fatal) => fail_publication(format!(
+                                "declined owner frame grant broke its invariant: {fatal:?}"
                             )),
                         }
                     } else {

@@ -10,6 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use carrick_abi::LinuxProtFlags;
+use carrick_core::mm::frames::{
+    PublicationCompletion, PublicationInvariant, PublicationNextAction, PublicationTerminal,
+    SelectedBackingPlan, publication_next_action,
+};
 use carrick_el1_abi::{
     Aarch64ParkedContext, El1TaskId, MmPortalSlots, PortalOwnerWait, RecordRef, ThreadIdentity,
     ZoneTables,
@@ -23,7 +27,8 @@ use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken, OwnedObje
 
 use crate::dispatch::host_alias::{HostAliasInstallGuard, HostAliasTransaction};
 use crate::dispatch::mem::ReservationBusy;
-use crate::dispatch::mm_mutation::MmMutationGuard;
+use crate::dispatch::mem::fault::{PublishedFrameGrantRefusal, ResidentFrameGrantPlan};
+use crate::dispatch::mm_mutation::{HostAliasPermit, MmMutationGuard};
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
 use crate::el1_zone::{HandbackEvent, HandbackPublisher, HostLockWait};
 use crate::kernel::debug::HvpatchAliasInstallSite;
@@ -370,6 +375,97 @@ pub fn resolve_host_first_touch_or_stale<E: ThreadedEngine>(
         HostStaleAttempt::NotRetried
     };
     Ok(Ok(step))
+}
+
+/// The carrier's next step for an EL1 frame-grant publication that was
+/// declined after its prepared backing was rolled back. The shared
+/// publication policy chooses the action; this step performs its mailbox and
+/// release-source effects so the HVF fault handler only reruns, parks or
+/// returns.
+pub enum DeclinedFrameGrantStep<'permit> {
+    /// The MM editor is held: the claim is released, and the fault parks on
+    /// this release source before it reruns.
+    ParkOnMmRelease(PortalOwnerWait),
+    /// Capacity: prepare and publish again, under the same claim, with this
+    /// strictly smaller plan.
+    RerunWith {
+        plan: Box<ResidentFrameGrantPlan<'permit>>,
+        selected: SelectedBackingPlan,
+    },
+    /// The fault page already holds an (inherited) output: the claim is
+    /// released and the faulting instruction reruns against the live image.
+    Replan,
+    /// A deterministic refusal: EL1 consumes the denial and forwards the
+    /// fault.
+    Refused(PublicationTerminal),
+}
+
+/// A declined publication that broke the mailbox or plan invariants. Each
+/// is carrier-fatal: no rerun can repair it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeclinedFrameGrantFatal {
+    Invariant(PublicationInvariant),
+    PublishedAction,
+    MmIdentity,
+    ClaimLost,
+    ReleaseSource(carrick_el1::memory::reservations::Refusal),
+    PlanConsumed,
+    Narrow(PublishedFrameGrantRefusal),
+    RefusalNotPublished,
+}
+
+/// Take the shared publication policy's next action for a declined frame
+/// grant whose claim `request` this carrier still holds on `mailbox`.
+/// `plan` is the unsettled plan the declined attempt published from.
+pub fn settle_declined_frame_grant<'permit>(
+    dispatcher: &SyscallDispatcher,
+    permit: &HostAliasPermit<'_>,
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    completion: PublicationCompletion,
+    selected: SelectedBackingPlan,
+    plan: Option<ResidentFrameGrantPlan<'permit>>,
+) -> Result<DeclinedFrameGrantStep<'permit>, DeclinedFrameGrantFatal> {
+    match publication_next_action(completion, selected, request.mm_key) {
+        PublicationNextAction::Published => Err(DeclinedFrameGrantFatal::PublishedAction),
+        PublicationNextAction::Fatal(invariant) => {
+            Err(DeclinedFrameGrantFatal::Invariant(invariant))
+        }
+        PublicationNextAction::ParkOnMmRelease { mm_key } => {
+            if mm_key != request.mm_key {
+                return Err(DeclinedFrameGrantFatal::MmIdentity);
+            }
+            if !mailbox.release_declined_publication(request) {
+                return Err(DeclinedFrameGrantFatal::ClaimLost);
+            }
+            dispatcher
+                .frame_grant_release_wait(permit)
+                .map(DeclinedFrameGrantStep::ParkOnMmRelease)
+                .map_err(DeclinedFrameGrantFatal::ReleaseSource)
+        }
+        PublicationNextAction::RerunWith(fallback) => {
+            let plan = plan
+                .ok_or(DeclinedFrameGrantFatal::PlanConsumed)?
+                .narrow_to(fallback)
+                .map_err(DeclinedFrameGrantFatal::Narrow)?;
+            Ok(DeclinedFrameGrantStep::RerunWith {
+                plan: Box::new(plan),
+                selected: fallback,
+            })
+        }
+        PublicationNextAction::ReplanInheritedPrepared => {
+            if !mailbox.release_declined_publication(request) {
+                return Err(DeclinedFrameGrantFatal::ClaimLost);
+            }
+            Ok(DeclinedFrameGrantStep::Replan)
+        }
+        PublicationNextAction::TerminalRefusal(terminal) => {
+            if !mailbox.publish_refusal(carrick_el1_abi::FRAME_GRANT_ERR_DENIED) {
+                return Err(DeclinedFrameGrantFatal::RefusalNotPublished);
+            }
+            Ok(DeclinedFrameGrantStep::Refused(terminal))
+        }
+    }
 }
 
 /// Lock-free single-waiter handback wakeup slot for single-carrier host threads
