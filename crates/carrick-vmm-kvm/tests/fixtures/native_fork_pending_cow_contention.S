@@ -21,9 +21,9 @@
  * fork failed with errno n. Other codes name a failed setup step.
  */
 #define INJECT_WAIT_PARK_CENSUS         0xfffffffffffffe13
-#define INJECT_HOLD_NEXT_FORK_COMMIT    0xfffffffffffffe2e
-#define INJECT_FORK_COMMIT_HELD         0xfffffffffffffe2f
-#define INJECT_RELEASE_HELD_FORK_COMMIT 0xfffffffffffffe30
+#define INJECT_HOLD_NEXT_FORK_COMMIT    0xfffffffffffffe31
+#define INJECT_FORK_COMMIT_HELD         0xfffffffffffffe32
+#define INJECT_RELEASE_HELD_FORK_COMMIT 0xfffffffffffffe33
 #define POLL_LIMIT                      0x10000000
 #ifdef FIRST_TOUCH
 #define OLD_VALUE                       0
