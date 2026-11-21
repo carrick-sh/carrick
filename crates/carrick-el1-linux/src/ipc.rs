@@ -2969,6 +2969,14 @@ fn bail<E: IpcExecution, M: UserCopy>(
                 carrick_guest_arch::NativeOrdinal::new(u64::from(op.nr)),
                 user.service_origin(),
                 carrick_el1_abi::RefusalVenue::Ring,
+                carrick_el1_abi::RefusalArguments::Registers(core::array::from_fn(|index| {
+                    if index == 0 {
+                        op.orig_x0
+                    } else {
+                        carrick_personality_linux::dispatch::SyscallFrame::argument(frame, index)
+                            .unwrap_or(0)
+                    }
+                })),
             );
             carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64
         };

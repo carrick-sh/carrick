@@ -12,6 +12,10 @@
  *                         answers it with a counted ENOSYS (#2157). The
  *                         child exits with the negated result, the parent
  *                         reaps status 38<<8 and the run exits 7.
+ *   CHILD_REFUSED_ARGS    as CHILD_STDIN_READ, with every argument
+ *                         register distinct (rsi an unmapped address the
+ *                         refusal never reads), so the counted refusal's
+ *                         record can be checked register by register.
  *   CHILD_POLL_WAIT       child ppoll({1, POLLIN}, 50 ms): stdout never
  *                         becomes readable, so the host readiness crossing
  *                         must wait, and a wait needs the child's own
@@ -82,7 +86,7 @@ _start:
     js failure
 #ifdef CHILD_EXIT_STATUS
     cmpl $0x300, status(%rip)
-#elif defined(CHILD_STDIN_READ)
+#elif defined(CHILD_STDIN_READ) || defined(CHILD_REFUSED_ARGS)
     cmpl $0x2600, status(%rip)
 #else
     cmpl $0, status(%rip)
@@ -100,6 +104,19 @@ child:
     xor %edi, %edi
     lea buffer(%rip), %rsi
     mov $1, %edx
+    xor %eax, %eax
+    syscall
+    neg %rax
+    mov %eax, %edi
+    jmp exit
+#endif
+#ifdef CHILD_REFUSED_ARGS
+    xor %edi, %edi
+    mov $0x51510000, %esi
+    mov $0x77, %edx
+    mov $0xa10, %r10d
+    mov $0xa08, %r8d
+    mov $0xa09, %r9d
     xor %eax, %eax
     syscall
     neg %rax
