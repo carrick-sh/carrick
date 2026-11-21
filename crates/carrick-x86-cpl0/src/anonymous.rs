@@ -804,7 +804,11 @@ pub(super) fn park_contended_fault(
         },
     );
     match outcome {
-        EditWaitOutcome::Parked(_) => ContendedFault::Parked,
+        EditWaitOutcome::Parked(_) => {
+            #[cfg(feature = "test-support")]
+            crate::test_support::publish_edit_park();
+            ContendedFault::Parked
+        }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,
         EditWaitOutcome::Refused => ContendedFault::Refused,
     }
@@ -896,7 +900,11 @@ pub(super) fn park_owner_fault_wait(
         || task.mm.key.load(Ordering::Acquire) == mm.raw(),
     );
     match result {
-        Ok(_) => ContendedFault::Parked,
+        Ok(_) => {
+            #[cfg(feature = "test-support")]
+            crate::test_support::publish_edit_park();
+            ContendedFault::Parked
+        }
         Err((ObjectWaitError::Changed, _)) => {
             if let Some((record, previous)) = replaced {
                 // SAFETY: failed publication leaves this slot owning record.
