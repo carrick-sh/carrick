@@ -6,17 +6,21 @@
 //! inventory and resolves first-touch/stale-stage-1 faults through one path.
 
 use carrick_abi::LinuxProtFlags;
-use carrick_guest_mem::{GuestVa, MappingSharing, MemoryError};
-use carrick_hal::{FrameInventoryCommit, ThreadedEngine, TrapError};
+use carrick_guest_mem::{Gpa, GuestVa, MappingSharing, MemoryError};
+use carrick_hal::{
+    FrameEventCapacity, FrameInventoryCommit, HostAliasBacking, ThreadedEngine, TrapError,
+};
 use carrick_mmu_core::aarch64::{LeafAccess, Stage1FaultKind};
 
-use crate::dispatch::host_alias::HostAliasInstallGuard;
+use crate::dispatch::host_alias::{HostAliasInstallGuard, HostAliasTransaction};
 use crate::dispatch::mem::ReservationBusy;
 use crate::dispatch::mm_mutation::MmMutationGuard;
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
 use crate::kernel::debug::HvpatchAliasInstallSite;
 use crate::kernel::{FrameInventoryError, KernelContext};
-use crate::linux_abi::{LINUX_PAGE_SIZE, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+use crate::linux_abi::{
+    LINUX_ENOMEM, LINUX_PAGE_SIZE, LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE,
+};
 
 /// Publish a backend-staged alias [`FrameInventoryCommit`] to the kernel's
 /// authoritative [`crate::kernel::FrameInventoryAuthority`] for `context`'s MM.
@@ -110,6 +114,86 @@ pub fn finish_host_alias_stage1_install<E: ThreadedEngine>(
     Ok(DispatchOutcome::Returned {
         value: success_retval,
     })
+}
+
+/// Reserve frame inventory, install a host alias through `engine`, apply its
+/// [`FrameInventoryCommit`] to `context`'s kernel authority, and finish the
+/// stage-1 protection/VMA commit under `dispatcher`'s MM mutation lease.
+#[allow(clippy::too_many_arguments)]
+pub fn install_host_alias_with_inventory<E: ThreadedEngine>(
+    engine: &mut E,
+    dispatcher: &mut SyscallDispatcher,
+    context: &KernelContext,
+    transaction: HostAliasTransaction,
+    va: GuestVa,
+    ipa: Gpa,
+    len: u64,
+    payload: &[u8],
+    backing: HostAliasBacking,
+    prot: u64,
+    prot_none: bool,
+    success_retval: i64,
+) -> Result<i64, String> {
+    let shared = backing.is_shared();
+    dispatcher
+        .with_mm_executor_mutation(|disp, mutation| -> Result<i64, String> {
+            let permit = mutation.host_alias_permit();
+            let Some(install) = transaction.claim(&permit) else {
+                drop(backing);
+                return Ok(LINUX_ENOMEM.guest_retval());
+            };
+            let capacity = FrameEventCapacity::for_event_count(2)
+                .map_err(|e| format!("alias frame event capacity: {e}"))?;
+            let reservation = context
+                .kernel()
+                .reserve_frame_inventory(1, 1, capacity)
+                .map_err(|e| format!("reserve alias frame inventory: {e}"))?;
+            let inventory_transaction = reservation.transaction();
+            if let Err(error) = engine.begin_alias_inventory(reservation) {
+                let _ = context
+                    .kernel()
+                    .frame_inventory()
+                    .abandon(inventory_transaction);
+                return Err(format!("begin_alias_inventory: {error}"));
+            }
+            if let Err(_error) = engine.map_host_alias(va, ipa, len, payload, backing) {
+                engine.abandon_alias_inventory();
+                let _ = context
+                    .kernel()
+                    .frame_inventory()
+                    .abandon(inventory_transaction);
+                drop(install);
+                return Ok(LINUX_ENOMEM.guest_retval());
+            }
+            let Some(commit) = engine.take_alias_inventory() else {
+                return Err("backend staged no alias inventory commit".to_owned());
+            };
+            apply_alias_frame_inventory(context, commit).map_err(|error| {
+                format!(
+                    "apply_alias_frame_inventory(frame={:?}): {error}",
+                    error.frame()
+                )
+            })?;
+            match finish_host_alias_stage1_install(
+                engine,
+                disp,
+                install,
+                va,
+                len,
+                prot,
+                prot_none,
+                shared,
+                success_retval,
+            ) {
+                Ok(DispatchOutcome::Returned { value }) => Ok(value),
+                Ok(other) => Err(format!("unexpected alias install outcome: {other:?}")),
+                Err(failure) => Err(format!(
+                    "alias stage-1 install failed at {:?}: {}",
+                    failure.site, failure.message
+                )),
+            }
+        })
+        .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))?
 }
 
 /// Apply Linux stage-1 first-touch permission rules: any accessible leaf in

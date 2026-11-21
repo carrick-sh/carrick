@@ -22,12 +22,13 @@ use carrick_el1_abi::{
     record_ipc_window_host,
 };
 use carrick_guest_arch::ContextGeneration;
-use carrick_guest_mem::{GuestMemory, MappingSharing};
+use carrick_guest_mem::GuestMemory;
 use carrick_hal::{
     GuestTimerBridge, HostSignalBridge, NO_PENDING_SIGNAL, PosixTimerSpec, SyscallTrap,
     ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError,
 };
 use carrick_kernel::compat::CompatReporter;
+use carrick_kernel::dispatch::carrier_loop::install_host_alias_with_inventory;
 use carrick_kernel::dispatch::{
     CarrierBridges, DispatchOutcome, SyscallDispatcher, SyscallRequest, boot_private_file_backings,
 };
@@ -974,56 +975,20 @@ where
                 prot,
                 prot_none,
             } => {
-                let shared = backing.is_shared();
-                let alias_result = dispatcher
-                    .with_mm_executor_mutation(|disp, mutation| -> Result<i64, String> {
-                        let permit = mutation.host_alias_permit();
-                        let Some(install) = transaction.claim(&permit) else {
-                            drop(backing);
-                            return Ok(carrick_abi::LINUX_ENOMEM.guest_retval());
-                        };
-                        engine
-                            .map_host_alias(va, ipa, len, &payload, backing)
-                            .map_err(|e| {
-                                format!("map_host_alias({:#x}, len={len:#x}): {e}", va.raw())
-                            })?;
-                        let len_usize = usize::try_from(len)
-                            .map_err(|_| format!("host alias length {len:#x} exceeds usize"))?;
-                        let prot_flags = LinuxProtFlags::from_bits_truncate(prot);
-                        let exec = prot_flags.contains(LinuxProtFlags::EXEC);
-                        if prot_none || exec {
-                            engine
-                                .protect_range(
-                                    va.raw(),
-                                    len_usize,
-                                    if prot_none { 0 } else { prot },
-                                )
-                                .map_err(|e| format!("protect_range({:#x}): {e}", va.raw()))?;
-                        }
-                        engine.set_mapping_protection_and_sharing(
-                            va.raw(),
-                            len_usize,
-                            prot_none,
-                            !prot_flags.contains(LinuxProtFlags::WRITE),
-                            if shared {
-                                MappingSharing::Shared
-                            } else {
-                                MappingSharing::Private
-                            },
-                        );
-                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                            let bus_len_usize = usize::try_from(bus_len)
-                                .map_err(|_| "bus fault length exceeds usize".to_owned())?;
-                            engine
-                                .protect_range(bus_start, bus_len_usize, 0)
-                                .map_err(|e| format!("protect_range bus fault: {e}"))?;
-                            engine.set_no_access(bus_start, bus_len_usize, true);
-                        }
-                        disp.commit_host_alias_install(install)
-                            .map_err(|e| format!("commit_host_alias_install: {e:?}"))?;
-                        Ok(success_retval)
-                    })
-                    .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))??;
+                let alias_result = install_host_alias_with_inventory(
+                    engine,
+                    dispatcher,
+                    &kernel_context,
+                    transaction,
+                    va,
+                    ipa,
+                    len,
+                    &payload,
+                    backing,
+                    prot,
+                    prot_none,
+                    success_retval,
+                )?;
                 reply_census.production_answers += 1;
                 engine
                     .complete_syscall(alias_result)
