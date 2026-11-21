@@ -74,6 +74,14 @@ pub trait GuestMemory {
         InlineRam::None
     }
 
+    /// Identify the inventory whose code generations stay valid across
+    /// dispatcher calls. The dispatcher still rechecks the execute mapping
+    /// and frame generation at every cold entry. Memory without this
+    /// guarantee keeps residency scoped to one dispatcher call.
+    fn code_cache_domain(&self) -> Option<carrick_softmmu::ExtentTableId> {
+        None
+    }
+
     /// A generation is supplied only for a fully readable code frame whose
     /// memory owner tracks all guest and host writes and backing changes.
     /// The owner must never reuse a generation for changed bytes or backing

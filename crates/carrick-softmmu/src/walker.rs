@@ -123,6 +123,10 @@ pub struct Reclaimed {
     pub published: usize,
 }
 
+/// Identity of the inventory that authorizes physical frame generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentTableId(core::num::NonZeroU64);
+
 /// Physical extent inventory and frame-keyed code-page tracker
 /// authenticating `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
 ///
@@ -195,6 +199,11 @@ impl ExtentTable {
             reclaim: ReclaimQueue::new(),
             terminal: false,
         })
+    }
+
+    /// Stable across edits and unique across inventories and their clones.
+    pub fn identity(&self) -> ExtentTableId {
+        ExtentTableId(self.domain.nonce())
     }
 
     /// An independent copy of the records in a fresh invalidation domain
