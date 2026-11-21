@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.

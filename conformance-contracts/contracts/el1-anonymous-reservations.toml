@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 schema_version = 1
 id = "kernel.el1.anonymous-reservations"
 title = "Guest EL1 authoritative anonymous reservations and brk/mmap semantics"

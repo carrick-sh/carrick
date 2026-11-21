@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #2359: a raw exit whose clear-child-tid copy-out is refused "not now"
 # (x86: a sibling exit holds the MM editor; ARM: the word is not yet
 # writable) keeps its owned call, restores its membership and admission,

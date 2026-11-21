@@ -1,3 +1,7 @@
+# #2655: an x86 fork whose rows outgrow the residency table is refused
+# "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
+# reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #1580 derives KVM lifecycle sidecar placement from the shared guest layout.
 # cpl0_lifecycle::x5_shared_clone_exit and cpl0_fork_e2e are the real-KVM
 # red/green controls; this contract's guest semantics and budgets are unchanged.
