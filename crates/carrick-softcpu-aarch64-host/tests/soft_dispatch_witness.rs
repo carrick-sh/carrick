@@ -1570,6 +1570,7 @@ const A64_SVC_1: u32 = 0xd400_0021;
 const A64_SVC_2: u32 = 0xd400_0041;
 const A64_B_BACK_1: u32 = 0x17ff_ffff;
 const A64_B_BACK_2: u32 = 0x17ff_fffe;
+const A64_BR_X3: u32 = 0xd61f_0060;
 const SCRATCH_OFFSET: u64 = 0x800;
 const PATCH_PATH_OFFSET: u64 = 0x80;
 
@@ -1589,6 +1590,9 @@ enum ResidencyPlan {
     /// `svc; str x2, [x1]; b .-8`: rewrite the `svc` with a guest store,
     /// then with a host `read`, then retire the page.
     Rewrite(CodeRetirement),
+    /// `svc; br x3` into a private file mapping holding `svc #2; b .-4`:
+    /// run that loop twice, then `munmap` it under its resident blocks.
+    Unmap,
 }
 
 /// Drives the production carrier with real decode and dispatch. Each
@@ -1599,6 +1603,9 @@ struct ResidencyExecutor {
     plan: ResidencyPlan,
     svc_visits: u64,
     fd: u64,
+    /// Where the `Unmap` plan's file mapping landed, and its `svc` visits.
+    mapped: Arc<std::sync::atomic::AtomicU64>,
+    mapped_visits: u64,
     prepared: Arc<std::sync::atomic::AtomicU64>,
     served: Arc<Mutex<Vec<u32>>>,
 }
@@ -1625,6 +1632,30 @@ impl ResidencyExecutor {
         let (nr, args) = match self.plan {
             ResidencyPlan::Loop { handoffs } if visit <= handoffs => (NR_GETPID, [0; 6]),
             ResidencyPlan::Loop { .. } => (NR_EXIT_GROUP, [0; 6]),
+            ResidencyPlan::Unmap => match visit {
+                1 => (
+                    NR_OPENAT,
+                    [AT_FDCWD, DATA_VA + PATCH_PATH_OFFSET, O_CLOEXEC, 0, 0, 0],
+                ),
+                2 => {
+                    let fd = rx(cpu, 0);
+                    if (fd as i64) < 3 {
+                        return Err(format!("openat(/patch) failed: {}", fd as i64));
+                    }
+                    (
+                        NR_MMAP,
+                        [
+                            0,
+                            GUEST_PAGE_BYTES,
+                            PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE,
+                            fd,
+                            0,
+                        ],
+                    )
+                }
+                _ => return Err(format!("the entry svc ran again at visit {visit}")),
+            },
             ResidencyPlan::Rewrite(retire) => match visit {
                 1 => (NR_GETPID, [0; 6]),
                 2 => (
@@ -1712,6 +1743,49 @@ impl ExecuteBlock for ResidencyExecutor {
         if cpu.pstate.el != ExceptionLevel::El0 {
             return self.bridge.execute(block, code, cpu);
         }
+        let mapped = self.mapped.load(Ordering::Relaxed);
+        if matches!(self.plan, ResidencyPlan::Unmap) && cpu.pc.0 != CODE_VA {
+            match cpu.pc.0 {
+                // After `openat`, branch back to the `svc` for the `mmap`.
+                pc if pc == CODE_VA + 4 && self.svc_visits == 1 => wx(cpu, 3, CODE_VA),
+                pc if pc == CODE_VA + 4 => {
+                    let va = rx(cpu, 0);
+                    if (va as i64) < 0 || va % GUEST_PAGE_BYTES != 0 {
+                        return Err(format!("mmap(/patch) returned {}", va as i64));
+                    }
+                    self.mapped.store(va, Ordering::Relaxed);
+                    wx(cpu, 3, va);
+                }
+                pc if pc == mapped => {
+                    self.record(block)?;
+                    self.mapped_visits += 1;
+                    let (nr, args) = match self.mapped_visits {
+                        1 => (NR_GETPID, [0; 6]),
+                        2 => (NR_MUNMAP, [mapped, GUEST_PAGE_BYTES, 0, 0, 0, 0]),
+                        visit => {
+                            return Err(format!("unmapped svc ran again at visit {visit}"));
+                        }
+                    };
+                    ScriptedHvc2Executor::set_call(cpu, nr, args);
+                }
+                pc if pc == mapped + 4 && self.mapped_visits >= 2 => {
+                    return Err(format!(
+                        "unmapped b .-4 ran after munmap returned {}",
+                        rx(cpu, 0) as i64
+                    ));
+                }
+                pc if pc == mapped + 4 => {}
+                pc => return Err(format!("unexpected user PC {pc:#x}")),
+            }
+            return match block.terminator() {
+                Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                    Ok(idx)
+                }
+                Terminator::Conditional { .. } => {
+                    Err("unexpected conditional terminator".to_owned())
+                }
+            };
+        }
         match cpu.pc.0 {
             CODE_VA => self.svc(cpu, block)?,
             pc if pc == CODE_VA + 4
@@ -1744,6 +1818,7 @@ struct ResidencyRun {
     run: carrick_softcpu_aarch64_host::SoftProcessRun<ResidencyExecutor>,
     prepared: u64,
     served: Vec<u32>,
+    mapped: u64,
 }
 
 fn run_residency(
@@ -1753,10 +1828,12 @@ fn run_residency(
     let code_words: &[u32] = match plan {
         ResidencyPlan::Loop { .. } => &[A64_SVC_0, A64_B_BACK_1],
         ResidencyPlan::Rewrite(_) => &[A64_SVC_0, A64_STR_X2_X1, A64_B_BACK_2],
+        ResidencyPlan::Unmap => &[A64_SVC_0, A64_BR_X3],
     };
     let elf = build_witness_elf(code_words, &[(PATCH_PATH_OFFSET as usize, b"/patch\0")]);
     let mailbox = Arc::new(AtomicPtr::new(null_mut()));
     let prepared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mapped = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let served = Arc::new(Mutex::new(Vec::new()));
     let executor = ResidencyExecutor {
         bridge: SequenceHvc2Executor {
@@ -1768,6 +1845,8 @@ fn run_residency(
         plan,
         svc_visits: 0,
         fd: 0,
+        mapped: Arc::clone(&mapped),
+        mapped_visits: 0,
         prepared: Arc::clone(&prepared),
         served: Arc::clone(&served),
     };
@@ -1799,6 +1878,7 @@ fn run_residency(
         run,
         prepared: prepared.load(Ordering::Relaxed),
         served,
+        mapped: mapped.load(Ordering::Relaxed),
     })
 }
 
@@ -1815,6 +1895,7 @@ fn soft_carrier_emits_the_hot_set_once_across_provider_exits() {
             run,
             prepared,
             served,
+            ..
         } = run_residency(ResidencyPlan::Loop { handoffs }, None)
             .expect("residency witness must finish through the production carrier");
         assert_eq!(run.exit_code, 0);
@@ -1893,4 +1974,36 @@ fn soft_carrier_serves_rewritten_code_and_the_remapped_page() {
     );
     assert_eq!(run.terminating_fault, None);
     assert_eq!(run.exit_code, 7);
+}
+
+/// `/patch` for the unmap witness: `svc #2; b .-4`.
+fn unmap_rootfs() -> std::io::Result<tempfile::TempDir> {
+    let temp = tempfile::tempdir()?;
+    let mut patch = vec![0; GUEST_PAGE_BYTES as usize];
+    patch[..4].copy_from_slice(&A64_SVC_2.to_le_bytes());
+    patch[4..8].copy_from_slice(&A64_B_BACK_1.to_le_bytes());
+    std::fs::write(temp.path().join("patch"), &patch)?;
+    Ok(temp)
+}
+
+#[test]
+fn soft_carrier_faults_after_munmap_of_resident_code() {
+    let _test_guard = lock_soft_carrier_test();
+    let rootfs = unmap_rootfs().expect("create the /patch rootfs");
+    let ResidencyRun {
+        run,
+        served,
+        mapped,
+        ..
+    } = run_residency(ResidencyPlan::Unmap, Some(rootfs.path()))
+        .expect("residency witness must finish through the production carrier");
+    // The mapped loop ran twice, so its `svc #2` and `b .-4` are resident.
+    assert_eq!(served, [A64_SVC_0, A64_SVC_0, A64_SVC_2, A64_SVC_2]);
+    // `munmap` returns to the resident `b .-4`: the fetch faults instead.
+    assert_eq!(run.exit_code, 128 + 11);
+    let fault = run.terminating_fault.expect("unmapped fetch must fault");
+    assert_eq!(
+        (fault.signum, fault.fault_addr, fault.elr),
+        (11, mapped + 4, mapped + 4)
+    );
 }
