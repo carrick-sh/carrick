@@ -1460,6 +1460,10 @@ fn dispatch_classified_fault<
                         let mut root = supply.contend(spaces, mm_key, || {
                             match roots.lock_in(spaces, index.index(), mm, slot as u32) {
                                 Err(crate::memory::reservations::Refusal::Busy) => Err(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations),
+                                // A fork in flight write-protected this page and
+                                // owns the transfer sequence until it publishes;
+                                // that publication releases PendingEdit.
+                                Ok(root) if root.fork_pending() => Err(carrick_sched_core::spaces::notification::SpaceWaitCause::PendingEdit),
                                 result => Ok(result.ok()),
                             }
                         }).flatten()?;
