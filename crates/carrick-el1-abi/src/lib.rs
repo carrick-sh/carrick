@@ -3854,12 +3854,16 @@ impl Counters {
         if origin == carrick_core_abi::service::ServiceOrigin::Descendant {
             children[bucket].fetch_add(1, Ordering::Relaxed);
         }
-        let _ = arguments;
+        self.publish_refused_call(&RefusedCall {
+            ordinal,
+            origin,
+            venue,
+            arguments,
+        });
     }
 
     /// Refusals are a slow path; keep the record out of callers' frames.
     #[inline(never)]
-    #[allow(dead_code)]
     fn publish_refused_call(&self, call: &RefusedCall) {
         let Ok(index) =
             self.refused_call_next
