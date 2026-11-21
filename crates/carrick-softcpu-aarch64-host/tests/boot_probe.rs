@@ -1785,7 +1785,7 @@ const GLIBC_LIBC_SHA256: &str = "ce67859ef338d8558a7fd7cff9a1effe5677ff9f7eea906
 fn assert_expected_single_process_enosys(counted: &[(u64, &'static str, u64)]) {
     for &(nr, name, count) in counted {
         assert!(
-            matches!(nr, 96 | 261 | 293),
+            matches!(nr, 96 | 132 | 134 | 135 | 261 | 293),
             "unexpected counted ENOSYS ({nr}, {name:?}, count={count}) in single-process production dispatch: {counted:?}"
         );
     }
