@@ -13,14 +13,14 @@
 # test code by construction.
 #
 # Build:  docker build --platform linux/arm64 -t cpython-test:3.12.13 docker/cpython-test
+# Use linux/amd64 for x86_64.
 # Then push to carrick's registry so `carrick run` can pull it:
 #         docker tag  cpython-test:3.12.13 localhost:5050/cpython-test:3.12.13
 #         docker push localhost:5050/cpython-test:3.12.13
 ARG CPYTHON_VERSION=3.12.13
-# The lane's oracle is canonical linux/arm64. Pin the architecture-specific
-# official image manifest as well as the version so a moving convenience tag
-# cannot silently change libc/userspace underneath the declared suites.
-FROM python:${CPYTHON_VERSION}@sha256:1cdca4a722dc7efb5f63c002a0bcf458e99cb1cbbe04d92493438f24642ba700
+# Pin the official multi-architecture image index. The build platform selects
+# its linux/amd64 or linux/arm64 manifest from that immutable index.
+FROM python:${CPYTHON_VERSION}@sha256:dd4fe98ab39f91e936f8e7e7a65a3ce59ecfb11e32f9a125b3132779920ba7f7
 
 ARG CPYTHON_VERSION
 
