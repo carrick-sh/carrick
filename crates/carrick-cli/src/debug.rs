@@ -163,8 +163,15 @@ pub(crate) fn run_debug(
             limit,
             json,
             results,
+            refusals,
         } => {
-            crate::debug_el1_census::run_el1_census(&inputs, limit, json, results.as_deref())?;
+            crate::debug_el1_census::run_el1_census(
+                &inputs,
+                limit,
+                json,
+                results.as_deref(),
+                refusals,
+            )?;
         }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
