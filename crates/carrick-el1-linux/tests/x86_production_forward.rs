@@ -1169,13 +1169,26 @@ fn x86_exec_routes_to_the_native_service_not_unported() {
     }
 }
 
-// The claim gate is neutral: only a fork child's exec is the native owner's.
+// The claim gate is neutral: a fork child's exec is the native owner's on
+// every ISA; the run root's only where the native service serves it (x86,
+// #2142), never where the root forwards to its host (AArch64). A host-loaded
+// task's never is.
 #[test]
 fn x86_exec_claim_is_a_fork_child_only() {
+    use carrick_el1_linux::dispatch::RootExecServer;
     use carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner as Owner;
-    assert!(dispatch::native_exec_claimed(|| Owner::ForkChild));
-    assert!(!dispatch::native_exec_claimed(|| Owner::Root));
-    assert!(!dispatch::native_exec_claimed(|| Owner::Unowned));
+    for root in [RootExecServer::NativeService, RootExecServer::HostForward] {
+        assert!(dispatch::native_exec_claimed(root, || Owner::ForkChild));
+        assert!(!dispatch::native_exec_claimed(root, || Owner::Unowned));
+    }
+    assert!(dispatch::native_exec_claimed(
+        RootExecServer::NativeService,
+        || Owner::Root
+    ));
+    assert!(!dispatch::native_exec_claimed(
+        RootExecServer::HostForward,
+        || Owner::Root
+    ));
 }
 
 // A claimed x86 child's execve/execveat is staged through the neutral body
