@@ -111,3 +111,18 @@ pr = 2595
 test = "carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::prepare_working_stock_is_independent_owned_zero_suffix"
 reason = "#2581: PrepareTableStock was removed when x86 root Prepare moved onto shared ForkStock; root table capacity beyond the former 12-page suffix is now covered by carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::custody_tests::x86_prepare_candidates_continue_after_twelve_root_table_loans and x86_kvm_run::mounted_static_x86_root_maps_sixteen_table_regions."
 pr = 2595
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::cpl0_layout_tests::low_image_reservations_stop_before_stack_and_retain_launch_limits"
+reason = "#2722: the x86 initial stack moved to LINUX_STACK_TOP, so a low image's arena no longer stops before the stack; the witness was renamed unchanged in intent to carrick_x86_cpl0_host::cpl0_boot::cpl0_layout_tests::low_image_reservations_keep_the_whole_arena_below_the_stack_and_retain_launch_limits, which now pins arena.len() == LINUX_MMAP_SIZE."
+pr = 2732
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::cpl0_layout_tests::static_pie_reservations_follow_image_break_above_old_arena_and_stack"
+reason = "#2722: with the stack at LINUX_STACK_TOP a static PIE's break sits below the stack, not above it; the witness was renamed to carrick_x86_cpl0_host::cpl0_boot::cpl0_layout_tests::static_pie_reservations_follow_image_break_below_the_stack."
+pr = 2732
+
+[[retired]]
+test = "cpl0_initial_mm::production_static_pie_loads_above_low_stack_and_exits_seven"
+reason = "#2722: the x86 stack is no longer low, so the production static-PIE witness was renamed to cpl0_initial_mm::production_static_pie_loads_at_its_high_base_and_exits_seven (same fixture, same exit 7)."
+pr = 2732
