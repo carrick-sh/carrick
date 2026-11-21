@@ -1,0 +1,38 @@
+# Allowlisted crossings an exec'd native child on x86_64 still refuses with a counted ENOSYS.
+# Decrease-only: see CHILD_CROSSING_GAP_CEILING in tests/x86_kvm_run.rs. Every owner must be OPEN
+# (scripts/check-x86-child-gap-owners.sh). Columns: canonical_nr, name, owner issue.
+14	removexattr	#2708
+15	lremovexattr	#2708
+16	fremovexattr	#2215
+26	inotify_init1	#1089
+51	chroot	#2219
+71	sendfile	#2219
+285	copy_file_range	#2219
+74	signalfd4	#561
+85	timerfd_create	#1506
+86	timerfd_settime	#1506
+87	timerfd_gettime	#1506
+113	clock_gettime	#2618
+114	clock_getres	#2618
+153	times	#2618
+169	gettimeofday	#2618
+227	msync	#2605
+228	mlock	#2605
+229	munlock	#2605
+230	mlockall	#2605
+231	munlockall	#2605
+232	mincore	#2605
+233	madvise	#2605
+284	mlock2	#2605
+436	close_range	#1678
+33	mknodat	#2709
+75	vmsplice	#2711
+76	splice	#2711
+77	tee	#2711
+81	sync	#2710
+213	readahead	#2215
+223	fadvise64	#2215
+286	preadv2	#2712
+287	pwritev2	#2712
+437	openat2	#2218
+72	pselect6	#2606
