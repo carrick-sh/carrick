@@ -2219,8 +2219,10 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         .expect("CPython must complete through production kernel dispatch");
     let elapsed = started.elapsed().as_secs_f64();
     let work = run.engine.vcpu().run_work();
+    let routes = carrick_softcpu_aarch64_host::sample_el1_routes(&run.engine)
+        .expect("sample EL1 route counters");
     println!(
-        "cpython production dispatch: exit={} syscalls_dispatched={} census={:?} \
+        "cpython production dispatch: exit={} syscalls_dispatched={} census={:?} ring={routes:?} \
          elapsed={elapsed:.3}s retired_instructions={} executed_blocks={} \
          decoded_blocks={} dispatches={} instr/s={:.0} blocks/s={:.0}",
         run.exit_code,
