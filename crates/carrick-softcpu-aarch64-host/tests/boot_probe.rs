@@ -2223,7 +2223,6 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         command
             .args([
                 "soft_cpu_runs_dynamic_cpython_through_production_dispatch",
-                "--exact",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -2236,10 +2235,20 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         }
         let output = command.output().expect("spawn A/B arm");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // libtest prints `test <name> ... ` before the captured line, so
+        // search inside each line rather than at its start.
         let line = stdout
             .lines()
-            .find(|line| line.starts_with("cpython production dispatch:"))
-            .unwrap_or("<no measurement line>");
+            .find_map(|line| {
+                line.find("cpython production dispatch:")
+                    .map(|at| &line[at..])
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "A/B arm {index} printed no measurement line:\n{stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
         println!(
             "ab run={index} handoff_cache={} status={} {line}",
             if cache_on { "on" } else { "off" },
@@ -2284,13 +2293,16 @@ fn cpython_production_dispatch_arm() {
     println!(
         "cpython production dispatch: exit={} syscalls_dispatched={} census={:?} ring={routes:?} \
          elapsed={elapsed:.3}s retired_instructions={} executed_blocks={} \
-         decoded_blocks={} dispatches={} instr/s={:.0} blocks/s={:.0}",
+         decoded_blocks={} emitted_blocks={} stage1_walks={} dispatches={} instr/s={:.0} \
+         blocks/s={:.0}",
         run.exit_code,
         run.syscalls_dispatched,
         run.reply_census,
         work.retired_instructions,
         work.executed_blocks,
         work.decoded_blocks,
+        work.emitted_blocks,
+        work.stage1_walks,
         work.dispatches,
         work.retired_instructions as f64 / elapsed,
         work.executed_blocks as f64 / elapsed,
