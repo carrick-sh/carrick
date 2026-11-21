@@ -226,6 +226,10 @@ static void run_child_crossings(const char *self_path) {
     u8 vec_byte[8];
     for (u64 i = 0; i < sizeof(scratch); ++i) scratch[i] = 0;
 
+    /* The native oracle inherits whatever descriptors its launcher leaked;
+     * close them so fd-valued results (dup, openat, socket) are comparable. */
+    for (i64 inherited = 3; inherited < 64; ++inherited) sc1(3, inherited);
+
     if (sc3(258, AT_FDCWD, (i64)p_work, 0755) < 0) die(79);
     if (sc1(80, (i64)p_work) < 0) die(78);
     if (sc3(258, AT_FDCWD, (i64)p_sub, 0755) < 0) die(77);
