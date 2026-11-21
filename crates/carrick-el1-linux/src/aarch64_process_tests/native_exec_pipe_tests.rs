@@ -242,6 +242,28 @@ fn serial_host_native_fork_exec_ends_record_locks_on_close_on_exec() {
         false,
         false,
         true,
+        false,
+    );
+}
+
+/// #2588: an adopted `execve` successor calls `pselect6` (including a
+/// temporary sigmask and a zero-timeout probe) on its inherited zone pipe,
+/// parks in ring releasing slot capacity, wakes when its live parent writes,
+/// sees the pipe readable, and reads the payload.
+#[test]
+fn serial_host_native_fork_exec_child_pselect6_wakes_on_parent_pipe_write() {
+    fork_exec_probe_copy_alignment(
+        None,
+        u32::MAX as u64,
+        false,
+        None,
+        None,
+        false,
+        None,
+        false,
+        false,
+        false,
+        true,
     );
 }
 
@@ -558,7 +580,7 @@ fn fork_exec_probe_alignment(
     misaligned: bool,
 ) {
     fork_exec_probe_copy_alignment(
-        futex, bitset, timed, metadata, departure, false, None, false, misaligned, false,
+        futex, bitset, timed, metadata, departure, false, None, false, misaligned, false, false,
     );
 }
 
@@ -575,7 +597,7 @@ fn fork_exec_probe_copy(
     clock: bool,
 ) {
     fork_exec_probe_copy_alignment(
-        futex, bitset, timed, metadata, departure, readlink, copy_error, clock, false, false,
+        futex, bitset, timed, metadata, departure, readlink, copy_error, clock, false, false, false,
     );
 }
 
@@ -620,6 +642,7 @@ fn fork_exec_probe_copy_alignment(
     clock: bool,
     misaligned: bool,
     locks: bool,
+    exec_pselect: bool,
 ) {
     let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -1360,6 +1383,165 @@ fn fork_exec_probe_copy_alignment(
             parent,
             child,
             (operation, bitset, timed, departure, misaligned),
+        );
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
+    if exec_pselect {
+        use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+        use carrick_test_support::GuestUserBuffer;
+
+        let mut pselect_cpu = crate::sched::FakeCpu::default();
+        let pselect = sys::PSELECT6.raw();
+        let read_bit = (1u64 << 3).to_ne_bytes();
+        let mut read_set = GuestUserBuffer::from_bytes(&read_bit);
+        let zero_ts = GuestUserBuffer::from_value([0u64, 0]);
+        let sigusr1 = 1u64 << (10 - 1);
+        let mask_buf = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
+        let mask_pair = GuestUserBuffer::from_value([mask_buf.arg(), 8]);
+        let child_control = unsafe {
+            &*(fixture
+                .zone
+                .record(child_binding.record.id)
+                .identity()
+                .control_slot as *const ThreadControlSlot)
+        };
+        let original_mask = child_control.blocked();
+
+        let mut dispatch6 = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+            let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
+            let mut frame = carrick_el1_abi::TrapFrame {
+                esr: 0x15 << 26,
+                elr: 0x400004,
+                slot: u64::from(fixture.slot.raw()),
+                ..Default::default()
+            };
+            frame.x[..6].copy_from_slice(&args);
+            frame.x[8] = nr;
+            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+            let binding =
+                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+            let mut entry = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &fixture.task,
+                    binding.address,
+                    &binding.words,
+                    &mut service,
+                )
+                .unwrap();
+            let route = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut pselect_cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            drop(entry);
+            for (at, bytes) in
+                crate::native_process_runtime::host_test_support::take_signal_copies()
+            {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        at.raw() as *mut u8,
+                        bytes.len(),
+                    );
+                }
+            }
+            (route, frame.x[0] as i64)
+        };
+
+        // 1. Zero-timeout pselect6 with sigmask in the adopted exec successor: 0, set cleared.
+        let (route, res) = dispatch6(
+            pselect,
+            [4, read_set.arg(), 0, 0, zero_ts.arg(), mask_pair.arg()],
+        );
+        assert!(
+            matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+            "exec successor zero-timeout pselect6 must complete in ring: {route:?} ({res})"
+        );
+        assert_eq!(res, 0);
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert!(!child_control.forwarded_wait_mask_armed());
+        assert_eq!(child_control.blocked(), original_mask);
+
+        // 2. Blocking pselect6 with sigmask parks in ring, releasing slot 0 for the parent.
+        read_set.as_mut_bytes().copy_from_slice(&read_bit);
+        fixture.task.linux.mark_pending_host_work();
+        let wait_args = [4, read_set.arg(), 0, 0, 0, mask_pair.arg()];
+        let (route, _) = dispatch6(pselect, wait_args);
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "exec successor blocking pselect6 must park in ring"
+        );
+        assert!(
+            fixture
+                .zone
+                .record(child_binding.record.id)
+                .has_object_operation()
+        );
+        assert!(child_control.forwarded_wait_mask_armed());
+        assert_eq!(child_control.blocked().0, sigusr1);
+
+        // 3. Parent writes to the inherited pipe write end (fd 4), waking the exec successor.
+        activate_target(source, &fixture.task, &parent_binding);
+        let payload = GuestUserBuffer::from_bytes(b"exec");
+        assert_eq!(
+            dispatch6(sys::WRITE.raw(), [4, payload.arg(), 4, 0, 0, 0]).1,
+            4
+        );
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, parent_binding.record.id)
+                .is_queued()
+        );
+
+        // 4. Exec successor resumes pselect6, sees fd 3 readable, restores mask, and reads "exec".
+        activate_target(source, &fixture.task, &child_binding);
+        read_set.as_mut_bytes().fill(0);
+        let (route, res) = dispatch6(pselect, wait_args);
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(res, 1);
+        assert_eq!(read_set.as_bytes(), &read_bit);
+        assert!(
+            !fixture
+                .zone
+                .record(child_binding.record.id)
+                .has_object_operation()
+        );
+        assert!(!child_control.forwarded_wait_mask_armed());
+        assert_eq!(child_control.blocked(), original_mask);
+
+        let received = GuestUserBuffer::zeroed(4);
+        assert_eq!(
+            dispatch6(sys::READ.raw(), [3, received.arg(), 4, 0, 0, 0]).1,
+            4
+        );
+        assert_eq!(received.as_bytes(), b"exec");
+        assert_eq!(
+            counters.forwarded[pselect as usize].load(Ordering::Relaxed),
+            0
         );
         registry.unregister_root_for_test(&runtime);
         return;

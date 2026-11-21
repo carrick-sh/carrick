@@ -14255,6 +14255,8 @@ fn native_descriptor_argument_witness(
         assert!(!waiter_control.forwarded_wait_mask_armed());
 
         // Nothing ready, no timeout: the wait parks in ring under the mask.
+        let waiter_pid = in_ring(run_binding(waiter, 172, [0; 4])); // getpid
+        assert!(waiter_pid > 0);
         read_set.as_mut_bytes().copy_from_slice(&read_bit);
         let wait = [4, read_set.arg(), 0, 0, 0, sized.arg()];
         task.linux.mark_pending_host_work();
@@ -14269,9 +14271,23 @@ fn native_descriptor_argument_witness(
         assert!(waiter_control.forwarded_wait_mask_armed());
         assert_eq!(waiter_control.blocked().0, sigusr1);
 
-        // The peer task makes the pipe readable; the waiter re-enters the
-        // same call, reports the descriptor and has its own mask back.
+        // The peer task sends SIGUSR1 while the waiter is parked under its
+        // temporary mask: the masked signal must not interrupt the wait.
+        // Then the peer writes to the pipe; the waiter re-enters the same
+        // call, reports the descriptor and has its persistent mask back.
         activate_target(source, &task, writer);
+        assert_eq!(
+            in_ring(run_binding(
+                writer,
+                129, // kill(waiter_pid, SIGUSR1)
+                [waiter_pid as u64, 10, 0, 0]
+            )),
+            0
+        );
+        assert!(
+            fixture.zone.record(waiter.record.id).has_object_operation(),
+            "SIGUSR1 blocked by pselect6's temporary mask must leave the wait enrolled"
+        );
         let payload = GuestUserBuffer::from_bytes(b"peer");
         assert_eq!(
             in_ring(run_binding(
@@ -18712,6 +18728,119 @@ fn serial_host_native_child_pselect6_wakes_on_sibling_pipe_write() {
         assert_eq!(result.1, 1, "sibling wake: {result:?}");
         assert!(matches!(
             result.0,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(read_set.as_bytes(), &mask);
+    });
+}
+
+/// #2588: a fork child calls `pselect6` on a zone pipe its direct parent
+/// holds: first a zero timeout on the empty pipe returns `0` with cleared
+/// sets, then a blocking `pselect6` parks in ring (releasing the single slot)
+/// until its live parent writes, wakes with `1`, reads the byte, and exits 0.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pselect6_wakes_on_parent_pipe_write_and_times_out() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    with_arm_process_host_dispatch(|call| {
+        let (_, parent_pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(parent_pid > 0);
+        let parent = ArmCaller::Child(parent_pid as u32);
+        call(parent, ARM_RESUME, [0; 6]);
+        let pipe = GuestUserBuffer::zeroed(8);
+        assert_eq!(
+            call(parent, sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]).1,
+            0
+        );
+        let read = u32::from_ne_bytes(pipe.as_bytes()[..4].try_into().unwrap());
+        let write = u32::from_ne_bytes(pipe.as_bytes()[4..].try_into().unwrap());
+        let (_, child_pid) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(child_pid > 0);
+        let child = ArmCaller::Child(child_pid as u32);
+        call(child, ARM_RESUME, [0; 6]);
+
+        let mask = (1u64 << read).to_ne_bytes();
+        let mut read_set = GuestUserBuffer::from_bytes(&mask);
+        let zero_ts = GuestUserBuffer::from_value([0u64, 0]);
+
+        // Zero timeout on an empty pipe returns 0 in ring and clears read_set.
+        let timed = call(
+            child,
+            sys::PSELECT6.raw(),
+            [u64::from(read) + 1, read_set.arg(), 0, 0, zero_ts.arg(), 0],
+        );
+        assert_eq!(timed.1, 0, "zero-timeout pselect6: {timed:?}");
+        assert!(matches!(
+            timed.0,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+
+        // Blocking pselect6 parks in ring, releasing execution capacity so the
+        // parent can run on the same slot and write to the pipe.
+        read_set.as_mut_bytes().copy_from_slice(&mask);
+        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, 0];
+        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(child, sys::PSELECT6.raw(), args);
+        assert_eq!(
+            parked.0,
+            CompletionRoute::Suspended,
+            "blocking child pselect6 must park: {parked:?}"
+        );
+
+        let byte = GuestUserBuffer::from_bytes(b"p");
+        assert_eq!(
+            call(
+                parent,
+                sys::WRITE.raw(),
+                [write.into(), byte.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+
+        let mut result = call(child, ARM_RESUME, [0; 6]);
+        if result.1 == i64::MIN {
+            result = call(child, sys::PSELECT6.raw(), args);
+        }
+        assert_eq!(
+            result.1, 1,
+            "parent pipe write wakes child pselect6: {result:?}"
+        );
+        assert!(matches!(
+            result.0,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(read_set.as_bytes(), &mask);
+
+        let buffer = GuestUserBuffer::zeroed(1);
+        assert_eq!(
+            call(
+                child,
+                sys::READ.raw(),
+                [read.into(), buffer.arg(), 1, 0, 0, 0]
+            )
+            .1,
+            1
+        );
+        assert_eq!(buffer.as_bytes(), b"p");
+
+        // Close all write ends (parent and child's inherited copy):
+        // pselect6 on the drained pipe reports readable EOF (1).
+        for holder in [parent, child] {
+            assert_eq!(
+                call(holder, sys::CLOSE.raw(), [write.into(), 0, 0, 0, 0, 0]).1,
+                0
+            );
+        }
+        read_set.as_mut_bytes().copy_from_slice(&mask);
+        let eof = call(child, sys::PSELECT6.raw(), args);
+        assert_eq!(eof.1, 1, "EOF pipe must be readable in select: {eof:?}");
+        assert!(matches!(
+            eof.0,
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
         assert_eq!(read_set.as_bytes(), &mask);

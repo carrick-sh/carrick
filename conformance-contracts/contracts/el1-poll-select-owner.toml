@@ -28,6 +28,9 @@ vm_free = [
   "carrick-el1-linux::ipc::tests::{production_zone_ppoll_ignores_negative_fd,production_zone_ppoll_events_zero_parks_until_writer_close,production_zone_ppoll_full_writer_with_both_interests_wakes_on_drain,x86_cpl0_zone_poll_parks_until_last_writer_closes}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_pselect6_wakes_on_sibling_pipe_write (native ARM production entry; a ready inherited pipe, then an actual park and sibling write; a concurrent modification of the bitmap does not change the retained interest)",
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_child_pselect6_wakes_on_parent_pipe_write_and_times_out,serial_host_native_pselect6_sigmask_on_a_zone_pipe_parks_in_ring}",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_pselect6_wakes_on_parent_pipe_write",
+  "carrick-el1-linux::ipc::tests::{pselect6_full_operation_arena_waits_for_a_slot_never_forwards,pselect6_first_touch_copyin_preserves_nfds_register_for_replay}",
   "carrick-el1-linux::native_process_runtime::host_test_support::{native_arm_pselect6_host_settlement,native_arm_pselect6_no_slot_wake,native_arm_pselect6_no_slot_wake_reports_eof}",
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_trap_frame_ppoll_retains_completed_output_across_owner_wait,poll_revents_crossing_a_page_retains_partial_copy_and_fault}",
 ]
@@ -35,6 +38,7 @@ vm_free = [
 embed = [
   "carrick-vmm-kvm::cpl0_shared_entry::native_child_pselect6_times_out_then_reports_eof (x86 pselect6 timeout clears the set and remaining time, and EOF is readable)",
   "carrick-vmm-kvm::cpl0_shared_entry::native_child_select_timeval_wakes_on_sibling_pipe_write (x86 select timeval normalization, invalid negative fraction, and remaining-time copyout)",
+  "carrick-vmm-kvm::cpl0_shared_entry::{native_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_wakes_on_exec_successor_write,native_exec_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends,native_two_children_pselect6_release_default_pool_capacity}",
   "carrick-vmm-kvm::cpl0_initial_mm::native_child_pselect6_wakes_on_sibling_pipe_write (production CPL0 guest; a ready pipe and a parked pselect6 on that same pipe; the sibling writes only after the test has observed enrollment)",
 ]
 

@@ -3971,6 +3971,335 @@ mod tests {
         }
     }
 
+    /// #2588: a native child's blocking `pselect6` on a zone pipe that meets
+    /// a full operation arena is contention ("not now"), never Forward/ENOSYS:
+    /// it drops its pin, keeps its armed temporary sigmask and original
+    /// deadline, parks on the arena's slot release (Busy once), and on wake
+    /// parks on the pipe and reports readiness once the pipe is written.
+    #[test]
+    fn pselect6_full_operation_arena_waits_for_a_slot_never_forwards() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (r1, w1, _) = w.pipe(a, BLOCK);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        w.fork_table(a, 203);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        // B (202) runs once A waits on the arena: B blocks on r2, handing the vCPU back to A.
+        let b_read = syscall(SYS_READ, r2, va, 16, B_SVC);
+        w.queue(202, OTHER_MM, &b_read, B_SVC);
+        let pins = w.host().refcount(a, Fd(r1)).unwrap();
+
+        // Populate pselect6 inputs in A's mapped page:
+        // va + 0x00: readfds (1 << r1)
+        // va + 0x20: timespec {5, 0}
+        // va + 0x40: sigset (1 << (10 - 1))
+        // va + 0x50: sigset_argpack {va + 0x40, 8}
+        let read_bit = (1u64 << r1).to_ne_bytes();
+        w.mem.write(MM, va, &read_bit);
+        let mut ts = [0u8; 16];
+        ts[..8].copy_from_slice(&5i64.to_ne_bytes());
+        w.mem.write(MM, va + 0x20, &ts);
+        let sigusr1 = 1u64 << (10 - 1);
+        w.mem.write(MM, va + 0x40, &sigusr1.to_ne_bytes());
+        let mut pack = [0u8; 16];
+        pack[..8].copy_from_slice(&(va + 0x40).to_ne_bytes());
+        pack[8..].copy_from_slice(&8u64.to_ne_bytes());
+        w.mem.write(MM, va + 0x50, &pack);
+
+        let mut held = Vec::new();
+        while let Ok(token) = w.region.begin_operation(IpcOperation::EMPTY) {
+            held.push(token);
+        }
+        assert_eq!(held.len(), carrick_el1_abi::ipc::IPC_OPERATIONS);
+        let slots = carrick_sched_core::object_wait::ObjectWaitKey::ipc_operation_slots(
+            w.region.operation_slot_generation(),
+        )
+        .index();
+
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC,
+            ..Default::default()
+        };
+        frame.x[0] = (r1 as u64) + 1;
+        frame.x[1] = va;
+        frame.x[4] = va + 0x20;
+        frame.x[5] = va + 0x50;
+        frame.x[8] = 72; // pselect6
+        let a_regs = frame.x;
+
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let mut cpu = core::mem::take(&mut w.cpu);
+        cpu.now = 1_000;
+        cpu.freq = 1_000_000_000;
+        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let native = |frame: &mut TrapFrame,
+                      owner: &mut NativeOwner<'_>,
+                      cpu: &mut FakeCpu,
+                      output: &mut Option<PollOutput>| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_single_zone_ppoll(&mut sched, frame, &venue, owner, output)
+        };
+
+        // Step 1 (Busy once): full operation arena parks A on slot release, never Forwards.
+        let mut out = None;
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut out),
+            SWITCHED,
+            "a full arena must park pselect6 on slot release instead of forwarding"
+        );
+        assert!(out.is_none());
+        assert_eq!(frame.elr, B_SVC, "A yields execution capacity to B");
+        assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 1);
+        assert_eq!(
+            w.host().refcount(a, Fd(r1)),
+            Ok(pins),
+            "pin dropped during slot wait"
+        );
+        assert_eq!(mask.arms.get(), 1, "temporary sigmask armed once");
+        assert_eq!(
+            mask.armed.get(),
+            Some(sigusr1),
+            "temporary sigmask stays armed"
+        );
+        assert!(
+            owner.accepted.is_some(),
+            "accepted deadline retained across slot wait"
+        );
+
+        // Corrupt user timespec and sigmask in memory while A waits, proving the
+        // replay uses the retained deadline and already-armed mask.
+        w.mem.write(MM, va + 0x20, &[0xff; 16]);
+        w.mem.write(MM, va + 0x40, &[0xff; 8]);
+        w.mem.write(MM, va + 0x50, &[0xff; 16]);
+        cpu.now = 2_000_000_000; // 2s elapsed of original 5s deadline
+
+        // Free three arena slots (one for B's read park, one for A's replayed pselect6,
+        // one for C's park when handing the vCPU back to A).
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            finish(&mut sched, held.pop().unwrap(), w.region);
+            assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 0);
+            finish(&mut sched, held.pop().unwrap(), w.region);
+            finish(&mut sched, held.pop().unwrap(), w.region);
+            let mut g = b_read;
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
+            assert_eq!(g.x, a_regs, "A replays its original pselect6 registers");
+            frame = g;
+        }
+
+        // Queue C (203) as the writer that will wake A's pipe wait.
+        w.mem.write(OTHER_MM, va + 0x100, b"z");
+        let c_write = syscall(SYS_WRITE, w1, va + 0x100, 1, B_SVC);
+        w.queue(203, OTHER_MM, &c_write, B_SVC);
+
+        // Step 2: A replays pselect6, keeps the original deadline and armed mask
+        // without re-arming, and parks on the empty pipe r1.
+        reenter(&mut frame, A_SVC);
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut out),
+            SWITCHED,
+            "replayed pselect6 parks on the pipe"
+        );
+        assert_eq!(
+            mask.arms.get(),
+            1,
+            "replay must not double-arm the temporary mask"
+        );
+        assert_eq!(mask.armed.get(), Some(sigusr1));
+
+        // Step 3: C writes 1 byte to w1, waking A; C then blocks on r2 so A runs.
+        {
+            let mut g = frame;
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                (serve_ipc(&mut sched, &mut g, &venue, &mut user), g.x[0]),
+                (RETURNED, 1)
+            );
+            let mut c_park = syscall(SYS_READ, r2, va + 0x200, 1, B_SVC);
+            assert_eq!(
+                serve_ipc(&mut sched, &mut c_park, &venue, &mut user),
+                SWITCHED
+            );
+            frame = c_park;
+        }
+
+        reenter(&mut frame, A_SVC);
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut out),
+            RETURNED,
+            "woken pselect6 completes in ring"
+        );
+        assert_eq!(frame.x[0], 1);
+        assert_eq!(
+            mask.armed.get(),
+            None,
+            "completed pselect6 disarms the temporary mask"
+        );
+        assert_eq!(w.host().refcount(a, Fd(r1)), Ok(pins), "pipe pin released");
+        let Some(PollOutput::Select { spans, result: 1 }) = out else {
+            panic!("expected Select output");
+        };
+        assert_eq!(spans[0].1, read_bit);
+        let rem_sec = i64::from_ne_bytes(spans[1].1[..8].try_into().unwrap());
+        assert!(
+            (2..=3).contains(&rem_sec),
+            "original 5s minus 2s elapsed, got {rem_sec}s"
+        );
+
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
+    /// #2588: when a native caller's `pselect6` input (`readfds`, `timeout`, or
+    /// `sigmask`) hits a first-touch/COW refusal (`has_copyin_refusal()`), the
+    /// ring must leave `frame.x[0]` (`nfds`) intact and return `Forward` so
+    /// `dispatch.rs`'s `wait_guest_copy` supplies the page and replays the SVC
+    /// with the original `nfds` instead of `-14`.
+    #[test]
+    fn pselect6_first_touch_copyin_preserves_nfds_register_for_replay() {
+        struct FirstTouchCopy<'a> {
+            inner: User<'a>,
+            fault_va: u64,
+            refused: bool,
+        }
+        impl UserCopy for FirstTouchCopy<'_> {
+            fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+                if src == self.fault_va {
+                    self.refused = true;
+                    return false;
+                }
+                self.inner.copy_in(dst, src)
+            }
+            fn has_copyin_refusal(&self) -> bool {
+                self.refused
+            }
+            fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+                self.inner.copy_out(at, bytes)
+            }
+        }
+
+        let w = world();
+        let a = w.table(w.a_tid);
+        let (r1, _w1, _) = w.pipe(a, BLOCK);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.write(MM, va, &(1u64 << r1).to_ne_bytes());
+        w.mem.write(MM, va + 0x20, &[0u8; 16]);
+        let mut pack = [0u8; 16];
+        pack[..8].copy_from_slice(&(va + 0x40).to_ne_bytes());
+        pack[8..].copy_from_slice(&8u64.to_ne_bytes());
+        w.mem.write(MM, va + 0x50, &pack);
+
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let mut cpu = FakeCpu {
+            now: 1_000,
+            freq: 1_000_000_000,
+            ..Default::default()
+        };
+
+        for fault_va in [va, va + 0x20, va + 0x50, va + 0x40] {
+            let nfds = (r1 as u64) + 1;
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                elr: A_SVC,
+                ..Default::default()
+            };
+            frame.x[0] = nfds;
+            frame.x[1] = va;
+            frame.x[4] = va + 0x20;
+            frame.x[5] = if fault_va >= va + 0x40 { va + 0x50 } else { 0 };
+            frame.x[8] = 72;
+            let mut copy = FirstTouchCopy {
+                inner: User {
+                    task: &w.task,
+                    mem: &w.mem,
+                },
+                fault_va,
+                refused: false,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            let mut out = None;
+            let served =
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut copy, &mut out);
+            assert!(copy.refused, "must hit fault_va={fault_va:#x}");
+            assert_eq!(
+                served,
+                IpcServed::Forward,
+                "first-touch copy_in at {fault_va:#x} must hand off to wait_guest_copy"
+            );
+            assert_eq!(
+                frame.x[0], nfds,
+                "first-touch copy_in at {fault_va:#x} must not clobber x0 (nfds)"
+            );
+            assert!(out.is_none());
+        }
+    }
+
     /// #1671 review P0-2: a fresh `epoll_pwait` with a sigmask whose events
     /// copy-out is refused keeps the accepted mask across the owner's
     /// suspended preparation. Readiness is lost meanwhile and the mask

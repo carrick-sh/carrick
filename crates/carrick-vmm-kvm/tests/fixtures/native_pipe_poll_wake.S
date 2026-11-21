@@ -25,6 +25,113 @@
 .global _start
 .text
 _start:
+#ifdef EXEC_POLLER_SUCCESSOR
+    jmp pselect_reader             /* stdin (fd 0, fds == 0) is the inherited pipe */
+#endif
+#ifdef TWO_POLLERS
+    lea fds(%rip), %rdi
+    mov $0x80000, %esi
+    mov $293, %eax                 /* pipe2(fds, O_CLOEXEC) */
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+    lea fds2(%rip), %rdi
+    mov $0x80000, %esi
+    mov $293, %eax                 /* pipe2(fds2, O_CLOEXEC) */
+    syscall
+    test %rax, %rax
+    jnz fail_pipe
+    mov $57, %eax                  /* root forks native parent so sockets/polls run native */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz two_pollers_parent
+    mov %eax, %edi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    movzbl status+1(%rip), %edi
+    jmp exit
+two_pollers_parent:
+    mov $57, %eax                  /* fork poller 1 on fds[0] */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jz single_pselect_poller
+    mov %eax, %r12d
+    mov $57, %eax                  /* fork poller 2 on fds2[0] */
+    syscall
+    test %eax, %eax
+    js fail_fork
+    jnz 1f
+    mov fds2(%rip), %eax
+    mov %eax, fds(%rip)
+    jmp single_pselect_poller
+1:
+    mov %eax, %r15d
+    mov %r12d, reader_pids(%rip)
+    mov %r15d, reader_pids+4(%rip)
+    mov $2, %edi                   /* AF_INET */
+    mov $2, %esi                   /* SOCK_DGRAM */
+    xor %edx, %edx
+    mov $41, %eax
+    syscall
+    test %rax, %rax
+    js child_fail
+    mov %eax, %r13d
+    mov %r13d, %edi
+    lea select_gate_peer(%rip), %rsi
+    mov $16, %edx
+    mov $42, %eax                  /* connect */
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    mov %r13d, %edi
+    lea reader_pids(%rip), %rsi
+    mov $8, %edx
+    mov $1, %eax                   /* send both reader pids */
+    syscall
+    cmp $8, %rax
+    jne child_fail
+    mov %r13d, pfd(%rip)
+    movw $1, pfd+4(%rip)
+    movw $0, pfd+6(%rip)
+    lea pfd(%rip), %rdi
+    mov $1, %esi
+    mov $8000, %edx
+    mov $7, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    mov %r13d, %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    mov fds+4(%rip), %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax                   /* wake poller 1 */
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    mov fds2+4(%rip), %edi
+    lea byte(%rip), %rsi
+    mov $1, %edx
+    mov $1, %eax                   /* wake poller 2 */
+    syscall
+    cmp $1, %rax
+    jne child_fail
+    jmp wait_for_child
+single_pselect_poller:
+    call pselect_one
+    xor %edi, %edi
+    jmp exit
+#endif
 #ifdef SELECT_TIMEOUT_EOF
     mov $57, %eax                  /* child owns the only copies of the pipe */
     syscall
@@ -106,6 +213,21 @@ _start:
     jmp child
 #endif
 poller:
+#ifdef EXEC_POLLER
+    mov fds(%rip), %edi
+    xor %esi, %esi
+    xor %edx, %edx
+    mov $292, %eax                 /* dup3(fds[0], 0, 0): stdin survives exec */
+    syscall
+    test %rax, %rax
+    jnz child_fail
+    lea successor(%rip), %rdi
+    lea successor_argv(%rip), %rsi
+    xor %edx, %edx
+    mov $59, %eax                  /* execve(SUCCESSOR_PATH) */
+    syscall
+    jmp child_fail
+#endif
 #ifdef USE_PSELECT
     jmp pselect_reader
 #endif
@@ -553,7 +675,7 @@ usr1_action: .quad usr1_handler, 0x04000000, usr1_restorer, 0 /* SA_RESTORER */
 usr1_mask: .quad 0x200
 usr1_mask_pair: .quad usr1_mask, 8
 #endif
-#ifdef EXEC_WRITER
+#if defined(EXEC_WRITER) || defined(EXEC_POLLER)
 successor: .asciz SUCCESSOR_PATH
 .balign 8
 successor_argv: .quad successor, 0
@@ -561,10 +683,12 @@ successor_argv: .quad successor, 0
 .bss
 .balign 4096
 fds: .space 8
+fds2: .space 8
 pfd: .space 8
 read_set: .space 8
 select_time: .space 16
 reader_pid: .space 4
+reader_pids: .space 8
 status: .space 8
 poll_result: .space 8
 received: .space 1
