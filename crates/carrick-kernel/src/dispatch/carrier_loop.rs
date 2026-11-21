@@ -1,21 +1,31 @@
-//! Shared host-carrier stage-1 alias publication and first-touch + stale-leaf
-//! fault resolution.
+//! Shared host-carrier stage-1 alias publication, first-touch + stale-leaf
+//! fault resolution, and `ReservationBusy` owner-wait helpers.
 //!
-//! Moved out of the HVPatch vCPU run loop (`carrick-runtime`) so every carrier
-//! lane (HVF/KVM runtime, the soft AArch64 runner) commits alias frame
-//! inventory and resolves first-touch/stale-stage-1 faults through one path.
+//! Used by both the multi-thread HVPatch vCPU run loop (`carrick-runtime`) and
+//! the single-process soft AArch64 runner (`carrick-softcpu-aarch64-host`) so
+//! neither frame-inventory alias commits nor first-touch/stale-stage-1 fault
+//! resolution can drift across carrier lanes.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use carrick_abi::LinuxProtFlags;
+use carrick_el1_abi::{
+    Aarch64ParkedContext, El1TaskId, MmPortalSlots, PortalOwnerWait, RecordRef, ThreadIdentity,
+    ZoneTables,
+};
 use carrick_guest_mem::{Gpa, GuestVa, MappingSharing, MemoryError};
 use carrick_hal::{
     FrameEventCapacity, FrameInventoryCommit, HostAliasBacking, ThreadedEngine, TrapError,
 };
 use carrick_mmu_core::aarch64::{LeafAccess, Stage1FaultKind};
+use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken, OwnedObjectWakeEffects};
 
 use crate::dispatch::host_alias::{HostAliasInstallGuard, HostAliasTransaction};
 use crate::dispatch::mem::ReservationBusy;
 use crate::dispatch::mm_mutation::MmMutationGuard;
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher};
+use crate::el1_zone::{HandbackEvent, HandbackPublisher, HostLockWait};
 use crate::kernel::debug::HvpatchAliasInstallSite;
 use crate::kernel::{FrameInventoryError, KernelContext};
 use crate::linux_abi::{
@@ -362,9 +372,266 @@ pub fn resolve_host_first_touch_or_stale<E: ThreadedEngine>(
     Ok(Ok(step))
 }
 
+/// Lock-free single-waiter handback wakeup slot for single-carrier host threads
+/// parking on [`ZoneTables`] (`SpaceWaitCause::Reservations`).
+pub struct SingleCarrierHandbackWait {
+    waiter_thread: std::thread::Thread,
+    expected_incarnation: AtomicU64,
+    ready: AtomicBool,
+}
+
+impl SingleCarrierHandbackWait {
+    /// Bind a wakeup slot to the calling carrier thread.
+    #[must_use]
+    pub fn for_current_thread() -> Self {
+        Self {
+            waiter_thread: std::thread::current(),
+            expected_incarnation: AtomicU64::new(0),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    /// Build a [`HandbackPublisher`] that wakes this carrier thread when its
+    /// parked `RecordRef` is handed back as [`HandbackEvent::Ready`].
+    #[must_use]
+    pub fn publisher(self: &Arc<Self>) -> HandbackPublisher {
+        let slot = Arc::clone(self);
+        Arc::new(move |event| {
+            if let HandbackEvent::Ready(record) = event {
+                slot.notify_ready(record);
+            }
+        })
+    }
+
+    /// Notify this slot if `record` matches the currently armed park incarnation.
+    pub fn notify_ready(&self, record: RecordRef) {
+        let expected = self.expected_incarnation.load(Ordering::Acquire);
+        if expected != 0 && record.incarnation == expected {
+            self.ready.store(true, Ordering::Release);
+            self.waiter_thread.unpark();
+        }
+    }
+
+    fn arm(&self, record: RecordRef) {
+        self.ready.store(false, Ordering::Relaxed);
+        self.expected_incarnation
+            .store(record.incarnation, Ordering::Release);
+    }
+
+    fn disarm(&self) {
+        self.expected_incarnation.store(0, Ordering::Release);
+        self.ready.store(false, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+}
+
+/// Outcome of one [`wait_for_owner_memory_release`] enrollment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerMemoryWaitStep {
+    /// The holder had already released before or during enrollment's
+    /// queue-locked probe-once check.
+    ProbeOnceReady,
+    /// Enrolled on `SpaceWaitCause::Reservations`, parked until the holder's
+    /// release handed back the zone record, and retired the record.
+    ParkedAndWoken,
+}
+
+/// The carrier zone and MM portal an owner-memory wait enrols on.
+#[derive(Clone, Copy)]
+pub struct OwnerWaitVenue<'a> {
+    zone: &'a ZoneTables,
+    portal: &'a MmPortalSlots,
+}
+
+impl<'a> OwnerWaitVenue<'a> {
+    /// A venue over one carrier's co-located zone tables and MM portal;
+    /// `MmPortalSlots::authenticate_wait` checks the pair's relation.
+    #[must_use]
+    pub fn new(zone: &'a ZoneTables, portal: &'a MmPortalSlots) -> Self {
+        Self { zone, portal }
+    }
+}
+
+impl OwnerWaitVenue<'static> {
+    /// The venue of the published EL1 aperture
+    /// (`carrick_el1_abi::record_el1_region_host_ptr`).
+    pub fn published() -> Result<Self, String> {
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        let Some(zone) = carrick_el1_abi::zone_tables() else {
+            return Err("owner memory wait has no published EL1 ZoneTables".to_owned());
+        };
+        if region == 0
+            || region.checked_add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                != Some(core::ptr::from_ref(zone) as usize)
+        {
+            return Err("owner memory wait EL1 region does not match ZoneTables".to_owned());
+        }
+        let portal_addr = region
+            .checked_add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            .ok_or_else(|| "owner memory wait EL1 portal offset overflow".to_owned())?;
+        // SAFETY: `zone_tables()` validated the live EL1 region mapping, and
+        // `EL1_MM_PORTAL_OFFSET` lies inside that same fixed ABI region, which
+        // stays mapped while its aperture is published.
+        let portal = unsafe { &*(portal_addr as *const MmPortalSlots) };
+        Ok(Self { zone, portal })
+    }
+}
+
+/// Authenticate `wait` against `venue`, enrol on the holder's release
+/// (`PortalWaitEnrollment::park_host`, which probes the space notification
+/// revision once under the queue lock), and park this carrier thread until
+/// the release hands its zone record back through the registered
+/// [`HandbackPublisher`] (`wake_slot`). Never polls.
+pub fn wait_for_owner_memory_release(
+    venue: OwnerWaitVenue<'_>,
+    context: &KernelContext,
+    wait: PortalOwnerWait,
+    wake_slot: &SingleCarrierHandbackWait,
+) -> Result<OwnerMemoryWaitStep, String> {
+    let OwnerWaitVenue { zone, portal } = venue;
+    let enrollment = match portal.authenticate_wait(zone, wait) {
+        Ok(enrollment) => enrollment,
+        Err(ObjectWaitError::Stale) => return Ok(OwnerMemoryWaitStep::ProbeOnceReady),
+        Err(error) => {
+            return Err(format!("owner wait receipt rejected: {error:?}"));
+        }
+    };
+    let serial = context.thread().key().serial.raw();
+    let token = OperationToken::metadata_request(serial)
+        .ok_or_else(|| "owner wait thread serial is zero".to_owned())?;
+    let identity = ThreadIdentity {
+        tid: El1TaskId::from_linux_tid(context.thread().key().tid.raw()).raw(),
+        serial,
+        mm: wait.handle().mm().raw(),
+        file_table: context.resources().files().id().raw(),
+        generation: 0,
+        affinity_source: context.thread().control_slot().affinity_source(),
+        affinity: context.thread().affinity().words()[0],
+        lifecycle_page: 0,
+        control_slot: 0,
+    };
+    let record = zone
+        .alloc_record(identity)
+        .map_err(|error| format!("owner wait record unavailable: {error:?}"))?;
+    let record_ref = zone.record_ref(record);
+    wake_slot.arm(record_ref);
+    let complete = |effects: OwnedObjectWakeEffects<'_, Aarch64ParkedContext>| {
+        carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects);
+    };
+    let cancel = |zone: &ZoneTables| {
+        wake_slot.disarm();
+        let _ = zone.claim_for_host(
+            record_ref,
+            None,
+            carrick_el1_abi::Handback::Cancelled,
+            &HostLockWait,
+            &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &HostLockWait,
+                    owned.zone(),
+                    owned,
+                );
+            },
+        );
+        zone.free_record(record);
+    };
+    match enrollment.park_host(record, token, &complete) {
+        Ok(()) => {
+            zone.counters.host_parks.fetch_add(1, Ordering::Relaxed);
+            // `park` may return spuriously; the handback (or the zone's own
+            // readiness) is the only wake condition.
+            while !wake_slot.is_ready() && zone.host_resume_readiness(record_ref) != Some(true) {
+                std::thread::park();
+            }
+            wake_slot.disarm();
+            zone.free_record(record);
+            Ok(OwnerMemoryWaitStep::ParkedAndWoken)
+        }
+        Err((ObjectWaitError::Stale, _)) => {
+            cancel(zone);
+            Ok(OwnerMemoryWaitStep::ProbeOnceReady)
+        }
+        Err((error, _)) => {
+            cancel(zone);
+            Err(format!("owner wait park_host failed: {error:?}"))
+        }
+    }
+}
+
+/// The single-carrier "not now" driver: run `attempt`; on
+/// [`ReservationBusy`] (whose MM mutation lease `attempt` has already
+/// released) enrol on the holder's release at `venue`, probe once, and rerun.
+/// Returns the attempt's result and how many owner waits it took.
+pub fn rerun_after_owner_release<'v, T>(
+    context: &KernelContext,
+    wake_slot: &SingleCarrierHandbackWait,
+    venue: impl Fn() -> Result<OwnerWaitVenue<'v>, String>,
+    mut attempt: impl FnMut() -> Result<Result<T, ReservationBusy>, String>,
+) -> Result<(T, u64), String> {
+    let mut owner_waits = 0u64;
+    loop {
+        match attempt()? {
+            Ok(done) => return Ok((done, owner_waits)),
+            Err(contended) => {
+                wait_for_owner_memory_release(venue()?, context, contended.wait, wake_slot)?;
+                owner_waits += 1;
+            }
+        }
+    }
+}
+
+/// Resolve a synchronous EL0 fault on a single-carrier engine with
+/// [`resolve_host_first_touch_or_stale`], rerunning through
+/// [`rerun_after_owner_release`] at the published EL1 aperture on
+/// [`ReservationBusy`]. Returns whether the fault was resolved and how many
+/// owner waits it took.
+pub fn resolve_host_first_touch_with_owner_wait<E: ThreadedEngine>(
+    engine: &mut E,
+    dispatcher: &mut SyscallDispatcher,
+    context: &KernelContext,
+    wake_slot: &SingleCarrierHandbackWait,
+    address: u64,
+    access: Option<LeafAccess>,
+    fault_kind: Option<Stage1FaultKind>,
+) -> Result<(bool, u64), String> {
+    let (step, owner_waits) =
+        rerun_after_owner_release(context, wake_slot, OwnerWaitVenue::published, || {
+            dispatcher
+                .with_mm_executor_mutation(|disp, mutation| {
+                    resolve_host_first_touch_or_stale(
+                        disp, engine, mutation, address, access, fault_kind,
+                    )
+                })
+                .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))?
+                .map_err(|e| format!("first-touch fault resolution trap error: {e}"))
+        })?;
+    match step {
+        HostFirstTouchStep {
+            resident:
+                HostResidentAttempt::BackendRefused {
+                    page, prot, error, ..
+                },
+            resolved: false,
+            ..
+        } => Err(format!(
+            "first-touch protect_range({page:#x}, prot={prot:#x}): {error}"
+        )),
+        HostFirstTouchStep {
+            growdown: HostGrowdownAttempt::ProtectFailed { start, error },
+            resolved: false,
+            ..
+        } => Err(format!("growdown protect_range({start:#x}): {error}")),
+        step => Ok((step.resolved, owner_waits)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn apply_first_touch_enforces_linux_stage1_access_matrix() {
@@ -401,5 +668,63 @@ mod tests {
             apply_first_touch(LINUX_PROT_WRITE, Some(LeafAccess::Write), || false, || {}),
             None
         );
+    }
+
+    #[test]
+    fn first_touch_busy_root_enrols_once_then_reruns_without_polling() {
+        use crate::dispatch::mem::delegated_tests::Root;
+        use std::time::{Duration, Instant};
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        let venue = root.owner_wait_venue();
+        let wake_slot = Arc::new(SingleCarrierHandbackWait::for_current_thread());
+        let address = crate::memory::LINUX_MMAP_BASE;
+        let attempts = AtomicUsize::new(0);
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+
+        let outcome = crate::el1_zone::with_test_handback_publisher(wake_slot.publisher(), || {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    // A peer EL1 slot owns the MM root.
+                    let held = root.lock_el1_slot(9);
+                    held_tx.send(()).unwrap();
+                    // Release only after the carrier thread enrolled and
+                    // parked, so the rerun must come from the handback.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while venue.zone.counters.host_parks.load(Ordering::Acquire) == 0 {
+                        assert!(Instant::now() < deadline, "carrier never parked");
+                        std::hint::spin_loop();
+                    }
+                    drop(held);
+                });
+                held_rx.recv().unwrap();
+                // The production driver the soft runner's first-touch
+                // path uses, over the production resident-fault planner.
+                rerun_after_owner_release(
+                    &ctx,
+                    &wake_slot,
+                    || Ok(venue),
+                    || {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        dispatcher
+                            .with_mm_executor_mutation(|disp, mutation| {
+                                disp.resident_fault_plan(&mutation.host_alias_permit(), address)
+                                    .map(|plan| plan.is_some())
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                )
+            })
+        });
+
+        assert_eq!(outcome, Ok((false, 1)), "Busy once, then the rerun answers");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "Busy once, then success: exactly two attempts, no yield loop"
+        );
+        assert_eq!(venue.zone.counters.host_parks.load(Ordering::Relaxed), 1);
     }
 }
