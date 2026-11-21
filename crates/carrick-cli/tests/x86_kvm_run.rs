@@ -2169,6 +2169,16 @@ fn run_mounted_binary_in_archive(
     json: bool,
     image_archive: &[u8],
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
+    run_mounted_binary_in_archive_with_census(elf, run_id, json, image_archive, None)
+}
+
+fn run_mounted_binary_in_archive_with_census(
+    elf: &std::path::Path,
+    run_id: &str,
+    json: bool,
+    image_archive: &[u8],
+    census_dir: Option<&std::path::Path>,
+) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, image_archive).unwrap();
@@ -2193,6 +2203,9 @@ fn run_mounted_binary_in_archive(
     command
         .env("CARRICK_HOME", &home)
         .env("CARRICK_RUN_ID", &scoped_run_id);
+    if let Some(census_dir) = census_dir {
+        command.env("CARRICK_EL1_CENSUS", census_dir);
+    }
     if json {
         command.arg("run").arg("--json");
     } else {
@@ -2511,6 +2524,15 @@ struct ChildCrossingGap {
     canonical: u64,
     name: String,
     owner: IssueNumber,
+    kind: ChildCrossingGapKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildCrossingGapKind {
+    /// A counted ENOSYS refusal in the census for the exec'd child.
+    Refusal,
+    /// Served, but the guest result differs from the native oracle.
+    Divergence,
 }
 
 /// Count ceiling for the gap table, in the manner of `AuthorityDebtCeilings`:
@@ -2534,8 +2556,15 @@ fn parse_child_crossing_gaps(text: &str) -> Result<Vec<ChildCrossingGap>, String
         }
         let at = |what: &str| format!("gap table line {}: {what}: {line:?}", index + 1);
         let cols: Vec<&str> = line.split('\t').collect();
-        let [canonical, name, owner] = cols[..] else {
-            return Err(at("want 3 tab-separated columns (canonical, name, owner)"));
+        let [canonical, name, owner, kind] = cols[..] else {
+            return Err(at(
+                "want 4 tab-separated columns (canonical, name, owner, kind)",
+            ));
+        };
+        let kind = match kind {
+            "refusal" => ChildCrossingGapKind::Refusal,
+            "divergence" => ChildCrossingGapKind::Divergence,
+            _ => return Err(at("kind must be refusal or divergence")),
         };
         let canonical: u64 = canonical
             .parse()
@@ -2557,6 +2586,7 @@ fn parse_child_crossing_gaps(text: &str) -> Result<Vec<ChildCrossingGap>, String
             canonical,
             name: name.to_owned(),
             owner: IssueNumber(owner),
+            kind,
         });
     }
     Ok(gaps)
@@ -2598,6 +2628,40 @@ fn parse_flip_allowlist(tsv: &str) -> Result<std::collections::BTreeMap<u64, &st
     Ok(allowlist)
 }
 
+/// How a served crossing's guest result is compared with the native Linux
+/// oracle. Everything is `Exact` (same success value, or same errno) unless
+/// the value depends on the host or the run, which is named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleComparison {
+    Exact,
+    /// Same success or same errno; the success value differs by design.
+    SuccessOrSameErrno(&'static str),
+}
+
+fn oracle_comparison(name: &str) -> OracleComparison {
+    match name {
+        "getcwd" => OracleComparison::SuccessOrSameErrno("length of a run-specific cwd path"),
+        "readlinkat" => OracleComparison::SuccessOrSameErrno("length of the run-specific exe path"),
+        "getdents64" => {
+            OracleComparison::SuccessOrSameErrno("record sizes depend on the directory")
+        }
+        _ => OracleComparison::Exact,
+    }
+}
+
+fn oracle_agrees(comparison: OracleComparison, native: i64, guest: i64) -> bool {
+    match comparison {
+        OracleComparison::Exact => native == guest,
+        OracleComparison::SuccessOrSameErrno(_) => {
+            if native < 0 || guest < 0 {
+                native == guest
+            } else {
+                true
+            }
+        }
+    }
+}
+
 #[test]
 fn child_crossing_gap_table_is_typed_and_ratcheted() {
     let gaps = parse_child_crossing_gaps(include_str!("fixtures/x86_child_crossing_gaps.tsv"))
@@ -2628,7 +2692,8 @@ fn child_crossing_gap_table_is_typed_and_ratcheted() {
     );
     assert!(
         parse_child_crossing_gaps("14\tremovexattr").is_err()
-            && parse_child_crossing_gaps("14\tmkdirat\t1").is_err(),
+            && parse_child_crossing_gaps("14\tmkdirat\t1\trefusal").is_err()
+            && parse_child_crossing_gaps("14\tremovexattr\t1\tother").is_err(),
         "a malformed or mislabelled row must fail the parse, not panic"
     );
     assert!(parse_flip_allowlist("nr\tname\tflip_routing\n1\tx\tForward-Allowlist\n").is_ok());
@@ -2719,7 +2784,14 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
         "native Linux returned ENOSYS for allowlisted crossings: {native_enosys:?}"
     );
 
-    let guest = run_mounted_binary(&elf, "exec-child-crossing-class", false);
+    let census_dir = dir.path().join("census");
+    let (guest, _) = run_mounted_binary_in_archive_with_census(
+        &elf,
+        "exec-child-crossing-class",
+        false,
+        &empty_image_archive(),
+        Some(&census_dir),
+    );
     assert_eq!(
         guest.status.code(),
         Some(7),
@@ -2735,33 +2807,111 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
     );
     let guest_rows = parse_rows(&guest.stdout, "guest");
 
+    // Routing, from the census refusal counters (#2650): which x86 ordinals
+    // the exec'd child's crossings refused, whichever venue counted them.
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        refusal_evidence: carrick_spec::syscall_census::RefusalEvidence,
+    }
+    let census_files: Vec<_> = std::fs::read_dir(&census_dir)
+        .expect("census directory")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1, "{census_files:?}");
+    let census: Envelope =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).expect("census json");
+    let evidence = census.refusal_evidence;
+    assert!(evidence.complete, "{evidence:?}");
+    assert_eq!(
+        evidence.isa,
+        carrick_spec::syscall_census::CensusIsa::X86_64
+    );
+    let refused_by = |caller| -> std::collections::BTreeMap<u64, u64> {
+        evidence
+            .rows
+            .iter()
+            .filter(|row| row.caller == caller)
+            .map(|row| (row.nr, row.refused + row.venue_refused))
+            .filter(|&(_, total)| total != 0)
+            .collect()
+    };
+    use carrick_spec::syscall_census::CallerClass;
+    assert_eq!(
+        refused_by(CallerClass::Root),
+        Default::default(),
+        "the root only forks, execs and waits: nothing of it may refuse"
+    );
+    let child_refused = refused_by(CallerClass::NativeChild);
+
     let gaps = parse_child_crossing_gaps(include_str!("fixtures/x86_child_crossing_gaps.tsv"))
         .unwrap_or_else(|error| panic!("{error}"));
-    let mut unexpected_enosys = Vec::new();
-    let mut newly_served_gaps = Vec::new();
-    for (canon, x86_nr, name, ret) in &guest_rows {
+    let mut failures = Vec::new();
+    let mut expected_refusals = std::collections::BTreeMap::new();
+    for ((canon, x86_nr, name, guest_ret), (_, _, _, native_ret)) in
+        guest_rows.iter().zip(&native_rows)
+    {
         let gap = gaps.iter().find(|gap| gap.canonical == *canon);
-        if *ret == -(libc::ENOSYS as i64) {
-            if gap.is_none() {
-                unexpected_enosys.push(format!("{name} (canonical={canon}, x86={x86_nr})"));
+        let refused = child_refused.get(x86_nr).copied().unwrap_or(0);
+        let comparison = oracle_comparison(name);
+        match gap.map(|gap| (gap, gap.kind)) {
+            Some((gap, ChildCrossingGapKind::Refusal)) => {
+                expected_refusals.insert(*x86_nr, 1);
+                if refused == 0 {
+                    failures.push(format!(
+                        "{name} (canonical={canon}, x86={x86_nr}, ret={guest_ret}) is now served; retire its row (owner #{}) and lower the ceiling",
+                        gap.owner.0
+                    ));
+                } else if *guest_ret != -(libc::ENOSYS as i64) {
+                    failures.push(format!(
+                        "{name} (x86={x86_nr}) is a counted refusal but returned {guest_ret}, not -ENOSYS"
+                    ));
+                }
             }
-        } else if let Some(gap) = gap {
-            newly_served_gaps.push(format!(
-                "{name} (canonical={canon}, x86={x86_nr}, ret={ret}, owner=#{})",
-                gap.owner.0
-            ));
+            Some((gap, ChildCrossingGapKind::Divergence)) => {
+                if refused != 0 {
+                    failures.push(format!(
+                        "{name} (x86={x86_nr}) is a divergence row but refused"
+                    ));
+                }
+                if oracle_agrees(OracleComparison::Exact, *native_ret, *guest_ret) {
+                    failures.push(format!(
+                        "{name} (canonical={canon}) now matches the oracle ({guest_ret}); retire its row (owner #{}) and lower the ceiling",
+                        gap.owner.0
+                    ));
+                } else if !oracle_agrees(
+                    OracleComparison::SuccessOrSameErrno("known divergence"),
+                    *native_ret,
+                    *guest_ret,
+                ) {
+                    failures.push(format!(
+                        "{name} (canonical={canon}): guest {guest_ret} vs native {native_ret} differ beyond the known divergence (owner #{})",
+                        gap.owner.0
+                    ));
+                }
+            }
+            None => {
+                if refused != 0 {
+                    failures.push(format!(
+                        "{name} (canonical={canon}, x86={x86_nr}) refused {refused}x in the census but is not a known gap"
+                    ));
+                }
+                if !oracle_agrees(comparison, *native_ret, *guest_ret) {
+                    failures.push(format!(
+                        "{name} (canonical={canon}, x86={x86_nr}): guest returned {guest_ret}, native oracle {native_ret} ({comparison:?})"
+                    ));
+                }
+            }
         }
     }
-    assert!(
-        newly_served_gaps.is_empty(),
-        "known gaps are now served in an exec'd child; retire their rows and lower the ceiling:\n  {}",
-        newly_served_gaps.join("\n  ")
+    assert_eq!(
+        child_refused, expected_refusals,
+        "census native_child refusals (x86 ordinal -> count) must be exactly the known gaps, once each"
     );
     assert!(
-        unexpected_enosys.is_empty(),
-        "exec'd native child returned unexpected ENOSYS on allowlisted crossings ({}):\n  {}",
-        unexpected_enosys.len(),
-        unexpected_enosys.join("\n  ")
+        failures.is_empty(),
+        "exec'd native child crossings disagree with the oracle or the gap table ({}):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
     );
 }
 
