@@ -1515,7 +1515,8 @@ fn fork_exec_probe_copy_alignment(
         );
 
         // 4. Exec successor resumes pselect6, sees fd 3 readable, restores mask, and reads "exec".
-        activate_target(source, &fixture.task, &child_binding);
+        let successor = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
+        activate_target(source, &fixture.task, &successor);
         read_set.as_mut_bytes().fill(0);
         let (route, res) = dispatch6(pselect, wait_args);
         assert!(matches!(

@@ -14255,8 +14255,6 @@ fn native_descriptor_argument_witness(
         assert!(!waiter_control.forwarded_wait_mask_armed());
 
         // Nothing ready, no timeout: the wait parks in ring under the mask.
-        let waiter_pid = in_ring(run_binding(waiter, 172, [0; 4])); // getpid
-        assert!(waiter_pid > 0);
         read_set.as_mut_bytes().copy_from_slice(&read_bit);
         let wait = [4, read_set.arg(), 0, 0, 0, sized.arg()];
         task.linux.mark_pending_host_work();
@@ -14271,23 +14269,9 @@ fn native_descriptor_argument_witness(
         assert!(waiter_control.forwarded_wait_mask_armed());
         assert_eq!(waiter_control.blocked().0, sigusr1);
 
-        // The peer task sends SIGUSR1 while the waiter is parked under its
-        // temporary mask: the masked signal must not interrupt the wait.
-        // Then the peer writes to the pipe; the waiter re-enters the same
-        // call, reports the descriptor and has its persistent mask back.
+        // The peer task makes the pipe readable; the waiter re-enters the
+        // same call, reports the descriptor and has its persistent mask back.
         activate_target(source, &task, writer);
-        assert_eq!(
-            in_ring(run_binding(
-                writer,
-                129, // kill(waiter_pid, SIGUSR1)
-                [waiter_pid as u64, 10, 0, 0]
-            )),
-            0
-        );
-        assert!(
-            fixture.zone.record(waiter.record.id).has_object_operation(),
-            "SIGUSR1 blocked by pselect6's temporary mask must leave the wait enrolled"
-        );
         let payload = GuestUserBuffer::from_bytes(b"peer");
         assert_eq!(
             in_ring(run_binding(
@@ -18779,16 +18763,33 @@ fn serial_host_native_child_pselect6_wakes_on_parent_pipe_write_and_times_out() 
         ));
         assert_eq!(read_set.as_bytes(), &[0; 8]);
 
-        // Blocking pselect6 parks in ring, releasing execution capacity so the
-        // parent can run on the same slot and write to the pipe.
+        // Blocking pselect6 under a temporary SIGUSR1 mask parks in ring,
+        // releasing execution capacity so the parent can run on the same slot,
+        // signal SIGUSR1 (held by the temporary mask, never EINTR), and write.
+        let sigusr1 = 1u64 << (10 - 1);
+        let sig_buf = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
+        let sig_pair = GuestUserBuffer::from_value([sig_buf.arg(), 8]);
         read_set.as_mut_bytes().copy_from_slice(&mask);
-        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, 0];
+        let args = [u64::from(read) + 1, read_set.arg(), 0, 0, 0, sig_pair.arg()];
         call(child, ARM_LEAVE_ON_PARK, [0; 6]);
         let parked = call(child, sys::PSELECT6.raw(), args);
         assert_eq!(
             parked.0,
             CompletionRoute::Suspended,
             "blocking child pselect6 must park: {parked:?}"
+        );
+
+        // Parent sends SIGUSR1 while child is parked under the temporary mask:
+        // child stays Suspended rather than waking with EINTR.
+        assert_eq!(
+            call(parent, 129, [child_pid as u64, 10, 0, 0, 0, 0]).1,
+            0,
+            "parent kill(child, SIGUSR1)"
+        );
+        assert_eq!(
+            call(child, ARM_RESUME, [0; 6]).0,
+            CompletionRoute::Suspended,
+            "masked SIGUSR1 must not wake parked pselect6"
         );
 
         let byte = GuestUserBuffer::from_bytes(b"p");
