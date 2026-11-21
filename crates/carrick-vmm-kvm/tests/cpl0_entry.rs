@@ -4423,3 +4423,416 @@ fn two_live_threads_selected_window_busy_loser_refaults_and_completes() {
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
+
+fn compile_static_gas_witness(asm: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("tempdir for x86 gas witness");
+    let src = dir.path().join("witness.S");
+    let out = dir.path().join("witness");
+    std::fs::write(&src, asm).expect("write witness.S");
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compile x86 gas witness");
+    assert!(
+        compiled.status.success(),
+        "assemble failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    std::fs::read(&out).expect("read compiled ELF")
+}
+
+/// #2581: a hardware user #PF on the root MM's lazy anonymous mapping must
+/// enrol on the admitted MM's release queue when the reservation root or
+/// space editor is contended, preserve all user GPRs (including RAX/RCX/R11)
+/// and RIP across the park, consume its metadata wait token on resume so a
+/// subsequent park on the same thread succeeds, and never fail with
+/// `kernel fault policy refused: reason 9`.
+#[test]
+fn production_root_user_fault_busy_once_parks_and_completes() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* mmap(NULL, 0x400000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+    xor %edi, %edi
+    mov $0x400000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+
+    /* Baseline park census -> %r13 */
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    mov %rax, %r13
+
+    /* 1. Arm INJECT_ROOT_BUSY_ONCE (-496) before first-touch #PF on block 0. */
+    mov $-496, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm_root
+
+    movabs $0x1122334455667788, %rax
+    movabs $0x99aabbccddeeff00, %rcx
+    movabs $0x13579bdf2468ace0, %r11
+    movq $0x5a5a5a5a, (%r12)
+
+    movabs $0x1122334455667788, %rdx
+    cmp %rdx, %rax
+    jne fail_rax_root
+    movabs $0x99aabbccddeeff00, %rdx
+    cmp %rdx, %rcx
+    jne fail_rcx_root
+    movabs $0x13579bdf2468ace0, %rdx
+    cmp %rdx, %r11
+    jne fail_r11_root
+    cmpq $0x5a5a5a5a, (%r12)
+    jne fail_val_root
+
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    lea 1(%r13), %rdx
+    cmp %rdx, %rax
+    jne fail_census_root
+
+    /* 2. Arm INJECT_EDITOR_BUSY_ONCE (-495) before first-touch #PF on block 1.
+     * Exercises a second fault park on the same thread, proving the first
+     * park consumed its metadata operation token.
+     */
+    mov $-495, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm_editor
+
+    movabs $0xfeedfacecafebeef, %rax
+    movq $0x6b6b6b6b, 0x200000(%r12)
+
+    movabs $0xfeedfacecafebeef, %rdx
+    cmp %rdx, %rax
+    jne fail_rax_editor
+    cmpq $0x6b6b6b6b, 0x200000(%r12)
+    jne fail_val_editor
+
+    mov $-493, %rax /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    lea 2(%r13), %rdx
+    cmp %rdx, %rax
+    jne fail_census_editor
+
+    mov $7, %edi
+    jmp die
+
+fail_mmap:          mov $90, %edi; jmp die
+fail_arm_root:      mov $91, %edi; jmp die
+fail_rax_root:      mov $92, %edi; jmp die
+fail_rcx_root:      mov $93, %edi; jmp die
+fail_r11_root:      mov $94, %edi; jmp die
+fail_val_root:      mov $95, %edi; jmp die
+fail_census_root:   mov $96, %edi; jmp die
+fail_arm_editor:    mov $97, %edi; jmp die
+fail_rax_editor:    mov $98, %edi; jmp die
+fail_val_editor:    mov $99, %edi; jmp die
+fail_census_editor: mov $100, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "root user #PF contention must park once and resume intact: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome.physical.refusal_overflow_count().unwrap(),
+        0,
+        "test injection must not enter production refusal accounting"
+    );
+}
+
+/// #2581: two live threads sharing the root MM concurrently first-touch the
+/// same and adjacent anonymous pages across 16 lazy 2 MiB grant blocks, then
+/// synchronize via CLONE_CHILD_CLEARTID + futex_wait and exit cleanly.
+#[test]
+fn two_live_threads_concurrent_root_first_touch_and_futex_complete() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* Control + worker stack region: 0x4000 bytes RW anonymous. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_ctrl_mmap
+    mov %rax, %r12
+
+    /* Pre-fault control + worker stack pages before starting the race. */
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $0, 0x3000(%r12)
+    /* Join timeout = { 5, 0 } at 0x20(%r12). */
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* Lazy 32 MiB anonymous arena (16 x 2 MiB grant windows), untouched. */
+    xor %edi, %edi
+    mov $0x02000000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_arena_mmap
+    mov %rax, %r13
+
+    /* Clone sibling worker thread (CLONE_VM..CLONE_CHILD_CLEARTID|SETTID). */
+    mov $0x013d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz worker_entry
+
+    /* Synchronize with sibling on barrier at 0x08(%r12) so both CPUs fault together. */
+    lock incl 0x08(%r12)
+1:
+    cmpl $2, 0x08(%r12)
+    je 2f
+    pause
+    jmp 1b
+2:
+    xor %ecx, %ecx
+leader_block_loop:
+    cmp $16, %ecx
+    je leader_join
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    /* Shared pages touched concurrently with worker via atomic add. */
+    lock addq $1, 0x0000(%rax)
+    movq $0xaaaa, 0x1000(%rax)
+    lock addq $1, 0x2000(%rax)
+    lock addq $1, 0x4000(%rax)
+    movq $0xaaaa, 0x5000(%rax)
+    lock addq $1, 0x6000(%rax)
+
+    inc %ecx
+    jmp leader_block_loop
+
+leader_join:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz verify_arena
+    mov %r12, %rdi
+    xor %esi, %esi /* FUTEX_WAIT */
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_join_timeout
+    jmp leader_join
+
+verify_arena:
+    cmpq $77, 0x10(%r12)
+    jne fail_worker_status
+
+    xor %ecx, %ecx
+verify_loop:
+    cmp $16, %ecx
+    je success
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    cmpq $0x10001, 0x0000(%rax)
+    jne fail_verify_shared
+    cmpq $0xaaaa, 0x1000(%rax)
+    jne fail_verify_leader
+    cmpq $0x10001, 0x2000(%rax)
+    jne fail_verify_shared
+    cmpq $0xbbbb, 0x3000(%rax)
+    jne fail_verify_worker
+    cmpq $0x10001, 0x4000(%rax)
+    jne fail_verify_shared
+    cmpq $0xaaaa, 0x5000(%rax)
+    jne fail_verify_leader
+    cmpq $0x10001, 0x6000(%rax)
+    jne fail_verify_shared
+    cmpq $0xbbbb, 0x7000(%rax)
+    jne fail_verify_worker
+
+    inc %ecx
+    jmp verify_loop
+
+success:
+    mov $7, %edi
+    jmp die
+
+worker_entry:
+    lock incl 0x08(%r12)
+3:
+    cmpl $2, 0x08(%r12)
+    je 4f
+    pause
+    jmp 3b
+4:
+    xor %ecx, %ecx
+worker_block_loop:
+    cmp $16, %ecx
+    je worker_done
+    mov %rcx, %rax
+    shl $21, %rax
+    add %r13, %rax
+
+    lock addq $0x10000, 0x0000(%rax)
+    lock addq $0x10000, 0x2000(%rax)
+    movq $0xbbbb, 0x3000(%rax)
+    lock addq $0x10000, 0x4000(%rax)
+    lock addq $0x10000, 0x6000(%rax)
+    movq $0xbbbb, 0x7000(%rax)
+
+    inc %ecx
+    jmp worker_block_loop
+
+worker_done:
+    movq $77, 0x10(%r12)
+    xor %edi, %edi
+    mov $60, %eax /* raw SYS_exit on non-last thread */
+    syscall
+    ud2
+
+fail_ctrl_mmap:     mov $81, %edi; jmp die
+fail_arena_mmap:    mov $82, %edi; jmp die
+fail_clone:         mov $83, %edi; jmp die
+fail_join_timeout:  mov $84, %edi; jmp die
+fail_worker_status: mov $85, %edi; jmp die
+fail_verify_shared: mov $86, %edi; jmp die
+fail_verify_leader: mov $87, %edi; jmp die
+fail_verify_worker: mov $88, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "concurrent two-thread root first-touch failed: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #2581: a fault doorbell raised on the idle CPL0 peer (CPU 1) while CPU 0 is
+/// parked in guest wait must capture the 15-word `FaultDoorbellRecord` and
+/// publish `InitialProcessExit::Fault` rather than failing with
+/// `idle CPL0 peer needs a host task handback: FaultDoorbellWord(...)`.
+#[test]
+fn idle_peer_user_fault_doorbell_publishes_fault_record() {
+    let asm = r#"
+.global _start
+.text
+_start:
+    xor %edi, %edi
+    mov $0x3000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+
+    movq $0, 0x0000(%r12)
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $5, 0x20(%r12)
+    movq $0, 0x28(%r12)
+
+    /* Clone sibling thread onto idle peer (CPU 1). */
+    mov $0x013d0f00, %edi
+    lea 0x2ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz sibling_fault
+
+    /* Park leader on CPU 0 in FUTEX_WAIT so sibling runs on idle peer CPU 1. */
+1:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz fail_joined
+    mov %r12, %rdi
+    xor %esi, %esi
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    jmp 1b
+
+sibling_fault:
+    /* Trigger hardware #UD (vector 6 -> FAULT_DOORBELL_PORT) on idle peer. */
+    ud2
+
+fail_mmap:   mov $91, %edi; jmp die
+fail_clone:  mov $92, %edi; jmp die
+fail_joined: mov $93, %edi; jmp die
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.terminating_signal, Some(libc::SIGILL));
+    assert_eq!(outcome.run.exit_code, 128 + libc::SIGILL);
+    let record = outcome
+        .fault_record
+        .expect("idle peer fault doorbell must publish FaultDoorbellRecord");
+    assert_eq!(record.vector, 6);
+    assert_eq!(record.cs & 3, 3);
+}
