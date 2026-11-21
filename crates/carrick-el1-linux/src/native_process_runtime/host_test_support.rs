@@ -13109,9 +13109,11 @@ impl crate::file::MemoryValidator for ResidentUser {
 }
 
 /// The x86 CPL0 `NativeService` completion arm's production body, driven with
-/// an admitted native fork child and the registered root: a child's
-/// `execve`/`execveat` is the native exec service's (#2235) and never settles
-/// here, a root's takes the counted refusal, and neither is forwarded.
+/// an admitted native fork child and the registered root: on x86 both the
+/// child's `execve`/`execveat` (#2235) and the root's (#2142) are the native
+/// exec service's, while AArch64's root forwards to its host. The counted
+/// refusal stays for a genuinely unwired native service: it is attributed to
+/// the record's lineage and never forwarded.
 #[test]
 #[cfg(test)]
 fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
@@ -13131,8 +13133,21 @@ fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
             Owner::Root
         }
     };
-    assert!(native_exec_claimed(|| owner(child)));
-    assert!(!native_exec_claimed(|| owner(root)));
+    use crate::dispatch::RootExecServer;
+    assert!(native_exec_claimed(
+        RootExecServer::NativeService,
+        || owner(child)
+    ));
+    assert!(native_exec_claimed(
+        RootExecServer::NativeService,
+        || owner(root)
+    ));
+    assert!(native_exec_claimed(RootExecServer::HostForward, || owner(
+        child
+    )));
+    assert!(!native_exec_claimed(RootExecServer::HostForward, || owner(
+        root
+    )));
 
     for (native, canonical) in [(59, 221), (322, 281)] {
         // The x86 route table hands this exec to the native service; without
@@ -13153,7 +13168,7 @@ fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
                 &counters,
             ),
             -38,
-            "native {native}: a root's exec keeps the counted refusal"
+            "native {native}: an unwired root service keeps the counted refusal"
         );
         assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
         assert_eq!(counters.refused_child[bucket].load(Ordering::Relaxed), 0);

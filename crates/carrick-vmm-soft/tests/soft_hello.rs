@@ -348,7 +348,7 @@ fn drive(
                                 .map(|reply| reply.into_reply())
                                 .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
                         },
-                        &mut |_| Err(carrick_abi::LINUX_ENOSYS),
+                        &mut |_, _| Err(carrick_abi::LINUX_ENOSYS),
                     )
                     .map_err(|error| format!("doorbell {port:#x}: {error}"))?;
                 run.exits.push(format!("doorbell {port:#x}"));

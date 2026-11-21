@@ -29,7 +29,7 @@ use super::*;
 use carrick_abi::{LINUX_E2BIG, LINUX_ENOEXEC, LINUX_ENOMEM, LINUX_ENOSYS, LinuxErrno};
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecArgumentCharge, ExecBuildSource, ExecSuccessorBacking,
-    ExecSuccessorEntry,
+    ExecSuccessorEntry, ServiceOrigin,
 };
 use carrick_core_abi::successor_image::{ImageRow, ImageStack};
 use carrick_el1::isa::x86_initial_mm::{
@@ -917,8 +917,94 @@ pub(in crate::cpl0_boot) type NativeExecContinuation = (
 );
 
 /// The carrier's exec owner: the neutral owner over x86's staged successors.
+/// A run root's row carries its loader's [`RootExecLoad`] (#2142).
 pub(in crate::cpl0_boot) type X86ExecOwner =
-    ExecPreparations<X86ExecPreparation<CarrierExecData>, NativeExecContinuation>;
+    ExecPreparations<X86ExecPreparation<CarrierExecData>, NativeExecContinuation, RootExecLoad>;
+
+/// What the run root's loader resolved for the Kernel's half of its exec
+/// (the executable identity the root's `/proc` reports). The carrier never
+/// reads it: it rides the exec owner's row from the Exec arm through the
+/// adoption to the root's settlement, where the executor's root exec
+/// transaction takes it back (#2142).
+pub type RootExecLoad = Box<dyn std::any::Any + Send>;
+
+/// One native exec the carrier's loader served: the image the CPL0 build
+/// maps and, for the run root's exec only, its [`RootExecLoad`].
+pub struct NativeExecLoad {
+    pub image: X86ExecImage,
+    pub root: Option<RootExecLoad>,
+}
+
+/// The run root's settled exec (#2142). The ring has committed its
+/// successor and parked this CPU on the maintenance root; this lane's
+/// guest entry is refused until the executor commits the Kernel half and
+/// retargets the root's loaded custody, consuming this.
+#[must_use = "a root exec settlement owns the run root's custody move; dropping it leaves its CPU refusing guest entry"]
+pub struct RootExecSettled {
+    settlement: carrick_hal::exec_owner::RootExecSettlement,
+    successor: AddressContext<RootGpa>,
+    /// The ring's execution generation of the root thread it switched to
+    /// the successor: exec advances it.
+    execution: ExecutionGeneration,
+    mm: carrick_hal::exec_owner::AuthenticatedExecMm,
+    load: RootExecLoad,
+    state: Option<carrick_hal::threaded::X86TaskCpuStateV1>,
+}
+
+impl RootExecSettled {
+    pub(crate) fn with_state(
+        mut self: Box<Self>,
+        state: carrick_hal::threaded::X86TaskCpuStateV1,
+    ) -> Self {
+        self.state = Some(state);
+        *self
+    }
+
+    /// The stopped CPU's state in the successor's MM and root generation:
+    /// the successor's first task state.
+    pub fn state(&self) -> Option<&carrick_hal::threaded::X86TaskCpuStateV1> {
+        self.state.as_ref()
+    }
+
+    /// The ring-issued successor MM the adoption authenticated: the only
+    /// MM the Kernel's half of this exec may install.
+    pub fn issued_mm(&self) -> &carrick_hal::exec_owner::AuthenticatedExecMm {
+        &self.mm
+    }
+
+    /// The successor's address context: its MM, root and the ring's root
+    /// generation.
+    pub fn successor(&self) -> AddressContext<RootGpa> {
+        self.successor
+    }
+
+    /// The ring's execution generation of the successor's thread: what a
+    /// forward from the successor authenticates against.
+    pub fn execution(&self) -> ExecutionGeneration {
+        self.execution
+    }
+
+    /// The adopted exec's receipt, predecessor and successor MMs.
+    pub fn settled(&self) -> carrick_hal::exec_owner::SettledExec {
+        self.settlement.settled()
+    }
+
+    /// Take the loader's Kernel half; the settlement stays owed.
+    pub fn take_load(&mut self) -> RootExecLoad {
+        std::mem::replace(&mut self.load, Box::new(()))
+    }
+
+    /// Consume the settlement once the root's custody has moved, with the
+    /// authenticated MM the Kernel's half installs.
+    pub fn consume(
+        self,
+    ) -> (
+        carrick_hal::exec_owner::SettledExec,
+        carrick_hal::exec_owner::AuthenticatedExecMm,
+    ) {
+        (self.settlement.consume(), self.mm)
+    }
+}
 
 /// What one [`carrick_el1_abi::NATIVE_EXEC_PORT`] crossing settled. A
 /// settlement moves the stopped task's registered CR3 from the predecessor's
@@ -929,6 +1015,8 @@ pub(in crate::cpl0_boot) enum NativeExecCrossing {
         successor: GuestArchBinding,
         predecessor: Option<RootGpa>,
     },
+    /// The run root's exec: its custody moves only through the executor.
+    RootSettled(Box<RootExecSettled>),
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
@@ -953,7 +1041,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
         pending: Box<anonymous_owner::native_service::PendingNativeExec>,
-        loaded: Result<X86ExecImage, LinuxErrno>,
+        loaded: Result<NativeExecLoad, LinuxErrno>,
     ) -> Result<(), TrapError> {
         if self.physical_execution(lease)?.context != pending.execution.context {
             return Err(fail("native exec completion context changed"));
@@ -961,7 +1049,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.drain_fork_quarantine(pending.execution)?;
         match loaded {
             Err(errno) => self.fail_native_exec(lease.cpu, pending, errno),
-            Ok(image) => {
+            Ok(NativeExecLoad { image, root }) => {
+                // Only the run root's exec carries the Kernel's half, and
+                // the root's always does.
+                let origin = pending.ticket.request().identity.birth.origin;
+                match (origin, root) {
+                    (ServiceOrigin::Initial, Some(load)) => self
+                        .exec_owner
+                        .attach(pending.receipt, load)
+                        .map_err(|_| fail("native root exec load attachment"))?,
+                    (ServiceOrigin::Descendant, None) => {}
+                    _ => return Err(fail("native exec load names another lineage")),
+                }
                 let request = X86ExecRequest {
                     image: Box::new(image),
                     successor: pending.successor,
@@ -1340,6 +1439,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         self.publish_built_successor(&request, context, tables.pages(), &mut data, &results)?;
         self.exec_frames().release(build)?;
+        let origin = adoption.mm.origin();
+        match (origin, adoption.attachment) {
+            (ServiceOrigin::Initial, Some(load)) => {
+                if self.root_exec_load.replace((adoption.mm, load)).is_some() {
+                    return Err(fail("a second root exec adopted before the first settled"));
+                }
+            }
+            (ServiceOrigin::Descendant, None) => {}
+            _ => return Err(fail("exec adoption load names another lineage")),
+        }
         let used = self
             .fork_stock
             .take_built_successor_tables(tables, results.tables_used)
@@ -1354,9 +1463,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 request.root_generation,
             )
         };
+        // The run root's predecessor is its boot-built MM, not a fork
+        // child's: the stock's root form takes it (#2142).
+        let form = match origin {
+            ServiceOrigin::Initial => carrick_hal::fork_stock::ExecPredecessorForm::Root,
+            ServiceOrigin::Descendant => carrick_hal::fork_stock::ExecPredecessorForm::Child,
+        };
         let replaced = self
             .fork_stock
-            .replace_child_for_exec_with_tables(
+            .replace_for_exec_with_tables(
+                form,
                 execution,
                 handle,
                 backing.root,
@@ -1564,15 +1680,31 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         } else {
             Err(ExecSettleRefusal::Unknown)
         };
+        let mut root = None;
         let known = match route {
             Ok(ExecSettlement::Child(_)) if held => true,
-            Ok(ExecSettlement::Child(_)) => {
-                return Err(fail("exec settlement without its predecessor custody"));
+            Ok(ExecSettlement::Root(settlement)) if held => {
+                // The executor consumes the root's settlement: it commits
+                // the Kernel half and moves the root's loaded custody.
+                let (mm, load) = match self.root_exec_load.take() {
+                    Some((mm, load)) if mm.successor() == successor => (mm, load),
+                    _ => return Err(fail("root exec settlement without its adopted load")),
+                };
+                root = Some(RootExecSettled {
+                    settlement,
+                    successor: context,
+                    execution: ExecutionGeneration::new(
+                        NonZeroU64::new(binding.generation.raw())
+                            .ok_or_else(|| fail("root exec settlement generation"))?,
+                    ),
+                    mm,
+                    load,
+                    state: None,
+                });
+                true
             }
-            // A root settlement has no consumer until #2142's root custody
-            // move; production refuses root exec before its ticket.
-            Ok(ExecSettlement::Root(_)) => {
-                return Err(fail("root exec settlement has no custody consumer"));
+            Ok(ExecSettlement::Child(_) | ExecSettlement::Root(_)) => {
+                return Err(fail("exec settlement without its predecessor custody"));
             }
             // Handed back unchanged; the ring's handback is #2142 R3's.
             Ok(ExecSettlement::NotHere) => false,
@@ -1599,6 +1731,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(error.to_string()))?;
         if !known {
             return Ok(NativeExecCrossing::Answered);
+        }
+        if let Some(root) = root {
+            return Ok(NativeExecCrossing::RootSettled(Box::new(root)));
         }
         let task = TaskIdentity {
             carrier: carrick_guest_arch::CarrierGeneration::new(self._vm.identity().nonzero()),
@@ -1767,7 +1902,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         successor: ReservationMm,
         root_generation: NonZeroU64,
     ) -> Result<ExecAdoptionReceipt, TrapError> {
-        use carrick_core_abi::service::{ServiceBirth, ServiceIdentity, ServiceOrigin};
+        use carrick_core_abi::service::{ServiceBirth, ServiceIdentity};
         use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
         let one = NonZeroU64::MIN;
         let identity = ServiceIdentity {

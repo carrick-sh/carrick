@@ -1307,7 +1307,12 @@ pub mod retained_slots;
 )]
 pub enum ForwardBindingRefusal {
     ContextMismatch,
-    GenerationMismatch,
+    /// The registered binding's execution generation is not the one the
+    /// stopped CPU's lifecycle record names.
+    GenerationMismatch {
+        stopped: u64,
+        registered: u64,
+    },
     TaskIdMismatch {
         stopped: carrick_el1_abi::EntryTaskKey,
         expected: carrick_el1_abi::EntryTaskKey,
@@ -1336,7 +1341,10 @@ impl ForwardExecution {
             return Err(ForwardBindingRefusal::ContextMismatch);
         }
         if binding.task().execution.raw().get() != self.binding.generation.raw() {
-            return Err(ForwardBindingRefusal::GenerationMismatch);
+            return Err(ForwardBindingRefusal::GenerationMismatch {
+                stopped: self.binding.generation.raw(),
+                registered: binding.task().execution.raw().get(),
+            });
         }
         if self.binding.task != self.leader_task {
             return Err(ForwardBindingRefusal::TaskIdMismatch {
@@ -2087,7 +2095,10 @@ mod forward_execution_tests {
             .expect("exact binding");
         assert_eq!(
             admitted.authenticate_typed(carrier_binding(context, 13)),
-            Err(ForwardBindingRefusal::GenerationMismatch)
+            Err(ForwardBindingRefusal::GenerationMismatch {
+                stopped: 12,
+                registered: 13,
+            })
         );
         assert!(
             admitted
@@ -2200,6 +2211,9 @@ pub struct ProductionCpuLease<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
     native_entropy: NativeEntropyService,
     cpu: CarrierCpu<M>,
     _custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
+    /// The run root's settled exec this lane served, until the executor
+    /// takes it (#2142).
+    root_exec: Option<exec_service::RootExecSettled>,
 }
 /// A forwarded frame copied out of a physical CPU's private CPL0 stack.
 /// Another task may reuse that stack while this one waits; the frame is
@@ -2298,6 +2312,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     /// Rebind the loaded run root to its `execve` successor: the carrier's
     /// shared root binding, this CPU's loaded custody and the forward leader
     /// rule all name the successor afterwards, or none changes.
+    /// The run root's exec this lane settled (#2142), for the executor to
+    /// commit. Guest entry stays refused until `retarget_root_exec` moves the
+    /// root's custody to the settled successor.
+    pub fn take_root_exec_settlement(&mut self) -> Option<exec_service::RootExecSettled> {
+        self.root_exec.take()
+    }
+
     pub fn retarget_root_exec(
         &mut self,
         predecessor: carrick_hal::guest_arch_binding::GuestArchBinding,
@@ -2610,10 +2631,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, child_binding, None))
                 }
                 carrick_el1_abi::NATIVE_EXEC_PORT => {
-                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::Peer)?
-                    {
-                        exec_rebind = Some((successor, predecessor));
+                    match custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::Peer)? {
+                        exec_service::NativeExecCrossing::Settled { successor, predecessor } => {
+                            exec_rebind = Some((successor, predecessor));
+                        }
+                        // The exec owner hands a root settlement on this
+                        // lane back before anything changes.
+                        exec_service::NativeExecCrossing::RootSettled(_) => {
+                            return Err(fail("root exec settled on the idle peer"));
+                        }
+                        exec_service::NativeExecCrossing::Answered => {}
                     }
                     Ok((None, None, None))
                 }
@@ -2701,7 +2728,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(&pending.payload);
+            let loaded = exec(
+                pending.ticket.request().identity.birth.origin,
+                &pending.payload,
+            );
             let mut custody = self
                 ._custody
                 .lock()
@@ -3013,6 +3043,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let mut pending_file = None;
         let mut pending_exec = None;
         let mut exec_rebind = None;
+        let mut root_exec = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
             let lease = StoppedCpuLease { cpu: slot, io };
             match production_port(*port) {
@@ -3034,10 +3065,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, child_binding, None))
                 }
                 Some(ProductionPort::NativeExec) => {
-                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::RootCustody)?
-                    {
-                        exec_rebind = Some((successor, predecessor));
+                    match custody.service_native_exec(&lease, carrick_hal::exec_owner::ExecSettleLane::RootCustody)? {
+                        exec_service::NativeExecCrossing::Settled { successor, predecessor } => {
+                            exec_rebind = Some((successor, predecessor));
+                        }
+                        exec_service::NativeExecCrossing::RootSettled(settled) => {
+                            root_exec = Some(settled);
+                        }
+                        exec_service::NativeExecCrossing::Answered => {}
                     }
                     Ok((None, None, None))
                 }
@@ -3120,12 +3155,25 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu
                 .rebind_child_successor(successor, predecessor, root_successor)?;
         }
+        if let Some(settled) = root_exec {
+            // Guest entry on this CPU is refused until the executor consumes
+            // the settlement through `retarget_root_exec`.
+            let state = self.cpu.begin_root_exec_settlement(settled.successor())?;
+            if self.root_exec.replace(settled.with_state(state)).is_some() {
+                return Err(fail(
+                    "a second root exec settled before the first was consumed",
+                ));
+            }
+        }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(&pending.payload);
+            let loaded = exec(
+                pending.ticket.request().identity.birth.origin,
+                &pending.payload,
+            );
             let mut custody = self
                 ._custody
                 .lock()
@@ -3157,15 +3205,24 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     }
 }
 
-/// The carrier's exec loader for a fork child's staged payload (#2235),
-/// invoked with physical custody and CPU-I/O borrows released: the shared
-/// request parse, resolver and x86 image checks, or the exec's errno.
-pub type NativeExecLoadService<'a> =
-    dyn FnMut(&[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> + 'a;
+/// The carrier's exec loader for a native exec's staged payload, a fork
+/// child's (#2235) or the run root's (#2142), invoked with physical custody
+/// and CPU-I/O borrows released: the shared request parse, resolver and x86
+/// image checks, or the exec's errno. The origin is the lineage the ticket's
+/// authenticated service identity names: the root's request resolves under
+/// the root's own filesystem authority, which the carrier retains.
+pub type NativeExecLoadService<'a> = dyn FnMut(
+        carrick_core_abi::service::ServiceOrigin,
+        &[u8],
+    ) -> Result<exec_service::NativeExecLoad, carrick_abi::LinuxErrno>
+    + 'a;
 
 /// A carrier with no exec capability leaves the exec unrouted: the
 /// carrier's counted ENOSYS.
-fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> {
+fn refuse_native_exec(
+    _: carrick_core_abi::service::ServiceOrigin,
+    _: &[u8],
+) -> Result<exec_service::NativeExecLoad, carrick_abi::LinuxErrno> {
     Err(carrick_abi::LINUX_ENOSYS)
 }
 
@@ -3895,6 +3952,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             native_entropy: self.native_entropy,
             cpu,
             _custody: Arc::clone(&self.custody),
+            root_exec: None,
         })
     }
 }
@@ -4091,6 +4149,13 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     exec_owner: exec_service::X86ExecOwner,
     /// Adopted execs whose predecessor custody awaits its settlement.
     exec_predecessors: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
+    /// The run root's adopted exec awaiting its settlement (#2142): the
+    /// successor MM and the loader's Kernel half, which the settlement hands
+    /// to the executor. At most one: the root has one thread group.
+    root_exec_load: Option<(
+        carrick_hal::exec_owner::AuthenticatedExecMm,
+        exec_service::RootExecLoad,
+    )>,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     /// Per CPU: a COW completion another exclusion published before the
     /// faulting CPU's settlement crossing arrived (#1482 P0-3).
@@ -5523,6 +5588,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             exec_owner: exec_service::X86ExecOwner::default(),
             exec_predecessors: Vec::new(),
+            root_exec_load: None,
             anonymous_pending: [None, None],
             cow_published: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
