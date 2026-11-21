@@ -426,7 +426,11 @@ pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
 pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZE;
 pub const INITIAL_MM_KEY: u64 = 301;
-pub const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
+/// The initial stack's top: 64 KiB under the 128 TiB user ceiling, as Linux
+/// places it near `TASK_SIZE` and ARM places it under its 1 TiB user top. A
+/// stack parked at 2 GiB clipped a low image's mmap arena to ~1016 MiB, so a
+/// 1 GiB `PROT_NONE|MAP_NORESERVE` reserve found no gap (#2722).
+pub const INITIAL_STACK_TOP: u64 = carrick_guest_arch::USER_CEILING - 0x1_0000;
 pub const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 /// The initial stack's whole reservation: Linux's default `RLIMIT_STACK`
 /// (8 MiB), as on ARM. The carrier builds only the top
@@ -434,6 +438,11 @@ pub const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 /// touch, as Linux grows the stack VMA.
 pub const INITIAL_STACK_RESERVATION: u64 = carrick_mem::memory::LINUX_STACK_SIZE;
 const _: () = assert!(INITIAL_STACK_RESERVATION > INITIAL_STACK_SIZE);
+// A low image's heap and whole Linux mmap arena fit below the stack.
+const _: () = assert!(
+    2 * INITIAL_ARENA_ALIGNMENT + carrick_mem::memory::LINUX_MMAP_SIZE
+        <= INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION
+);
 // Place mmap at the next boundary after the image, preserving low-image space.
 pub const INITIAL_ARENA_ALIGNMENT: u64 = 1024 * 1024 * 1024;
 pub const COUNTERS_OFFSET: u64 = 0x1_0000;
@@ -743,9 +752,11 @@ pub fn initial_reservation_layout(
         .ok_or_else(|| fail("initial stack layout"))?;
     let stack = ReservationRange::new(stack_base, stack_top.raw())
         .ok_or_else(|| fail("initial stack layout"))?;
-    // The authenticated break is the highest page-rounded PT_LOAD end. A
-    // static PIE can sit above the low initial stack, so neither reservation
-    // may depend on a fixed split address or assume the stack is above it.
+    // The authenticated break is the highest page-rounded PT_LOAD end. The
+    // stack sits under the user ceiling, so the arena takes Linux's whole
+    // mmap size above the image; only an image within that size of the stack
+    // is clipped to it. A break above the stack still bounds at the ceiling,
+    // so neither reservation assumes which side of the stack the image is.
     let ceiling = if initial_break.raw() <= stack.start() {
         stack.start()
     } else if initial_break.raw() >= stack.end() {
@@ -5176,14 +5187,14 @@ mod cpl0_layout_tests {
     }
 
     #[test]
-    fn static_pie_reservations_follow_image_break_above_old_arena_and_stack() {
+    fn static_pie_reservations_follow_image_break_below_the_stack() {
         let elf = static_pie_elf();
         let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
         let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).unwrap();
         let initial_break = image.regions.iter().map(|region| region.end).max().unwrap();
         assert_eq!(initial_break, 0x88_0013_1000);
         assert!(initial_break > 0x4000_0000);
-        assert!(initial_break > INITIAL_STACK_TOP);
+        assert!(initial_break < INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION);
         let layout = initial_reservation_layout(
             UserVa::new(initial_break),
             UserVa::new(INITIAL_STACK_TOP),
@@ -5202,7 +5213,7 @@ mod cpl0_layout_tests {
                 .iter()
                 .all(|region| region.end <= layout.heap.start())
         );
-        assert!(INITIAL_STACK_TOP <= layout.heap.start());
+        assert!(layout.arena.end() <= INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION);
     }
 
     /// #2722: a low image's mmap arena spans Linux's whole mmap size; a
@@ -5229,7 +5240,7 @@ mod cpl0_layout_tests {
     }
 
     #[test]
-    fn low_image_reservations_stop_before_stack_and_retain_launch_limits() {
+    fn low_image_reservations_take_the_mmap_size_and_retain_launch_limits() {
         let limits = InitialReservationLimits {
             address: carrick_abi::LinuxRlimit::new(0x2000_0000, 0x3000_0000),
             data: carrick_abi::LinuxRlimit::new(0x1000_0000, 0x2000_0000),
@@ -5241,6 +5252,8 @@ mod cpl0_layout_tests {
             0x2000_0000,
             0x4000_0000,
             0x4000_1000,
+            0x88_0013_1000,
+            INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - carrick_mem::memory::LINUX_MMAP_SIZE,
             INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - 8192,
         ] {
             let layout = initial_reservation_layout(
@@ -5252,18 +5265,18 @@ mod cpl0_layout_tests {
             assert_eq!(layout.brk, initial_break);
             assert_eq!(layout.heap.start(), initial_break);
             assert!(layout.heap.len() <= INITIAL_ARENA_ALIGNMENT);
-            // Preserve both capacities for every formerly admitted low image.
+            // Every low image keeps its heap to the next GiB and Linux's
+            // whole mmap size above it (#2722); only an image within that
+            // size of the stack is clipped to the stack.
             if initial_break < 0x4000_0000 {
                 assert_eq!(layout.heap.len(), 0x4000_0000 - initial_break);
-                assert_eq!(
-                    layout.arena.len(),
-                    INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - 0x4000_0000
-                );
+                assert_eq!(layout.arena.len(), carrick_mem::memory::LINUX_MMAP_SIZE);
             }
             assert_eq!(layout.heap.end(), layout.arena.start());
             assert_eq!(
                 layout.arena.end(),
-                INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION
+                (layout.arena.start() + carrick_mem::memory::LINUX_MMAP_SIZE)
+                    .min(INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION)
             );
             assert_eq!(layout.address_limit, address_limit);
             assert_eq!(layout.data_limit, data_limit);
@@ -5311,8 +5324,20 @@ mod cpl0_layout_tests {
         }
     }
 
+    /// An image just below the default stack clips its arena to the stack;
+    /// one above a lower stack bounds its arena at the canonical user end.
     #[test]
-    fn high_image_arena_is_bounded_by_canonical_user_end() {
+    fn high_image_arena_is_bounded_by_the_stack_or_canonical_user_end() {
+        let stack_base = INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION;
+        let below = initial_reservation_layout(
+            UserVa::new(stack_base - INITIAL_ARENA_ALIGNMENT - 4096),
+            UserVa::new(INITIAL_STACK_TOP),
+            InitialReservationLimits::UNLIMITED,
+        )
+        .unwrap();
+        assert_eq!(below.heap.end(), below.arena.start());
+        assert_eq!(below.arena.end(), stack_base);
+        let low_stack_top = 0x7fff_0000;
         for (initial_break, arena_len) in [
             (
                 carrick_guest_arch::USER_CEILING - INITIAL_ARENA_ALIGNMENT - 4096,
@@ -5322,7 +5347,7 @@ mod cpl0_layout_tests {
         ] {
             let layout = initial_reservation_layout(
                 UserVa::new(initial_break),
-                UserVa::new(INITIAL_STACK_TOP),
+                UserVa::new(low_stack_top),
                 InitialReservationLimits::UNLIMITED,
             )
             .unwrap();
