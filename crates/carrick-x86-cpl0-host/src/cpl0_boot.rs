@@ -3356,6 +3356,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
                 }
                 for index in 0..2 {
                     let task = custody.task(carrick_guest_arch::CpuId::new(index));
+                    if task
+                        .write_census(index as usize, &mut capture.zone_census)
+                        .is_err()
+                    {
+                        capture
+                            .unavailable
+                            .push("current task census formatting failed".to_owned());
+                    }
                     capture.vcpus[index as usize].push_str(&format!(
                         " actual_guest_run={} pending_host_work={} served_with_work={}",
                         custody.actual_run[index as usize].load(Ordering::Acquire) != 0,

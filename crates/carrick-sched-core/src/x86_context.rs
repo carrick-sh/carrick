@@ -26,6 +26,35 @@ pub struct ParkedContextWords {
 
 pub const X86_XSAVE_BYTES: usize = 832;
 
+/// The index of each general register in [`ParkedContextWords::frame`]:
+/// the CPL0 interrupt image's PUSH order (RIP, CS, RFLAGS, RSP and SS
+/// follow at 15..20).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(usize)]
+pub enum X86ParkedGpr {
+    R15 = 0,
+    R14 = 1,
+    R13 = 2,
+    R12 = 3,
+    Rbp = 4,
+    Rbx = 5,
+    R11 = 6,
+    R10 = 7,
+    R9 = 8,
+    R8 = 9,
+    Rax = 10,
+    Rcx = 11,
+    Rdx = 12,
+    Rsi = 13,
+    Rdi = 14,
+}
+
 /// Fresh x87/SSE state for a new x86 user image. XSTATE_BV marks both legacy
 /// components present so XRSTOR loads these control words from the image.
 const fn initial_user_xsave() -> [u8; X86_XSAVE_BYTES] {
@@ -175,12 +204,19 @@ impl ParkedContextWords {
 
 impl crate::CensusContext for ParkedContextWords {
     fn syscall_registers(&self) -> crate::SavedSyscallRegisters {
-        let f = &self.frame;
+        let gpr = |register: X86ParkedGpr| self.frame[register as usize];
         crate::SavedSyscallRegisters {
             isa: carrick_guest_arch::GuestIsa::X86_64,
-            number: f[10],                                 // RAX
-            args: [f[14], f[13], f[12], f[7], f[9], f[8]], // RDI, RSI, RDX, R10, R8, R9
-            pc: f[15],                                     // RIP
+            number: gpr(X86ParkedGpr::Rax),
+            args: [
+                gpr(X86ParkedGpr::Rdi),
+                gpr(X86ParkedGpr::Rsi),
+                gpr(X86ParkedGpr::Rdx),
+                gpr(X86ParkedGpr::R10),
+                gpr(X86ParkedGpr::R8),
+                gpr(X86ParkedGpr::R9),
+            ],
+            pc: self.frame[15], // RIP
             lr: None,
         }
     }

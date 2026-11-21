@@ -4199,6 +4199,45 @@ pub fn clear_current_task_record(slot: usize) {
     current_task.clear();
 }
 
+impl CurrentTask {
+    /// One census line for the record of `slot`: the loaded task, its
+    /// address space and process, the boundary flags and the slot's service
+    /// notice. An empty record writes nothing. Zero stores; values may be
+    /// torn. `pending_host_work` or `served_with_work` still set on a slot
+    /// that waits in the guest is host work EL1 announced and no host
+    /// boundary took: EL1 announces an owed host IPC wake solely through
+    /// these flags. A notice left on a slot nobody serves is stranded.
+    pub fn write_census(&self, slot: usize, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let tid = self.execution.task.load(Ordering::Acquire);
+        let pending = u32::from(self.linux.has_pending_host_work());
+        let served = self.linux.served_word();
+        let notice = self.service_notice.census_words();
+        if tid == 0 && pending == 0 && served == 0 && notice.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            out,
+            "el1 task slot {slot}: tid={tid} serial={} mm={} pending_host_work={pending} served_with_work={served} generation={} pid={} service_notice={notice}",
+            self.mm.thread_generation.load(Ordering::Acquire),
+            self.mm.key.load(Ordering::Acquire),
+            self.execution.generation.load(Ordering::Relaxed).raw(),
+            self.metadata.visible_pid.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// [`CurrentTask::write_census`] for each record of a current-task array,
+/// indexed by slot.
+pub fn write_current_tasks_census(
+    tasks: &[CurrentTask],
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    for (slot, task) in tasks.iter().enumerate() {
+        task.write_census(slot, out)?;
+    }
+    Ok(())
+}
+
 /// Bytes the EL1 hooks reserve at the top of each slot's stack for the
 /// [`TrapFrame`] (its size rounded up to 16 bytes).
 pub const TRAP_FRAME_ALLOCATION: u64 = 0x120;
@@ -4477,32 +4516,22 @@ pub fn publish_zone_identity(slot: usize, zone_mm: u64, thread_serial: u64) {
 }
 
 /// For a wedge post-mortem: every slot's task record with its boundary
-/// flags. `pending_host_work` or `served_with_work` still set on a slot that
-/// waits in the guest is host work EL1 announced and no host boundary took:
-/// EL1 announces an owed host IPC wake solely through these flags.
+/// flags and service notice ([`CurrentTask::write_census`]). Nothing when
+/// the region is not mapped.
 pub fn write_current_task_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return Ok(());
     }
-    for slot in 0..EL1_STACK_SLOTS as usize {
-        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
-        // SAFETY: the record lives in the EL1 region; only atomics are touched.
-        let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        let tid = task.execution.task.load(Ordering::Acquire);
-        let pending = u32::from(task.linux.has_pending_host_work());
-        let served = task.linux.served_word();
-        if tid == 0 && pending == 0 && served == 0 {
-            continue;
-        }
-        writeln!(
-            out,
-            "el1 task slot {slot}: tid={tid} serial={} mm={} pending_host_work={pending} served_with_work={served}",
-            task.mm.thread_generation.load(Ordering::Acquire),
-            task.mm.key.load(Ordering::Acquire),
-        )?;
-    }
-    Ok(())
+    // SAFETY: the array lives in the mapped EL1 region for EL1_STACK_SLOTS
+    // slots; the census only loads its atomics.
+    let tasks = unsafe {
+        core::slice::from_raw_parts(
+            (ptr + EL1_CURRENT_TASKS_OFFSET as usize) as *const CurrentTask,
+            EL1_STACK_SLOTS as usize,
+        )
+    };
+    write_current_tasks_census(tasks, out)
 }
 
 /// Read the task record of `slot` (what EL1 last published as running): the
@@ -7353,3 +7382,6 @@ mod el1_stack_layout_tests {
 
 #[cfg(test)]
 mod refusal_census_tests;
+
+#[cfg(all(test, not(feature = "loom")))]
+mod current_task_census_tests;

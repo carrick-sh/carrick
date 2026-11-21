@@ -794,6 +794,45 @@ pub enum ServiceNoticeBusy {
 const NOTICE_WRITING: u64 = u64::MAX;
 const NOTICE_TAKING: u64 = 1 << 62;
 
+/// A [`ServiceNotice`]'s raw words, observed for a census. Its `Display`
+/// names the state: `empty`, `writing`, or the held record (`taking` while
+/// the carrier consumes it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceNoticeWords {
+    pub record: u64,
+    pub incarnation: u64,
+    pub execution: u64,
+    pub sequence: u64,
+}
+
+impl ServiceNoticeWords {
+    pub fn is_empty(&self) -> bool {
+        self.record == 0
+    }
+}
+
+impl core::fmt::Display for ServiceNoticeWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.record {
+            0 => f.write_str("empty"),
+            NOTICE_WRITING => f.write_str("writing"),
+            word => write!(
+                f,
+                "record={} incarnation={} execution={} sequence={}{}",
+                (word & !NOTICE_TAKING).wrapping_sub(1),
+                self.incarnation,
+                self.execution,
+                self.sequence,
+                if word & NOTICE_TAKING != 0 {
+                    " taking"
+                } else {
+                    ""
+                },
+            ),
+        }
+    }
+}
+
 /// One producer per execution lane. Publication is followed by an owned park
 /// and exit, or by an in-ring switch to a runnable peer when `resume_checkpoint`
 /// parks `begin_return_work` before host intake; a peer that contends on an
@@ -892,6 +931,16 @@ impl ServiceNotice {
     /// carrier intake already took (or is taking) needs no further doorbell.
     pub fn names_record(&self, record: carrick_sched_core::RecordId) -> bool {
         self.record.load(Ordering::Acquire) == u64::from(record.raw()) + 1
+    }
+    /// The notice's words for a census, with zero stores: never a
+    /// selector and never authority (the words may be torn).
+    pub fn census_words(&self) -> ServiceNoticeWords {
+        ServiceNoticeWords {
+            record: self.record.load(Ordering::Acquire),
+            incarnation: self.incarnation.load(Ordering::Relaxed),
+            execution: self.execution.load(Ordering::Relaxed),
+            sequence: self.sequence.load(Ordering::Relaxed),
+        }
     }
     pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
         let record = self.record.load(Ordering::Acquire);
@@ -3584,6 +3633,31 @@ mod tests {
         assert_eq!(ticket.request().operation, operation);
         assert!(ticket.complete(true).is_ok());
         assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
+    }
+
+    #[test]
+    fn service_notice_census_names_the_held_record_with_zero_stores() {
+        let notice = ServiceNotice::new();
+        assert!(notice.census_words().is_empty());
+        assert_eq!(alloc::format!("{}", notice.census_words()), "empty");
+        let selector = ServiceSelector {
+            record: birth(1, 3).record,
+            execution: SnapshotGeneration::INITIAL,
+            sequence: NonZeroU64::new(5).unwrap(),
+        };
+        notice.publish(selector).unwrap();
+        let words = notice.census_words();
+        assert_eq!(
+            alloc::format!("{words}"),
+            alloc::format!(
+                "record=1 incarnation=3 execution={} sequence=5",
+                SnapshotGeneration::INITIAL.raw()
+            )
+        );
+        // Observing it leaves the notice for its consumer.
+        assert_eq!(notice.census_words(), words);
+        assert_eq!(notice.take(), Ok(Some(selector)));
+        assert!(notice.census_words().is_empty());
     }
 
     #[test]
