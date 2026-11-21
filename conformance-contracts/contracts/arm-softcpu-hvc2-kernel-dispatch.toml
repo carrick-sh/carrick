@@ -37,6 +37,8 @@ vm_free = [
   "carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples",
   "carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response",
   "carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically",
+  "carrick-kernel::dispatch::carrier_loop::tests::apply_first_touch_enforces_linux_stage1_access_matrix",
+  "carrick-kernel::dispatch::carrier_loop::tests::first_touch_busy_root_enrols_once_then_reruns_without_polling",
 ]
 
 [bindings.unresolved]
