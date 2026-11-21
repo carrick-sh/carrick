@@ -1816,9 +1816,10 @@ fn soft_carrier_emits_the_hot_set_once_across_provider_exits() {
         assert_eq!(
             run.reply_census,
             Hvc2ReplyCensus {
-                fixture_answers: 0,
+                ring_completed: 0,
                 // The handoffs and the final `exit_group`.
-                production_answers: handoffs + 1,
+                kernel_dispatched: handoffs + 1,
+                runner_refused: 0,
             }
         );
         assert_eq!(served.len() as u64, handoffs + 1);

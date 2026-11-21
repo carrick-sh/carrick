@@ -35,8 +35,8 @@ use carrick_mem::memory::{
     stage1_hvpatch_page_tables, stage1_identity_page_tables,
 };
 use carrick_softcpu_aarch64::dispatch::{
-    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, ExecuteBlock, Report, ResidentBlock,
-    RunControl, RunWork, Stop, run, run_controlled,
+    BlockMemory, CHAIN_QUANTUM, ChainBudget, ChainExit, DispatchCache, ExecuteBlock, Report,
+    ResidentBlock, RunControl, RunWork, Stop, run, run_controlled,
 };
 use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory, InlineRam, MemoryFault,
@@ -621,6 +621,7 @@ fn native_back_edge_services_pending_kick_and_timer_irq() {
             BlockLimits::default(),
             CHAIN_QUANTUM + 1,
             &control,
+            &mut DispatchCache::default(),
         );
         assert_eq!(x(&cpu, 5), 1);
         if kick {
@@ -2138,6 +2139,11 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
 #[test]
 #[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_cpython_through_el1_vectors_with_fixture_replies() {
+    // MEASUREMENT BRANCH ONLY (#2717): keep this load off the A/B arms.
+    if std::env::var_os("CARRICK_A64_PYTHON_ROOT").is_some() {
+        println!("skipped on the #2717 measurement branch");
+        return;
+    }
     let root = std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT");
     let root = FixtureRoot::new(root.into());
     let executable = CPYTHON_EXECUTABLE;
@@ -2204,6 +2210,50 @@ fn read_pinned_cpython(root: &FixtureRoot) -> Vec<u8> {
 #[test]
 #[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
+    // MEASUREMENT BRANCH ONLY (#2717): the parent runs this witness as child
+    // processes in ABBA order with the handoff cache off and on.
+    if std::env::var_os("CARRICK_AB_CHILD").is_some() {
+        cpython_production_dispatch_arm();
+        return;
+    }
+    let _carrier_lock = lock_soft_carrier_test();
+    let exe = std::env::current_exe().expect("test binary path");
+    for (index, cache_on) in [false, true, true, false].into_iter().enumerate() {
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args([
+                "soft_cpu_runs_dynamic_cpython_through_production_dispatch",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CARRICK_AB_CHILD", "1");
+        if cache_on {
+            command.env_remove("CARRICK_SOFT_AARCH64_HANDOFF_CACHE");
+        } else {
+            command.env("CARRICK_SOFT_AARCH64_HANDOFF_CACHE", "0");
+        }
+        let output = command.output().expect("spawn A/B arm");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with("cpython production dispatch:"))
+            .unwrap_or("<no measurement line>");
+        println!(
+            "ab run={index} handoff_cache={} status={} {line}",
+            if cache_on { "on" } else { "off" },
+            output.status
+        );
+        assert!(
+            output.status.success(),
+            "A/B arm {index} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn cpython_production_dispatch_arm() {
     let _carrier_lock = lock_soft_carrier_test();
     let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
