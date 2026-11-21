@@ -1942,6 +1942,14 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
     assert_eq!(replies.report_ifuncs(&mut memory, &program), 3);
 }
 
+static SOFT_CARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_soft_carrier_test() -> std::sync::MutexGuard<'static, ()> {
+    SOFT_CARRIER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Engine witness: dynamic glibc hello runs on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
 /// `carrick-kernel` / `carrick-personality-linux` dispatch against a pinned
@@ -1950,6 +1958,7 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_el1_vectors_with_fixture_replies() 
 #[test]
 #[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
 fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
     let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
     let root_dir = std::path::PathBuf::from(
@@ -2034,6 +2043,7 @@ fn compile_static_musl_hello(tag: &str) -> Vec<u8> {
 #[test]
 #[ignore = "requires production CARRICK_A64_ELF and the pinned arm64 musl rust-std target"]
 fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
     let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
         .expect("read the production EL1 ELF");
     let user_elf = compile_static_musl_hello("full");

@@ -11,13 +11,15 @@ use std::mem::offset_of;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use carrick_abi::{LinuxProtFlags, SigBlockMask, SigSet};
 use carrick_el1_abi::{
     Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, El1TaskId, IpcWindow,
-    SnapshotGeneration, ipc_table_map_host, record_el1_region_host_ptr, record_ipc_window_host,
+    SnapshotGeneration, clear_current_task_record, clear_el1_region_host_ptr_if,
+    get_el1_region_host_ptr, ipc_table_map_host, record_el1_region_host_ptr,
+    record_ipc_window_host,
 };
 use carrick_guest_arch::ContextGeneration;
 use carrick_guest_mem::{GuestMemory, MappingSharing};
@@ -30,7 +32,7 @@ use carrick_kernel::dispatch::{
     CarrierBridges, DispatchOutcome, SyscallDispatcher, SyscallRequest, boot_private_file_backings,
 };
 use carrick_kernel::el1_delegation::{
-    clear_el1_region_host_ptr, get_orig_arg0, publish_current_task, revalidate_current_task,
+    get_orig_arg0, publish_current_task, recall_all_delegated, revalidate_current_task,
     settle_el1_boundary_for,
 };
 use carrick_kernel::kernel::VmaSummary;
@@ -271,16 +273,53 @@ where
     pub engine: SoftAarch64Engine<X>,
 }
 
+static SOFT_CARRIER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returned when a second soft AArch64 single-process carrier attempts to run
+/// concurrently in the same host process while the process-global EL1 aperture
+/// and IPC window are already bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftCarrierActiveError;
+
+impl core::fmt::Display for SoftCarrierActiveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a soft AArch64 single-process carrier is already active in this host process")
+    }
+}
+
+impl std::error::Error for SoftCarrierActiveError {}
+
+struct SoftCarrierLease;
+
+impl SoftCarrierLease {
+    fn try_acquire() -> Result<Self, SoftCarrierActiveError> {
+        SOFT_CARRIER_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| SoftCarrierActiveError)
+    }
+}
+
+impl Drop for SoftCarrierLease {
+    fn drop(&mut self) {
+        SOFT_CARRIER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 struct El1ApertureScope {
-    active: bool,
+    el1_host_ptr: usize,
+    _lease: SoftCarrierLease,
 }
 
 impl Drop for El1ApertureScope {
     fn drop(&mut self) {
-        if self.active {
-            record_ipc_window_host(None);
-            clear_el1_region_host_ptr();
-            record_el1_region_host_ptr(0);
+        if self.el1_host_ptr != 0 {
+            if get_el1_region_host_ptr() == self.el1_host_ptr {
+                recall_all_delegated();
+                clear_current_task_record(0);
+                record_ipc_window_host(None);
+            }
+            let _ = clear_el1_region_host_ptr_if(self.el1_host_ptr);
         }
     }
 }
@@ -418,6 +457,7 @@ where
     X::Error: core::fmt::Debug,
     F: FnOnce(&mut SoftAarch64Engine<X>) -> Result<(), String>,
 {
+    let carrier_lease = SoftCarrierLease::try_acquire().map_err(|e| e.to_string())?;
     let mut dispatcher = SyscallDispatcher::with_bridges(refusing_soft_bridges());
     if let Some(root_dir) = config.rootfs_dir {
         let rootfs = RootFs::from_immutable_host_dir(root_dir).map_err(|e| {
@@ -490,14 +530,18 @@ where
         .set_guest_thread_id((1u64 << 32) | 1u64)
         .map_err(|e| format!("stamp guest thread id: {e}"))?;
 
-    let mut aperture_scope = El1ApertureScope { active: false };
+    let mut aperture_scope = El1ApertureScope {
+        el1_host_ptr: 0,
+        _lease: carrier_lease,
+    };
     if let Some(el1_host_ptr) = carrick_hal::GuestVmBackend::host_ptr(
         engine.backend(),
         LINUX_EL1_KERNEL_BASE,
         LINUX_EL1_KERNEL_SIZE as usize,
     ) {
-        record_el1_region_host_ptr(el1_host_ptr as usize);
-        aperture_scope.active = true;
+        let ptr = el1_host_ptr as usize;
+        record_el1_region_host_ptr(ptr);
+        aperture_scope.el1_host_ptr = ptr;
         if let Some(ipc_backing) = &ipc {
             // SAFETY: `engine` retains `ipc_backing` across the entire lifetime of `aperture_scope`.
             let window = unsafe {
@@ -544,7 +588,7 @@ where
     dispatcher
         .activate_file_authority(root_ctx.resources().files())
         .map_err(|e| format!("activate file authority: {e:?}"))?;
-    if aperture_scope.active {
+    if aperture_scope.el1_host_ptr != 0 {
         publish_file_table(&root_ctx);
     }
     drop(root_ctx);
@@ -579,6 +623,7 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
+    let _carrier_lease = SoftCarrierLease::try_acquire().map_err(|e| e.to_string())?;
     let summary = drive_single_process_syscalls(&mut engine, dispatcher, max_syscalls)?;
     Ok(SoftProcessRun {
         exit_code: summary.exit_code,
