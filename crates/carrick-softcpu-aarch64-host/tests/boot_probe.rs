@@ -2045,8 +2045,13 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
         .as_ref()
         .expect("production SoftProcessRun must back glibc relocation and IFUNC inspection");
     assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, run, compiler);
-    // `rseq` (293) stays a counted refusal (#1906).
-    assert_counted_enosys(&receipt.counted_enosys, &[(293, 1)], "glibc hello");
+    // `set_tid_address` (96) and `prlimit64` (261) wait on the in-ring root
+    // process owner (#2645); `rseq` (293) is an accepted refusal (#1906).
+    assert_counted_enosys(
+        &receipt.counted_enosys,
+        &[(96, 1), (261, 1), (293, 1)],
+        "glibc hello",
+    );
 }
 
 /// Engine witness: static musl hello runs to exit on the soft CPU through the
@@ -2113,10 +2118,15 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
     assert_production_replies(&receipt.census, receipt.syscalls_dispatched, 5);
     assert_eq!(receipt.exit_code, 0);
     assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
-    // Rust std's stack-overflow guard: `sigaltstack` (132) and its two
-    // `SIGSEGV`/`SIGBUS` handler installs (134) wait on guest signal delivery
-    // in the single-process runner (#2645).
-    assert_counted_enosys(&receipt.counted_enosys, &[(132, 1), (134, 2)], "musl hello");
+    // `set_tid_address` (96) waits on the in-ring root process owner, and
+    // Rust std's stack-overflow guard, `sigaltstack` (132) and its two
+    // `SIGSEGV`/`SIGBUS` handler installs (134), on guest signal delivery
+    // in the single-process runner (both #2645).
+    assert_counted_enosys(
+        &receipt.counted_enosys,
+        &[(96, 1), (132, 1), (134, 2)],
+        "musl hello",
+    );
 }
 
 /// Engine witness: CPython 3.12.16 runs through the production EL1 vectors and
