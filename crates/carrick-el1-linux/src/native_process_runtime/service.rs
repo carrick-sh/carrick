@@ -98,8 +98,159 @@ impl CallerAccessFailure {
     }
 }
 
+/// Linear receipt proving this execution lane published its selector into
+/// `CurrentTask.service_notice` and must hand it to
+/// [`NativeProcessEntry::park_published_notice`].
+#[must_use = "every published service notice must be handed to park_published_notice"]
+struct PublishedNotice {
+    #[cfg(test)]
+    armed: bool,
+}
+
+impl PublishedNotice {
+    fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            armed: true,
+        }
+    }
+
+    fn consume(mut self) {
+        #[cfg(test)]
+        {
+            self.armed = false;
+        }
+        let _ = &mut self;
+    }
+
+    fn abort_on_error(self) {
+        self.consume();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublishedNotice {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            panic!("published service notice dropped without parking");
+        }
+    }
+}
+
+fn publish_service_notice(
+    slot: &carrick_core_abi::service::ServiceNotice,
+    selector: carrick_core_abi::service::ServiceSelector,
+) -> Result<PublishedNotice, carrick_core_abi::service::ServiceNoticeBusy> {
+    slot.publish_or_observe(selector)
+        .map(|()| PublishedNotice::new())
+}
+
+/// Linear obligation created when a published service notice parks with
+/// [`NativeResume::Left`] on a transport without a synchronous service doorbell.
+#[must_use = "an unannounced service park must either exit straight to the carrier or mark pending host work"]
+struct UnannouncedNotice {
+    #[cfg(test)]
+    armed: bool,
+}
+
+impl UnannouncedNotice {
+    fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            armed: true,
+        }
+    }
+
+    fn consume(mut self) {
+        #[cfg(test)]
+        {
+            self.armed = false;
+        }
+        let _ = &mut self;
+    }
+}
+
+#[cfg(test)]
+impl Drop for UnannouncedNotice {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            panic!("unannounced service park dropped without carrier exit or host-work mark");
+        }
+    }
+}
+
+/// Outcome of parking a service request. A parked notice without a physical
+/// service doorbell can only be consumed by leaving straight to the carrier or
+/// marking pending host work on the slot.
+#[must_use = "every service park must either exit straight to the carrier or mark pending host work"]
+enum ServiceParkOutcome {
+    Announced(NativeResume),
+    UnannouncedLeftNone(UnannouncedNotice),
+    UnannouncedLeftSome(LinuxWaitStatus, UnannouncedNotice),
+}
+
+#[cfg(not(test))]
+const _: () =
+    assert!(core::mem::size_of::<ServiceParkOutcome>() == core::mem::size_of::<NativeResume>());
+
+impl ServiceParkOutcome {
+    fn announced(resumed: NativeResume) -> Self {
+        Self::Announced(resumed)
+    }
+
+    fn from_published_park(resumed: NativeResume, physical_checkpoint: bool) -> Self {
+        if !physical_checkpoint {
+            match resumed {
+                NativeResume::Left(None) => {
+                    return Self::UnannouncedLeftNone(UnannouncedNotice::new());
+                }
+                NativeResume::Left(Some(status)) => {
+                    return Self::UnannouncedLeftSome(status, UnannouncedNotice::new());
+                }
+                other => return Self::Announced(other),
+            }
+        }
+        Self::Announced(resumed)
+    }
+
+    /// Consume at a boundary whose `Left` already returns directly to the
+    /// carrier without entering `Sched::idle`.
+    fn into_carrier_exit(self) -> NativeResume {
+        match self {
+            Self::Announced(resumed) => resumed,
+            Self::UnannouncedLeftNone(unannounced) => {
+                unannounced.consume();
+                NativeResume::Left(None)
+            }
+            Self::UnannouncedLeftSome(status, unannounced) => {
+                unannounced.consume();
+                NativeResume::Left(Some(status))
+            }
+        }
+    }
+
+    /// Consume on a continuation or syscall path whose `Left` can return to
+    /// `Sched::idle` without a physical service doorbell.
+    fn mark_host_work(self, current: &CurrentTask) -> NativeResume {
+        match self {
+            Self::Announced(resumed) => resumed,
+            Self::UnannouncedLeftNone(unannounced) => {
+                unannounced.consume();
+                current.linux.mark_pending_host_work();
+                NativeResume::Left(None)
+            }
+            Self::UnannouncedLeftSome(status, unannounced) => {
+                unannounced.consume();
+                current.linux.mark_pending_host_work();
+                NativeResume::Left(Some(status))
+            }
+        }
+    }
+}
+
 enum PreparedService {
-    Request(ServiceRequest, bool),
+    OwnerWait(ServiceRequest, carrick_core_abi::PortalOwnerWait),
+    Published(ServiceRequest, PublishedNotice, bool),
     NoticeWait(
         ServiceRequest,
         carrick_core_abi::service::ServiceSelector,
@@ -110,12 +261,12 @@ enum PreparedService {
 
 enum NoticeParkOutcome {
     Resumed(NativeResume),
-    Published(bool),
+    Published(PublishedNotice, bool),
 }
 
 enum NoticeFinishOutcome {
     Resumed(NativeResume),
-    Published(bool),
+    Published(PublishedNotice, bool),
     Held(carrick_core_abi::service::ServiceSelector, bool),
 }
 
@@ -458,19 +609,36 @@ mod exec_comm_tests {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ServiceCompletion {
-    Inline,
-    RetrySyscall,
+    CarrierExitInline,
+    MarkHostWorkInline,
+    CarrierExitRetrySyscall,
+    MarkHostWorkRetrySyscall,
     OwnerCheckpoint,
 }
 
 impl ServiceCompletion {
-    fn retries_syscall(&self) -> bool {
-        matches!(self, Self::RetrySyscall)
+    fn retries_syscall(self) -> bool {
+        matches!(
+            self,
+            Self::CarrierExitRetrySyscall | Self::MarkHostWorkRetrySyscall
+        )
     }
 
-    fn checkpoints_owner(&self) -> bool {
+    fn checkpoints_owner(self) -> bool {
         matches!(self, Self::OwnerCheckpoint)
+    }
+
+    fn discharge(self, outcome: ServiceParkOutcome, current: &CurrentTask) -> NativeResume {
+        match self {
+            Self::CarrierExitInline | Self::CarrierExitRetrySyscall | Self::OwnerCheckpoint => {
+                outcome.into_carrier_exit()
+            }
+            Self::MarkHostWorkInline | Self::MarkHostWorkRetrySyscall => {
+                outcome.mark_host_work(current)
+            }
+        }
     }
 }
 
@@ -889,7 +1057,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         Some(wait),
                         ServicePayload::Copyout(output),
-                        ServiceCompletion::Inline,
+                        ServiceCompletion::MarkHostWorkInline,
                     );
                 }
                 Err(NativeProcessError::Busy) => {
@@ -901,7 +1069,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         None,
                         ServicePayload::Copyout(output),
-                        ServiceCompletion::Inline,
+                        ServiceCompletion::MarkHostWorkInline,
                     );
                 }
                 Err(NativeProcessError::Unsupported) => {
@@ -927,7 +1095,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 Some(wait),
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::Inline,
+                                ServiceCompletion::MarkHostWorkInline,
                             );
                         }
                         Err(NativeProcessError::Busy) => {
@@ -939,7 +1107,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 None,
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::Inline,
+                                ServiceCompletion::MarkHostWorkInline,
                             );
                         }
                         Err(NativeProcessError::Unsupported) => {
@@ -952,7 +1120,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 Some(sequence),
                                 None,
                                 ServicePayload::Copyout(output),
-                                ServiceCompletion::RetrySyscall,
+                                ServiceCompletion::MarkHostWorkRetrySyscall,
                             );
                         }
                         Err(NativeProcessError::Fault) if output.prefix_on_fault => {
@@ -1084,7 +1252,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             fault_sequence,
             None,
             ServicePayload::None,
-            ServiceCompletion::Inline,
+            ServiceCompletion::CarrierExitInline,
         )
     }
     /// A completed host member must retain its exact native return owner even
@@ -1187,7 +1355,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             owner_wait,
             ServicePayload::Copyin,
-            ServiceCompletion::Inline,
+            ServiceCompletion::MarkHostWorkInline,
         );
         match self.finish_service_handoff(result) {
             Ok(NativeResume::Left(status)) => {
@@ -1246,7 +1414,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             sequence,
             None,
             ServicePayload::Adapter,
-            ServiceCompletion::RetrySyscall,
+            ServiceCompletion::CarrierExitRetrySyscall,
         )
     }
     /// Supply the memory a refused guest copy needs (readable for an input,
@@ -1344,7 +1512,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             sequence,
             wait,
             ServicePayload::Copyin,
-            ServiceCompletion::RetrySyscall,
+            ServiceCompletion::MarkHostWorkRetrySyscall,
         )?;
         match result {
             NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
@@ -1388,7 +1556,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }),
                 None => ServicePayload::None,
             },
-            ServiceCompletion::RetrySyscall,
+            ServiceCompletion::CarrierExitRetrySyscall,
         )
     }
     pub fn begin_exec_service(
@@ -1442,7 +1610,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::Exec(payload),
-            ServiceCompletion::Inline,
+            ServiceCompletion::CarrierExitInline,
         )
     }
     /// Begin a staged exec through the same owner on every ISA, for an entry
@@ -1505,7 +1673,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::ClockSample(PendingClockSample { record, output }),
-            ServiceCompletion::Inline,
+            ServiceCompletion::CarrierExitInline,
         )
     }
 
@@ -1690,7 +1858,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::HostFile(file),
-            ServiceCompletion::Inline,
+            ServiceCompletion::MarkHostWorkInline,
         )
     }
 
@@ -1893,7 +2061,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         None,
                         ServicePayload::Copyin,
-                        ServiceCompletion::RetrySyscall,
+                        ServiceCompletion::MarkHostWorkRetrySyscall,
                     );
                 }
                 Err(NativeProcessError::OwnerWait(wait)) => {
@@ -1905,7 +2073,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         Some(wait),
                         ServicePayload::Copyin,
-                        ServiceCompletion::RetrySyscall,
+                        ServiceCompletion::MarkHostWorkRetrySyscall,
                     );
                 }
                 Err(NativeProcessError::Unsupported) => {
@@ -1923,7 +2091,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             flags,
                             requested,
                         }),
-                        ServiceCompletion::RetrySyscall,
+                        ServiceCompletion::MarkHostWorkRetrySyscall,
                     );
                 }
                 Err(error) => return Err(error),
@@ -1948,7 +2116,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 address,
                 empty_fault: requested.raw() != 0 && capacity == 0,
             },
-            ServiceCompletion::Inline,
+            ServiceCompletion::MarkHostWorkInline,
         )
     }
 
@@ -2059,7 +2227,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             Some(wait),
             ServicePayload::None,
-            ServiceCompletion::Inline,
+            ServiceCompletion::CarrierExitInline,
         )
     }
     #[inline(never)]
@@ -2082,8 +2250,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             completion.retries_syscall(),
             completion.checkpoints_owner(),
         )?;
-        let (request, adapter) = match prepared {
-            PreparedService::Request(request, adapter) => (request, adapter),
+        let outcome = match prepared {
+            PreparedService::OwnerWait(request, wait) => self
+                .park_owner_wait(&request, wait)
+                .map(ServiceParkOutcome::announced),
+            PreparedService::Published(request, notice, adapter) => self.park_published_notice(
+                &request,
+                notice,
+                adapter || completion.checkpoints_owner(),
+            ),
             PreparedService::NoticeWait(request, holder, adapter) => {
                 #[cfg(test)]
                 {
@@ -2093,28 +2268,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         hook();
                     }
                 }
-                return match self.park_notice_wait(
+                match self.park_notice_wait(
                     &request,
                     holder,
                     adapter || completion.checkpoints_owner(),
                 )? {
-                    NoticeParkOutcome::Resumed(result) => Ok(result),
-                    NoticeParkOutcome::Published(defer_completion) => {
-                        self.park_published_notice(&request, defer_completion)
+                    NoticeParkOutcome::Resumed(result) => Ok(ServiceParkOutcome::announced(result)),
+                    NoticeParkOutcome::Published(notice, defer_completion) => {
+                        let resumed = self
+                            .park_published_notice(&request, notice, defer_completion)?
+                            .mark_host_work(self.current);
+                        Ok(ServiceParkOutcome::announced(resumed))
                     }
-                };
+                }
             }
-            PreparedService::Retired(result) => return Ok(result),
-        };
-        if let Some(wait) = owner_wait {
-            self.park_owner_wait(&request, wait)
-        } else {
-            let physical_checkpoint = self.service.native_service_doorbell();
-            self.park_service(
-                &request,
-                physical_checkpoint || adapter || completion.checkpoints_owner(),
-            )
-        }
+            PreparedService::Retired(result) => Ok(ServiceParkOutcome::announced(result)),
+        }?;
+        Ok(completion.discharge(outcome, self.current))
     }
 
     #[inline(never)]
@@ -2507,43 +2677,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .publish_owner_continuation(entry);
         }
-        if owner_wait.is_some() {
-            return Ok(PreparedService::Request(request, adapter));
+        if let Some(wait) = owner_wait {
+            return Ok(PreparedService::OwnerWait(request, wait));
         }
         self.service_phase = NativeServicePhase::Notice;
-        match self
-            .current
-            .service_notice
-            .publish_or_observe(request.identity.into())
-        {
-            Ok(()) => {}
-            Err(carrick_core_abi::service::ServiceNoticeBusy::Held(holder)) => {
-                if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
-                    pending.notice_wait = Some(holder);
-                    return Ok(PreparedService::NoticeWait(request, holder, adapter));
+        let notice =
+            match publish_service_notice(&self.current.service_notice, request.identity.into()) {
+                Ok(notice) => notice,
+                Err(carrick_core_abi::service::ServiceNoticeBusy::Held(holder)) => {
+                    if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record)
+                    {
+                        pending.notice_wait = Some(holder);
+                        return Ok(PreparedService::NoticeWait(request, holder, adapter));
+                    }
+                    return self.abort_unpublished_service(request, NativeProcessError::Stale);
                 }
-                return self.abort_unpublished_service(request, NativeProcessError::Stale);
-            }
-            Err(carrick_core_abi::service::ServiceNoticeBusy::Duplicate(_)) => {
-                return self.abort_unpublished_service(
-                    request,
-                    NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::NoticePublishDuplicate,
-                    ),
-                );
-            }
-            Err(carrick_core_abi::service::ServiceNoticeBusy::Corrupt) => {
-                return self.abort_unpublished_service(
-                    request,
-                    NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::NoticePublishBusy,
-                    ),
-                );
-            }
-        }
+                Err(carrick_core_abi::service::ServiceNoticeBusy::Duplicate(_)) => {
+                    return self.abort_unpublished_service(
+                        request,
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::NoticePublishDuplicate,
+                        ),
+                    );
+                }
+                Err(carrick_core_abi::service::ServiceNoticeBusy::Corrupt) => {
+                    return self.abort_unpublished_service(
+                        request,
+                        NativeProcessError::ServiceQuarantined(
+                            NativeServiceQuarantine::NoticePublishBusy,
+                        ),
+                    );
+                }
+            };
         #[cfg(test)]
         super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
-        Ok(PreparedService::Request(request, adapter))
+        Ok(PreparedService::Published(request, notice, adapter))
     }
 
     /// Retire or reject an installed IPC adapter operation before terminal
@@ -3032,15 +3200,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Some(if notice_wait.is_some() {
             match self.finish_notice_wait(&request, adapter || checkpoints_owner) {
                 Ok(NoticeFinishOutcome::Resumed(result)) => Ok(result),
-                Ok(NoticeFinishOutcome::Published(defer_completion)) => {
-                    self.park_published_notice(&request, defer_completion)
-                }
+                Ok(NoticeFinishOutcome::Published(notice, defer_completion)) => self
+                    .park_published_notice(&request, notice, defer_completion)
+                    .map(|outcome| outcome.mark_host_work(self.current)),
                 Ok(NoticeFinishOutcome::Held(holder, defer_completion)) => {
                     match self.park_notice_wait(&request, holder, defer_completion) {
                         Ok(NoticeParkOutcome::Resumed(result)) => Ok(result),
-                        Ok(NoticeParkOutcome::Published(defer_completion)) => {
-                            self.park_published_notice(&request, defer_completion)
-                        }
+                        Ok(NoticeParkOutcome::Published(notice, defer_completion)) => self
+                            .park_published_notice(&request, notice, defer_completion)
+                            .map(|outcome| outcome.mark_host_work(self.current)),
                         Err(error) => Err(error),
                     }
                 }
@@ -3053,21 +3221,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
 
-    /// Park a request that won publication after waiting for a peer's notice.
-    /// The earlier carrier exit was consumed draining that peer, so this
-    /// publication owns the next host-work ring when parking leaves no runner.
+    /// Park a request whose selector was just published into `service_notice`.
+    /// Callers must explicitly consume the returned [`ServiceParkOutcome`] via
+    /// either a direct carrier exit or a host-work mark when no synchronous
+    /// service doorbell exists.
     #[inline(never)]
     fn park_published_notice(
         &mut self,
         request: &ServiceRequest,
+        notice: PublishedNotice,
         defer_completion: bool,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<ServiceParkOutcome, NativeProcessError> {
+        notice.consume();
         let physical_checkpoint = self.service.native_service_doorbell();
         let resumed = self.park_service(request, physical_checkpoint || defer_completion)?;
-        if matches!(resumed, NativeResume::Left(_)) {
-            self.current.linux.mark_pending_host_work();
-        }
-        Ok(resumed)
+        Ok(ServiceParkOutcome::from_published_park(
+            resumed,
+            physical_checkpoint,
+        ))
     }
 
     #[inline(never)]
@@ -3373,7 +3544,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let entry = self.service_owner_entry(request);
         let mut save_context_ran = false;
         let mut cancelled = false;
-        let mut published = false;
+        let mut published = None;
         let mut holder_changed = false;
         let mut failure = None;
         let parked = carrick_core::wait::park_object_record(
@@ -3396,13 +3567,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     cancelled = true;
                     return Err(ObjectWaitError::Changed);
                 }
-                match self
-                    .current
-                    .service_notice
-                    .publish_or_observe(request.identity.into())
+                match publish_service_notice(&self.current.service_notice, request.identity.into())
                 {
-                    Ok(()) => {
-                        published = true;
+                    Ok(notice) => {
+                        published = Some(notice);
                         Err(ObjectWaitError::Changed)
                     }
                     Err(ServiceNoticeBusy::Held(live)) if live == holder => {
@@ -3451,17 +3619,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .cancel_unpublished_service(request)
                         .map(NoticeParkOutcome::Resumed);
                 }
-                if published {
+                if let Some(notice) = published {
                     if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record)
                     {
                         pending.notice_wait = None;
                     }
-                    self.restore_preparation_operation(operation)?;
+                    if let Err(error) = self.restore_preparation_operation(operation) {
+                        notice.abort_on_error();
+                        return Err(error);
+                    }
                     #[cfg(test)]
                     super::host_test_support::run_service_published_hook(
                         self.runtime as *const _ as usize,
                     );
-                    return Ok(NoticeParkOutcome::Published(defer_completion));
+                    return Ok(NoticeParkOutcome::Published(notice, defer_completion));
                 }
                 let holder_retired = !save_context_ran && error == ObjectWaitError::Stale;
                 let host_contended = error == ObjectWaitError::Occupied
@@ -3494,22 +3665,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .cancel_unpublished_service(request)
                 .map(NoticeFinishOutcome::Resumed);
         }
-        match self
-            .current
-            .service_notice
-            .publish_or_observe(request.identity.into())
-        {
-            Ok(()) => {
+        match publish_service_notice(&self.current.service_notice, request.identity.into()) {
+            Ok(notice) => {
                 if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
                     pending.notice_wait = None;
                 } else {
+                    notice.abort_on_error();
                     return Err(NativeProcessError::Stale);
                 }
                 #[cfg(test)]
                 super::host_test_support::run_service_published_hook(
                     self.runtime as *const _ as usize,
                 );
-                Ok(NoticeFinishOutcome::Published(defer_completion))
+                Ok(NoticeFinishOutcome::Published(notice, defer_completion))
             }
             Err(ServiceNoticeBusy::Held(holder)) => {
                 if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {

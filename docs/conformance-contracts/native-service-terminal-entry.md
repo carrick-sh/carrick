@@ -61,8 +61,14 @@ published `PendingService`, enrols on `ObjectWaitKey::native_service(holder.reco
 probes once under that queue lock, releases execution capacity, and reruns
 notice publication when woken. Parking the contender rings the slot's
 host-work doorbell because that park can remove the last runnable record while
-the holder's notice still awaits carrier intake. The EL1 idle boundary then
-exits so carrier intake can take the holder notice.
+the holder's notice still awaits carrier intake. Every notice publication
+produces a linear `PublishedNotice` receipt consumed by `park_published_notice`,
+whose `ServiceParkOutcome` must be explicitly discharged either at a direct
+carrier exit boundary or by marking pending host work on transports without a
+synchronous service doorbell (covering contended reruns as well as in-ring
+service continuations such as `publish_pending_host_file` after a
+host-readiness wake). The EL1 idle boundary then
+exits so carrier intake can take the notice.
 A `service_notice` word that already names the
 publisher's own `RecordId` remains broken duplicate lane custody and fails
 closed with `NativeServiceQuarantine::NoticePublishDuplicate`
