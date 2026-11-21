@@ -141,8 +141,9 @@ fn parked_census_names_wait_key_resume_owner_and_saved_pc() {
     // #2646: the saved syscall number and arguments, the wait queue it is
     // linked on, and the slot maps are part of the same census.
     assert!(
-        census.contains("saved_nr=98 saved_args=[\n    0x7000,\n    0x80,"),
-        "{census}"
+        census.lines().any(|line| line.starts_with("zone record ")
+            && line.ends_with(" saved_nr=98 saved_args=[7000, 80, 0, 0, 0, 0]")),
+        "one parked record per census line: {census}"
     );
     let bucket = ZoneTables::bucket_of(MM, address);
     let line = census
