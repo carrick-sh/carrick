@@ -4705,6 +4705,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
+            exit_venue: service::EntryExitVenue::DirectCarrierExit,
         })
     }
     /// Enter through the exact process registry. A non-leader thread retains
@@ -4764,6 +4765,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
+            exit_venue: service::EntryExitVenue::DirectCarrierExit,
         }))
     }
 
@@ -5155,6 +5157,7 @@ pub struct NativeProcessEntry<
     copyout_ready: Option<Box<service::OwnedCopyout<'a>>>,
     adapter_ready: Option<Box<service::AdapterPreparation>>,
     service_phase: NativeServicePhase,
+    exit_venue: service::EntryExitVenue,
 }
 
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -7462,10 +7465,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core_abi::NativeRunFailureReason,
         >,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        let previous_venue = core::mem::replace(
+            &mut self.exit_venue,
+            service::EntryExitVenue::SchedulerResume,
+        );
         let record = self.source.zone.record(self.record.id);
         let host_owned = !record.is_native_owned() && record.requires_native_entry();
-        let resumed = self.resume_owned_checkpoint()?;
-        self.finish_host_resume(resumed, host_owned, checkpoint)
+        let result = self
+            .resume_owned_checkpoint()
+            .and_then(|resumed| self.finish_host_resume(resumed, host_owned, checkpoint));
+        self.exit_venue = previous_venue;
+        result
     }
 
     // Physical reply application has returned before final signal/service
