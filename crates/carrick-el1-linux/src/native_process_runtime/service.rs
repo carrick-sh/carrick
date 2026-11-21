@@ -249,7 +249,7 @@ impl ServiceParkOutcome {
 }
 
 enum PreparedService {
-    OwnerWait(ServiceRequest, carrick_core_abi::PortalOwnerWait),
+    WithPortalWait(ServiceRequest, carrick_core_abi::PortalOwnerWait),
     Published(ServiceRequest, PublishedNotice, bool),
     NoticeWait(
         ServiceRequest,
@@ -609,7 +609,7 @@ mod exec_comm_tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum ServiceCompletion {
     CarrierExitInline,
     MarkHostWorkInline,
@@ -2255,7 +2255,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             completion.checkpoints_owner(),
         )?;
         let outcome = match prepared {
-            PreparedService::OwnerWait(request, wait) => self
+            PreparedService::WithPortalWait(request, wait) => self
                 .park_owner_wait(&request, wait)
                 .map(ServiceParkOutcome::announced),
             PreparedService::Published(request, notice, adapter) => self.park_published_notice(
@@ -2682,7 +2682,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .publish_owner_continuation(entry);
         }
         if let Some(wait) = owner_wait {
-            return Ok(PreparedService::OwnerWait(request, wait));
+            return Ok(PreparedService::WithPortalWait(request, wait));
         }
         self.service_phase = NativeServicePhase::Notice;
         let notice =
