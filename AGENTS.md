@@ -165,11 +165,13 @@ Docker oracle. The scoreboard is the fast smoke check.
 ## Debugging
 
 Use real debuggers, never `eprintln!`. `carrick trace` is the tracer: extend
-it, and keep `scripts/dtrace/` scripts. Zero events means the probe didn't
-fire. Logging perturbs races; USDT doesn't. Deadlock: a real core and
+it; keep `scripts/dtrace/`. Zero events means the probe didn't
+fire. Logs perturb races; USDT doesn't. Deadlock: a real core and
 `bt all`. Heisenbug: the event ring via `carrick-lldb` on the **carrier**.
 After `carrick_fatal!`, read `CARRICK_LAST_FATAL`. A diagnosis is a hypothesis
-until you read real values. → [`docs/diagnostics-and-debugging.md`](docs/diagnostics-and-debugging.md),
+until you read real values. **Diagnose before fixing:** a stuck row first
+gets a read-only pass naming its cause in real values; fix briefs
+cite them. → [`docs/diagnostics-and-debugging.md`](docs/diagnostics-and-debugging.md),
 skills `carrick-trace` and `carrick-lldb`.
 
 ## Shared machines and leases
@@ -209,8 +211,7 @@ skills `carrick-trace` and `carrick-lldb`.
   body covering why, what and how it was verified. Add one
   `Co-Authored-By: <agent name> <vendor noreply>` line per agent:
   `noreply@anthropic.com`, `noreply@openai.com` or `noreply@google.com`.
-  Preserve another agent's authorship. The SHA map for the 2026-10-14 history
-  rewrite is on `history/coauthor-rewrite-2026-10-14`.
+  Preserve another agent's authorship.
 - **Hooks:** pre-commit runs `fmt-check` and pre-push runs `clippy`. Fix with
   `just fmt` or `just clippy`. Unrelated fmt churn is toolchain skew: check it
   out. Run **`just ci`** in full before pushing; it stops at the first red.
