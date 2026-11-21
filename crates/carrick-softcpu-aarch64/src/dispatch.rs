@@ -275,7 +275,7 @@ fn fetch_address(
 
 fn read_word(memory: &mut impl GuestMemory, pa: Gpa) -> Result<u32, MemoryFault> {
     let mut bytes = [0; 4];
-    memory.read(VirtualAddress(pa.raw()), &mut bytes)?;
+    memory.fetch(VirtualAddress(pa.raw()), &mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
@@ -367,6 +367,10 @@ impl<M: GuestMemory> MeasuredMemory<'_, M> {
 impl<M: GuestMemory> GuestMemory for MeasuredMemory<'_, M> {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
         self.inner.read(address, bytes)
+    }
+
+    fn fetch(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
+        self.inner.fetch(address, bytes)
     }
 
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault> {

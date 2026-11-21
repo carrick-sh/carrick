@@ -62,7 +62,7 @@ impl Pstate {
                 | u64::from(self.el == ExceptionLevel::El1 && self.sp == StackSelect::El1),
         )
     }
-    pub(crate) fn restore(saved: SavedPstate) -> Option<Self> {
+    pub fn restore(saved: SavedPstate) -> Option<Self> {
         let v = saved.0;
         let (el, sp) = match v & 31 {
             0 => (ExceptionLevel::El0, StackSelect::El0),

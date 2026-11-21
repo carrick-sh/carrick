@@ -60,6 +60,14 @@ pub trait GuestMemory {
     fn read(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault>;
     fn write(&mut self, address: VirtualAddress, bytes: &[u8]) -> Result<(), MemoryFault>;
 
+    /// Fetch instruction bytes from a physical address. Defaults to
+    /// [`Self::read`] for flat memory providers; stage-2 memory providers
+    /// enforce stage-2 execute permission here independently of stage-1
+    /// `UXN`/`PXN`.
+    fn fetch(&mut self, address: VirtualAddress, bytes: &mut [u8]) -> Result<(), MemoryFault> {
+        self.read(address, bytes)
+    }
+
     /// Borrow direct-access RAM for this block only. Writable loans must
     /// exclude code-tracked frames and memory with provider side effects.
     fn inline_ram(&mut self, _read: Option<FrameGpa>, _write: Option<FrameGpa>) -> InlineRam<'_> {

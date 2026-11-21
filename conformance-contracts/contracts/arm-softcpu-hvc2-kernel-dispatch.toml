@@ -1,0 +1,41 @@
+schema_version = 1
+id = "arm.softcpu.hvc2-kernel-dispatch"
+title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
+guest_surfaces = [
+  "isa:aarch64",
+  "syscall:brk",
+  "syscall:clock_gettime",
+  "syscall:close",
+  "syscall:fstat",
+  "syscall:geteuid",
+  "syscall:getuid",
+  "syscall:mmap",
+  "syscall:mprotect",
+  "syscall:munmap",
+  "syscall:openat",
+  "syscall:prlimit64",
+  "syscall:read",
+  "syscall:write",
+  "vmm:soft",
+]
+semantic_authority = [
+  "Arm ARM DDI0487G.a D1.10 (exception entry and HVC), D5.4 and D5.8 (stage-1/stage-2 permissions and faults), and D5.10 (TLB maintenance).",
+  "man 2 brk, mmap, mprotect, munmap, openat, fstat, read, write, close, clock_gettime, getuid, geteuid, prlimit64, exit_group.",
+]
+fixture = "carrick-softcpu-aarch64-host::soft_dispatch_witness"
+scale_points = [1]
+rationale = "Single-process AArch64 guests on the soft CPU must route forwarded HVC #2 syscalls through the shared Aarch64EngineCore<SoftAarch64Vmm> and production SyscallDispatcher with zero fixture syscall replies, enforcing 4 KiB stage-2 execute permissions and ExtentTable code-page invalidations."
+structural_budgets = []
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_stage2_enforces_execute_permission_and_extent_code_generations",
+  "carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response",
+  "carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically",
+]
+
+[bindings.unresolved]
+embed_structural = "The soft AArch64 single-process runner executes via carrick-softcpu-aarch64-host on Linux arm64 (boot_probe dynamic glibc hello and static musl hello); CLI carrier wiring lands in a later #1236 slice."
+signed = "macOS signed HVF acceptance covers HvfVmm; soft AArch64 native block execution runs on Linux arm64 CI (soft-aarch64-native)."
+docker = "Dynamic glibc hello and static musl hello outputs and exit codes are checked directly against deterministic Linux expectations with zero fixture syscall replies."
