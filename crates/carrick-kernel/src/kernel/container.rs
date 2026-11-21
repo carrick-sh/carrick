@@ -16,7 +16,7 @@
 //! UTS/net namespaces. Every task reaches its container through its
 //! `NsProxy`, never through a static.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -501,19 +501,96 @@ impl std::fmt::Debug for RingRealtimeWord {
     }
 }
 
+/// The guest realtime offset together with everything that must move with
+/// it. The fields are private to this module, so no [`ClockDomain`] path can
+/// store an offset without bumping the vvar epoch and re-publishing the
+/// carrier's ring realtime word: [`GuestRealtime::commit`] is the one writer,
+/// and it takes the held `clock_changes` state as proof of serialization.
+mod guest_realtime {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    use super::{ClockChangeState, RingRealtimeWord};
+
+    #[derive(Debug)]
+    pub(super) struct GuestRealtime {
+        /// Guest `CLOCK_REALTIME` minus host realtime, in nanoseconds.
+        offset_ns: AtomicI64,
+        /// Bumped (Release) on every offset change, AFTER the new delta is
+        /// stored, so a reader that observes the new epoch (Acquire) also
+        /// observes the new delta. Each Linux MM records the epoch its vvar
+        /// word was stamped under and re-stamps itself when it falls behind.
+        epoch: AtomicU64,
+        /// The carrier's ring realtime word, re-published with every offset
+        /// store so the ring never serves a moved clock's old value after
+        /// the change returns.
+        ring: OnceLock<RingRealtimeWord>,
+    }
+
+    impl GuestRealtime {
+        pub(super) fn new(initial_offset_ns: i64) -> Self {
+            Self {
+                offset_ns: AtomicI64::new(initial_offset_ns),
+                epoch: AtomicU64::new(0),
+                ring: OnceLock::new(),
+            }
+        }
+
+        pub(super) fn offset_ns(&self) -> i64 {
+            self.offset_ns.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn epoch(&self) -> u64 {
+            self.epoch.load(Ordering::Acquire)
+        }
+
+        pub(super) fn ring_host_off_ns(&self) -> Option<u64> {
+            self.ring.get().map(|word| word.host_off_ns)
+        }
+
+        /// Move the offset to `next(current)`, bump the epoch and re-publish
+        /// the bound ring word, all before `changes` is released.
+        pub(super) fn commit(
+            &self,
+            _changes: &mut ClockChangeState,
+            next: impl FnOnce(i64) -> i64,
+        ) {
+            let offset = next(self.offset_ns.load(Ordering::SeqCst));
+            self.offset_ns.store(offset, Ordering::SeqCst);
+            self.epoch.fetch_add(1, Ordering::Release);
+            self.publish_ring(offset);
+        }
+
+        /// Bind the carrier's ring word once and publish the current offset.
+        pub(super) fn bind_ring(
+            &self,
+            _changes: &mut ClockChangeState,
+            word: RingRealtimeWord,
+        ) -> Result<(), RingRealtimeWord> {
+            self.ring.set(word)?;
+            self.publish_ring(self.offset_ns());
+            Ok(())
+        }
+
+        fn publish_ring(&self, offset_ns: i64) {
+            if let Some(word) = self.ring.get() {
+                (word.publish)(crate::vdso::vvar_realtime_off_ns(
+                    word.host_off_ns,
+                    offset_ns,
+                ));
+            }
+        }
+    }
+}
+
 /// The container's time authority. Supports standard system time tracking
 /// plus embedder-controlled modes (`Offset`, `Frozen`, `Scaled`, and
 /// `Deterministic`).
 #[derive(Debug)]
 pub struct ClockDomain {
     control: TimeControl,
-    /// Guest `CLOCK_REALTIME` minus host realtime, in nanoseconds.
-    realtime_offset_ns: AtomicI64,
-    /// Bumped (Release) on every offset change, AFTER the new delta is stored,
-    /// so a reader that observes the new epoch (Acquire) also observes the new
-    /// delta. Each Linux MM records the epoch its vvar word was stamped under
-    /// and re-stamps itself when it falls behind.
-    epoch: AtomicU64,
+    /// The guest realtime offset, its vvar epoch and the carrier's ring word.
+    realtime: guest_realtime::GuestRealtime,
     start_host_instant: Instant,
     virtual_monotonic_ns: AtomicU64,
     /// Publishes virtual-clock progress and guest-controlled realtime steps to
@@ -526,10 +603,6 @@ pub struct ClockDomain {
     clock_changes: Arc<Mutex<ClockChangeState>>,
     waiters: Arc<Mutex<DeterministicWaiters>>,
     adjtimex: Mutex<AdjtimexState>,
-    /// The carrier's ring realtime word, published under `clock_changes`
-    /// with every offset store so the ring never serves a moved clock's old
-    /// value after the change returns.
-    ring_realtime: OnceLock<RingRealtimeWord>,
 }
 
 impl Default for ClockDomain {
@@ -547,8 +620,7 @@ impl ClockDomain {
         };
         Self {
             control,
-            realtime_offset_ns: AtomicI64::new(initial_offset_ns),
-            epoch: AtomicU64::new(0),
+            realtime: guest_realtime::GuestRealtime::new(initial_offset_ns),
             start_host_instant: Instant::now(),
             virtual_monotonic_ns: AtomicU64::new(0),
             clock_wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
@@ -559,7 +631,6 @@ impl ClockDomain {
             })),
             waiters: Arc::new(Mutex::new(DeterministicWaiters::default())),
             adjtimex: Mutex::new(AdjtimexState::default()),
-            ring_realtime: OnceLock::new(),
         }
     }
 
@@ -620,13 +691,13 @@ impl ClockDomain {
     pub fn realtime_offset_ns(&self) -> i64 {
         match &self.control {
             TimeControl::Offset(delta) => delta.as_nanos_i64().unwrap_or(0),
-            _ => self.realtime_offset_ns.load(Ordering::SeqCst),
+            _ => self.realtime.offset_ns(),
         }
     }
 
     /// The domain's generation counter; bumped on every offset change.
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.realtime.epoch()
     }
 
     pub fn wait_queue(&self) -> Arc<crate::kernel::WaitQueue> {
@@ -676,12 +747,15 @@ impl ClockDomain {
         })
     }
 
-    fn begin_clock_change(&self, change: impl FnOnce()) -> Vec<ClockChangeCallback> {
+    fn begin_clock_change(
+        &self,
+        change: impl FnOnce(&mut ClockChangeState),
+    ) -> Vec<ClockChangeCallback> {
         let mut state = self
             .clock_changes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        change();
+        change(&mut state);
         state.generation = state.generation.wrapping_add(1);
         state.listeners.values().cloned().collect()
     }
@@ -701,10 +775,8 @@ impl ClockDomain {
         if self.is_controlled() {
             return Err(carrick_abi::LINUX_EPERM);
         }
-        let callbacks = self.begin_clock_change(|| {
-            self.realtime_offset_ns.store(delta_ns, Ordering::SeqCst);
-            self.epoch.fetch_add(1, Ordering::Release);
-            self.publish_ring_realtime();
+        let callbacks = self.begin_clock_change(|changes| {
+            self.realtime.commit(changes, |_| delta_ns);
         });
         self.finish_clock_change(callbacks);
         Ok(())
@@ -720,22 +792,11 @@ impl ClockDomain {
         if self.is_controlled() {
             return Err(carrick_abi::LINUX_EPERM);
         }
-        let callbacks = self.begin_clock_change(|| {
-            let mut curr = self.realtime_offset_ns.load(Ordering::SeqCst);
-            loop {
-                let next = curr.saturating_add(step_ns);
-                match self.realtime_offset_ns.compare_exchange_weak(
-                    curr,
-                    next,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => curr = actual,
-                }
-            }
-            self.epoch.fetch_add(1, Ordering::Release);
-            self.publish_ring_realtime();
+        // Every offset writer holds clock_changes, so a step is one bounded
+        // read-modify-write rather than a compare/exchange retry loop.
+        let callbacks = self.begin_clock_change(|changes| {
+            self.realtime
+                .commit(changes, |current| current.saturating_add(step_ns));
         });
         self.finish_clock_change(callbacks);
         Ok(())
@@ -774,11 +835,8 @@ impl ClockDomain {
         if let Some(delta) = step {
             // All offset writers hold clock_changes, so this is one bounded
             // update rather than a compare/exchange retry loop.
-            let current = self.realtime_offset_ns.load(Ordering::SeqCst);
-            self.realtime_offset_ns
-                .store(current.saturating_add(delta), Ordering::SeqCst);
-            self.epoch.fetch_add(1, Ordering::Release);
-            self.publish_ring_realtime();
+            self.realtime
+                .commit(&mut changes, |current| current.saturating_add(delta));
         }
         request.apply_fields(&mut discipline);
         let value = request.write_reply(&discipline, self.realtime_now(), output);
@@ -882,7 +940,7 @@ impl ClockDomain {
             return Err(TimeError::UnsupportedMode(format!("{:?}", self.control)));
         }
         let mut old_ns = 0;
-        let callbacks = self.begin_clock_change(|| {
+        let callbacks = self.begin_clock_change(|_| {
             old_ns = self
                 .virtual_monotonic_ns
                 .fetch_add(delta.as_nanos() as u64, Ordering::SeqCst);
@@ -1139,9 +1197,8 @@ impl ClockDomain {
     /// the VMM has calibrated the base (no vDSO in this lane / unit tests).
     /// A bound carrier's own calibration wins over the process-wide one.
     pub fn vvar_realtime_off_ns(&self) -> Option<u64> {
-        self.ring_realtime
-            .get()
-            .map(|word| word.host_off_ns)
+        self.realtime
+            .ring_host_off_ns()
             .or_else(crate::vdso::realtime_off_ns)
             .map(|base| crate::vdso::vvar_realtime_off_ns(base, self.realtime_offset_ns()))
     }
@@ -1151,24 +1208,11 @@ impl ClockDomain {
     /// before the change returns. A second binding is refused: the word
     /// serves one container.
     pub fn bind_ring_realtime(&self, word: RingRealtimeWord) -> Result<(), RingRealtimeWord> {
-        let _changes = self
+        let mut changes = self
             .clock_changes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.ring_realtime.set(word)?;
-        self.publish_ring_realtime();
-        Ok(())
-    }
-
-    /// Callers hold `clock_changes`, so publications follow offset stores in
-    /// order.
-    fn publish_ring_realtime(&self) {
-        if let Some(word) = self.ring_realtime.get() {
-            (word.publish)(crate::vdso::vvar_realtime_off_ns(
-                word.host_off_ns,
-                self.realtime_offset_ns(),
-            ));
-        }
+        self.realtime.bind_ring(&mut changes, word)
     }
 
     /// Publish this domain's realtime word into the calling process's vvar
@@ -2225,6 +2269,73 @@ mod clock_domain_tests {
             assert_eq!(clock.with_clock_change_snapshot(|| ()).0, generation);
             assert_eq!(output.abi_bytes(), output_before);
         }
+    }
+
+    /// A leaked all-zero carrier zone of one ISA's parked-context shape; all
+    /// zero bytes are the valid empty zone.
+    fn leaked_zone<C>() -> &'static carrick_sched_core::ZoneTables<C>
+    where
+        C: Copy + Send + Sync + zerocopy::FromZeros,
+    {
+        let layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables<C>>();
+        // SAFETY: the layout is the zone's own; all-zero is a valid zone and
+        // the allocation is leaked, so the reference never dangles.
+        unsafe {
+            let zone = std::alloc::alloc_zeroed(layout).cast::<carrick_sched_core::ZoneTables<C>>();
+            assert!(!zone.is_null());
+            &*zone
+        }
+    }
+
+    /// Every way the container clock moves (`clock_settime`/`settimeofday`
+    /// through `try_set`, a step, and `adjtimex` ADJ_SETOFFSET) re-publishes
+    /// the carrier zone's ring realtime word before it returns, on the ARM
+    /// (`ThreadCtx`) and the x86 CPL0 (`ParkedContextWords`) zone alike. The
+    /// offset has one writer, so a future `clock_settime` server cannot move
+    /// the clock and leave the ring serving the old value.
+    fn assert_clock_changes_republish_zone_word<C>()
+    where
+        C: Copy + Send + Sync + zerocopy::FromZeros + 'static,
+    {
+        use carrick_abi::{LinuxTimeval, LinuxTimex};
+        use carrick_time_core::{TimexAccess, TimexRequest};
+        const HOST_OFF: u64 = 1_700_000_000_000_000_000;
+        let zone = leaked_zone::<C>();
+        let clock = ClockDomain::system();
+        assert_eq!(zone.realtime_offset(), None, "uncalibrated zone");
+        clock
+            .bind_ring_realtime(super::RingRealtimeWord::new(HOST_OFF, move |word| {
+                zone.publish_realtime_offset(word)
+            }))
+            .expect("first binding");
+        assert_eq!(zone.realtime_offset(), Some(HOST_OFF), "bound at offset 0");
+        let ring = || zone.realtime_offset().expect("calibrated");
+        let expected = |offset: i64| vvar_realtime_word(HOST_OFF, offset);
+
+        clock.try_set_realtime_offset_ns(7_200_000_000_000).unwrap();
+        assert_eq!(ring(), expected(7_200_000_000_000), "set republished");
+
+        clock.try_step_realtime_offset_ns(-60_000_000_000).unwrap();
+        assert_eq!(ring(), expected(7_140_000_000_000), "step republished");
+
+        let mut input = LinuxTimex::new_read_state(LinuxTimeval::new(-7_200, 0));
+        input.modes = carrick_abi::LINUX_ADJ_SETOFFSET;
+        let request = TimexRequest::validate(&input, TimexAccess::Adjust).unwrap();
+        let mut output = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        clock.apply_timex(&request, &mut output).unwrap();
+        assert_eq!(clock.realtime_offset_ns(), -60_000_000_000);
+        assert_eq!(ring(), expected(-60_000_000_000), "adjtimex republished");
+        assert_eq!(clock.epoch(), 3, "one epoch per change");
+    }
+
+    #[test]
+    fn clock_changes_republish_the_arm_zone_realtime_word() {
+        assert_clock_changes_republish_zone_word::<carrick_sched_core::ThreadCtx>();
+    }
+
+    #[test]
+    fn clock_changes_republish_the_x86_zone_realtime_word() {
+        assert_clock_changes_republish_zone_word::<carrick_sched_core::ParkedContextWords>();
     }
 
     #[test]
