@@ -1140,7 +1140,8 @@ pub enum FaultVerdict {
     /// The first-touch window selector found a root hole or a limit.
     WindowHole,
     WindowRefused,
-    BackingWindowRefused,
+    /// The descriptor owner refused the selected backing window.
+    BackingWindowRefused(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
     /// The selection could not be built or published (root, editor, slot).
     SelectionUnavailable,
     /// A supply window was published for the host; not a refusal.
@@ -1149,7 +1150,8 @@ pub enum FaultVerdict {
 
 impl FaultVerdict {
     /// A stable nonzero word for the diagnostic record: the branch in the
-    /// low byte, a COW decline reason plus one in the next.
+    /// low byte; above it a COW decline reason plus one, or a descriptor
+    /// refusal's wire code.
     #[must_use]
     pub const fn code(self) -> u64 {
         match self {
@@ -1170,7 +1172,7 @@ impl FaultVerdict {
             Self::PreparedCommitRefused => 0x0e,
             Self::WindowHole => 0x0f,
             Self::WindowRefused => 0x10,
-            Self::BackingWindowRefused => 0x11,
+            Self::BackingWindowRefused(refusal) => 0x11 | ((refusal as u64) << 8),
             Self::SelectionUnavailable => 0x12,
             Self::Selected => 0x13,
         }
@@ -1849,8 +1851,8 @@ fn dispatch_classified_fault<
                     retry = true;
                     return None;
                 }
-                Err(_) => {
-                    supply.note(FaultVerdict::BackingWindowRefused);
+                Err(refusal) => {
+                    supply.note(FaultVerdict::BackingWindowRefused(refusal));
                     return None;
                 }
             };

@@ -2944,6 +2944,45 @@ fn production_fork_parent_writes_its_rwx_private_page() {
     );
 }
 
+/// #2701 / #2668: a kernel copy-out after a fork into a parent page that is
+/// mapped and never touched. The shared owner selection committed the
+/// inherited prepared leaf, which the fork had left to be armed copy-on-write
+/// at residency, and then answered `MmError::Fault` for the read-only leaf it
+/// had just made: read(2) returned EFAULT (Go's "read |0: bad address").
+#[test]
+fn production_fork_parent_copyout_commits_and_copies_an_untouched_page() {
+    let elf = native_exit_fixture("native_fork_parent_prepared_copyout.S");
+    assert_eq!(native_oracle_status(&elf), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 256, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("fork parent copy-out run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_fork_parent_prepared_copyout.S): {:?}",
+        outcome.run
+    );
+}
+
+/// #2701 / #2668 (R2): the same selection writes the signal frame. A SIGCHLD
+/// handler with `SA_ONSTACK` on a mapped, never-touched signal stack must run
+/// after the fork; before the fix the frame write faulted and the ring forced
+/// SIGSEGV (`si_code` SI_KERNEL), which killed Go on its first child exit.
+#[test]
+fn production_fork_sigchld_handler_runs_on_an_untouched_signal_stack() {
+    let elf = native_exit_fixture("native_fork_sigchld_onstack.S");
+    assert_eq!(native_oracle_status(&elf), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 256, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("fork SIGCHLD on-stack run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_fork_sigchld_onstack.S): {:?}",
+        outcome.run
+    );
+}
+
 /// #2359: two clone threads of the root raw-exit at the same moment on the
 /// two CPUs. Each clears its child-tid word through the MM owner while its
 /// sibling's exit can hold that MM's editor. Contention is "not now": the
