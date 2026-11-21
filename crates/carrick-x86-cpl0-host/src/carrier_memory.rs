@@ -1435,9 +1435,19 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     permissions,
                     ..
                 } => {
-                    let live = resident.contains(va);
-                    (entry & PRESENT != 0) == live
-                        && (entry & PREPARED != 0) != live
+                    let present = entry & PRESENT != 0;
+                    let prepared = entry & PREPARED != 0;
+                    // The resident page is live. Every other page stays
+                    // prepared until its first touch, but this settlement
+                    // runs without excluding the other CPU: its in-guest
+                    // first touch may already have published one (same
+                    // output, checked above) and written it.
+                    let state = if resident.contains(va) {
+                        present && !prepared
+                    } else {
+                        present != prepared
+                    };
+                    state
                         && entry & PRIVATE != 0
                         && (entry & MAY_WRITE != 0) == permissions.writable
                         && (entry & MAY_EXEC != 0) == permissions.executable
