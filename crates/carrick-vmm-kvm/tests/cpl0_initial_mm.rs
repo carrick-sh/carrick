@@ -6500,11 +6500,12 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
     );
 }
 
-/// #2620 part B: V8's `OS::SetPermissions` aborts when an `mprotect` returns
-/// non-zero. A forked child performs one V8-shaped protection edit and exits
-/// 7 on success, or with the errno of the first failing call (see
-/// `native_child_mprotect_shapes.S` for the cases).
-fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+/// #2722: a large `PROT_NONE|MAP_NORESERVE` reservation must find a gap in the
+/// initial mmap arena. The fixture reserves, commits a part and writes it, and
+/// exits 7 on success, or with the errno of the first failing call (see
+/// `native_child_mprotect_shapes.S` for the cases). The same binary runs
+/// natively first, as the Linux oracle.
+fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DCASE={case}");
     let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&define]);
     let dir = tempfile::tempdir().expect("oracle directory");
@@ -6517,40 +6518,19 @@ fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOut
         .expect("run native oracle");
     assert_eq!(native.status.code(), Some(7), "native oracle case {case}");
     try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
-        .expect("mprotect shape run")
+        .expect("reservation shape run")
 }
 
-macro_rules! mprotect_shape_witness {
+macro_rules! reservation_shape_witness {
     ($name:ident, $case:expr, $doc:expr) => {
         #[doc = $doc]
         #[test]
         fn $name() {
-            let outcome = run_mprotect_shape($case);
-            let counters = outcome.physical.syscall_counters().expect("counters");
-            let at = |bucket: &[std::sync::atomic::AtomicU64]| -> Vec<(usize, u64)> {
-                bucket
-                    .iter()
-                    .enumerate()
-                    .map(|(nr, c)| (nr, c.load(std::sync::atomic::Ordering::Acquire)))
-                    .filter(|(nr, c)| *c != 0 && matches!(nr, 9 | 10 | 11 | 28))
-                    .collect()
-            };
-            eprintln!(
-                "case {} exit {} (x86 nr 9 mmap, 10 mprotect, 11 munmap) served {:?} forwarded {:?} \
-                 refused {:?} refused_child {:?} venue_refused {:?} venue_refused_child {:?}",
-                $case,
-                outcome.run.exit_code,
-                at(&counters.served),
-                at(&counters.forwarded),
-                at(&counters.refused),
-                at(&counters.refused_child),
-                at(&counters.venue_refused),
-                at(&counters.venue_refused_child),
-            );
+            let outcome = run_reservation_shape($case);
             assert_eq!(
                 (outcome.run.exit_code, outcome.run.terminating_signal),
                 (7, None),
-                "case {} child exit (7 = Linux; else the errno): {:?}",
+                "case {} exit (7 = Linux; else the errno, +100 from mmap): {:?}",
                 $case,
                 outcome.run
             );
@@ -6558,43 +6538,34 @@ macro_rules! mprotect_shape_witness {
     };
 }
 
-mprotect_shape_witness!(
+reservation_shape_witness!(
     production_mprotect_commits_inside_a_gib_noreserve_reservation,
     1,
-    "A 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
+    "A forked child's 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
 );
-mprotect_shape_witness!(
-    production_mprotect_flips_rw_anonymous_to_rx_and_calls_it,
-    2,
-    "RW anonymous page, code written, mprotect R|X, then executed."
-);
-mprotect_shape_witness!(
-    production_mprotect_makes_rw_anonymous_rwx_and_calls_it,
-    3,
-    "As the R|X flip, with R|W|X."
-);
-mprotect_shape_witness!(
-    production_mprotect_spans_two_adjacent_vmas,
-    4,
-    "One mprotect across the boundary of two adjacent VMAs."
-);
-mprotect_shape_witness!(
-    production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
-    5,
-    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run."
-);
-mprotect_shape_witness!(
+reservation_shape_witness!(
     production_mprotect_commits_inside_a_16_mib_reservation,
     6,
     "Size probe: as the GiB reserve, at 16 MiB."
 );
-mprotect_shape_witness!(
+reservation_shape_witness!(
     production_mprotect_commits_inside_a_256_mib_reservation,
     7,
     "Size probe: as the GiB reserve, at 256 MiB."
 );
-mprotect_shape_witness!(
+reservation_shape_witness!(
     production_mprotect_commits_inside_a_gib_reservation_in_the_root,
     8,
-    "Size probe: the GiB reserve issued by the run root, no fork."
+    "The GiB reserve issued by the run root, no fork."
+);
+reservation_shape_witness!(
+    production_mprotect_commits_three_gib_into_a_4gib_reservation,
+    10,
+    "A 4 GiB reserve, 1 MiB committed RW 3 GiB into it."
+);
+reservation_shape_witness!(
+    production_fork_child_runs_beside_a_parent_holding_a_4gib_reservation,
+    9,
+    "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
+     committed page and the child reserves 1 GiB more."
 );
