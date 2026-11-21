@@ -1439,10 +1439,15 @@ impl Personality for LinuxPersonality {
             // exactly as ARM's owned entry does, then hand the payload to
             // the shared owner, which parks until the carrier has prepared
             // and sealed the successor. The carrier consumes the root's
-            // settlement; ARM's root forwards to its host instead.
+            // settlement on the loaded lane, so only the root thread holding
+            // that lane's custody hands it over; ARM's root forwards to its
+            // host instead.
             if route == CompletionRoute::NativeService
                 && carrick_el1_linux::dispatch::native_exec_claimed(
-                    carrick_el1_linux::dispatch::RootExecServer::NativeService,
+                    carrick_el1_linux::dispatch::RootExecServer::native_service_for(
+                        source.zone.slot(slot).host_record(),
+                        source.zone.slot(slot).current(),
+                    ),
                     || process.thread_group_owner(),
                 )
                 && let Some(request) =
