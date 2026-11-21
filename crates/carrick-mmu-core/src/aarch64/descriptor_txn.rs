@@ -2066,6 +2066,11 @@ impl Executor<'_> {
                 Loc::Fresh(_) => Err(DescriptorRefusal::Malformed),
             };
         }
+        if descriptor == 0
+            && matches!(self.op, DescriptorOp::Protect(edit) if edit.ceiling.is_some())
+        {
+            return Ok(0);
+        }
         let covers_entry = self.start <= base && base + span <= self.end;
         if let DescriptorOp::Terminal { edit, .. } = self.op {
             if level > 0 && level < 3 && descriptor != 0 && edit.rule.requires_private_pages() {
@@ -4061,6 +4066,40 @@ mod tests {
                 DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
             );
             assert_eq!(words.image(), armed);
+        }
+
+        #[test]
+        fn sparse_protect_refuses_a_later_host_leaf_without_editing_the_first_run() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(3, PageSpan::new(VA, 3 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            words.set(leaf_pa(VA + PT_PAGE), 0);
+            let last = leaf_pa(VA + 2 * PT_PAGE);
+            words.set(last, words.get(last) & !SW_EL1_PRIVATE);
+            let before = words.image();
+            assert_eq!(
+                run(
+                    &words,
+                    DescriptorOp::Protect(GuestPermissionEdit {
+                        va: VA,
+                        len: 3 * PT_PAGE,
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                        ceiling: Some(GuestPermissionCeiling {
+                            readable: true,
+                            writable: true,
+                            executable: true,
+                        }),
+                    }),
+                    &TableGrants::NONE,
+                ),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+            );
+            assert_eq!(words.image(), before);
         }
 
         /// #2620: the reservation root's ceiling (Linux `VM_MAY*`), not the

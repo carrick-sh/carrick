@@ -273,6 +273,37 @@ child:
     add $4096, %rbx
     cmp %r14, %rbx
     jb 2b
+    MPROTECT %r15, %r13, $3
+    /* Opening the range keeps touched bytes and faults in zero for holes. */
+    cmpb $0x5a, (%r15)
+    jne harness
+    cmpb $0, 0x2000(%r15)
+    jne harness
+    cmpb $0x5a, 0x3000(%r15)
+    jne harness
+    MPROTECT %r15, %r13, $0
+    mov $11, %edi               /* rt_sigaction(SIGSEGV, &action, NULL, 8) */
+    lea segv_action(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    js fail
+#if CASE == 12
+    movb (%r15), %al            /* backed PROT_NONE page */
+#else
+    movb 0x1000(%r15), %al      /* still-lazy PROT_NONE page */
+#endif
+    jmp harness                  /* the load unexpectedly succeeded */
+segv_handler:
+    cmpl $2, 8(%rsi)            /* siginfo.si_code == SEGV_ACCERR */
+    jne harness
+    jmp done
+sigreturn:
+    mov $15, %eax
+    syscall
+    ud2
 #endif
     jmp done
 #else
@@ -297,6 +328,12 @@ exit:
     mov $231, %eax
     syscall
     ud2
+#if CASE == 12 || CASE == 13
+.section .rodata
+.balign 8
+segv_action:
+    .quad segv_handler, 0x04000004, sigreturn, 0 /* SA_RESTORER | SA_SIGINFO */
+#endif
 .section .bss
 .balign 4
 status: .space 4

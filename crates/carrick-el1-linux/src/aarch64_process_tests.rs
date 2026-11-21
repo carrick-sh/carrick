@@ -5986,8 +5986,8 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     assert_eq!(fault_action, carrick_el1_abi::Action::Forward);
     assert_eq!(
         supply.outcome(),
-        OwnerFaultSupplyOutcome::PolicyDeclined,
-        "mapped anonymous PROT_READ write fault must record PolicyDeclined on Mailbox owner supply"
+        OwnerFaultSupplyOutcome::ProtectionDeclined,
+        "mapped anonymous PROT_READ write fault must record ProtectionDeclined on Mailbox owner supply"
     );
 
     // Ptrace-traced root task must still forward to the host ptrace fault stop.

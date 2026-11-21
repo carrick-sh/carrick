@@ -762,8 +762,9 @@ pub struct GuestPermissionEdit {
     pub executable: bool,
     /// The mapping's ceiling from the reservation root. When present it
     /// bounds the edit on every private leaf (prepared, resident or
-    /// COW-armed) and extends the leaf's software ceiling tags; when absent
-    /// those tags bound it and a COW-armed leaf is refused.
+    /// COW-armed) and extends the leaf's software ceiling tags. The root
+    /// covers the whole range, so absent descriptors are left lazy. Without
+    /// a root ceiling, leaf tags bound the edit and holes or COW are refused.
     pub ceiling: Option<GuestPermissionCeiling>,
 }
 
