@@ -421,6 +421,49 @@ mod tests {
         unsafe { std::alloc::dealloc(dyn_host, dyn_layout) };
     }
 
+    struct NullResolver;
+    impl HostMetadataPinResolver for NullResolver {
+        fn pin_dynamic(
+            &self,
+            _extent: MetadataExtent,
+        ) -> Result<DynamicResidencyPin, MetadataResolutionError> {
+            Err(MetadataResolutionError::InvalidExtent)
+        }
+    }
+
+    /// Dropping a replaced resolver re-enters `clear_host_residency_resolver`
+    /// (a carrier mapping teardown does this). The drop must run outside the
+    /// resolver lock, so the replacing install returns instead of
+    /// self-deadlocking.
+    struct ReentrantClearResolver(usize);
+    impl HostMetadataPinResolver for ReentrantClearResolver {
+        fn pin_dynamic(
+            &self,
+            _extent: MetadataExtent,
+        ) -> Result<DynamicResidencyPin, MetadataResolutionError> {
+            Err(MetadataResolutionError::InvalidExtent)
+        }
+    }
+    impl Drop for ReentrantClearResolver {
+        fn drop(&mut self) {
+            clear_host_residency_resolver(self.0);
+        }
+    }
+
+    #[test]
+    fn replacing_a_resolver_whose_drop_clears_the_resolver_does_not_deadlock() {
+        let _guard = TEST_REGION_LOCK.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            install_host_residency_resolver(1, Arc::new(ReentrantClearResolver(2)));
+            install_host_residency_resolver(2, Arc::new(NullResolver));
+            clear_host_residency_resolver(2);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("install must not drop the replaced resolver under its lock");
+    }
+
     trait CastResidencyPtr {
         fn cast_mut_residency_ptr(self) -> *mut FrameGrantResidencyTable;
     }
