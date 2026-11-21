@@ -352,11 +352,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             return Err(fail("native fault reply already retained"));
                         }
                         match self.prepare_native_backing_grant(execution, window, file, reply)? {
-                            Ok(Some(pending)) => {
+                            Ok(anonymous_owner::BackingPreparation::Prepared(Some(pending))) => {
                                 self.native_backing_pending.insert(address, pending);
                                 true
                             }
-                            Ok(None) => false,
+                            Ok(anonymous_owner::BackingPreparation::Prepared(None)) => false,
+                            // No rerun owner exists on this copy path yet:
+                            // an EFAULT here would be a wrong answer (#2686).
+                            Ok(anonymous_owner::BackingPreparation::Raced(refusal)) => {
+                                return Err(fail(format!(
+                                    "native backing plan raced a publication: {refusal:?}"
+                                )));
+                            }
                             Err(wait) => {
                                 owner_wait = Some(wait);
                                 false
