@@ -933,12 +933,72 @@ fn poll_result(frame: &mut impl GuestDispatchFrame, value: i64) -> IpcServed {
 /// exists for the case the host cannot observe: an inherited zone object that
 /// is not ready yet. It retains the exact pollfd bytes, description pin and
 /// absolute deadline in the same operation arena as pipe and epoll waits.
+///
+/// A pselect6 sigmask follows the `epoll_pwait` protocol
+/// (`kernel.el1.epoll-zone`): it is armed in the thread's control slot just
+/// before the park, so the post-enrollment probe already sees it, and a call
+/// that returns without parking never changes the mask. A parked wait hands
+/// the armed mask to its continuation. A caught signal's EINTR leaves it for
+/// the signal checkpoint, which runs the handler under the temporary mask and
+/// then restores the persistent one; every other end of the call restores it
+/// here.
 pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     output: &mut Option<PollOutput>,
+) -> IpcServed {
+    let record = sched.zone().slot(sched.slot()).current();
+    let mut interrupted = false;
+    let served = serve_zone_readiness(sched, frame, venue, user, output, &mut interrupted);
+    let parked = record.is_some_and(|id| sched.zone().record(id).has_object_operation());
+    if !(parked || interrupted) {
+        user.disarm_wait_sigmask();
+    }
+    served
+}
+
+/// The `sigset_t` pselect6 takes through its `{ss, ss_len}` pair.
+const SELECT_SIGSET_BYTES: u64 = 8;
+
+/// Read pselect6's sixth argument, `{const sigset_t *ss; size_t ss_len}`.
+/// `Ok(None)`: no pair, or a NULL `ss`, leaves the mask alone.
+fn read_select_sigmask(
+    pair_va: u64,
+    user: &mut impl UserCopy,
+) -> Result<Option<u64>, carrick_syscall_abi::LinuxErrno> {
+    use carrick_syscall_abi::{LINUX_EFAULT, LINUX_EINVAL};
+
+    if pair_va == 0 {
+        return Ok(None);
+    }
+    let mut pair = [0u8; 16];
+    if !user.copy_in(&mut pair, pair_va) {
+        return Err(LINUX_EFAULT);
+    }
+    let set_va = u64::from_ne_bytes(pair[..8].try_into().unwrap_or_default());
+    let set_len = u64::from_ne_bytes(pair[8..].try_into().unwrap_or_default());
+    if set_va == 0 {
+        return Ok(None);
+    }
+    if set_len != SELECT_SIGSET_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    let mut set = [0u8; SELECT_SIGSET_BYTES as usize];
+    if !user.copy_in(&mut set, set_va) {
+        return Err(LINUX_EFAULT);
+    }
+    Ok(Some(u64::from_ne_bytes(set)))
+}
+
+fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+    output: &mut Option<PollOutput>,
+    interrupted: &mut bool,
 ) -> IpcServed {
     use crate::dispatch::PollTimeoutKind;
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
@@ -1019,6 +1079,7 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             if reason == Some(carrick_sched_core::Handback::Signal) && user.interrupt_pending_wait()
             {
                 finish(sched, token, region);
+                *interrupted = true;
                 let result = LINUX_EINTR.guest_retval();
                 if let Some(layout) = &select {
                     match native_select_output(*layout, op.buf, sched, pollfd, op.deadline, result)
@@ -1034,6 +1095,8 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
         Ok(None) => None,
     };
 
+    // A resumed call's mask is already armed; it never reads user memory again.
+    let mut sigmask = None;
     let (mut pollfd, deadline, mut retained) = if let Some((pollfd, deadline, token, op)) = resumed
     {
         (pollfd, deadline, Some((token, op)))
@@ -1047,14 +1110,10 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
         }
         if let Some(layout) = &select
             && !layout.timeval
-            && argument_word(frame, 5) != 0
         {
-            let mut pair = [0u8; 16];
-            if !user.copy_in(&mut pair, argument_word(frame, 5)) {
-                return poll_result(frame, LINUX_EFAULT.guest_retval());
-            }
-            if pair[..8] != [0; 8] {
-                return IpcServed::Forward;
+            match read_select_sigmask(argument_word(frame, 5), user) {
+                Ok(mask) => sigmask = mask,
+                Err(errno) => return poll_result(frame, errno.guest_retval()),
             }
         }
         let deadline = match timeout_kind {
@@ -1297,6 +1356,15 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             };
             (token, op)
         };
+        // Armed before the park, whose post-enrollment probe must already see
+        // the temporary mask. A caller without a native signal owner leaves
+        // before any effect; the host swaps the mask around its own wait.
+        if let Some(mask) = sigmask
+            && !user.arm_wait_sigmask(mask)
+        {
+            finish(sched, token, region);
+            return IpcServed::Forward;
+        }
         match park(
             sched,
             frame,
