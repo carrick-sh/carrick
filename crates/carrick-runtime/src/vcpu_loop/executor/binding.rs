@@ -393,10 +393,7 @@ impl PendingExecReplacement {
 
     /// The x86 venue's replacement: `arch` must name the committed
     /// successor's MM.
-    // The x86 RootExecVenue (#2142 slice 4) publishes this; until then only
-    // the KVM retarget witness does.
     #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-    #[allow(dead_code)]
     pub(crate) fn cpl0(
         transition: carrick_kernel::kernel::exec::CommittedExecTransition,
         arch: carrick_hal::guest_arch_binding::GuestArchBinding,

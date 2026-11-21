@@ -29,6 +29,22 @@ pub(crate) struct LoadedExecImage {
     pub(crate) binfmt_argv: Option<Vec<Vec<u8>>>,
 }
 
+/// An x86 CPL0 exec successor as the build maps it, and the executable it
+/// was loaded from.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) struct LoadedX86ExecImage {
+    pub(crate) image: carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
+    pub(crate) source: carrick_kernel::dispatch::executable_authority::ExecSource,
+}
+
+/// The Kernel's half of the x86 run root's exec, resolved by its loader and
+/// carried by the carrier to the root's settlement (#2142): what the
+/// successor's `/proc/self/{exe,cmdline,environ}` report.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) struct X86RootExecLoad {
+    pub(crate) identity: carrick_kernel::kernel::exec_transaction::ExecImageIdentity,
+}
+
 /// Loader configuration retains physical services, never a task or dispatcher.
 pub(crate) struct ExecLoaderCapabilities {
     clock: Arc<carrick_kernel::kernel::container::ClockDomain>,
@@ -107,6 +123,7 @@ fn prepare_native_exec_image(
 ) -> Result<LoadedExecImage, LinuxErrno> {
     prepare_native_exec(
         capability,
+        NativeExecAuthority::Sealed,
         payload,
         descriptor_source,
         |files, target, argv, env| {
@@ -130,6 +147,7 @@ fn prepare_native_exec_image(
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub(crate) fn prepare_native_x86_exec_image(
     capability: &NativeExecCapability,
+    authority: NativeExecAuthority,
     payload: &[u8],
     descriptor_source: impl Fn(
         [u64; 3],
@@ -138,15 +156,10 @@ pub(crate) fn prepare_native_x86_exec_image(
         carrick_kernel::dispatch::executable_authority::ExecSource,
         LinuxErrno,
     >,
-) -> Result<
-    (
-        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
-        carrick_kernel::dispatch::executable_authority::ExecSource,
-    ),
-    LinuxErrno,
-> {
+) -> Result<LoadedX86ExecImage, LinuxErrno> {
     prepare_native_exec(
         capability,
+        authority,
         payload,
         descriptor_source,
         |files, target, argv, env| {
@@ -155,28 +168,99 @@ pub(crate) fn prepare_native_x86_exec_image(
     )
 }
 
-/// The KVM CPL0 carrier's exec loader for a fork child's staged payload
-/// (#2235): the run's exec capability and descriptor sources, through
-/// [`prepare_native_x86_exec_image`].
+/// The KVM CPL0 carrier's exec loader for a native exec's staged payload:
+/// a fork child's (#2235) under its sealed access, the run root's (#2142)
+/// under the root's own filesystem authority, which the carrier retains.
+/// `origin` is the lineage the ring's authenticated service identity names.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub(crate) fn load_native_x86_exec(
     dispatcher: &std::sync::Mutex<SyscallDispatcher>,
+    origin: carrick_core_abi::service::ServiceOrigin,
     payload: &[u8],
-) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::NativeExecLoad, LinuxErrno> {
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
     let capability = capture_native_exec_capability(&dispatcher)?;
-    let (image, source) = prepare_native_x86_exec_image(&capability, payload, |table, fd| {
-        dispatcher.native_descriptor_exec_source(table, fd)
-    })?;
-    Ok(image.with_executable(dispatcher.retain_native_executable(source)))
+    let authority = match origin {
+        carrick_core_abi::service::ServiceOrigin::Initial => NativeExecAuthority::HostRoot,
+        carrick_core_abi::service::ServiceOrigin::Descendant => NativeExecAuthority::Sealed,
+    };
+    let LoadedX86ExecImage { image, source } =
+        prepare_native_x86_exec_image(&capability, authority, payload, |table, fd| {
+            dispatcher.native_descriptor_exec_source(table, fd)
+        })?;
+    let image = image.with_executable(dispatcher.retain_native_executable(source.clone()));
+    let root = match authority {
+        NativeExecAuthority::Sealed => None,
+        NativeExecAuthority::HostRoot => {
+            Some(
+                Box::new(X86RootExecLoad {
+                    identity: x86_root_exec_identity(payload, source)?,
+                }) as carrick_x86_cpl0_host::cpl0_boot::exec_service::RootExecLoad,
+            )
+        }
+    };
+    Ok(carrick_x86_cpl0_host::cpl0_boot::exec_service::NativeExecLoad { image, root })
 }
 
-/// Parse a native child's staged exec request under the caller's sealed
-/// access, and hand what it names to `load`.
+/// The identity the x86 root's successor reports, as the caller named it:
+/// the requested path (`/dev/fd/N` for `fexecve`) and the caller's own argv
+/// and environment, before any `#!` expansion. x86 guests take no Rosetta
+/// redirect, so there are no binfmt argv.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn x86_root_exec_identity(
+    payload: &[u8],
+    source: carrick_kernel::dispatch::executable_authority::ExecSource,
+) -> Result<carrick_kernel::kernel::exec_transaction::ExecImageIdentity, LinuxErrno> {
+    let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
+        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    let path = core::str::from_utf8(view.path()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    let path = match view.call() {
+        carrick_core_abi::service::ExecCall::Execveat { dirfd, flags }
+            if path.is_empty() && flags & carrick_abi::LINUX_AT_EMPTY_PATH as u32 != 0 =>
+        {
+            format!("/dev/fd/{dirfd}")
+        }
+        _ => path.to_owned(),
+    };
+    let argv: Vec<String> = view
+        .argv()
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+    Ok(
+        carrick_kernel::kernel::exec_transaction::ExecImageIdentity {
+            path,
+            command_line: argv.join(" "),
+            argv,
+            env: view.envp().map(<[u8]>::to_vec).collect(),
+            source,
+            binfmt_argv: None,
+        },
+    )
+}
+
+/// Whose filesystem authority resolves a native exec request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeExecAuthority {
+    /// The caller's own cwd and credentials, which its ring owner sealed
+    /// into the request from the caller's task row (#1392).
+    Sealed,
+    /// The initial host root's: the carrier retains the root's filesystem
+    /// custody (#1714 option A), so its request crosses unsealed and
+    /// resolves with the capability's own root context (#2142).
+    #[cfg_attr(
+        not(all(feature = "platform-linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    HostRoot,
+}
+
+/// Parse a native exec request under `authority`, and hand what it names to
+/// `load`.
 fn prepare_native_exec<R>(
     capability: &NativeExecCapability,
+    authority: NativeExecAuthority,
     payload: &[u8],
     descriptor_source: impl Fn(
         [u64; 3],
@@ -195,18 +279,27 @@ fn prepare_native_exec<R>(
     let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     // Served exactly or left unrouted: counted ENOSYS, never a guess.
-    let access = view.access().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
-    // `ExecFiles` resolves from the global root; a chrooted caller's exec
-    // is left unrouted until it resolves under the caller's root.
-    if access.root.is_some_and(|root| root != b"/") {
-        return Err(crate::linux_abi::LINUX_ENOSYS);
-    }
-    let cwd = core::str::from_utf8(access.cwd).map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
-    let files = capability.files.for_native_access(
-        cwd.to_owned(),
-        carrick_abi::NsUid::new(access.ids.fsuid),
-        carrick_abi::NsGid::new(access.ids.fsgid),
-    );
+    let files = match (authority, view.access()) {
+        (NativeExecAuthority::Sealed, Some(access)) => {
+            // `ExecFiles` resolves from the global root; a chrooted caller's
+            // exec is left unrouted until it resolves under the caller's root.
+            if access.root.is_some_and(|root| root != b"/") {
+                return Err(crate::linux_abi::LINUX_ENOSYS);
+            }
+            let cwd =
+                core::str::from_utf8(access.cwd).map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
+            capability.files.for_native_access(
+                cwd.to_owned(),
+                carrick_abi::NsUid::new(access.ids.fsuid),
+                carrick_abi::NsGid::new(access.ids.fsgid),
+            )
+        }
+        // The capability was captured from the run root's own context.
+        (NativeExecAuthority::HostRoot, None) => capability.files.clone(),
+        (NativeExecAuthority::Sealed, None) | (NativeExecAuthority::HostRoot, Some(_)) => {
+            return Err(crate::linux_abi::LINUX_ENOSYS);
+        }
+    };
     let descriptor = |fd: carrick_el1_abi::ipc::fd::Fd| {
         let table = view.table().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
         descriptor_source(table, fd.0)
@@ -899,13 +992,7 @@ pub(crate) fn load_x86_exec_image<'a>(
     target: impl Into<ExecTarget<'a>>,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-) -> Result<
-    (
-        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
-        carrick_kernel::dispatch::executable_authority::ExecSource,
-    ),
-    LinuxErrno,
-> {
+) -> Result<LoadedX86ExecImage, LinuxErrno> {
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
     // No vDSO or trap policy reaches an image the CPL0 build maps.
     let _ = loader;
@@ -925,8 +1012,10 @@ pub(crate) fn load_x86_exec_image<'a>(
             error,
         ))
     })?;
-    let image = X86ExecImage::from_program(&program, argv, env)?;
-    Ok((image, source))
+    Ok(LoadedX86ExecImage {
+        image: X86ExecImage::from_program(&program, argv, env)?,
+        source,
+    })
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
@@ -2022,10 +2111,11 @@ mod tests {
         let load = |path: &str, argv: &[&[u8]]| {
             prepare_native_x86_exec_image(
                 &capability,
+                NativeExecAuthority::Sealed,
                 &x86_exec_payload(ExecCall::Execve, path, argv, None),
                 no_descriptors,
             )
-            .map(|(image, _)| image)
+            .map(|loaded| loaded.image)
         };
 
         let image = load("/bin/successor", &[b"successor"]).expect("a static successor loads");
@@ -2080,15 +2170,17 @@ mod tests {
         };
         let table = [7, 8, 9];
         let asked = std::cell::Cell::new(None);
-        let (by_descriptor, _) = prepare_native_x86_exec_image(
+        let by_descriptor = prepare_native_x86_exec_image(
             &capability,
+            NativeExecAuthority::Sealed,
             &x86_exec_payload(fexecve, "", &[b"opened"], Some(table)),
             |t, fd| {
                 asked.set(Some((t, fd)));
                 Ok(source.clone())
             },
         )
-        .expect("fexecve loads the open file");
+        .expect("fexecve loads the open file")
+        .image;
         assert_eq!(asked.get(), Some((table, 3)));
         assert_eq!(by_descriptor.entry().entry.raw(), 0x401000);
 
@@ -2102,12 +2194,14 @@ mod tests {
             }
         };
         for spelling in ["/proc/self/fd/3", "/dev/fd/3"] {
-            let (image, _) = prepare_native_x86_exec_image(
+            let image = prepare_native_x86_exec_image(
                 &capability,
+                NativeExecAuthority::Sealed,
                 &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
                 resolve,
             )
-            .expect("execve of an fd path loads the open file");
+            .expect("execve of an fd path loads the open file")
+            .image;
             assert_eq!(image.entry().entry.raw(), 0x401000);
         }
         for (spelling, errno) in [
@@ -2118,6 +2212,7 @@ mod tests {
         ] {
             let result = prepare_native_x86_exec_image(
                 &capability,
+                NativeExecAuthority::Sealed,
                 &x86_exec_payload(ExecCall::Execve, spelling, &[b"opened"], Some(table)),
                 resolve,
             );
