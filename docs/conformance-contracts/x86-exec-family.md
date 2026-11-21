@@ -249,17 +249,32 @@ path, and the host Kernel's half runs at the root's settlement:
   here kills the run with SIGSEGV (past no return).
 - **Owed work.** A native service is never declined for owed host work on
   x86. That transport has no replay, and the exec would be refused ENOSYS.
+- **Custody.** The carrier consumes the settlement only on the lane holding
+  the root's loaded custody; on any other lane the exec owner hands it back
+  (`ExecSettlement::NotHere`) after the ring's point of no return. So the
+  ring claims a root exec only for that lane's host-loaded home record
+  (`RootExecServer::native_service_for`). The leader is that record from
+  boot, and a home record runs on its home lane only, whatever its
+  affinity: its exec always settles on the custody lane. A non-leader root
+  thread holds no custody on either CPU, and its exec stays unrouted (the
+  counted ENOSYS main gives) before anything is staged.
 
 Witnesses: `production_root_exec_{replaces_image_and_runs_static_successor,
 of_a_missing_path_is_enoent,of_a_non_elf_file_is_enoexec,twice_runs_the_second_successor,
-with_a_running_sibling_thread_runs_the_successor,closes_only_close_on_exec_descriptors}`.
-The last three also run the fixture natively as the Linux oracle.
+with_a_running_sibling_thread_runs_the_successor,closes_only_close_on_exec_descriptors}`
+on the loaded lane. The image, twice, running-sibling and fork-wait4-exec
+(`production_root_fork_wait_exec_*`) witnesses also run with the root's
+affinity on the idle peer and on either CPU, and assert every settlement
+lands on the custody lane (exec owner census `handed_back` 0).
+`production_root_thread_exec_*` witness the non-leader thread's unrouted
+exec on all three affinities (red on 0ab17c717 with a ring fatal: the exec
+drain killed the yielding leader). The fixtures with a native run also run
+as the Linux oracle.
 
 What remains (follow-ups):
-- A root exec settled on the idle peer is still handed back unchanged
-  (`ExecSettlement::NotHere`). The ring's handback of that record (R3 of the
-  approved design) is not built. Every witness pins the root to the loaded
-  lane.
+- A non-leader root thread's exec is unrouted (#2723): Linux runs the
+  successor with the thread taking the leader's TID, which needs the root's
+  custody to move with it.
 - The boot-built predecessor's frames and tables are not returned on root
   exec. The root form has no stock custody for them.
 - The host's own `FileTable` for the root mirrors only what the host
