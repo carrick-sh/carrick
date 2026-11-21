@@ -376,6 +376,11 @@ mod test_support {
             if spins > BIRTH_HOLD_SPINS {
                 carrick_x86_carrier::entry::fatal_boot();
             }
+            // A real fork preparation returns; the hold must still
+            // acknowledge a sibling's TLB shootdown on this running root.
+            if carrick_el1::isa::x86::interrupt::service_shootdowns().is_err() {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
             core::hint::spin_loop();
         }
         FORK_COMMIT_HOLD.store(0, Ordering::Release);
