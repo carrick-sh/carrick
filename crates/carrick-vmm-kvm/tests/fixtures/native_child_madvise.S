@@ -133,6 +133,41 @@ child:
     syscall
     cmp $-22, %rax
     jne einval_failed
+
+    /* A mapped range may include a never-backed hole between two runs.
+     * Commit only its endpoints before touching them. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    xor %edx, %edx
+    mov $0x4022, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js map_failed
+    mov %rax, %r15
+    mov %r15, %rdi
+    mov $0x1000, %esi
+    mov $3, %edx
+    mov $74, %ebx
+    call protect
+    lea 0x3000(%r15), %rdi
+    mov $0x1000, %esi
+    mov $3, %edx
+    mov $74, %ebx
+    call protect
+    movb $0x61, (%r15)
+    movb $0x62, 0x3000(%r15)
+    mov %r15, %rdi
+    mov $0x4000, %esi
+    mov $4, %edx
+    call advise
+    cmpb $0, (%r15)
+    jne sparse_bytes_failed
+    cmpb $0, 0x3000(%r15)
+    jne sparse_bytes_failed
+
     xor %edi, %edi
     jmp exit
 
@@ -182,6 +217,9 @@ rw_bytes_failed:
     jmp exit
 einval_failed:
     mov $69, %edi
+    jmp exit
+sparse_bytes_failed:
+    mov $75, %edi
 exit:
     mov $231, %eax
     syscall
