@@ -18848,6 +18848,197 @@ fn serial_host_native_child_pselect6_wakes_on_parent_pipe_write_and_times_out() 
     });
 }
 
+/// #2621: apt's refused shape. A fork child's `pselect6(9, read, write,
+/// NULL, timeout, NULL)` over three zone pipes (two in the read set, one in
+/// the write set) is served in ring as a client of the epoll owner: an
+/// immediate answer reports only the writable pipe, a full write pipe and
+/// empty read pipes time out at once, and a blocking wait parks until the
+/// live parent writes ONE read pipe (exactly that bit, the write set clear)
+/// or drains the write pipe (only the write bit). A temporary mask holds a
+/// signal across a multi-descriptor wait.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pselect6_multi_fd_wakes_on_one_parent_pipe() {
+    use ArmCaller::Root;
+    use carrick_personality_linux::{crossing::nr as sys, dispatch::CompletionRoute};
+    use carrick_test_support::GuestUserBuffer;
+
+    const EAGAIN: i64 = -11;
+    let served = |route: CompletionRoute| {
+        matches!(route, CompletionRoute::Served | CompletionRoute::WithWork)
+    };
+    with_arm_process_host_dispatch(|call| {
+        let (_, parent_pid) = call(Root, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(parent_pid > 0);
+        let parent = ArmCaller::Child(parent_pid as u32);
+        call(parent, ARM_RESUME, [0; 6]);
+        let mut pipe = |flags: u64| {
+            let fds = GuestUserBuffer::zeroed(8);
+            assert_eq!(
+                call(parent, sys::PIPE2.raw(), [fds.arg(), flags, 0, 0, 0, 0]).1,
+                0
+            );
+            let bytes = fds.as_bytes();
+            (
+                u64::from(u32::from_ne_bytes(bytes[..4].try_into().unwrap())),
+                u64::from(u32::from_ne_bytes(bytes[4..].try_into().unwrap())),
+            )
+        };
+        let a = pipe(0);
+        let b = pipe(0);
+        let w = pipe(carrick_abi::LINUX_O_NONBLOCK);
+        let nfds = a.0.max(a.1).max(b.0).max(b.1).max(w.0).max(w.1) + 1;
+        assert_eq!(nfds, 9, "apt's shape: pipes at fds 3..=8");
+        let (_, child_pid) = call(parent, 220, [17, 0, 0, 0, 0, 0]);
+        assert!(child_pid > 0);
+        let child = ArmCaller::Child(child_pid as u32);
+        call(child, ARM_RESUME, [0; 6]);
+
+        let bits = |fds: &[u64]| fds.iter().fold(0u64, |set, fd| set | 1 << fd).to_ne_bytes();
+        let read_interest = bits(&[a.0, b.0]);
+        let write_interest = bits(&[w.1]);
+        let mut read_set = GuestUserBuffer::from_bytes(&read_interest);
+        let mut write_set = GuestUserBuffer::from_bytes(&write_interest);
+        let mut timeout = GuestUserBuffer::from_value([5u64, 0]);
+        let args = |read: &GuestUserBuffer, write: &GuestUserBuffer, timeout: u64, mask: u64| {
+            [nfds, read.arg(), write.arg(), 0, timeout, mask]
+        };
+
+        // The write pipe has room: an immediate answer, the write bit alone.
+        let ready = call(
+            child,
+            sys::PSELECT6.raw(),
+            args(&read_set, &write_set, timeout.arg(), 0),
+        );
+        assert_eq!(ready.1, 1, "immediate multi-fd pselect6: {ready:?}");
+        assert!(served(ready.0));
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert_eq!(write_set.as_bytes(), &write_interest);
+
+        // Fill the write pipe: nothing is ready, a zero timeout answers 0.
+        let chunk = GuestUserBuffer::zeroed(4096);
+        let mut filled = 0;
+        loop {
+            let (_, wrote) = call(child, sys::WRITE.raw(), [w.1, chunk.arg(), 4096, 0, 0, 0]);
+            if wrote == EAGAIN {
+                break;
+            }
+            assert!(wrote > 0, "filling the write pipe: {wrote}");
+            filled += wrote;
+            assert!(filled <= 1 << 20, "a pipe without capacity");
+        }
+        read_set.as_mut_bytes().copy_from_slice(&read_interest);
+        write_set.as_mut_bytes().copy_from_slice(&write_interest);
+        timeout.as_mut_bytes().fill(0);
+        let none = call(
+            child,
+            sys::PSELECT6.raw(),
+            args(&read_set, &write_set, timeout.arg(), 0),
+        );
+        assert_eq!(none.1, 0, "zero-timeout multi-fd pselect6: {none:?}");
+        assert!(served(none.0));
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert_eq!(write_set.as_bytes(), &[0; 8]);
+
+        // Blocking: parks in ring on every member, the parent runs on the
+        // released slot and writes the second read pipe only.
+        read_set.as_mut_bytes().copy_from_slice(&read_interest);
+        write_set.as_mut_bytes().copy_from_slice(&write_interest);
+        let blocking = args(&read_set, &write_set, 0, 0);
+        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(child, sys::PSELECT6.raw(), blocking);
+        assert_eq!(
+            parked.0,
+            CompletionRoute::Suspended,
+            "blocking multi-fd pselect6 must park: {parked:?}"
+        );
+        assert_eq!(
+            call(child, ARM_RESUME, [0; 6]).0,
+            CompletionRoute::Suspended
+        );
+        let byte = GuestUserBuffer::from_bytes(b"b");
+        assert_eq!(
+            call(parent, sys::WRITE.raw(), [b.1, byte.arg(), 1, 0, 0, 0]).1,
+            1
+        );
+        let mut result = call(child, ARM_RESUME, [0; 6]);
+        if result.1 == i64::MIN {
+            result = call(child, sys::PSELECT6.raw(), blocking);
+        }
+        assert_eq!(result.1, 1, "parent write wakes the set: {result:?}");
+        assert!(served(result.0));
+        assert_eq!(read_set.as_bytes(), &bits(&[b.0]));
+        assert_eq!(write_set.as_bytes(), &[0; 8]);
+        let received = GuestUserBuffer::zeroed(1);
+        assert_eq!(
+            call(child, sys::READ.raw(), [b.0, received.arg(), 1, 0, 0, 0]).1,
+            1
+        );
+        assert_eq!(received.as_bytes(), b"b");
+
+        // Blocking again: the parent drains the write pipe, which wakes the
+        // write member alone.
+        read_set.as_mut_bytes().copy_from_slice(&read_interest);
+        write_set.as_mut_bytes().copy_from_slice(&write_interest);
+        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(child, sys::PSELECT6.raw(), blocking);
+        assert_eq!(parked.0, CompletionRoute::Suspended, "{parked:?}");
+        let drain = GuestUserBuffer::zeroed(4096);
+        let mut drained = 0;
+        loop {
+            let (_, got) = call(parent, sys::READ.raw(), [w.0, drain.arg(), 4096, 0, 0, 0]);
+            if got == EAGAIN {
+                break;
+            }
+            assert!(got > 0, "draining the write pipe: {got}");
+            drained += got;
+        }
+        assert_eq!(drained, filled);
+        let mut result = call(child, ARM_RESUME, [0; 6]);
+        if result.1 == i64::MIN {
+            result = call(child, sys::PSELECT6.raw(), blocking);
+        }
+        assert_eq!(
+            result.1, 1,
+            "a drained pipe wakes the write member: {result:?}"
+        );
+        assert_eq!(read_set.as_bytes(), &[0; 8]);
+        assert_eq!(write_set.as_bytes(), &write_interest);
+
+        // Two read pipes under a temporary SIGUSR1 mask: the masked signal
+        // never ends the wait, the parent's write to the first pipe does.
+        let sigusr1 = 1u64 << (10 - 1);
+        let sig_buf = GuestUserBuffer::from_bytes(&sigusr1.to_ne_bytes());
+        let sig_pair = GuestUserBuffer::from_value([sig_buf.arg(), 8]);
+        read_set.as_mut_bytes().copy_from_slice(&read_interest);
+        let masked = [nfds, read_set.arg(), 0, 0, 0, sig_pair.arg()];
+        call(child, ARM_LEAVE_ON_PARK, [0; 6]);
+        let parked = call(child, sys::PSELECT6.raw(), masked);
+        assert_eq!(parked.0, CompletionRoute::Suspended, "{parked:?}");
+        assert_eq!(
+            call(parent, 129, [child_pid as u64, 10, 0, 0, 0, 0]).1,
+            0,
+            "parent kill(child, SIGUSR1)"
+        );
+        assert_eq!(
+            call(child, ARM_RESUME, [0; 6]).0,
+            CompletionRoute::Suspended,
+            "a masked signal must not end the multi-fd wait"
+        );
+        let byte = GuestUserBuffer::from_bytes(b"a");
+        assert_eq!(
+            call(parent, sys::WRITE.raw(), [a.1, byte.arg(), 1, 0, 0, 0]).1,
+            1
+        );
+        let mut result = call(child, ARM_RESUME, [0; 6]);
+        if result.1 == i64::MIN {
+            result = call(child, sys::PSELECT6.raw(), masked);
+        }
+        assert_eq!(result.1, 1, "masked multi-fd wait: {result:?}");
+        assert_eq!(read_set.as_bytes(), &bits(&[a.0]));
+    });
+}
+
 #[test]
 fn arm_root_host_backed_descriptors_keep_one_owner() {
     use carrick_abi::{
