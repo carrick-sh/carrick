@@ -2193,14 +2193,50 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return self.settle_cow_grant(index, execution);
         }
         if let Some(PendingGrant::Prepare(pending)) = self.anonymous_pending[index].take() {
-            let reply = self
+            use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+            let reply_ptr = self
                 .grant_portal()?
                 .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
                 as *const carrick_el1_abi::PortalGrantSlot;
             // SAFETY: the carrier retains this initialized physical reply.
-            if !self.settle_backing_grant(pending, unsafe { &*reply }, None)? {
-                return Err(fail("owner grant refused"));
+            let reply = unsafe { &*reply_ptr };
+            let applied = reply
+                .inspect_receipt(pending.window, &pending.txn)
+                .is_some_and(|receipt| matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+            if applied {
+                if !self.settle_backing_grant(pending, reply, None)? {
+                    return Err(fail("owner grant refused"));
+                }
+                return Ok(());
+            }
+            let ram = Arc::clone(&self.ram);
+            let zone = retained_cow_zone(&ram)?;
+            let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+            let delivery = |zone: &X86Cpl0Zone,
+                            waker: Waker,
+                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| wake.deliver(zone, waker, owned);
+            let release = SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                    &delivery,
+                ),
+            };
+            match self.settled_pause(release, pending.window.operation.mm)? {
+                Ok((pause, _)) => {
+                    self.settle_backing_grant(pending, reply, Some(&pause))?;
+                    drop(pause);
+                    wake.finish()?;
+                }
+                Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                    self.settle_backing_grant(pending, reply, None)?;
+                    wake.finish()?;
+                }
+                Err(_) => return Err(fail("owner grant settlement MM changed")),
             }
             return Ok(());
         }
@@ -2215,7 +2251,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return self.supply_cow_grant(index, execution, window);
         }
-        let (_, window) = self
+        let (generation, window) = self
             .grant_portal()?
             .grant(index)
             .ok_or_else(|| fail("owner grant slot"))?
@@ -2227,8 +2263,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .ok_or_else(|| fail("owner grant slot"))?
             as *const carrick_el1_abi::PortalGrantSlot;
         // SAFETY: the carrier retains this initialized slot across staging.
-        let pending = self.prepare_backing_grant(execution, window, file, unsafe { &*reply })?;
-        self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+        match self.prepare_native_backing_grant(execution, window, file, unsafe { &*reply })? {
+            Ok(pending) => {
+                self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+            }
+            Err(_wait) => {
+                let _ = unsafe { &*reply }.cancel_fault_selection(window, generation);
+            }
+        }
         Ok(())
     }
 
@@ -2323,21 +2365,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             None => return Err(fail("owner grant receipt absent")),
         };
         if undo {
-            let _proof = exclusion
-                .ok_or_else(|| fail("owner grant refused"))?
-                .proof();
             // The exact withdrawn or rolled-back receipt proves that none of
             // these fresh bytes are named by a guest descriptor.
             pending.inventory.guest_exposed = false;
-            unsafe {
-                self._vm
-                    .cancel_prepared(&[pending.handle], &mut pending.inventory)
+            if let Some(pause) = exclusion {
+                self.cancel_withdrawn_backing(pending, pause.proof())?;
+            } else {
+                self.cancelled_backing_pending.push(pending);
             }
-            .map_err(|error| fail(error.to_string()))?;
-            self.prepare_table_stock
-                .as_mut()
-                .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
-                .return_unused(pending.tables, 0)?;
             return Ok(false);
         }
         let receipt = receipt.ok_or_else(|| fail("owner grant applied receipt absent"))?;
@@ -2388,6 +2423,46 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // Retained stage-2 custody now belongs to the live guest graph.
         let _retained = pending.handle;
         Ok(true)
+    }
+
+    pub(super) fn cancel_withdrawn_backing(
+        &mut self,
+        mut pending: PendingPrepare,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        if excluded.key() != pending.window.operation.mm.raw() {
+            return Err(fail("withdrawn backing exclusion MM mismatch"));
+        }
+        pending.inventory.guest_exposed = false;
+        // SAFETY: `excluded` proves no guest editor of this MM is active, and
+        // the exact withdrawn or refused receipt proved no guest descriptor
+        // ever named `pending.handle`.
+        unsafe {
+            self._vm
+                .cancel_prepared(&[pending.handle], &mut pending.inventory)
+        }
+        .map_err(|error| fail(error.to_string()))?;
+        self.prepare_table_stock
+            .as_mut()
+            .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
+            .return_unused(pending.tables, 0)?;
+        Ok(())
+    }
+
+    pub(super) fn drain_cancelled_backing_for_excluded(
+        &mut self,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let mut retained = Vec::new();
+        for pending in core::mem::take(&mut self.cancelled_backing_pending) {
+            if pending.window.operation.mm.raw() == excluded.key() {
+                self.cancel_withdrawn_backing(pending, excluded)?;
+            } else {
+                retained.push(pending);
+            }
+        }
+        self.cancelled_backing_pending = retained;
+        Ok(())
     }
 
     pub(super) fn prepare_native_backing_grant(

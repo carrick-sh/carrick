@@ -771,7 +771,12 @@ pub(super) fn park_contended_fault(
                 Err(EditAdmissionRefusal::Stale) => None,
             }
         },
-        |key, snapshot, token| {
+        |key, snapshot, fallback| {
+            let Some(token) = carrick_sched_core::object_wait::OperationToken::metadata_request(
+                snapshot.observed().revision().max(1),
+            ) else {
+                return Err((ObjectWaitError::Stale, fallback));
+            };
             let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
             let mut replaced = None;
             let result = park_object_record_rechecked(
@@ -804,7 +809,11 @@ pub(super) fn park_contended_fault(
         },
     );
     match outcome {
-        EditWaitOutcome::Parked(_) => ContendedFault::Parked,
+        EditWaitOutcome::Parked(_) => {
+            #[cfg(feature = "test-support")]
+            crate::test_support::publish_edit_park();
+            ContendedFault::Parked
+        }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,
         EditWaitOutcome::Refused => ContendedFault::Refused,
     }
@@ -870,7 +879,7 @@ pub(super) fn park_owner_fault_wait(
             (enrollment.key(), enrollment.observed_snapshot())
         }
     };
-    let Some(token) = OperationToken::prepared_edit(key) else {
+    let Some(token) = OperationToken::metadata_request(wait.revision().max(1)) else {
         return ContendedFault::Refused;
     };
     let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
@@ -896,7 +905,11 @@ pub(super) fn park_owner_fault_wait(
         || task.mm.key.load(Ordering::Acquire) == mm.raw(),
     );
     match result {
-        Ok(_) => ContendedFault::Parked,
+        Ok(_) => {
+            #[cfg(feature = "test-support")]
+            crate::test_support::publish_edit_park();
+            ContendedFault::Parked
+        }
         Err((ObjectWaitError::Changed, _)) => {
             if let Some((record, previous)) = replaced {
                 // SAFETY: failed publication leaves this slot owning record.
