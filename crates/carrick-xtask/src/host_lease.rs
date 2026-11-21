@@ -1222,9 +1222,10 @@ mod tests {
     /// #2375: under a continuous stream of shared holders, where each next
     /// holder is admitted BEFORE the previous one releases (so the lock is
     /// never free), an exclusive request is granted after the holder already
-    /// in releases, ahead of the next shared request. On main the stream never
-    /// leaves a gap, and the writer starves until its limit. Overlap and
-    /// ordering are established by coordination; time is only a hang guard.
+    /// in releases, ahead of any shared request made once it is queued. Without
+    /// the turnstile the stream never leaves a gap, and the writer starves until
+    /// its limit. Overlap and ordering are established by coordination; time is
+    /// only a hang guard.
     #[test]
     fn exclusive_request_is_granted_ahead_of_a_continuous_shared_stream() {
         use std::sync::Arc;
@@ -1247,35 +1248,50 @@ mod tests {
             })
         };
         let mut handoffs = 0u32;
-        let next_at = loop {
+        // A shared request that was already on its way when the writer was
+        // seen queued: it may have passed the turnstile just before the writer
+        // took it, and report only later (#2557), so it carries no ordering claim.
+        let mut undecided = None;
+        while !writer_queued(&lock) && !writer.is_finished() {
             // Admit the next shared holder while the current one still holds.
             let (next_held, next_release, next_join) = shared_holder(&lock, &order);
-            let mut next_at = None;
+            let mut next_in = false;
             until("the next holder or a queued writer", || {
-                next_at = next_held.try_recv().ok();
-                next_at.is_some() || writer_queued(&lock) || writer.is_finished()
+                next_in = next_held.try_recv().is_ok();
+                next_in || writer_queued(&lock) || writer.is_finished()
             });
+            if !next_in {
+                undecided = Some((next_held, next_release, next_join));
+                break;
+            }
+            // Overlapped handoff: the stream goes on (what starves a polling writer).
             let _ = release.send(());
             join.join().unwrap();
             (release, join) = (next_release, next_join);
-            match next_at {
-                // Overlapped handoff: the stream goes on (what starves a polling writer).
-                Some(_) if !writer.is_finished() => handoffs += 1,
-                Some(at) => break at,
-                // The writer is queued: the next holder waits behind it.
-                None => break next_held.recv().unwrap(),
-            }
-        };
+            handoffs += 1;
+        }
+        // The writer holds the turnstile until it is granted, and it cannot be
+        // granted while the current holder holds, so a shared request made now
+        // must queue behind it.
+        let (late_held, late_release, late_join) = shared_holder(&lock, &order);
         let _ = release.send(());
         join.join().unwrap();
+        if let Some((held, release, join)) = undecided {
+            held.recv().unwrap();
+            let _ = release.send(());
+            join.join().unwrap();
+        }
         let (granted, writer_at) = writer.join().unwrap();
+        let late_at = late_held.recv().unwrap();
+        let _ = late_release.send(());
+        late_join.join().unwrap();
         assert!(
             granted,
             "the exclusive request starved ({handoffs} overlapped shared handoffs)"
         );
         assert!(
-            writer_at < next_at,
-            "a shared holder ({next_at}) got in ahead of the queued exclusive request ({writer_at})"
+            writer_at < late_at,
+            "a shared request made while the exclusive request was queued got in first ({late_at} before {writer_at})"
         );
     }
 
