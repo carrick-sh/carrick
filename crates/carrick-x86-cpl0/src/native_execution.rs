@@ -158,6 +158,15 @@ pub fn schedule(slot: SlotId) -> ! {
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
                         // SAFETY: switch_in_full still gives this slot the
+                        // exact record; a resumed fault/metadata wait clears
+                        // its token here and preserves user RAX.
+                        let metadata_resume = unsafe {
+                            source
+                                .zone
+                                .record(selected.record)
+                                .consume_metadata_operation()
+                        };
+                        // SAFETY: switch_in_full still gives this slot the
                         // exact record; its exec commit rewrote the context.
                         match unsafe { runtime.record_binding(record) } {
                             // A committed exec replaced the record's image:
@@ -172,7 +181,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                 state = replaced;
                             }
                             Some(_) => {
-                                if let Some(result) = selected.result {
+                                if !metadata_resume && let Some(result) = selected.result {
                                     words.set_syscall_return(result);
                                 }
                             }
