@@ -14,20 +14,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use carrick_abi::{LinuxProtFlags, SigBlockMask, SigSet};
+use carrick_abi::{SigBlockMask, SigSet};
 use carrick_el1_abi::{
-    Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, El1TaskId, IpcWindow,
-    SnapshotGeneration, clear_current_task_record, clear_el1_region_host_ptr_if,
-    get_el1_region_host_ptr, ipc_table_map_host, record_el1_region_host_ptr,
-    record_ipc_window_host,
+    Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, EL1_MM_PORTAL_OFFSET,
+    El1TaskId, IpcWindow, MmPortalSlots, SnapshotGeneration, clear_current_task_record,
+    clear_el1_region_host_ptr_if, get_el1_region_host_ptr, ipc_table_map_host,
+    record_el1_region_host_ptr, record_ipc_window_host,
 };
 use carrick_guest_arch::ContextGeneration;
-use carrick_guest_mem::{GuestMemory, MappingSharing};
+use carrick_guest_mem::GuestMemory;
 use carrick_hal::{
     GuestTimerBridge, HostSignalBridge, NO_PENDING_SIGNAL, PosixTimerSpec, SyscallTrap,
     ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError,
 };
 use carrick_kernel::compat::CompatReporter;
+use carrick_kernel::dispatch::carrier_loop::{
+    SingleCarrierHandbackWait, install_host_alias_with_inventory,
+    resolve_host_first_touch_with_owner_wait,
+};
 use carrick_kernel::dispatch::{
     CarrierBridges, DispatchOutcome, SyscallDispatcher, SyscallRequest, boot_private_file_backings,
 };
@@ -35,14 +39,15 @@ use carrick_kernel::el1_delegation::{
     get_orig_arg0, publish_current_task, recall_all_delegated, revalidate_current_task,
     settle_el1_boundary_for,
 };
-use carrick_kernel::kernel::VmaSummary;
+use carrick_kernel::el1_zone::register_handback_publisher;
 use carrick_kernel::kernel::continuation::ipc::{host_window_backing, publish_file_table};
 use carrick_kernel::kernel::exec_transaction::{
     core_file_mappings_from_address_space, proc_maps_from_address_space,
 };
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
+use carrick_kernel::kernel::{FrameInventorySnapshot, VmaSummary};
 use carrick_mem::linux_abi::{
-    LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, syscall::lookup_aarch64,
+    LINUX_AT_HWCAP2, LINUX_AT_NULL, LinuxAarch64Hwcap, syscall::lookup_aarch64,
 };
 use carrick_mem::memory::{AddressSpace, El1IrqMode, LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE};
 use carrick_softcpu_aarch64::GUEST_CPU_PROFILE;
@@ -333,6 +338,7 @@ where
     /// `(aarch64_nr, syscall_name, count)` refused with `ENOSYS` in EL1 ring or host dispatch.
     pub counted_enosys: Vec<(u64, &'static str, u64)>,
     pub vmas: Vec<VmaSummary>,
+    pub frame_inventory: FrameInventorySnapshot,
     pub engine: SoftAarch64Engine<X>,
 }
 
@@ -387,10 +393,10 @@ impl Drop for El1ApertureScope {
     }
 }
 
-/// Patch `AT_HWCAP` and `AT_HWCAP2` in the initial stack region to match
-/// [`GUEST_CPU_PROFILE`] so glibc/musl IFUNC resolvers select only instructions
-/// admitted by the soft AArch64 CPU profile, returning the updated auxv bytes.
-fn patch_stack_auxv_hwcaps(image: &mut AddressSpace) -> Result<Vec<u8>, String> {
+/// Patch `AT_HWCAP2` in the initial stack region to match [`GUEST_CPU_PROFILE`]
+/// (`AT_HWCAP` is masked up front via [`AddressSpace::without_auxv_hwcap`]),
+/// returning the serialized auxv bytes.
+fn patch_stack_auxv_hwcap2(image: &mut AddressSpace) -> Result<Vec<u8>, String> {
     let Some(sp) = image.initial_stack_pointer() else {
         return Ok(image.linux_auxv_image().to_vec());
     };
@@ -433,16 +439,13 @@ fn patch_stack_auxv_hwcaps(image: &mut AddressSpace) -> Result<Vec<u8>, String> 
     }
 
     let auxv_start = cursor;
-    let hwcap = GUEST_CPU_PROFILE.hwcap().bits();
     let hwcap2 = GUEST_CPU_PROFILE.hwcap2().bits();
     loop {
         let tag = read_u64_at(bytes, cursor)?;
         let val_off = cursor
             .checked_add(8)
             .ok_or_else(|| "initial stack auxv val offset overflow".to_owned())?;
-        if tag == LINUX_AT_HWCAP {
-            bytes[val_off..val_off + 8].copy_from_slice(&hwcap.to_le_bytes());
-        } else if tag == LINUX_AT_HWCAP2 {
+        if tag == LINUX_AT_HWCAP2 {
             bytes[val_off..val_off + 8].copy_from_slice(&hwcap2.to_le_bytes());
         }
         cursor = cursor
@@ -548,6 +551,7 @@ where
     })
     .map_err(|e| format!("load ELF {}: {e}", config.executable_path))?
     .with_vdso_auxv(false)
+    .without_auxv_hwcap(LinuxAarch64Hwcap::all() - GUEST_CPU_PROFILE.hwcap())
     .with_main_file_path(config.executable_path)
     .with_linux_initial_stack_execfn_page_size(
         &argv,
@@ -557,7 +561,7 @@ where
     )
     .map_err(|e| format!("build initial stack: {e}"))?;
 
-    let auxv_bytes = patch_stack_auxv_hwcaps(&mut image)?;
+    let auxv_bytes = patch_stack_auxv_hwcap2(&mut image)?;
     let image = image
         .with_el0_trampoline()
         .and_then(|img| img.with_el1_vectors_mailbox_clock(true, true, El1IrqMode::Gic))
@@ -646,12 +650,21 @@ where
             root_ctx.thread().key().serial.raw(),
             std::sync::atomic::Ordering::Release,
         );
+        if let Some(carrier_id) = NonZeroU64::new(ptr as u64) {
+            // SAFETY: `el1_host_ptr` points to the live `LINUX_EL1_KERNEL_SIZE`
+            // stage-2 window, and `EL1_MM_PORTAL_OFFSET` is aligned inside it.
+            let portal =
+                unsafe { &*((ptr + EL1_MM_PORTAL_OFFSET as usize) as *const MmPortalSlots) };
+            let _ = portal.bind_carrier(carrier_id);
+        }
     }
 
     dispatcher
         .activate_file_authority(root_ctx.resources().files())
         .map_err(|e| format!("activate file authority: {e:?}"))?;
+    let wake_slot = Arc::new(SingleCarrierHandbackWait::for_current_thread());
     if aperture_scope.el1_host_ptr != 0 {
+        register_handback_publisher(wake_slot.publisher());
         publish_file_table(&root_ctx);
     }
     drop(root_ctx);
@@ -659,7 +672,12 @@ where
     let outcome = {
         let mut dispatcher = dispatcher;
         setup(&mut engine).and_then(|()| {
-            drive_single_process_syscalls(&mut engine, &mut dispatcher, config.max_syscalls)
+            drive_single_process_syscalls(
+                &mut engine,
+                &mut dispatcher,
+                &wake_slot,
+                config.max_syscalls,
+            )
         })
     };
     drop(aperture_scope);
@@ -673,6 +691,7 @@ where
         terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
+        frame_inventory: summary.frame_inventory,
         engine,
     })
 }
@@ -689,7 +708,11 @@ where
     X::Error: core::fmt::Debug,
 {
     let _carrier_lease = SoftCarrierLease::try_acquire().map_err(|e| e.to_string())?;
-    let summary = drive_single_process_syscalls(&mut engine, dispatcher, max_syscalls)?;
+    let wake_slot = Arc::new(SingleCarrierHandbackWait::for_current_thread());
+    if get_el1_region_host_ptr() != 0 {
+        register_handback_publisher(wake_slot.publisher());
+    }
+    let summary = drive_single_process_syscalls(&mut engine, dispatcher, &wake_slot, max_syscalls)?;
     Ok(SoftProcessRun {
         exit_code: summary.exit_code,
         stdout: summary.stdout,
@@ -699,6 +722,7 @@ where
         terminating_fault: summary.terminating_fault,
         counted_enosys: summary.counted_enosys,
         vmas: summary.vmas,
+        frame_inventory: summary.frame_inventory,
         engine,
     })
 }
@@ -712,103 +736,13 @@ struct SingleProcessSummary {
     terminating_fault: Option<SoftFaultTermination>,
     counted_enosys: Vec<(u64, &'static str, u64)>,
     vmas: Vec<VmaSummary>,
-}
-
-fn prot_allows_access(prot: u64, access: Option<carrick_mmu_core::aarch64::LeafAccess>) -> bool {
-    use carrick_mmu_core::aarch64::LeafAccess;
-    let flags = LinuxProtFlags::from_bits_truncate(prot);
-    match access {
-        // Any accessible stage-1 leaf in Carrick's lowering is readable.
-        Some(LeafAccess::Read) => {
-            flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
-        }
-        Some(LeafAccess::Write) => flags.contains(LinuxProtFlags::WRITE),
-        Some(LeafAccess::Execute) => flags.contains(LinuxProtFlags::EXEC),
-        None => false,
-    }
-}
-
-fn try_resolve_single_process_first_touch<X>(
-    engine: &mut SoftAarch64Engine<X>,
-    dispatcher: &mut SyscallDispatcher,
-    syndrome: u64,
-    far: u64,
-) -> Result<bool, String>
-where
-    X: ExecuteBlock + Send + 'static,
-    X::Error: core::fmt::Debug,
-{
-    let Some(access) = carrick_aarch64::esr::el0_fault_access(syndrome) else {
-        return Ok(false);
-    };
-    loop {
-        let step = dispatcher
-            .with_mm_executor_mutation(
-                |disp,
-                 mutation|
-                 -> Result<
-                    Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>,
-                    String,
-                > {
-                    let permit = mutation.host_alias_permit();
-                    match disp.resident_fault_plan(&permit, far) {
-                        Err(contended) => return Ok(Err(contended)),
-                        Ok(Some(plan)) => {
-                            let page = plan.page();
-                            let prot = plan.prot();
-                            if !prot_allows_access(prot, Some(access)) {
-                                return Ok(Ok(false));
-                            }
-                            engine
-                                .protect_range(page, GUEST_PAGE_BYTES as usize, prot)
-                                .map_err(|e| {
-                                    format!(
-                                        "first-touch protect_range({page:#x}, prot={prot:#x}): {e}"
-                                    )
-                                })?;
-                            disp.commit_resident_fault(plan);
-                            return Ok(Ok(true));
-                        }
-                        Ok(None) => {}
-                    }
-
-                    if matches!(
-                        access,
-                        carrick_mmu_core::aarch64::LeafAccess::Read
-                            | carrick_mmu_core::aarch64::LeafAccess::Write
-                    ) && let Some(plan) = disp.mmap_growdown_fault_plan(&permit, far)
-                    {
-                        let rw = (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits();
-                        engine
-                            .protect_range(plan.start(), plan.len(), rw)
-                            .map_err(|e| {
-                                format!(
-                                    "growdown protect_range({:#x}, len={:#x}): {e}",
-                                    plan.start(),
-                                    plan.len()
-                                )
-                            })?;
-                        disp.commit_mmap_growdown(plan);
-                        return Ok(Ok(true));
-                    }
-
-                    Ok(Ok(false))
-                },
-            )
-            .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))??;
-        match step {
-            Ok(done) => return Ok(done),
-            Err(_contended) => {
-                // Release the MM mutation lease before yielding and rerunning.
-                std::thread::yield_now();
-            }
-        }
-    }
+    frame_inventory: FrameInventorySnapshot,
 }
 
 fn drive_single_process_syscalls<X>(
     engine: &mut SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
+    wake_slot: &SingleCarrierHandbackWait,
     max_syscalls: usize,
 ) -> Result<SingleProcessSummary, String>
 where
@@ -819,8 +753,6 @@ where
     let mut refused_by_runner = std::collections::BTreeMap::<u64, u64>::new();
     let mut syscalls_dispatched = 0u64;
     let mut reply_census = Hvc2ReplyCensus::default();
-    let max_first_touch_faults = max_syscalls.saturating_mul(16).max(65_536);
-    let mut first_touch_faults = 0usize;
     let mut syscall_turns = 0usize;
 
     while syscall_turns < max_syscalls {
@@ -849,10 +781,12 @@ where
                     syndrome, elr, far, ..
                 },
             ) => {
-                if first_touch_faults < max_first_touch_faults
-                    && try_resolve_single_process_first_touch(engine, dispatcher, syndrome, far)?
-                {
-                    first_touch_faults += 1;
+                let access = carrick_aarch64::esr::el0_fault_access(syndrome);
+                let fault_kind = carrick_aarch64::esr::el0_fault_kind(syndrome);
+                let (resolved, _owner_waits) = resolve_host_first_touch_with_owner_wait(
+                    engine, dispatcher, &pre_ctx, wake_slot, far, access, fault_kind,
+                )?;
+                if resolved {
                     continue;
                 }
                 if let Some((signum, si_code, fault_addr)) =
@@ -961,56 +895,20 @@ where
                 prot,
                 prot_none,
             } => {
-                let shared = backing.is_shared();
-                let alias_result = dispatcher
-                    .with_mm_executor_mutation(|disp, mutation| -> Result<i64, String> {
-                        let permit = mutation.host_alias_permit();
-                        let Some(install) = transaction.claim(&permit) else {
-                            drop(backing);
-                            return Ok(carrick_abi::LINUX_ENOMEM.guest_retval());
-                        };
-                        engine
-                            .map_host_alias(va, ipa, len, &payload, backing)
-                            .map_err(|e| {
-                                format!("map_host_alias({:#x}, len={len:#x}): {e}", va.raw())
-                            })?;
-                        let len_usize = usize::try_from(len)
-                            .map_err(|_| format!("host alias length {len:#x} exceeds usize"))?;
-                        let prot_flags = LinuxProtFlags::from_bits_truncate(prot);
-                        let exec = prot_flags.contains(LinuxProtFlags::EXEC);
-                        if prot_none || exec {
-                            engine
-                                .protect_range(
-                                    va.raw(),
-                                    len_usize,
-                                    if prot_none { 0 } else { prot },
-                                )
-                                .map_err(|e| format!("protect_range({:#x}): {e}", va.raw()))?;
-                        }
-                        engine.set_mapping_protection_and_sharing(
-                            va.raw(),
-                            len_usize,
-                            prot_none,
-                            !prot_flags.contains(LinuxProtFlags::WRITE),
-                            if shared {
-                                MappingSharing::Shared
-                            } else {
-                                MappingSharing::Private
-                            },
-                        );
-                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                            let bus_len_usize = usize::try_from(bus_len)
-                                .map_err(|_| "bus fault length exceeds usize".to_owned())?;
-                            engine
-                                .protect_range(bus_start, bus_len_usize, 0)
-                                .map_err(|e| format!("protect_range bus fault: {e}"))?;
-                            engine.set_no_access(bus_start, bus_len_usize, true);
-                        }
-                        disp.commit_host_alias_install(install)
-                            .map_err(|e| format!("commit_host_alias_install: {e:?}"))?;
-                        Ok(success_retval)
-                    })
-                    .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))??;
+                let alias_result = install_host_alias_with_inventory(
+                    engine,
+                    dispatcher,
+                    &kernel_context,
+                    transaction,
+                    va,
+                    ipa,
+                    len,
+                    &payload,
+                    backing,
+                    prot,
+                    prot_none,
+                    success_retval,
+                )?;
                 reply_census.production_answers += 1;
                 engine
                     .complete_syscall(alias_result)
@@ -1071,6 +969,14 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
+    let frame_inventory = dispatcher
+        .capture_one_task_context()
+        .map(|ctx| ctx.kernel().frame_inventory().snapshot())
+        .unwrap_or(FrameInventorySnapshot {
+            revision: 0,
+            frames: Vec::new(),
+            mappings: Vec::new(),
+        });
     let vmas = dispatcher
         .vma_snapshot_source()
         .snapshot(Instant::now() + Duration::from_secs(1))
@@ -1106,5 +1012,6 @@ where
         terminating_fault,
         counted_enosys,
         vmas,
+        frame_inventory,
     }
 }

@@ -546,6 +546,14 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
         "unexpected counted ENOSYS: {:?}",
         run.counted_enosys
     );
+    assert!(
+        run.frame_inventory.mappings.iter().any(|m| {
+            m.gpa.raw() >= carrick_softcpu_aarch64_host::SOFT_ALIAS_GPA_BASE
+                && m.length.raw() == GUEST_PAGE_BYTES
+        }),
+        "MapHostAlias must publish its stage-2 alias frame into the kernel frame inventory, got {:?}",
+        run.frame_inventory
+    );
 
     let final_obs = obs.lock().expect("lock witness observations");
     assert_eq!(final_obs.heap_roundtrip_word, 0xCAFE_BABE_1234_5678);

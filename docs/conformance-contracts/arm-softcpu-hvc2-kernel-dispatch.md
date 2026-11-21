@@ -26,6 +26,12 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   bring-up (`set_tid_address` 96 and `prlimit64` 261 pending `#2645`, `rseq`
   293 per `#1906`, and timer/signal syscalls refused fail-closed with `-ENOSYS`)
   are sampled in `counted_enosys` rather than faked.
+- **Shared host-carrier stage-1 alias inventory, first-touch, and owner wait**:
+  `carrick_kernel::dispatch::carrier_loop` owns alias `FrameInventoryCommit`
+  publication, post-publish stage-1 protection/sharing/`SIGBUS` tail commit,
+  first-touch + `MAP_GROWSDOWN` + stale-leaf retry, and `ReservationBusy`
+  owner-release enrollment (`PortalWaitEnrollment::park_host`, probe-once, then
+  sleep without `yield_now()` polling), shared with `carrick-runtime`.
 - **Stage-1 and stage-2 permission and unmap enforcement**: stores after
   `mprotect(..., PROT_READ)` terminate with `SIGSEGV` (`SEGV_ACCERR`) leaving
   read-only contents intact, and accesses after `munmap` terminate with
@@ -43,6 +49,8 @@ routing from the soft AArch64 CPU (`carrick-softcpu-aarch64` +
   - `carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples`
   - `carrick-aarch64::mailbox::tests::mailbox_slot_round_trips_request_and_response`
   - `carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically`
+  - `carrick-kernel::dispatch::carrier_loop::tests::apply_first_touch_enforces_linux_stage1_access_matrix`
+  - `carrick-kernel::dispatch::carrier_loop::tests::owner_memory_wait_parks_once_on_reservation_busy_and_resumes_after_release`
 - Native Linux `aarch64` (`soft-aarch64-native`):
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch`
   - `carrick-softcpu-aarch64-host::boot_probe::soft_cpu_runs_static_musl_hello_through_production_dispatch`

@@ -9,6 +9,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,8 +35,9 @@ use carrick_guest_mem::{
     zero_range_chunked,
 };
 use carrick_hal::{
+    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryReservation, FrameLength,
     GenericVcpuRegistry, GuestEntryRegs, GuestVmBackend, HostAliasBacking, HostAliasSharing,
-    MemPerms, OsError, Reg, SysReg, TrapError, VcpuKick, VcpuRegistry,
+    MappingGeneration, MemPerms, OsError, Reg, SysReg, TrapError, VcpuKick, VcpuRegistry,
 };
 use carrick_mem::memory::{
     AddressSpace, CarrierMaintenanceRoot, LINUX_CARRIER_MAINT_ROOT_BASE, LINUX_EL1_IMAGE_SIZE,
@@ -1373,12 +1375,18 @@ where
                     HvcImmediateKind::Kick => return Ok(Aarch64Exit::Kicked),
                     HvcImmediateKind::Idle => return Ok(Aarch64Exit::Halt),
                     HvcImmediateKind::MetadataGrant => {
-                        // `SoftStage2` backs the full `EL1_DYNAMIC_METADATA_SIZE`
-                        // window on demand; complete any pending grant request in place.
+                        // Single-process soft bring-up does not run a dynamic
+                        // metadata allocator; fail closed with `ERR_DENIED`
+                        // rather than echoing unallocated request arguments.
                         if let Some(mb) = carrick_el1_abi::metadata_mailbox_host()
-                            && let Some(req) = mb.claim_request()
+                            && mb.claim_request().is_some()
                         {
-                            mb.publish_response(0, req.arg1, req.arg2, req.arg3);
+                            mb.publish_response(
+                                carrick_el1_abi::METADATA_GRANT_ERR_DENIED,
+                                0,
+                                0,
+                                0,
+                            );
                         }
                         continue;
                     }
@@ -1474,12 +1482,19 @@ where
     }
 }
 
+enum PendingAliasInventory {
+    Armed(FrameInventoryReservation),
+    Committed(FrameInventoryCommit<()>),
+}
+
 /// Soft AArch64 VM backend implementing [`Aarch64Vmm`] over [`SoftStage2`].
 pub struct SoftAarch64Vmm<X = HostBlockRunner> {
     stage2: Arc<ExclusiveStage2>,
     protections: Arc<MemoryProtections>,
     control: Arc<RunControl>,
     next_alias_gpa: u64,
+    pending_alias_inventory: Option<PendingAliasInventory>,
+    next_inventory_generation: u64,
     executor_marker: core::marker::PhantomData<fn() -> X>,
 }
 
@@ -1564,6 +1579,8 @@ where
             protections,
             control,
             next_alias_gpa: SOFT_ALIAS_GPA_BASE,
+            pending_alias_inventory: None,
+            next_inventory_generation: 1,
             executor_marker: core::marker::PhantomData,
         };
         Ok(Aarch64EngineCore::from_parts(vmm, vcpu))
@@ -1842,10 +1859,7 @@ where
     fn translated_read_into(&self, va: u64, ipa: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
         self.stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address: va,
-                length: dst.len(),
-            })?
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?
             .read_gpa_bytes(ipa, dst)
             .map_err(|_| MemoryError::OutOfBounds {
                 address: va,
@@ -1856,10 +1870,7 @@ where
     fn translated_write(&mut self, va: u64, ipa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address: va,
-                length: bytes.len(),
-            })?
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?
             .write_gpa_bytes(ipa, bytes)
             .map_err(|_| MemoryError::OutOfBounds {
                 address: va,
@@ -1875,10 +1886,7 @@ where
         let mut stage2 = self
             .stage2
             .try_borrow()
-            .map_err(|_| MemoryError::OutOfBounds {
-                address,
-                length: len,
-            })?;
+            .map_err(|e| MemoryError::HostMap(e.to_string()))?;
         zero_range_chunked(address, len, |addr, zeros| {
             stage2
                 .write_gpa_bytes(addr, zeros)
@@ -1887,6 +1895,33 @@ where
                     length: zeros.len(),
                 })
         })
+    }
+
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        if self.pending_alias_inventory.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping soft AArch64 alias inventory transaction".to_owned(),
+            ));
+        }
+        self.pending_alias_inventory = Some(PendingAliasInventory::Armed(reservation));
+        Ok(())
+    }
+
+    fn take_alias_inventory(&mut self) -> Option<FrameInventoryCommit<()>> {
+        match self.pending_alias_inventory.take() {
+            Some(PendingAliasInventory::Committed(commit)) => Some(commit),
+            other => {
+                self.pending_alias_inventory = other;
+                None
+            }
+        }
+    }
+
+    fn abandon_alias_inventory(&mut self) -> bool {
+        self.pending_alias_inventory.take().is_some()
     }
 
     fn shared_futex_location(&self, backing_gpa: Gpa) -> Option<SharedFutexLocation> {
@@ -1968,6 +2003,53 @@ where
         {
             self.next_alias_gpa = next;
         }
+        drop(stage2);
+
+        if let Some(PendingAliasInventory::Armed(mut reservation)) =
+            self.pending_alias_inventory.take()
+        {
+            let transaction = reservation.transaction();
+            let frame = reservation
+                .claim_frame()
+                .map_err(|e| TrapError::Hypervisor(format!("alias claim_frame: {e}")))?;
+            let mapping = reservation
+                .claim_mapping()
+                .map_err(|e| TrapError::Hypervisor(format!("alias claim_mapping: {e}")))?;
+            let raw_gen = NonZeroU64::new(self.next_inventory_generation).ok_or_else(|| {
+                TrapError::Hypervisor("alias generation wrapped to zero".to_owned())
+            })?;
+            self.next_inventory_generation = self.next_inventory_generation.saturating_add(1);
+            let generation = MappingGeneration::from_backend_counter(raw_gen);
+            let length_nz = NonZeroU64::new(aligned_len)
+                .ok_or_else(|| TrapError::Hypervisor("alias zero aligned_len".to_owned()))?;
+            let length = FrameLength::from_mapping_extent(length_nz);
+            let inv_perms = MemPerms {
+                read: true,
+                write: writable,
+                exec: false,
+            };
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation,
+                    gpa: Gpa::new(gpa),
+                    length,
+                    permissions: inv_perms,
+                })
+                .map_err(|e| TrapError::Hypervisor(format!("alias PrepareMapping: {e}")))?;
+            reservation
+                .push(FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping,
+                    generation,
+                })
+                .map_err(|e| TrapError::Hypervisor(format!("alias PublishMapping: {e}")))?;
+            self.pending_alias_inventory =
+                Some(PendingAliasInventory::Committed(reservation.commit(())));
+        }
+
         Ok((gpa, writable))
     }
 
