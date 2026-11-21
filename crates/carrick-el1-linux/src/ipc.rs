@@ -927,12 +927,67 @@ fn poll_result(frame: &mut impl GuestDispatchFrame, value: i64) -> IpcServed {
     IpcServed::Returned { switched: false }
 }
 
+/// The `sigset_t` pselect6 takes through its `{ss, ss_len}` pair.
+const SELECT_SIGSET_BYTES: u64 = 8;
+
+/// Read pselect6's sixth argument, `{const sigset_t *ss; size_t ss_len}`.
+/// `Ok(None)`: no pair, or a NULL `ss`, leaves the mask alone.
+fn read_select_sigmask(
+    pair_va: u64,
+    user: &mut impl UserCopy,
+) -> Result<Option<u64>, carrick_syscall_abi::LinuxErrno> {
+    use carrick_syscall_abi::{LINUX_EFAULT, LINUX_EINVAL};
+
+    if pair_va == 0 {
+        return Ok(None);
+    }
+    let mut pair = [0u8; 16];
+    if !user.copy_in(&mut pair, pair_va) {
+        return Err(LINUX_EFAULT);
+    }
+    let set_va = u64::from_ne_bytes(pair[..8].try_into().unwrap_or_default());
+    let set_len = u64::from_ne_bytes(pair[8..].try_into().unwrap_or_default());
+    if set_va == 0 {
+        return Ok(None);
+    }
+    if set_len != SELECT_SIGSET_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    let mut set = [0u8; SELECT_SIGSET_BYTES as usize];
+    if !user.copy_in(&mut set, set_va) {
+        return Err(LINUX_EFAULT);
+    }
+    Ok(Some(u64::from_ne_bytes(set)))
+}
+
+fn select_input_error(
+    frame: &mut impl GuestDispatchFrame,
+    user: &impl UserCopy,
+    errno: carrick_syscall_abi::LinuxErrno,
+) -> IpcServed {
+    if errno == carrick_syscall_abi::LINUX_EFAULT && user.has_copyin_refusal() {
+        IpcServed::Forward
+    } else {
+        poll_result(frame, errno.guest_retval())
+    }
+}
+
 /// Serve a single zone description for poll, ppoll, select and pselect6.
 ///
 /// The shared dispatcher handles immediate, host and mixed sets. This owner
 /// exists for the case the host cannot observe: an inherited zone object that
 /// is not ready yet. It retains the exact pollfd bytes, description pin and
 /// absolute deadline in the same operation arena as pipe and epoll waits.
+///
+/// A pselect6 sigmask follows the `epoll_pwait` protocol
+/// (`kernel.el1.epoll-zone`): it is armed in the thread's control slot just
+/// before parking, so the post-enrollment probe already sees it, and a call
+/// that completes without parking never changes the mask. A parked wait (or an
+/// operation-slot contention park) hands the armed mask to its continuation
+/// without touching the thread's control slot after `park` succeeds. A caught
+/// signal's EINTR leaves the mask armed for the signal checkpoint, which runs
+/// the handler under the temporary mask and restores the persistent one; every
+/// other non-parked exit disarms it here.
 pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -940,9 +995,29 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     user: &mut M,
     output: &mut Option<PollOutput>,
 ) -> IpcServed {
+    let mut keep_sigmask = false;
+    let served = serve_zone_readiness(sched, frame, venue, user, output, &mut keep_sigmask);
+    if !keep_sigmask {
+        user.disarm_wait_sigmask();
+    }
+    served
+}
+
+fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+    output: &mut Option<PollOutput>,
+    keep_sigmask: &mut bool,
+) -> IpcServed {
     use crate::dispatch::PollTimeoutKind;
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
+    use carrick_core_abi::wait::AcceptedWait;
     use carrick_el1_abi::ipc::epoll::EpollMember;
+    use carrick_guest_arch::CounterTick;
+    use carrick_sched_core::object_wait::OperationToken;
+    use carrick_sched_core::refusal::Refusal;
 
     const POLLFD_BYTES: usize = core::mem::size_of::<PollFd>();
 
@@ -985,7 +1060,13 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
     };
     let table = TableId::from_raw(raw_table);
     let authority = region.fd(EL1_WAIT);
-    let resumed = match sched.take_object_operation() {
+    let taken = match sched.take_object_operation() {
+        // The replay receipt of an operation-slot contention park owns no
+        // arena slot: the native owner holds its accepted deadline and mask.
+        Ok(Some(t)) if t.metadata_generation().is_some() => Ok(None),
+        taken => taken,
+    };
+    let resumed = match taken {
         Err(_) => return IpcServed::Forward,
         Ok(Some(operation)) => {
             let Some(token) = from_sched_token(operation) else {
@@ -1019,6 +1100,7 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             if reason == Some(carrick_sched_core::Handback::Signal) && user.interrupt_pending_wait()
             {
                 finish(sched, token, region);
+                *keep_sigmask = true;
                 let result = LINUX_EINTR.guest_retval();
                 if let Some(layout) = &select {
                     match native_select_output(*layout, op.buf, sched, pollfd, op.deadline, result)
@@ -1034,73 +1116,83 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
         Ok(None) => None,
     };
 
+    // A resumed or slot-wait-replayed call's mask is already armed; it never
+    // reads sigmask or timeout from user memory again.
+    let mut sigmask = None;
     let (mut pollfd, deadline, mut retained) = if let Some((pollfd, deadline, token, op)) = resumed
     {
         (pollfd, deadline, Some((token, op)))
     } else {
+        let accepted = user.take_accepted_epoll_wait();
         let mut pollfd = PollFd::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
-        };
-        if select.is_none() && !user.copy_in(bytes, arg0) {
-            return IpcServed::Forward;
-        }
-        if let Some(layout) = &select
-            && !layout.timeval
-            && argument_word(frame, 5) != 0
-        {
-            let mut pair = [0u8; 16];
-            if !user.copy_in(&mut pair, argument_word(frame, 5)) {
-                return poll_result(frame, LINUX_EFAULT.guest_retval());
+        if let Some(accepted) = accepted {
+            let deadline = accepted
+                .deadline
+                .map_or(carrick_el1_abi::ipc::IpcCounterDeadline::NONE, |tick| {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::at(tick.raw())
+                });
+            if user.interrupt_pending_wait() {
+                *keep_sigmask = true;
+                let result = LINUX_EINTR.guest_retval();
+                if let Some(layout) = &select {
+                    match native_select_output(
+                        *layout,
+                        IpcUserVa(timeout_arg),
+                        sched,
+                        pollfd,
+                        deadline,
+                        result,
+                    ) {
+                        Ok(answer) => *output = Some(answer),
+                        Err(errno) => return poll_result(frame, errno.guest_retval()),
+                    }
+                }
+                return poll_result(frame, result);
             }
-            if pair[..8] != [0; 8] {
-                return IpcServed::Forward;
-            }
-        }
-        let deadline = match timeout_kind {
-            PollTimeoutKind::Milliseconds => {
-                let timeout_ms = timeout_arg as i32;
-                if timeout_ms < 0 {
-                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
-                } else if timeout_ms == 0 {
-                    carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
-                } else {
-                    let duration = u64::try_from(timeout_ms)
-                        .unwrap_or(0)
-                        .saturating_mul(1_000_000);
-                    carrick_el1_abi::ipc::IpcCounterDeadline::at(
-                        sched
-                            .now()
-                            .saturating_add(sched.ticks(duration))
-                            .saturating_add(1),
-                    )
+            if select.is_none() {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
+                };
+                if !user.copy_in(bytes, arg0) {
+                    return IpcServed::Forward;
+                }
+            } else if let Some(layout) = &mut select {
+                let Ok(capacity) = authority.backing_capacity(table) else {
+                    return IpcServed::Forward;
+                };
+                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
+                    Ok(Some(decoded)) => pollfd = decoded,
+                    Ok(None) => return IpcServed::Forward,
+                    Err(errno) => return select_input_error(frame, user, errno),
                 }
             }
-            PollTimeoutKind::Timespec => {
-                if timeout_arg == 0 {
-                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
-                } else {
-                    let mut timeout = [0u8; 16];
-                    if !user.copy_in(&mut timeout, timeout_arg) {
-                        return if select.is_some() {
-                            poll_result(frame, LINUX_EFAULT.guest_retval())
-                        } else {
-                            IpcServed::Forward
-                        };
-                    }
-                    let seconds = i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
-                    let fraction = i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
-                    if seconds < 0 || fraction < 0 || (!is_timeval && fraction >= 1_000_000_000) {
-                        return poll_result(frame, LINUX_EINVAL.guest_retval());
-                    }
-                    let nanos =
-                        (fraction as u64).saturating_mul(if is_timeval { 1_000 } else { 1 });
-                    let duration = (seconds as u64)
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(nanos);
-                    if duration == 0 {
+            (pollfd, deadline, None)
+        } else {
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
+            };
+            if select.is_none() && !user.copy_in(bytes, arg0) {
+                return IpcServed::Forward;
+            }
+            if let Some(layout) = &select
+                && !layout.timeval
+            {
+                match read_select_sigmask(argument_word(frame, 5), user) {
+                    Ok(mask) => sigmask = mask,
+                    Err(errno) => return select_input_error(frame, user, errno),
+                }
+            }
+            let deadline = match timeout_kind {
+                PollTimeoutKind::Milliseconds => {
+                    let timeout_ms = timeout_arg as i32;
+                    if timeout_ms < 0 {
+                        carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                    } else if timeout_ms == 0 {
                         carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
                     } else {
+                        let duration = u64::try_from(timeout_ms)
+                            .unwrap_or(0)
+                            .saturating_mul(1_000_000);
                         carrick_el1_abi::ipc::IpcCounterDeadline::at(
                             sched
                                 .now()
@@ -1109,19 +1201,56 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
                         )
                     }
                 }
-            }
-        };
-        if let Some(layout) = &mut select {
-            let Ok(capacity) = authority.backing_capacity(table) else {
-                return IpcServed::Forward;
+                PollTimeoutKind::Timespec => {
+                    if timeout_arg == 0 {
+                        carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                    } else {
+                        let mut timeout = [0u8; 16];
+                        if !user.copy_in(&mut timeout, timeout_arg) {
+                            return if select.is_some() {
+                                select_input_error(frame, user, LINUX_EFAULT)
+                            } else {
+                                IpcServed::Forward
+                            };
+                        }
+                        let seconds =
+                            i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
+                        let fraction =
+                            i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
+                        if seconds < 0 || fraction < 0 || (!is_timeval && fraction >= 1_000_000_000)
+                        {
+                            return poll_result(frame, LINUX_EINVAL.guest_retval());
+                        }
+                        let nanos =
+                            (fraction as u64).saturating_mul(if is_timeval { 1_000 } else { 1 });
+                        let duration = (seconds as u64)
+                            .saturating_mul(1_000_000_000)
+                            .saturating_add(nanos);
+                        if duration == 0 {
+                            carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
+                        } else {
+                            carrick_el1_abi::ipc::IpcCounterDeadline::at(
+                                sched
+                                    .now()
+                                    .saturating_add(sched.ticks(duration))
+                                    .saturating_add(1),
+                            )
+                        }
+                    }
+                }
             };
-            match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                Ok(Some(decoded)) => pollfd = decoded,
-                Ok(None) => return IpcServed::Forward,
-                Err(errno) => return poll_result(frame, errno.guest_retval()),
+            if let Some(layout) = &mut select {
+                let Ok(capacity) = authority.backing_capacity(table) else {
+                    return IpcServed::Forward;
+                };
+                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
+                    Ok(Some(decoded)) => pollfd = decoded,
+                    Ok(None) => return IpcServed::Forward,
+                    Err(errno) => return select_input_error(frame, user, errno),
+                }
             }
+            (pollfd, deadline, None)
         }
-        (pollfd, deadline, None)
     };
 
     // Negative pollfds do not name an object. The shared poll body clears
@@ -1263,6 +1392,18 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             return IpcServed::Forward;
         };
         drop(guard);
+        // Armed once before admission/park so the post-enrollment probe
+        // observes the temporary mask and `Parked::Retry` never double-arms.
+        if let Some(mask) = sigmask.take()
+            && !user.arm_wait_sigmask(mask)
+        {
+            if let Some((token, _)) = active.take() {
+                finish(sched, token, region);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            return IpcServed::Forward;
+        }
         let mut raw = [0u8; POLLFD_BYTES];
         raw[..4].copy_from_slice(&pollfd.fd.to_ne_bytes());
         raw[4..6].copy_from_slice(&pollfd.events.to_ne_bytes());
@@ -1288,14 +1429,86 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
                 deadline,
                 ..IpcOperation::EMPTY
             };
-            let token = match region.begin_operation(op) {
-                Ok(token) => token,
-                Err(_) => {
+            let (replay, key, observed) = match region.begin_operation(op) {
+                Ok(token) => (None, None, Ok(token)),
+                Err(IpcError::NoOperations) => {
+                    let zone = sched.zone();
+                    let slot = sched.slot();
+                    let completion =
+                        |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                            '_,
+                            E::Context,
+                        >| {
+                            crate::sched::object_wait::deliver_completion(zone, slot, owned)
+                        };
+                    match admit_operation_wait(region, zone, op, &completion).result {
+                        Ok(token) => (None, None, Ok(token)),
+                        // SAFETY: the enrollment's key and pre-probe observation go
+                        // directly to this lane's scheduler park below; no guard crosses.
+                        Err(Refusal::Contended(ticket)) => {
+                            let replay = OperationToken::metadata_request(
+                                region.operation_slot_generation().get(),
+                            )
+                            .unwrap_or_else(|| {
+                                crate::dispatch::invalid_completion(
+                                    crate::dispatch::NativeInvariant::EntryBinding,
+                                )
+                            });
+                            let (replay, key, observed) = unsafe {
+                                ticket.park_and_rerun(replay, |replay, enrollment| {
+                                    (replay, enrollment.key(), enrollment.observed())
+                                })
+                            };
+                            (Some(replay), Some(key), Err(Some(observed)))
+                        }
+                        Err(Refusal::Invariant(_) | Refusal::Guest(_)) => (None, None, Err(None)),
+                    }
+                }
+                Err(_) => (None, None, Err(None)),
+            };
+            match observed {
+                Ok(token) => (token, op),
+                Err(None) => {
                     release_pin(sched, OfdPin::from_raw(op.pin), region);
                     return IpcServed::Forward;
                 }
-            };
-            (token, op)
+                Err(Some(observed)) => {
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    let accepted = AcceptedWait {
+                        deadline: op.deadline.get().map(CounterTick::new),
+                    };
+                    if !user.retain_accepted_epoll_wait(accepted) {
+                        return IpcServed::Forward;
+                    }
+                    let (Some(replay), Some(key)) = (replay, key) else {
+                        let _ = user.take_accepted_epoll_wait();
+                        return IpcServed::Forward;
+                    };
+                    // SAFETY: observed before the arena probe that found no free slot.
+                    let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
+                    match sched.park(
+                        frame,
+                        key,
+                        snapshot,
+                        replay,
+                        None,
+                        Some(&mut || user.interrupt_pending_wait()),
+                    ) {
+                        Ok(served) => {
+                            *keep_sigmask = true;
+                            return served;
+                        }
+                        Err((ObjectWaitError::Changed, _)) => {
+                            let _ = user.take_accepted_epoll_wait();
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = user.take_accepted_epoll_wait();
+                            return IpcServed::Forward;
+                        }
+                    }
+                }
+            }
         };
         match park(
             sched,
@@ -1309,7 +1522,10 @@ pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
             deadline.get(),
             &mut || user.interrupt_pending_wait(),
         ) {
-            Parked::Done(served) => return served,
+            Parked::Done(served) => {
+                *keep_sigmask = true;
+                return served;
+            }
             Parked::Retry(token) => retained = Some((token, op)),
             Parked::Refused(token) => {
                 finish(sched, token, region);
@@ -3981,9 +4197,8 @@ mod tests {
         let mut w = world();
         let a = w.table(w.a_tid);
         let (r1, w1, _) = w.pipe(a, BLOCK);
-        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        let (r2, w2, _) = w.pipe(a, BLOCK);
         w.fork_table(a, 202);
-        w.fork_table(a, 203);
         let va = 0x20000;
         w.mem.map(MM, va, PAGE);
         w.mem.map(OTHER_MM, va, PAGE);
@@ -4021,7 +4236,7 @@ mod tests {
 
         let mut frame = TrapFrame {
             esr: 0x15 << 26,
-            elr: A_SVC,
+            elr: A_SVC + 4,
             ..Default::default()
         };
         frame.x[0] = (r1 as u64) + 1;
@@ -4119,13 +4334,36 @@ mod tests {
             frame = g;
         }
 
-        // Queue C (203) as the writer that will wake A's pipe wait.
+        // Wake B (202) onto the runqueue by writing 1 byte to w2, so when A
+        // parks on empty r1 below, B runs, drains r2, writes to w1, and parks again.
+        w.mem.write(MM, va + 0x100, b"k");
         w.mem.write(OTHER_MM, va + 0x100, b"z");
-        let c_write = syscall(SYS_WRITE, w1, va + 0x100, 1, B_SVC);
-        w.queue(203, OTHER_MM, &c_write, B_SVC);
+        {
+            let mut a_wake_b = syscall(SYS_WRITE, w2, va + 0x100, 1, A_SVC);
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                (
+                    serve_ipc(&mut sched, &mut a_wake_b, &venue, &mut user),
+                    a_wake_b.x[0]
+                ),
+                (RETURNED, 1)
+            );
+        }
 
         // Step 2: A replays pselect6, keeps the original deadline and armed mask
-        // without re-arming, and parks on the empty pipe r1.
+        // without re-arming, and parks on the empty pipe r1, switching to B.
         reenter(&mut frame, A_SVC);
         assert_eq!(
             native(&mut frame, &mut owner, &mut cpu, &mut out),
@@ -4139,9 +4377,11 @@ mod tests {
         );
         assert_eq!(mask.armed.get(), Some(sigusr1));
 
-        // Step 3: C writes 1 byte to w1, waking A; C then blocks on r2 so A runs.
+        // Step 3: B finishes its resumed read on r2, writes 1 byte to w1 (waking A),
+        // and blocks on empty r2 again so A runs.
         {
             let mut g = frame;
+            reenter(&mut g, B_SVC);
             let mut user = User {
                 task: &w.task,
                 mem: &w.mem,
@@ -4159,12 +4399,20 @@ mod tests {
                 (serve_ipc(&mut sched, &mut g, &venue, &mut user), g.x[0]),
                 (RETURNED, 1)
             );
-            let mut c_park = syscall(SYS_READ, r2, va + 0x200, 1, B_SVC);
+            let mut b_write = syscall(SYS_WRITE, w1, va + 0x100, 1, B_SVC);
             assert_eq!(
-                serve_ipc(&mut sched, &mut c_park, &venue, &mut user),
+                (
+                    serve_ipc(&mut sched, &mut b_write, &venue, &mut user),
+                    b_write.x[0]
+                ),
+                (RETURNED, 1)
+            );
+            let mut b_park = syscall(SYS_READ, r2, va + 0x200, 1, B_SVC);
+            assert_eq!(
+                serve_ipc(&mut sched, &mut b_park, &venue, &mut user),
                 SWITCHED
             );
-            frame = c_park;
+            frame = b_park;
         }
 
         reenter(&mut frame, A_SVC);
