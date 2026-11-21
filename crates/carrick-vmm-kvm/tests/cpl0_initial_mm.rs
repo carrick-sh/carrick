@@ -555,6 +555,27 @@ fn serial_host_native_root_and_child_cputime_and_times() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// A root the scheduler never switched in keeps its CPU-time accounting
+/// across a host crossing: after polling its standard descriptors it burns
+/// CPU, and raw `CLOCK_PROCESS_CPUTIME_ID` and `times` advance.
+#[test]
+fn serial_host_native_root_cputime_survives_a_host_crossing() {
+    let elf = native_exit_fixture_with_flags("native_root_cputime_after_crossing.S", &[]);
+    let directory = tempfile::tempdir().expect("oracle directory");
+    let oracle = directory.path().join("native_root_cputime_after_crossing");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let linux_status = std::process::Command::new(&oracle)
+        .status()
+        .expect("run native Linux oracle");
+    assert_eq!(linux_status.code(), Some(8), "native Linux oracle");
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_cputime_survives_a_host_crossing",
+        "native_root_cputime_after_crossing.S",
+        &[],
+        8,
+    );
+}
+
 #[test]
 fn serial_host_native_exec_successor_vdso_monotonic_matches_raw_clock() {
     let directory = tempfile::tempdir().expect("successor directory");
