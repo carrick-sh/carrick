@@ -1,0 +1,38 @@
+schema_version = 1
+id = "kernel.x86.ring-syscall-exits"
+title = "A syscall the x86 CPL0 ring serves costs the host no VM exit"
+guest_surfaces = ["vmm:kvm", "execution:x86-cpl0-ring", "syscall:getppid", "syscall:rt_sigprocmask"]
+semantic_authority = [
+  "man 2 getppid",
+  "man 2 rt_sigprocmask",
+  "AMD64 Architecture Programmer's Manual volume 2 (SVM intercepts: CR reads, decode assists) and Intel SDM volume 3 (CR4 guest/host masks); clean-room architectural rules without Linux, KVM or QEMU implementation source",
+  "AGENTS.md: a pathological per-call ratio is a correctness bug (#2679)",
+]
+fixture = "carrick-vmm-kvm/tests/fixtures/native_root_syscall_exits.S"
+scale_points = [256, 2048, 16384]
+rationale = """
+A ring-served syscall runs entirely in the guest kernel: it must not need the
+host. Before #2679 every guarded CPL0 user access read CR4 before STAC and
+again before CLAC, and the MMU's live-root check read it too. SVM intercepts
+every guest CR4 read, and a nested host without decode assists also decodes
+each one in software, so one ring `getppid` cost six VM exits and about
+100 us, ~250x native. The stopped host programs CR4 before a vCPU's first
+instruction and the guest never writes it, so each CPU reads it once into
+its binding (`isa::x86::control::Cr4`) and every later user access tests the
+snapshot. The live KVM witness counts the carrier's own in-kernel KVM exits
+(`KVM_GET_STATS_FD` on both vCPUs) across three scale points and bounds the
+per-syscall slope. The red is SVM-specific: VMX reads CR4 through its read
+shadow without an exit, so an Intel host passes before and after the fix.
+"""
+structural_budgets = []
+
+[bindings]
+vm_free = []
+embed = []
+docker = []
+
+[bindings.unresolved]
+vm_free = "The cost is a hardware intercept; no VM-free layer executes CR4 reads."
+embed_structural = "The budget is enforced by the live KVM witness carrick-vmm-kvm::cpl0_syscall_exits::serial_host_native_root_ring_syscalls_cost_no_vm_exit (`just test-kvm` lane), which reads the carrier's own KVM_GET_STATS_FD counters: exits(n) - exits(256) <= (syscalls(n) - syscalls(256)) / 64 and insn_emulation(n) - insn_emulation(256) <= (syscalls(n) - syscalls(256)) / 1024. WorkMetric has no KVM exit unit yet, so the bound lives in the witness, not in structural_budgets."
+signed = "The macOS HVF AArch64 lane has no CR4 and the witness is x86-only."
+docker = "Docker runs the syscall natively with no VM exit; the oracle is architectural (no host exit per ring call)."
