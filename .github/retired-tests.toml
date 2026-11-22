@@ -137,3 +137,15 @@ test = "cpl0_initial_mm::serial_host_native_child_absolute_clock_nanosleep_is_re
 reason = "#2028: a CPL0 child's expired monotonic deadline now succeeds. The replacement checks immediate success, and a separate future-deadline witness checks that the wait reaches its deadline."
 replaced_by = "cpl0_initial_mm::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero"
 pr = 2618
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::forward_execution_tests::forward_venue_refuses_mismatched_child_entry_key"
+reason = "#2780: a stopped task whose key is not the child root's issued leader key is now admitted to the forward venue as a typed thread-group member (ForwardSubject::Member) instead of refused with TaskIdMismatch, so the refusal witness became a witness of the subject."
+replaced_by = "carrick_x86_cpl0_host::cpl0_boot::forward_execution_tests::forward_venue_names_another_child_entry_key_a_member"
+pr = 2785
+
+[[retired]]
+test = "carrick_x86_cpl0_host::cpl0_boot::forward_execution_tests::forward_venue_refuses_clone_vm_sibling_on_child_root"
+reason = "#2780: a CLONE_VM sibling on a child root is now a typed member of that root (never its leader, with or without a birth record on its own control slot) instead of a venue refusal."
+replaced_by = "carrick_x86_cpl0_host::cpl0_boot::forward_execution_tests::forward_venue_names_clone_vm_sibling_a_member_of_the_child_root"
+pr = 2785
