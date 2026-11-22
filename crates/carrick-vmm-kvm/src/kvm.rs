@@ -314,7 +314,7 @@ fn register_vcpu_kernel_stats(fd: &VcpuFd) {
     }
 }
 
-fn print_vcpu_kernel_stats(reason: &str) {
+fn print_vcpu_kernel_stats(reason: &str, pid: u32) {
     let Ok(list) = VCPU_KERNEL_STATS.lock() else {
         return;
     };
@@ -323,8 +323,7 @@ fn print_vcpu_kernel_stats(reason: &str) {
         let _ = stats.read_into(&mut totals);
     }
     eprintln!(
-        "[carrick-kvm-kernel-stats pid={} reason={reason} vcpus={}] {}",
-        std::process::id(),
+        "[carrick-kvm-kernel-stats pid={pid} reason={reason} vcpus={}] {}",
         list.len(),
         totals.line()
     );
@@ -334,10 +333,10 @@ pub(crate) fn print_kvm_stats_once(reason: &str) {
     if !kvm_stats_enabled() || KVM_STATS_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    print_vcpu_kernel_stats(reason);
+    let pid = std::process::id();
+    print_vcpu_kernel_stats(reason, pid);
     eprintln!(
-        "[carrick-kvm-stats pid={} reason={reason}] runs={} eintr={} io_syscall={} io_fault={} io_other={} mmio={} halt={} kicked={} debug={} internal={} other={} get_regs={} set_regs={} get_sregs={} set_sregs={} get_fpu={} set_fpu={} set_msrs={}",
-        std::process::id(),
+        "[carrick-kvm-stats pid={pid} reason={reason}] runs={} eintr={} io_syscall={} io_fault={} io_other={} mmio={} halt={} kicked={} debug={} internal={} other={} get_regs={} set_regs={} get_sregs={} set_sregs={} get_fpu={} set_fpu={} set_msrs={}",
         KVM_RUNS.load(Ordering::Relaxed),
         KVM_RUN_EINTRS.load(Ordering::Relaxed),
         KVM_EXIT_IO_SYSCALL.load(Ordering::Relaxed),

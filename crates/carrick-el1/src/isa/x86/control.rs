@@ -21,13 +21,13 @@ impl Cr4 {
     /// fills it. A CPU without a published binding reads the hardware.
     pub fn current() -> Self {
         let Some(binding) = super::context::current_cpu_binding() else {
-            return Self(read_hardware());
+            return Self(super::mmu::read_cr4());
         };
         let cached = binding.cr4_snapshot.load(Ordering::Relaxed);
         if cached != 0 {
             return Self(cached);
         }
-        let live = read_hardware();
+        let live = super::mmu::read_cr4();
         // Only this CPU writes its binding's snapshot, and an interrupt that
         // fills it first stores the same hardware value.
         binding.cr4_snapshot.store(live, Ordering::Relaxed);
@@ -45,13 +45,4 @@ impl Cr4 {
     pub const fn smap_word(self) -> u64 {
         self.0 & CR4_SMAP
     }
-}
-
-fn read_hardware() -> u64 {
-    let cr4: u64;
-    // SAFETY: CPL0 may read its own CR4; the read has no side effect.
-    unsafe {
-        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
-    };
-    cr4
 }

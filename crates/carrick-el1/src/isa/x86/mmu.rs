@@ -81,6 +81,17 @@ impl DrainReceipt {
     }
 }
 
+/// One hardware read of this CPU's CR4, for its binding's snapshot
+/// ([`super::control::Cr4::current`]): the only CR4 read in the kernel.
+pub(super) fn read_cr4() -> u64 {
+    let cr4: u64;
+    // SAFETY: CPL0 may read its own CR4; the read has no side effect.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+    cr4
+}
+
 fn live_root() -> Result<RootGpa, ArchError> {
     let cr3: u64;
     // SAFETY: CPL0 may read this CPU's CR3 (not intercepted under nested
