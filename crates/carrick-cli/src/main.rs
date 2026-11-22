@@ -139,6 +139,7 @@ mod hvpatch_carrier_cpu_low_rate_profile;
 mod hvpatch_core_profile;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hvpatch_inotify_population_profile;
+mod venue_gaps;
 // Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
 #[cfg(any(test, target_os = "macos"))]
 mod hvpatch_exec_runtime_profile;

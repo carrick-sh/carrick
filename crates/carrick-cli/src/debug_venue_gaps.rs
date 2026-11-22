@@ -1,6 +1,6 @@
 //! `carrick debug venue-gaps`: diff native-oracle syscall profiles against
 //! Carrick's routing for the root and a native child (#1906). The diff
-//! itself lives in `carrick_runtime::venue_gaps`.
+//! itself lives in `crate::venue_gaps`.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -44,19 +44,17 @@ pub(crate) fn run_venue_gaps(profiles: &[PathBuf], census: &[PathBuf], all: bool
     let census = if census.is_empty() {
         None
     } else {
-        Some(carrick_runtime::venue_gaps::census_refusals(&censuses(
-            census,
-        )?))
+        Some(crate::venue_gaps::census_refusals(&censuses(census)?))
     };
     for path in profiles {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read profile {}", path.display()))?;
-        let profile = carrick_runtime::venue_gaps::parse_profile(&text)
+        let profile = crate::venue_gaps::parse_profile(&text)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("profile {}", path.display()))?;
         print!(
             "{}",
-            carrick_runtime::venue_gaps::render(&row_name(path), &profile, census.as_ref(), all)
+            crate::venue_gaps::render(&row_name(path), &profile, census.as_ref(), all)
                 .map_err(anyhow::Error::msg)?
         );
         println!();

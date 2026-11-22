@@ -75,6 +75,12 @@ carrick-mem = { path = "../carrick-mem" }
 carrick-embed = { path = "../carrick-embed", default-features = false }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+# `debug venue-gaps` asks the personality's own routing decision (#1906).
+carrick-personality-linux = { path = "../carrick-personality-linux" }
+carrick-syscall-abi = { path = "../carrick-syscall-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-abi = { path = "../carrick-abi" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-vfs = { path = "../carrick-vfs" }

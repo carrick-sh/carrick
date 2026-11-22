@@ -431,7 +431,7 @@ pub fn shape_text(isa: GuestIsa, shape: ShapeKey) -> String {
 /// nr, caller).
 pub type CensusRefusals = BTreeMap<(&'static str, u64, bool), u64>;
 
-pub fn census_refusals(censuses: &[crate::el1_census::Census]) -> CensusRefusals {
+pub fn census_refusals(censuses: &[carrick_runtime::el1_census::Census]) -> CensusRefusals {
     let mut out = CensusRefusals::new();
     for census in censuses {
         let isa = match census.refusal_evidence.isa {
