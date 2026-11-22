@@ -7628,6 +7628,114 @@ mod tests {
         );
     }
 
+    /// #1906, #2825: ARM's production staging route takes a `pselect6` over
+    /// host-backed descriptors to the readiness venue as one select-shaped
+    /// set, for a fork child and for the root when the selected descriptor
+    /// is a host-backed description of its ring table. A set the venue does
+    /// not stage is a counted ENOSYS for a child and keeps the root's host
+    /// route. This is the ARM route's host unit witness: the signed HVF
+    /// check of both is deferred (#2825).
+    #[test]
+    fn native_host_file_stage_takes_a_host_socket_pselect6_to_the_venue() {
+        use carrick_core_abi::host_file::{
+            HostFileOp, HostFileRequestView, POLL_SHAPE_ARG, PollShape,
+        };
+        use carrick_core_abi::service::ServiceOrigin;
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileStage, InZoneKind,
+        };
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        // `pselect6(4, {3}, NULL, NULL, NULL, NULL)`.
+        let read_set = alloc::boxed::Box::new(1u64 << 3);
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 72;
+        frame.x[0] = 4;
+        frame.x[1] = core::ptr::from_ref::<u64>(&read_set).addr() as u64;
+        let table = [3, 4, 5];
+        for origin in [ServiceOrigin::Descendant, ServiceOrigin::Initial] {
+            let staged = native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                origin,
+                |fd| {
+                    assert_eq!(fd, 3, "only the selected descriptor is resolved");
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    })
+                },
+                &mut |_| 0,
+            );
+            let Some(HostFileStage::Request { mut record, .. }) = staged else {
+                panic!("{origin:?}: a select over a host socket crosses: {staged:?}");
+            };
+            let view = HostFileRequestView::parse(&mut record).unwrap();
+            assert_eq!(view.header().table, table);
+            assert_eq!(view.header().op, HostFileOp::Poll);
+            assert_eq!(view.header().args[POLL_SHAPE_ARG], PollShape::Select.raw());
+        }
+        // The selected descriptor is an in-zone pipe: the venue stages
+        // nothing. A child's call is a counted ENOSYS, never a host
+        // crossing; the root's keeps its existing route.
+        let pipe = |_| {
+            Some(NativeDescriptor::InZone(InZoneKind::Pipe(
+                carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+            )))
+        };
+        let child = native_host_file_stage(
+            &frame,
+            &task,
+            &Resident,
+            table,
+            ServiceOrigin::Descendant,
+            pipe,
+            &mut |_| 0,
+        );
+        assert!(
+            child.is_some() && !matches!(child, Some(HostFileStage::Request { .. })),
+            "a child's unstaged select never reaches the host: {child:?}"
+        );
+        assert_eq!(
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                ServiceOrigin::Initial,
+                pipe,
+                &mut |_| 0,
+            ),
+            None
+        );
+        // A descriptor of the root's host table is not in its ring table:
+        // the root's select keeps its host route.
+        assert_eq!(
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                ServiceOrigin::Initial,
+                |_| None,
+                &mut |_| 0,
+            ),
+            None
+        );
+    }
+
     /// #231: a fork child's `socket(AF_INET, SOCK_STREAM, 0)` is a real host
     /// network crossing. ARM's production staging route for an owned native
     /// SVC stages it as a host-file venue request in the caller's own table;
