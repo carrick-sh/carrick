@@ -1405,6 +1405,26 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 Err(_) => return Err((va, u64::MAX)),
             };
             let physical = entry & ADDRESS;
+            // The ring released this MM's editor before the settlement
+            // crossing: a sibling thread may have protected or retired a
+            // page of this window since (its mapping can lie inside it).
+            if let DescriptorOp::Prepare {
+                output,
+                permissions,
+                ..
+            } = txn.op
+                && output
+                    .raw()
+                    .checked_add(va - span.va)
+                    .and_then(|page| PreparedLeafSuccessor::classify(entry, page, permissions))
+                    .is_some()
+            {
+                let Some(next) = va.checked_add(size - (va & (size - 1))) else {
+                    return Err((va, entry));
+                };
+                va = next.min(end);
+                continue;
+            }
             let expected_base = match txn.op {
                 DescriptorOp::Map { output, .. } | DescriptorOp::Prepare { output, .. } => {
                     Some(output.raw())

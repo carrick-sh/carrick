@@ -51,8 +51,8 @@ impl PrivateAnonymousWitness {
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_guest_arch::{FrameGpa, UserVa};
         use carrick_mmu_core::x86::descriptor_txn::{
-            ADDRESS, COW, DescriptorOp, PAGE, PREPARED, PRESENT, PRIVATE, RETIRED,
-            read_terminal_descriptor,
+            ADDRESS, COW, DescriptorOp, PAGE, PREPARED, PRESENT, PRIVATE, PreparedLeafSuccessor,
+            RETIRED, read_terminal_descriptor,
         };
         let fail = |message: &str| carrick_hal::TrapError::Hypervisor(message.to_owned());
         let mm = grant.context.mm.raw();
@@ -122,6 +122,15 @@ impl PrivateAnonymousWitness {
                     let (entry, size) =
                         read_terminal_descriptor(&grant.memory.words(), txn.root, UserVa::new(va))
                             .map_err(|_| fail("private witness terminal unavailable"))?;
+                    // A sibling's `munmap` retired this page between the
+                    // ring's edit and this settlement: it is no longer a
+                    // live private leaf, so it leaves the population.
+                    if size == PAGE
+                        && PreparedLeafSuccessor::classify(entry, pa, permissions)
+                            == Some(PreparedLeafSuccessor::Retired)
+                    {
+                        continue;
+                    }
                     if size != PAGE
                         || entry & PRIVATE == 0
                         || entry & (PRESENT | PREPARED) == 0

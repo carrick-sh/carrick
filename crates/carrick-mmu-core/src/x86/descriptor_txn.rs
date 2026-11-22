@@ -90,6 +90,39 @@ pub enum DescriptorOp {
         size: LeafSize,
     },
 }
+/// What a `Prepare` leaf may read by the time its owner settles it.
+///
+/// The ring applies a `Prepare` under the MM's editor and releases the editor
+/// before its carrier crossing. A sibling thread of the same MM may edit the
+/// same pages in that interval: its window can span the sibling's adjacent
+/// mapping. The settlement accepts the applied leaf and exactly these ring
+/// successors of it, each still naming the `Prepare`'s output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedLeafSuccessor {
+    /// A sibling `Protect` inside the ceiling the `Prepare` recorded.
+    Protected,
+    /// A sibling `Retire`: inaccessible, kept for the owner's scrub.
+    Retired,
+}
+impl PreparedLeafSuccessor {
+    /// Classify `entry` against the page `output` a `Prepare` with
+    /// `permissions` made. `None`: not a successor of that leaf.
+    pub fn classify(entry: u64, output: u64, permissions: Permissions) -> Option<Self> {
+        if entry & ADDRESS != output || entry & PRIVATE == 0 || entry & COW != 0 {
+            return None;
+        }
+        if entry & (PRESENT | PREPARED | RETIRED) == RETIRED {
+            return Some(Self::Retired);
+        }
+        let live = entry & RETIRED == 0 && (entry & PRESENT != 0) != (entry & PREPARED != 0);
+        let ceiling = (entry & MAY_WRITE != 0) == permissions.writable
+            && (entry & MAY_EXEC != 0) == permissions.executable;
+        let within = (entry & WRITE == 0 || entry & MAY_WRITE != 0)
+            && (entry & NX != 0 || entry & MAY_EXEC != 0);
+        (live && ceiling && within).then_some(Self::Protected)
+    }
+}
+
 impl DescriptorOp {
     /// Digest operation kind, also used by descriptor diagnostics.
     fn kind(self) -> u64 {
