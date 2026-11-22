@@ -2408,3 +2408,212 @@ fn x86_abort_retires_object_parked_member() {
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words, ClosingObjectParkCause::Abort);
 }
+
+/// #2749 route A: two live processes share one execution lane. Process 1
+/// parks on a fault it selected nothing for, and its notice is not yet taken
+/// when Process 2 faults on the same lane, selects its copy-on-write supply
+/// and parks behind that notice. The carrier's intake of Process 1 must not
+/// see Process 2's selection, and Process 2's selection must reach exactly
+/// Process 2's own ticket after the lane has been reused.
+fn fault_selection_travels_with_its_request_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceFaultSupply, ServiceOperation};
+
+    const PAGE: u64 = 0x7000_0000;
+    let capacity = NativeServiceCapacityFixture::<C>::new_for::<B>(2, make_words);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    // The per-CPU selection lane of `fixture.slot`.
+    let lane: &'static carrick_el1_abi::PortalGrantSlot =
+        Box::leak(Box::new(carrick_el1_abi::PortalGrantSlot::new()));
+    let fault = |present| {
+        ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+            address: UserVa::new(PAGE + 0x123),
+            access: carrick_guest_arch::Access::Write,
+            present,
+        })
+    };
+    let window_for = |mm: u64, sequence: u64| carrick_core_abi::PortalGrantWindow {
+        operation: carrick_core_abi::PortalOperation {
+            carrier: NonZeroU64::MIN,
+            mm: carrick_core_abi::ReservationMm::new(mm).unwrap(),
+            incarnation: NonZeroU64::MIN,
+            sequence: NonZeroU64::new(sequence).unwrap(),
+        },
+        mapping_incarnation: carrick_core_abi::ReservationIncarnation::new(1).unwrap(),
+        range: carrick_core_abi::ReservationRange::new(PAGE, PAGE + 4096).unwrap(),
+        protection: carrick_core_abi::ReservationProtection::from_bits(3).unwrap(),
+        fault_page: PAGE,
+        host_backing: None,
+        fork_sequence: None,
+    };
+    let claim = |notice: carrick_core_abi::service::ServiceSelector| {
+        let identity = fixture.zone.record(notice.record.id).identity();
+        // SAFETY: the fixture retains this exact member and its control.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity) }
+            .unwrap()
+    };
+    let notify = |record: RecordRef| {
+        let key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue.notify_object(fixture.slot, &mut effects).unwrap();
+    };
+
+    // Process 1 forwards a fault with no selection and parks; the carrier has
+    // not yet taken its notice.
+    let (holder_record, holder_addr, holder_words) = capacity.select().unwrap();
+    {
+        let mut service = fixture.service();
+        let mut holder = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                holder_addr,
+                &holder_words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            holder.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        let result = holder.begin_service(fault(false), None);
+        let phase = holder.native_service_phase();
+        let settled = holder.settle_service_exit(result, NativeServiceExit::Bridge);
+        let resumed = crate::dispatch::native_service_completion(settled, phase)
+            .unwrap_or_else(|fatal| panic!("holder fault entry became {fatal:?}"));
+        assert!(matches!(resumed, NativeResume::Left(None)));
+    }
+
+    // Process 2 runs on the same lane, stamps its selection there, and parks
+    // behind Process 1's notice.
+    let (contender_record, contender_addr, contender_words) = capacity.select().unwrap();
+    assert_ne!(contender_record, holder_record);
+    let selected = window_for(contender_addr.mm.raw().get(), 9);
+    {
+        let mut service = fixture.service();
+        let mut contender = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                contender_addr,
+                &contender_words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            contender.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        assert!(lane.publish_cow_fault_selection(9, selected));
+        let result = contender.begin_service(fault(true), Some(selected.operation.sequence));
+        let phase = contender.native_service_phase();
+        let settled = contender.settle_service_exit(result, NativeServiceExit::Bridge);
+        let resumed = crate::dispatch::native_service_completion(settled, phase)
+            .unwrap_or_else(|fatal| panic!("contender fault entry became {fatal:?}"));
+        assert!(matches!(resumed, NativeResume::Left(None)));
+    }
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+
+    // Carrier intake of Process 1, as the HVF and CPL0 hosts perform it.
+    let holder_notice = fixture.task.service_notice.take().unwrap().unwrap();
+    assert_eq!(holder_notice.record, holder_record);
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    let mut holder_ticket = claim(holder_notice);
+    assert_eq!(holder_ticket.request().fault_sequence, None);
+    assert_eq!(
+        holder_ticket.take_fault_selection(lane),
+        Ok(None),
+        "an unselected fault's intake must not be refused by a peer's selection"
+    );
+    assert!(holder_ticket.complete(false).is_ok());
+    notify(holder_record);
+
+    // Process 1 resumes refused; Process 2 publishes its retained request.
+    let mut holder_resumed = false;
+    let mut contender_published = false;
+    for _ in 0..2 {
+        let (record, addr, saved) = capacity.select().unwrap();
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                addr,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        if record == holder_record {
+            assert!(!matches!(
+                resumed,
+                NativeResume::Invalid | NativeResume::Left(_)
+            ));
+            let _ = fixture.zone.release_current(
+                fixture.slot,
+                record.id,
+                &carrick_sched_core::ShortLockSpin,
+            );
+            holder_resumed = true;
+        } else {
+            assert_eq!(record, contender_record);
+            assert!(matches!(resumed, NativeResume::Left(None)));
+            contender_published = true;
+        }
+    }
+    assert!(holder_resumed && contender_published);
+
+    // Carrier intake of Process 2 takes exactly the selection it stamped.
+    let contender_notice = fixture.task.service_notice.take().unwrap().unwrap();
+    assert_eq!(contender_notice.record, contender_record);
+    let mut contender_ticket = claim(contender_notice);
+    assert_eq!(
+        contender_ticket.request().fault_sequence,
+        Some(selected.operation.sequence)
+    );
+    assert_eq!(
+        contender_ticket.take_fault_selection(lane),
+        Ok(Some(ServiceFaultSupply::Cow(selected)))
+    );
+    assert!(contender_ticket.complete(false).is_ok());
+    notify(contender_record);
+}
+
+#[test]
+fn arm_fault_selection_travels_with_its_request() {
+    fault_selection_travels_with_its_request_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_fault_selection_travels_with_its_request() {
+    fault_selection_travels_with_its_request_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
