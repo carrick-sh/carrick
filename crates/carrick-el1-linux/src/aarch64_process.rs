@@ -2697,7 +2697,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
 
     /// The owner writes a signal frame only into an MM its portal admitted
-    /// ([`Self::access_user_target`]); a root opened on the legacy venue has
+    /// (`access_user_target`); a root opened on the legacy venue has
     /// none, so no caught handler could ever be delivered there.
     fn signal_frames_reach(&self, mm: &Mm) -> bool {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
