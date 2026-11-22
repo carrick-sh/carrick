@@ -428,6 +428,15 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
     pub fn observe(&self, cause: SpaceWaitCause) -> ObjectWaitSnapshot {
         self.zone.notification_snapshot(self.key(cause))
     }
+    /// True while `key` names one of this source's causes and that cause
+    /// still reads `observed`. A park rechecks the key its probe named, never
+    /// the cause that first refused the call: the two differ when the holder
+    /// changed between the refusal and the probe (#2763).
+    pub fn still_at(&self, key: ObjectWaitKey, observed: ObjectWaitSnapshot) -> bool {
+        SpaceWaitCause::ALL
+            .into_iter()
+            .any(|cause| self.key(cause) == key && self.observe(cause) == observed)
+    }
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceNotificationLease<'_, C> {
     fn drop(&mut self) {
