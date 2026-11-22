@@ -58,19 +58,22 @@ impl Drop for UnregisterRoot {
 }
 
 fn wfi_kick_bell() -> &'static (std::sync::Mutex<u64>, std::sync::Condvar) {
-    static BELL: std::sync::OnceLock<(std::sync::Mutex<u64>, std::sync::Condvar)> =
+    type Bell = (std::sync::Mutex<u64>, std::sync::Condvar);
+    static BELL: std::sync::OnceLock<Bell> = std::sync::OnceLock::new();
+    // The test binary's kicker, registered for the rest of the process.
+    static KICKER: std::sync::OnceLock<carrick_kernel::el1_zone::SlotKickerRegistration> =
         std::sync::OnceLock::new();
-    BELL.get_or_init(|| {
-        let pair = (std::sync::Mutex::new(0u64), std::sync::Condvar::new());
+    let bell = BELL.get_or_init(|| (std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
+    KICKER.get_or_init(|| {
         carrick_kernel::el1_zone::register_slot_kicker(Box::new(|_| {
             if let Some((lock, cvar)) = BELL.get() {
                 let mut epoch = lock.lock().unwrap();
                 *epoch = epoch.wrapping_add(1);
                 cvar.notify_all();
             }
-        }));
-        pair
-    })
+        }))
+    });
+    bell
 }
 
 struct ArmWfiCpu<'a> {

@@ -215,6 +215,10 @@ pub(crate) struct HvpatchRuntimeDirectory {
     >,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     guest_capture: Mutex<Option<Arc<carrick_vmm_hvf::guest_capture::GuestCapture>>>,
+    /// The zone's way to this carrier's vCPU slots, registered by the first
+    /// pool start and held for the carrier's life.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    slot_kicker: Mutex<Option<carrick_kernel::el1_zone::SlotKickerRegistration>>,
     native_deadlines: Mutex<Option<crate::deadline_driver::DeadlineDriver>>,
     /// Carrier-owned logical process jobs. No process child owns a host thread;
     /// the root waits these exact completions before shutting the shared pool.
@@ -716,6 +720,8 @@ impl Default for HvpatchRuntimeDirectory {
             persistent_pool: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             guest_capture: Mutex::new(None),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            slot_kicker: Mutex::new(None),
             native_deadlines: Mutex::new(None),
             process_jobs: Mutex::new(ProcessJobDirectoryState::default()),
             process_jobs_changed: Condvar::new(),
@@ -833,9 +839,11 @@ impl HvpatchRuntimeDirectory {
         carrick_kernel::kernel::mm_occupancy::install_guest_cow_settlement(
             authority.guest_cow_settlement(),
         );
-        carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
-            carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
-        }));
+        self.slot_kicker.lock().get_or_insert_with(|| {
+            carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
+                carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
+            }))
+        });
         // No executor may transfer a deadline until the carrier server is
         // durably admitted. Its mapping reference stays live through shutdown.
         let zone = carrick_el1_abi::zone_tables().ok_or_else(|| {
