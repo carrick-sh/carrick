@@ -27,7 +27,9 @@
 //! - with `--venue-profile <row>=<file>`, each call shape the row makes on
 //!   the native oracle that Carrick's static route answers ENOSYS, on either
 //!   ISA (`venue_gap`, from `crate::venue_gaps`): the stops past the ones the
-//!   runs reached.
+//!   runs reached. Each gap is joined with the runs' counted refusals: it is
+//!   `reached` when a run of its row on its ISA refused that call for that
+//!   caller, and `not yet reached` when the row stopped before making it.
 //!
 //! The output is one ranked table (instance, ISA, row, stage, kind, site,
 //! count, runs, real values) in `<out>/table.md` and `<out>/table.json`, and
@@ -521,6 +523,14 @@ fn refusal_site(rank: &RefusalRank, venue: &str) -> String {
     )
 }
 
+/// The call and caller a refusal site (`refusal_site`) or a venue-gap site
+/// (`venue_gap_rows`) names: the text before the first `(` or space, and the
+/// `caller=` token.
+fn site_call(site: &str) -> Option<(&str, &str)> {
+    let name = &site[..site.find(['(', ' '])?];
+    Some((name, token(site, "caller")?))
+}
+
 /// Read every census JSON a run wrote into its census directory.
 fn load_censuses(directory: &Path) -> Result<Vec<Census>> {
     let mut censuses = Vec::new();
@@ -991,6 +1001,74 @@ pub(crate) fn venue_gap_rows(
     Ok(rows)
 }
 
+/// Join each venue gap with the runs' counted refusals. A gap is a static
+/// route; a run reaches it only if the row gets as far as making the call.
+/// The gap's runs column becomes the runs of its row, on its ISA, that
+/// refused the call for the same caller, out of the runs of that row, so
+/// reached gaps rank first. Its values say which: `reached` with the refusal
+/// count and stages, `not yet reached` when the row ran and never refused
+/// it, `not run` when no run of the row was on that ISA. A counted refusal
+/// carries no argument shape, so a shaped gap (a socket family, say) also
+/// takes the refused calls' recorded arguments.
+pub(crate) fn mark_reached(venue: &mut [TableRow], records: &[RunRecord]) {
+    for gap in venue
+        .iter_mut()
+        .filter(|row| row.kind == FindingKind::VenueGap)
+    {
+        let Some((name, caller)) = site_call(&gap.site) else {
+            continue;
+        };
+        let shaped = gap.site.contains(" [");
+        let (name, caller) = (name.to_owned(), caller.to_owned());
+        let mut refused = 0u64;
+        let mut stages = BTreeSet::new();
+        let mut recorded = Vec::new();
+        gap.runs = 0;
+        gap.of_runs = 0;
+        for record in records {
+            if record.isa != gap.isa || record.row != gap.row {
+                continue;
+            }
+            gap.of_runs += 1;
+            let mut hit = false;
+            for finding in &record.findings {
+                if finding.kind == FindingKind::Refused
+                    && site_call(&finding.site) == Some((name.as_str(), caller.as_str()))
+                {
+                    hit = true;
+                    refused = refused.saturating_add(finding.count);
+                    for value in &finding.values {
+                        push_value(&mut recorded, value.clone());
+                    }
+                }
+            }
+            if hit {
+                gap.runs += 1;
+                stages.insert(record.stage.as_str());
+            }
+        }
+        let isa = gap.isa.name();
+        gap.values.push(if gap.of_runs == 0 {
+            format!("not run: no run of this row on {isa}")
+        } else if gap.runs == 0 {
+            format!("not yet reached: no {isa} run of this row refused it")
+        } else {
+            format!(
+                "reached: refused {refused} times in stage {}{}",
+                stages.into_iter().collect::<Vec<_>>().join(", "),
+                if shaped {
+                    " (counted per call, not per shape; recorded arguments follow)"
+                } else {
+                    ""
+                }
+            )
+        });
+        if shaped {
+            gap.values.extend(recorded);
+        }
+    }
+}
+
 /// The venue-gap rows of every profile a directory holds (`<out>/venue/`);
 /// none when it has none.
 fn venue_rows(out: &Path) -> Result<Vec<TableRow>> {
@@ -1253,7 +1331,9 @@ fn write_outputs(
     limit: usize,
 ) -> Result<String> {
     let mut rows = rank(records, oracle);
-    rows.extend(venue_rows(out)?);
+    let mut venue = venue_rows(out)?;
+    mark_reached(&mut venue, records);
+    rows.extend(venue);
     sort_rows(&mut rows);
     let table = render(records, oracle, &rows, limit);
     std::fs::write(out.join("table.md"), &table)
@@ -2244,6 +2324,96 @@ VENUEPROFILE1|complete|root=7
 ";
 
     #[test]
+    fn a_venue_gap_is_reached_only_by_a_run_that_refused_its_call() {
+        let gap = |isa, row: &str, site: &str| TableRow {
+            instance: VENUE_INSTANCE.to_owned(),
+            isa,
+            row: row.to_owned(),
+            stage: VENUE_STAGE.to_owned(),
+            kind: FindingKind::VenueGap,
+            site: site.to_owned(),
+            count: 4,
+            runs: 0,
+            of_runs: 0,
+            values: vec!["native oracle".to_owned()],
+        };
+        let refused = |site: &str, count, value: &str| Finding {
+            kind: FindingKind::Refused,
+            site: site.to_owned(),
+            count,
+            values: vec![value.to_owned()],
+        };
+        let socket = "REFUSE nr=41(socket) caller=child venue=ring a0=0x1 a1=0x80001";
+        let records = [
+            record(
+                "go",
+                1,
+                false,
+                vec![
+                    refused("socket(nr=41) caller=child venue=ring", 3, socket),
+                    refused("pidfd_open(nr=434) caller=root venue=ring", 1, "x"),
+                ],
+            ),
+            record("go", 2, false, vec![]),
+            // Another row's refusal reaches nothing of this row's.
+            record(
+                "pip",
+                1,
+                false,
+                vec![refused(
+                    "copy_file_range(nr=326) caller=child venue=carrier",
+                    9,
+                    "x",
+                )],
+            ),
+        ];
+        let mut venue = [
+            gap(
+                RowIsa::X86_64,
+                "go",
+                "socket [AF_UNIX type=1] caller=child route=ENOSYS (unrouted)",
+            ),
+            // The same call from the other caller, and a call no run made.
+            gap(
+                RowIsa::X86_64,
+                "go",
+                "pidfd_open caller=child route=ENOSYS (unrouted)",
+            ),
+            gap(
+                RowIsa::X86_64,
+                "go",
+                "copy_file_range caller=child route=ENOSYS (unrouted)",
+            ),
+            gap(
+                RowIsa::Arm64,
+                "go",
+                "pidfd_open caller=root route=ENOSYS (unrouted)",
+            ),
+        ];
+        mark_reached(&mut venue, &records);
+        assert_eq!((venue[0].runs, venue[0].of_runs), (1, 2));
+        assert_eq!(
+            venue[0].values[1..],
+            [
+                "reached: refused 3 times in stage build (counted per call, not per shape; recorded arguments follow)",
+                socket
+            ]
+        );
+        for unreached in &venue[1..3] {
+            assert_eq!((unreached.runs, unreached.of_runs), (0, 2), "{unreached:?}");
+            assert_eq!(
+                unreached.values[1],
+                "not yet reached: no x86_64 run of this row refused it"
+            );
+        }
+        assert_eq!((venue[3].runs, venue[3].of_runs), (0, 0));
+        assert_eq!(venue[3].values[1], "not run: no run of this row on arm64");
+        // A reached gap ranks before an unreached one.
+        sort_rows(&mut venue);
+        assert!(venue[0].site.starts_with("socket "), "{:?}", venue[0].site);
+    }
+
+    #[test]
     fn a_venue_profiles_gaps_rank_as_rows_and_survive_report() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("carrick");
@@ -2291,7 +2461,7 @@ VENUEPROFILE1|complete|root=7
         );
         assert!(gap.contains("caller=child route=ENOSYS"), "{gap}");
         assert!(
-            gap.contains("| 2 | 0/0 | `native oracle nr=510: calls=2 enosys=2 errors=0` |"),
+            gap.contains("`native oracle nr=510: calls=2 enosys=2 errors=0`"),
             "{gap}"
         );
         // Every venue row is one of `venue_gaps::gap_rows`'s gaps.
