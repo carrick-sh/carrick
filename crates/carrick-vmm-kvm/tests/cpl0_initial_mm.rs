@@ -609,6 +609,24 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #2655: a root whose fork needs more residency rows than one table segment
+/// holds must fork, and both processes must run on. The fixture commits
+/// 2,400 one-page mappings that share no grant window, so the parent holds
+/// 2,400 rows and the child needs 2,400 more, against one 4,096-slot segment.
+/// Before the fix the carrier died here with `physical fork source residency
+/// capacity`; now it refuses "not now", the guest grows the table and the
+/// fork reruns. Parent and child both write inherited pages while both live.
+#[test]
+fn native_fork_of_a_root_wider_than_one_residency_segment_runs_both_sides() {
+    let elf = native_exit_fixture("native_fork_wide_residency.S");
+    let outcome = run_exec_fixture(&elf, 1 << 20);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "wide fork status (9 wrong byte, 10 mmap, 12 wait4, 100 + errno fork)"
+    );
+    assert!(outcome.run.stderr.is_empty());
+}
+
 /// A second live child holds fork-stock tables while this child's production
 /// NATIVE_SERVICE_PORT exec parks. Retirement returns the tables and must
 /// resume the exact parked record through its scheduler object queue.
