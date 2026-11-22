@@ -3501,6 +3501,76 @@ mod tests {
             }
         }
 
+        /// A read-only `MAP_SHARED` file mapping whose byte source the
+        /// host-file venue retained is served in ring like a private one.
+        /// It never becomes writable: `mprotect` asking for `PROT_WRITE` is
+        /// EACCES (mprotect(2)), while read and execute edits succeed. Its
+        /// source leaves custody when the mapping is unmapped.
+        #[test]
+        fn read_only_shared_file_mapping_is_served_and_stays_unwritable() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let source = carrick_el1_abi::HostBackingIdentity::new(
+                core::num::NonZeroU64::new(7).unwrap(),
+                core::num::NonZeroU64::MIN,
+                0,
+            );
+            let (route, address) = syscall_with_file(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x2000, PROT_READ, MAP_SHARED, 3, 0],
+                Some(source),
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert!(address > 0, "{address}");
+            let address = address as u64;
+            for (prot, expected) in [
+                (PROT_READ | PROT_WRITE, -13),
+                (PROT_READ | PROT_EXEC, 0),
+                (PROT_READ | PROT_WRITE | PROT_EXEC, -13),
+                (PROT_WRITE, -13),
+                (0, 0),
+                (PROT_READ, 0),
+            ] {
+                // The second page too: a split node keeps the ceiling.
+                let (route, result) = syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MPROTECT,
+                    [address + 0x1000, 0x1000, prot, 0, 0, 0],
+                );
+                assert_eq!(
+                    (route, result),
+                    (DelegatedAnonymous::Served, expected),
+                    "prot {prot}"
+                );
+            }
+            let (route, result) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MUNMAP,
+                [address, 0x2000, 0, 0, 0, 0],
+            );
+            assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+            let mut out = [(core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN); 8];
+            let taken = take_native_source_releases(&delegated.task, access, &table, 0, &mut out);
+            assert_eq!(taken, 1);
+            assert_eq!(out[0].0, source.handle());
+        }
+
         /// The glibc loader's exact sequence for libc.so.6 (Docker oracle
         /// strace): reserve the image PROT_NONE, map text and data over it
         /// from the file, trim, guard the gap, map bss, then make RELRO

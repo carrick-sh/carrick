@@ -985,6 +985,64 @@ fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
     );
 }
 
+/// A read-only `MAP_SHARED` mapping of a read-only description can never
+/// write the file, so it takes the private mapping's byte-source crossing.
+/// Asking for `PROT_WRITE` there is EACCES (mmap(2)); a writable description
+/// could later be made writable through `mprotect`, so it stays unrouted.
+#[test]
+fn read_only_shared_file_mmap_takes_the_byte_source_crossing() {
+    let mut user = memory(b"");
+    let args = |prot: u64, flags: u64, fd: u64| [0, 8192, prot, flags, fd, 4096];
+    let decoded = |prot, fd| {
+        HostFileCall::decode(LINUX_NR_MMAP, &args(prot, LINUX_MAP_SHARED, fd))
+            .expect("a shared file mmap is a host-file call")
+    };
+    let call = decoded(1, 3);
+    let key = NativeMapKey::of(&args(1, LINUX_MAP_SHARED, 3));
+    assert_eq!(call, HostFileCall::MapPrivate(key));
+    let Some(HostFileStage::Request {
+        mut record, map, ..
+    }) = run(call, &mut user)
+    else {
+        panic!("a read-only shared mapping crosses for its byte source");
+    };
+    assert_eq!(map, Some(key), "the retry key keeps MAP_SHARED");
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::MapPrivate);
+    assert_eq!(view.header().args[..2], [4096, 8192]);
+    // PROT_WRITE (alone or with PROT_READ) on a read-only description.
+    for prot in [2, 3, 7] {
+        assert_eq!(
+            run(decoded(prot, 3), &mut user),
+            returned(carrick_syscall_abi::LINUX_EACCES),
+            "prot {prot}"
+        );
+    }
+    // A writable description: not served here, with or without PROT_WRITE.
+    for prot in [1, 3] {
+        assert_eq!(run(decoded(prot, 1), &mut user), None, "prot {prot}");
+    }
+    // The descriptor errors of a private mapping are unchanged.
+    assert_eq!(
+        run(decoded(1, 0), &mut user),
+        returned(carrick_syscall_abi::LINUX_ENODEV)
+    );
+    assert_eq!(
+        run(decoded(1, 9), &mut user),
+        returned(carrick_syscall_abi::LINUX_EBADF)
+    );
+    // Neither both sharing bits nor a shared anonymous mapping is claimed.
+    for flags in [
+        LINUX_MAP_SHARED | LINUX_MAP_PRIVATE,
+        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+    ] {
+        assert_eq!(
+            HostFileCall::decode(LINUX_NR_MMAP, &args(1, flags, 3)),
+            None
+        );
+    }
+}
+
 #[test]
 fn unserved_epoll_reads_do_not_prepare_output() {
     let mut user = memory(&[]);
