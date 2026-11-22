@@ -38,6 +38,7 @@ surfaces = [
   { path = "crates/carrick-abi/src/lib.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-cli/src/debug_a64_census.rs", contracts = [] },
+  { path = "crates/carrick-cli/src/debug_discover.rs", contracts = [] },
   { path = "crates/carrick-cli/src/debug_zonedump.rs", contracts = [] },
   { path = "crates/carrick-cli/tests/fixtures/x86_b1_files.S", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-cli/tests/fixtures/x86_entrypoint_argv.S", contract = "runtime.image-entrypoint" },
