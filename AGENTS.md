@@ -150,7 +150,9 @@ Docker oracle. The scoreboard is the fast smoke check.
 - **One signed result belongs to one artifact.** Record HEAD, SHA-256,
   CDHash, LC_UUID, the entitlement and `__dof_carrick`. Run
   `just smoke-signed` and attach its receipt before you report signed work.
-  Compare populations (tests started, binaries finished), not failure names.
+  Signed HVF once per landing train on its union head, per PR only for an
+  ARM-only claim (owner, 2026-11-22). Compare populations (tests started,
+  binaries finished).
 - **Pre-existing means it fails on current GitHub main**, not on the PR's base.
 - **Gate and test tooling passes a known-answer run** before anything relies
   on it. A workflow change records `Known-answer run: <id>` on its PR.
@@ -179,9 +181,8 @@ values; fix briefs cite them.
 - Signed `just accept` builds under shared `carrick` and holds exclusive
   `gate` only while guests run, re-verifying the binary and fixtures after
   admission (#2013); guest-booting host profiles (`kvm`, `el1-native`) keep
-  `gate`. `scripts/test-signed.sh` holds shared `carrick`. Deliberate load needs
-  `CARRICK_ALLOW_LOAD=1` and cleans up after itself, and every `dtrace -Z`
-  session is bounded.
+  `gate`. `scripts/test-signed.sh` holds shared `carrick`. Deliberate load
+  needs `CARRICK_ALLOW_LOAD=1` and cleans up; every `dtrace -Z` session is bounded.
 - Lock order: remote checkout lock, then host lease, then work. Never upgrade
   a shared lease (release `carrick` fully, then request `gate`), and never
   unlink a live lock file.
@@ -244,9 +245,8 @@ values; fix briefs cite them.
   after-evidence. Never use one for a flaky or crash fix. Standing cases (owner,
   2026-11-04 and 2026-11-08): docs- and workflow-only PRs; calculated bets to
   keep landings flowing; owner-directed x86, KVM, HAL or CPL0 landings.
-- **WIP limit: 20 open PRs** (owner, 2026-11-07; enforced by `worker start`).
-  Above it, only finishing work starts. An agent may override it to fix the
-  project, rarely, with a logged reason (owner, 2026-11-11).
+- **WIP limit: 12 open PRs** (owner, 2026-11-22; enforced by `worker start`).
+  Above it only finishing work starts (logged overrides, 11-11).
 - **Personality split:** the shared kernel is personality-neutral. Nothing
   here names an out-of-tree personality. Neutral crates must not depend on
   `carrick-personality-linux`; `carrick-el1`, `carrick-el1-abi`, `carrick-hal`
