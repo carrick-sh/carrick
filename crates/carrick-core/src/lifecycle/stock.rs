@@ -31,6 +31,19 @@ pub fn claimable(page: &dyn Lifecycle) -> bool {
     })
 }
 
+/// The thread control of each pool entry. A fixed pool keeps them in one
+/// slab behind the leader's (slot zero); a pool that grows resolves an
+/// extension entry through its own segment.
+pub trait PoolControls<T> {
+    fn pool_control(&self, index: usize) -> Option<&T>;
+}
+
+impl<T> PoolControls<T> for [T] {
+    fn pool_control(&self, index: usize) -> Option<&T> {
+        self.get(index.checked_add(1)?)
+    }
+}
+
 /// Identities retained by a stock owner until both lifecycle exit and the final
 /// control pin have settled. `I` owns the adapter's namespace reservation.
 pub struct StockEntries<I> {
@@ -76,7 +89,7 @@ impl<I> StockEntries<I> {
     pub fn drain_closed<T: super::MemberControl>(
         &mut self,
         page: &dyn Lifecycle,
-        controls: &[T],
+        controls: &(impl PoolControls<T> + ?Sized),
     ) -> Result<(), super::TransitionError> {
         use super::{EntryState, TransitionError};
         if !page.gate().is_terminal() {
@@ -90,7 +103,10 @@ impl<I> StockEntries<I> {
                 return Err(TransitionError::StaleGeneration);
             }
             if state == EntryState::Reserved {
-                match super::revoke_unborn_control(page, *entry, &controls[entry.index() + 1]) {
+                let control = controls
+                    .pool_control(entry.index())
+                    .ok_or(TransitionError::NoSuchEntry)?;
+                match super::revoke_unborn_control(page, *entry, control) {
                     Ok(()) | Err(TransitionError::WrongState(EntryState::Claimed)) => {}
                     Err(error) => return Err(error),
                 }
@@ -106,6 +122,41 @@ impl<I> StockEntries<I> {
         self.identities.try_reserve_exact(additional)
     }
 
+    /// Reserve bookkeeping for a pool of `entries` slots, before a pool that
+    /// grows publishes the slots: `insert` must never allocate.
+    pub fn try_reserve_total(
+        &mut self,
+        entries: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        self.identities
+            .try_reserve_exact(entries.saturating_sub(self.identities.len()))
+    }
+
+    /// Whether the pool is about to change without growth: a sibling's birth
+    /// is claimed and unsettled, or a retained identity is on its way back
+    /// (exiting, or exited with a control pin still out). A clone waits for
+    /// that, as [`Self::admission`] does, before it asks for more entries.
+    pub fn retiring(&self, page: &dyn Lifecycle) -> bool {
+        use super::EntryState;
+        (0..page.entry_count()).any(|index| {
+            page.state(index)
+                .is_some_and(|(_, state)| state == EntryState::Claimed)
+        }) || self.identities.iter().any(|(entry, _)| {
+            page.state(entry.index())
+                .is_some_and(|(generation, state)| {
+                    generation == entry.generation()
+                        && matches!(
+                            state,
+                            EntryState::ExitingBorn
+                                | EntryState::ExitingPublished
+                                | EntryState::ExitedInZone
+                                | EntryState::Reaped
+                                | EntryState::Revoked
+                        )
+                })
+        })
+    }
+
     pub fn insert(&mut self, entry: super::EntryRef, identity: I) {
         self.identities.push((entry, identity));
     }
@@ -115,7 +166,7 @@ impl<I> StockEntries<I> {
     pub fn settle<T: super::MemberControl>(
         &mut self,
         page: &dyn Lifecycle,
-        controls: &[T],
+        controls: &(impl PoolControls<T> + ?Sized),
     ) -> Result<(), super::TransitionError> {
         use super::{EntryState, TransitionError};
         let mut index = 0;
@@ -127,10 +178,13 @@ impl<I> StockEntries<I> {
             if generation != entry.generation() {
                 return Err(TransitionError::StaleGeneration);
             }
+            let control = controls
+                .pool_control(entry.index())
+                .ok_or(TransitionError::NoSuchEntry)?;
             if matches!(
                 state,
                 EntryState::ExitedInZone | EntryState::Reaped | EntryState::Revoked
-            ) && !controls[entry.index() + 1].exit_custody().referenced()
+            ) && !control.exit_custody().referenced()
             {
                 if state == EntryState::ExitedInZone {
                     page.reap(entry)?;
@@ -157,7 +211,7 @@ impl<I> StockEntries<I> {
     pub fn recyclable<T: super::MemberControl>(
         &self,
         page: &dyn Lifecycle,
-        controls: &[T],
+        controls: &(impl PoolControls<T> + ?Sized),
     ) -> Option<usize> {
         (0..page.entry_count()).find(|&index| {
             page.state(index).is_some_and(|(_, state)| {
@@ -167,7 +221,9 @@ impl<I> StockEntries<I> {
                         | super::EntryState::Reaped
                         | super::EntryState::Revoked
                 )
-            }) && !controls[index + 1].exit_custody().referenced()
+            }) && controls
+                .pool_control(index)
+                .is_some_and(|control| !control.exit_custody().referenced())
                 // A final pin can drop after settle examined this entry. The
                 // predecessor must still be removed before we reuse its slot.
                 && !self
@@ -189,7 +245,7 @@ impl<I> StockEntries<I> {
     pub unsafe fn admission<'a, T: super::MemberControl, R: super::MemberControlRelease + 'a>(
         &self,
         page: &dyn Lifecycle,
-        controls: &'a [T],
+        controls: &'a (impl PoolControls<T> + ?Sized),
         release: alloc::sync::Arc<R>,
     ) -> StockAdmission {
         use super::EntryState;
@@ -215,10 +271,11 @@ impl<I> StockEntries<I> {
                         )
                 })
             {
+                let Some(control) = controls.pool_control(entry.index()) else {
+                    return StockAdmission::Changed;
+                };
                 // SAFETY: the caller retains this source in the final-pin lane.
-                if !unsafe {
-                    super::arm_member_release(&controls[entry.index() + 1], release.clone())
-                } {
+                if !unsafe { super::arm_member_release(control, release.clone()) } {
                     return StockAdmission::Changed;
                 }
                 pending = true;

@@ -1127,7 +1127,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         entry: EntryRef,
     ) -> Option<&'a ThreadControlSlot> {
         core::ptr::eq(page, self.page)
-            .then(|| self.controls.get(entry.index() + 1))
+            .then(|| self.page.pool_control(self.controls, entry.index()))
             .flatten()
     }
     fn record_decline(&self, reason: LifecycleDecline) {

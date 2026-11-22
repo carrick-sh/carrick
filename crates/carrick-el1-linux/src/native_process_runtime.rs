@@ -289,7 +289,7 @@ pub struct NativeLifecycleResources<'a> {
 }
 impl<'a> NativeLifecycleResources<'a> {
     pub fn born_slot(&self, entry: EntryRef) -> Option<&'a ThreadControlSlot> {
-        self.controls.get(entry.index().checked_add(1)?)
+        self.page.pool_control(self.controls, entry.index())
     }
 }
 /// Select the execution venue for an EL1 exit through [`carrick_el1::substrate::sched::NativeEntryVenue`].
@@ -8014,7 +8014,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         expected_host,
                     });
                 }
-                for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+                for index in 0..carrick_el1_abi::Lifecycle::entry_count(page) {
                     if let Some((generation, _)) = page.state(index) {
                         let entry = carrick_el1_abi::EntryRef::new(index as u32, generation);
                         if page.pool_control_disposition(entry)
@@ -9267,6 +9267,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
         let thread_stock = match thread_stock::NativeThreadStock::new(
+            page,
             lifecycle.controls,
             self.source.zone,
             self.source.zone.record_ref(record),
@@ -10066,8 +10067,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             task.remove_thread(child_tid);
             return Err(error);
         }
-        if let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, caller_tid)
-        {
+        if let Err(error) = thread_stock::replenish(
+            self.runtime,
+            &mut graph,
+            self.key,
+            caller_tid,
+            thread_stock::StockGrowth::Within,
+        ) {
             // Born is already committed: report an invariant failure without
             // inviting the clone caller to roll back a published record.
             self.run_failure = Some(error.run_failure_reason());
@@ -10466,7 +10472,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok()
             .map(|task| task.metadata().namespace_pid);
         if let Some(leader) = leader
-            && let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, leader)
+            && let Err(error) = thread_stock::replenish(
+                self.runtime,
+                &mut graph,
+                self.key,
+                leader,
+                thread_stock::StockGrowth::Within,
+            )
         {
             self.run_failure = Some(error.run_failure_reason());
         }

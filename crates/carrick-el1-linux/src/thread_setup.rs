@@ -25,6 +25,14 @@ impl LifecycleVenue for GuestLifecycleVenue {
     }
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
         let address = page.control_address(entry)?;
+        // An extension entry's control lives in the segment the page links;
+        // the stock owner bound exactly that address.
+        if let Some(control) = page.extension_control(entry.index()) {
+            // SAFETY: the linked segment is retained for as long as any
+            // record names the page, as the carrier's control slab is.
+            return (core::ptr::from_ref(control) as u64 == address)
+                .then(|| unsafe { &*(address as *const ThreadControlSlot) });
+        }
         let end = address.checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
         let base = {
             #[cfg(all(target_os = "none", target_arch = "x86_64"))]
