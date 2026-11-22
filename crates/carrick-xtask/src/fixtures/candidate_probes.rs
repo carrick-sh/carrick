@@ -359,7 +359,12 @@ pub fn plan(root: &Path, base: &Path) -> Result<CandidateBuild<BuildPlan>> {
             ),
         ],
     )
-    .unwrap_or_default();
+    .map_err(|error| {
+        fail(format!(
+            "cannot read the base probe inventory at {}: {error}",
+            String::from(manifest.source_head.clone())
+        ))
+    })?;
     let current_inventory = fs::read(safe_path(root, PROBE_INVENTORY)?)?;
     match classify_inputs(
         &manifest.sources,
