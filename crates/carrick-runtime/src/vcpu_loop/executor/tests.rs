@@ -8950,7 +8950,8 @@ fn serial_host_mixed_queue_progress(compute_in_zone: bool) {
             carrick_el1_abi::record_el1_region_host_ptr(self.0);
         }
     }
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
     carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
     let zone = carrick_el1_abi::zone_tables().unwrap();
@@ -9166,7 +9167,8 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         .unwrap();
     assert_eq!(scheduler.queued_len(), 0);
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
     carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
     let zone = carrick_el1_abi::zone_tables().unwrap();
@@ -9307,7 +9309,7 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
 /// the child the parent's status (a second process terminal) and woke it.
 #[test]
 fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_exact_owner() {
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -9441,7 +9443,7 @@ fn serial_host_root_exit_member_loads_without_its_retired_zone_residency() {
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -9739,7 +9741,7 @@ fn native_service_notice_contention_does_not_exhaust_the_default_executor_pool()
 /// and the pool's join would then wait forever.
 #[test]
 fn serial_host_shutdown_kick_publishes_host_work_to_a_guest_idle_worker() {
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -9882,7 +9884,8 @@ fn claimed_sibling_zone_reload(retired: bool) {
     let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(17, [Step::Exit]);
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
     let zone = unsafe {
         &*region
@@ -9971,7 +9974,7 @@ fn serial_host_zone_park_wake_loads_on_second_executor_without_poke() {
 /// immediately, so RED is bounded and never rescued by a diagnostic poke.
 #[test]
 fn serial_host_zone_service_between_scan_and_idle_enrollment_is_claimed() {
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -10065,7 +10068,7 @@ fn serial_host_zone_handback_between_scan_and_idle_enrollment_is_claimed() {
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -10205,7 +10208,7 @@ fn zone_park_wake_loads_on_second_executor(wake_before_save: bool) {
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -10430,7 +10433,7 @@ fn terminal_zone_wait_before_queued_claim(
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
-    struct Region(Box<carrick_test_support::TestEl1Region>);
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
             assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
@@ -10663,7 +10666,8 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
     task.mm
         .thread_generation
         .store(sibling.thread().key().serial.raw(), Ordering::Release);
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: the fixture retains aligned, zeroed ABI storage for the pool.
     let zone = unsafe {
         &*region
@@ -11034,7 +11038,8 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
 fn host_birth_without_a_host_thread_fails_closed_not_dropped() {
     let (kernel, _root) = bootstrap(19_900);
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
     let zone = unsafe {
         &*region
@@ -11104,7 +11109,8 @@ fn first_entry_order(
     let sibling = abi_born_sibling_adopting(&kernel, &root, Some(script));
     let key = sibling.thread().key();
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
     let zone: &'static carrick_el1_abi::ZoneTables = unsafe {
         &*region

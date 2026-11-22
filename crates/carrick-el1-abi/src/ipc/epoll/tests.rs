@@ -6,9 +6,8 @@
 
 extern crate std;
 
-use super::super::tests::zeroed_directory;
+use super::super::tests::RegionBacking;
 use super::*;
-use std::alloc::Layout;
 use std::boxed::Box;
 use std::vec::Vec;
 
@@ -22,25 +21,21 @@ impl LockWait for Spin {
 
 static IDENTITY: AtomicU64 = AtomicU64::new(0x9_0000);
 
-fn region() -> &'static IpcRegion<'static> {
-    let pool_len = 1 << 20;
-    let dir = zeroed_directory();
-    // SAFETY: a leaked zeroed pool outlives the region.
-    let pool =
-        unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
+/// A region over its own backing; views must not outlive it.
+struct Region {
+    region: &'static IpcRegion<'static>,
+    _backing: RegionBacking,
+}
+
+fn region() -> Region {
+    let backing = RegionBacking::new(1 << 20);
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
-    let region = unsafe {
-        IpcRegion::initialize(
-            dir,
-            IPC_DIRECTORY_BYTES,
-            pool,
-            pool_len,
-            identity,
-            IpcLimits::ZONE,
-        )
+    // SAFETY: `Region` owns the backing and drops it after the view.
+    let region = unsafe { backing.initialize(identity, IpcLimits::ZONE) };
+    Region {
+        region: Box::leak(Box::new(region)),
+        _backing: backing,
     }
-    .unwrap();
-    Box::leak(Box::new(region))
 }
 
 /// A backed pipe (ring from a fresh ring-area extent).
@@ -116,7 +111,8 @@ use events::{ERR, ET, HUP, IN, ONESHOT, OUT};
 
 #[test]
 fn level_triggered_eventfd_reports_until_drained() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     assert!(add(r, ep, efd, EpollMember::EventFd, 5, IN).is_none());
@@ -138,7 +134,8 @@ fn level_triggered_eventfd_reports_until_drained() {
 
 #[test]
 fn edge_triggered_reports_each_arrival_once() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 3, IN | ET);
@@ -167,7 +164,8 @@ fn edge_triggered_reports_each_arrival_once() {
 
 #[test]
 fn oneshot_disarms_until_modified() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 7, IN | ONESHOT);
@@ -192,7 +190,8 @@ fn oneshot_disarms_until_modified() {
 
 #[test]
 fn pipe_close_masks_follow_linux() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let p = pipe(r, 0);
     add(r, ep, p, EpollMember::PipeReader, 1, IN | events::RDHUP);
@@ -216,7 +215,8 @@ fn pipe_close_masks_follow_linux() {
 
 #[test]
 fn harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let a = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     let b = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
@@ -236,7 +236,8 @@ fn harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan() {
 
 #[test]
 fn items_are_keyed_on_file_and_fd_number() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     r.epoll_add(ep, efd, EpollMember::EventFd, 4, 1, IN, 1, &Spin)
@@ -273,7 +274,8 @@ fn items_are_keyed_on_file_and_fd_number() {
 
 #[test]
 fn closing_the_last_descriptor_of_a_file_removes_its_items() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep1 = r.create_epoll(&Spin).unwrap();
     let ep2 = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
@@ -295,7 +297,8 @@ fn closing_the_last_descriptor_of_a_file_removes_its_items() {
 
 #[test]
 fn destroying_an_epoll_unlinks_members_and_frees_items() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let free_before = (0..IPC_EPOLL_ITEMS)
         .filter(|&i| r.epoll_item_at(i).unwrap().live.load(Ordering::Relaxed) == 0)
         .count();
@@ -320,7 +323,8 @@ fn destroying_an_epoll_unlinks_members_and_frees_items() {
 
 #[test]
 fn freeing_a_member_detaches_items_the_host_did_not() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN);
@@ -338,7 +342,8 @@ fn freeing_a_member_detaches_items_the_host_did_not() {
 
 #[test]
 fn a_member_carries_a_bounded_number_of_zone_items() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     for fd in 0..MAX_MEMBER_ITEMS as i32 {
         let ep = r.create_epoll(&Spin).unwrap();
@@ -369,7 +374,8 @@ fn a_member_carries_a_bounded_number_of_zone_items() {
 /// watched only by a zone epoll owes nothing.
 #[test]
 fn a_member_owes_the_host_only_through_an_epoll_with_a_host_waiter() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN);
@@ -389,7 +395,8 @@ fn a_member_owes_the_host_only_through_an_epoll_with_a_host_waiter() {
 
 #[test]
 fn restore_requeues_and_rearms_an_undelivered_harvest() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN | ONESHOT);
@@ -404,7 +411,8 @@ fn restore_requeues_and_rearms_an_undelivered_harvest() {
 
 #[test]
 fn ready_count_requires_shared_zone_only_proof() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN | ONESHOT);
@@ -437,7 +445,8 @@ fn ready_count_requires_shared_zone_only_proof() {
 #[test]
 fn bounded_ready_count_preserves_edges_and_oneshots() {
     for mode in [ET, ONESHOT] {
-        let r = region();
+        let backing = region();
+        let r = backing.region;
         let ep = r.create_epoll(&Spin).unwrap();
         assert_eq!(r.epoll_ready_count(ep, 32, &Spin).unwrap(), 0);
         for fd in 4..39 {
@@ -494,7 +503,8 @@ fn ready_count_survives_cursor_replacement_between_batches() {
     // Exercise the bounded count and the old boolean probe through the same
     // shared scan. Neither may consume the continuously ready tail edge.
     for probe in [false, true] {
-        let r = region();
+        let backing = region();
+        let r = backing.region;
         let ep = r.create_epoll(&Spin).unwrap();
         let mut stale = Vec::new();
         for fd in 1..=32 {
@@ -551,7 +561,8 @@ fn ready_count_survives_cursor_replacement_between_batches() {
 
 #[test]
 fn ready_probe_does_not_consume() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN | ET);
@@ -565,7 +576,8 @@ fn ready_probe_does_not_consume() {
 
 #[test]
 fn host_half_count_is_reported_by_harvest() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     r.epoll_set_host_items(ep, 1, &Spin).unwrap();
     assert_eq!(r.epoll_host_items(ep, &Spin).unwrap(), 1);
@@ -585,7 +597,8 @@ fn host_half_count_is_reported_by_harvest() {
 /// publication queues it again in the middle of the scan.
 #[test]
 fn a_harvest_reports_an_item_once_when_republished_mid_scan() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN | ET);
@@ -611,7 +624,8 @@ fn a_harvest_reports_an_item_once_when_republished_mid_scan() {
 /// epoll lock already released, and the popped item is not lost.
 #[test]
 fn a_refused_member_lock_releases_the_epoll_and_keeps_the_item() {
-    let r = region();
+    let backing = region();
+    let r = backing.region;
     let ep = r.create_epoll(&Spin).unwrap();
     let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
     add(r, ep, efd, EpollMember::EventFd, 4, IN | ET);

@@ -26,3 +26,6 @@ loom = []
 
 [dev-dependencies]
 loom = "=0.7.2"
+# Lazily committed IPC directory and pool fixtures (#2822). A dev-only cycle:
+# the support crate's own copy of this ABI is never mixed with the tested one.
+carrick-test-support = { path = "../carrick-test-support" }

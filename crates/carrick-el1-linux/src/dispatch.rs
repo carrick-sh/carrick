@@ -8948,14 +8948,10 @@ mod tests {
             for mutation in 0..3 {
                 for switched in [false, true] {
                     for _ in 0..scale {
-                        let layout = std::alloc::Layout::new::<ZoneTables>();
-                        // SAFETY: ZoneTables permits zero initialization, using
-                        // its exact alignment/size; Box owns the allocation.
-                        let zone = unsafe {
-                            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-                            assert!(!ptr.is_null());
-                            std::boxed::Box::from_raw(ptr)
-                        };
+                        // SAFETY: ZoneTables permits zero initialization; the
+                        // box owns its lazily committed mapping.
+                        let zone =
+                            unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() };
                         let slot = SlotId::new(0);
                         zone.drive(slot, 3);
                         zone.publish_slot(slot, 7, None, 0);
@@ -9289,12 +9285,7 @@ mod tests {
     fn el1_sched_venue_carrier_topology_and_missing_authority() {
         use carrick_personality_linux::sched::SchedVenue;
 
-        let layout = std::alloc::Layout::new::<ZoneTables>();
-        let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-            assert!(!ptr.is_null());
-            std::boxed::Box::from_raw(ptr)
-        };
+        let zone = unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() };
         zone.publish_carrier_cpu_count(4);
         // Executor occupancy is not the installed carrier topology.
         for cpu in 0..4 {

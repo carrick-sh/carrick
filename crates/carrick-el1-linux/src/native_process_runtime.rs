@@ -12554,12 +12554,9 @@ mod tests {
             Some(NativeProcessError::Busy),
             Some(NativeProcessError::Stale),
         ] {
-            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-                assert!(!ptr.is_null());
-                Box::from_raw(ptr)
+                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = ThreadLifecyclePage::new();
             let control = ThreadControlSlot::new();
@@ -12817,12 +12814,9 @@ mod tests {
         two_roots_fork_gate_contract(Some(carrick_el1_abi::GateState::HostOnly));
     }
     fn two_roots_fork_gate_contract(peer_gate: Option<carrick_el1_abi::GateState>) {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let registry = Box::leak(Box::new(NativeProcessRegistry::<
             AddressContext<RootGpa>,
@@ -13233,9 +13227,7 @@ mod tests {
                 .is_none()
         );
         let foreign_zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         assert!(
             registry
@@ -13756,7 +13748,7 @@ mod tests {
 
     fn receiver_reuse_case(reserved_before_admission: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone: Arc<ZoneTables<ParkedContextWords>> = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
             assert!(!ptr.is_null());
@@ -14118,12 +14110,9 @@ mod tests {
     }
     #[test]
     fn nonleader_thread_forks_through_its_authenticated_process_owner() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let registry = Box::leak(Box::new(NativeProcessRegistry::<
             AddressContext<RootGpa>,
@@ -14326,14 +14315,11 @@ mod tests {
             (false, 0xabcd_0000_0000_1000, 1, false),
             (false, 0x1001, 1, false),
         ] {
-            let layout =
-                std::alloc::Layout::new::<ZoneTables<carrick_sched_core::Aarch64ParkedContext>>();
-            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout)
-                    .cast::<ZoneTables<carrick_sched_core::Aarch64ParkedContext>>();
-                assert!(!ptr.is_null());
-                Box::from_raw(ptr)
+                carrick_test_support::ZeroedBox::<
+                    ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+                >::new_zeroed()
             };
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
@@ -14418,12 +14404,9 @@ mod tests {
         signal_wait_contract(true, true);
     }
     fn signal_wait_contract(default_stop: bool, suspend_only: bool) {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -14779,12 +14762,9 @@ mod tests {
 
     #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -14900,12 +14880,9 @@ mod tests {
 
     #[test]
     fn exit_failure_preserves_stale_cause() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -15050,12 +15027,9 @@ mod tests {
             (false, false, true, false),
             (false, false, false, true),
         ] {
-            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-                assert!(!ptr.is_null());
-                Box::from_raw(ptr)
+                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
@@ -15333,12 +15307,9 @@ mod tests {
     }
     #[test]
     fn clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -15580,12 +15551,9 @@ mod tests {
             cleanup_on_exit,
         ) = configuration;
         let _ = host_test_support::take_signal_copies();
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         zone.publish_carrier_cpu_count(1);
         let page = Box::new(ThreadLifecyclePage::new());
@@ -16214,12 +16182,9 @@ mod tests {
         reparented_exit_notification_contract(true, false);
     }
     fn reparented_exit_notification_contract(parent_caught: bool, adopter_caught: bool) {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -16658,12 +16623,9 @@ mod tests {
     }
     #[test]
     fn child_exit_group_waits_for_parent_bucket_and_delivers_status() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -16855,12 +16817,9 @@ mod tests {
     fn vfork_parent_stays_suspended_until_child_execs_or_exits() {
         const CHILD_STACK: u64 = 0x7ffe_f000;
         for (exec_first, host_loaded) in [(false, false), (true, false), (false, true)] {
-            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-                assert!(!ptr.is_null());
-                Box::from_raw(ptr)
+                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
@@ -17100,12 +17059,9 @@ mod tests {
     #[test]
     fn blocked_adopter_wait_resumes_with_an_inherited_zombie() {
         for depth_count in [2, 3] {
-            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-                assert!(!ptr.is_null());
-                Box::from_raw(ptr)
+                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             zone.publish_carrier_cpu_count(1);
             let page = Box::new(ThreadLifecyclePage::new());
@@ -17350,11 +17306,8 @@ mod tests {
 
     #[test]
     fn two_threads_keep_credentials_comm_and_affinity_independent() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         zone.publish_carrier_cpu_count(2);
         let page = Box::new(ThreadLifecyclePage::new());
@@ -17635,11 +17588,8 @@ mod tests {
 
     #[test]
     fn thread_exit_removes_thread_state_and_stays_bounded() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -17747,11 +17697,8 @@ mod tests {
 
     #[test]
     fn non_leader_credential_changes_and_calling_thread_authority() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -17893,11 +17840,8 @@ mod tests {
 
     #[test]
     fn capset_restricted_to_pid_zero_and_caller_own_tid() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18001,11 +17945,8 @@ mod tests {
 
     #[test]
     fn getppid_returns_zero_when_parent_outside_pid_namespace() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18163,11 +18104,8 @@ mod tests {
 
     #[test]
     fn get_robust_list_foreign_nonleader_dispatch_checks() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18619,11 +18557,8 @@ mod tests {
 
     #[test]
     fn prlimit64_resolves_non_leader_tid_of_own_process() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18779,12 +18714,9 @@ mod tests {
         blocked_ipc_signal_contract(6, false, false);
     }
     fn blocked_ipc_signal_contract(operation: u8, contended: bool, external: bool) {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -19322,11 +19254,8 @@ mod tests {
 
     #[test]
     fn fork_failure_injection_after_prepare_loaned_cleans_up_and_subsequent_fork_succeeds() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -19540,11 +19469,8 @@ mod tests {
 
     #[test]
     fn fork_commits_child_execution_snapshot_independently_of_durable_task_serial() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());

@@ -4802,7 +4802,7 @@ pub(crate) mod tests {
             crate::vcpu_loop::signal_ingress_producer::HostSignalBridgeGuard::acquire(
                 "serial_host_synchronous_signal_return_publishes_bridge_before_native_checkpoint",
             );
-        struct IngressRegion(Box<carrick_test_support::TestEl1Region>);
+        struct IngressRegion(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
         impl Drop for IngressRegion {
             fn drop(&mut self) {
                 assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(

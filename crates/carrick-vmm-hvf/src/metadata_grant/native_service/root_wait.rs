@@ -217,7 +217,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Wake {
-        region: Arc<carrick_test_support::TestEl1Region>,
+        region: Arc<carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>>,
         carrier: NonZeroU64,
         publications: AtomicUsize,
         handbacks: AtomicUsize,
@@ -314,7 +314,7 @@ mod tests {
         for ready_before_enrollment in [false, true] {
             let custody = Arc::new(crate::trap::CarrierVmCustody::new_live_fixture());
             let wake = Arc::new(Wake {
-                region: Arc::from(carrick_test_support::TestEl1Region::zeroed()),
+                region: Arc::new(carrick_test_support::TestEl1Region::zeroed()),
                 carrier: custody.transfer_carrier,
                 publications: AtomicUsize::new(0),
                 handbacks: AtomicUsize::new(0),

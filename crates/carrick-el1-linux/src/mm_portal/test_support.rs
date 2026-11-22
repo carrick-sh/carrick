@@ -18,8 +18,9 @@ pub const RW: u64 = 3 | (1 << 6) | (1 << 10) | (1 << 54);
 
 pub struct Region {
     pub ptr: NonNull<u8>,
-    pub layout: std::alloc::Layout,
     pub bank: Option<std::sync::Arc<Bank>>,
+    /// Lazily committed: a fixture pays only for the region pages it touches.
+    _pages: carrick_test_support::ZeroedPages,
 }
 impl Default for Region {
     fn default() -> Self {
@@ -28,15 +29,13 @@ impl Default for Region {
 }
 impl Region {
     pub fn new() -> Self {
-        let layout =
-            std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 64)
-                .unwrap();
-        // SAFETY: allocation is the exact retained carrier region layout.
-        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
+        // The exact carrier region size, zeroed and page-aligned.
+        let pages =
+            carrick_test_support::ZeroedPages::new(carrick_el1_abi::EL1_REGION_SIZE as usize);
         Self {
-            ptr,
-            layout,
+            ptr: pages.as_non_null(),
             bank: None,
+            _pages: pages,
         }
     }
     pub fn portal_slots(&self) -> &carrick_el1_abi::MmPortalSlots {
@@ -74,7 +73,7 @@ impl Drop for Region {
     fn drop(&mut self) {
         let leftover =
             crate::aarch64_process::drain_and_clear_retired_scope(self.zone(), self.table());
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        // `_pages` unmaps the region after this body.
         if !std::thread::panicking() {
             assert_eq!(
                 leftover, 0,
