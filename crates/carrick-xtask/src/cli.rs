@@ -82,6 +82,10 @@ pub enum Commands {
     CiChanges(crate::ci_changes::CiChangesArgs),
     /// Classify cancelled Actions jobs without retrying or changing a verdict.
     CiStarvedJobs(crate::ci_changes::StarvedJobsArgs),
+    #[command(
+        about = "Merge main and a list of PR heads into a throwaway worktree (conflicts recorded) and optionally build it"
+    )]
+    UnionBuild(crate::union_build::UnionBuildArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
@@ -357,6 +361,8 @@ pub enum CliError {
     CommitTrailers(#[from] crate::commit_trailers::CommitTrailersError),
     #[error(transparent)]
     TrustedSteps(#[from] crate::trusted_steps::TrustedStepsError),
+    #[error("union-build: {0}")]
+    UnionBuild(#[from] crate::union_build::UnionBuildError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -636,6 +642,11 @@ where
         Commands::WorktreeRun(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::worktree_admission::run(&info.repository_root, args)?;
+            Ok(())
+        }
+        Commands::UnionBuild(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::union_build::run(&info.repository_root, args, writer)?;
             Ok(())
         }
         Commands::WorktreeGc(args) => {
