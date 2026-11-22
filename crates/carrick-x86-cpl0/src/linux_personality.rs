@@ -1170,6 +1170,8 @@ fn supply_user_fault(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_armed_cow_supply();
             let supply = match handle {
                 Some(handle) => {
                     carrick_el1::fault::OwnerFaultSupply::new(portal).with_handle(handle)

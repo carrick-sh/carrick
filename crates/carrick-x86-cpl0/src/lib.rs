@@ -175,6 +175,13 @@ mod test_support {
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     static EARLY_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// As [`INJECT_HOLD_NEXT_COW_SETTLE`], but the hold engages earlier:
+    /// after the carrier supplied the faulting member's replacement grant
+    /// and before the member resolves its fault with one. The supplied
+    /// grant is ready in the MM's pool for the whole hold, so a sibling's
+    /// copy-on-write can claim it (#2749). Polled, released and bounded
+    /// through the settle hold's calls.
+    pub const INJECT_HOLD_NEXT_COW_SUPPLY: u64 = 0xffff_ffff_ffff_fe47;
     /// The calling member's next owner-selected grant finds its MM editor
     /// held when it serves the window the carrier already prepared and
     /// submitted: the loser of a two-CPU race in one grant window.
@@ -434,10 +441,28 @@ mod test_support {
     /// About seconds of spinning before the hold gives up.
     const COW_SETTLE_HOLD_SPINS: u64 = 1 << 28;
 
+    /// The armed hold engages after the supply crossing, not before the
+    /// settlement crossing.
+    static COW_HOLD_AT_SUPPLY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Called by the user-fault owner between a COW completion and its
     /// settlement crossing, on the faulting member's CPU. While held it
     /// acknowledges shootdowns, as a member away at its crossing does.
     pub fn hold_armed_cow_settle() {
+        hold_armed_cow(false);
+    }
+
+    /// Called by the user-fault owner after the carrier supplied its COW
+    /// grant and before the member resolves the fault again.
+    pub fn hold_armed_cow_supply() {
+        hold_armed_cow(true);
+    }
+
+    fn hold_armed_cow(at_supply: bool) {
+        if COW_HOLD_AT_SUPPLY.load(Ordering::Acquire) != at_supply {
+            return;
+        }
         if COW_SETTLE_HOLD
             .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -457,6 +482,9 @@ mod test_support {
                 carrick_x86_carrier::entry::fatal_boot();
             }
             core::hint::spin_loop();
+        }
+        if at_supply {
+            COW_HOLD_AT_SUPPLY.store(false, Ordering::Release);
         }
         COW_SETTLE_HOLD.store(0, Ordering::Release);
     }
@@ -917,6 +945,16 @@ mod test_support {
                 .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_HOLD_NEXT_COW_SUPPLY => {
+                if COW_SETTLE_HOLD
+                    .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return None;
+                }
+                COW_HOLD_AT_SUPPLY.store(true, Ordering::Release);
+                Some(0)
+            }
             INJECT_COW_SETTLE_HELD => {
                 if COW_SETTLE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
                     return Some(1);
@@ -985,6 +1023,7 @@ mod test_support {
                         Ordering::Acquire,
                     )
                     .or_else(|_| {
+                        COW_HOLD_AT_SUPPLY.store(false, Ordering::Release);
                         COW_SETTLE_HOLD.compare_exchange(
                             BIRTH_ARMED,
                             0,
