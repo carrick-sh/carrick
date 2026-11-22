@@ -92,15 +92,28 @@ pub(super) fn mmap<M: ReservationPolicyAccess>(
 
 /// Linux `MAP_PRIVATE` of a file: the placement and charges of a private
 /// mapping, with its bytes supplied from `backing` on first touch (the same
-/// byte-source node an inherited private file mapping carries).
+/// byte-source node an inherited private file mapping carries). A read-only
+/// `MAP_SHARED` mapping takes the same custody, marked so that it is shown
+/// as shared and never becomes writable; a writable one is `Invalid` here.
 pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
     root: &mut M,
     placement: Placement,
     len: GuestLen,
     prot: ReservationProtection,
     backing: HostBackingIdentity,
+    sharing: FileMapSharing,
 ) -> Result<Decision, Refusal> {
     let len = len.raw();
+    let custody = ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE);
+    let flags = match sharing {
+        FileMapSharing::Private => custody,
+        FileMapSharing::SharedReadOnly
+            if prot.bits() & ReservationProtection::WRITE.bits() == 0 =>
+        {
+            custody.union(ReservationNodeFlags::SHARED_READ_ONLY)
+        }
+        FileMapSharing::SharedReadOnly => return Err(Refusal::Invalid),
+    };
     if root.has_pending_edit() || root.fork_pending() {
         return Err(Refusal::Busy);
     }
@@ -117,7 +130,7 @@ pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
         policy_value: UserVa::new(LinuxReservationLayout::from(root.layout()).brk),
         require_coverage: false,
         source: None,
-        flags: ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+        flags,
     })?;
     if let Decision::Work(request) = decision
         && let Err(refusal) = root.write_pending_backing(backing)

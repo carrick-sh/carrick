@@ -752,6 +752,20 @@ impl MemState {
         row
     }
 
+    /// The `/proc/<pid>/maps` row of one owner mapping. A read-only shared
+    /// file mapping is held in private byte-source custody, and is shown as
+    /// the shared mapping its caller made.
+    fn owner_proc_row(&self, mapping: &Mapping) -> ProcMapsEntry {
+        let mut row = proc_row(&self.owner_observed_row(mapping));
+        if mapping
+            .flags
+            .contains(ReservationNodeFlags::SHARED_READ_ONLY)
+        {
+            row.sharing = ProcMapSharing::Shared;
+        }
+        row
+    }
+
     pub(super) fn owner_observed_rows(&self) -> Vec<SemanticVma> {
         let root = self
             .delegated_root()
@@ -821,7 +835,7 @@ impl MemState {
             return Some(
                 mappings
                     .iter()
-                    .map(|mapping| proc_row(&self.owner_observed_row(mapping)))
+                    .map(|mapping| self.owner_proc_row(mapping))
                     .collect(),
             );
         }
@@ -838,7 +852,7 @@ impl MemState {
         let root_rows: Vec<ProcMapsEntry> = mappings
             .iter()
             .filter(|mapping| root_rendered_mapping(mapping))
-            .map(|mapping| proc_row(&self.owner_observed_row(mapping)))
+            .map(|mapping| self.owner_proc_row(mapping))
             .collect();
         if host_rows.is_empty() && root_rows.is_empty() {
             return host();

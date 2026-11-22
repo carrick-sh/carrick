@@ -966,14 +966,14 @@ fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
         ),
         returned(carrick_syscall_abi::LINUX_EINVAL)
     );
-    // Decoding claims only private file mappings.
+    // Decoding claims only file mappings with exactly one sharing type.
     let args = |flags| [0, 4096, 1, flags, 3, 0];
     assert!(matches!(
         HostFileCall::decode(LINUX_NR_MMAP, &args(LINUX_MAP_PRIVATE)),
         Some(HostFileCall::MapPrivate(_))
     ));
     assert_eq!(
-        HostFileCall::decode(LINUX_NR_MMAP, &args(LINUX_MAP_SHARED)),
+        HostFileCall::decode(LINUX_NR_MMAP, &args(LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)),
         None
     );
     assert_eq!(

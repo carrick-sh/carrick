@@ -319,7 +319,10 @@ pub enum HostFileCall {
         request: u64,
         arg: u64,
     },
-    /// A private file mapping (`mmap` without `MAP_ANONYMOUS`/`MAP_SHARED`).
+    /// A file mapping served from a retained byte source: `MAP_PRIVATE`, or
+    /// `MAP_SHARED` asking for no write on a read-only description (it can
+    /// never write the file, so it needs no shared pages). Never
+    /// `MAP_ANONYMOUS`.
     MapPrivate(NativeMapKey),
     /// `chdir(2)`: one chdir lookup crossing, then the ring updates the
     /// caller's task row (#1392).
@@ -354,7 +357,7 @@ pub enum HostFileCall {
     Socket(SocketCall),
 }
 
-/// The exact arguments of a private file `mmap`. The carrier retains the
+/// The exact arguments of a file `mmap`. The carrier retains the
 /// file as a byte source; the ring's reservation owner then maps it when the
 /// same call is retried with exactly these arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,6 +390,8 @@ pub const LINUX_NR_MMAP: CanonicalNr = CanonicalNr(222);
 pub const LINUX_MAP_SHARED: u64 = 0x01;
 pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
+/// Linux `PROT_WRITE`.
+pub const LINUX_PROT_WRITE: u64 = 0x2;
 
 impl HostFileCall {
     /// These native-child mutations (of the namespace, or of the caller's
@@ -787,8 +792,10 @@ impl HostFileCall {
                 sigmask: args[3],
             },
             c if c == LINUX_NR_MMAP
-                && args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)
-                    == LINUX_MAP_PRIVATE =>
+                && matches!(
+                    args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE),
+                    LINUX_MAP_PRIVATE | LINUX_MAP_SHARED
+                ) =>
             {
                 Self::MapPrivate(NativeMapKey::of(args))
             }
@@ -2425,6 +2432,22 @@ fn stage_call(
             NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENODEV),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { access } if !access.readable() => {
+                errno(carrick_syscall_abi::LINUX_EACCES)
+            }
+            // A shared mapping of a description open for writing can be
+            // written now or after an `mprotect`: it needs pages shared with
+            // the file, which this byte-source route does not give. Leave it
+            // unrouted.
+            NativeDescriptor::HostBacked { access }
+                if key.flags & LINUX_MAP_SHARED != 0 && access.writable() =>
+            {
+                return None;
+            }
+            // mmap(2): EACCES for MAP_SHARED with PROT_WRITE when the
+            // description is not open for writing.
+            NativeDescriptor::HostBacked { .. }
+                if key.flags & LINUX_MAP_SHARED != 0 && key.prot & LINUX_PROT_WRITE != 0 =>
+            {
                 errno(carrick_syscall_abi::LINUX_EACCES)
             }
             NativeDescriptor::HostBacked { .. }

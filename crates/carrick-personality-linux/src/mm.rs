@@ -30,10 +30,14 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
             && !self.contains(Self::GROWSDOWN)
             && protection.bits() & 2 != 0
     }
-    /// Linux `MAP_PRIVATE` mappings carry `VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC`
-    /// (`do_mmap`); shared mappings conservatively cap at their committed `protection`.
+    /// A private mapping may take any protection (mprotect(2)). A shared
+    /// mapping of a description not open for writing may never become
+    /// writable (mprotect(2), EACCES). Other shared mappings conservatively
+    /// cap at their committed `protection`.
     fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection {
-        if self.contains(Self::PRIVATE) {
+        if self.contains(Self::SHARED_READ_ONLY) {
+            ReservationProtection::READ_EXECUTE
+        } else if self.contains(Self::PRIVATE) {
             ReservationProtection::READ_WRITE_EXECUTE
         } else {
             protection
@@ -200,8 +204,9 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
         len: GuestLen,
         protection: ReservationProtection,
         backing: HostBackingIdentity,
+        sharing: FileMapSharing,
     ) -> Result<Decision, Refusal> {
-        reservation::mmap_private_file(root, placement, len, protection, backing)
+        reservation::mmap_private_file(root, placement, len, protection, backing, sharing)
     }
     fn mremap<M: carrick_core_abi::ReservationPolicyAccess>(
         root: &mut M,
@@ -373,6 +378,18 @@ mod flag_tests {
             ReservationNodeFlags::ANONYMOUS.protection_ceiling(ReservationProtection::READ),
             ReservationProtection::READ
         );
-        assert_eq!(ReservationNodeFlags::from_bits(1 << 11), None);
+        // A read-only shared file mapping: private byte-source custody the
+        // ring edits, carried by every edit, never writable, never charged.
+        let shared = ReservationNodeFlags::PRIVATE
+            .union(ReservationNodeFlags::FILE)
+            .union(ReservationNodeFlags::SHARED_READ_ONLY);
+        assert!(shared.root_editable());
+        assert!(ReservationNodeFlags::CARRIED.contains(ReservationNodeFlags::SHARED_READ_ONLY));
+        assert!(!ReservationNodeFlags::ATTRIBUTES.contains(ReservationNodeFlags::SHARED_READ_ONLY));
+        assert_eq!(
+            shared.protection_ceiling(ReservationProtection::READ),
+            ReservationProtection::READ_EXECUTE
+        );
+        assert_eq!(ReservationNodeFlags::from_bits(1 << 12), None);
     }
 }
