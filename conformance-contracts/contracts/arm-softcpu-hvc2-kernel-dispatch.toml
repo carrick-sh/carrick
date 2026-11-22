@@ -9,6 +9,14 @@
 # shared carrier lifecycle publisher, so the ring serves the per-thread
 # setup calls (set_robust_list, sigaltstack, rt_sigprocmask) from the
 # control slot, as on HVF. Bound below by the pre-entry publication witness.
+# #2645 slice B wake path: the soft CPU gains a GICv3 CPU interface for its
+# private interrupts (acknowledge, EOI, self-targeted SGI1R) and derives the
+# EL1 virtual timer's ISTATUS and PPI from its counter; WFI parks the vCPU's
+# thread outside the stage-2 borrow until the timer deadline or a kick
+# instead of surfacing Halt. The GIC priorities move into carrick-el1-abi,
+# shared with HVF's bring-up (values unchanged). Bound by the soft_wake
+# witnesses on the production idle entry and the soft CPU unit witnesses.
+# The zone stays off on the soft carrier: no syscall routing changes.
 schema_version = 1
 id = "arm.softcpu.hvc2-kernel-dispatch"
 title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
@@ -62,6 +70,13 @@ vm_free = [
   "carrick-aarch64::mailbox::tests::hvc_immediates_classify_canonically",
   "carrick-kernel::dispatch::carrier_loop::tests::apply_first_touch_enforces_linux_stage1_access_matrix",
   "carrick-kernel::dispatch::carrier_loop::tests::first_touch_busy_root_enrols_once_then_reruns_without_polling",
+  "carrick-softcpu-aarch64-host::soft_wake::soft_idle_wfi_parks_until_the_virtual_timer_and_acknowledges_it",
+  "carrick-softcpu-aarch64-host::soft_wake::soft_wfi_park_ends_on_a_cross_thread_kick",
+  "carrick-softcpu-aarch64::gic::tests::acknowledge_takes_the_highest_priority_then_eoi_reopens",
+  "carrick-softcpu-aarch64::gic::tests::priority_mask_and_disabled_interrupts_are_not_signalled",
+  "carrick-softcpu-aarch64::gic::tests::sgi1r_targets_follow_affinity_and_irm",
+  "carrick-softcpu-aarch64::dispatch::tests::gic_timer_interrupt_preempts_el0_only_when_unmasked",
+  "carrick-softcpu-aarch64::handler::virtual_timer_raises_its_ppi_through_the_gic_cpu_interface",
 ]
 
 [bindings.unresolved]
