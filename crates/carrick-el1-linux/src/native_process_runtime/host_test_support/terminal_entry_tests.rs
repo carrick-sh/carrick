@@ -2433,6 +2433,15 @@ fn fault_selection_travels_with_its_request_for<
     // The per-CPU selection lane of `fixture.slot`.
     let lane: &'static carrick_el1_abi::PortalGrantSlot =
         Box::leak(Box::new(carrick_el1_abi::PortalGrantSlot::new()));
+    super::FAULT_SELECTION_LANE.with(|cell| cell.set(Some(lane)));
+    // The carrier resolves a request's own storage from its ticket, as the
+    // HVF and CPL0 hosts do; it never reads `lane`.
+    let storage = |ticket: &carrick_core_abi::service::ServiceTicket<&ServiceCell>| {
+        ticket
+            .fault_selection_address()
+            // SAFETY: the parked request retains its boxed storage to its ACK.
+            .map(|address| unsafe { &*(address.raw() as *const carrick_el1_abi::PortalGrantSlot) })
+    };
     let fault = |present| {
         ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
             address: UserVa::new(PAGE + 0x123),
@@ -2532,6 +2541,13 @@ fn fault_selection_travels_with_its_request_for<
         assert!(matches!(resumed, NativeResume::Left(None)));
     }
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert!(
+        !lane.has_outstanding_for(selected.operation.mm.raw()),
+        "a parked request must not leave its selection in the lane"
+    );
+    // The lane is reused while both requests wait for the carrier.
+    let later = window_for(contender_addr.mm.raw().get(), 10);
+    assert!(lane.publish_cow_fault_selection(10, later));
 
     // Carrier intake of Process 1, as the HVF and CPL0 hosts perform it.
     let holder_notice = fixture.task.service_notice.take().unwrap().unwrap();
@@ -2541,8 +2557,9 @@ fn fault_selection_travels_with_its_request_for<
     }
     let mut holder_ticket = claim(holder_notice);
     assert_eq!(holder_ticket.request().fault_sequence, None);
+    assert!(storage(&holder_ticket).is_none());
     assert_eq!(
-        holder_ticket.take_fault_selection(lane),
+        holder_ticket.take_fault_selection(None),
         Ok(None),
         "an unselected fault's intake must not be refused by a peer's selection"
     );
@@ -2594,12 +2611,20 @@ fn fault_selection_travels_with_its_request_for<
         contender_ticket.request().fault_sequence,
         Some(selected.operation.sequence)
     );
+    let contender_storage = storage(&contender_ticket);
+    assert!(contender_storage.is_some());
     assert_eq!(
-        contender_ticket.take_fault_selection(lane),
+        contender_ticket.take_fault_selection(contender_storage),
         Ok(Some(ServiceFaultSupply::Cow(selected)))
+    );
+    assert_eq!(
+        lane.pending_cow_fault_selection(later.operation.mm.raw(), PAGE),
+        Some((10, later)),
+        "neither intake disturbs the lane's current selection"
     );
     assert!(contender_ticket.complete(false).is_ok());
     notify(contender_record);
+    super::FAULT_SELECTION_LANE.with(|cell| cell.set(None));
 }
 
 #[test]

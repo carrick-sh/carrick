@@ -2080,22 +2080,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if self.anonymous_pending[index].is_some() {
             return Ok(None);
         }
-        let slot = self
-            .grant_portal()?
-            .grant(index)
-            .ok_or_else(|| fail("file supply grant slot"))?;
         let selected = if native_service {
-            slot.pending_fault_selection_for_mm(
-                carrick_el1_abi::ReservationMm::new(execution.context.mm.raw().get())
-                    .ok_or_else(|| fail("file supply native MM"))?,
-            )
+            // A native request owns its selection; this CPU's lane may hold
+            // another request's (#2749).
+            self.pending_native_fault_window(lease.cpu, execution)?
         } else {
-            slot.pending_fault_selection(
-                execution.context.mm.raw().get(),
-                lease.io.get_gpr(X86Reg::Rdi)?,
-            )
+            self.grant_portal()?
+                .grant(index)
+                .ok_or_else(|| fail("file supply grant slot"))?
+                .pending_fault_selection(
+                    execution.context.mm.raw().get(),
+                    lease.io.get_gpr(X86Reg::Rdi)?,
+                )
+                .map(|(_, window)| window)
         };
-        let Some((_, window)) = selected else {
+        let Some(window) = selected else {
             return Ok(None);
         };
         let Some(identity) = window.host_backing else {

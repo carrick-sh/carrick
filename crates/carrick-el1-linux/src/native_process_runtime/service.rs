@@ -330,13 +330,17 @@ pub(super) enum ClosingAdapterCustody {
 }
 
 enum PendingServiceReply {
+    /// A backing fault: the request's selection, then the carrier's reply.
     Fault(Box<carrick_el1_abi::PortalGrantSlot>),
+    /// A present (copy-on-write) fault: the request's selection only. The
+    /// carrier publishes no descriptor reply for it.
+    Selection(Box<carrick_el1_abi::PortalGrantSlot>),
     Exec(Box<ExecSuccessorManifest>),
 }
 impl PendingServiceReply {
     fn address(&self) -> carrick_guest_arch::KernelVa {
         let address = match self {
-            Self::Fault(reply) => core::ptr::from_ref(&**reply).addr(),
+            Self::Fault(reply) | Self::Selection(reply) => core::ptr::from_ref(&**reply).addr(),
             Self::Exec(reply) => core::ptr::from_ref(&**reply).addr(),
         };
         carrick_guest_arch::KernelVa::new(address as u64)
@@ -2614,10 +2618,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             });
         let mut reply = match operation {
-            ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some() => {
-                Some(PendingServiceReply::Fault(
-                    FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed(),
-                ))
+            ServiceOperation::Fault(fault) if fault_sequence.is_some() => {
+                let storage =
+                    FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed();
+                Some(if fault.present {
+                    PendingServiceReply::Selection(storage)
+                } else {
+                    PendingServiceReply::Fault(storage)
+                })
             }
             ServiceOperation::Exec { .. } => Some(PendingServiceReply::Exec(
                 FallibleBox::<ExecSuccessorManifest>::try_reserve()?.zeroed(),
@@ -2674,19 +2682,53 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             .into()
                     })
             } else {
-                self.control
-                    .service
-                    .publish_with_reply(
-                        birth,
-                        self.binding.generation,
-                        operation,
-                        fault_sequence,
-                        reply.as_ref().map(PendingServiceReply::address),
-                    )
-                    .map_err(|error| {
-                        service_protocol_error(error, NativeServiceQuarantine::ServicePublishBusy)
+                // This entry still exclusively owns its lane. Move the
+                // selection into the request's storage before the request is
+                // visible: the member may park, and the lane be reused,
+                // before the carrier takes this request's notice.
+                let transfer = match (operation, fault_sequence, reply.as_ref()) {
+                    (
+                        ServiceOperation::Fault(fault),
+                        Some(sequence),
+                        Some(
+                            PendingServiceReply::Fault(storage)
+                            | PendingServiceReply::Selection(storage),
+                        ),
+                    ) => self
+                        .service
+                        .fault_selection_lane()
+                        .map(|lane| (lane, &**storage, fault.address.raw(), sequence)),
+                    _ => None,
+                };
+                let mm = birth.mm.mm().raw();
+                if transfer.is_some_and(|(lane, storage, address, sequence)| {
+                    !lane.transfer_native_fault_selection(storage, mm, address, sequence)
+                }) {
+                    Err(NativeProcessError::Stale)
+                } else {
+                    self.control
+                        .service
+                        .publish_with_reply(
+                            birth,
+                            self.binding.generation,
+                            operation,
+                            fault_sequence,
+                            reply.as_ref().map(PendingServiceReply::address),
+                        )
+                        .map_err(|error| {
+                            // An unpublished request returns its selection
+                            // to the lane this entry still owns.
+                            if let Some((lane, storage, address, sequence)) = transfer {
+                                storage
+                                    .transfer_native_fault_selection(lane, mm, address, sequence);
+                            }
+                            service_protocol_error(
+                                error,
+                                NativeServiceQuarantine::ServicePublishBusy,
+                            )
                             .into()
-                    })
+                        })
+                }
             }
         };
         let request = match published {

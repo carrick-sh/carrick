@@ -2944,19 +2944,22 @@ fn composed_native_supply_with_prepared(
             .ok()
             .unwrap()
     };
-    let captured = ticket
-        .take_fault_selection(portal.grant(0).unwrap())
-        .unwrap()
-        .unwrap();
+    // SAFETY: the parked request retains its boxed selection storage to ACK.
+    let storage = ticket
+        .fault_selection_address()
+        .map(|address| unsafe { &*(address.raw() as *const carrick_el1_abi::PortalGrantSlot) });
+    assert!(
+        !portal.grant(0).unwrap().has_outstanding_for(identity.mm),
+        "the parked request owns its selection; the lane is free for its successor"
+    );
+    let captured = ticket.take_fault_selection(storage).unwrap().unwrap();
     assert_eq!(
         captured,
         carrick_core_abi::service::ServiceFaultSupply::Cow(selected)
     );
     assert!(!portal.grant(0).unwrap().has_outstanding_for(identity.mm));
     assert!(
-        ticket
-            .take_fault_selection(portal.grant(0).unwrap())
-            .is_err(),
+        ticket.take_fault_selection(storage).is_err(),
         "one selection transfer per ticket"
     );
     assert_eq!(
@@ -3294,10 +3297,12 @@ fn composed_native_supply_with_prepared(
         unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, member) }
             .unwrap()
     };
+    // SAFETY: the parked request retains its boxed selection storage to ACK.
+    let storage = ticket
+        .fault_selection_address()
+        .map(|address| unsafe { &*(address.raw() as *const carrick_el1_abi::PortalGrantSlot) });
     assert_eq!(
-        ticket
-            .take_fault_selection(portal.grant(0).unwrap())
-            .unwrap(),
+        ticket.take_fault_selection(storage).unwrap(),
         Some(carrick_core_abi::service::ServiceFaultSupply::Backing(
             window
         ))

@@ -139,6 +139,71 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Ok(pointer)
     }
 
+    /// Observe the window selected by this CPU's untaken native fault notice,
+    /// in the storage its request owns, for file preparation before intake.
+    /// This grants no service, MM or backing authority: intake claims the
+    /// exact ticket and takes this same window before any publication.
+    pub(in crate::cpl0_boot) fn pending_native_fault_window(
+        &self,
+        cpu: carrick_guest_arch::CpuId,
+        execution: GrantExecution,
+    ) -> Result<Option<carrick_el1_abi::PortalGrantWindow>, TrapError> {
+        let Some(selector) = self.task(cpu).service_notice.observe() else {
+            return Ok(None);
+        };
+        let zone_pointer = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("native service zone absent"))?;
+        // SAFETY: boot initialized this aligned fixed zone; custody retains RAM.
+        let zone = unsafe { &*zone_pointer.cast::<X86Cpl0Zone>() };
+        let key = ObjectWaitKey::native_service(selector.record)
+            .ok_or_else(|| fail("native service wait key"))?;
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| self.complete_object_wake(cpu, owned);
+        let member = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
+            .map_err(|_| fail("native service queue"))?
+            .native_service_member(selector.record);
+        // Intake reports a notice whose member or MM changed; nothing is
+        // prepared for it here.
+        let Some(member) = member.filter(|member| {
+            member.mm == execution.context.mm.raw().get()
+                && member.generation == selector.execution.raw()
+        }) else {
+            return Ok(None);
+        };
+        let pointer = self.native_service_pointer(
+            execution.context,
+            KernelVa::new(member.control_slot),
+            size_of::<ThreadControlSlot>(),
+            align_of::<ThreadControlSlot>(),
+        )?;
+        // SAFETY: the complete aligned control is in authenticated retained
+        // supervisor storage; only its atomic service words are observed.
+        let control = unsafe { &*pointer.cast::<ThreadControlSlot>() };
+        let Some(address) = control.service.pending_fault_selection_address(selector) else {
+            return Ok(None);
+        };
+        let pointer = self.native_service_pointer(
+            execution.context,
+            address,
+            size_of::<carrick_el1_abi::PortalGrantSlot>(),
+            align_of::<carrick_el1_abi::PortalGrantSlot>(),
+        )?;
+        // SAFETY: the unclaimed request retains this authenticated storage;
+        // its member is parked while this CPU is stopped.
+        let storage = unsafe { &*pointer.cast::<carrick_el1_abi::PortalGrantSlot>() };
+        Ok(carrick_el1_abi::ReservationMm::new(member.mm)
+            .and_then(|mm| storage.pending_fault_selection_for_mm(mm))
+            .map(|(_, window)| window))
+    }
+
     fn claim_native_notice<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
@@ -327,27 +392,33 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             ServiceOperation::CarrierWork { demand, .. } => carrier_work_supplied(demand),
             ServiceOperation::Fault(_) => {
-                let slot = self
-                    .grant_portal()?
-                    .grant(lease.cpu.raw() as usize)
-                    .ok_or_else(|| fail("native fault selection slot"))?;
-                let selected = ticket
-                    .take_fault_selection(slot)
-                    .map_err(|_| fail("native fault selection identity"))?;
-                match (selected, ticket.reply_address()) {
-                    (
-                        Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)),
-                        Some(address),
-                    ) => {
+                // The selection travels in the request's own storage. This
+                // CPU's lane is never read: it may already hold another
+                // request's selection (#2749).
+                let storage = ticket
+                    .fault_selection_address()
+                    .map(|address| {
                         let pointer = self.native_service_pointer(
                             execution.context,
                             address,
                             size_of::<carrick_el1_abi::PortalGrantSlot>(),
                             align_of::<carrick_el1_abi::PortalGrantSlot>(),
                         )?;
-                        // SAFETY: the ticket retains this authenticated isolated reply
+                        // SAFETY: the ticket retains this authenticated isolated storage
                         // until ACK, then the ring's pending owner retains it to settlement.
-                        let reply = unsafe { &*pointer.cast::<carrick_el1_abi::PortalGrantSlot>() };
+                        Ok::<_, TrapError>((address, unsafe {
+                            &*pointer.cast::<carrick_el1_abi::PortalGrantSlot>()
+                        }))
+                    })
+                    .transpose()?;
+                let selected = ticket
+                    .take_fault_selection(storage.map(|(_, storage)| storage))
+                    .map_err(|_| fail("native fault selection identity"))?;
+                match (selected, storage) {
+                    (
+                        Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)),
+                        Some((address, reply)),
+                    ) => {
                         if self.native_backing_pending.contains_key(&address) {
                             return Err(fail("native fault reply already retained"));
                         }

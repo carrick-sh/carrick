@@ -2744,6 +2744,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             None
         }
     }
+    fn fault_selection_lane(&self) -> Option<&carrick_el1_abi::PortalGrantSlot> {
+        // SAFETY: fixed initialized ABI region of this carrier.
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        let slots = unsafe {
+            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+        };
+        // SAFETY: a hosted zone is the `EL1_ZONE_OFFSET` record of its
+        // retained ABI region, whose `EL1_MM_PORTAL_OFFSET` record is that
+        // region's selection portal (`MmPortalSlots::authenticate_wait`
+        // checks the same relation).
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        let slots = unsafe {
+            &*core::ptr::from_ref(self.zone)
+                .cast::<u8>()
+                .sub(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                .cast::<carrick_el1_abi::MmPortalSlots>()
+        };
+        slots.grant(usize::from(self.slot.raw()))
+    }
     fn copy_syscall_output(
         &mut self,
         mm: &Self::Mm,

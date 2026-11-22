@@ -1005,6 +1005,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
         None
     }
+    /// The per-CPU selection lane of the entry this service serves. The
+    /// shared owner moves a selected fault's window out of it, into storage
+    /// the request owns, before the request can outlive the lane (#2749).
+    fn fault_selection_lane(&self) -> Option<&carrick_el1_abi::PortalGrantSlot> {
+        None
+    }
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
     /// staging step already made the range writable (fault supply first), so
