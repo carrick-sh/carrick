@@ -275,6 +275,7 @@ fn guarded_read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut value = 0_u64;
     let mut ok = 1_u64;
+    let smap = super::control::Cr4::current().smap_word();
     // SAFETY: CPL0 owns the current task and its fixup slot. The CPL0 #PF
     // gate resumes only at label 2; CR4.SMAP gates STAC/CLAC on this CPU.
     // The range check excludes supervisor VA; carrick_mmu_core x86
@@ -282,18 +283,18 @@ fn guarded_read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
     // supervisor leaf in the lower half during concurrent publication.
     unsafe {
         core::arch::asm!(
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
+            "test {smap}, {smap}", "jz 9f", "stac", "9:",
             "lea {tmp}, [rip + 2f]", "mov [{fixup}], {tmp}",
             "mov {value}, [{address}]",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 8f", "clac", "8:",
+            "test {smap}, {smap}", "jz 8f", "clac", "8:",
             "jmp 3f",
             "2:",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 7f", "clac", "7:",
+            "test {smap}, {smap}", "jz 7f", "clac", "7:",
             "mov {ok}, 0", "mov {value}, 0",
             "3:",
-            tmp = out(reg) _, fixup = in(reg) fixup, address = in(reg) address,
+            tmp = out(reg) _, fixup = in(reg) fixup, smap = in(reg) smap, address = in(reg) address,
             value = inout(reg) value, ok = inout(reg) ok,
             options(nostack)
         );
@@ -312,24 +313,25 @@ pub fn read_u32(task: &CurrentTask, address: u64) -> Option<u32> {
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut value = 0_u64;
     let mut ok = 1_u64;
+    let smap = super::control::Cr4::current().smap_word();
     // SAFETY: the guarded load and #PF fixup follow the same task-local
     // protocol as read_u64; the e-register load zero extends to 64 bits.
     // Concurrent leaf publication depends on
     // descriptor_txn::check_leaf_privilege_matches_range (see read_u64).
     unsafe {
         core::arch::asm!(
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
+            "test {smap}, {smap}", "jz 9f", "stac", "9:",
             "lea {tmp}, [rip + 2f]", "mov [{fixup}], {tmp}",
             "mov {value:e}, [{address}]",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 8f", "clac", "8:",
+            "test {smap}, {smap}", "jz 8f", "clac", "8:",
             "jmp 3f",
             "2:",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 7f", "clac", "7:",
+            "test {smap}, {smap}", "jz 7f", "clac", "7:",
             "mov {ok}, 0", "mov {value}, 0",
             "3:",
-            tmp = out(reg) _, fixup = in(reg) fixup, address = in(reg) address,
+            tmp = out(reg) _, fixup = in(reg) fixup, smap = in(reg) smap, address = in(reg) address,
             value = inout(reg) value, ok = inout(reg) ok,
             options(nostack)
         );
@@ -355,18 +357,19 @@ pub fn compare_exchange_u32(
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut observed = expected;
     let mut ok = 1_u64;
+    let smap = super::control::Cr4::current().smap_word();
     // SAFETY: user permissions and the exact live task were checked above.
     // LOCK CMPXCHG is one atomic RMW; #PF restores SMAP and clears the fixup.
     unsafe {
         core::arch::asm!(
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
+            "test {smap}, {smap}", "jz 9f", "stac", "9:",
             "lea {tmp}, [rip + 2f]", "mov [{fixup}], {tmp}",
             "lock cmpxchg dword ptr [{address}], {desired:e}",
             "jmp 3f",
             "2:", "mov {ok}, 0",
             "3:", "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 8f", "clac", "8:",
-            tmp = out(reg) _, fixup = in(reg) fixup, address = in(reg) address,
+            "test {smap}, {smap}", "jz 8f", "clac", "8:",
+            tmp = out(reg) _, fixup = in(reg) fixup, smap = in(reg) smap, address = in(reg) address,
             desired = in(reg) desired, inout("eax") observed,
             ok = inout(reg) ok, options(nostack)
         );
@@ -403,24 +406,25 @@ unsafe fn guarded_copy(task: &CurrentTask, dst: *mut u8, src: *const u8, len: us
     }
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut ok = 1_u64;
+    let smap = super::control::Cr4::current().smap_word();
     // SAFETY: REP MOVSB is guarded by the task-local fixup, and the caller
     // supplies a valid kernel operand. DF is cleared for the forward copy.
     // The caller's lower-half check relies on
     // descriptor_txn::check_leaf_privilege_matches_range for concurrent maps.
     unsafe {
         core::arch::asm!(
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
+            "test {smap}, {smap}", "jz 9f", "stac", "9:",
             "lea {tmp}, [rip + 2f]", "mov [{fixup}], {tmp}",
             "cld", "rep movsb",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 8f", "clac", "8:",
+            "test {smap}, {smap}", "jz 8f", "clac", "8:",
             "jmp 3f",
             "2:",
             "mov qword ptr [{fixup}], 0",
-            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 7f", "clac", "7:",
+            "test {smap}, {smap}", "jz 7f", "clac", "7:",
             "mov {ok}, 0",
             "3:",
-            tmp = out(reg) _, fixup = in(reg) fixup,
+            tmp = out(reg) _, fixup = in(reg) fixup, smap = in(reg) smap,
             inout("rdi") dst => _, inout("rsi") src => _, inout("rcx") len => _,
             ok = inout(reg) ok,
             options(nostack)

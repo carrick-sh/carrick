@@ -6544,6 +6544,7 @@ fn bootstrap_cpu_binding(index: usize, scheduler_witness: u64) -> CpuBinding {
         last_seen_generation: AtomicU64::new(0),
         stdio_table_admitted: AtomicU64::new(0),
         file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
+        cr4_snapshot: AtomicU64::new(0),
     }
 }
 
