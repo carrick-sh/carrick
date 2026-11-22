@@ -91,6 +91,7 @@ impl ReservationProtection {
     pub const WRITE: Self = Self(2);
     pub const EXECUTE: Self = Self(4);
     pub const READ_WRITE: Self = Self(3);
+    pub const READ_EXECUTE: Self = Self(5);
     pub const READ_WRITE_EXECUTE: Self = Self(7);
     pub const fn from_bits(bits: u64) -> Option<Self> {
         if bits & !7 == 0 {
@@ -268,6 +269,23 @@ mod tests {
     }
 }
 
+/// How a file mapping served from a retained host byte source shares its
+/// pages with the file.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum FileMapSharing {
+    /// `MAP_PRIVATE`: stores stay in the mapping.
+    Private,
+    /// `MAP_SHARED` of a description that cannot write the file: the
+    /// mapping may never hold a store ([`ReservationNodeFlags::SHARED_READ_ONLY`]).
+    SharedReadOnly,
+}
+
 /// Attributes of one reservation node, fixed when the node is inserted (host
 /// import, host opaque insertion, or a host attribute edit). EL1 edits only
 /// plain private anonymous nodes; any edit touching another node is a
@@ -312,6 +330,13 @@ impl ReservationNodeFlags {
     /// validated placement venue. Carried by splits and fork; never mintable
     /// by guest proposals or admitted host inserts. A fork import retains it.
     pub const PLACED_OUTSIDE_LAYOUT: Self = Self(1 << 10);
+    /// A `MAP_SHARED` file mapping of a description that cannot write its
+    /// file, held in private byte-source custody (`PRIVATE | FILE`): no
+    /// store can reach it, so there is nothing to share back. It is shown
+    /// as shared and can never be made writable. Minted only by a file
+    /// mapping proposal ([`FileMapSharing::SharedReadOnly`]); carried by
+    /// splits, moves and fork.
+    pub const SHARED_READ_ONLY: Self = Self(1 << 11);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
     /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
@@ -331,14 +356,16 @@ impl ReservationNodeFlags {
             | Self::WIPEONFORK.0
             | Self::DONTDUMP.0
             | Self::IMAGE.0
-            | Self::PLACED_OUTSIDE_LAYOUT.0,
+            | Self::PLACED_OUTSIDE_LAYOUT.0
+            | Self::SHARED_READ_ONLY.0,
     );
     const ALL: u32 = Self::ANONYMOUS_PRIVATE.0
         | Self::ATTRIBUTES.0
         | Self::FILE.0
         | Self::SHARED_ANONYMOUS.0
         | Self::IMAGE.0
-        | Self::PLACED_OUTSIDE_LAYOUT.0;
+        | Self::PLACED_OUTSIDE_LAYOUT.0
+        | Self::SHARED_READ_ONLY.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL == 0 {
@@ -466,14 +493,16 @@ pub trait ReservationPolicy {
         len: GuestLen,
         protection: ReservationProtection,
     ) -> Result<Decision, Refusal>;
-    /// A private file mapping whose bytes come from `backing` (a retained
-    /// host byte source at the mapping's file offset), supplied on fault.
+    /// A file mapping in private custody whose bytes come from `backing` (a
+    /// retained host byte source at the mapping's file offset), supplied on
+    /// fault. `sharing` says what the caller asked for.
     fn mmap_private_file<M: ReservationPolicyAccess>(
         root: &mut M,
         placement: Placement,
         len: GuestLen,
         protection: ReservationProtection,
         backing: HostBackingIdentity,
+        sharing: FileMapSharing,
     ) -> Result<Decision, Refusal>;
     fn mremap<M: ReservationPolicyAccess>(
         root: &mut M,

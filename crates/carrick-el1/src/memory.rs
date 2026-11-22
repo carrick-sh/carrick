@@ -95,6 +95,7 @@ pub fn may_complete_advisory_mmap_before_work(flags: u64, protection: u64) -> bo
 }
 
 const EINVAL: i64 = 22;
+const EACCES: i64 = 13;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
 type ReservationModel<'a, G, C> =
@@ -260,10 +261,11 @@ pub fn decide_anonymous_syscall<
     decide_reservation_syscall(frame, current, model, None)
 }
 
-/// [`decide_anonymous_syscall`], plus a private file `mmap` whose byte
-/// source the native host-file venue already retained for exactly this call
-/// (`file`, at file offset 0). Without a source a file mapping forwards, as
-/// before.
+/// [`decide_anonymous_syscall`], plus a file `mmap` whose byte source the
+/// native host-file venue already retained for exactly this call (`file`,
+/// at file offset 0): a private mapping, or a read-only shared one the venue
+/// proved can never write its file. Without a source a file mapping
+/// forwards, as before.
 pub fn decide_reservation_syscall<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
@@ -300,15 +302,19 @@ pub fn decide_reservation_syscall_for_origin<
         SYS_BRK => model.brk(frame.arguments()[0]),
         SYS_MMAP => {
             let flags = frame.arguments()[3];
-            let file = match file {
-                Some(source)
-                    if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) == MAP_PRIVATE
-                        && flags & !DELEGATED_MMAP_FLAGS == 0 =>
-                {
-                    Some(source)
-                }
-                _ => None,
-            };
+            let file = file.and_then(|source| {
+                use carrick_el1_abi::FileMapSharing;
+                let sharing = match flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) {
+                    MAP_PRIVATE => FileMapSharing::Private,
+                    // The venue retains a source for a shared mapping only
+                    // when it asks for no write on a read-only description.
+                    MAP_SHARED if frame.arguments()[2] & PROT_WRITE == 0 => {
+                        FileMapSharing::SharedReadOnly
+                    }
+                    _ => return None,
+                };
+                (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED) == 0).then_some((source, sharing))
+            });
             if file.is_none() && !private_anonymous_mmap(flags) {
                 return ReservationDisposition::Forward;
             }
@@ -331,10 +337,14 @@ pub fn decide_reservation_syscall_for_origin<
                 Placement::Hint(frame.arguments()[0])
             };
             match file {
-                Some(source) => match source.advance(frame.arguments()[5]) {
-                    Some(source) => {
-                        model.mmap_private_file(placement, frame.arguments()[1], prot, source)
-                    }
+                Some((source, sharing)) => match source.advance(frame.arguments()[5]) {
+                    Some(source) => model.mmap_private_file(
+                        placement,
+                        frame.arguments()[1],
+                        prot,
+                        source,
+                        sharing,
+                    ),
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
                 None if service_origin == ServiceOrigin::Descendant => model
@@ -373,6 +383,19 @@ pub fn decide_reservation_syscall_for_origin<
             if nr == SYS_MUNMAP {
                 model.munmap(range)
             } else {
+                // mprotect(2): EACCES for write access to a shared mapping
+                // of a file that is not open for writing.
+                if prot.bits() & PROT_WRITE != 0 {
+                    let mut read_only_shared = false;
+                    let observed = model.observe_range(range, &mut |mapping| {
+                        read_only_shared |= mapping
+                            .flags
+                            .contains(carrick_el1_abi::ReservationNodeFlags::SHARED_READ_ONLY);
+                    });
+                    if observed.is_ok() && read_only_shared {
+                        return ReservationDisposition::Return(-EACCES);
+                    }
+                }
                 model.mprotect(range, prot)
             }
         }

@@ -218,6 +218,10 @@ impl X86AnonymousVenue<'_> {
                 })
             }
             Some(HostFileStage::Returned(result)) => Err(result),
+            // The venue does not serve this mapping (a shared mapping of a
+            // writable description): no source, so the owner leaves it
+            // unrouted.
+            None => Ok(None),
             _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
         }
     }

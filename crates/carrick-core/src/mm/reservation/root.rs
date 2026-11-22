@@ -2657,15 +2657,16 @@ impl<
         }
     }
 
-    /// Map `len` bytes privately from a retained host byte source.
+    /// Map `len` bytes in private custody from a retained host byte source.
     pub fn mmap_private_file(
         &mut self,
         placement: Placement,
         len: u64,
         prot: ReservationProtection,
         backing: HostBackingIdentity,
+        sharing: carrick_core_abi::FileMapSharing,
     ) -> Result<Decision, Refusal> {
-        Policy::mmap_private_file(self, placement, GuestLen::new(len), prot, backing)
+        Policy::mmap_private_file(self, placement, GuestLen::new(len), prot, backing, sharing)
     }
     /// Prepare an anonymous range outside the allocation layout. The host
     /// placement authority validates user VA bounds, reserved apertures and
