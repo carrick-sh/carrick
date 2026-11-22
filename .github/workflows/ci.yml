@@ -322,7 +322,9 @@ jobs:
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy }}
-      macos: ${{ steps.filter.outputs.macos }}
+      # Owner 2026-11-22 (#231): `vars.CARRICK_CI_MACOS == 'off'` runs Linux-only;
+      # every macOS job gates on this output, and ci-results expects them skipped.
+      macos: ${{ vars.CARRICK_CI_MACOS == 'off' && 'false' || steps.filter.outputs.macos }}
       el1_native: ${{ steps.filter.outputs.el1_native }}
       workflows: ${{ steps.filter.outputs.workflows }}
       lower_layer: ${{ steps.filter.outputs.lower_layer }}

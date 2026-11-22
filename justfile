@@ -1556,7 +1556,7 @@ ci-results:
       .changes.result == "success" and
       .["xtask-build"].result == "success" and
       (.["macos-authority"].result ==
-        (if $event == "merge_group" then "success" else "skipped" end)) and
+        (if $event == "merge_group" and (.changes.outputs.macos // "true") == "true" then "success" else "skipped" end)) and
       (length > 1) and
       (. as $root |
        (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
@@ -1599,6 +1599,11 @@ ci-results:
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key as $k | $pr_only | index($k)))
            | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
+       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "false" and ($root.changes.outputs.el1_native // "true") == "true" and ($is_lower | not) then
+         # Linux-only (vars.CARRICK_CI_MACOS == "off", owner 2026-11-22 #231):
+         # every non-macOS job must succeed and every macOS job must be skipped.
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key | startswith("macos-") | not)) | all(.[]; .result == "success")) and
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped"))
        else false end)
     ' <<< "${CI_NEEDS:?}"
     child_pr=$(jq -r '.changes.outputs.child_pr // empty' <<< "${CI_NEEDS}" 2>/dev/null || true)
