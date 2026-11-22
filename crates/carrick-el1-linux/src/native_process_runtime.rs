@@ -692,6 +692,19 @@ pub enum FaultReplyDisposition {
     Cancel,
 }
 
+/// Who retires a member with no pool entry (a host-admitted leader) when
+/// its process closes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntrylessRetirement {
+    /// A host thread executes the member and owes the Kernel its
+    /// retirement: the ring routes the exit to it and waits for its receipt.
+    HostThread,
+    /// No host thread exists for the member. The ring retires it as a
+    /// losing member of the close; its execution lane only applies that
+    /// verdict (#2780).
+    Ring,
+}
+
 /// Physical crossings are outside graph guards. commit_mm is only the final
 /// guest-core root publication; preparation has already performed descriptor
 /// work. A failed settlement retains the closed child and never queues it.
@@ -881,6 +894,10 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     /// at run teardown; this owner cancels only the records it executes.
     fn root_exit_ends_run(&self) -> bool {
         false
+    }
+    /// Who retires a closing process's member that has no pool entry.
+    fn entryless_retirement(&self) -> EntrylessRetirement {
+        EntrylessRetirement::HostThread
     }
     fn signal_deadline(
         &mut self,
@@ -1582,6 +1599,13 @@ enum PendingCloseOperation<'a> {
         entry: OwnerEntry,
     },
     Exec(PendingExecAdoption<'a>),
+}
+
+/// What joining a pending close as a losing member left for its caller to
+/// finish once the graph lock is released.
+struct LosingMemberJoin {
+    notification: Option<carrick_core::terminal::TerminalNotification>,
+    host_fallback: Option<carrick_core::terminal::ThreadTerminalIdentity>,
 }
 
 enum PendingCloseAdmission<'a> {
@@ -7533,6 +7557,141 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    /// Retire an entryless member of a closing process in the ring: it joins
+    /// the pending close (an exit or an exec) as a losing member, which
+    /// commits its membership and publishes its exact retirement receipt
+    /// for the closing owner, then releases its record. The close keeps its
+    /// own operation and owner.
+    #[inline(never)]
+    fn retire_entryless_member(
+        &mut self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Result<LifecycleOutcome, NativeFailure> {
+        let (page, channel, joined) = {
+            let graph = self.runtime.graph.lock();
+            let page = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Stale)?
+                .native()
+                .resources()
+                .page;
+            let channel = graph
+                .pending
+                .exit(&self.key)
+                .ok_or(NativeFailure::Stale)?
+                .channel
+                .clone();
+            (
+                page,
+                channel,
+                self.join_close_as_losing_member(page, status)?,
+            )
+        };
+        if let Some(identity) = joined.host_fallback {
+            self.route_losing_member_to_host(identity)?;
+        }
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
+        if let Some(notification) = joined.notification {
+            publish_terminal_notification(
+                &notification,
+                self.source.zone,
+                self.source.slot,
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
+            );
+        }
+        self.park_pending_exit(page, &channel, OwnerEntry::Exception)?
+            .ok_or(NativeFailure::Quarantined)
+    }
+
+    /// Join the pending close as a member that is not its owner. The caller
+    /// holds the graph lock, so the join is atomic with the close's member
+    /// snapshot. A member whose exit is already terminal or in flight
+    /// elsewhere falls back to its host owner.
+    fn join_close_as_losing_member(
+        &self,
+        page: &'a ThreadLifecyclePage,
+        member_status: carrick_sched_core::process::TerminationStatus,
+    ) -> Result<LosingMemberJoin, NativeFailure> {
+        let mut joined = LosingMemberJoin {
+            notification: None,
+            host_fallback: None,
+        };
+        let entry = self.control.entry();
+        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+            self.binding,
+            entry,
+            member_status,
+        )
+        .ok_or(NativeFailure::Quarantined)?;
+        let custody = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Thread,
+            carrick_core::terminal::Live,
+        >::admitted(identity)
+        .begin();
+        match custody.reserve_member(page, self.control) {
+            Err((
+                _,
+                carrick_core::lifecycle::MemberMembershipError::AlreadyTerminal
+                | carrick_core::lifecycle::MemberMembershipError::InFlight,
+            )) => {
+                joined.host_fallback = Some(identity);
+            }
+            Err(_) => return Err(NativeFailure::Quarantined),
+            Ok((custody, mut membership)) => {
+                let host_receipt = member_host_identity(page, self.control)?;
+                custody
+                    .commit_zone_membership(self.control, &mut membership)
+                    .ok_or(NativeFailure::Quarantined)?;
+                if let Some(entry) = entry {
+                    let _ = page.publish(entry);
+                    carrick_core::lifecycle::retire_cancelled_pool_member(
+                        page,
+                        entry,
+                        self.control,
+                        membership,
+                    )
+                    .map_err(|_| NativeFailure::Quarantined)?;
+                } else {
+                    membership.publish();
+                }
+                page.publish_exact_host_retirement(self.control, host_receipt.retirement());
+                if let carrick_core::terminal::RetirementVerdict::RetireThread {
+                    notification,
+                    ..
+                } = custody.into_verdict(page)
+                {
+                    joined.notification = notification;
+                }
+            }
+        }
+        Ok(joined)
+    }
+
+    fn route_losing_member_to_host(
+        &mut self,
+        identity: carrick_core::terminal::ThreadTerminalIdentity,
+    ) -> Result<(), NativeFailure> {
+        let custody = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Thread,
+            carrick_core::terminal::Live,
+        >::admitted(identity)
+        .begin();
+        if ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
+            Ok(())
+        } else {
+            Err(NativeFailure::Stale)
+        }
+    }
+
     /// Retire a non-owner through the same lifecycle-page transaction as a
     /// raw thread `exit`. A cancelled service continuation reaches this path
     /// without returning to EL0, so it must publish both scheduler and page
@@ -7554,6 +7713,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .page;
         let entry = self.control.entry();
+        if entry.is_none() && self.service.entryless_retirement() == EntrylessRetirement::Ring {
+            return self.retire_entryless_member(status);
+        }
         let identity =
             carrick_core::terminal::ThreadTerminalIdentity::from_exit(self.binding, entry, status)
                 .ok_or(NativeFailure::Stale)?;
@@ -8328,54 +8490,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
                 refused_exec = Some(Box::new(exec));
             } else if !is_owner {
-                let entry = self.control.entry();
-                let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-                    self.binding,
-                    entry,
-                    member_status,
-                )
-                .ok_or(NativeFailure::Quarantined)?;
-                let custody = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Thread,
-                    carrick_core::terminal::Live,
-                >::admitted(identity)
-                .begin();
-                match custody.reserve_member(page, self.control) {
-                    Err((
-                        _,
-                        carrick_core::lifecycle::MemberMembershipError::AlreadyTerminal
-                        | carrick_core::lifecycle::MemberMembershipError::InFlight,
-                    )) => {
-                        member_host_fallback = Some(identity);
-                    }
-                    Err(_) => return Err(NativeFailure::Quarantined),
-                    Ok((custody, mut membership)) => {
-                        let host_receipt = member_host_identity(page, self.control)?;
-                        custody
-                            .commit_zone_membership(self.control, &mut membership)
-                            .ok_or(NativeFailure::Quarantined)?;
-                        if let Some(entry) = entry {
-                            let _ = page.publish(entry);
-                            carrick_core::lifecycle::retire_cancelled_pool_member(
-                                page,
-                                entry,
-                                self.control,
-                                membership,
-                            )
-                            .map_err(|_| NativeFailure::Quarantined)?;
-                        } else {
-                            membership.publish();
-                        }
-                        page.publish_exact_host_retirement(self.control, host_receipt.retirement());
-                        if let carrick_core::terminal::RetirementVerdict::RetireThread {
-                            notification,
-                            ..
-                        } = custody.into_verdict(page)
-                        {
-                            member_notification = notification;
-                        }
-                    }
-                }
+                let joined = self.join_close_as_losing_member(page, member_status)?;
+                member_notification = joined.notification;
+                member_host_fallback = joined.host_fallback;
             }
             (
                 page,
@@ -8390,14 +8507,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         drop(registry_state);
         if let Some(identity) = member_host_fallback {
-            let custody = carrick_core::terminal::TerminalCustody::<
-                carrick_core::terminal::Thread,
-                carrick_core::terminal::Live,
-            >::admitted(identity)
-            .begin();
-            if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                return Err(NativeFailure::Stale);
-            }
+            self.route_losing_member_to_host(identity)?;
         }
 
         if let Some(exec) = cancelled_exec {

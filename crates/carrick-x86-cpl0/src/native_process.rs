@@ -663,6 +663,13 @@ fn abort_child(
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
+    /// The loaded CPL0 lane has no host thread per guest member: the ring
+    /// owns the root leader's retirement too.
+    fn entryless_retirement(
+        &self,
+    ) -> carrick_el1_linux::native_process_runtime::EntrylessRetirement {
+        carrick_el1_linux::native_process_runtime::EntrylessRetirement::Ring
+    }
     fn root_fork_seed(
         &mut self,
         capability: carrick_core_abi::service::ExecCapabilityId,
