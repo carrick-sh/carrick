@@ -577,24 +577,71 @@ pub fn zone() -> Option<&'static ZoneTables> {
     zone_tables()
 }
 
+/// The carrier's in-guest scheduling for as long as this lives: [`enable`]d
+/// on creation, and off again once dropped. The flag is process-global, so a
+/// carrier whose lifetime is shorter than the process (the soft carrier) holds
+/// this instead of leaving the zone on for whatever runs after it.
+#[must_use = "dropping the scope turns the guest scheduler off"]
+pub struct GuestSchedulerScope(());
+
+impl GuestSchedulerScope {
+    pub fn enable(guest_interrupts: bool) -> Self {
+        enable(guest_interrupts);
+        Self(())
+    }
+}
+
+impl Drop for GuestSchedulerScope {
+    fn drop(&mut self) {
+        enable(false);
+    }
+}
+
 /// How the host reaches a vCPU slot: mark pending host work and force its
-/// vCPU out of the guest. Registered by the HVF carrier.
+/// vCPU out of the guest. Registered by the carrier that runs the slots.
 pub type SlotKicker = Box<dyn Fn(SlotId) + Send + Sync>;
 
-static SLOT_KICKER: OnceLock<SlotKicker> = OnceLock::new();
+/// The registered kicker and the serial of its registration.
+static SLOT_KICKER: parking_lot::RwLock<Option<(u64, SlotKicker)>> = parking_lot::RwLock::new(None);
+static SLOT_KICKER_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Register the carrier's slot kicker (once per process).
-pub fn register_slot_kicker(kicker: SlotKicker) {
-    let _ = SLOT_KICKER.set(kicker);
+/// One carrier's registration of its slot kicker. Dropping it unregisters
+/// exactly this kicker, after any kick already running through it returns:
+/// no kick reaches the vCPUs of a carrier that has retired.
+#[must_use = "dropping the registration unregisters the kicker"]
+pub struct SlotKickerRegistration(u64);
+
+impl Drop for SlotKickerRegistration {
+    fn drop(&mut self) {
+        let mut kicker = SLOT_KICKER.write();
+        if kicker.as_ref().is_some_and(|(serial, _)| *serial == self.0) {
+            *kicker = None;
+        }
+    }
+}
+
+/// Register the carrier's slot kicker for the life of the returned
+/// registration. A later registration replaces it.
+pub fn register_slot_kicker(kicker: SlotKicker) -> SlotKickerRegistration {
+    let serial = SLOT_KICKER_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    *SLOT_KICKER.write() = Some((serial, kicker));
+    SlotKickerRegistration(serial)
+}
+
+/// Run the registered kicker for `slot`. The kick runs under the read lock
+/// (recursively: a waiting unregistration cannot block it), so an
+/// unregistration waits for it.
+fn run_slot_kicker(slot: SlotId) {
+    if let Some((_, kicker)) = SLOT_KICKER.read_recursive().as_ref() {
+        kicker(slot);
+    }
 }
 
 /// Force the vCPU on `slot` to exit, so its executor takes back every thread
 /// EL1 holds there.
 pub fn kick_slot(slot: SlotId) {
     carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
-    if let Some(kicker) = SLOT_KICKER.get() {
-        kicker(slot);
-    }
+    run_slot_kicker(slot);
 }
 
 /// Claim `record` for `kind` (with `seq`, only that park). A thread EL1 holds
@@ -1232,9 +1279,7 @@ pub(crate) fn hand_back_completions_in(zone: &ZoneTables) {
 /// owes it a reschedule SGI (`ZoneTables::take_resched`), which its run loop
 /// raises before the vCPU runs on.
 pub fn resched_slot(slot: SlotId) {
-    if let Some(kicker) = SLOT_KICKER.get() {
-        kicker(slot);
-    }
+    run_slot_kicker(slot);
 }
 
 fn deliver_placement(placed: Option<carrick_el1_abi::HostPlacement>) -> bool {
