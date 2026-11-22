@@ -19,9 +19,9 @@ use carrick_abi::syscall::nr;
 use carrick_abi::{CanonicalNr, SigBlockMask, SigSet};
 use carrick_el1_abi::{
     Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, EL1_MM_PORTAL_OFFSET,
-    El1TaskId, IpcWindow, MmPortalSlots, SlotId, SnapshotGeneration, clear_current_task_record,
-    clear_el1_region_host_ptr_if, get_el1_region_host_ptr, ipc_table_map_host,
-    record_el1_region_host_ptr, record_ipc_window_host,
+    El1TaskId, IpcWindow, MmPortalSlots, SignalFrameCustody, SlotId, SnapshotGeneration,
+    clear_current_task_record, clear_el1_region_host_ptr_if, get_el1_region_host_ptr,
+    ipc_table_map_host, record_el1_region_host_ptr, record_ipc_window_host,
 };
 use carrick_guest_arch::ContextGeneration;
 use carrick_guest_mem::GuestMemory;
@@ -1133,6 +1133,13 @@ where
             // Owner-memory waits authenticate against this carrier binding.
             if !portal.bind_carrier(carrier_id) {
                 return Err("soft carrier MM portal is already bound".to_owned());
+            }
+            // The soft engine has no owner-transfer custody, so the root's
+            // MM opens on the legacy venue and only the owner could write a
+            // signal frame there: EL1 accepts a caught handler only for an
+            // owner-admitted MM (#2814 retires this).
+            if !portal.publish_signal_frame_custody(SignalFrameCustody::AdmittedOwner) {
+                return Err("soft carrier signal-frame custody is already published".to_owned());
             }
         }
         aperture_scope.lifecycle = Some(publish_root_lifecycle(&engine, &root_ctx)?);
