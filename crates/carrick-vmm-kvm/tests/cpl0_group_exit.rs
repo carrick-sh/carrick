@@ -12,6 +12,12 @@ fn group_exit(flags: &[&str], test: &str) {
 /// `expected` is the run's exit code: the root's own status, or 0 when the
 /// root parent reaped and checked the child's status itself.
 fn group_exit_with_status(flags: &[&str], test: &str, expected: i32) {
+    group_exit_with_output(flags, test, expected, "");
+}
+
+/// As [`group_exit_with_status`], and the run's stdout must be exactly
+/// `stdout`.
+fn group_exit_with_output(flags: &[&str], test: &str, expected: i32, stdout: &str) {
     if std::env::var_os("CARRICK_GROUP_EXIT_CHILD").is_none() {
         let output = std::process::Command::new("timeout")
             .args(["--signal=KILL", "60"])
@@ -66,6 +72,11 @@ fn group_exit_with_status(flags: &[&str], test: &str, expected: i32) {
     assert_eq!(
         outcome.run.exit_code, expected,
         "the group must end with its exact status"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&outcome.run.stdout),
+        stdout,
+        "the group's stdout"
     );
 }
 
@@ -157,5 +168,67 @@ fn root_abort_retires_epoll_and_futex_workers() {
         &["-DEPOLL_WORKER", "-DABORT_SIGNAL", "-DROOT_ABORT"],
         "root_abort_retires_epoll_and_futex_workers",
         128 + 6,
+    );
+}
+
+/// #2780: a member of the run's root writes to stdout while its leader is
+/// runnable. The write is the member's own host crossing; the carrier serves
+/// it and the run ends with the leader's status.
+#[test]
+fn root_worker_stdout_write_is_served() {
+    group_exit_with_output(
+        &["-DWORKER_WRITES", "-DROOT_ABORT"],
+        "root_worker_stdout_write_is_served",
+        5,
+        "w\n",
+    );
+}
+
+/// #2780 (#2281): the same write from a member of a fork child, which the
+/// parent then reaps with its exact status.
+#[test]
+fn fork_child_worker_stdout_write_is_served() {
+    group_exit_with_output(
+        &["-DWORKER_WRITES"],
+        "fork_child_worker_stdout_write_is_served",
+        0,
+        "w\n",
+    );
+}
+
+/// #2780: a member of the run's root ends the group with `exit_group(5)`
+/// while the leader is parked in a futex wait.
+#[test]
+fn root_worker_exit_group_retires_parked_leader() {
+    group_exit_with_status(
+        &["-DWORKER_EXITS", "-DLEADER_PARKED", "-DROOT_ABORT"],
+        "root_worker_exit_group_retires_parked_leader",
+        5,
+    );
+}
+
+/// #2780: a member of the run's root aborts (`tgkill(self, SIGABRT)`) while
+/// the leader is parked in a futex wait: the run ends with 128 + SIGABRT.
+#[test]
+fn root_worker_abort_ends_run_with_sigabrt_status() {
+    group_exit_with_status(
+        &[
+            "-DWORKER_EXITS",
+            "-DLEADER_PARKED",
+            "-DWORKER_ABORTS",
+            "-DROOT_ABORT",
+        ],
+        "root_worker_abort_ends_run_with_sigabrt_status",
+        128 + 6,
+    );
+}
+
+/// #2780: the same member abort in a fork child; the parent's wait4 sees
+/// SIGABRT.
+#[test]
+fn fork_child_worker_abort_retires_parked_leader() {
+    group_exit(
+        &["-DWORKER_EXITS", "-DLEADER_PARKED", "-DWORKER_ABORTS"],
+        "fork_child_worker_abort_retires_parked_leader",
     );
 }

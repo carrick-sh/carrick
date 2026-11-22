@@ -3,7 +3,10 @@
    EPOLL_WORKER (#2620) parks the worker in epoll_pwait(-1) on a ring epoll
    watching an eventfd nobody writes, and adds a third member parked in a
    futex wait; EXEC_SUCCESSOR has the fork child exec SUCCESSOR_PATH, this
-   fixture built with -DSUCCESSOR, which runs the members as its own. */
+   fixture built with -DSUCCESSOR, which runs the members as its own.
+   WORKER_ABORTS (#2780) has the worker end the group with a fatal SIGABRT
+   on itself instead of exit_group; WORKER_WRITES (#2780) has the worker
+   write one line to stdout before it reports ready. */
 .global _start
 .text
 _start:
@@ -28,7 +31,7 @@ _start:
     syscall
     cmp %r12d, %eax
     jne failure
-#ifdef ABORT_SIGNAL
+#if defined(ABORT_SIGNAL) || defined(WORKER_ABORTS)
     mov status(%rip), %eax
     and $0x7f, %eax
     cmp $6, %eax
@@ -173,6 +176,16 @@ futex_worker_loop:
     jmp futex_worker_loop
 #endif
 worker:
+#ifdef WORKER_WRITES
+    /* write(1, "w\n", 2): a host crossing made by a member, not the leader. */
+    mov $1, %edi
+    lea worker_line(%rip), %rsi
+    mov $2, %edx
+    mov $1, %eax
+    syscall
+    cmp $2, %rax
+    jne failure
+#endif
     movl $1, ready(%rip)
 #ifdef EPOLL_WORKER
 epoll_worker_loop:
@@ -195,6 +208,21 @@ worker_wait_go:
     syscall
     jmp worker_wait_go
 worker_exit_group:
+#ifdef WORKER_ABORTS
+    /* abort() on a member: tgkill(getpid(), gettid(), SIGABRT). */
+    mov $39, %eax
+    syscall
+    mov %eax, %r13d
+    mov $186, %eax
+    syscall
+    mov %eax, %esi
+    mov %r13d, %edi
+    mov $6, %edx
+    mov $234, %eax
+    syscall
+    mov $92, %edi
+    jmp exit
+#endif
     mov $5, %edi
     jmp exit
 #endif
@@ -241,6 +269,10 @@ successor_envp: .quad 0
 /* struct epoll_event { u32 events; u64 data; } __packed: EPOLLIN. */
 epoll_interest: .long 1
     .quad 0x2620
+#endif
+#ifdef WORKER_WRITES
+.section .rodata
+worker_line: .ascii "w\n"
 #endif
 .bss
 .balign 4096
