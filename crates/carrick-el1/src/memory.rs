@@ -1806,14 +1806,16 @@ fn serve_delegated_anonymous_attempt<
             let _ = pending.cancel(model);
             forward(why)
         };
-    let (Some(grant), Some(owner)) = (
-        spaces.grant(index, mm_key),
-        frame
-            .slot()
-            .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
-    ) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
+    // The editor before the roots: its admission names a raised gate (a host
+    // pause of this MM, which lowers) as `Gate`, and the call parks on that
+    // release. Reading the grant first saw the same pause as "no grant" and
+    // forwarded, which a native child answers with ENOSYS (#2749).
     let _editor_guard =
         match spaces
             .table()
@@ -1832,6 +1834,13 @@ fn serve_delegated_anonymous_attempt<
                 return refuse(pending, &mut model, Leave::RootUnavailableStale);
             }
         };
+    // This editor was admitted with the gate open, and a host pause that
+    // raises it now finds the editor and backs off. So only a closed
+    // (retiring) or re-keyed entry has no roots here; a raised count does
+    // not refuse the editor its own MM.
+    let Some(grant) = spaces.table().installed_grant(index, mm_key) else {
+        return refuse(pending, &mut model, Leave::NoGrant);
+    };
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
