@@ -374,6 +374,7 @@ fn native_socket_type(socket: &NativeNetFile) -> Option<i32> {
         .inspect_kind(|open| match open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_ & 0xf),
             OpenDescription::InMemorySocket { socket, .. } => Some(socket.socket_type),
+            OpenDescription::Netlink { sock_type, .. } => Some(*sock_type & 0xf),
             _ => None,
         })
         .flatten()

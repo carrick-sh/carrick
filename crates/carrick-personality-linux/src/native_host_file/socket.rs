@@ -38,9 +38,14 @@
 //! ([`HostFileStage::FaultAfterPrefix`]): Linux stops there and answers
 //! the count moved.
 //!
-//! AF_UNIX and every other family keep their own route: a `socket` call of
-//! another domain is not decoded here, and a call on an in-zone descriptor
-//! stays with its ring owner.
+//! `socket` of AF_UNIX and AF_NETLINK crosses too (#1906): the carrier's
+//! socket implementation owns a named or abstract AF_UNIX socket and the
+//! run's netlink view, exactly as the run root reaches them, and a native
+//! process had no way to create either (glibc's `getaddrinfo` opens both).
+//! The descriptor is then a host-backed description like an inet socket's.
+//! The ring keeps what it owns: an AF_UNIX stream `socketpair` is in-zone,
+//! and a call on an in-zone descriptor stays with its ring owner. A
+//! `socket` of any other domain is not decoded here.
 
 use super::{
     Access, HostFileOp, HostFileOutput, HostFileStage, HostFileUser, IOVEC_BYTES, LINUX_UIO_MAXIOV,
@@ -84,8 +89,19 @@ pub struct SocketCall {
 }
 
 impl SocketCall {
+    /// The `socket` domains that cross: the host networks, and the two
+    /// local families the carrier's socket implementation serves.
+    pub const CARRIER_DOMAINS: [i32; 4] = [
+        carrick_syscall_abi::LINUX_AF_INET,
+        carrick_syscall_abi::LINUX_AF_INET6,
+        carrick_syscall_abi::LINUX_AF_UNIX,
+        carrick_syscall_abi::LINUX_AF_NETLINK,
+    ];
+
     /// Decode a canonical syscall of the family. `None` for every other
-    /// call, and for a `socket` of a family that is not a host network.
+    /// call, and for a `socket` of a domain the carrier's socket
+    /// implementation does not own for a native process
+    /// ([`Self::CARRIER_DOMAINS`]).
     pub fn decode(canonical: CanonicalNr, args: &[u64; 6]) -> Option<Self> {
         use crate::crossing::nr;
         let family = [
@@ -110,13 +126,8 @@ impl SocketCall {
         if !family.contains(&canonical) {
             return None;
         }
-        if canonical == nr::SOCKET {
-            let domain = args[0] as i32;
-            if domain != carrick_syscall_abi::LINUX_AF_INET
-                && domain != carrick_syscall_abi::LINUX_AF_INET6
-            {
-                return None;
-            }
+        if canonical == nr::SOCKET && !Self::CARRIER_DOMAINS.contains(&(args[0] as i32)) {
+            return None;
         }
         Some(Self {
             canonical,
