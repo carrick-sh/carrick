@@ -29,6 +29,7 @@ use carrick_hal::{
     ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError,
 };
 use carrick_kernel::compat::CompatReporter;
+use carrick_kernel::dispatch::carrier_lifecycle::CarrierLifecycleMappings;
 use carrick_kernel::dispatch::carrier_loop::{
     SingleCarrierHandbackWait, install_host_alias_with_inventory,
     resolve_host_first_touch_with_owner_wait,
@@ -58,7 +59,7 @@ use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
 use carrick_vfs::rootfs::RootFs;
 
 use crate::HostBlockRunner;
-use crate::facade::{GUEST_PAGE_BYTES, SoftAarch64Engine, SoftAarch64Vmm};
+use crate::facade::{GUEST_PAGE_BYTES, SoftAarch64Engine, SoftAarch64Vmm, SoftRetainedMetadata};
 
 /// Fail-closed signal bridge for single-process soft-CPU bring-up before
 /// `#2645` wires guest signal delivery: passive pending queries report empty,
@@ -412,6 +413,9 @@ impl Drop for SoftCarrierLease {
 
 struct El1ApertureScope {
     el1_host_ptr: usize,
+    /// The root's retained lifecycle mappings. They retire after slot 0's
+    /// publication clears and before the aperture is unpublished.
+    lifecycle: Option<CarrierLifecycleMappings<SoftRetainedMetadata>>,
     _lease: SoftCarrierLease,
 }
 
@@ -423,6 +427,7 @@ impl Drop for El1ApertureScope {
                 clear_current_task_record(0);
                 record_ipc_window_host(None);
             }
+            drop(self.lifecycle.take());
             let _ = clear_el1_region_host_ptr_if(self.el1_host_ptr);
         }
     }
@@ -493,36 +498,74 @@ fn patch_stack_auxv_hwcap2(image: &mut AddressSpace) -> Result<Vec<u8>, String> 
     Ok(bytes[auxv_start..cursor].to_vec())
 }
 
-/// Sample counted `ENOSYS` refusals from `EL1_COUNTERS_BASE` (`refused` + `venue_refused`).
-pub fn sample_el1_counted_enosys<X>(engine: &SoftAarch64Engine<X>) -> Vec<(u64, &'static str, u64)>
+/// One per-ordinal EL1 counter array at `offset` in [`Counters`].
+fn sample_el1_counter_array<X>(engine: &SoftAarch64Engine<X>, offset: usize) -> Option<Vec<u64>>
 where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
     use carrick_aarch64::Aarch64Vmm as _;
 
-    let ring_base = EL1_COUNTERS_BASE + offset_of!(Counters, refused) as u64;
-    let venue_base = EL1_COUNTERS_BASE + offset_of!(Counters, venue_refused) as u64;
-    let Ok(ring_bytes) = engine.backend().read_gpa(ring_base, 512 * 8) else {
+    let bytes = engine
+        .backend()
+        .read_gpa(EL1_COUNTERS_BASE + offset as u64, 512 * 8)
+        .ok()?;
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|word| {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(word);
+                u64::from_le_bytes(raw)
+            })
+            .collect(),
+    )
+}
+
+/// The nonzero `(aarch64_nr, syscall_name, count)` entries of `counts`.
+fn named_counts(counts: impl Iterator<Item = u64>) -> Vec<(u64, &'static str, u64)> {
+    counts
+        .enumerate()
+        .filter(|&(_, count)| count != 0)
+        .map(|(nr, count)| {
+            let nr = nr as u64;
+            (
+                nr,
+                lookup_aarch64(nr).map_or("unknown", |call| call.name),
+                count,
+            )
+        })
+        .collect()
+}
+
+/// Sample counted `ENOSYS` refusals from `EL1_COUNTERS_BASE` (`refused` + `venue_refused`).
+pub fn sample_el1_counted_enosys<X>(engine: &SoftAarch64Engine<X>) -> Vec<(u64, &'static str, u64)>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    let (Some(ring), Some(venue)) = (
+        sample_el1_counter_array(engine, offset_of!(Counters, refused)),
+        sample_el1_counter_array(engine, offset_of!(Counters, venue_refused)),
+    ) else {
         return Vec::new();
     };
-    let Ok(venue_bytes) = engine.backend().read_gpa(venue_base, 512 * 8) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for nr in 0..512usize {
-        let mut r = [0u8; 8];
-        let mut v = [0u8; 8];
-        r.copy_from_slice(&ring_bytes[nr * 8..nr * 8 + 8]);
-        v.copy_from_slice(&venue_bytes[nr * 8..nr * 8 + 8]);
-        let count = u64::from_le_bytes(r).saturating_add(u64::from_le_bytes(v));
-        if count != 0 {
-            let nr_u64 = nr as u64;
-            let name = lookup_aarch64(nr_u64).map_or("unknown", |call| call.name);
-            out.push((nr_u64, name, count));
-        }
-    }
-    out
+    named_counts(
+        ring.into_iter()
+            .zip(venue)
+            .map(|(ring, venue)| ring.saturating_add(venue)),
+    )
+}
+
+/// Sample the syscalls the EL1 ring completed without leaving the guest
+/// (`Counters::served`), per native ordinal.
+pub fn sample_el1_served<X>(engine: &SoftAarch64Engine<X>) -> Vec<(u64, &'static str, u64)>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    sample_el1_counter_array(engine, offset_of!(Counters, served))
+        .map_or_else(Vec::new, |served| named_counts(served.into_iter()))
 }
 
 /// Syscalls the EL1 ring routed, summed over every native ordinal.
@@ -540,18 +583,9 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
-    use carrick_aarch64::Aarch64Vmm as _;
-
-    let total = |offset: usize| -> Option<u64> {
-        let bytes = engine
-            .backend()
-            .read_gpa(EL1_COUNTERS_BASE + offset as u64, 512 * 8)
-            .ok()?;
-        Some(bytes.chunks_exact(8).fold(0u64, |sum, word| {
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(word);
-            sum.saturating_add(u64::from_le_bytes(raw))
-        }))
+    let total = |offset: usize| {
+        sample_el1_counter_array(engine, offset)
+            .map(|counts| counts.into_iter().fold(0u64, u64::saturating_add))
     };
     Some(El1RouteCensus {
         served: total(offset_of!(Counters, served))?,
@@ -564,6 +598,8 @@ where
 /// guest's own stage-2 view of the dynamic metadata aperture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftRootPublication {
+    /// `CurrentTask[0]`'s loaded task (its kernel TID, 0: none).
+    pub task_tid: u64,
     /// `CurrentTask[0]`'s published lifecycle page (guest address, 0: none).
     pub lifecycle_page: u64,
     /// `CurrentTask[0]`'s published control slot (guest address, 0: none).
@@ -623,6 +659,7 @@ where
                 .cast::<MmPortalSlots>(),
         )
     };
+    let task_tid = task.execution.task.load(Ordering::Acquire);
     let lifecycle_page = task.metadata.lifecycle_page.load(Ordering::Acquire);
     let control_slot = task.metadata.control_slot.load(Ordering::Acquire);
     let inside = |gpa: u64, len: usize| {
@@ -651,6 +688,7 @@ where
     let portal_is_owner_wait_venue = get_el1_region_host_ptr() == region as usize
         && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
     Ok(SoftRootPublication {
+        task_tid,
         lifecycle_page,
         control_slot,
         in_metadata_aperture,
@@ -770,6 +808,7 @@ where
 
     let mut aperture_scope = El1ApertureScope {
         el1_host_ptr: 0,
+        lifecycle: None,
         _lease: carrier_lease,
     };
     if let Some(el1_host_ptr) = carrick_hal::GuestVmBackend::host_ptr(
@@ -831,6 +870,7 @@ where
                 return Err("soft carrier MM portal is already bound".to_owned());
             }
         }
+        aperture_scope.lifecycle = Some(publish_root_lifecycle(&engine, &root_ctx)?);
     }
 
     dispatcher
@@ -868,6 +908,33 @@ where
         frame_inventory: summary.frame_inventory,
         engine,
     })
+}
+
+/// Publish the root thread's lifecycle page and control slot on mailbox slot
+/// 0 through the shared carrier lifecycle publisher, mapping each retained
+/// slab into this carrier's EL1 dynamic metadata aperture, exactly as an HVF
+/// executor does when it loads a task.
+fn publish_root_lifecycle<X>(
+    engine: &SoftAarch64Engine<X>,
+    root: &carrick_kernel::kernel::KernelContext,
+) -> Result<CarrierLifecycleMappings<SoftRetainedMetadata>, String>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    let mappings = CarrierLifecycleMappings::new(engine.backend().retained_metadata());
+    let control = root.thread().control_lease();
+    if control.visible_tid().is_none() {
+        let tid = carrick_kernel::namespace::pid::ns_visible_thread_tid(root.thread())
+            .ok_or_else(|| "soft root thread has no namespace identity".to_owned())?;
+        if !control.publish_visible_tid(tid) {
+            return Err("soft root thread changed lifecycle identity".to_owned());
+        }
+    }
+    mappings
+        .publish(0, control)
+        .map_err(|error| format!("soft root lifecycle publication failed: {error:?}"))?;
+    Ok(mappings)
 }
 
 /// Drive an already-brought-up [`SoftAarch64Engine`] against `dispatcher` until

@@ -14,14 +14,15 @@ pub mod runner;
 
 pub use facade::{
     GUEST_PAGE_BYTES, MappingGeometry, SOFT_ALIAS_GPA_BASE, SoftAarch64Engine, SoftAarch64Vcpu,
-    SoftAarch64Vmm, SoftKickHandle, SoftStage2, Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
+    SoftAarch64Vmm, SoftKickHandle, SoftRetainedExtent, SoftRetainedMetadata, SoftStage2,
+    Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
 };
 pub use memory::SoftMemory;
 pub use runner::{
     El1RouteCensus, Hvc2ReplyCensus, SoftCarrierActiveError, SoftFaultTermination, SoftProcessRun,
     SoftRootPublication, SoftSingleProcessConfig, drive_single_process_engine, run_single_process,
     run_single_process_with_executor, run_single_process_with_executor_and_setup,
-    sample_el1_counted_enosys, sample_el1_routes, sample_root_publication,
+    sample_el1_counted_enosys, sample_el1_routes, sample_el1_served, sample_root_publication,
 };
 
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
