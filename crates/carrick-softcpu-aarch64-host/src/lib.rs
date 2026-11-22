@@ -19,9 +19,9 @@ pub use facade::{
 pub use memory::SoftMemory;
 pub use runner::{
     El1RouteCensus, Hvc2ReplyCensus, SoftCarrierActiveError, SoftFaultTermination, SoftProcessRun,
-    SoftSingleProcessConfig, drive_single_process_engine, run_single_process,
+    SoftRootPublication, SoftSingleProcessConfig, drive_single_process_engine, run_single_process,
     run_single_process_with_executor, run_single_process_with_executor_and_setup,
-    sample_el1_counted_enosys, sample_el1_routes,
+    sample_el1_counted_enosys, sample_el1_routes, sample_root_publication,
 };
 
 use carrick_softcpu_aarch64::dispatch::ExecuteBlock;

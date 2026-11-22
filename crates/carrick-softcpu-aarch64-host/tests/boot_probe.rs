@@ -2055,6 +2055,60 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
     );
 }
 
+/// Root-publication witness on the production soft entry: before the dynamic
+/// glibc hello's first instruction, the production EL1 image
+/// (`CARRICK_A64_ELF`) sees the root's thread lifecycle page and control slot
+/// mapped into its dynamic metadata aperture and a carrier-bound MM portal,
+/// and the run's guest-visible result is unchanged by the publication.
+#[test]
+#[ignore = "requires CARRICK_A64_DYN_ROOT and CARRICK_A64_ELF"]
+fn soft_cpu_runs_dynamic_glibc_hello_with_published_root_lifecycle_through_production_dispatch() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let root_dir = std::path::PathBuf::from(
+        std::env::var_os("CARRICK_A64_DYN_ROOT").expect("set CARRICK_A64_DYN_ROOT"),
+    );
+    let root = FixtureRoot::new(root_dir.clone());
+    let hello = root.read("/hello").expect("read dynamic hello");
+    let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+        elf_bytes: &hello,
+        executable_path: "/hello",
+        argv: vec![b"/hello".to_vec()],
+        envp: Vec::new(),
+        rootfs_dir: Some(&root_dir),
+        el1_elf_override: Some(&el1_elf),
+        max_syscalls: 4096,
+    };
+    let mut entry = None;
+    let run = carrick_softcpu_aarch64_host::run_single_process_with_executor_and_setup(
+        &config,
+        HostBlockRunner::new().expect("native arm64 block runner"),
+        |engine| {
+            entry = Some(carrick_softcpu_aarch64_host::sample_root_publication(
+                engine,
+            )?);
+            Ok(())
+        },
+    )
+    .expect("dynamic glibc hello must complete through production kernel dispatch");
+    let entry = entry.expect("setup sampled the pre-entry publication");
+    println!(
+        "glibc hello root publication={entry:?} exit={} census={:?} counted_enosys={:?}",
+        run.exit_code, run.reply_census, run.counted_enosys
+    );
+    assert!(
+        entry.ring_ready(),
+        "the root's lifecycle and MM portal must be what the ring expects: {entry:?}"
+    );
+    assert_eq!(entry.control_visible_tid, Some(1));
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(run.stdout, b"dynamic glibc hello\n");
+    let after = carrick_softcpu_aarch64_host::sample_root_publication(&run.engine)
+        .expect("sample the retired publication");
+    assert_eq!((after.lifecycle_page, after.control_slot), (0, 0));
+}
+
 /// Engine witness: static musl hello runs to exit on the soft CPU through the
 /// production EL1 vectors and trap path (`CARRICK_A64_ELF`) and production
 /// `carrick-kernel` / `carrick-personality-linux` dispatch, with zero `HVC #2`
