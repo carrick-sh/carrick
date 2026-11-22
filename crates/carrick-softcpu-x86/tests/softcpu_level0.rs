@@ -6029,3 +6029,111 @@ fn stopped_soft_cpu_moves_to_another_host_thread_and_runs() {
     );
     assert_eq!(cpu.context().gpr[reg::RAX], LINUX_SYS_GETPID);
 }
+
+/// `jmp short $+2` x `blocks`, then `jmp` back: `blocks + 1` distinct blocks.
+fn setup_working_set(blocks: usize) -> (SoftCpu, TestSoftMmuMemory, u64) {
+    let (code_va, stack_va) = (0x0040_0000u64, 0x0080_0000u64);
+    let mut code: Vec<u8> = std::iter::repeat_n([0xeb, 0x00], blocks)
+        .flatten()
+        .collect();
+    let back = -(code.len() as i32 + 5);
+    code.push(0xe9);
+    code.extend_from_slice(&back.to_le_bytes());
+    let mut mem = TestSoftMmuMemory::new();
+    mem.map_range(
+        code_va,
+        code.len().next_multiple_of(4096),
+        PagePerms::USER_RX,
+    );
+    assert!(mem.write_direct(code_va, &code));
+    mem.map_range(stack_va, 8192, PagePerms::USER_RW);
+    let mut cpu = SoftCpu::new(mem.extents()).expect("SoftCpu");
+    cpu.context_mut().rip = code_va;
+    cpu.context_mut().gpr[reg::RSP] = stack_va + 4096;
+    (cpu, mem, code_va)
+}
+
+/// A 4,096-block working set repeated 3, 10 and 30 times translates and
+/// emits each block once: re-emission must not grow with the pass count.
+#[test]
+fn working_set_of_4096_blocks_stays_resident_across_passes() {
+    let blocks = 4096;
+    let mut census = Vec::new();
+    for passes in [3u64, 10, 30] {
+        let (mut cpu, mut mem, va) = setup_working_set(blocks);
+        for _ in 0..passes {
+            for _ in 0..=blocks {
+                assert!(matches!(
+                    cpu.step_block(&mut mem).unwrap(),
+                    SoftCpuExit::Continue { .. }
+                ));
+            }
+            assert_eq!(cpu.context().rip, va);
+        }
+        census.push((passes, cpu.translation_count(), cpu.emission_count()));
+    }
+    let distinct = blocks as u64 + 1;
+    assert!(
+        census
+            .iter()
+            .all(|&(_, translated, emitted)| translated == distinct && emitted == distinct),
+        "the x86 soft CPU re-emits a resident working set: \
+         (passes, translations, emissions) = {census:?}, {distinct} distinct blocks"
+    );
+}
+
+/// A 16-block hot loop interleaved with cold one-shot blocks well past any
+/// resident budget: the cold scan may evict only cold code.
+#[test]
+fn hot_loop_survives_a_cold_scan() {
+    let (hot, chunk, chunks) = (16usize, 64usize, 1024usize);
+    let (code_va, stack_va) = (0x0040_0000u64, 0x0080_0000u64);
+    // Hot loop: `jmp short $+2` x 15, `jmp rax`. Cold chunk: x 63, `jmp rbx`.
+    let mut code: Vec<u8> = Vec::new();
+    code.extend(std::iter::repeat_n([0xeb, 0x00], hot - 1).flatten());
+    code.extend_from_slice(&[0xff, 0xe0]);
+    let cold_va = code_va + code.len() as u64;
+    for _ in 0..chunks {
+        code.extend(std::iter::repeat_n([0xeb, 0x00], chunk - 1).flatten());
+        code.extend_from_slice(&[0xff, 0xe3]);
+    }
+    let mut mem = TestSoftMmuMemory::new();
+    mem.map_range(
+        code_va,
+        code.len().next_multiple_of(4096),
+        PagePerms::USER_RX,
+    );
+    assert!(mem.write_direct(code_va, &code));
+    mem.map_range(stack_va, 8192, PagePerms::USER_RW);
+    let mut cpu = SoftCpu::new(mem.extents()).expect("SoftCpu");
+    cpu.context_mut().gpr[reg::RSP] = stack_va + 4096;
+    cpu.context_mut().gpr[reg::RBX] = code_va;
+    let run = |cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, blocks: usize| {
+        for _ in 0..blocks {
+            assert!(matches!(
+                cpu.step_block(mem).unwrap(),
+                SoftCpuExit::Continue { .. }
+            ));
+        }
+    };
+    cpu.context_mut().rip = code_va;
+    cpu.context_mut().gpr[reg::RAX] = cold_va;
+    run(&mut cpu, &mut mem, hot);
+    let after_first_loop = cpu.translation_count();
+    for next in 1..=chunks {
+        run(&mut cpu, &mut mem, chunk);
+        assert_eq!(cpu.context().rip, code_va);
+        cpu.context_mut().gpr[reg::RAX] = cold_va + (2 * chunk * next) as u64;
+        let before = cpu.translation_count();
+        run(&mut cpu, &mut mem, hot);
+        assert_eq!(
+            cpu.translation_count(),
+            before,
+            "the hot loop was re-translated after {next} cold chunks"
+        );
+    }
+    assert_eq!(
+        cpu.translation_count(),
+        after_first_loop + (chunk * chunks) as u64
+    );
+}
