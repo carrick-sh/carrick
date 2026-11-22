@@ -942,6 +942,30 @@ impl ServiceNotice {
             sequence: self.sequence.load(Ordering::Relaxed),
         }
     }
+    /// Read the untaken selector with zero stores. An observation only: the
+    /// caller's later `take` and claim are the authority.
+    pub fn observe(&self) -> Option<ServiceSelector> {
+        let record = self.record.load(Ordering::Acquire);
+        if record == 0 || record == NOTICE_WRITING || record & NOTICE_TAKING != 0 {
+            return None;
+        }
+        let incarnation = self.incarnation.load(Ordering::Acquire);
+        let execution = self.execution.load(Ordering::Acquire);
+        let sequence = NonZeroU64::new(self.sequence.load(Ordering::Acquire))?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        if self.record.load(Ordering::Acquire) != record {
+            return None;
+        }
+        let id = record
+            .checked_sub(1)
+            .and_then(|raw| u32::try_from(raw).ok())
+            .and_then(carrick_sched_core::RecordId::from_raw)?;
+        Some(ServiceSelector {
+            record: RecordRef { id, incarnation },
+            execution: SnapshotGeneration::from_raw(execution),
+            sequence,
+        })
+    }
     pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
         let record = self.record.load(Ordering::Acquire);
         if record == 0 {
@@ -1600,10 +1624,7 @@ impl ServiceCell {
             || !self.same_birth(birth)
             || (fault_sequence.is_some() && !matches!(operation, ServiceOperation::Fault(_)))
             || (reply.is_some()
-                && !matches!(
-                    operation,
-                    ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some()
-                )
+                && !(matches!(operation, ServiceOperation::Fault(_)) && fault_sequence.is_some())
                 && !matches!(operation, ServiceOperation::Exec { .. }))
             || reply.is_some_and(|address| address.raw() == 0)
         {
@@ -1707,6 +1728,27 @@ impl ServiceCell {
         }
         self.state.store(expected, Ordering::Release);
         Err(ServiceError::Stale)
+    }
+    /// Observe where an unclaimed fault request stored its selection, with
+    /// zero stores. No authority: intake claims the exact ticket and takes
+    /// the same storage before any physical publication.
+    pub fn pending_fault_selection_address(
+        &self,
+        selector: ServiceSelector,
+    ) -> Option<carrick_guest_arch::KernelVa> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, REQUESTED | CANCEL_QUEUED)
+            || self.words[8].load(Ordering::Relaxed) != selector.execution.raw()
+            || self.sequence.load(Ordering::Relaxed) != selector.sequence.get()
+            || self.words[9].load(Ordering::Relaxed) != 1
+            || self.result.load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
+        let address = NonZeroU64::new(self.wait_revision.load(Ordering::Relaxed))?;
+        (self.state.load(Ordering::Acquire) == state
+            && self.sequence.load(Ordering::Relaxed) == selector.sequence.get())
+        .then(|| carrick_guest_arch::KernelVa::new(address.get()))
     }
     /// Claim a notice against its independently retained native member.
     ///
@@ -2190,17 +2232,34 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     pub fn request(&self) -> ServiceRequest {
         self.request
     }
-    /// Claim at most one lane selection before the transport releases that
-    /// execution lane. The ticket cannot later consume a successor's window.
+    /// Where the ring stored this request's selection, or `None` for a
+    /// request that selected nothing. Never a per-CPU lane.
+    pub fn fault_selection_address(&self) -> Option<carrick_guest_arch::KernelVa> {
+        match (self.request.operation, self.request.fault_sequence) {
+            (ServiceOperation::Fault(_), Some(_)) => self.reply_address(),
+            _ => None,
+        }
+    }
+    /// Take this request's selection, at most once, from the storage at
+    /// [`Self::fault_selection_address`]. A request stamped with no sequence
+    /// selected nothing and inspects no storage: the lane that delivered its
+    /// notice may already hold another request's selection.
     pub fn take_fault_selection(
         &mut self,
-        slot: &crate::PortalGrantSlot,
+        storage: Option<&crate::PortalGrantSlot>,
     ) -> Result<Option<ServiceFaultSupply>, ServiceError> {
         if self.selection_taken {
             return Err(ServiceError::Stale);
         }
         self.selection_taken = true;
-        slot.take_native_fault_selection(self)
+        if !matches!(self.request.operation, ServiceOperation::Fault(_))
+            || self.request.fault_sequence.is_none()
+        {
+            return Ok(None);
+        }
+        storage
+            .ok_or(ServiceError::Stale)?
+            .take_native_fault_selection(self)
     }
     pub fn complete_backing_fault(self) -> Result<(), (ServiceError, Self)> {
         if !matches!(self.request().operation, ServiceOperation::Fault(fault) if !fault.present) {
@@ -3388,50 +3447,83 @@ mod tests {
         }
     }
 
+    fn fault_page() -> u64 {
+        match fault() {
+            ServiceOperation::Fault(fault) => fault.address.raw() & !4095,
+            _ => unreachable!(),
+        }
+    }
+    /// Publish a selected fault as the ring does: stamp the lane, then move
+    /// the selection into storage the request owns before publication.
+    fn publish_selected(
+        cell: &ServiceCell,
+        owner: ServiceBirth,
+        lane: &crate::PortalGrantSlot,
+        storage: &crate::PortalGrantSlot,
+        sequence: u64,
+    ) -> ServiceRequest {
+        let sequence = NonZeroU64::new(sequence).unwrap();
+        assert!(lane.transfer_native_fault_selection(
+            storage,
+            owner.mm.mm().raw(),
+            fault_page(),
+            sequence
+        ));
+        cell.publish_with_reply(
+            owner,
+            SnapshotGeneration::INITIAL,
+            fault(),
+            Some(sequence),
+            Some(carrick_guest_arch::KernelVa::new(
+                core::ptr::from_ref(storage).addr() as u64,
+            )),
+        )
+        .unwrap()
+    }
+
+    // #2749: these four tests used to assert `Stale` when a ticket met a
+    // successor's selection in the shared lane. The selection now travels
+    // in request-owned storage, so lane reuse is invisible to a ticket; what
+    // they pin is exact ownership, one take per ticket, and the refusals
+    // that remain (a recycled MM incarnation, a second take).
     #[test]
     fn fault_supply_transfer_survives_lane_reuse_and_cancellation() {
-        let slot = crate::PortalGrantSlot::new();
+        let lane = crate::PortalGrantSlot::new();
+        let (a_storage, b_storage) = (crate::PortalGrantSlot::new(), crate::PortalGrantSlot::new());
         let first = ServiceCell::new();
         let second = ServiceCell::new();
         let a = birth(1, 1);
         let b = birth(2, 1);
         first.bind(a).unwrap();
         second.bind(b).unwrap();
-        let a_request = first
-            .publish(
-                a,
-                SnapshotGeneration::INITIAL,
-                fault(),
-                Some(NonZeroU64::MIN),
-            )
-            .unwrap();
-        let b_request = second
-            .publish(b, SnapshotGeneration::INITIAL, fault(), NonZeroU64::new(2))
-            .unwrap();
-        let mut a_ticket = first.claim(a_request).unwrap();
-        let mut b_ticket = second.claim(b_request).unwrap();
         let a_window = supply_window(a);
         let mut b_window = supply_window(b);
         b_window.operation.sequence = NonZeroU64::new(2).unwrap();
-        assert!(slot.publish_cow_fault_selection(1, a_window));
+        assert!(lane.publish_cow_fault_selection(1, a_window));
+        let a_request = publish_selected(&first, a, &lane, &a_storage, 1);
+        assert!(!lane.has_outstanding_for(a.mm.mm().raw()));
+        // The lane is reused before the first request's intake.
+        assert!(lane.publish_fault_selection(2, b_window));
+        let b_request = publish_selected(&second, b, &lane, &b_storage, 2);
+        let mut a_ticket = first.claim(a_request).unwrap();
+        let mut b_ticket = second.claim(b_request).unwrap();
         assert_eq!(
-            a_ticket.take_fault_selection(&slot),
+            a_ticket.take_fault_selection(Some(&a_storage)),
             Ok(Some(ServiceFaultSupply::Cow(a_window)))
         );
-        assert!(!slot.has_outstanding_for(a.mm.mm().raw()));
         assert!(!first.cancel(a_request.identity).unwrap());
         assert_eq!(first.consume(a_request.identity), Err(ServiceError::Busy));
-        assert!(slot.publish_fault_selection(2, b_window));
         assert_eq!(
-            a_ticket.take_fault_selection(&slot),
-            Err(ServiceError::Stale)
+            a_ticket.take_fault_selection(Some(&b_storage)),
+            Err(ServiceError::Stale),
+            "one take per ticket, whatever storage it is offered"
         );
         assert_eq!(
-            slot.pending_fault_selection(b.mm.mm().raw(), b_window.fault_page),
+            b_storage.pending_fault_selection(b.mm.mm().raw(), b_window.fault_page),
             Some((2, b_window))
         );
         assert_eq!(
-            b_ticket.take_fault_selection(&slot),
+            b_ticket.take_fault_selection(Some(&b_storage)),
             Ok(Some(ServiceFaultSupply::Backing(b_window)))
         );
         assert!(b_ticket.complete(false).is_ok());
@@ -3451,6 +3543,7 @@ mod tests {
     #[test]
     fn unselected_fault_intake_ignores_a_peer_selection() {
         let lane = crate::PortalGrantSlot::new();
+        let c_storage = crate::PortalGrantSlot::new();
         let holder = ServiceCell::new();
         let contender = ServiceCell::new();
         let h = birth(1, 1);
@@ -3462,37 +3555,39 @@ mod tests {
             .unwrap();
         let c_window = supply_window(c);
         assert!(lane.publish_cow_fault_selection(1, c_window));
-        let c_request = contender
-            .publish(
-                c,
-                SnapshotGeneration::INITIAL,
-                fault(),
-                Some(NonZeroU64::MIN),
-            )
-            .unwrap();
+        let c_request = publish_selected(&contender, c, &lane, &c_storage, 1);
+        // A third selection occupies the lane while both requests wait.
+        let mut later = supply_window(c);
+        later.operation.sequence = NonZeroU64::new(3).unwrap();
+        assert!(lane.publish_cow_fault_selection(3, later));
         let mut h_ticket = holder.claim(h_request).unwrap();
-        assert_eq!(h_ticket.take_fault_selection(&lane), Ok(None));
+        assert_eq!(h_ticket.fault_selection_address(), None);
+        assert_eq!(h_ticket.take_fault_selection(None), Ok(None));
         let mut c_ticket = contender.claim(c_request).unwrap();
         assert_eq!(
-            c_ticket.take_fault_selection(&lane),
+            c_ticket
+                .fault_selection_address()
+                .map(|address| address.raw()),
+            Some(core::ptr::from_ref(&c_storage).addr() as u64)
+        );
+        assert_eq!(
+            c_ticket.take_fault_selection(Some(&c_storage)),
             Ok(Some(ServiceFaultSupply::Cow(c_window)))
+        );
+        assert_eq!(
+            lane.pending_cow_fault_selection(c.mm.mm().raw(), later.fault_page),
+            Some((3, later)),
+            "neither intake disturbs the lane's current selection"
         );
         assert!(h_ticket.complete(false).is_ok());
         assert!(c_ticket.complete(false).is_ok());
     }
 
     #[test]
-    fn prepared_supply_transfer_retains_exact_owner_across_lane_reuse() {
-        let slot = crate::PortalGrantSlot::new();
+    fn selected_fault_without_request_storage_is_refused() {
         let cell = ServiceCell::new();
         let owner = birth(1, 1);
         cell.bind(owner).unwrap();
-        let window = supply_window(owner);
-        assert!(slot.publish_prepared_fault_selection(1, window));
-        assert!(
-            slot.pending_fault_selection(owner.mm.mm().raw(), window.fault_page)
-                .is_none()
-        );
         let request = cell
             .publish(
                 owner,
@@ -3502,17 +3597,40 @@ mod tests {
             )
             .unwrap();
         let mut ticket = cell.claim(request).unwrap();
-        assert_eq!(
-            ticket.take_fault_selection(&slot),
-            Ok(Some(ServiceFaultSupply::Prepared(window)))
+        assert_eq!(ticket.fault_selection_address(), None);
+        assert_eq!(ticket.take_fault_selection(None), Err(ServiceError::Stale));
+        assert!(ticket.complete(false).is_ok());
+    }
+
+    #[test]
+    fn prepared_supply_transfer_retains_exact_owner_across_lane_reuse() {
+        let lane = crate::PortalGrantSlot::new();
+        let storage = crate::PortalGrantSlot::new();
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let window = supply_window(owner);
+        assert!(lane.publish_prepared_fault_selection(1, window));
+        assert!(
+            lane.pending_fault_selection(owner.mm.mm().raw(), window.fault_page)
+                .is_none()
         );
-        assert!(!slot.has_outstanding_for(owner.mm.mm().raw()));
+        let request = publish_selected(&cell, owner, &lane, &storage, 1);
+        assert!(!lane.has_outstanding_for(owner.mm.mm().raw()));
         let mut successor = window;
         successor.operation.sequence = NonZeroU64::new(2).unwrap();
-        assert!(slot.publish_prepared_fault_selection(2, successor));
-        assert_eq!(ticket.take_fault_selection(&slot), Err(ServiceError::Stale));
+        assert!(lane.publish_prepared_fault_selection(2, successor));
+        let mut ticket = cell.claim(request).unwrap();
         assert_eq!(
-            slot.pending_prepared_fault_selection(owner.mm.mm().raw(), window.fault_page),
+            ticket.take_fault_selection(Some(&storage)),
+            Ok(Some(ServiceFaultSupply::Prepared(window)))
+        );
+        assert_eq!(
+            ticket.take_fault_selection(Some(&storage)),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            lane.pending_prepared_fault_selection(owner.mm.mm().raw(), window.fault_page),
             Some((2, successor))
         );
         assert!(!cell.cancel(request.identity).unwrap());
@@ -3522,24 +3640,21 @@ mod tests {
 
     #[test]
     fn fault_supply_transfer_rejects_recycled_mm_incarnation() {
-        let slot = crate::PortalGrantSlot::new();
+        let lane = crate::PortalGrantSlot::new();
+        let storage = crate::PortalGrantSlot::new();
         let cell = ServiceCell::new();
         let owner = birth(1, 1);
         cell.bind(owner).unwrap();
-        let request = cell
-            .publish(
-                owner,
-                SnapshotGeneration::INITIAL,
-                fault(),
-                Some(NonZeroU64::MIN),
-            )
-            .unwrap();
-        let mut ticket = cell.claim(request).unwrap();
         let window = supply_window(birth(1, 2));
-        assert!(slot.publish_cow_fault_selection(1, window));
-        assert_eq!(ticket.take_fault_selection(&slot), Err(ServiceError::Stale));
+        assert!(lane.publish_cow_fault_selection(1, window));
+        let request = publish_selected(&cell, owner, &lane, &storage, 1);
+        let mut ticket = cell.claim(request).unwrap();
         assert_eq!(
-            slot.pending_cow_fault_selection(owner.mm.mm().raw(), window.fault_page),
+            ticket.take_fault_selection(Some(&storage)),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            storage.pending_cow_fault_selection(owner.mm.mm().raw(), window.fault_page),
             Some((1, window))
         );
         assert!(ticket.complete(false).is_ok());
@@ -3547,8 +3662,48 @@ mod tests {
     }
 
     #[test]
+    fn lane_transfer_moves_only_the_exact_stamped_selection() {
+        let lane = crate::PortalGrantSlot::new();
+        let storage = crate::PortalGrantSlot::new();
+        let owner = birth(1, 1);
+        let mm = owner.mm.mm().raw();
+        let window = supply_window(owner);
+        let two = NonZeroU64::new(2).unwrap();
+        assert!(!lane.transfer_native_fault_selection(&storage, mm, fault_page(), NonZeroU64::MIN));
+        assert!(lane.publish_cow_fault_selection(1, window));
+        for (mm, page, sequence) in [
+            (mm, fault_page(), two),
+            (mm + 1, fault_page(), NonZeroU64::MIN),
+            (mm, fault_page() + 4096, NonZeroU64::MIN),
+        ] {
+            assert!(!lane.transfer_native_fault_selection(&storage, mm, page, sequence));
+            assert_eq!(
+                lane.pending_cow_fault_selection(owner.mm.mm().raw(), fault_page()),
+                Some((1, window)),
+                "a refused transfer leaves the lane's selection in place"
+            );
+        }
+        assert!(lane.transfer_native_fault_selection(&storage, mm, fault_page(), NonZeroU64::MIN));
+        assert!(!lane.has_outstanding_for(mm));
+        assert_eq!(
+            storage.pending_cow_fault_selection(mm, fault_page()),
+            Some((1, window))
+        );
+        // Occupied storage refuses a second selection and keeps the lane's.
+        let mut next = window;
+        next.operation.sequence = two;
+        assert!(lane.publish_cow_fault_selection(2, next));
+        assert!(!lane.transfer_native_fault_selection(&storage, mm, fault_page(), two));
+        assert_eq!(
+            lane.pending_cow_fault_selection(mm, fault_page()),
+            Some((2, next))
+        );
+    }
+
+    #[test]
     fn delayed_first_fault_take_cannot_steal_same_mm_page_successor() {
-        let slot = crate::PortalGrantSlot::new();
+        let lane = crate::PortalGrantSlot::new();
+        let (a_storage, b_storage) = (crate::PortalGrantSlot::new(), crate::PortalGrantSlot::new());
         let first = ServiceCell::new();
         let second = ServiceCell::new();
         let a = birth(1, 1);
@@ -3556,32 +3711,27 @@ mod tests {
         b.mm = a.mm;
         first.bind(a).unwrap();
         second.bind(b).unwrap();
-        let a_request = first
-            .publish(
-                a,
-                SnapshotGeneration::INITIAL,
-                fault(),
-                Some(NonZeroU64::MIN),
-            )
-            .unwrap();
-        let b_request = second
-            .publish(b, SnapshotGeneration::INITIAL, fault(), NonZeroU64::new(2))
-            .unwrap();
-        let mut old_ticket = first.claim(a_request).unwrap();
-        let mut next_ticket = second.claim(b_request).unwrap();
+        let window = supply_window(a);
         let mut successor = supply_window(b);
         successor.operation.sequence = NonZeroU64::new(2).unwrap();
-        assert!(slot.publish_cow_fault_selection(2, successor));
+        assert!(lane.publish_cow_fault_selection(1, window));
+        let a_request = publish_selected(&first, a, &lane, &a_storage, 1);
+        assert!(lane.publish_cow_fault_selection(2, successor));
+        let b_request = publish_selected(&second, b, &lane, &b_storage, 2);
+        let mut old_ticket = first.claim(a_request).unwrap();
+        let mut next_ticket = second.claim(b_request).unwrap();
+        // Offered the successor's storage, the delayed ticket is refused and
+        // the successor's selection stays for its own ticket.
         assert_eq!(
-            old_ticket.take_fault_selection(&slot),
+            old_ticket.take_fault_selection(Some(&b_storage)),
             Err(ServiceError::Stale)
         );
         assert_eq!(
-            slot.pending_cow_fault_selection(a.mm.mm().raw(), successor.fault_page),
+            b_storage.pending_cow_fault_selection(a.mm.mm().raw(), successor.fault_page),
             Some((2, successor))
         );
         assert_eq!(
-            next_ticket.take_fault_selection(&slot),
+            next_ticket.take_fault_selection(Some(&b_storage)),
             Ok(Some(ServiceFaultSupply::Cow(successor)))
         );
         assert!(next_ticket.complete(false).is_ok());

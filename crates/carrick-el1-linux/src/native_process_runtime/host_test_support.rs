@@ -93,6 +93,12 @@ pub(super) fn run_service_published_hook(runtime: usize) {
 
 #[cfg(test)]
 std::thread_local! {
+    // The per-CPU selection lane a test gives its `Physical` entries (#2749).
+    pub(super) static FAULT_SELECTION_LANE: core::cell::Cell<Option<&'static carrick_el1_abi::PortalGrantSlot>> = const { core::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
     // Inject the other lane's close between notice contention and the park probe.
     pub(super) static SERVICE_NOTICE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -579,6 +585,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     ) -> Result<(), NativeProcessError> {
         assert_eq!(request.access, carrick_guest_arch::Access::Read);
         self.prepare_copy_error.map_or(Ok(()), Err)
+    }
+    #[cfg(test)]
+    fn fault_selection_lane(&self) -> Option<&carrick_el1_abi::PortalGrantSlot> {
+        FAULT_SELECTION_LANE.with(core::cell::Cell::get)
     }
     #[cfg(test)]
     fn copyout_fault(

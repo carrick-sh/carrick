@@ -140,7 +140,59 @@ impl PortalGrantSlot {
             .or_else(|| self.pending_fault_selection(mm, address))?;
         (generation == window.operation.sequence.get()).then_some(window.operation.sequence)
     }
-    /// Transfer only the selection stamped into the retained native request.
+    /// Move the selection stamped for `sequence` out of this per-CPU lane into
+    /// `storage`, which the native request owns until its acknowledgment.
+    ///
+    /// A request outlives its lane: its member parks and another task runs on
+    /// that CPU. The ring calls this while it still exclusively owns the lane,
+    /// before the request is published, so the carrier never has to find a
+    /// request's selection through whichever lane delivered its notice.
+    pub fn transfer_native_fault_selection(
+        &self,
+        storage: &Self,
+        mm: u64,
+        address: u64,
+        sequence: core::num::NonZeroU64,
+    ) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, 3 | 4 | Self::PREPARED_SELECTION_STATE)
+            || self
+                .state
+                .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        // Reservation excludes a successor's publication while the stamp and
+        // payload are checked and copied.
+        let words: [u64; 13] = core::array::from_fn(|i| self.window[i].load(Ordering::Relaxed));
+        let exact = self.fault_generation.load(Ordering::Relaxed) == sequence.get()
+            && PortalGrantWindow::decode(words).is_some_and(|window| {
+                window.operation.sequence == sequence
+                    && window.operation.mm.raw() == mm
+                    && window.fault_page == address & !4095
+            });
+        if !exact
+            || storage
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            self.state.store(state, Ordering::Release);
+            return false;
+        }
+        for (word, value) in storage.window.iter().zip(words) {
+            word.store(value, Ordering::Relaxed);
+        }
+        storage
+            .fault_generation
+            .store(sequence.get(), Ordering::Relaxed);
+        storage.state.store(state, Ordering::Release);
+        self.state.store(0, Ordering::Release);
+        true
+    }
+    /// Take the selection out of the request-owned storage that
+    /// [`Self::transfer_native_fault_selection`] filled for this ticket.
     pub(crate) fn take_native_fault_selection<
         P: core::ops::Deref<Target = crate::service::ServiceCell>,
     >(
@@ -152,22 +204,18 @@ impl PortalGrantSlot {
         let ServiceOperation::Fault(fault) = request.operation else {
             return Ok(None);
         };
-        let state = self.state.load(Ordering::Acquire);
         let Some(sequence) = request.fault_sequence else {
-            return if state == 0 {
-                Ok(None)
-            } else {
-                Err(ServiceError::Stale)
-            };
+            return Ok(None);
         };
+        let state = self.state.load(Ordering::Acquire);
         if !matches!(state, 3 | 4 | Self::PREPARED_SELECTION_STATE) {
             return Err(ServiceError::Stale);
         }
         self.state
             .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| ServiceError::Stale)?;
-        // Reservation excludes publication and reclamation while the stamp and
-        // payload are checked, including ABA through a same-MM/page successor.
+        // The storage belongs to this one request; the checks still refuse a
+        // request whose MM incarnation or page no longer matches its stamp.
         let selected = PortalGrantWindow::decode(core::array::from_fn(|i| {
             self.window[i].load(Ordering::Relaxed)
         }))

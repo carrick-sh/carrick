@@ -1525,21 +1525,9 @@ pub(super) fn take(
         drop(claim_backing);
         match ticket {
             Ok(mut ticket) => {
-                let portal = region
-                    .record_ptr::<carrick_el1_abi::MmPortalSlots>(
-                        carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
-                    )
-                    .ok_or_else(|| stale())?;
-                // SAFETY: initialized portal in the retained carrier ABI region.
-                let portal = unsafe { &*portal };
-                let cow = ticket
-                    .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(|| stale())?)
-                    .map_err(|_| stale())?;
                 let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
                     match ticket.request().operation {
-                        carrick_core_abi::service::ServiceOperation::Fault(fault)
-                            if !fault.present =>
-                        {
+                        carrick_core_abi::service::ServiceOperation::Fault(_) => {
                             let (pointer, pin) = retain_reply::<carrick_el1_abi::PortalGrantSlot>(
                                 custody, region, address,
                             )?;
@@ -1556,6 +1544,27 @@ pub(super) fn take(
                     }
                 } else {
                     (None, None)
+                };
+                // The selection travels in the request's own storage. The
+                // delivering CPU's lane is never read: it may already hold
+                // another request's selection (#2749).
+                let cow = ticket
+                    .take_fault_selection(match (ticket.fault_selection_address(), &reply) {
+                        // SAFETY: `retain_reply` authenticated and pinned
+                        // this exact ring-owned storage above.
+                        (Some(_), Some(NativeServiceReply::Fault(storage))) => {
+                            Some(unsafe { storage.as_ref() })
+                        }
+                        _ => None,
+                    })
+                    .map_err(|_| stale())?;
+                // Only a backing fault's storage doubles as the descriptor
+                // reply; a copy-on-write request's held its selection alone.
+                let reply = match ticket.request().operation {
+                    carrick_core_abi::service::ServiceOperation::Fault(fault) if fault.present => {
+                        None
+                    }
+                    _ => reply,
                 };
                 let exec_payload = match ticket.request().operation {
                     carrick_core_abi::service::ServiceOperation::Exec { payload, .. } => {

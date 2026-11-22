@@ -721,6 +721,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         ))
     }
 
+    fn fault_selection_lane(&self) -> Option<&carrick_el1_abi::PortalGrantSlot> {
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        // SAFETY: boot retains the initialized per-CPU selection portal.
+        let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
+        slots.grant(usize::from(self.slot.raw()))
+    }
+
     #[inline(never)]
     fn apply_fault_reply(
         &mut self,
