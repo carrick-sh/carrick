@@ -27,7 +27,7 @@ mod test_support {
     pub const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
     /// The next owner-selected grant's descriptor executor refuses it before
     /// any store (#2579): for capacity (`TablesExhausted`), for an occupied
-    /// leaf (`Occupied`), or terminally (`StaleRoot`).
+    /// leaf (`Occupied`), or terminally (`WrongMm`).
     pub const INJECT_GRANT_CAPACITY_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe50;
     pub const INJECT_GRANT_OCCUPIED_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe51;
     pub const INJECT_GRANT_TERMINAL_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe52;
@@ -1270,7 +1270,7 @@ mod test_support {
                 carrick_core::mm::frames::inject_grant_refusal_once(match native {
                     INJECT_GRANT_CAPACITY_REFUSAL_ONCE => DescriptorRefusal::TablesExhausted,
                     INJECT_GRANT_OCCUPIED_REFUSAL_ONCE => DescriptorRefusal::Occupied,
-                    _ => DescriptorRefusal::StaleRoot,
+                    _ => DescriptorRefusal::WrongMm,
                 })
                 .then_some(0)
             }
