@@ -13,6 +13,13 @@
 //! stage is a gap. A ring family can still decline a shape at run time (an
 //! mmap flag the reservation owner does not carry), so a census of the same
 //! workload, when given, adds the counted refusals Carrick actually made.
+//!
+//! The static route is an **approximation** of production's: it composes
+//! the production building blocks, but takes descriptor and poll service as
+//! always available, where production decides them per call
+//! (`may_serve_descriptor`, `may_serve_poll`). So it under-reports
+//! descriptor-family gaps; a census of the same workload shows them as
+//! declines. Sharing one `static_route` with `dispatch()` is the follow-up.
 use carrick_guest_arch::{GuestIsa, NativeOrdinal};
 use carrick_personality_linux::crossing::{AllowedHostCrossing, HostCrossingKind};
 use carrick_personality_linux::dispatch::{Family, service_owner};
@@ -659,8 +666,8 @@ pub fn render(
 mod tests {
     use super::*;
 
-    /// The recorder's known-answer run (x86_64, docker 26.1.5, bpftrace
-    /// 0.23.2): root `syscall(511)` and `socket(AF_INET, SOCK_DGRAM)`, then a
+    /// An excerpt (trimmed, not verbatim) of the recorder's known-answer run
+    /// (x86_64, docker 26.1.5, bpftrace 0.23.2): root `syscall(511)` and `socket(AF_INET, SOCK_DGRAM)`, then a
     /// forked child's two `syscall(510)` and one `socket(AF_UNIX,
     /// SOCK_STREAM)`.
     const KNOWN_ANSWER: &str = "Attaching 8 probes...
