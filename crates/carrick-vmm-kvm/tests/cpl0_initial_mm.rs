@@ -1014,7 +1014,7 @@ fn native_fork_child_exec_outlived_by_its_exiting_root_retires_every_preparation
     }
     let live = observed
         .iter()
-        .filter(|(_, _, census)| census.live() != 0)
+        .filter(|(_, _, census)| census.unretired() != 0)
         .collect::<Vec<_>>();
     assert!(
         live.is_empty(),
