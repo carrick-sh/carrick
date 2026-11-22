@@ -47,7 +47,7 @@ use carrick_mem::memory::{
 };
 use carrick_mmu_core::aarch64::PageTableError;
 use carrick_softcpu_aarch64::dispatch::{
-    DispatchCache, ExecuteBlock, RunControl, RunWork, Stop, run_controlled,
+    AARCH64_RESIDENCY, DispatchCache, ExecuteBlock, RunControl, RunWork, Stop, run_controlled,
 };
 use carrick_softcpu_aarch64::exception::Syndrome;
 use carrick_softcpu_aarch64::handler::{
@@ -59,6 +59,7 @@ use carrick_softcpu_aarch64::state::{
 };
 use carrick_softcpu_aarch64::translate::BlockLimits;
 use carrick_softcpu_aarch64::{Gpr, Hint, OperandRegister};
+use carrick_softmmu::block_cache::{ResidencyBudget, ResidencyCensus};
 use carrick_softmmu::{ExtentRecord, ExtentTable, OwnerGeneration, PAGE_SIZE_4K};
 
 use crate::HostBlockRunner;
@@ -1055,6 +1056,13 @@ impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
         self.work
     }
 
+    /// Code kept across `run` calls now, and its high-water mark; `None`
+    /// when the handoff cache is off.
+    #[must_use]
+    pub fn code_residency(&self) -> Option<ResidencyCensus> {
+        self.code.as_ref().map(DispatchCache::census)
+    }
+
     fn sync_shared_overrides(&mut self) {
         if self.tpidrro_dirty.swap(false, Ordering::AcqRel) {
             self.cpu.named.tpidrroel0 = SystemValue(self.tpidrro_pending.load(Ordering::Acquire));
@@ -1588,7 +1596,7 @@ where
             executor,
             code: (std::env::var_os("CARRICK_SOFT_AARCH64_HANDOFF_CACHE").as_deref()
                 != Some(std::ffi::OsStr::new("0")))
-            .then(DispatchCache::default),
+            .then(|| DispatchCache::new(ResidencyBudget::for_owner(AARCH64_RESIDENCY))),
             stage2: Arc::clone(&stage2),
             control: Arc::clone(&control),
             mailbox,

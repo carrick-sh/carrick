@@ -2246,6 +2246,11 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
         work.retired_instructions as f64 / elapsed,
         work.executed_blocks as f64 / elapsed,
     );
+    println!(
+        "cpython code residency: {:?} decoded/executed={:.4}%",
+        run.engine.vcpu().code_residency(),
+        100.0 * work.decoded_blocks as f64 / work.executed_blocks.max(1) as f64,
+    );
     for (nr, name, count) in &run.counted_enosys {
         println!("cpython counted ENOSYS: nr={nr} name={name} count={count}");
     }

@@ -13,7 +13,7 @@ metric = "softcpu_block_decodes"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the resident budget (X86_RESIDENCY)."
 
 [[structural_budgets]]
 kind = "affine"
@@ -21,7 +21,7 @@ metric = "softcpu_block_emits"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the resident budget (X86_RESIDENCY)."
 
 [[structural_budgets]]
 kind = "affine"
@@ -29,7 +29,7 @@ metric = "softcpu_code_page_walks"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the resident budget (X86_RESIDENCY)."
 
 [bindings]
 vm_free = [

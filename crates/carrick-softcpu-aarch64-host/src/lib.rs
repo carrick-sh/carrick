@@ -69,6 +69,18 @@ pub struct HostCode {
     _unsupported: core::convert::Infallible,
 }
 
+impl carrick_softmmu::block_cache::CodeFootprint for HostCode {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn code_bytes(&self) -> carrick_softmmu::block_cache::CodeBytes {
+        carrick_softmmu::block_cache::CodeBytes::new(self._mapping.mapped_bytes())
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    fn code_bytes(&self) -> carrick_softmmu::block_cache::CodeBytes {
+        match self._unsupported {}
+    }
+}
+
 // SAFETY: HostCode is constructed only after publishing its private mapping.
 // It exposes no mutable access. Readers may run its immutable instructions
 // concurrently, with separate frames, and the mapping lives through each call.

@@ -44,7 +44,9 @@ pub use context::{
     AdmitRefused, DescriptorTablePtr, FxsaveArea, HostAccess, SoftCpuContext, SoftSegment,
     X86Exception, X86ExceptionVector, reg,
 };
-pub use cpu::{JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
+pub use cpu::{
+    JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError, X86_RESIDENCY,
+};
 pub use cpuid::{CpuidAuthority, CpuidRegs, DEFAULT_TSC_HZ};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
