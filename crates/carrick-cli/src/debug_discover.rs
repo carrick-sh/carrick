@@ -9,8 +9,10 @@
 //! - every counted refusal from the run's EL1 census (`refusal_evidence`),
 //!   with the arguments of the refused calls the census kept
 //!   (`refused_calls`, #2690);
-//! - every carrier fatal site (`carrick fatal [<domain>]: <message>`) and
-//!   Rust panic location on the carrier's stderr;
+//! - every carrier fatal site (`carrick fatal [<domain>]: <message>`), Rust
+//!   panic location and carrier error (`carrick: <error chain>`, the
+//!   rc-125 refusals such as `physical fork source residency capacity`) on
+//!   the carrier's stderr;
 //! - every errno the guest itself reported on its streams (`Function not
 //!   implemented`, `... (38)`), a wrong-errno candidate;
 //! - every contention leave the census counted (`anonymous_leaves`,
@@ -158,6 +160,7 @@ fn is_label(name: &str) -> bool {
 pub(crate) enum FindingKind {
     Fatal,
     Panic,
+    CarrierError,
     Timeout,
     Refused,
     GuestErrno,
@@ -173,6 +176,7 @@ impl FindingKind {
         match self {
             Self::Fatal => "fatal",
             Self::Panic => "panic",
+            Self::CarrierError => "carrier_error",
             Self::Timeout => "timeout",
             Self::Refused => "refused",
             Self::GuestErrno => "guest_errno",
@@ -361,6 +365,14 @@ pub(crate) fn stream_findings(stderr: &str, stdout: &str) -> Vec<Finding> {
             );
             continue;
         }
+        if let Some(error) = carrier_error(&line) {
+            add(
+                FindingKind::CarrierError,
+                shape(error),
+                error.trim().chars().take(300).collect(),
+            );
+            continue;
+        }
         if let Some(errno) = guest_errno(&line) {
             add(
                 FindingKind::GuestErrno,
@@ -379,6 +391,28 @@ pub(crate) fn stream_findings(stderr: &str, stdout: &str) -> Vec<Finding> {
         }
     }
     by_key.into_values().collect()
+}
+
+/// The carrier's own terminal error: `carrick: <error chain>` on its stderr
+/// (anyhow's chain, such as `configuration refused: hypervisor operation
+/// failed: physical fork source residency capacity`). Progress lines the
+/// carrier prints with the same prefix (`carrick: image ... pulling`) are
+/// not errors.
+fn carrier_error(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("carrick: ")?;
+    const ERROR_WORDS: &[&str] = &[
+        "failed",
+        "refused",
+        "error",
+        "denied",
+        "invalid",
+        "unexpected",
+    ];
+    let lower = rest.to_ascii_lowercase();
+    ERROR_WORDS
+        .iter()
+        .any(|word| lower.contains(word))
+        .then_some(rest)
 }
 
 fn caller_name(caller: CallerClass) -> &'static str {
@@ -955,7 +989,9 @@ mod tests {
             index out of bounds\n\
             E: Select has failed (38)\n\
             E: Select has failed (38)\n\
-            go: open /tmp/x: no such file or directory\n";
+            go: open /tmp/x: no such file or directory\n\
+            carrick: image docker.io/library/node:22 (linux/amd64) pulling\n\
+            carrick: configuration refused: hypervisor operation failed: physical fork source residency capacity\n";
         let findings = stream_findings(stderr, "pip: [Errno 38] Function not implemented\n");
         let keys: Vec<String> = findings.iter().map(Finding::key).collect();
         assert!(
@@ -982,6 +1018,23 @@ mod tests {
         assert!(
             keys.iter()
                 .any(|k| k.starts_with("guest_errno ENOSYS: pip: [Errno #]"))
+        );
+        // The carrier's rc-125 error chain is its own site; a progress line
+        // with the same prefix is not.
+        let carrier = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::CarrierError)
+            .unwrap();
+        assert_eq!(
+            carrier.site,
+            "configuration refused: hypervisor operation failed: physical fork source residency capacity"
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.kind == FindingKind::CarrierError)
+                .count(),
+            1
         );
         // ENOENT is left out: correct programs print it all the time.
         assert!(!keys.iter().any(|k| k.contains("no such file")), "{keys:?}");
