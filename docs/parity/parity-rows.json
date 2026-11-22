@@ -32,7 +32,7 @@
       },
       "timeout_secs": 900,
       "stages": [
-        {"name": "row", "command": ["sh", "-c", "cd /tmp && GOFLAGS=-mod=mod GOCACHE=/tmp/gc go install golang.org/x/example/hello@v0.0.0-20240925201127-4ac1d1bdc3e3 && /go/bin/hello && echo GOREAL_OK"], "expect": "GOREAL_OK"}
+        {"name": "row", "command": ["sh", "-c", "cd /tmp && GOFLAGS=-mod=mod GOCACHE=/tmp/gc go install golang.org/x/example/hello@v0.0.0-20250915201037-7f05d217867b && /go/bin/hello && echo GOREAL_OK"], "expect": "GOREAL_OK"}
       ]
     },
     {
