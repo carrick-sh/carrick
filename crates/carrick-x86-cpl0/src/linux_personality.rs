@@ -787,7 +787,6 @@ fn park_owner_waiting_user_fault(
     match anonymous::park_owner_fault_wait(prep.task, prep.slot, wait, &saved) {
         anonymous::ContendedFault::Parked => {
             drop(saved);
-            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
             native_execution::schedule(prep.slot)
         }
         anonymous::ContendedFault::Rerun => 0,
@@ -838,7 +837,6 @@ fn park_contended_user_fault(
     match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
         anonymous::ContendedFault::Parked => {
             drop(saved);
-            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
             native_execution::schedule(prep.slot)
         }
         anonymous::ContendedFault::Rerun => 0,

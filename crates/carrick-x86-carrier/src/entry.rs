@@ -313,8 +313,9 @@ pub fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
 }
 
 /// End this CPU's user #PF custody when the fault leaves for the scheduler.
-/// Its complete context is already owned by the parked scheduler record and
-/// resumes there, never through this entry frame.
+/// A parked fault's context is owned by its scheduler record and resumes
+/// there; a fault ended by a fatal signal resumes nowhere. Neither returns
+/// through this entry frame, so the scheduler entry is the one caller.
 pub fn leave_user_page_fault(binding: &CpuBinding) {
     binding.fault_active.store(0, Ordering::Release);
 }
