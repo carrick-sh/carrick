@@ -6175,6 +6175,44 @@ fn production_sched_yield_hands_the_cpu_to_a_queued_sibling() {
     );
 }
 
+/// #2749 fatal 3 on x86: five threads of the root share two guest CPUs. The
+/// root and three workers make no call but `sched_yield`, while one worker
+/// is parked on a futex the yielders wake. Every yield returns 0, the park
+/// ends, and the workers' raw
+/// exits and the root's `exit_group` (with `LIVE_YIELDER`, beside a worker
+/// still yielding) end the run. The ARM scheduler's version of this yield
+/// reported a switch it had not made and killed the carrier.
+#[test]
+fn production_sched_yield_spinners_let_parked_root_siblings_finish() {
+    let bound = format!("-DBOUND_TICKS={}", 5 * tsc_ticks_per_second());
+    for flags in [vec![bound.as_str()], vec![bound.as_str(), "-DLIVE_YIELDER"]] {
+        let elf = native_exit_fixture_with_flags("native_yield_spin_parked_siblings.S", &flags);
+        let dir = tempfile::tempdir().expect("oracle directory");
+        let oracle = dir.path().join("oracle");
+        carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+        let native = std::process::Command::new("timeout")
+            .args(["20", "taskset", "-c", "0"])
+            .arg(&oracle)
+            .output()
+            .expect("Linux oracle");
+        assert_eq!(
+            native.status.code(),
+            Some(0),
+            "native Linux oracle {flags:?}"
+        );
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, 1 << 16, ROOT_AFFINITY_LOADED)
+            .unwrap_or_else(|error| panic!("yield spinners {flags:?}: {error:?}"));
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.terminating_signal),
+            (0, None),
+            "91: the parks did not end within 5 s; 93: a worker's exit was not observed; \
+             94: a yield returned nonzero; 95 or 96: a park failed \
+             (see native_yield_spin_parked_siblings.S) {flags:?}: {:?}",
+            outcome.run
+        );
+    }
+}
+
 /// A full journal held by exited children must reclaim their fork quarantine
 /// without depending on another fork to drive the existing reclaim path.
 #[test]

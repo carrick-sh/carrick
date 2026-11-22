@@ -590,6 +590,135 @@ fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
 
+/// A thread the host made runnable (a completed host wait): host-owned with
+/// `Handback::Service`, queued on `SLOT` by host placement. EL1 never runs
+/// it at EL0; only the slot's executor can take it.
+fn queue_host_service_thread(w: &World, tid: u64) -> carrick_el1_abi::RecordId {
+    struct HostWait;
+    impl carrick_sched_core::LockWait<Aarch64ParkedContext> for HostWait {
+        fn wait(&self, _attempt: u32) -> bool {
+            core::hint::spin_loop();
+            true
+        }
+    }
+    let zone = &*w.zone;
+    zone.enter_guest(SLOT);
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid,
+            serial: tid + 1000,
+            mm: MM,
+            file_table: 5,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let seq = zone.next_seq(record);
+    zone.publish_park(record, seq);
+    assert_eq!(
+        zone.claim_for_host(
+            zone.record_ref(record),
+            None,
+            carrick_sched_core::Handback::Service,
+            &HostWait,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        ),
+        carrick_el1_abi::HostClaim::Claimed
+    );
+    assert_eq!(zone.place_from_host(record).map(|p| p.slot), Some(SLOT));
+    assert!(zone.head_needs_host(SLOT));
+    record
+}
+
+/// #2749 fatal 3: a host-loaded root thread calls `sched_yield` while the
+/// head of its run queue waits for its executor (`Handback::Service`). EL1
+/// may not run that head, so the yield is a real handoff to the executor:
+/// the caller goes to the tail with its completed call and its receipt, and
+/// the vCPU leaves for the host. Before the fix the scheduler discarded the
+/// caller's fresh record and still reported a switch, with no receipt: the
+/// production dispatcher answered `InvalidCompletion` (the carrier's
+/// `EntryBinding at=dispatch.rs:610` fatal).
+#[test]
+fn sched_yield_behind_a_host_service_head_hands_the_caller_to_the_run_queue() {
+    const SYS_SCHED_YIELD: usize = 124;
+    let mut w = World::new(LifecycleHatches::ON);
+    let service = queue_host_service_thread(&w, 303);
+    let mut frame = TrapFrame {
+        elr: CLONE_PC,
+        ..TrapFrame::default()
+    };
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Idle,
+        "the vCPU leaves for the head's executor"
+    );
+    assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+    assert_eq!(w.zone.slot(SLOT).current(), None, "EL1 ran nothing");
+    assert_eq!(w.zone.runnable_head(SLOT), Some(service));
+    let caller = w
+        .zone
+        .slot(SLOT)
+        .host_record()
+        .expect("the caller's record is retained, never discarded");
+    assert!(
+        matches!(
+            w.zone.record(caller).claim(),
+            carrick_sched_core::Claim::Queued { slot, .. } if slot == SLOT
+        ),
+        "the caller waits behind the service thread: {:?}",
+        w.zone.record(caller).claim()
+    );
+    assert_eq!(w.zone.record(caller).identity().tid, PARENT_TID);
+    assert_eq!(w.zone.slot(SLOT).queued(), 2);
+    assert_eq!(w.zone.counters.el1_service_exits.load(Ordering::Relaxed), 1);
+}
+
+/// #2749 fatal 3, two live threads: the root and a raw-clone sibling both
+/// spin on `sched_yield` while a third thread waits for its executor behind
+/// them. The first yield runs the sibling; the sibling's yield then finds
+/// the service thread at the head, and must give up the CPU to its executor
+/// instead of spinning in the ring until the slice tick.
+#[test]
+fn yield_spinning_threads_hand_a_host_service_head_to_its_executor() {
+    const RAW_THREAD_FLAGS: u64 = 0x0005_0f00;
+    const SYS_SCHED_YIELD: usize = 124;
+    let mut w = World::new(LifecycleHatches::ON);
+    w.venue.stock(2, CHILD_TID, CHILD_VISIBLE);
+    let (action, mut frame) = w.syscall(SYS_CLONE, &clone_args(RAW_THREAD_FLAGS, 0, 0));
+    assert_eq!(action, Action::Served);
+    let service = queue_host_service_thread(&w, 303);
+    assert_eq!(w.zone.slot(SLOT).queued(), 2);
+
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Served,
+        "the runnable sibling is the head: it runs"
+    );
+    assert_eq!(
+        w.task().execution.task.load(Ordering::Acquire),
+        u64::from(CHILD_TID)
+    );
+    let sibling = w.zone.slot(SLOT).current().expect("the sibling runs");
+    assert_eq!(w.zone.runnable_head(SLOT), Some(service));
+
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Idle,
+        "the sibling's yield leaves for the service thread's executor"
+    );
+    assert_eq!(w.zone.slot(SLOT).current(), None);
+    assert_eq!(w.zone.runnable_head(SLOT), Some(service));
+    assert!(matches!(
+        w.zone.record(sibling).claim(),
+        carrick_sched_core::Claim::Queued { slot, .. } if slot == SLOT
+    ));
+    assert_eq!(w.zone.slot(SLOT).queued(), 3, "service, root, sibling");
+    assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+}
+
 #[test]
 fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
     for flags in [GLIBC_FLAGS, MUSL_FLAGS, GO_FLAGS] {
