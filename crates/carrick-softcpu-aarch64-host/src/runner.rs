@@ -14,41 +14,49 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use carrick_aarch64::{Aarch64Vcpu as _, Aarch64Vmm as _};
 use carrick_abi::syscall::nr;
 use carrick_abi::{CanonicalNr, SigBlockMask, SigSet};
 use carrick_el1_abi::{
     Counters, CurrentTask, EL1_COUNTERS_BASE, EL1_CURRENT_TASKS_OFFSET, EL1_MM_PORTAL_OFFSET,
-    El1TaskId, IpcWindow, MmPortalSlots, SnapshotGeneration, clear_current_task_record,
+    El1TaskId, IpcWindow, MmPortalSlots, SlotId, SnapshotGeneration, clear_current_task_record,
     clear_el1_region_host_ptr_if, get_el1_region_host_ptr, ipc_table_map_host,
     record_el1_region_host_ptr, record_ipc_window_host,
 };
 use carrick_guest_arch::ContextGeneration;
 use carrick_guest_mem::GuestMemory;
 use carrick_hal::{
-    GuestTimerBridge, HostSignalBridge, NO_PENDING_SIGNAL, PosixTimerSpec, SyscallTrap,
-    ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError,
+    GuestTimerBridge, HostSignalBridge, InGuestFlag, NO_PENDING_SIGNAL, PosixTimerSpec,
+    SyscallTrap, ThreadedEngine, TimerDelivery, TimerSpecNs, TrapError, VcpuRegistry,
 };
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::carrier_lifecycle::CarrierLifecycleMappings;
 use carrick_kernel::dispatch::carrier_loop::{
-    SingleCarrierHandbackWait, install_host_alias_with_inventory,
-    resolve_host_first_touch_with_owner_wait,
+    SingleCarrierHandbackWait, StoppedSlotBackend, StoppedSlotLoad, StoppedSlotRefusal,
+    ZoneExitSettlement, ZoneSlotDriver, enter_mm_executor_then_register,
+    install_host_alias_with_inventory, publish_leased_first_address_space,
+    publish_stopped_zone_slot, resolve_host_first_touch_with_owner_wait, run_guest,
+    settle_zone_exit,
 };
 use carrick_kernel::dispatch::{
-    CarrierBridges, DispatchOutcome, SyscallDispatcher, SyscallRequest, boot_private_file_backings,
+    CarrierBridges, DispatchOutcome, MmExecutorParticipation, SyscallDispatcher, SyscallRequest,
+    boot_private_file_backings,
 };
 use carrick_kernel::el1_delegation::{
     get_orig_arg0, publish_current_task, recall_all_delegated, revalidate_current_task,
-    settle_el1_boundary_for,
+    settle_el1_boundary_for, settle_pending_host_work_for,
 };
-use carrick_kernel::el1_zone::register_handback_publisher;
+use carrick_kernel::el1_zone::{
+    GuestSchedulerScope, SlotKickerRegistration, register_handback_publisher, register_slot_kicker,
+};
 use carrick_kernel::kernel::continuation::ipc::{host_window_backing, publish_file_table};
 use carrick_kernel::kernel::exec_transaction::{
     core_file_mappings_from_address_space, proc_maps_from_address_space,
 };
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
 use carrick_kernel::kernel::{
-    FrameInventorySnapshot, Kernel, VmaSummary, is_default_ignore_signal, is_default_stop_signal,
+    FrameInventorySnapshot, Kernel, VmaSummary, execution_slot_for_current_thread,
+    is_default_ignore_signal, is_default_stop_signal, publish_idle_root,
 };
 use carrick_mem::linux_abi::{
     LINUX_AT_HWCAP2, LINUX_AT_NULL, LinuxAarch64Hwcap, syscall::lookup_aarch64,
@@ -416,11 +424,15 @@ struct El1ApertureScope {
     /// The root's retained lifecycle mappings. They retire after slot 0's
     /// publication clears and before the aperture is unpublished.
     lifecycle: Option<CarrierLifecycleMappings<SoftRetainedMetadata>>,
+    /// The carrier's in-guest zone. It closes first: the root's address
+    /// space and slot leave the zone while the aperture is still published.
+    zone: Option<SoftZone>,
     _lease: SoftCarrierLease,
 }
 
 impl Drop for El1ApertureScope {
     fn drop(&mut self) {
+        drop(self.zone.take());
         if self.el1_host_ptr != 0 {
             if get_el1_region_host_ptr() == self.el1_host_ptr {
                 recall_all_delegated();
@@ -430,6 +442,254 @@ impl Drop for El1ApertureScope {
             drop(self.lifecycle.take());
             let _ = clear_el1_region_host_ptr_if(self.el1_host_ptr);
         }
+    }
+}
+
+/// The soft carrier's one execution slot: mailbox slot 0, its single vCPU.
+const SOFT_ZONE_SLOT: SlotId = SlotId::new(0);
+/// The zone driver identity of the soft carrier's only executor.
+const SOFT_ZONE_DRIVER: ZoneSlotDriver = ZoneSlotDriver::new(NonZeroU64::MIN);
+/// The root's process ASID (ASID 0 is the carrier maintenance root's).
+const SOFT_ROOT_ASID: u16 = 1;
+
+/// The soft carrier's in-guest zone for one run, set up the way an HVF
+/// executor sets up its first load: the guest scheduler on, the slot kicker
+/// registered, the root executor admitted and registered, its vCPU slot
+/// occupied and published, and the root's address space BOUND for EL1 to
+/// install itself. Everything is carrier-scoped and leaves with this value.
+struct SoftZone {
+    /// The root's address space, open for EL1. Dropped first: it waits for
+    /// no vCPU to have the space installed, then retires its entry.
+    publication: Option<carrick_kernel::kernel::AddressSpacePublication>,
+    participation: Option<MmExecutorParticipation>,
+    registry: Arc<dyn VcpuRegistry>,
+    tid: carrick_hal::ThreadId,
+    mm: carrick_kernel::kernel::MmId,
+    in_guest: InGuestFlag,
+    /// The zone was closed: its slot left, its space retired.
+    closed: bool,
+    _kicker: SlotKickerRegistration,
+    _scheduler: GuestSchedulerScope,
+}
+
+/// Whose exit a settled soft vCPU exit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoftZoneExit {
+    /// The root's own: a syscall, fault or kick of its thread.
+    Root,
+    /// EL1's idle exit, with the root parked in the zone.
+    IdleWithRootParked,
+}
+
+/// The soft mechanics of the stopped-slot publication: its vCPU's own SGI
+/// target (affinity 0) and the one executor's driver role.
+struct SoftStoppedSlot;
+
+impl StoppedSlotBackend for SoftStoppedSlot {
+    type Error = String;
+
+    fn reschedule_target(&mut self) -> Result<u64, String> {
+        Ok(carrick_guest_arch::sgi_target_of(0))
+    }
+
+    /// The soft carrier's one executor drives only slot 0: there is no
+    /// slot it drove before to leave.
+    fn prepare_driver(&mut self, _slot: SlotId, _driver: ZoneSlotDriver) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl SoftZone {
+    fn start<X>(
+        engine: &mut SoftAarch64Engine<X>,
+        dispatcher: &SyscallDispatcher,
+        root: &carrick_kernel::kernel::KernelContext,
+    ) -> Result<Self, String>
+    where
+        X: ExecuteBlock + Send + 'static,
+        X::Error: core::fmt::Debug,
+    {
+        // The root runs under its own ASID, so EL1 can switch this vCPU
+        // between the root's space and the maintenance root.
+        engine
+            .configure_process_asid(SOFT_ROOT_ASID)
+            .map_err(|e| format!("configure the soft root's ASID: {e}"))?;
+        let lease_ttbr0 = engine
+            .vcpu()
+            .get_sys_reg(carrick_hal::SysReg::Ttbr0)
+            .map_err(|e| format!("read the soft root's TTBR0: {e}"))?;
+        // The soft vCPU has a GIC CPU interface and an EL1 virtual timer,
+        // the interrupts the in-guest scheduler needs.
+        let scheduler = GuestSchedulerScope::enable(true);
+        let kick = engine.kick_handle();
+        let kicker = register_slot_kicker(Box::new(move |slot| {
+            if slot == SOFT_ZONE_SLOT {
+                carrick_hal::VcpuKick::kick(&kick);
+            }
+        }));
+        let carrier_root = engine
+            .vm()
+            .carrier_maintenance_root()
+            .map_err(|e| format!("soft carrier maintenance root: {e}"))?;
+        publish_idle_root(carrier_root.raw());
+
+        let registry = engine.vm().fresh_fork_kicker();
+        let tid = root.thread().registry_id();
+        let in_guest = InGuestFlag::for_guest_thread();
+        let slot = execution_slot_for_current_thread(Some(SOFT_ZONE_SLOT.index()))
+            .map_err(|e| format!("soft root execution slot: {e}"))?;
+        let (mut participation, enrollment) = enter_mm_executor_then_register(
+            dispatcher,
+            Some(Arc::clone(root.thread())),
+            Arc::clone(&registry),
+            tid,
+            slot,
+            || {
+                registry.subscribe_register(
+                    tid,
+                    Box::new(engine.kick_handle()),
+                    &in_guest,
+                    Arc::new(|| {}),
+                )
+            },
+        )
+        .map_err(|e| format!("admit the soft root executor: {e}"))?;
+        let mm = root.shared().mm().id();
+        let mut zone = Self {
+            publication: None,
+            participation: None,
+            registry,
+            tid,
+            mm,
+            in_guest,
+            closed: false,
+            _kicker: kicker,
+            _scheduler: scheduler,
+        };
+        // The soft carrier runs one thread: nothing can freeze its
+        // registration.
+        if !matches!(
+            enrollment,
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ) {
+            return Err("the soft root's vCPU registration is frozen".to_owned());
+        }
+        participation
+            .occupy_slot(slot)
+            .map_err(|e| format!("occupy the soft root's slot: {e}"))?;
+        publish_stopped_zone_slot(
+            StoppedSlotLoad {
+                slot: SOFT_ZONE_SLOT,
+                driver: SOFT_ZONE_DRIVER,
+                mm,
+                serial: root.thread().key().serial,
+                bound_cpu: None,
+                affinity: root.thread().control_slot().affinity_source(),
+            },
+            &mut SoftStoppedSlot,
+        )
+        .map_err(|refusal| match refusal {
+            StoppedSlotRefusal::Backend(error) => error,
+            StoppedSlotRefusal::Held(held) => {
+                format!("soft zone slot 0 still held threads at the root's load: {held}")
+            }
+        })?;
+        zone.publication =
+            publish_leased_first_address_space(dispatcher, &mut participation, engine, lease_ttbr0)
+                .map_err(|e| format!("BIND the soft root's address space: {e}"))?;
+        zone.participation = Some(participation);
+        if zone.publication.is_none() {
+            return Err("the soft root's address space was not BOUND".to_owned());
+        }
+        Ok(zone)
+    }
+
+    /// Run the root's vCPU in the zone: the slot is in the guest, and the
+    /// root's executor registration reads in-guest, for exactly the run.
+    fn run_guest<R>(&self, thread: &carrick_kernel::kernel::Thread, run: impl FnOnce() -> R) -> R {
+        let zone = carrick_kernel::el1_zone::zone().map(|zone| (zone, SOFT_ZONE_SLOT));
+        self.in_guest.enter_guest();
+        let result = run_guest(Some(thread), zone, run);
+        self.in_guest.leave_guest();
+        result
+    }
+
+    /// Settle slot 0 at a vCPU exit, as an HVF executor does
+    /// ([`settle_zone_exit`]). The exit is the root's to handle when nothing
+    /// of it stays switched in and its own address space is installed. EL1
+    /// may instead have left its idle loop with the root parked in the zone
+    /// (host work arrived while it waited): that exit carries no call of
+    /// the root's, and the slot must have vacated the root's space.
+    fn settle_exit(&self) -> Result<SoftZoneExit, String> {
+        let Some(zone) = carrick_kernel::el1_zone::zone() else {
+            return Err("the soft carrier's zone turned off under its run".to_owned());
+        };
+        let installed = zone.installed_space(SOFT_ZONE_SLOT);
+        let (exit, expected) = match settle_zone_exit(zone, SOFT_ZONE_SLOT) {
+            ZoneExitSettlement::Released
+            | ZoneExitSettlement::Held {
+                current: None,
+                own: None,
+            } => (SoftZoneExit::Root, self.mm.raw()),
+            ZoneExitSettlement::Held {
+                current: None,
+                own: Some(_),
+            } => (SoftZoneExit::IdleWithRootParked, 0),
+            other => {
+                return Err(format!(
+                    "the soft root's slot settled into a state its single executor cannot own: {other:?}"
+                ));
+            }
+        };
+        if installed != expected {
+            return Err(format!(
+                "soft zone slot 0 exited ({exit:?}) with space {installed:#x} installed, not {expected:#x}"
+            ));
+        }
+        Ok(exit)
+    }
+
+    /// Serve an idle exit EL1 took with the root parked in the zone: settle
+    /// the host work it left for, then return the vCPU to the idle entry.
+    /// EL1 keeps the root's wait (and its deadline on this slot's timer) and
+    /// runs the root again when the wait ends; the root's next exit is an
+    /// ordinary one.
+    fn serve_idle_exit<X>(
+        &self,
+        engine: &mut SoftAarch64Engine<X>,
+        dispatcher: &SyscallDispatcher,
+    ) -> Result<(), String>
+    where
+        X: ExecuteBlock + Send + 'static,
+        X::Error: core::fmt::Debug,
+    {
+        settle_pending_host_work_for(SOFT_ZONE_SLOT.index(), dispatcher);
+        let frame = carrick_el1_abi::prepare_idle_frame(SOFT_ZONE_SLOT.index())
+            .ok_or("the soft idle entry has no EL1 region")?;
+        engine
+            .enter_idle_entry(frame)
+            .map_err(|e| format!("return the soft vCPU to the idle entry: {e}"))
+    }
+
+    /// Close the zone in order: the root's address space retires, its
+    /// executor leaves its slot and registry, and slot 0 is left undriven.
+    fn close(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        drop(self.publication.take());
+        drop(self.participation.take());
+        self.registry.unregister(self.tid);
+        carrick_kernel::el1_zone::leave_slot(SOFT_ZONE_SLOT, SOFT_ZONE_DRIVER.raw(), None)
+            .map_err(|refused| format!("soft zone slot 0 refused to leave: {refused}"))
+    }
+}
+
+impl Drop for SoftZone {
+    fn drop(&mut self) {
+        // An unwinding or failed run: the refusal has no one to report to.
+        let _ = self.close();
     }
 }
 
@@ -809,6 +1069,7 @@ where
     let mut aperture_scope = El1ApertureScope {
         el1_host_ptr: 0,
         lifecycle: None,
+        zone: None,
         _lease: carrier_lease,
     };
     if let Some(el1_host_ptr) = carrick_hal::GuestVmBackend::host_ptr(
@@ -881,18 +1142,35 @@ where
         register_handback_publisher(wake_slot.publisher());
         publish_file_table(&root_ctx);
     }
-    drop(root_ctx);
 
+    // The dispatcher (and the kernel graph it holds) leaves before the
+    // aperture: its file table withdraws its IPC binding from the mapped
+    // region, on every path.
     let outcome = {
         let mut dispatcher = dispatcher;
-        setup(&mut engine).and_then(|()| {
+        let zone = if aperture_scope.el1_host_ptr != 0 {
+            SoftZone::start(&mut engine, &dispatcher, &root_ctx)
+                .map(|zone| aperture_scope.zone = Some(zone))
+        } else {
+            Ok(())
+        };
+        drop(root_ctx);
+        let run = zone.and_then(|()| setup(&mut engine)).and_then(|()| {
             drive_single_process_syscalls(
                 &mut engine,
                 &mut dispatcher,
                 &wake_slot,
+                aperture_scope.zone.as_mut(),
                 config.max_syscalls,
             )
-        })
+        });
+        // The root's executor leaves its slot, and its space retires, before
+        // the kernel graph does.
+        let closed = aperture_scope
+            .zone
+            .take()
+            .map_or(Ok(()), |mut zone| zone.close());
+        run.and_then(|summary| closed.map(|()| summary))
     };
     drop(aperture_scope);
     let summary = outcome?;
@@ -953,7 +1231,8 @@ where
     if get_el1_region_host_ptr() != 0 {
         register_handback_publisher(wake_slot.publisher());
     }
-    let summary = drive_single_process_syscalls(&mut engine, dispatcher, &wake_slot, max_syscalls)?;
+    let summary =
+        drive_single_process_syscalls(&mut engine, dispatcher, &wake_slot, None, max_syscalls)?;
     Ok(SoftProcessRun {
         exit_code: summary.exit_code,
         stdout: summary.stdout,
@@ -984,6 +1263,7 @@ fn drive_single_process_syscalls<X>(
     engine: &mut SoftAarch64Engine<X>,
     dispatcher: &mut SyscallDispatcher,
     wake_slot: &SingleCarrierHandbackWait,
+    mut zone: Option<&mut SoftZone>,
     max_syscalls: usize,
 ) -> Result<SingleProcessSummary, String>
 where
@@ -1029,7 +1309,24 @@ where
             pre_ctx.resources().files().id().raw(),
         );
 
-        let mut raw = match engine.next_syscall() {
+        let next = match zone.as_deref() {
+            Some(zone) => {
+                let next = zone.run_guest(pre_ctx.thread(), || engine.next_syscall());
+                if zone.settle_exit()? == SoftZoneExit::IdleWithRootParked {
+                    if !matches!(next, Ok(None)) {
+                        return Err(format!(
+                            "EL1's idle exit with the root parked surfaced as {next:?}"
+                        ));
+                    }
+                    syscall_turns += 1;
+                    zone.serve_idle_exit(engine, dispatcher)?;
+                    continue;
+                }
+                next
+            }
+            None => engine.next_syscall(),
+        };
+        let mut raw = match next {
             Ok(Some(raw)) => {
                 syscall_turns += 1;
                 raw
@@ -1046,7 +1343,15 @@ where
                 let access = carrick_aarch64::esr::el0_fault_access(syndrome);
                 let fault_kind = carrick_aarch64::esr::el0_fault_kind(syndrome);
                 let (resolved, _owner_waits) = resolve_host_first_touch_with_owner_wait(
-                    engine, dispatcher, &pre_ctx, wake_slot, far, access, fault_kind,
+                    engine,
+                    dispatcher,
+                    zone.as_deref_mut()
+                        .and_then(|zone| zone.participation.as_mut()),
+                    &pre_ctx,
+                    wake_slot,
+                    far,
+                    access,
+                    fault_kind,
                 )?;
                 if resolved {
                     continue;
@@ -1115,9 +1420,21 @@ where
         let request = SyscallRequest::from_raw(raw);
         syscalls_dispatched += 1;
 
-        let outcome = dispatcher
-            .dispatch(&kernel_context, request, &mut *engine, &reporter)
-            .map_err(|e| format!("dispatch syscall {nr} failed: {e}"))?;
+        // The root's executor dispatches under its own participation.
+        let outcome = match zone
+            .as_deref_mut()
+            .and_then(|zone| zone.participation.as_mut())
+        {
+            Some(executor) => dispatcher.dispatch_with_mm_executor(
+                executor,
+                &kernel_context,
+                request,
+                &mut *engine,
+                &reporter,
+            ),
+            None => dispatcher.dispatch(&kernel_context, request, &mut *engine, &reporter),
+        }
+        .map_err(|e| format!("dispatch syscall {nr} failed: {e}"))?;
 
         match outcome {
             DispatchOutcome::Returned { value } => {
@@ -1161,6 +1478,8 @@ where
                 let alias_result = install_host_alias_with_inventory(
                     engine,
                     dispatcher,
+                    zone.as_deref_mut()
+                        .and_then(|zone| zone.participation.as_mut()),
                     &kernel_context,
                     transaction,
                     va,

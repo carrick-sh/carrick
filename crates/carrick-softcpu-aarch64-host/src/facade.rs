@@ -1258,6 +1258,9 @@ pub struct SoftAarch64Vcpu<X: ExecuteBlock> {
     max_quanta_per_exit: u64,
     work: RunWork,
     idle_parks: u64,
+    /// The vCPU has run guest code. Until its first run it caches no
+    /// translation: its stage-1 TLB model and block cache start empty.
+    ran: bool,
 }
 
 impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
@@ -1336,6 +1339,25 @@ where
 {
     fn mailbox_slot(&self) -> Option<usize> {
         self.mailbox.as_ref().map(|_| 0)
+    }
+
+    /// Stage-1 maintenance owed before this vCPU's first run has nothing to
+    /// invalidate (it has cached no translation), so it is discharged here
+    /// without running the maintenance trampoline.
+    fn defer_stage1_maintenance(
+        &mut self,
+        _maintenance: carrick_aarch64::vmm::Stage1Maintenance,
+    ) -> bool {
+        !self.ran
+    }
+
+    /// The loaded task's roots when EL1 may install them itself: one root
+    /// for both halves, under a process ASID (ASID 0 is the carrier
+    /// maintenance root's). The soft CPU has no per-task memory model, so
+    /// nothing else of the task's translation state stays behind a switch.
+    fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
+        let (ttbr0, ttbr1) = (self.cpu.named.ttbr0.0, self.cpu.named.ttbr1.0);
+        (ttbr0 >> 48 != 0 && ttbr1 == ttbr0).then_some((ttbr0, ttbr1))
     }
 
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
@@ -1600,6 +1622,7 @@ where
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
+        self.ran = true;
         self.sync_shared_overrides();
         let stage2_owner = Arc::clone(&self.stage2);
         let mut stage2 = stage2_owner.try_borrow()?;
@@ -1878,6 +1901,7 @@ where
             max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
             work: RunWork::default(),
             idle_parks: 0,
+            ran: false,
         };
         vcpu.restore(&staged.snapshot())?;
         if vcpu.mailbox.is_some() {
