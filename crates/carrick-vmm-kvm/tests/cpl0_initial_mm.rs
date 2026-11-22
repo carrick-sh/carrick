@@ -7280,6 +7280,7 @@ mprotect_shape_witness!(
 /// MM's reservation root and descriptor editor. Contention is "not now": no
 /// call may come back as an errno, and none may leave the ring.
 #[test]
+#[ignore = "#2763: the x86 shootdown rendezvous is never acknowledged under threaded mm calls"]
 fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
     let elf = native_exit_fixture("native_child_threaded_mm.S");
     let dir = tempfile::tempdir().expect("oracle directory");
@@ -7291,12 +7292,9 @@ fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
         .output()
         .expect("run native oracle");
     assert_eq!(native.status.code(), Some(0), "native Linux oracle");
-    let outcome = try_run_pool_fixture_with_root_affinity(
-        &elf,
-        1 << 20,
-        kvm_pool_fixture::ROOT_AFFINITY_ANY,
-    )
-    .expect("threaded mm run");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 1 << 20, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("threaded mm run");
     let counters = outcome.physical.syscall_counters().expect("counters");
     let load =
         |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);

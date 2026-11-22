@@ -4147,6 +4147,8 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
         SpaceWaitCause::Reservations,
         SpaceWaitCause::Editor,
         SpaceWaitCause::PreparedOverlap,
+        // A host pause of the MM (#2749): its raised gate is contention too.
+        SpaceWaitCause::Gate,
     ] {
         let region = Region::new();
         let zone = region.zone();
@@ -4249,6 +4251,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 )
                 .unwrap()
         });
+        let held_gate = (cause == SpaceWaitCause::Gate).then(|| {
+            access
+                .try_exclude_editor(zone.spaces.find(mm.raw()).unwrap(), mm.raw())
+                .unwrap()
+        });
         assert_eq!(
             serve_delegated_anonymous(
                 &mut frame,
@@ -4260,6 +4267,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 None
             ),
             DelegatedAnonymous::Contended(cause),
+            "leaves={:?}",
+            counters
+                .anonymous_leaves
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
         );
         let mut cpu = FakeCpu::default();
         let mut sched = Sched {
@@ -4291,6 +4303,7 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
         assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
         drop(held_root);
         drop(held_editor);
+        drop(held_gate);
         if let Some((permit, request)) = prepared {
             portal.cancel_prepared(permit, request, 0).unwrap();
         }
@@ -4317,7 +4330,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 .each_ref()
                 .map(|counter| counter.load(Ordering::Relaxed)),
         );
-        for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
+        for leave in [
+            AnonymousLeave::RootBusy,
+            AnonymousLeave::EditorBusy,
+            AnonymousLeave::NoGrant,
+        ] {
             assert_eq!(
                 counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
                 0
