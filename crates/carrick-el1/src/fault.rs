@@ -2448,6 +2448,85 @@ mod tests {
         }
     }
 
+    /// Commits the leaf, as the sibling's retirement of another page of the
+    /// same bulk grant lands: the row is re-identified under the fault's
+    /// residency token.
+    struct SiblingRetiresResolver<'a> {
+        table: &'a carrick_el1_abi::FrameGrantResidencyTable,
+        mm: u64,
+        sibling_page: u64,
+    }
+
+    impl PreparedPageResolver for SiblingRetiresResolver<'_> {
+        fn commit_prepared(
+            &mut self,
+            _ttbr0: u64,
+            _va: u64,
+            _expected_ipa: u64,
+            _access: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            assert!(
+                self.table
+                    .retire_overlapping(self.mm, self.sibling_page, 4096)
+            );
+            Ok(GuestPreparedCommit::Committed)
+        }
+    }
+
+    /// #2766: a fault looks its prepared page up before it holds the MM
+    /// editor. A sibling thread's munmap or mprotect of another page of the
+    /// same bulk grant re-identifies the residency row in between, so the
+    /// token is stale when the leaf commits. The commit is still this leaf's:
+    /// it is recorded under the row's live identity, never a kernel panic.
+    #[test]
+    fn prepared_commit_records_residency_after_a_sibling_retires_part_of_its_grant() {
+        let mm = 77;
+        let base = 0x4000_0000;
+        let va = base + 4096;
+        let table = carrick_el1_abi::FrameGrantResidencyTable::new();
+        table
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: base,
+                physical_ipa: 0x9000_0000,
+                len: 3 * 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut frame = write_translation_fault(0, va);
+        let mut prepared = SiblingRetiresResolver {
+            table: &table,
+            mm,
+            sibling_page: base + 2 * 4096,
+        };
+        assert_eq!(
+            dispatch_fault_with_prepared(
+                &mut frame,
+                &Counters::default(),
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &table,
+                    resolver: &mut prepared,
+                    roots: None,
+                    file_slots: None,
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert!(table.is_guest_committed(mm, va));
+    }
+
     struct RetiredResidencyResolver {
         descriptor: u64,
         selections: usize,
