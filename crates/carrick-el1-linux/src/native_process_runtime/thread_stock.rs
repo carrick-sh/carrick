@@ -13,7 +13,7 @@ const SEGMENT_GRANT_ROUNDS: u8 = 4;
 
 /// Every pool entry's thread control: the loaned slab for the lifecycle
 /// page's own entries, the segment's own controls past them.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(super) struct PoolSlots<'a> {
     page: &'a ThreadLifecyclePage,
     head: &'a [ThreadControlSlot],
@@ -347,7 +347,7 @@ pub(super) fn at_limit<M: Clone, C: ProcessContext>(
 /// Whether a refill may link a new segment. Only a clone that found the pool
 /// with nothing standing and nothing on its way back grows it; the refills
 /// after a birth or a retirement work within the entries the pool has.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(super) enum StockGrowth {
     Within,
     ForClone,
