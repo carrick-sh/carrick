@@ -17,6 +17,9 @@
           ],
           "expect": "KA_OK",
           "known_answer": {
+            "arm64": [
+              "refused rseq(nr=293) caller=root venue=ring"
+            ],
             "x86_64": [
               "refused rseq(nr=334) caller=root venue=ring"
             ]

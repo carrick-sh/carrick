@@ -1161,8 +1161,16 @@ pub(crate) enum DebugCommand {
         /// Rows to print in the table.
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Time every selected stage on the native Docker oracle with this
+        /// docker CLI first, in a Docker-only phase that ends before the
+        /// first carrick run (`<out>/oracle.jsonl`), and rank each stage
+        /// that passes at 5x the oracle's median time or more as
+        /// `pathological_time`. Without it, an `oracle.jsonl` already in
+        /// `--out` is used. Never run carrick elsewhere on the host meanwhile.
+        #[arg(long, value_name = "DOCKER")]
+        oracle: Option<PathBuf>,
         /// Re-rank a finished `--out` directory without running anything.
-        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap"])]
+        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle"])]
         report: bool,
     },
     /// Rank EL1 census files (written by runs with
