@@ -7856,9 +7856,18 @@ pub fn unexpected_boot_wake(
 pub trait ProductionMemberCpu {
     /// The stopped CPU's current privilege level (CS.DPL).
     fn stopped_cpl(&self) -> Result<u8, TrapError>;
-    /// Stopped at CPL3 with interrupts enabled and no interrupt shadow or
-    /// injected event pending.
+    /// Stopped at CPL3 with interrupts enabled and no interrupt shadow, so
+    /// a KICK queued now is taken before the next user instruction. An
+    /// external interrupt the backend accepted but has not delivered keeps
+    /// that true: it is taken at this same boundary and enters CPL0, where
+    /// the queued KICK follows it before any return to user code. A pending
+    /// software interrupt does not.
     fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError>;
+    /// The stopped CPU's interruptibility as read from the backend, for the
+    /// fatal that refuses a reentry.
+    fn describe_stop(&self) -> String {
+        String::new()
+    }
     /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
     /// reentry that follows.
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError>;
@@ -7899,7 +7908,10 @@ pub fn run_production_member<C: ProductionMemberCpu>(
     });
     if has_debt {
         if cpl == 3 && !cpu.stopped_at_interruptible_user()? {
-            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+            return Err(fail(format!(
+                "shootdown debt requires interruptible CPL3 reentry: slot {slot} {}",
+                cpu.describe_stop()
+            )));
         } else if cpl != 0 && cpl != 3 {
             return Err(fail("shootdown debt on unsupported CPL reentry"));
         }

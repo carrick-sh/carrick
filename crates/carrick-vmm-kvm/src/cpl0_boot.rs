@@ -159,7 +159,10 @@ fn stopped_at_interruptible_user(cpu: &KvmVcpu) -> Result<bool, TrapError> {
         && sregs.cs.selector & 3 == 3
         && regs.rflags & (1 << 9) != 0
         && events.interrupt.shadow == 0
-        && events.interrupt.injected == 0)
+        // An accepted external interrupt is delivered at this boundary on
+        // reentry; only a software interrupt would resume the user's own
+        // instruction stream.
+        && (events.interrupt.injected == 0 || events.interrupt.soft == 0))
 }
 
 /// One KVM vCPU and its VM's MSI route, as the shared production run
@@ -202,6 +205,21 @@ impl ProductionMemberCpu for KvmMember<'_> {
             return Err(fail("reentry shootdown MSI was blocked"));
         }
         Ok(())
+    }
+    fn describe_stop(&self) -> String {
+        let (Ok(regs), Ok(events)) = (self.cpu.fd().get_regs(), self.cpu.fd().get_vcpu_events())
+        else {
+            return String::from("(vCPU state unreadable)");
+        };
+        format!(
+            "rip={:#x} rflags={:#x} interrupt injected={} nr={:#x} soft={} shadow={}",
+            regs.rip,
+            regs.rflags,
+            events.interrupt.injected,
+            events.interrupt.nr,
+            events.interrupt.soft,
+            events.interrupt.shadow
+        )
     }
     fn run_guest(&mut self) -> Result<VcpuExit, TrapError> {
         Ok(HvVcpu::run(self.cpu)?)
