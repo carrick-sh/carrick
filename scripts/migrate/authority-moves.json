@@ -242,6 +242,10 @@
       "issue": 2501
     },
     {
+      "owner": "carrick_cli::debug_venue_gaps::run_venue_gaps",
+      "issue": 1906
+    },
+    {
       "owner": "carrick_cli::debug_zonedump::read_input",
       "issue": 2646
     }
