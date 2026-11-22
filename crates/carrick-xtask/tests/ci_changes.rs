@@ -1599,10 +1599,15 @@ fn only_a_ready_upper_layer_makes_its_base_a_lower_layer() {
 /// The Linux unit lane (`linux-unit-arm`, `linux-unit-x86`: `just test`'s
 /// shards on hosted arm64 and x86_64 runners) is the only lane that runs the
 /// host unit set while the macOS jobs are off (owner, 2026-11-22, #231). Both
-/// are hosted Linux jobs, so they run on drafts, and `ci-results` requires
-/// them wherever they run.
+/// are hosted Linux jobs, so they run on drafts.
+///
+/// `ci-results` judges only the jobs `ci-ok` lists in `needs`. The lane is
+/// advisory until `ci-ok` lists it (#2809), so this drives `ci-results` with
+/// needs that already carry the two jobs: it must then reject a lane job that
+/// is not green on every event where the heavy Linux jobs run, drafts
+/// included, and accept the lane skipped where they are skipped.
 #[test]
-fn linux_unit_lane_is_required_wherever_heavy_linux_jobs_run() {
+fn ci_results_rejects_a_needed_linux_unit_lane_job_that_is_not_green() {
     const LANE: [&str; 2] = ["linux-unit-arm", "linux-unit-x86"];
     const NOT_GREEN: [&str; 3] = ["failure", "cancelled", "skipped"];
     // A Linux-only pull request: `changes.outputs.macos` is false, every
