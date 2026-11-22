@@ -939,6 +939,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 label,
                 reap,
                 limit,
+                oracle,
                 report,
             } => {
                 if report {
@@ -956,6 +957,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         label: &label,
                         reap: reap.as_deref(),
                         limit,
+                        oracle: oracle.as_deref(),
                     })?;
                 }
             }
