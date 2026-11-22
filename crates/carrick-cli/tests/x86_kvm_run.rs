@@ -804,6 +804,44 @@ fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {
     );
 }
 
+/// #2792: a user page fault that ends in a fatal signal leaves its entry
+/// frame for the scheduler. Its CPU must stop holding that fault: the next
+/// task there takes its own page faults. Sixteen fork children die of
+/// SIGSEGV beside three siblings that fault in fresh pages; the carrier
+/// died on a CPL0 `ud2` (kernel fault vector 6) at the next sibling fault.
+#[test]
+fn mounted_static_x86_fault_death_leaves_the_cpu_to_faulting_siblings() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fault-death");
+    compile_assembly_with_flags(
+        "x86_fault_death_beside_faulting_siblings.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native fault-death oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"segv=16 clean=3\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "fault-death-beside-siblings", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
