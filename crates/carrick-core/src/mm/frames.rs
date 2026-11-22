@@ -122,6 +122,24 @@ pub enum PublicationNextAction {
     TerminalRefusal(PublicationTerminal),
 }
 
+/// Whether an in-guest owner serve's refusal means only that its selection
+/// went stale: the reservation root no longer authenticates the window
+/// (`StaleRoot`: a sibling thread unmapped or re-protected part of it, or a
+/// pending operation overlaps it), or the fault page already holds an output
+/// (`Occupied`). Nothing was published and the MM is intact, so the faulting
+/// access reruns and its reselection reads the live mapping. Every other
+/// refusal keeps its own policy.
+#[must_use]
+pub const fn refusal_is_stale_selection(
+    reason: carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+) -> bool {
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    matches!(
+        reason,
+        DescriptorRefusal::Occupied | DescriptorRefusal::StaleRoot
+    )
+}
+
 /// Decide a refused publication without performing carrier work.
 ///
 /// Capacity gets at most one strictly smaller attempt because a one-page plan

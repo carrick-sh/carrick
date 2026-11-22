@@ -1750,7 +1750,21 @@ fn dispatch_classified_fault<
             prepared_access,
         ) {
             Ok(GuestPreparedCommit::Committed) => {
-                assert!(path.residency.record_commit(page));
+                // `page` was looked up before this editor was held. A sibling
+                // thread's retirement of another page of the same bulk grant
+                // re-identifies the row in between, and the token goes stale
+                // while this leaf stays Prepared at the same output. Under
+                // the editor the row is stable: record under its live
+                // identity. A committed leaf no live row covers at this
+                // output is a broken invariant.
+                assert!(
+                    path.residency.record_commit(page)
+                        || path
+                            .residency
+                            .lookup(mm_key, far)
+                            .is_some_and(|live| live.expected_ipa == page.expected_ipa
+                                && path.residency.record_commit(live))
+                );
                 if let FaultSupply::Mailbox { mailboxes, .. } = supply {
                     consume_served_refusals(mailboxes, mm_key, far, access);
                 }

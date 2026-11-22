@@ -1285,6 +1285,17 @@ fn serve_selected_window(
         let reason = match outcome {
             Ok(GrantServeOutcome::Completed(receipt)) => match receipt.outcome {
                 DescriptorOutcome::Applied(_) => return UserFaultSupply::Served,
+                // The root no longer authenticates the window this serve was
+                // selected for: a sibling thread unmapped or re-protected
+                // part of it, or filled the fault page. Nothing was
+                // published, so rerun the access; its reselection reads the
+                // live mapping, and a mapping that is gone answers SIGSEGV
+                // there (#2766).
+                DescriptorOutcome::Refused(reason)
+                    if carrick_core::mm::frames::refusal_is_stale_selection(reason) =>
+                {
+                    return UserFaultSupply::Served;
+                }
                 DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => {
                     reason
                 }
