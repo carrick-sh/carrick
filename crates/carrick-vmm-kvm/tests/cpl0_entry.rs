@@ -3034,9 +3034,11 @@ fn production_selected_grant_terminal_decline_is_not_rerun() {
         Err(error) => {
             let error = error.to_string();
             assert!(
-                error.contains("kernel fault policy refused: reason 9")
-                    && error.contains("vector: 14")
-                    && error.contains("error_code: 6"),
+                // The carrier prints the reason and the record in hex: the
+                // reason's upper bytes carry the deciding branch (#2668).
+                error.contains("kernel fault policy refused: reason 0x9,")
+                    && error.contains("vector: e,")
+                    && error.contains("error_code: 6,"),
                 "a terminal decline must surface as the unresolved write fault: {error}"
             );
         }
