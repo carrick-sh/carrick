@@ -75,7 +75,19 @@ const MAP_ANONYMOUS: u64 = 0x20;
 const CLOCK_MONOTONIC: u64 = 1;
 
 fn build_witness_elf(code_words: &[u32], data_init: &[(usize, &[u8])]) -> Vec<u8> {
-    let mut elf = vec![0u8; 0x3000];
+    build_text_elf(code_words, 0x1000, DATA_VA, data_init)
+}
+
+/// `text_bytes` of code at `CODE_VA` (NOP-padded), then one data page at
+/// `data_va`.
+fn build_text_elf(
+    code_words: &[u32],
+    text_bytes: usize,
+    data_va: u64,
+    data_init: &[(usize, &[u8])],
+) -> Vec<u8> {
+    let data_offset = 0x1000 + text_bytes;
+    let mut elf = vec![0u8; data_offset + 0x1000];
     // Elf64_Ehdr
     elf[0..4].copy_from_slice(b"\x7fELF");
     elf[4] = 2; // ELFCLASS64
@@ -90,26 +102,28 @@ fn build_witness_elf(code_words: &[u32], data_init: &[(usize, &[u8])]) -> Vec<u8
     elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
     elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
 
-    let write_phdr = |buf: &mut [u8], base: usize, flags: u32, offset: u64, vaddr: u64| {
-        buf[base..base + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        buf[base + 4..base + 8].copy_from_slice(&flags.to_le_bytes());
-        buf[base + 8..base + 16].copy_from_slice(&offset.to_le_bytes());
-        buf[base + 16..base + 24].copy_from_slice(&vaddr.to_le_bytes());
-        buf[base + 24..base + 32].copy_from_slice(&vaddr.to_le_bytes());
-        buf[base + 32..base + 40].copy_from_slice(&0x1000u64.to_le_bytes());
-        buf[base + 40..base + 48].copy_from_slice(&0x1000u64.to_le_bytes());
-        buf[base + 48..base + 56].copy_from_slice(&0x1000u64.to_le_bytes());
-    };
-    write_phdr(&mut elf, 64, 5, 0x1000, CODE_VA); // PF_R | PF_X
-    write_phdr(&mut elf, 120, 6, 0x2000, DATA_VA); // PF_R | PF_W
+    let write_phdr =
+        |buf: &mut [u8], base: usize, flags: u32, offset: u64, vaddr: u64, bytes: u64| {
+            buf[base..base + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            buf[base + 4..base + 8].copy_from_slice(&flags.to_le_bytes());
+            buf[base + 8..base + 16].copy_from_slice(&offset.to_le_bytes());
+            buf[base + 16..base + 24].copy_from_slice(&vaddr.to_le_bytes());
+            buf[base + 24..base + 32].copy_from_slice(&vaddr.to_le_bytes());
+            buf[base + 32..base + 40].copy_from_slice(&bytes.to_le_bytes());
+            buf[base + 40..base + 48].copy_from_slice(&bytes.to_le_bytes());
+            buf[base + 48..base + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        };
+    let text = text_bytes as u64;
+    write_phdr(&mut elf, 64, 5, 0x1000, CODE_VA, text); // PF_R | PF_X
+    write_phdr(&mut elf, 120, 6, data_offset as u64, data_va, 0x1000); // PF_R | PF_W
 
-    for i in 0..(0x1000 / 4) {
+    for i in 0..(text_bytes / 4) {
         let word = code_words.get(i).copied().unwrap_or(A64_NOP);
         let at = 0x1000 + i * 4;
         elf[at..at + 4].copy_from_slice(&word.to_le_bytes());
     }
     for &(off, bytes) in data_init {
-        let at = 0x2000 + off;
+        let at = data_offset + off;
         elf[at..at + bytes.len()].copy_from_slice(bytes);
     }
     elf
@@ -1915,6 +1929,34 @@ impl ExecuteBlock for ResidencyExecutor {
     }
 }
 
+/// Route the EL0 `svc` vector through `hvc #2; eret` and bind the mailbox
+/// the [`SequenceHvc2Executor`] bridge publishes into.
+fn install_hvc2_bridge<X>(
+    engine: &mut carrick_softcpu_aarch64_host::SoftAarch64Engine<X>,
+    mailbox: &AtomicPtr<Aarch64SyscallMailbox>,
+) -> Result<(), String>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    let mut vec_stub = [0u8; 8];
+    vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+    vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+    engine
+        .backend()
+        .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+        .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+    let ptr = engine
+        .backend()
+        .host_ptr(
+            LINUX_SYSCALL_MAILBOX_BASE,
+            AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+        )
+        .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+    mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+    Ok(())
+}
+
 struct ResidencyRun {
     run: carrick_softcpu_aarch64_host::SoftProcessRun<ResidencyExecutor>,
     prepared: u64,
@@ -1953,23 +1995,8 @@ fn run_residency(
     };
     let mut config = SoftSingleProcessConfig::new(&elf, "/residency");
     config.rootfs_dir = rootfs;
-    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
-        let mut vec_stub = [0u8; 8];
-        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
-        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
-        engine
-            .backend()
-            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
-            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
-        let ptr = engine
-            .backend()
-            .host_ptr(
-                LINUX_SYSCALL_MAILBOX_BASE,
-                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
-            )
-            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
-        mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
-        Ok(())
+    let run = run_single_process_with_executor_and_setup(&config, executor, |engine| {
+        install_hvc2_bridge(engine, &mailbox)
     })?;
     let served = served
         .lock()
@@ -2176,5 +2203,312 @@ fn soft_carrier_publish_retires_a_reused_frames_resident_code() {
         vmm.code_generation(frame).expect("borrow soft stage-2"),
         Some(resident),
         "publish_user_executable kept the resident incarnation of a rewritten frame"
+    );
+}
+
+/// `b .+4`: every word is its own one-instruction block.
+const A64_B_NEXT: u32 = 0x1400_0001;
+/// Data page of the working-set witnesses, above their largest text.
+const WORKING_SET_DATA_VA: u64 = 0x0100_0000;
+
+/// `b` from word `from` to word `to` of the witness text.
+fn a64_b(from: usize, to: usize) -> u32 {
+    let offset = to as i64 - from as i64;
+    0x1400_0000 | (offset as u32 & 0x03ff_ffff)
+}
+
+#[derive(Clone, Copy)]
+enum WorkingSetPlan {
+    /// `svc; b .+4` x `blocks`; `b` back to the `svc`: `passes` handoffs,
+    /// then `exit_group(0)`.
+    Repeat { blocks: usize, passes: u64 },
+    /// `svc`; a hot loop of `HOT_BLOCKS` (`b .+4` x 15, `br x3`); then
+    /// `chunks` cold chunks of `COLD_CHUNK_BLOCKS` (`b .+4` x 63, `br x3`).
+    /// The hot `br` enters the next cold chunk, each cold `br` returns to
+    /// the hot loop, and after the last chunk the hot `br` returns to the
+    /// `svc`, which exits. Every cold block runs once.
+    Scan { chunks: usize },
+}
+
+const HOT_BLOCKS: usize = 16;
+const COLD_CHUNK_BLOCKS: usize = 64;
+
+impl WorkingSetPlan {
+    fn text(self) -> Vec<u32> {
+        let mut words = vec![A64_SVC_0];
+        match self {
+            Self::Repeat { blocks, .. } => {
+                words.extend(std::iter::repeat_n(A64_B_NEXT, blocks));
+                words.push(a64_b(words.len(), 0));
+            }
+            Self::Scan { chunks } => {
+                words.extend(std::iter::repeat_n(A64_B_NEXT, HOT_BLOCKS - 1));
+                words.push(A64_BR_X3);
+                for _ in 0..chunks {
+                    words.extend(std::iter::repeat_n(A64_B_NEXT, COLD_CHUNK_BLOCKS - 1));
+                    words.push(A64_BR_X3);
+                }
+            }
+        }
+        words
+    }
+
+    fn hot_pcs(self) -> std::ops::Range<u64> {
+        CODE_VA + 4..CODE_VA + 4 + 4 * HOT_BLOCKS as u64
+    }
+}
+
+/// Code whose drop is observed: `live` counts every prepared block that is
+/// still owned, by the cache or by a launch in flight.
+struct LiveCode(Arc<LiveCodeCensus>);
+
+#[derive(Default)]
+struct LiveCodeCensus {
+    live: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl Drop for LiveCode {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Drives the production carrier with real decode, dispatch and residency.
+/// `prepare` is one emitted block, recorded per guest PC (EL0 code and the
+/// EL1 vectors do not share addresses).
+struct WorkingSetExecutor {
+    bridge: SequenceHvc2Executor,
+    plan: WorkingSetPlan,
+    svc_visits: u64,
+    chunks_entered: usize,
+    emitted: Arc<Mutex<std::collections::BTreeMap<u64, u64>>>,
+    code: Arc<LiveCodeCensus>,
+}
+
+impl WorkingSetExecutor {
+    fn steer(&mut self, cpu: &mut CpuState) -> Result<(), String> {
+        let pc = cpu.pc.0;
+        if pc == CODE_VA {
+            self.svc_visits += 1;
+            let (nr, args) = match self.plan {
+                WorkingSetPlan::Repeat { passes, .. } if self.svc_visits <= passes => {
+                    (NR_GETPID, [0; 6])
+                }
+                WorkingSetPlan::Scan { .. } if self.svc_visits == 1 => (NR_GETPID, [0; 6]),
+                _ => (NR_EXIT_GROUP, [0; 6]),
+            };
+            ScriptedHvc2Executor::set_call(cpu, nr, args);
+            return Ok(());
+        }
+        let WorkingSetPlan::Scan { chunks } = self.plan else {
+            return Ok(());
+        };
+        let hot_br = CODE_VA + 4 * HOT_BLOCKS as u64;
+        let cold = hot_br + 4;
+        if pc == hot_br {
+            let target = if self.chunks_entered < chunks {
+                cold + (4 * COLD_CHUNK_BLOCKS * self.chunks_entered) as u64
+            } else {
+                CODE_VA
+            };
+            self.chunks_entered += 1;
+            wx(cpu, 3, target);
+        } else if pc >= cold && (pc - cold) / 4 % COLD_CHUNK_BLOCKS as u64 == 63 {
+            wx(cpu, 3, CODE_VA + 4);
+        }
+        Ok(())
+    }
+}
+
+impl ExecuteBlock for WorkingSetExecutor {
+    type Error = String;
+    type Code = LiveCode;
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<LiveCode, Self::Error> {
+        *self
+            .emitted
+            .lock()
+            .map_err(|_| "poisoned emitted".to_owned())?
+            .entry(block.guest().start().0)
+            .or_default() += 1;
+        let live = self.code.live.fetch_add(1, Ordering::Relaxed) + 1;
+        self.code.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(LiveCode(Arc::clone(&self.code)))
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        _code: &LiveCode,
+        cpu: &mut CpuState,
+    ) -> Result<usize, Self::Error> {
+        if cpu.pstate.el != ExceptionLevel::El0 {
+            return self.bridge.execute(block, &(), cpu);
+        }
+        self.steer(cpu)?;
+        match block.terminator() {
+            Terminator::Handler(idx) | Terminator::Jump(idx) | Terminator::Fallthrough(idx) => {
+                Ok(idx)
+            }
+            Terminator::Conditional { .. } => Err("unexpected conditional terminator".to_owned()),
+        }
+    }
+}
+
+struct WorkingSetRun {
+    run: carrick_softcpu_aarch64_host::SoftProcessRun<WorkingSetExecutor>,
+    /// Emissions per block start PC.
+    emitted: std::collections::BTreeMap<u64, u64>,
+    code: Arc<LiveCodeCensus>,
+}
+
+impl WorkingSetRun {
+    fn emissions(&self) -> u64 {
+        self.emitted.values().sum()
+    }
+
+    fn first_sights(&self) -> u64 {
+        self.emitted.len() as u64
+    }
+}
+
+fn run_working_set(plan: WorkingSetPlan) -> Result<WorkingSetRun, String> {
+    let words = plan.text();
+    let text_bytes = (words.len() * 4).next_multiple_of(0x1000);
+    let elf = build_text_elf(&words, text_bytes, WORKING_SET_DATA_VA, &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let emitted = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let code = Arc::new(LiveCodeCensus::default());
+    let executor = WorkingSetExecutor {
+        bridge: SequenceHvc2Executor {
+            mailbox: Arc::clone(&mailbox),
+            calls: Vec::new(),
+            returns: Arc::new(Mutex::new(Vec::new())),
+            next_seq: 1,
+        },
+        plan,
+        svc_visits: 0,
+        chunks_entered: 0,
+        emitted: Arc::clone(&emitted),
+        code: Arc::clone(&code),
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/working-set");
+    let run = run_single_process_with_executor_and_setup(&config, executor, |engine| {
+        install_hvc2_bridge(engine, &mailbox)
+    })?;
+    let emitted = emitted
+        .lock()
+        .map_err(|_| "poisoned emitted".to_owned())?
+        .clone();
+    Ok(WorkingSetRun { run, emitted, code })
+}
+
+/// Emissions a repeated working set may spend beyond one per distinct block.
+const WORKING_SET_EMISSION_SLACK: u64 = 8;
+
+/// A 4,096-block working set repeated 3, 10 and 30 times emits each block
+/// once: re-emission must not grow with the pass count.
+#[test]
+fn soft_carrier_keeps_a_4096_block_working_set_resident_across_passes() {
+    let _test_guard = lock_soft_carrier_test();
+    let mut census = Vec::new();
+    for passes in [3, 10, 30] {
+        let ws = run_working_set(WorkingSetPlan::Repeat {
+            blocks: 4096,
+            passes,
+        })
+        .expect("working-set witness must finish through the production carrier");
+        assert_eq!(ws.run.exit_code, 0);
+        assert_eq!(ws.run.terminating_fault, None);
+        assert_eq!(ws.run.reply_census.kernel_dispatched, passes + 1);
+        let work = ws.run.engine.vcpu().run_work();
+        println!(
+            "passes={passes} first_sights={} emitted_blocks={} executed_blocks={} decoded_blocks={}",
+            ws.first_sights(),
+            ws.emissions(),
+            work.executed_blocks,
+            work.decoded_blocks
+        );
+        census.push((passes, ws.first_sights(), ws.emissions()));
+    }
+    assert!(
+        census
+            .iter()
+            .all(|&(_, first, emitted)| first >= 4096
+                && emitted <= first + WORKING_SET_EMISSION_SLACK),
+        "the carrier re-emits a resident 4,096-block working set: \
+         (passes, first sights, emissions) = {census:?}, slack {WORKING_SET_EMISSION_SLACK}"
+    );
+}
+
+/// Cold one-shot blocks, `COLD_CHUNK_BLOCKS` per hot-loop iteration. The
+/// scan is larger than any resident budget, so residency must choose.
+const SCAN_CHUNKS: usize = 1024;
+
+/// A 16-block hot loop interleaved with a 65,536-block cold scan: the scan
+/// may evict only cold code, so every hot block is emitted exactly once.
+#[test]
+fn soft_carrier_keeps_a_hot_loop_resident_through_a_cold_scan() {
+    let _test_guard = lock_soft_carrier_test();
+    let plan = WorkingSetPlan::Scan {
+        chunks: SCAN_CHUNKS,
+    };
+    let ws =
+        run_working_set(plan).expect("scan witness must finish through the production carrier");
+    assert_eq!(ws.run.exit_code, 0);
+    assert_eq!(ws.run.terminating_fault, None);
+    let cold = (SCAN_CHUNKS * COLD_CHUNK_BLOCKS) as u64;
+    assert!(ws.first_sights() >= cold + HOT_BLOCKS as u64);
+    let hot: Vec<u64> = plan
+        .hot_pcs()
+        .step_by(4)
+        .map(|pc| ws.emitted.get(&pc).copied().unwrap_or(0))
+        .collect();
+    let work = ws.run.engine.vcpu().run_work();
+    println!(
+        "cold_blocks={cold} first_sights={} emitted_blocks={} executed_blocks={} hot_emissions={hot:?}",
+        ws.first_sights(),
+        ws.emissions(),
+        work.executed_blocks
+    );
+    assert_eq!(
+        hot, [1; HOT_BLOCKS],
+        "a cold scan evicted the resident hot loop"
+    );
+}
+
+/// Owned code the carrier may keep for the budget witness: at most this
+/// many blocks are live at once, cache and launch in flight together.
+const LIVE_CODE_BOUND: u64 = 65;
+
+/// The cache keeps at most its code budget, and evicted code is released
+/// as it is evicted: the live code never exceeds the bound across a working
+/// set larger than the budget, and none survives the carrier.
+#[test]
+fn soft_carrier_releases_evicted_code_within_its_budget() {
+    let _test_guard = lock_soft_carrier_test();
+    let ws = run_working_set(WorkingSetPlan::Repeat {
+        blocks: 4096,
+        passes: 3,
+    })
+    .expect("budget witness must finish through the production carrier");
+    assert_eq!(ws.run.exit_code, 0);
+    let peak = ws.code.peak.load(Ordering::Relaxed);
+    println!(
+        "first_sights={} emitted_blocks={} peak_live_code={peak}",
+        ws.first_sights(),
+        ws.emissions()
+    );
+    assert!(
+        peak <= LIVE_CODE_BOUND,
+        "live code reached {peak} blocks, budget bound {LIVE_CODE_BOUND}"
+    );
+    let census = Arc::clone(&ws.code);
+    drop(ws);
+    assert_eq!(
+        census.live.load(Ordering::Relaxed),
+        0,
+        "code outlived the carrier"
     );
 }
