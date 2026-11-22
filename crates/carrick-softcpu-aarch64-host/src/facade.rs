@@ -11,8 +11,8 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use carrick_aarch64::esr::decode_el0_sys64_read;
@@ -26,13 +26,17 @@ use carrick_aarch64::{
 };
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE, EL1_IPC_BASE, EL1_IPC_POOL_BASE,
-    EL1_STACK_GUARD_TABLES_BASE, IpcWindowBacking, is_el1_stack_guard,
+    EL1_REGION_BASE, EL1_REGION_SIZE, EL1_STACK_GUARD_TABLES_BASE, IpcWindowBacking,
+    MetadataResolutionError, is_el1_stack_guard,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    Gpa, HostVa, LegacyProtectionRead, MemoryError, SharedFutexLocation, UserMemoryAuthority,
-    zero_range_chunked,
+    Gpa, GuestVa, HostVa, LegacyProtectionRead, MemoryError, SharedFutexLocation,
+    UserMemoryAuthority, zero_range_chunked,
+};
+use carrick_hal::retained_metadata::{
+    RetainedMetadataBacking, RetainedMetadataExtent, RetainedMetadataMapper,
 };
 use carrick_hal::{
     FrameInventoryCommit, FrameInventoryEvent, FrameInventoryReservation, FrameLength,
@@ -198,6 +202,10 @@ pub struct SoftStage2 {
     page_perms: BTreeMap<u64, MemPerms>,
     last_abort: Option<Stage2Abort>,
     _ipc_pin: Option<Arc<dyn IpcWindowBacking>>,
+    /// Carrier custody of retained EL1 metadata mapped by
+    /// [`SoftStage2::map_retained_metadata`], keyed by its aperture GPA. A
+    /// backing leaves only with its successful unmap, or with this carrier.
+    retained_metadata: BTreeMap<u64, Arc<dyn RetainedMetadataBacking>>,
 }
 
 impl SoftStage2 {
@@ -211,6 +219,7 @@ impl SoftStage2 {
             page_perms: BTreeMap::new(),
             last_abort: None,
             _ipc_pin: None,
+            retained_metadata: BTreeMap::new(),
         })
     }
 
@@ -226,6 +235,63 @@ impl SoftStage2 {
 
     pub fn retain_ipc_backing(&mut self, ipc: Arc<dyn IpcWindowBacking>) {
         self._ipc_pin = Some(ipc);
+    }
+
+    /// Map retained ABI storage read/write, never executable, at the lowest
+    /// free range of the EL1-only dynamic metadata aperture, without copying
+    /// it. This carrier keeps `backing` until the exact mapping retires.
+    pub fn map_retained_metadata(
+        &mut self,
+        backing: Arc<dyn RetainedMetadataBacking>,
+    ) -> Result<u64, MetadataResolutionError> {
+        let len = u64::try_from(backing.mapped_len())
+            .map_err(|_| MetadataResolutionError::InvalidExtent)?;
+        let host = NonNull::new(backing.host_base().raw() as *mut u8)
+            .ok_or(MetadataResolutionError::InvalidExtent)?;
+        if len == 0
+            || len > EL1_DYNAMIC_METADATA_SIZE
+            || !len.is_multiple_of(GUEST_PAGE_BYTES)
+            || !(host.as_ptr() as usize).is_multiple_of(PAGE_BYTES_USIZE)
+        {
+            return Err(MetadataResolutionError::InvalidExtent);
+        }
+        let gpa = self
+            .allocate_free_gpa(
+                EL1_DYNAMIC_METADATA_BASE,
+                EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE,
+                len,
+            )
+            .ok_or(MetadataResolutionError::Busy)?;
+        let rw = MemPerms {
+            read: true,
+            write: true,
+            exec: false,
+        };
+        // SAFETY: `retained_metadata` keeps `backing`, and with it the range,
+        // until `retire_retained_metadata` unmaps this exact window or the
+        // carrier drops.
+        unsafe { self.map_external_stage2(gpa, host, len, rw, true) }
+            .map_err(|_| MetadataResolutionError::Busy)?;
+        self.retained_metadata.insert(gpa, backing);
+        Ok(gpa)
+    }
+
+    /// Whether the retained mapping at `gpa` is still this carrier's.
+    #[must_use]
+    pub fn retains_metadata_at(&self, gpa: u64) -> bool {
+        self.retained_metadata.contains_key(&gpa)
+    }
+
+    /// Unmap the retained mapping at `gpa`, then release its backing.
+    pub fn retire_retained_metadata(&mut self, gpa: u64) -> Result<(), TrapError> {
+        let backing = self.retained_metadata.get(&gpa).ok_or_else(|| {
+            TrapError::Hypervisor(format!("no retained metadata mapping at {gpa:#x}"))
+        })?;
+        let len = u64::try_from(backing.mapped_len())
+            .map_err(|_| TrapError::Hypervisor("retained metadata length overflow".to_owned()))?;
+        self.unmap_stage2(gpa, len)?;
+        self.retained_metadata.remove(&gpa);
+        Ok(())
     }
 
     fn window_for_range(&self, gpa: u64, len: usize) -> Option<&Stage2Window> {
@@ -1014,6 +1080,87 @@ impl ExclusiveStage2 {
     }
 }
 
+/// One soft carrier's authority to map retained ABI storage into its EL1
+/// dynamic metadata aperture ([`RetainedMetadataMapper`]). It names its
+/// carrier weakly: once that stage 2 drops, every call fails `StaleOwner`.
+#[derive(Clone)]
+pub struct SoftRetainedMetadata {
+    stage2: Weak<ExclusiveStage2>,
+}
+
+/// One retained mapping in its exact soft carrier.
+pub struct SoftRetainedExtent {
+    stage2: Weak<ExclusiveStage2>,
+    gpa: u64,
+}
+
+impl RetainedMetadataMapper for SoftRetainedMetadata {
+    type Extent = SoftRetainedExtent;
+
+    fn region(&self) -> Result<NonNull<u8>, MetadataResolutionError> {
+        let stage2 = self
+            .stage2
+            .upgrade()
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        let stage2 = stage2
+            .try_borrow()
+            .map_err(|_| MetadataResolutionError::Busy)?;
+        stage2
+            .host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)
+            .and_then(NonNull::new)
+            .ok_or(MetadataResolutionError::StaleOwner)
+    }
+
+    fn map_retained(
+        &self,
+        backing: Arc<dyn RetainedMetadataBacking>,
+    ) -> Result<SoftRetainedExtent, MetadataResolutionError> {
+        let stage2 = self
+            .stage2
+            .upgrade()
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        let gpa = stage2
+            .try_borrow()
+            .map_err(|_| MetadataResolutionError::Busy)?
+            .map_retained_metadata(backing)?;
+        Ok(SoftRetainedExtent {
+            stage2: Arc::downgrade(&stage2),
+            gpa,
+        })
+    }
+}
+
+impl RetainedMetadataExtent for SoftRetainedExtent {
+    fn guest_base(&self) -> Result<GuestVa, MetadataResolutionError> {
+        let stage2 = self
+            .stage2
+            .upgrade()
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        let stage2 = stage2
+            .try_borrow()
+            .map_err(|_| MetadataResolutionError::Busy)?;
+        stage2
+            .retains_metadata_at(self.gpa)
+            .then_some(GuestVa::new(self.gpa))
+            .ok_or(MetadataResolutionError::StaleOwner)
+    }
+
+    fn try_retire(self) -> Result<(), Self> {
+        // A dropped carrier released this mapping and its backing with it.
+        let Some(stage2) = self.stage2.upgrade() else {
+            return Ok(());
+        };
+        let Ok(mut guard) = stage2.try_borrow() else {
+            return Err(self);
+        };
+        if guard.retire_retained_metadata(self.gpa).is_err() {
+            drop(guard);
+            return Err(self);
+        }
+        Ok(())
+    }
+}
+
 /// Cross-thread kick handle interrupting `SoftAarch64Vcpu::run` at a block boundary.
 #[derive(Clone)]
 pub struct SoftKickHandle {
@@ -1645,6 +1792,14 @@ impl<X> SoftAarch64Vmm<X> {
     pub fn code_generation(&self, frame: FrameGpa) -> Result<Option<CodeGeneration>, TrapError> {
         Ok(self.stage2.try_borrow()?.code_generation(frame))
     }
+
+    /// This carrier's retained-metadata mapping capability.
+    #[must_use]
+    pub fn retained_metadata(&self) -> SoftRetainedMetadata {
+        SoftRetainedMetadata {
+            stage2: Arc::downgrade(&self.stage2),
+        }
+    }
 }
 
 fn populate_stage2_for_image(
@@ -1674,8 +1829,8 @@ fn populate_stage2_for_image(
         }
     }
 
-    // Ensure the dynamic metadata window and carrier maintenance root exist
-    // when an EL1 kernel region is present.
+    // Ensure the carrier maintenance root exists when an EL1 kernel region
+    // is present.
     if stage2
         .host_ptr(LINUX_EL1_KERNEL_BASE, PAGE_BYTES_USIZE)
         .is_some()
@@ -1699,21 +1854,9 @@ fn populate_stage2_for_image(
             }
             page += GUEST_PAGE_BYTES;
         }
-        if stage2
-            .host_ptr(EL1_DYNAMIC_METADATA_BASE, PAGE_BYTES_USIZE)
-            .is_none()
-        {
-            stage2.map_owned_anonymous(
-                EL1_DYNAMIC_METADATA_BASE,
-                EL1_DYNAMIC_METADATA_SIZE,
-                MemPerms {
-                    read: true,
-                    write: true,
-                    exec: false,
-                },
-                true,
-            )?;
-        }
+        // The dynamic metadata aperture stays unmapped at stage 2 until the
+        // carrier maps retained ABI storage into it
+        // (`SoftStage2::map_retained_metadata`), as on HVF.
         if stage2
             .host_ptr(LINUX_CARRIER_MAINT_ROOT_BASE, PAGE_BYTES_USIZE)
             .is_none()
