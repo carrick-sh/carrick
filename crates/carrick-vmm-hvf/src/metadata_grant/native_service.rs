@@ -8,7 +8,9 @@ use core::ops::Deref;
 
 struct ServicePin {
     cell: core::ptr::NonNull<ServiceCell>,
-    _mapping: HostMetadataExtentPin,
+    /// `None` for a control in the ring's bootstrap arena, which the retained
+    /// carrier ABI region backs (see [`retain_ring_record`]).
+    _mapping: Option<HostMetadataExtentPin>,
     _carrier: Arc<crate::trap::CarrierVmCustody>,
 }
 struct RetainedExecPayload {
@@ -1444,53 +1446,25 @@ pub(super) fn take(
         // Metadata retention can acquire host mutexes. Snapshot the member,
         // retain its allocation outside the queue, then revalidate at claim.
         drop(queue);
+        // A member's control is ring metadata: the carrier's loaned slab for
+        // the lifecycle page's own entries, a segment from the ring's
+        // allocator past them (#2734). One resolver retains either venue.
         let address = carrick_guest_arch::KernelVa::new(identity.control_slot);
-        let Some((_, base, len)) = retained_dynamic_metadata(
-            custody,
-            address,
-            core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>(),
-        ) else {
-            return consumed.miss("native-service control metadata absent");
-        };
-        let offset = identity
-            .control_slot
-            .checked_sub(base)
-            .ok_or_else(|| stale())? as usize;
-        if offset
-            .checked_add(core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>())
-            .is_none_or(|end| end > len)
-        {
-            return Err(stale());
-        }
-        let pin = {
-            let aperture = metadata_aperture(custody).lock();
-            let index = ((base - EL1_DYNAMIC_METADATA_BASE)
-                / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
-            let Some(mapping) = aperture.slots.get(index).and_then(Option::as_ref) else {
+        let (control, pin) = match retain_ring_record::<carrick_el1_abi::ThreadControlSlot>(
+            custody, region, address,
+        ) {
+            Ok(retained) => retained,
+            Err(RingRecordMiss::Absent) => {
+                return consumed.miss("native-service control metadata absent");
+            }
+            Err(RingRecordMiss::ApertureAbsent) => {
                 return consumed.miss("native-service metadata aperture absent");
-            };
-            let extent =
-                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(|| stale())?;
-            aperture
-                .pin_extent(extent, generation.0)
-                .map_err(|_| stale())?
+            }
+            Err(RingRecordMiss::Invalid) => return Err(stale()),
         };
-        // SAFETY: checked whole control range inside the pinned metadata extent.
-        let control = unsafe {
-            pin.host_base()
-                .as_ptr()
-                .add(offset)
-                .cast::<carrick_el1_abi::ThreadControlSlot>()
-        };
-        if !control
-            .addr()
-            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ThreadControlSlot>())
-        {
-            return Err(stale());
-        }
-        // SAFETY: the pin retains initialized control storage. The exact
+        // SAFETY: the resolver retains initialized control storage. The exact
         // member and control identity are revalidated under the service queue.
-        let control = unsafe { &*control };
+        let control = unsafe { control.as_ref() };
         let pin = ServicePin {
             cell: core::ptr::NonNull::from(&control.service),
             _mapping: pin,
@@ -1516,7 +1490,10 @@ pub(super) fn take(
         }
         // A refused claim consumes its pin. Keep the allocation alive until
         // after the queue drops even if teardown removed its aperture entry.
-        let claim_backing = Arc::clone(&pin._mapping._backing);
+        let claim_backing = pin
+            ._mapping
+            .as_ref()
+            .map(|mapping| Arc::clone(&mapping._backing));
         // SAFETY: exact member/control revalidated under its queue above. The
         // ring's active service claim retains its admitted MM through ticket ACK.
         let ticket =
@@ -1928,11 +1905,32 @@ fn settle_backing_and_tables(
     )
 }
 
-pub(super) fn retain_reply<T>(
+/// Why [`retain_ring_record`] could not retain a ring-owned record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RingRecordMiss {
+    /// No retained metadata covers the whole record.
+    Absent,
+    /// The granted extent's aperture entry is gone.
+    ApertureAbsent,
+    /// The address or the extent contradicts the metadata layout.
+    Invalid,
+}
+
+/// Retain one record the ring's metadata allocator owns, for a host reader.
+///
+/// The ring allocates from two venues and a reader must not care which:
+/// - its bootstrap arena inside the carrier ABI region, which the retained
+///   region itself backs (no pin);
+/// - a granted dynamic extent, which the returned pin keeps mapped.
+///
+/// Replies, successor manifests and thread controls all resolve here. A
+/// lifecycle page's own controls sit in a loaned extent; a control in an
+/// extension segment (#2734) sits wherever the allocator placed the segment.
+pub(super) fn retain_ring_record<T>(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
     address: carrick_guest_arch::KernelVa,
-) -> Result<(core::ptr::NonNull<T>, Option<HostMetadataExtentPin>), TrapError> {
+) -> Result<(core::ptr::NonNull<T>, Option<HostMetadataExtentPin>), RingRecordMiss> {
     let size = core::mem::size_of::<T>();
     if address.raw() < EL1_DYNAMIC_METADATA_BASE {
         let offset = address
@@ -1940,16 +1938,27 @@ pub(super) fn retain_reply<T>(
             .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
             .and_then(|offset| usize::try_from(offset).ok())
             .filter(|offset| fork_custody_in_retained_region(*offset, size))
-            .ok_or_else(|| stale())?;
+            .ok_or(RingRecordMiss::Absent)?;
         return Ok((
-            core::ptr::NonNull::new(region.record_ptr(offset).ok_or_else(|| stale())?)
-                .ok_or_else(|| stale())?,
+            core::ptr::NonNull::new(region.record_ptr(offset).ok_or(RingRecordMiss::Invalid)?)
+                .ok_or(RingRecordMiss::Invalid)?,
             None,
         ));
     }
     let (_, base, len) =
-        retained_dynamic_metadata(custody, address, size).ok_or_else(|| stale())?;
-    let generation = custody.live_generation().ok_or_else(|| stale())?;
+        retained_dynamic_metadata(custody, address, size).ok_or(RingRecordMiss::Absent)?;
+    let offset = usize::try_from(
+        address
+            .raw()
+            .checked_sub(base)
+            .ok_or(RingRecordMiss::Invalid)?,
+    )
+    .map_err(|_| RingRecordMiss::Invalid)?;
+    if offset.checked_add(size).is_none_or(|end| end > len) {
+        return Err(RingRecordMiss::Invalid);
+    }
+    // A reader that snapshotted a generation revalidates it after this pin.
+    let generation = custody.live_generation().ok_or(RingRecordMiss::Invalid)?;
     let pin = {
         let aperture = metadata_aperture(custody).lock();
         let index =
@@ -1958,27 +1967,33 @@ pub(super) fn retain_reply<T>(
             .slots
             .get(index)
             .and_then(Option::as_ref)
-            .ok_or_else(|| stale())?;
+            .ok_or(RingRecordMiss::ApertureAbsent)?;
         aperture
             .pin_extent(
-                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(|| stale())?,
+                MetadataExtent::new(base, len as u64, mapping.token)
+                    .ok_or(RingRecordMiss::Invalid)?,
                 generation.0,
             )
-            .map_err(|_| stale())?
+            .map_err(|_| RingRecordMiss::Invalid)?
     };
-    // SAFETY: the exact request retains the whole aligned ring-owned reply.
-    let pointer = unsafe {
-        pin.host_base()
-            .as_ptr()
-            .add((address.raw() - base) as usize)
-    };
+    // SAFETY: the checked record lies wholly inside the pinned extent.
+    let pointer = unsafe { pin.host_base().as_ptr().add(offset) };
     if !pointer.addr().is_multiple_of(core::mem::align_of::<T>()) {
-        return Err(stale());
+        return Err(RingRecordMiss::Invalid);
     }
     Ok((
-        core::ptr::NonNull::new(pointer.cast()).ok_or_else(|| stale())?,
+        core::ptr::NonNull::new(pointer.cast()).ok_or(RingRecordMiss::Invalid)?,
         Some(pin),
     ))
+}
+
+/// A reply the exact request retains: any miss is a custody mismatch.
+pub(super) fn retain_reply<T>(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'_>,
+    address: carrick_guest_arch::KernelVa,
+) -> Result<(core::ptr::NonNull<T>, Option<HostMetadataExtentPin>), TrapError> {
+    retain_ring_record(custody, region, address).map_err(|_| stale())
 }
 
 #[cfg(test)]
@@ -2335,6 +2350,80 @@ mod intake_tests {
             Some(address & !4095)
         );
         assert_eq!(loads, 3, "a block terminates the authenticated walk");
+    }
+
+    /// #2734: a thread born into an extension entry keeps its control in a
+    /// lifecycle segment, which the ring's allocator may place in its
+    /// bootstrap arena. Intake resolved only granted extents and died with
+    /// "native-service control metadata absent" (signed HVF, `5184cadfe`).
+    #[test]
+    fn intake_resolves_a_segment_control_in_the_ring_bootstrap_arena() {
+        use carrick_el1_abi::{ThreadControlSlot, ThreadLifecyclePage, ThreadLifecycleSegment};
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new_live_fixture());
+        let offset = (carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+            .next_multiple_of(core::mem::align_of::<ThreadLifecycleSegment>());
+        // SAFETY: TestEl1Region owns aligned complete ABI storage; the
+        // bootstrap arena admits one whole segment at this offset.
+        let segment = unsafe {
+            let segment = region
+                .as_mut_ptr()
+                .add(offset)
+                .cast::<ThreadLifecycleSegment>();
+            ThreadLifecycleSegment::initialize_at(segment);
+            core::ptr::NonNull::new(segment).unwrap()
+        };
+        let page = ThreadLifecyclePage::new();
+        // SAFETY: initialized above and retained by `region` past `page`.
+        unsafe { page.publish_extension(segment) };
+        let first = carrick_el1_abi::THREAD_POOL_ENTRIES;
+        let control = page
+            .extension_control(first + 3)
+            .expect("linked segment control");
+        let record = birth().record;
+        control.bind_zone_record(record);
+        let address = carrick_guest_arch::KernelVa::new(
+            carrick_el1_abi::EL1_REGION_BASE
+                + (core::ptr::from_ref(control).addr() - region.as_ptr().addr()) as u64,
+        );
+        assert!(address.raw() >= carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE);
+        assert!(
+            retained_dynamic_metadata(&custody, address, core::mem::size_of::<ThreadControlSlot>())
+                .is_none(),
+            "a bootstrap-arena control is in no granted extent: the old intake's miss"
+        );
+        // SAFETY: this fixture retains the aligned entire region.
+        let retained = unsafe {
+            RetainedAbiRegion::new(
+                region.as_mut_ptr(),
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .unwrap()
+        };
+        let (resolved, pin) =
+            retain_ring_record::<ThreadControlSlot>(&custody, retained, address).unwrap();
+        assert!(pin.is_none(), "the retained ABI region backs the arena");
+        assert!(core::ptr::eq(resolved.as_ptr().cast_const(), control));
+        // SAFETY: the resolver returned the initialized segment control.
+        assert_eq!(unsafe { resolved.as_ref() }.zone_record(), Some(record));
+
+        // Below the arena is carrier ABI state, never ring metadata.
+        let below = carrick_guest_arch::KernelVa::new(
+            carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE
+                - core::mem::size_of::<ThreadControlSlot>() as u64,
+        );
+        assert_eq!(
+            retain_ring_record::<ThreadControlSlot>(&custody, retained, below).err(),
+            Some(RingRecordMiss::Absent)
+        );
+        // A granted-extent address with no extent behind it is absent too.
+        let ungranted = carrick_guest_arch::KernelVa::new(EL1_DYNAMIC_METADATA_BASE);
+        assert_eq!(
+            retain_ring_record::<ThreadControlSlot>(&custody, retained, ungranted).err(),
+            Some(RingRecordMiss::Absent)
+        );
+        // SAFETY: no reader of the extension entries remains.
+        unsafe { page.detach_extension(|_| {}) };
     }
 
     #[test]
