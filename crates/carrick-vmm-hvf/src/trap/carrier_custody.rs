@@ -626,6 +626,19 @@ impl CarrierVmCustody {
         }
     }
 
+    /// Apply the exec owner's carrier-exit verdict (#2799): retire every row
+    /// the run left unadopted and drop what it held outside the owner's
+    /// lock, as a ring cancellation does. A sealed successor's physical
+    /// frames are released here, while the VM is still live, so they are not
+    /// pinned at the terminal global-frame cleanup. Returns the rows retired.
+    pub(crate) fn retire_native_exec_preparations_at_carrier_exit(&self) -> usize {
+        let retired = self
+            .native_exec_preparations
+            .lock()
+            .retire_at_carrier_exit();
+        retired.len()
+    }
+
     /// What this carrier's exec owner reserved, sealed and retired.
     pub fn exec_owner_census(&self) -> carrick_hal::exec_owner::ExecOwnerCensus {
         self.native_exec_preparations.lock().census()

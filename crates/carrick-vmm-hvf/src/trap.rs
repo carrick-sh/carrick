@@ -1200,6 +1200,11 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
         ));
     };
     let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
+    // #2799: every logical process and executor has joined, so no ring can
+    // adopt or cancel an exec again. Retire the rows the run left unadopted
+    // before the destroy: a sealed successor's frames must not be pinned at
+    // the terminal global-frame cleanup below. A retry finds none left.
+    custody.retire_native_exec_preparations_at_carrier_exit();
     // Keep the published bundle recoverable until raw destroy succeeds. A
     // failed destroy leaves the exact VM live, so its publication must remain
     // reachable for retry rather than disappearing with a provisional take.

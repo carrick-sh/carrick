@@ -879,6 +879,11 @@ fn run_prepared_kvm_pool_with_debug(
             });
         }
     }
+    // #2799: the pool is shut down, so no lane can adopt or cancel an exec
+    // again. A process that died with the run between its exec's seal and
+    // its adoption left a row holding its successor's frames; the exec owner
+    // retires it here rather than leave it live at teardown.
+    physical.retire_exec_preparations_at_carrier_exit()?;
     let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
     let physical_crossing_families: Vec<_> = physical
         .physical_crossing_counts()?

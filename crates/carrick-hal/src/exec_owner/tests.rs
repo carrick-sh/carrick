@@ -132,6 +132,28 @@ fn the_receipt_is_reserved_at_claim_and_the_seal_reuses_it() {
         )
         .unwrap();
     assert!(third.receipt().raw() > second.receipt().raw());
+    // #2799: the carrier's exit retires what is still live, in any phase,
+    // and hands back what each row held. A second drain finds nothing.
+    let drained = owner.retire_at_carrier_exit();
+    assert_eq!(drained.len(), 2);
+    assert!(drained.iter().any(|row| {
+        row.retirement.receipt == first.receipt()
+            && row.retirement.sealed
+            && row.retirement.reason == ExecRetireReason::CarrierExit
+            && matches!(row.held, ExecRetained::Staged("staged"))
+    }));
+    assert!(drained.iter().any(|row| {
+        row.retirement.receipt == third.receipt()
+            && !row.retirement.sealed
+            && matches!(row.held, ExecRetained::Claimed)
+    }));
+    assert_eq!(
+        owner.census().to_string(),
+        "live=0 reserved=3 sealed=1 adopted=0 retired=3"
+    );
+    assert_eq!(owner.census().carrier_exit, 2);
+    assert!(owner.is_empty());
+    assert!(owner.retire_at_carrier_exit().is_empty());
 }
 
 /// The attachment slot: set once before the seal, returned by value with

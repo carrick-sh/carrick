@@ -981,7 +981,8 @@ fn native_fork_child_execs_while_parent_keeps_running() {
 /// anywhere between claim and adoption. Two live processes; the root never
 /// waits. Whatever instant the exit lands on, the carrier must finish with the
 /// root's status and every receipt the exec owner reserved must be retired: a
-/// row still live at teardown keeps its prepared successor's frames.
+/// row still live at teardown keeps its prepared successor's frames. A row the
+/// ring never adopted is retired by the carrier's exit.
 #[test]
 fn native_fork_child_exec_outlived_by_its_exiting_root_retires_every_preparation() {
     let directory = tempfile::tempdir().expect("successor directory");

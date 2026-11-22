@@ -4190,6 +4190,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock_counters())
     }
 
+    /// Retire the exec rows the run left unadopted, once every CPU lane of
+    /// this carrier has stopped (#2799). Returns the rows retired.
+    pub fn retire_exec_preparations_at_carrier_exit(&self) -> Result<usize, TrapError> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        custody.retire_native_execs_at_carrier_exit()
+    }
+
     /// The exec owner's census observed through the production carrier.
     pub fn exec_owner_census(&self) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
         let custody = self
