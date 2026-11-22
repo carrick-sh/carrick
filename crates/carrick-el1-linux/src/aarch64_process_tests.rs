@@ -1432,6 +1432,14 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
     }
 }
 
+/// Whether a [`Fixture`]'s root MM finishes its import into the portal
+/// owner, as an owner-transfer carrier's root does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootAdmission {
+    Admitted,
+    Unadmitted,
+}
+
 impl Fixture {
     #[cfg(test)]
     fn new(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {
@@ -1499,7 +1507,44 @@ impl Fixture {
         leader: ThreadIdentity,
         arena_len: u64,
     ) -> Self {
-        Self::with_identity_arena_and_import(root_gpa, asid, page, control, leader, arena_len, None)
+        Self::with_identity_arena_and_import(
+            root_gpa,
+            asid,
+            page,
+            control,
+            leader,
+            arena_len,
+            None,
+            RootAdmission::Admitted,
+        )
+    }
+    /// [`Self::new`] whose MM the portal owner never admits: the root a
+    /// carrier opened on the legacy venue (descriptor lane off, a census
+    /// refusal, or the soft carrier).
+    #[cfg(test)]
+    fn unadmitted(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {
+        let page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        let control = Box::leak(Box::new(ThreadControlSlot::new()));
+        Self::with_identity_arena_and_import(
+            root_gpa,
+            asid,
+            page,
+            control,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+            0x1000_0000,
+            None,
+            RootAdmission::Unadmitted,
+        )
     }
     /// [`Self::new`] whose MM also imports `anonymous` as private anonymous
     /// memory: host memory the VM-free fixture dereferences as user memory,
@@ -1530,6 +1575,7 @@ impl Fixture {
             },
             0x1000_0000,
             Some(anonymous),
+            RootAdmission::Admitted,
         )
     }
     fn with_identity_arena_and_import(
@@ -1540,6 +1586,7 @@ impl Fixture {
         leader: ThreadIdentity,
         arena_len: u64,
         anonymous: Option<carrick_el1_abi::ReservationRange>,
+        admission: RootAdmission,
     ) -> Self {
         let file_table = leader.file_table;
         // The host records the leader's birth identity when it allocates the
@@ -1696,11 +1743,13 @@ impl Fixture {
                 .unwrap();
         }
         drop(owner);
-        super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, table, zone)
-            .root_any(mm, 0)
-            .unwrap()
-            .finish_import()
-            .unwrap();
+        if admission == RootAdmission::Admitted {
+            super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, table, zone)
+                .root_any(mm, 0)
+                .unwrap()
+                .finish_import()
+                .unwrap();
+        }
 
         let tables = crate::mm_portal::test_support::Tables::new(root_gpa, IPA, 2);
         let maintenance = CallerInvalidatesAsid;
@@ -6753,6 +6802,63 @@ fn arm_signal_setup_uses_one_native_owner() {
             "ARM signal syscall {nr} escaped to the carrier"
         );
         assert_eq!(frame.x[0] as i64, expected, "ARM signal syscall {nr}");
+    }
+}
+
+/// The handler gate is the carrier's typed signal-frame custody, not MM
+/// admission alone. An HVF- or x86-kind carrier delivers to every MM it runs,
+/// so a root whose MM the portal never admitted (descriptor lane off, census
+/// refusal, a momentarily stale MM) still installs its handler. Only the soft
+/// carrier's custody leaves that install unrouted, a counted ENOSYS.
+#[test]
+fn arm_rt_sigaction_handler_gate_follows_carrier_signal_frame_custody() {
+    use carrick_el1_abi::SignalFrameCustody;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    for (custody, installs) in [
+        (SignalFrameCustody::Carrier, true),
+        (SignalFrameCustody::AdmittedOwner, false),
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::unadmitted(0x10000, asid(1))));
+        let mut service = fixture.process_service().with_signal_frame_custody(custody);
+        let mm = carrick_el1_abi::ReservationMm::new(fixture.address.mm.raw().get()).unwrap();
+        assert!(
+            super::aarch64_process::Portal::for_zone(
+                NonZeroU64::MIN,
+                fixture.region.table(),
+                fixture.zone,
+            )
+            .admitted_handle(mm, 0)
+            .is_err(),
+            "the witness needs an MM its portal never admitted"
+        );
+        // struct sigaction { handler, flags, restorer, mask } for SIGUSR1.
+        let action = carrick_test_support::GuestUserBuffer::from_value([0x40_0100u64, 0, 0, 0]);
+        let old = carrick_test_support::GuestUserBuffer::from_value([u64::MAX; 4]);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[..4].copy_from_slice(&[10, action.arg(), 0, 8]);
+        frame.x[8] = 134;
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        if installs {
+            assert_ne!(route, CompletionRoute::Forward, "{custody:?}");
+            assert_eq!(frame.x[0], 0, "{custody:?}");
+        } else {
+            assert_eq!(route, CompletionRoute::Forward, "{custody:?}");
+        }
+
+        // The disposition the owner holds now: the handler only where its
+        // frame can be delivered. A query needs no frame on either carrier.
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[..4].copy_from_slice(&[10, 0, old.arg(), 8]);
+        frame.x[8] = 134;
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        assert_ne!(route, CompletionRoute::Forward, "{custody:?} query");
+        assert_eq!(frame.x[0], 0, "{custody:?} query");
+        assert_eq!(
+            old.read::<[u64; 4]>(0)[0],
+            if installs { 0x40_0100 } else { 0 },
+            "{custody:?} disposition"
+        );
     }
 }
 
