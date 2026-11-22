@@ -1593,3 +1593,179 @@ fn only_a_ready_upper_layer_makes_its_base_a_lower_layer() {
         "unknown draft state counts as draft"
     );
 }
+
+/// The Linux unit lane (`linux-unit-arm`, `linux-unit-x86`: `just test`'s
+/// shards on hosted arm64 and x86_64 runners) is the only lane that runs the
+/// host unit set while the macOS jobs are off (owner, 2026-11-22, #231). Both
+/// are hosted Linux jobs, so they run on drafts, and `ci-results` requires
+/// them wherever they run.
+#[test]
+fn linux_unit_lane_is_required_wherever_heavy_linux_jobs_run() {
+    const LANE: [&str; 2] = ["linux-unit-arm", "linux-unit-x86"];
+    const NOT_GREEN: [&str; 3] = ["failure", "cancelled", "skipped"];
+    // A Linux-only pull request: `changes.outputs.macos` is false, every
+    // macOS job is skipped, and every hosted Linux job ran.
+    let needs: serde_json::Value = serde_json::from_str(
+        r#"{
+      "xtask-build": { "result": "success" },
+      "changes": {
+        "result": "success",
+        "outputs": { "heavy": "true", "macos": "false", "el1_native": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
+      },
+      "actionlint": { "result": "skipped" },
+      "linked-issue": { "result": "success" },
+      "commit-trailers": { "result": "success" },
+      "trusted-steps": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
+      "lint-domains": { "result": "success" },
+      "portable": { "result": "success" },
+      "loom": { "result": "success" },
+      "x86-host-tests": { "result": "success" },
+      "linux-doc": { "result": "success" },
+      "linux-unit-arm": { "result": "success" },
+      "linux-unit-x86": { "result": "success" },
+      "macos-authority": { "result": "skipped" },
+      "macos-clippy": { "result": "skipped" },
+      "macos-build": { "result": "skipped" },
+      "macos-unit-a": { "result": "skipped" },
+      "macos-unit-b": { "result": "skipped" },
+      "macos-integration": { "result": "skipped" },
+      "cross-check-linux": { "result": "success" },
+      "cross-check-freebsd": { "result": "success" },
+      "cross-check-netbsd": { "result": "success" },
+      "cross-check-macos": { "result": "success" },
+      "kernel-linux-native": { "result": "success" },
+      "el1-native-tests": { "result": "success" },
+      "el1-native-gate": { "result": "success" }
+    }"#,
+    )
+    .unwrap();
+    let with = |base: &serde_json::Value, job: &str, result: &str| {
+        let mut value = base.clone();
+        value[job]["result"] = result.into();
+        value.to_string()
+    };
+    let skip_heavy = |base: &serde_json::Value| {
+        let mut value = base.clone();
+        for (job, body) in value.as_object_mut().unwrap() {
+            if matches!(
+                job.as_str(),
+                "portable"
+                    | "loom"
+                    | "x86-host-tests"
+                    | "linux-doc"
+                    | "linux-unit-arm"
+                    | "linux-unit-x86"
+                    | "cross-check-linux"
+                    | "cross-check-freebsd"
+                    | "cross-check-netbsd"
+                    | "cross-check-macos"
+                    | "kernel-linux-native"
+                    | "el1-native-tests"
+                    | "el1-native-gate"
+            ) {
+                body["result"] = "skipped".into();
+            }
+        }
+        value
+    };
+
+    // Ready for review: green only when both runners' shards succeeded.
+    assert!(
+        run_ci_results("pull_request", Some("false"), &needs.to_string()),
+        "a ready Linux-only PR with a green unit lane passes"
+    );
+    for job in LANE {
+        for result in NOT_GREEN {
+            assert!(
+                !run_ci_results("pull_request", Some("false"), &with(&needs, job, result)),
+                "a ready PR with {job} {result} must fail ci-results"
+            );
+        }
+    }
+
+    // Draft: the lane runs (hosted Linux), so a green one reaches the draft
+    // notice, and a red or skipped one fails on the job itself.
+    let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), &needs.to_string(), &[]);
+    assert!(!ok, "a draft's ci-results never passes: {out}");
+    assert!(
+        out.contains("draft run: the jobs that ran passed"),
+        "a draft with a green unit lane fails only on the draft notice: {out}"
+    );
+    for job in LANE {
+        for result in NOT_GREEN {
+            let (ok, out) = run_ci_results_with_env(
+                "pull_request",
+                Some("true"),
+                &with(&needs, job, result),
+                &[],
+            );
+            assert!(!ok, "a draft with {job} {result} must fail ci-results");
+            assert!(
+                !out.contains("draft run:"),
+                "{job} {result} must fail on the job, not the draft notice: {out}"
+            );
+        }
+    }
+
+    // A lower stack layer skips every heavy job, this lane included.
+    let mut lower = skip_heavy(&needs);
+    lower["changes"]["outputs"]["lower_layer"] = "true".into();
+    assert!(
+        run_ci_results("pull_request", Some("false"), &lower.to_string()),
+        "a lower layer with the unit lane skipped passes"
+    );
+    // Unreferenced prose (heavy=false) skips it with the other heavy jobs.
+    let mut prose = skip_heavy(&needs);
+    prose["changes"]["outputs"]["heavy"] = "false".into();
+    prose["changes"]["outputs"]["el1_native"] = "false".into();
+    for job in [
+        "lint-clippy",
+        "lint-gates",
+        "xtask-tests-build",
+        "lint-domains",
+    ] {
+        prose[job]["result"] = "skipped".into();
+    }
+    assert!(
+        run_ci_results("pull_request", Some("false"), &prose.to_string()),
+        "a prose-only PR with the unit lane skipped passes"
+    );
+    for job in LANE {
+        assert!(
+            !run_ci_results("pull_request", Some("false"), &with(&lower, job, "failure")),
+            "a lower layer with a failed {job} must fail ci-results"
+        );
+        assert!(
+            !run_ci_results("pull_request", Some("false"), &with(&prose, job, "failure")),
+            "a prose-only PR with a failed {job} must fail ci-results"
+        );
+    }
+
+    // Merge groups run it too: the merged tree is tested nowhere else. With
+    // macOS on, the group also runs the macOS build, clippy and census; with
+    // macOS off (#2804) the Linux jobs are all there is.
+    let mut linux_group = needs.clone();
+    linux_group["actionlint"]["result"] = "success".into();
+    let mut macos_group = linux_group.clone();
+    macos_group["changes"]["outputs"]["macos"] = "true".into();
+    for job in ["macos-authority", "macos-clippy", "macos-build"] {
+        macos_group[job]["result"] = "success".into();
+    }
+    for (name, group) in [("macOS", &macos_group), ("Linux-only", &linux_group)] {
+        assert!(
+            run_ci_results("merge_group", None, &group.to_string()),
+            "a {name} merge group with a green unit lane passes"
+        );
+        for job in LANE {
+            for result in NOT_GREEN {
+                assert!(
+                    !run_ci_results("merge_group", None, &with(group, job, result)),
+                    "a {name} merge group with {job} {result} must fail ci-results"
+                );
+            }
+        }
+    }
+}
