@@ -1,3 +1,12 @@
+# #2645 slice C: an owner that cannot publish a caught signal's frame leaves
+# an rt_sigaction installing a handler unrouted (counted ENOSYS) rather than
+# accepting a handler it never delivers. The shared personality asks the
+# owner (ProcessSignals::delivers_caught_signals); the EL1 owner answers from
+# its service (NativeProcessService::signal_frames_reach), which on ARM is
+# exactly the MM portal admission the frame copy itself requires. Default and
+# ignore dispositions and queries are unchanged. HVF and x86 roots are
+# admitted, so their semantics, bindings and budgets are unchanged; the soft
+# AArch64 root (legacy-opened MM, #2814) refuses handlers until slice D.
 # #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
 # (enter_mm_executor_then_register, the leased-root check and
 # open_first_address_space) and the stopped zone-slot publication move to
@@ -77,6 +86,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-personality-linux::sigaction_contract::{a_handler_the_owner_cannot_deliver_stays_unrouted,dispositions_and_queries_need_no_frame_delivery,a_deliverable_handler_is_installed}",
   "carrick-el1-linux::aarch64_process_tests::native_signal_work_return_tests::*",
   "carrick-el1-linux::aarch64_process_tests::native_signal_resume_tests::*",
   "carrick-vmm-kvm::cpl0_entry::{production_signal_frame_owner_wait_parks_and_delivers_once,production_signal_frame_busy_once_retains_and_delivers_once,production_signal_frame_real_fault_delivers_sigsegv_si_kernel}",
