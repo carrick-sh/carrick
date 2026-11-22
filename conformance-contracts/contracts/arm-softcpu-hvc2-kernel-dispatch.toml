@@ -31,12 +31,15 @@
 # issuers (the shared RetainedBirthZone source HVF and x86 use) and
 # publishes the root's own namespace PID, so EL1 admits the root's process
 # owner on its first call. The ring serves set_tid_address, prlimit64,
-# gettid, the identity getters, rt_sigaction and exit_group; exit_group
+# gettid, the identity getters, rt_sigaction dispositions and queries, and
+# exit_group; exit_group
 # crosses back through HVC #6 GRANT_OP_ROOT_EXIT, authenticated by the
 # shared stopped-CPU readers (carrick-aarch64 stopped_abi), and ends the
 # run with its full status. glibc hello and CPython now count only rseq
-# (293, #1906); musl hello counts nothing. Caught-signal delivery to a
-# ring-installed handler is slice D.
+# (293, #1906); musl hello counts nothing. The soft root's MM is opened on
+# the legacy venue, never admitted to the MM portal owner, so the owner
+# cannot publish a signal frame: installing a caught handler stays a counted
+# ENOSYS until slice D admits the MM and delivers it (#2814).
 schema_version = 1
 id = "arm.softcpu.hvc2-kernel-dispatch"
 title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
@@ -63,6 +66,7 @@ guest_surfaces = [
   "syscall:gettid",
   "syscall:prlimit64",
   "syscall:exit_group",
+  "syscall:rt_sigaction",
   "signal:SIGPIPE",
   "vmm:soft",
 ]
@@ -111,7 +115,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
-hosted_arm64 = "The in-guest zone witnesses need the production EL1 image on an arm64 host and run in the soft-aarch64-native job's ignored step: carrick-softcpu-aarch64-host::soft_zone::soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer, ::soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait and ::soft_zone_host_futex_wake_reaches_the_parked_ring_waiter. The root admission witnesses run there too: ::soft_root_set_tid_address_returns_its_own_tid_in_ring, ::soft_root_prlimit64_copies_out_the_stack_limit_in_ring, ::soft_root_prlimit64_refuses_a_bad_resource_and_a_bad_pointer_in_ring and ::soft_root_exit_group_status_crosses_the_native_root_exit."
+hosted_arm64 = "The in-guest zone witnesses need the production EL1 image on an arm64 host and run in the soft-aarch64-native job's ignored step: carrick-softcpu-aarch64-host::soft_zone::soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer, ::soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait and ::soft_zone_host_futex_wake_reaches_the_parked_ring_waiter. The root admission witnesses run there too: ::soft_root_set_tid_address_returns_its_own_tid_in_ring, ::soft_root_prlimit64_copies_out_the_stack_limit_in_ring, ::soft_root_prlimit64_refuses_a_bad_resource_and_a_bad_pointer_in_ring, ::soft_root_exit_group_status_crosses_the_native_root_exit and ::soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver."
 embed_structural = "The soft AArch64 single-process runner executes via carrick-softcpu-aarch64-host on Linux arm64 (boot_probe dynamic glibc hello, static musl hello and pinned CPython 3.12.16); CLI carrier wiring lands in a later #1236 slice."
 signed = "macOS signed HVF acceptance covers HvfVmm; soft AArch64 native block execution runs on Linux arm64 CI (soft-aarch64-native)."
 docker = "Dynamic glibc hello, static musl hello and pinned CPython 3.12.16 outputs and exit codes are checked directly against deterministic Linux expectations with zero fixture syscall replies."
