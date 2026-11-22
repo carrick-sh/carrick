@@ -267,7 +267,7 @@ fn live_counter_source_is_read_at_every_count_observation() {
     r.cpu.gic.enable(27, 0x80);
     r.cpu.gic.configure(0xf0, true);
     // The virtual count is the live one less its offset.
-    r.cpu.counter = CounterSource::live(live, 0);
+    r.cpu.counter = CounterSource::provider(live, 0);
     // A stale provider sample: never what the guest reads.
     r.cpu.named.cntvct = SystemValue(7);
     assert_eq!(r.run(MRS_X1_CNTVCT), Outcome::Continue);
@@ -295,7 +295,7 @@ fn live_counter_source_is_read_at_every_count_observation() {
     assert_eq!(r.run(MRS_X1_IAR1), Outcome::Continue);
     assert_eq!(r.get(1), 27);
     // D11.2.2: the virtual count is the live count less the offset.
-    r.cpu.counter = CounterSource::live(live, 600);
+    r.cpu.counter = CounterSource::provider(live, 600);
     assert_eq!(r.run(MRS_X1_CNTVCT), Outcome::Continue);
     assert_eq!(r.get(1), 2_000);
 }

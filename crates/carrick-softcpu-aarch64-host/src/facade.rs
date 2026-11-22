@@ -1860,7 +1860,7 @@ where
         let mut cpu = CpuState::default();
         cpu.named.cntfrq = SystemValue(DEFAULT_CNTFRQ_HZ);
         let boot_count = soft_physical_count();
-        cpu.counter = CounterSource::live(soft_physical_count, boot_count);
+        cpu.counter = CounterSource::provider(soft_physical_count, boot_count);
         cpu.sample_counter();
         cpu.named.mpidr = SystemValue(MPIDR_AFF0_RES1);
         // What a driver's CPU bring-up programs on every carrier's GIC (HVF:
