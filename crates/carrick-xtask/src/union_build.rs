@@ -102,7 +102,13 @@ pub struct UnionBuildArgs {
 pub enum Outcome {
     Merged,
     AlreadyInBase,
-    Conflict { paths: Vec<String> },
+    /// The head conflicts. `with_base` says whether it conflicts with the
+    /// base alone (it needs a rebase) or only with heads merged before it
+    /// (a landing-train interaction).
+    Conflict {
+        paths: Vec<String>,
+        with_base: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,10 +259,23 @@ pub fn union(root: &Path, args: &UnionBuildArgs) -> Result<UnionReceipt, UnionBu
             ));
         }
         git_ok(&args.worktree, &["merge", "--abort"])?;
+        // Against the base alone, in memory (no worktree change).
+        let with_base = !git(
+            &args.worktree,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                &base_sha,
+                &head,
+            ],
+        )?
+        .status
+        .success();
         receipts.push(HeadReceipt {
             pr,
             head,
-            outcome: Outcome::Conflict { paths },
+            outcome: Outcome::Conflict { paths, with_base },
         });
     }
     let union_sha = git_ok(&args.worktree, &["rev-parse", "HEAD"])?;
@@ -325,7 +344,15 @@ pub fn render(receipt: &UnionReceipt) -> String {
         let outcome = match &head.outcome {
             Outcome::Merged => "merged".to_owned(),
             Outcome::AlreadyInBase => "already in base".to_owned(),
-            Outcome::Conflict { paths } => format!("CONFLICT: {}", paths.join(", ")),
+            Outcome::Conflict { paths, with_base } => format!(
+                "CONFLICT {}: {}",
+                if *with_base {
+                    "with the base (rebase it)"
+                } else {
+                    "with an earlier head (train interaction)"
+                },
+                paths.join(", ")
+            ),
         };
         out.push_str(&format!(
             "  #{} {}: {outcome}\n",
@@ -387,9 +414,10 @@ mod tests {
         sh(dir, &["rev-parse", "HEAD"])
     }
 
-    /// A remote with main, three PR heads (one clean, one conflicting with
-    /// the first, one already merged) and a clone of it.
-    fn fixture() -> (tempfile::TempDir, PathBuf, [String; 4]) {
+    /// A remote with main, four PR heads (one clean, one conflicting with
+    /// the first, one already merged, one conflicting with main) and a
+    /// clone of it.
+    fn fixture() -> (tempfile::TempDir, PathBuf, [String; 5]) {
         let dir = tempfile::tempdir().unwrap();
         let remote = dir.path().join("remote");
         std::fs::create_dir(&remote).unwrap();
@@ -404,10 +432,13 @@ mod tests {
         sh(&remote, &["checkout", "-q", "-b", "pr3"]);
         let pr3 = commit(&remote, "b.txt", "b\n", "pr3");
         sh(&remote, &["checkout", "-q", "main"]);
+        sh(&remote, &["checkout", "-q", "-b", "pr4"]);
+        let pr4 = commit(&remote, "b.txt", "stale\n", "pr4");
+        sh(&remote, &["checkout", "-q", "main"]);
         sh(&remote, &["merge", "-q", "--no-ff", "--no-edit", "pr3"]);
         let main = sh(&remote, &["rev-parse", "HEAD"]);
         assert_ne!(main, base0);
-        for (n, sha) in [(1, &pr1), (2, &pr2), (3, &pr3)] {
+        for (n, sha) in [(1, &pr1), (2, &pr2), (3, &pr3), (4, &pr4)] {
             sh(
                 &remote,
                 &["update-ref", &format!("refs/pull/{n}/head"), sha],
@@ -421,7 +452,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        (dir, clone, [main, pr1, pr2, pr3])
+        (dir, clone, [main, pr1, pr2, pr3, pr4])
     }
 
     #[test]
@@ -449,7 +480,7 @@ mod tests {
 
     #[test]
     fn a_conflicting_head_is_recorded_and_left_out_and_the_rest_merge() {
-        let (dir, clone, [main, pr1, pr2, pr3]) = fixture();
+        let (dir, clone, [main, pr1, pr2, pr3, pr4]) = fixture();
         let worktree = dir.path().join("union");
         let receipt = union(
             &clone,
@@ -458,6 +489,7 @@ mod tests {
                     "1".parse().unwrap(),
                     "2".parse().unwrap(),
                     format!("3@{pr3}").parse().unwrap(),
+                    "4".parse().unwrap(),
                 ],
                 base: "main".to_owned(),
                 remote: "origin".to_owned(),
@@ -480,7 +512,8 @@ mod tests {
                     pr: 2,
                     head: pr2,
                     outcome: Outcome::Conflict {
-                        paths: vec!["a.txt".to_owned()]
+                        paths: vec!["a.txt".to_owned()],
+                        with_base: false,
                     }
                 },
                 HeadReceipt {
@@ -488,9 +521,17 @@ mod tests {
                     head: pr3,
                     outcome: Outcome::AlreadyInBase
                 },
+                HeadReceipt {
+                    pr: 4,
+                    head: pr4,
+                    outcome: Outcome::Conflict {
+                        paths: vec!["b.txt".to_owned()],
+                        with_base: true,
+                    }
+                },
             ]
         );
-        assert_eq!(receipt.conflicts().count(), 1);
+        assert_eq!(receipt.conflicts().count(), 2);
         // The union holds main and #1, and the aborted merge left it clean.
         assert_eq!(
             std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
@@ -506,7 +547,10 @@ mod tests {
                 .unwrap();
         assert_eq!(on_disk, receipt);
         assert!(render(&receipt).contains("#2 "), "{}", render(&receipt));
-        assert!(render(&receipt).contains("CONFLICT: a.txt"));
+        assert!(
+            render(&receipt).contains("CONFLICT with an earlier head (train interaction): a.txt")
+        );
+        assert!(render(&receipt).contains("CONFLICT with the base (rebase it): b.txt"));
         // An existing worktree path is refused rather than reused.
         let again = union(
             &clone,
