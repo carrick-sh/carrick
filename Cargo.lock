@@ -1095,6 +1095,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-softcpu-aarch64",
  "carrick-softmmu",
  "carrick-vfs",

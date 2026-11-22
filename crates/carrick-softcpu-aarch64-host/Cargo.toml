@@ -24,6 +24,7 @@ carrick-vfs = { path = "../carrick-vfs" }
 libc.workspace = true
 
 [dev-dependencies]
+carrick-personality-linux = { path = "../carrick-personality-linux" }
 goblin.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
