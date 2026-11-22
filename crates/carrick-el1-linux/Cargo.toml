@@ -24,7 +24,7 @@ zerocopy.workspace = true
 
 [features]
 default = []
-host-test = ["carrick-el1/host-test", "carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test"]
+host-test = ["carrick-el1/host-test", "carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test", "dep:carrick-test-support"]
 allocator-test-control = ["carrick-el1/allocator-test-control"]
 
 [[bin]]
@@ -51,3 +51,5 @@ carrick-personality-linux = { path = "../carrick-personality-linux", features = 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 carrick-fatal = { path = "../carrick-fatal" }
 libc.workspace = true
+# Host-test fixtures (`mm_portal::test_support`) back carrier regions with it.
+carrick-test-support = { path = "../carrick-test-support", optional = true }

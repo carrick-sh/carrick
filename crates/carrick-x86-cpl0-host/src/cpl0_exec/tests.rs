@@ -16,7 +16,7 @@ const ENTRY: u64 = 0x40_1000;
 
 /// A zeroed carrier region holding the zone and reservation table at their
 /// real CPL0 offsets.
-struct Region(Box<carrick_test_support::TestEl1Region>);
+struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
 
 impl Region {
     fn new() -> Self {

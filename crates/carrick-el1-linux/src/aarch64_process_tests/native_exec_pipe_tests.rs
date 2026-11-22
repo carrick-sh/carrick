@@ -1866,7 +1866,8 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             .install(table.id(), fd::Fd(number), false)
             .unwrap();
     }
-    let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let storage =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: aligned storage is retained for both inherited table bindings.
     let map = unsafe {
         &*storage

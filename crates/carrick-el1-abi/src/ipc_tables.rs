@@ -340,12 +340,11 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     extern crate std;
     use super::*;
-    use std::boxed::Box;
+    use carrick_test_support::{ZeroedBox, ZeroedPages};
 
-    fn map() -> Box<IpcTableMap> {
-        let layout = std::alloc::Layout::new::<IpcTableMap>();
+    fn map() -> ZeroedBox<IpcTableMap> {
         // SAFETY: all-zero is the empty map.
-        unsafe { Box::from_raw(std::alloc::alloc_zeroed(layout).cast()) }
+        unsafe { ZeroedBox::new_zeroed() }
     }
     fn raw(n: u64) -> RawTableId {
         RawTableId {
@@ -395,7 +394,7 @@ mod tests {
 
     #[test]
     fn owned_lookup_does_not_spin_behind_unrelated_preempted_publication() {
-        let m: &'static IpcTableMap = Box::leak(map());
+        let m: &'static IpcTableMap = ZeroedBox::leak(map());
         let keys: std::vec::Vec<u64> = (1..u64::MAX)
             .filter(|key| home(*key) == home(1))
             .take(2)
@@ -449,9 +448,8 @@ mod tests {
         assert!(m.window_published());
         let dir_len = crate::ipc::IPC_DIRECTORY_BYTES;
         let pool_len = crate::EL1_IPC_POOL_SPAN as usize;
-        let dir = unsafe {
-            std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(dir_len, 4096).unwrap())
-        } as usize;
+        let backing = ZeroedPages::new(dir_len);
+        let dir = backing.as_ptr() as usize;
         let pool = 0x1000_0000_usize; // never dereferenced by these checks
         // SAFETY: only validation and a header read of zeroed memory.
         unsafe {
@@ -469,7 +467,7 @@ mod tests {
 
     #[test]
     fn el1_ipc_table_map_readers_never_see_torn_entries() {
-        let m: &'static IpcTableMap = Box::leak(map());
+        let m: &'static IpcTableMap = ZeroedBox::leak(map());
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
             s.spawn(|| {

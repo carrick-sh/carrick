@@ -231,7 +231,7 @@ fn with_pair(run: impl FnOnce(Pair<'_, '_>)) {
     // It is leaked because the kernel bound below keeps the zone's namespace
     // table as its identity authority for as long as any claim lives.
     let zone: &'static carrick_test_support::TestEl1Region =
-        Box::leak(carrick_test_support::TestEl1Region::zeroed());
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let zone: &'static ZoneTables = unsafe {
         &*zone
             .as_ptr()

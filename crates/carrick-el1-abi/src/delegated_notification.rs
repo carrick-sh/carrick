@@ -266,30 +266,22 @@ mod tests {
     extern crate std;
     use super::*;
     use carrick_sched_core::{Waker, ZoneTables};
-    struct Region {
-        ptr: core::ptr::NonNull<u8>,
-        layout: std::alloc::Layout,
-    }
+    struct Region(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
     impl Region {
         fn new() -> Self {
-            let layout =
-                std::alloc::Layout::from_size_align(crate::EL1_REGION_SIZE as usize, 4096).unwrap();
-            Self {
-                ptr: core::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
-                layout,
-            }
+            Self(carrick_test_support::TestEl1Region::zeroed())
         }
         fn authority(&self) -> DelegatedFileAuthority<'_> {
             let file = unsafe {
                 &*self
-                    .ptr
+                    .0
                     .as_ptr()
                     .add(EL1_OBJECT_TABLE_OFFSET as usize)
                     .cast::<DelegatedFile>()
             };
             let zone = unsafe {
                 &*self
-                    .ptr
+                    .0
                     .as_ptr()
                     .add(EL1_ZONE_OFFSET as usize)
                     .cast::<ZoneTables>()
@@ -307,11 +299,6 @@ mod tests {
                 },
             )
             .unwrap()
-        }
-    }
-    impl Drop for Region {
-        fn drop(&mut self) {
-            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
         }
     }
     #[test]

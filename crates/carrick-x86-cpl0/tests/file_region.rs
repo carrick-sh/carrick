@@ -13,7 +13,7 @@ use std::os::fd::AsRawFd;
 
 struct Fixture {
     registration: FileRegionRegistration,
-    _storage: Box<TestEl1Region>,
+    _storage: carrick_test_support::ZeroedBox<TestEl1Region>,
 }
 
 fn binding(identity: u64) -> FileRegionBinding {

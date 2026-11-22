@@ -2070,7 +2070,7 @@ mod intake_tests {
     }
 
     struct RootReplyFixture {
-        region: Box<carrick_test_support::TestEl1Region>,
+        region: carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>,
         custody: Arc<crate::trap::CarrierVmCustody>,
         owner: carrick_el1_abi::El1MmHandle,
         window: carrick_el1_abi::PortalGrantWindow,
