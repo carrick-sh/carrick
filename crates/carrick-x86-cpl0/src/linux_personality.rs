@@ -265,6 +265,13 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         self.staged.is_some()
     }
 
+    fn staged_for_ring_owner(&self) -> bool {
+        matches!(
+            self.staged,
+            Some(carrick_personality_linux::native_host_file::HostFileStage::InRing)
+        )
+    }
+
     fn release_host_object(
         &mut self,
         binding: HostObjectBinding,

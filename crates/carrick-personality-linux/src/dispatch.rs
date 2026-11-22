@@ -1761,6 +1761,12 @@ fn finish<'a, C: EntryContext + 'a>(
         // Only an unserved, effect-free decline is staged: Handback retains
         // its operation and AccountedForward has already run its family.
         if result == FamilyCompletion::Forward && pending.stage_native_host_file() {
+            // A stage with no host request leaves the call with its ring
+            // owner. Declined for owed work, that owner has not answered
+            // yet (an empty poll set, #2791): rerun, never a counted ENOSYS.
+            if pending.staged_for_ring_owner() && rerun_declined_for_work(true, pending) {
+                return CompletionRoute::WithWork;
+            }
             // Staged readlink owns its service and copyout. Only an actual
             // host syscall replay belongs in its forward census.
             if ordinal == crate::crossing::nr::READLINKAT.raw() {
