@@ -389,7 +389,9 @@ pub fn dispatch_fault(
             if action == Action::Forward
                 && matches!(
                     supply.outcome(),
-                    OwnerFaultSupplyOutcome::PolicyDeclined | OwnerFaultSupplyOutcome::Unavailable
+                    OwnerFaultSupplyOutcome::PolicyDeclined
+                        | OwnerFaultSupplyOutcome::ProtectionDeclined
+                        | OwnerFaultSupplyOutcome::Unavailable
                 )
                 && (native || supply.outcome() == OwnerFaultSupplyOutcome::PolicyDeclined)
             {

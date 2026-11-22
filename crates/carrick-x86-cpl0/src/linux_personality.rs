@@ -2,7 +2,7 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
-use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
+use carrick_abi::{LinuxErrno, LinuxSiginfo};
 use carrick_el1::isa::x86::context::native::{CpuBinding, NativeFrame, checked_scheduler_slot};
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
 use carrick_el1_abi::{
@@ -1131,29 +1131,18 @@ fn supply_user_fault(
         }
         return UserFaultSupply::Served;
     }
-    use carrick_el1::fault::OwnerFaultSupplyOutcome;
-    match supply.outcome() {
-        OwnerFaultSupplyOutcome::ProtectionDeclined => UserFaultSupply::Signal {
-            signum: LINUX_SIGSEGV,
-            code: LINUX_SEGV_ACCERR,
+    use crate::fault_answer::{FaultAnswer, answer};
+    match answer(supply.outcome(), fault.present) {
+        FaultAnswer::Signal { signum, code } => UserFaultSupply::Signal {
+            signum,
+            code,
             address: fault.address,
         },
-        OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
-            signum: LINUX_SIGSEGV,
-            code: if fault.present {
-                LINUX_SEGV_ACCERR
-            } else {
-                LINUX_SEGV_MAPERR
-            },
-            address: fault.address,
-        },
-        OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
+        FaultAnswer::Wait(wait) => UserFaultSupply::TypedRelease(wait),
         // Reason 9 in the low byte; the shared policy's deciding branch
         // above it, so the host's refusal line names it (#2668).
-        OwnerFaultSupplyOutcome::Unavailable => {
-            UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8))
-        }
-        OwnerFaultSupplyOutcome::CowSelected => {
+        FaultAnswer::Unresolved => UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8)),
+        FaultAnswer::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
@@ -1186,19 +1175,18 @@ fn supply_user_fault(
                 &mut cow,
             );
             if result != Action::Served || cow.completion.is_none() {
-                return match supply.outcome() {
-                    OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
-                        signum: LINUX_SIGSEGV,
-                        code: if fault.present {
-                            LINUX_SEGV_ACCERR
-                        } else {
-                            LINUX_SEGV_MAPERR
-                        },
+                // A sibling may change the mapping between the COW supply and
+                // this rerun, so every decline answers as on the first pass.
+                return match answer(supply.outcome(), fault.present) {
+                    FaultAnswer::Signal { signum, code } => UserFaultSupply::Signal {
+                        signum,
+                        code,
                         address: fault.address,
                     },
-                    OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
+                    FaultAnswer::Wait(wait) => UserFaultSupply::TypedRelease(wait),
                     // The rerun after the COW supply: bit 24 marks it (#2668).
-                    _ => {
+                    // A second selection here is no answer either.
+                    FaultAnswer::Unresolved | FaultAnswer::CowSelected | FaultAnswer::Selected => {
                         UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8) | (1 << 24))
                     }
                 };
@@ -1211,7 +1199,7 @@ fn supply_user_fault(
             );
             UserFaultSupply::Served
         }
-        OwnerFaultSupplyOutcome::Selected => {
+        FaultAnswer::Selected => {
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
             };
