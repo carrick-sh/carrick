@@ -214,6 +214,65 @@ impl Drop for FrameGrantResidencyRetirement<'_> {
     }
 }
 
+/// Why [`FrameGrantResidencyTable::begin_replacement`] changed nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyReplacementRefusal {
+    InvalidIdentity,
+    /// A grant-window lease holds a row the replacement would retire.
+    Leased,
+    /// No slot for the replacement row, or for the part of a retired row
+    /// that lies outside the replaced span. The table needs a segment.
+    Capacity,
+}
+
+/// One copy-on-write's whole residency change, admitted before any leaf
+/// changes: transfer admission is closed on every row the replacement
+/// overlaps, and a slot is reserved for the replacement row and for each
+/// part of those rows outside the replaced span. [`commit`](Self::commit)
+/// therefore cannot run out of slots, and dropping the token restores the
+/// table exactly (#2813). The caller holds the exact-MM editor throughout.
+pub struct FrameGrantResidencyReplacement<'a> {
+    table: FrameGrantResidencyTable<ResidencyRows<'a>>,
+    replacement: FrameGrantResidencyIdentity,
+    replacement_slot: usize,
+    lower: Option<usize>,
+    upper: Option<usize>,
+    active: bool,
+}
+impl FrameGrantResidencyReplacement<'_> {
+    /// Retire the overlapped rows, republish their outside parts with their
+    /// committed bits, and publish the replacement row with every page
+    /// committed. Call it once the replacement leaves are live. Exact-MM
+    /// exclusion makes a failed commit an invariant violation.
+    #[must_use]
+    pub fn commit(mut self) -> bool {
+        self.active = false;
+        self.table.commit_replacement(
+            self.replacement,
+            self.replacement_slot,
+            self.lower,
+            self.upper,
+        )
+    }
+}
+impl Drop for FrameGrantResidencyReplacement<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            for slot in [Some(self.replacement_slot), self.lower, self.upper]
+                .into_iter()
+                .flatten()
+            {
+                self.table.release_reserved_slot(slot);
+            }
+            self.table.reopen_replaced_rows(
+                self.replacement.mm_key,
+                self.replacement.semantic_base,
+                self.replacement.semantic_base + self.replacement.len,
+            );
+        }
+    }
+}
+
 /// A shared open-addressed segment. Grants hash by their smallest power-of-two
 /// page-count bucket. A page in a grant lies in its base bucket or the next
 /// bucket, so lookups check those two buckets for each size class. Disjoint
@@ -933,13 +992,24 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 return Err(FrameGrantResidencyRefusal::Overlap);
             }
         }
-        let class = (identity.len / GRANT_PAGE_SIZE)
-            .next_power_of_two()
-            .trailing_zeros();
-        let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
+        let slot = self
+            .reserve_slot(identity.mm_key, identity.semantic_base, identity.len)
+            .ok_or(FrameGrantResidencyRefusal::Capacity)?;
+        self.slot(slot)
+            .ok_or(FrameGrantResidencyRefusal::Capacity)?
+            .publish(identity);
+        Ok(slot)
+    }
+
+    /// Claim a reusable slot on the probe chain of a row at `semantic_base`
+    /// of `len` bytes. The slot reads as an in-flight publication until its
+    /// row is published or [`Self::release_reserved_slot`] returns it.
+    fn reserve_slot(&self, mm_key: u64, semantic_base: u64, len: u64) -> Option<usize> {
+        let class = (len / GRANT_PAGE_SIZE).next_power_of_two().trailing_zeros();
+        let bucket = semantic_base / (GRANT_PAGE_SIZE << class);
         for (segment_index, segment) in self.segments().enumerate() {
             for probe in 0..GRANT_PROBES {
-                let slot = Self::probe(identity.mm_key, bucket, class, probe);
+                let slot = Self::probe(mm_key, bucket, class, probe);
                 let record = &segment.slots[slot];
                 let state = record.state.load(Ordering::Acquire);
                 if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
@@ -957,12 +1027,235 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                     )
                     .is_ok()
                 {
-                    record.publish(identity);
-                    return Ok(segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot);
+                    return Some(segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot);
                 }
             }
         }
-        Err(FrameGrantResidencyRefusal::Capacity)
+        None
+    }
+
+    /// Return a reserved slot nothing was published into. It stays a
+    /// tombstone so no probe chain through it is cut.
+    fn release_reserved_slot(&self, slot: usize) {
+        let Some(record) = self.slot(slot) else {
+            return;
+        };
+        let state = record.state.load(Ordering::Acquire);
+        if state & GRANT_STATE_MASK == GRANT_WRITING {
+            record.state.store(
+                (state & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                Ordering::Release,
+            );
+            self.storage
+                .rows()
+                .directory
+                .retirement_epoch
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Admit one copy-on-write's residency change before any leaf changes:
+    /// see [`FrameGrantResidencyReplacement`]. A refusal changes nothing.
+    pub fn begin_replacement(
+        &self,
+        replacement: FrameGrantResidencyIdentity,
+    ) -> Result<FrameGrantResidencyReplacement<'_>, ResidencyReplacementRefusal> {
+        if !replacement.valid() {
+            return Err(ResidencyReplacementRefusal::InvalidIdentity);
+        }
+        let mm_key = replacement.mm_key;
+        let start = replacement.semantic_base;
+        let end = start + replacement.len;
+        if !self.close_replaced_rows(mm_key, start, end) {
+            return Err(ResidencyReplacementRefusal::Leased);
+        }
+        // Rows of one MM never overlap: only the row holding the span's
+        // first page can reach below it, and only the row holding its last
+        // page can reach above it.
+        let below = self.lookup(mm_key, start).and_then(|row| {
+            let base = row.identity.semantic_base;
+            (base < start).then(|| (base, start - base))
+        });
+        let above = self.lookup(mm_key, end - GRANT_PAGE_SIZE).and_then(|row| {
+            let row_end = row.identity.semantic_base + row.identity.len;
+            (row_end > end).then(|| (end, row_end - end))
+        });
+        let mut reserved = [None; 3];
+        for (index, span) in [Some((start, replacement.len)), below, above]
+            .into_iter()
+            .enumerate()
+        {
+            let Some((base, len)) = span else {
+                continue;
+            };
+            reserved[index] = self.reserve_slot(mm_key, base, len);
+            if reserved[index].is_none() {
+                for slot in reserved.into_iter().flatten() {
+                    self.release_reserved_slot(slot);
+                }
+                self.reopen_replaced_rows(mm_key, start, end);
+                return Err(ResidencyReplacementRefusal::Capacity);
+            }
+        }
+        let Some(replacement_slot) = reserved[0] else {
+            return Err(ResidencyReplacementRefusal::Capacity);
+        };
+        Ok(FrameGrantResidencyReplacement {
+            table: self.storage.rows().as_table(),
+            replacement,
+            replacement_slot,
+            lower: reserved[1],
+            upper: reserved[2],
+            active: true,
+        })
+    }
+
+    /// Close transfer admission on every row overlapping `[start, end)`,
+    /// found by bounded lookups. False, with nothing closed, when a
+    /// grant-window lease holds one.
+    fn close_replaced_rows(&self, mm_key: u64, start: u64, end: u64) -> bool {
+        for page in (start..end).step_by(GRANT_PAGE_SIZE as usize) {
+            let Some(row) = self.lookup(mm_key, page) else {
+                continue;
+            };
+            // A row that began on an earlier page of the span is closed.
+            if page > start && row.identity.semantic_base < page {
+                continue;
+            }
+            let closed = self.slot(row.slot).is_some_and(|record| {
+                record
+                    .transfer_pins
+                    .compare_exchange(
+                        0,
+                        TRANSFER_PIN_RETIRING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            });
+            if !closed {
+                self.reopen_replaced_rows(mm_key, start, page);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reopen_replaced_rows(&self, mm_key: u64, start: u64, end: u64) {
+        for page in (start..end).step_by(GRANT_PAGE_SIZE as usize) {
+            if let Some(record) = self
+                .lookup(mm_key, page)
+                .and_then(|row| self.slot(row.slot))
+            {
+                let _ = record.transfer_pins.compare_exchange(
+                    TRANSFER_PIN_RETIRING,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+    }
+
+    fn commit_replacement(
+        &self,
+        replacement: FrameGrantResidencyIdentity,
+        replacement_slot: usize,
+        mut lower: Option<usize>,
+        mut upper: Option<usize>,
+    ) -> bool {
+        let mm_key = replacement.mm_key;
+        let start = replacement.semantic_base;
+        let end = start + replacement.len;
+        for page in (start..end).step_by(GRANT_PAGE_SIZE as usize) {
+            // A row retired on an earlier page is no longer found.
+            let Some(row) = self.lookup(mm_key, page) else {
+                continue;
+            };
+            let Some((record, dirty)) = self.slot_entry(row.slot) else {
+                return false;
+            };
+            if record.transfer_pins.load(Ordering::Acquire) != TRANSFER_PIN_RETIRING {
+                return false;
+            }
+            let bits =
+                core::array::from_fn(|index| record.committed[index].load(Ordering::Acquire));
+            if record
+                .state
+                .compare_exchange(
+                    row.epoch,
+                    (row.epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            dirty.fetch_and(!(1 << (row.slot % 64)), Ordering::AcqRel);
+            self.storage
+                .rows()
+                .directory
+                .retirement_epoch
+                .fetch_add(1, Ordering::Release);
+            let base = row.identity.semantic_base;
+            let row_end = base + row.identity.len;
+            if base < start {
+                let Some(slot) = lower.take() else {
+                    return false;
+                };
+                self.write_fragment(slot, row.identity, bits, base, start);
+            }
+            if row_end > end {
+                let Some(slot) = upper.take() else {
+                    return false;
+                };
+                self.write_fragment(slot, row.identity, bits, end, row_end);
+            }
+        }
+        for slot in [lower, upper].into_iter().flatten() {
+            self.release_reserved_slot(slot);
+        }
+        let Some((record, dirty)) = self.slot_entry(replacement_slot) else {
+            return false;
+        };
+        record.publish(replacement);
+        for bit in 0..(replacement.len / GRANT_PAGE_SIZE) as usize {
+            record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+        }
+        dirty.fetch_or(1 << (replacement_slot % 64), Ordering::Release);
+        true
+    }
+
+    /// Publish `[fragment_start, fragment_end)` of the retired row
+    /// `identity` into a slot reserved for it, carrying its committed bits.
+    fn write_fragment(
+        &self,
+        fragment_slot: usize,
+        identity: FrameGrantResidencyIdentity,
+        bits: [u64; 8],
+        fragment_start: u64,
+        fragment_end: u64,
+    ) {
+        let Some((record, dirty)) = self.slot_entry(fragment_slot) else {
+            return;
+        };
+        let base = identity.semantic_base;
+        record.publish(FrameGrantResidencyIdentity {
+            semantic_base: fragment_start,
+            physical_ipa: identity.physical_ipa + fragment_start - base,
+            len: fragment_end - fragment_start,
+            ..identity
+        });
+        let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
+        let count = ((fragment_end - fragment_start) / GRANT_PAGE_SIZE) as usize;
+        for bit in 0..count {
+            let old_bit = shift + bit;
+            if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
+                record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+                dirty.fetch_or(1 << (fragment_slot % 64), Ordering::Release);
+            }
+        }
     }
 
     /// Number of addressable records in this venue's resolved view.
@@ -1508,24 +1801,12 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             if fragment_start >= fragment_end {
                 continue;
             }
-            let fragment = FrameGrantResidencyIdentity {
-                semantic_base: fragment_start,
-                physical_ipa: identity.physical_ipa + fragment_start - base,
-                len: fragment_end - fragment_start,
-                ..identity
-            };
-            if let Some(fragment_slot) = self.publish(fragment)
-                && let Some((record, dirty)) = self.slot_entry(fragment_slot)
-            {
-                let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
-                let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
-                for bit in 0..count {
-                    let old_bit = shift + bit;
-                    if bits[old_bit / 64] & (1 << (old_bit % 64)) != 0 {
-                        record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
-                        dirty.fetch_or(1 << (fragment_slot % 64), Ordering::Release);
-                    }
-                }
+            if let Some(fragment_slot) = self.reserve_slot(
+                identity.mm_key,
+                fragment_start,
+                fragment_end - fragment_start,
+            ) {
+                self.write_fragment(fragment_slot, identity, bits, fragment_start, fragment_end);
             }
         }
     }

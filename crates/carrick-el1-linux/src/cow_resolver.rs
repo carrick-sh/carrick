@@ -42,6 +42,12 @@ impl CowResolver for HardwareCowResolver {
     fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
         self.completion.take()
     }
+    fn grow_residency(&mut self) -> bool {
+        carrick_core::mm::frames::grow_residency_for_cow(
+            carrick_el1::isa::frame_grant_residency_guest(),
+            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+        )
+    }
     fn executable_publication(&self) -> bool {
         self.publication.is_some()
     }
@@ -169,6 +175,13 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
 
     fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
         self.completion.take()
+    }
+
+    fn grow_residency(&mut self) -> bool {
+        carrick_core::mm::frames::grow_residency_for_cow(
+            self.residency,
+            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+        )
     }
 
     fn editor_busy(&mut self) {

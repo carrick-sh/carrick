@@ -148,7 +148,10 @@ pub fn handle_cow_outcome(
             CowResolution::NeedsSupply
         }
         crate::cow::GuestCowOutcome::Declined(reason) => CowResolution::Refused(Some(reason)),
-        _ => CowResolution::Resolved,
+        crate::cow::GuestCowOutcome::ResidencyCapacity => CowResolution::NeedsResidency,
+        crate::cow::GuestCowOutcome::Resolved(_) | crate::cow::GuestCowOutcome::AlreadyWritable => {
+            CowResolution::Resolved
+        }
     }
 }
 
@@ -1583,6 +1586,17 @@ fn dispatch_classified_fault<
             CowResolution::Resolved => return Action::Served,
             CowResolution::Refused(reason) => {
                 supply.note(FaultVerdict::CowRefused(reason));
+                return Action::Forward;
+            }
+            // Nothing changed. The table grows outside the MM editor, and
+            // the faulting instruction's rerun takes the copy-on-write
+            // again against the larger table (#2813).
+            CowResolution::NeedsResidency => {
+                drop(_editor);
+                if cow_resolver.grow_residency() {
+                    return Action::Served;
+                }
+                supply.note(FaultVerdict::CowRefused(None));
                 return Action::Forward;
             }
             CowResolution::NeedsSupply => {
