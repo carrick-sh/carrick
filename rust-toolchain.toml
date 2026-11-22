@@ -20,5 +20,9 @@ components = ["rustfmt", "clippy", "llvm-tools-preview"]
 # x86_64-unknown-none builds the freestanding CPL0 image (`just build-cpl0`,
 # a dependency of `just test-kvm`). x86_64-unknown-linux-musl builds the static
 # x86 fixtures and probes the KVM lane runs (`linux/amd64` conformance probes,
-# the musl hello fixture).
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-freebsd", "x86_64-unknown-netbsd", "aarch64-unknown-none-softfloat", "x86_64-unknown-none", "x86_64-unknown-linux-musl"]
+# the musl hello fixture). x86_64-unknown-linux-gnu is the triple the host
+# authority census pins for its Linux profiles
+# (scripts/migrate/check-host-authority-transitions.py): the host itself on
+# x86_64 Linux, a cross target on Linux arm64 and macOS, where a census test
+# otherwise fails with "can't find crate for `std`" (#2809).
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-freebsd", "x86_64-unknown-netbsd", "aarch64-unknown-none-softfloat", "x86_64-unknown-none", "x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
