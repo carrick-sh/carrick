@@ -4514,15 +4514,10 @@ where
         if let Some(context) = &self.state.service_kernel_context {
             executor::native_terminal_test_control::terminal(context.thread().key());
         }
-        let code = i32::try_from(status.code()).map_err(|_| {
-            RuntimeError::Configuration("native terminal status exceeds result domain".into())
-        })?;
-        let (exit_code, signal) = match status.kind() {
-            carrick_sched_core::process::TerminationKind::Exited => (code, None),
-            carrick_sched_core::process::TerminationKind::Signaled { .. } => {
-                (128 + code, Some(code))
-            }
-        };
+        let (exit_code, signal) = carrick_kernel::run_result::native_terminal_exit(status)
+            .ok_or_else(|| {
+                RuntimeError::Configuration("native terminal status exceeds result domain".into())
+            })?;
         let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
             &self.kernel,
             exit_code,
