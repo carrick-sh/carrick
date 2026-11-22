@@ -728,6 +728,22 @@ pub fn grow_residency_or_not_now(
     }
 }
 
+/// Grow the residency table by one segment for a copy-on-write that found
+/// no slot for its rows (`GuestCowOutcome::ResidencyCapacity`). The caller
+/// holds no MM editor and no descriptor claim. `true` means rerun the
+/// copy-on-write: a segment was published by this caller or a racing owner,
+/// or one is being published now.
+#[inline(never)]
+pub fn grow_residency_for_cow(
+    table: &FrameGrantResidencyTable,
+    allocator: &impl ReservationMetadataAllocator,
+) -> bool {
+    matches!(
+        table.grow(allocator, table.extension_count()),
+        Ok(()) | Err(ResidencyGrowthRefusal::Publishing)
+    )
+}
+
 /// Grow the residency table for a fork the carrier refused with
 /// `ForkStockRefusal::Residency`. A fork publishes rows for every inherited
 /// page outside a grant window, in the parent and in the child, so its need

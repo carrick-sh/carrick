@@ -24,6 +24,10 @@ pub enum GuestCowOutcome {
     AlreadyWritable,
     /// Left to the host (counted in the pool by reason).
     Declined(CowDecline),
+    /// The residency table has no slot for the rows this copy-on-write
+    /// publishes. Nothing changed and the grant is ready again: grow the
+    /// table outside the MM editor, then rerun (#2813).
+    ResidencyCapacity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,9 +252,29 @@ where
         return decline(pool);
     }
 
-    if !residency.retire_small_span(mm_key, run.va, run.len) {
-        return decline(pool);
-    }
+    // The whole residency change is admitted before the first byte is
+    // copied: a row that finds no slot is a typed "not now" with every leaf,
+    // row and grant as it was, never a live page without its row (#2813).
+    let replacing =
+        match residency.begin_replacement(carrick_core_abi::FrameGrantResidencyIdentity {
+            mm_key,
+            semantic_base: run.va,
+            physical_ipa: new_ipa,
+            len: run.len,
+            mapping_id: grant.backing.mapping_id.get(),
+            frame_id: grant.backing.frame_id.get(),
+            owner_generation: grant.backing.owner_generation.get(),
+            inventory_revision: grant.backing.inventory_revision.get(),
+        }) {
+            Ok(replacing) => replacing,
+            Err(carrick_core_abi::mm::residency::ResidencyReplacementRefusal::Capacity) => {
+                if !pool.abandon(&grant) {
+                    return Err(CowError::Internal);
+                }
+                return Ok(GuestCowOutcome::ResidencyCapacity);
+            }
+            Err(_) => return decline(pool),
+        };
 
     for offset in (0..run.len).step_by(PAGE as usize) {
         let copied = copy_window.with_page(run.old_ipa + offset, new_ipa + offset, &mut copy_page);
@@ -274,25 +298,8 @@ where
             if flush_required {
                 invalidate_asid();
             }
-            let replacement = carrick_core_abi::FrameGrantResidencyIdentity {
-                mm_key,
-                semantic_base: run.va,
-                physical_ipa: new_ipa,
-                len: run.len,
-                mapping_id: grant.backing.mapping_id.get(),
-                frame_id: grant.backing.frame_id.get(),
-                owner_generation: grant.backing.owner_generation.get(),
-                inventory_revision: grant.backing.inventory_revision.get(),
-            };
-            if residency.publish(replacement).is_some() {
-                for offset in (0..run.len).step_by(PAGE as usize) {
-                    let page = residency
-                        .lookup(mm_key, run.va + offset)
-                        .ok_or(CowError::Corrupt)?;
-                    if !residency.record_commit(page) {
-                        return Err(CowError::Corrupt);
-                    }
-                }
+            if !replacing.commit() {
+                return Err(CowError::Corrupt);
             }
             let completion = CowGrantCompletion {
                 purpose: carrick_core_abi::CowGrantPurpose::UserWrite,

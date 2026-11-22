@@ -246,6 +246,11 @@ impl<
                     }
                     awaiting_supply_progress = true;
                 }
+                TransferStep::GrowResidency => {
+                    if !venue.selection_venues().cow.grow_residency() {
+                        return Err(UserWriteError::Owner(MmError::NoMemory));
+                    }
+                }
                 TransferStep::Suspended => return Err(UserWriteError::Busy),
                 TransferStep::Complete => break,
             }

@@ -8,6 +8,10 @@ use core::num::NonZeroU64;
 pub enum CowResolution {
     Resolved,
     NeedsSupply,
+    /// The residency table has no slot for this copy-on-write's rows and
+    /// nothing changed. Release the MM editor, grow the table
+    /// ([`CowResolver::grow_residency`]) and rerun (#2813).
+    NeedsResidency,
     /// Left to the forwarding venue. The reason is the classifier's decline
     /// when one decided; `None` when the venue itself was unavailable.
     Refused(Option<carrick_core_abi::CowDecline>),
@@ -60,6 +64,13 @@ pub trait CowResolver {
     /// The MM's editor could not be taken (another EL1 editor, or a host
     /// pause closed its gate): the fault goes to the host.
     fn editor_busy(&mut self) {}
+    /// Grow this resolver's residency table after
+    /// [`CowResolution::NeedsResidency`]. The caller holds no MM editor.
+    /// `true`: rerun the copy-on-write (a segment was published, here or by
+    /// a racing owner). `false`: the table cannot grow.
+    fn grow_residency(&mut self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]

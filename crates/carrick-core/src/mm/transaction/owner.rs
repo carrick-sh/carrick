@@ -110,6 +110,10 @@ pub enum TransferStep {
     Selected(SelectedChunk),
     Supply(carrick_core_abi::PortalGrantWindow),
     CowSupply(carrick_core_abi::PortalGrantWindow),
+    /// A copy-on-write found no residency slot and changed nothing. The MM
+    /// editor is released: grow the table through the selection's COW
+    /// resolver, then select again.
+    GrowResidency,
     /// A gate/editor wait or the existing lazy FrameGrantRequest path. No
     /// root lock, editor, or physical pin survives this return.
     Suspended,
@@ -617,6 +621,7 @@ impl<
                             )?;
                         }
                         CowResolution::Refused(_) => return Err(MmError::Core),
+                        CowResolution::NeedsResidency => return Ok(TransferStep::GrowResidency),
                         CowResolution::NeedsSupply => {
                             let mut root = self.root(continuation.handle.mm(), slot)?;
                             return Ok(TransferStep::CowSupply(

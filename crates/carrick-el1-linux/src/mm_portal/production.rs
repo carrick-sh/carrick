@@ -356,6 +356,16 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 frame.x[18] = window.host_backing.map_or(0, |source| source.offset());
                 Err(MmError::Busy)
             }
+            // The selection released the MM editor; the caller's rerun
+            // takes the copy-on-write again against the larger table.
+            TransferStep::GrowResidency => {
+                use carrick_core::mm::transfer::resolver::CowResolver as _;
+                if cow.grow_residency() {
+                    Err(MmError::Busy)
+                } else {
+                    Err(MmError::NoMemory)
+                }
+            }
             TransferStep::Suspended => Err(MmError::Busy),
             TransferStep::Complete => Err(MmError::Invalid),
         }

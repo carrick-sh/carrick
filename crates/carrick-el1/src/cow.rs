@@ -751,8 +751,10 @@ mod tests {
     /// #2813: a COW never leaves a live page without its residency row.
     /// The source row covers eight pages and the run replaces its lower
     /// four, so the COW needs two slots (the replacement row and the row's
-    /// upper fragment) and the table has room for one. A row that finds no
-    /// slot was silently dropped.
+    /// upper fragment) and the table has none: the old row keeps its slot
+    /// until the replacement commits. A row that found no slot was silently
+    /// dropped; now the COW changes nothing, answers `ResidencyCapacity`,
+    /// and succeeds once there is room.
     #[test]
     fn cow_with_no_residency_slot_loses_no_row() {
         let (arena, memory) = forked(true);
@@ -810,6 +812,38 @@ mod tests {
                 residency.is_guest_committed(MM, VA + offset),
                 "page {offset:#x} lost its residency row: {outcome:?}"
             );
+        }
+        // Nothing changed: the leaf, the source row and the ready grant.
+        assert_eq!(outcome, Ok(GuestCowOutcome::ResidencyCapacity));
+        assert_eq!(arena.leaf(VA) & PA, OLD);
+        let source = residency.lookup(MM, VA).unwrap();
+        assert_eq!((source.identity, source.expected_ipa), (old, OLD));
+        assert!(
+            residency.pin_transfer(source).is_some(),
+            "admission reopened"
+        );
+        assert_eq!(pool.ready(MM).count(), 1);
+        assert_eq!(residency.observed_slots_used(), residency.slot_capacity());
+
+        // With room (every filler retired) the same COW resolves, and both
+        // the replacement row and the upper fragment are published.
+        assert!(residency.retire_overlapping(MM, 0x1_0000_0000, 1 << 40));
+        let outcome = resolve_guest_cow(
+            &venue,
+            MM,
+            VA,
+            |source, destination| memory.copy_through(&arena, source, destination),
+            || {},
+        );
+        assert!(
+            matches!(outcome, Ok(GuestCowOutcome::Resolved(_))),
+            "{outcome:?}"
+        );
+        for offset in (0..8 * PAGE).step_by(PAGE as usize) {
+            let page = residency.lookup(MM, VA + offset).unwrap();
+            let expected = if offset < 4 * PAGE { GRANT } else { OLD };
+            assert_eq!(page.expected_ipa, expected + offset);
+            assert!(residency.is_guest_committed(MM, VA + offset));
         }
     }
 
