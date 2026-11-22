@@ -59,12 +59,7 @@ mod execve_tests {
     /// suite is green on KVM-less hosts. The KVM gate (`just test-kvm`) sets
     /// `CARRICK_REQUIRE_KVM=1`, under which a missing device FAILS.
     fn kvm_available() -> bool {
-        let present = std::path::Path::new("/dev/kvm").exists();
-        assert!(
-            present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
-            "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
-        );
-        present
+        carrick_test_support::kvm_host::usable_or_skip()
     }
 
     fn engine_for(bytes: &[u8]) -> KvmTrapEngine {

@@ -297,20 +297,7 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
 
 #[test]
 fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
-    let present = std::path::Path::new("/dev/kvm").exists();
-    assert!(
-        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
-    );
-    if !present {
-        let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
-        // libtest captures eprintln! from passing tests. Write to the host
-        // descriptor so an ordinary test invocation shows the skip reason.
-        // SAFETY: message is a retained byte literal and fd 2 is the test
-        // process's stderr; a short write affects only this diagnostic.
-        unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
-        return;
-    }
+    carrick_test_support::require_kvm!();
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
     // The completed compiler owns all writable ELF descriptors. A writer
@@ -2122,18 +2109,7 @@ fn mounted_static_x86_signal_segv_fault_matches_native() {
 }
 
 fn skip_without_kvm() -> bool {
-    let present = std::path::Path::new("/dev/kvm").exists();
-    assert!(
-        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
-    );
-    if !present {
-        let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
-        // SAFETY: fixed diagnostic bytes to the test process stderr.
-        unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
-        return true;
-    }
-    false
+    !carrick_test_support::kvm_host::usable_or_skip()
 }
 
 fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {

@@ -123,6 +123,7 @@ mod tests {
 
     #[test]
     fn three_vcpus_observe_one_carrier_backing_in_order() {
+        carrick_test_support::require_kvm!();
         let mut machine = CarrierMachine::create_stopped(3).unwrap();
         let mut extent = BackingExtent::private(FrameGpa::new(0), PAGE as usize).unwrap();
         // Real-mode MOV AL, [0x100]; OUT 0xe9, AL; HLT. Each KVM_RUN must
