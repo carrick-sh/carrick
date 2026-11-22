@@ -2715,10 +2715,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     /// (`access_user_target`): a root opened on the legacy venue has none.
     /// HVF and x86 carriers deliver to every MM they run.
     fn signal_frames_reach(&self, mm: &Mm) -> bool {
-        let _ = self.signal_frames;
-        self.portal().is_ok_and(|owner| {
-            ReservationMm::new(mm.mm.raw().get())
-                .is_some_and(|key| owner.admitted_handle(key, self.worker()).is_ok())
+        self.signal_frames.reaches(|| {
+            self.portal().is_ok_and(|owner| {
+                ReservationMm::new(mm.mm.raw().get())
+                    .is_some_and(|key| owner.admitted_handle(key, self.worker()).is_ok())
+            })
         })
     }
 
