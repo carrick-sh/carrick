@@ -90,15 +90,19 @@ impl HostResolverSnapshot {
     }
 
     /// Capture configd's rendered resolver file using only in-process file I/O.
+    /// The host read stays here, the launch owner of this I/O; the choice of
+    /// which file to serve is [`Self::capture_with`]'s.
     pub fn capture_launch() -> Self {
-        Self::capture_from(&HostResolverFiles::LAUNCH)
+        Self::capture_with(&HostResolverFiles::LAUNCH, |path| {
+            std::fs::read_to_string(path).ok()
+        })
     }
 
-    fn capture_from(files: &HostResolverFiles<'_>) -> Self {
+    fn capture_with(files: &HostResolverFiles<'_>, read: impl Fn(&str) -> Option<String>) -> Self {
         let contents = files
             .rendered
             .iter()
-            .find_map(|path| std::fs::read_to_string(path).ok())
+            .find_map(|path| read(path))
             .unwrap_or_default();
         // A systemd-resolved host's /etc/resolv.conf names only its loopback
         // stub (127.0.0.53). The guest's loopback is its own, so that server is
@@ -106,14 +110,11 @@ impl HostResolverSnapshot {
         // containers the upstream servers in /run/systemd/resolve/resolv.conf;
         // do the same, but only when that file names a reachable server.
         let contents = match files.resolved_upstream {
-            Some(upstream) if names_only_loopback_servers(&contents) => {
-                std::fs::read_to_string(upstream)
-                    .ok()
-                    .filter(|upstream| {
-                        nameserver_addresses(upstream).any(|address| !address.is_loopback())
-                    })
-                    .unwrap_or(contents)
-            }
+            Some(upstream) if names_only_loopback_servers(&contents) => read(upstream)
+                .filter(|upstream| {
+                    nameserver_addresses(upstream).any(|address| !address.is_loopback())
+                })
+                .unwrap_or(contents),
             _ => contents,
         };
         Self {
@@ -454,7 +455,8 @@ mod tests {
             rendered: &[rendered_path.as_str()],
             resolved_upstream: Some(upstream_path.as_str()),
         };
-        let snapshot = HostResolverSnapshot::capture_from(&files);
+        let snapshot =
+            HostResolverSnapshot::capture_with(&files, |path| std::fs::read_to_string(path).ok());
         String::from_utf8(ResolvConfVfs::from_host_snapshot(&snapshot).contents).unwrap()
     }
 

@@ -77,76 +77,30 @@ mod overlay_dispatch_tests {
             let reporter = CompatReporter::default();
             let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
             let initial = if nr == 65 { 42 } else { 0 };
-            let create = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
-            let DispatchOutcome::Returned { value: fd } = create else {
-                panic!("{create:?}");
-            };
+            let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let DispatchOutcome::Returned { value: fd } = create else { panic!("{create:?}"); };
             for (index, len) in sizes.iter().enumerate() {
                 let address = 0x4100 + index as u64 * 32;
                 memory.write_bytes(address, &1u64.to_ne_bytes()).unwrap();
-                memory
-                    .write_bytes(
-                        0x4000 + index as u64 * 16,
-                        LinuxIovec::new(address, *len).as_bytes(),
-                    )
-                    .unwrap();
+                memory.write_bytes(0x4000 + index as u64 * 16, LinuxIovec::new(address, *len).as_bytes()).unwrap();
             }
-            let result = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(
-                        nr,
-                        SyscallArgs([fd as u64, 0x4000, sizes.len() as u64, 0, 0, 0]),
-                    ),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
-            let expected_outcome = if expected < 0 {
-                DispatchOutcome::errno(LINUX_EINVAL)
-            } else {
-                DispatchOutcome::Returned { value: expected }
-            };
+            let result = dispatcher.dispatch(&context, SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x4000, sizes.len() as u64, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let expected_outcome = if expected < 0 { DispatchOutcome::errno(LINUX_EINVAL) } else { DispatchOutcome::Returned { value: expected } };
             assert_eq!(result, expected_outcome, "nr={nr} sizes={sizes:?}");
             if nr == 65 && expected == 8 {
                 let mut delivered = Vec::new();
                 for (index, len) in sizes.iter().enumerate() {
                     let count = (*len as usize).min(8 - delivered.len());
-                    delivered.extend(
-                        memory
-                            .read_bytes(0x4100 + index as u64 * 32, count)
-                            .unwrap(),
-                    );
-                    if delivered.len() == 8 {
-                        break;
-                    }
+                    delivered.extend(memory.read_bytes(0x4100 + index as u64 * 32, count).unwrap());
+                    if delivered.len() == 8 { break; }
                 }
                 assert_eq!(delivered, 42u64.to_ne_bytes());
             }
-            let drain = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
+            let drain = dispatcher.dispatch(&context, SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])), &mut memory, &reporter).unwrap();
             if let Some(value) = remaining {
                 assert_eq!(drain, DispatchOutcome::Returned { value: 8 });
-                assert_eq!(
-                    memory.read_bytes(0x4300, 8).unwrap(),
-                    (value as u64).to_ne_bytes()
-                );
-            } else {
-                assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN));
-            }
+                assert_eq!(memory.read_bytes(0x4300, 8).unwrap(), (value as u64).to_ne_bytes());
+            } else { assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN)); }
         }
     }
 
@@ -165,39 +119,16 @@ mod overlay_dispatch_tests {
             let reporter = CompatReporter::default();
             let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
             let initial = if nr == 65 { 42 } else { 0 };
-            let create = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
-            let DispatchOutcome::Returned { value: fd } = create else {
-                panic!("{create:?}");
-            };
+            let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([initial, 2048, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+            let DispatchOutcome::Returned { value: fd } = create else { panic!("{create:?}"); };
             memory.write_bytes(0x4100, &1u64.to_ne_bytes()).unwrap();
             let mut iovecs = Vec::new();
-            if first_len != 0 {
-                iovecs.push(LinuxIovec::new(0x4100, first_len));
-            }
+            if first_len != 0 { iovecs.push(LinuxIovec::new(0x4100, first_len)); }
             iovecs.push(LinuxIovec::new(1, 8));
             for (index, iovec) in iovecs.iter().enumerate() {
-                memory
-                    .write_bytes(0x4000 + index as u64 * 16, iovec.as_bytes())
-                    .unwrap();
+                memory.write_bytes(0x4000 + index as u64 * 16, iovec.as_bytes()).unwrap();
             }
-            let result = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(
-                        nr,
-                        SyscallArgs([fd as u64, 0x4000, iovecs.len() as u64, 0, 0, 0]),
-                    ),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
+            let result = dispatcher.dispatch(&context, SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x4000, iovecs.len() as u64, 0, 0, 0])), &mut memory, &reporter).unwrap();
             let wanted = match expected {
                 -14 => DispatchOutcome::errno(LINUX_EFAULT),
                 -22 => DispatchOutcome::errno(LINUX_EINVAL),
@@ -205,109 +136,42 @@ mod overlay_dispatch_tests {
             };
             assert_eq!(result, wanted, "nr={nr} first_len={first_len}");
             if nr == 65 && first_len != 0 {
-                assert_eq!(
-                    memory.read_bytes(0x4100, first_len as usize).unwrap(),
-                    42u64.to_ne_bytes()[..first_len as usize]
-                );
+                assert_eq!(memory.read_bytes(0x4100, first_len as usize).unwrap(), 42u64.to_ne_bytes()[..first_len as usize]);
             }
-            let drain = dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap();
+            let drain = dispatcher.dispatch(&context, SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4300, 8, 0, 0, 0])), &mut memory, &reporter).unwrap();
             if let Some(value) = counter {
                 assert_eq!(drain, DispatchOutcome::Returned { value: 8 });
                 assert_eq!(memory.read_bytes(0x4300, 8).unwrap(), value.to_ne_bytes());
-            } else {
-                assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN));
-            }
+            } else { assert_eq!(drain, DispatchOutcome::errno(LINUX_EAGAIN)); }
         }
     }
 
     #[test]
     fn serial_host_el1_ipc_production_eventfd_table_shares_data_with_guest_view() {
-        use carrick_el1_abi::ipc::{IpcBacking, fd};
+        use carrick_el1_abi::ipc::{fd, IpcBacking};
         use carrick_el1_abi::ipc_tables::IpcTableMap;
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
         let owner = context.kernel().ipc().unwrap();
         // SAFETY: zero is the empty atomic map; retained for this test process.
-        let map = unsafe {
-            &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>())
-                .cast::<IpcTableMap>()
-        };
+        let map = unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>()).cast::<IpcTableMap>() };
         let files = context.resources().files();
         files.publish_ipc(Arc::clone(&owner), map).unwrap();
         let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
         let reporter = CompatReporter::default();
-        let create = dispatcher
-            .dispatch(
-                &context,
-                SyscallRequest::new(19, SyscallArgs([7, 0, 0, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap();
-        let DispatchOutcome::Returned { value: number } = create else {
-            panic!("eventfd creation: {create:?}");
-        };
+        let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([7, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();
+        let DispatchOutcome::Returned { value: number } = create else { panic!("eventfd creation: {create:?}"); };
         let table = fd::TableId::from_raw(map.lookup(files.id().raw()).unwrap());
         let region = owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
         let description = authority.get(table, fd::Fd(number as i32)).unwrap();
-        let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(description.backing) else {
-            panic!("production eventfd must route to its shared object");
-        };
-        assert_eq!(
-            region
-                .lock(object, &crate::el1_zone::HostLockWait)
-                .unwrap()
-                .eventfd()
-                .unwrap()
-                .try_read()
-                .result,
-            Ok(7)
-        );
+        let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(description.backing) else { panic!("production eventfd must route to its shared object"); };
+        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(7));
         memory.write_bytes(0x4000, &9u64.to_ne_bytes()).unwrap();
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(64, SyscallArgs([number as u64, 0x4000, 8, 0, 0, 0])),
-                    &mut memory,
-                    &reporter
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 8 }
-        );
-        assert_eq!(
-            region
-                .lock(object, &crate::el1_zone::HostLockWait)
-                .unwrap()
-                .eventfd()
-                .unwrap()
-                .try_read()
-                .result,
-            Ok(9)
-        );
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(57, SyscallArgs([number as u64, 0, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 0 }
-        );
-        assert_eq!(
-            authority.get(table, fd::Fd(number as i32)),
-            Err(fd::Error::BadFd)
-        );
+        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(64, SyscallArgs([number as u64, 0x4000, 8, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 8 });
+        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(9));
+        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(57, SyscallArgs([number as u64, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 0 });
+        assert_eq!(authority.get(table, fd::Fd(number as i32)), Err(fd::Error::BadFd));
         assert!(region.lock(object, &crate::el1_zone::HostLockWait).is_err());
     }
 
@@ -370,17 +234,10 @@ mod overlay_dispatch_tests {
             for (index, value) in [0u64, 7, 11].into_iter().enumerate() {
                 let address = 0x4100 + index as u64 * 8;
                 memory.write_bytes(address, &value.to_ne_bytes()).unwrap();
-                memory
-                    .write_bytes(
-                        0x4200 + index as u64 * 16,
-                        LinuxIovec::new(address, 8).as_bytes(),
-                    )
-                    .unwrap();
+                memory.write_bytes(0x4200 + index as u64 * 16, LinuxIovec::new(address, 8).as_bytes()).unwrap();
             }
             SyscallRequest::new(66, SyscallArgs([fd as u64, 0x4200, 3, 0, 0, 0]))
-        } else {
-            write
-        };
+        } else { write };
         let blocked = dispatcher
             .dispatch(&context, write, &mut memory, &reporter)
             .unwrap();
@@ -476,17 +333,12 @@ mod overlay_dispatch_tests {
         };
         let completion = continuation.resume(event, &context).unwrap().completion;
         assert_eq!(
-            fold_continuation_completion(
-                completion,
-                &dispatcher,
-                &context,
-                &mut memory,
-                (context.shared().mm().id(), context.shared().mm().id().raw()),
-            )
-            .unwrap(),
-            Some(DispatchOutcome::Returned {
-                value: if vector { 24 } else { 8 }
-            })
+            fold_continuation_completion(completion,
+&dispatcher,
+&context,
+&mut memory,
+(context.shared().mm().id(), context.shared().mm().id().raw()),).unwrap(),
+            Some(DispatchOutcome::Returned { value: if vector { 24 } else { 8 } })
         );
         assert_eq!(
             dispatcher
@@ -495,10 +347,7 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Returned { value: 8 }
         );
         let delivered = memory.read_bytes(0x4020, 8).unwrap();
-        assert_eq!(
-            u64::from_ne_bytes(delivered.try_into().unwrap()),
-            if vector { 18 } else { 7 }
-        );
+        assert_eq!(u64::from_ne_bytes(delivered.try_into().unwrap()), if vector { 18 } else { 7 });
         if reuse_fd {
             let read_replacement =
                 SyscallRequest::new(63, SyscallArgs([fd as u64, 0x4020, 8, 0, 0, 0]));
@@ -568,90 +417,56 @@ mod overlay_dispatch_tests {
     }
 
     fn exec_child_allocation_reuses_cloexec_stdio(pair: bool) {
-        let mut parent = SyscallDispatcher::new();
-        let parent_context = parent.capture_one_task_context().unwrap();
-        let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
-        let reporter = CompatReporter::default();
-        assert_eq!(
-            parent
-                .dispatch(
-                    &parent_context,
+            let mut parent = SyscallDispatcher::new();
+            let parent_context = parent.capture_one_task_context().unwrap();
+            let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
+            let reporter = CompatReporter::default();
+            assert_eq!(
+                parent.dispatch(&parent_context,
                     SyscallRequest::new(25, SyscallArgs([0, 2, 1, 0, 0, 0])),
-                    &mut memory,
-                    &reporter
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 0 },
-            "F_SETFD on parent stdin must succeed; EBADF is errno 9"
-        );
-        let (mut child, child_context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
-            &parent,
-            parent_context.thread().registry_id(),
-            crate::thread::ThreadId::synthetic_for_tests(4172),
-            41,
-            42,
-        );
-        let kernel = child_context.kernel();
-        let prepared = kernel.prepare_exec(&child_context, None).unwrap();
-        let child_context = kernel.commit_exec(prepared, None).unwrap();
-        assert!(child.stdio_is_closed(0));
-        if pair {
-            assert_eq!(
-                child
-                    .dispatch(
-                        &child_context,
-                        SyscallRequest::new(59, SyscallArgs([0; 6])),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
-                DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT),
-                "failed pipe copyout is EFAULT, errno 14"
+                    &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 0 },
+                "F_SETFD on parent stdin must succeed; EBADF is errno 9"
             );
-            assert_eq!(
-                child
-                    .dispatch(
-                        &child_context,
-                        SyscallRequest::new(25, SyscallArgs([0, 1, 0, 0, 0, 0])),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
-                DispatchOutcome::errno(crate::linux_abi::LINUX_EBADF),
-                "rollback must leave stdin closed: EBADF, errno 9"
-            );
-        }
-        let request = if pair {
-            SyscallRequest::new(59, SyscallArgs([0x10000, 0, 0, 0, 0, 0]))
-        } else {
-            SyscallRequest::new(19, SyscallArgs([0, 0, 0, 0, 0, 0]))
-        };
-        assert_eq!(
-            child
-                .dispatch(&child_context, request, &mut memory, &reporter)
-                .unwrap(),
-            DispatchOutcome::Returned { value: 0 },
-            "allocation must reuse fd 0 after exec; EMFILE is errno 24"
-        );
-        if pair {
-            let bytes = memory.read_bytes(0x10000, 8).unwrap();
-            assert_eq!(i32::from_ne_bytes(bytes[..4].try_into().unwrap()), 0);
-            assert_eq!(i32::from_ne_bytes(bytes[4..].try_into().unwrap()), 3);
-        }
-        assert_eq!(
-            parent
-                .dispatch(
-                    &parent_context,
+            let (mut child, child_context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
+                &parent, parent_context.thread().registry_id(),
+                crate::thread::ThreadId::synthetic_for_tests(4172), 41, 42);
+            let kernel = child_context.kernel();
+            let prepared = kernel.prepare_exec(&child_context, None).unwrap();
+            let child_context = kernel.commit_exec(prepared, None).unwrap();
+            assert!(child.stdio_is_closed(0));
+            if pair {
+                assert_eq!(child.dispatch(&child_context,
+                    SyscallRequest::new(59, SyscallArgs([0; 6])),
+                    &mut memory, &reporter).unwrap(),
+                    DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT),
+                    "failed pipe copyout is EFAULT, errno 14");
+                assert_eq!(child.dispatch(&child_context,
                     SyscallRequest::new(25, SyscallArgs([0, 1, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 1 },
-            "the live parent's stdin and FD_CLOEXEC must be unchanged"
-        );
-        assert!(parent.capture_one_task_context().is_ok());
-        assert!(child.capture_one_task_context().is_ok());
+                    &mut memory, &reporter).unwrap(),
+                    DispatchOutcome::errno(crate::linux_abi::LINUX_EBADF),
+                    "rollback must leave stdin closed: EBADF, errno 9");
+            }
+            let request = if pair {
+                SyscallRequest::new(59, SyscallArgs([0x10000, 0, 0, 0, 0, 0]))
+            } else {
+                SyscallRequest::new(19, SyscallArgs([0, 0, 0, 0, 0, 0]))
+            };
+            assert_eq!(child.dispatch(&child_context, request, &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 0 },
+                "allocation must reuse fd 0 after exec; EMFILE is errno 24");
+            if pair {
+                let bytes = memory.read_bytes(0x10000, 8).unwrap();
+                assert_eq!(i32::from_ne_bytes(bytes[..4].try_into().unwrap()), 0);
+                assert_eq!(i32::from_ne_bytes(bytes[4..].try_into().unwrap()), 3);
+            }
+            assert_eq!(parent.dispatch(&parent_context,
+                SyscallRequest::new(25, SyscallArgs([0, 1, 0, 0, 0, 0])),
+                &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 1 },
+                "the live parent's stdin and FD_CLOEXEC must be unchanged");
+            assert!(parent.capture_one_task_context().is_ok());
+            assert!(child.capture_one_task_context().is_ok());
     }
 
     #[test]
@@ -659,45 +474,22 @@ mod overlay_dispatch_tests {
         let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
         let (mut child, context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
-            &parent,
-            parent_context.thread().registry_id(),
-            crate::thread::ThreadId::synthetic_for_tests(4173),
-            41,
-            42,
-        );
+            &parent, parent_context.thread().registry_id(),
+            crate::thread::ThreadId::synthetic_for_tests(4173), 41, 42);
         let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
         let reporter = CompatReporter::default();
-        assert_eq!(
-            child
-                .dispatch(
-                    &context,
-                    SyscallRequest::new(57, SyscallArgs([0; 6])),
-                    &mut memory,
-                    &reporter
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 0 }
-        );
+        assert_eq!(child.dispatch(&context,
+            SyscallRequest::new(57, SyscallArgs([0; 6])), &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Returned { value: 0 });
         for index in 0..64 {
             let expected = if index == 0 { 0 } else { index + 2 };
-            assert_eq!(
-                child
-                    .dispatch(
-                        &context,
-                        SyscallRequest::new(19, SyscallArgs([0; 6])),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
-                DispatchOutcome::Returned { value: expected }
-            );
+            assert_eq!(child.dispatch(&context,
+                SyscallRequest::new(19, SyscallArgs([0; 6])), &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: expected });
             // The reservation selector handles standard streams separately.
             // Its cursor must skip already visited nonstdio slots, otherwise
             // each subsequent allocation scans the entire populated prefix.
-            assert_eq!(
-                *child.captured_file_table().lock_next_fd(),
-                (expected + 1).max(3) as i32
-            );
+            assert_eq!(*child.captured_file_table().lock_next_fd(), (expected + 1).max(3) as i32);
         }
         assert!(!parent.stdio_is_closed(0));
         assert!(parent.capture_one_task_context().is_ok());
@@ -897,9 +689,7 @@ mod overlay_dispatch_tests {
         #[cfg(not(target_os = "linux"))]
         {
             let DispatchOutcome::Returned { value } = outcome else {
-                panic!(
-                    "large nonblocking socket write should make partial progress, got {outcome:?}"
-                );
+                panic!("large nonblocking socket write should make partial progress, got {outcome:?}");
             };
             assert!(
                 value > 0 && (value as usize) < bytes.len(),
@@ -1131,8 +921,7 @@ mod overlay_dispatch_tests {
 
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             {
-                let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
-                    .expect("open description");
+                let open = crate::kernel::FileDescription::inspect(&epoll_open.description).expect("open description");
                 let OpenDescription::Epoll { kqueue, .. } = &*open else {
                     panic!("epfd should be an epoll description");
                 };
@@ -1661,7 +1450,11 @@ mod overlay_dispatch_tests {
         // description wait queue (contract kernel.el1.epoll-zone): that
         // enrollment subscribes the zone record, so a zone item made ready
         // later wakes it through the record's publisher.
-        let epoll = h.dispatcher.open_file(epfd).expect("epoll fd").description;
+        let epoll = h
+            .dispatcher
+            .open_file(epfd)
+            .expect("epoll fd")
+            .description;
         let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let enrollment = {
             let woke = Arc::clone(&woke);
@@ -1720,10 +1513,7 @@ mod overlay_dispatch_tests {
         bytes[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
         h.memory.write_bytes(event, &bytes).expect("event");
         assert_eq!(
-            returned(h.call(
-                21,
-                [epfd as u64, LINUX_EPOLL_CTL_ADD, rd as u64, event, 0, 0]
-            )),
+            returned(h.call(21, [epfd as u64, LINUX_EPOLL_CTL_ADD, rd as u64, event, 0, 0])),
             0
         );
         let byte = h.reserve(8);
@@ -1761,10 +1551,7 @@ mod overlay_dispatch_tests {
             bytes[8..16].copy_from_slice(&data.to_le_bytes());
             h.memory.write_bytes(event, &bytes).expect("event");
             assert_eq!(
-                returned(h.call(
-                    21,
-                    [epfd as u64, LINUX_EPOLL_CTL_ADD, fd as u64, event, 0, 0]
-                )),
+                returned(h.call(21, [epfd as u64, LINUX_EPOLL_CTL_ADD, fd as u64, event, 0, 0])),
                 0
             );
         }
@@ -1908,10 +1695,7 @@ mod overlay_dispatch_tests {
             (linux_errno::ENFILE.get(), 2 * IPC_OBJECT_SEGMENT as u64),
             "the zone's object store is its file table: ENFILE, not ENOMEM"
         );
-        assert_eq!(
-            errno(h.call(19, [0, 0, 0, 0, 0, 0])),
-            linux_errno::ENFILE.get()
-        );
+        assert_eq!(errno(h.call(19, [0, 0, 0, 0, 0, 0])), linux_errno::ENFILE.get());
         // A close returns the object: the next pipe2 succeeds again.
         let fds = h.memory.read_bytes(pair, 8).unwrap();
         let read_fd = i32::from_le_bytes(fds[0..4].try_into().unwrap());
@@ -2142,8 +1926,7 @@ mod overlay_dispatch_tests {
         // dispatch, so no consumption re-arm reaches the epoll interest.
         {
             let open = h.dispatcher.open_file(reader).expect("pipe reader");
-            let description = crate::kernel::FileDescription::inspect(&open.description)
-                .expect("reader description");
+            let description = crate::kernel::FileDescription::inspect(&open.description).expect("reader description");
             let OpenDescription::PipeReader { pipe, .. } = &*description else {
                 panic!("pipe2 read end must be a shared pipe reader");
             };
@@ -2912,10 +2695,7 @@ mod overlay_dispatch_tests {
             fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
                 unreachable!()
             }
-            fn resume_read(
-                &self,
-                continuation: OwnedReadContinuation,
-            ) -> Result<Vec<u8>, MemoryError> {
+            fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
                 assert!(continuation.take::<Vec<u8>>().unwrap().is_empty());
                 Ok(vec![b'x'])
             }
@@ -2937,32 +2717,28 @@ mod overlay_dispatch_tests {
             )
         };
         let mut memory = SuspendedByte(wait);
-        let request =
-            SyscallRequest::new(64, SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]));
-        let first = h
-            .dispatcher
-            .dispatch(&context, request, &mut memory, &h.reporter)
-            .unwrap();
+        let request = SyscallRequest::new(
+            64,
+            SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]),
+        );
+        let first = h.dispatcher.dispatch(&context, request, &mut memory, &h.reporter).unwrap();
         let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
             panic!("copy-in must suspend: {first:?}");
         };
         assert_eq!(staged_write_state(&epoll, writer).0, LINUX_EPOLLOUT);
-        let completed = h
-            .dispatcher
-            .resume_owned_write_copy_in(
-                &context,
-                request,
-                pending,
-                &mut memory,
-                &h.reporter,
-                None,
-                OrdinaryDispatchRoute {
-                    host_wait: None,
-                    lease: None,
-                    mm_executor: None,
-                },
-            )
-            .unwrap();
+        let completed = h.dispatcher.resume_owned_write_copy_in(
+            &context,
+            request,
+            pending,
+            &mut memory,
+            &h.reporter,
+            None,
+            OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        ).unwrap();
         assert_eq!(completed, DispatchOutcome::Returned { value: 1 });
         assert_eq!(staged_write_state(&epoll, writer).0 & LINUX_EPOLLOUT, 0);
     }
@@ -3025,10 +2801,7 @@ mod overlay_dispatch_tests {
             fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
                 unreachable!()
             }
-            fn resume_read(
-                &self,
-                continuation: OwnedReadContinuation,
-            ) -> Result<Vec<u8>, MemoryError> {
+            fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
                 assert!(continuation.take::<Vec<u8>>().unwrap().is_empty());
                 Ok(vec![b'x'])
             }
@@ -3060,14 +2833,7 @@ mod overlay_dispatch_tests {
             assert_eq!(
                 returned(h.call(
                     21,
-                    [
-                        epfd,
-                        LINUX_EPOLL_CTL_ADD,
-                        repl_writer as u64,
-                        event_addr,
-                        0,
-                        0
-                    ],
+                    [epfd, LINUX_EPOLL_CTL_ADD, repl_writer as u64, event_addr, 0, 0],
                 )),
                 0,
             );
@@ -3167,8 +2933,10 @@ mod overlay_dispatch_tests {
                 )
             };
             let mut memory = SuspendedByte(wait);
-            let request =
-                SyscallRequest::new(64, SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]));
+            let request = SyscallRequest::new(
+                64,
+                SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]),
+            );
             let first = h
                 .dispatcher
                 .dispatch(&context, request, &mut memory, &h.reporter)
@@ -3681,8 +3449,7 @@ mod overlay_dispatch_tests {
 
         let delivered_guest_fd = {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
-                .expect("open description");
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description).expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -4604,37 +4371,20 @@ mod overlay_dispatch_tests {
                 7,
             )
         };
-        let mut memory = Word {
-            wait,
-            unavailable: true,
-        };
-        let request = SyscallRequest::new(
-            98,
-            SyscallArgs::from([
-                MEM_BASE,
-                LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
-                8,
-                0,
-                0,
-                0,
-            ]),
-        );
+        let mut memory = Word { wait, unavailable: true };
+        let request = SyscallRequest::new(98, SyscallArgs::from([
+            MEM_BASE, LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(), 8, 0, 0, 0,
+        ]));
         let reporter = CompatReporter::default();
         assert_eq!(
-            dispatcher
-                .dispatch(&context, request, &mut memory, &reporter)
-                .unwrap(),
+            dispatcher.dispatch(&context, request, &mut memory, &reporter).unwrap(),
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
             "unavailable backing must not become EFAULT"
         );
         memory.unavailable = false;
         assert_eq!(
-            dispatcher
-                .dispatch(&context, request, &mut memory, &reporter)
-                .unwrap(),
-            DispatchOutcome::Errno {
-                errno: LINUX_EAGAIN
-            },
+            dispatcher.dispatch(&context, request, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Errno { errno: LINUX_EAGAIN },
             "redispatch must compare the now available value"
         );
     }
@@ -4646,135 +4396,118 @@ mod overlay_dispatch_tests {
         use std::time::{Duration, SystemTime};
 
         for refused_load in [1, 2] {
-            struct Word {
-                wait: PortalOwnerWait,
-                loads: std::cell::Cell<u32>,
-                bytes: [u8; 16],
-                refused_load: u32,
+        struct Word {
+            wait: PortalOwnerWait,
+            loads: std::cell::Cell<u32>,
+            bytes: [u8; 16],
+            refused_load: u32,
+        }
+        impl GuestMemory for Word {
+            fn read_bytes_raw(&self, _: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                Ok(self.bytes[..length].to_vec())
             }
-            impl GuestMemory for Word {
-                fn read_bytes_raw(&self, _: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-                    Ok(self.bytes[..length].to_vec())
-                }
-                fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
-                    let load = self.loads.get() + 1;
-                    self.loads.set(load);
-                    if load == self.refused_load {
-                        Err(MemoryError::OwnerWait(self.wait))
-                    } else {
-                        Ok(7)
-                    }
-                }
-                fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
-                    unreachable!("WAIT must not write the word")
+            fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
+                let load = self.loads.get() + 1;
+                self.loads.set(load);
+                if load == self.refused_load {
+                    Err(MemoryError::OwnerWait(self.wait))
+                } else {
+                    Ok(7)
                 }
             }
-            impl CurrentMmMemory for Word {}
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!("WAIT must not write the word")
+            }
+        }
+        impl CurrentMmMemory for Word {}
 
-            let dispatcher = SyscallDispatcher::new();
-            let context = dispatcher.capture_one_task_context().unwrap();
-            let wait = unsafe {
-                PortalOwnerWait::from_owner(
-                    El1MmHandle::from_admitted_owner(
-                        NonZeroU64::new(1).unwrap(),
-                        ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
-                        NonZeroU64::new(3).unwrap(),
-                    ),
-                    PortalWaitCause::Reservations,
-                    7,
-                )
-            };
-            let mut bytes = [0_u8; 16];
-            bytes[..8].copy_from_slice(&5_i64.to_ne_bytes());
-            let mut memory = Word {
-                wait,
-                loads: std::cell::Cell::new(0),
-                bytes,
-                refused_load,
-            };
-            let reporter = CompatReporter::default();
-            let futex = crate::thread::FutexTable::new();
-            let tid = crate::thread::ThreadId::synthetic_for_tests(1703);
-            let registry = crate::thread::ThreadRegistry::new(tid);
-            let sibling = registry.register_child(0);
-            assert!(registry.is_live(tid) && registry.is_live(sibling));
-            let request = SyscallRequest::new(
-                98,
-                SyscallArgs::from([
-                    MEM_BASE,
-                    LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
-                    7,
-                    MEM_BASE + 0x100,
-                    0,
-                    0,
-                ]),
-            );
-            let clock =
-                crate::kernel::container::ClockDomain::deterministic(SystemTime::UNIX_EPOCH);
-            let completion = SyscallCompletionToken::new(
-                PreparedSyscall {
-                    request,
-                    original_args: request.args,
-                },
-                context.retain_exact(),
-                None,
-            );
-            let operation = completion.relative_futex_wait();
-            let first = dispatch_threaded_futex(
-                &context,
-                &clock,
-                &carrick_thread::platform_futex::SharedFutexTable::new(),
-                request,
-                &mut memory,
-                &reporter,
-                &futex,
-                tid,
-                &registry,
-                None,
-                None,
-                host_table_futex_queue(),
-                Some(operation),
-            );
-            assert_eq!(
-                first,
-                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-            );
-            clock.advance(Duration::from_secs(1)).unwrap();
-            memory.bytes[..8].copy_from_slice(&9_i64.to_ne_bytes());
-            let second = dispatch_threaded_futex(
-                &context,
-                &clock,
-                &carrick_thread::platform_futex::SharedFutexTable::new(),
-                request,
-                &mut memory,
-                &reporter,
-                &futex,
-                tid,
-                &registry,
-                None,
-                None,
-                host_table_futex_queue(),
-                Some(operation),
-            );
-            match second {
-                DispatchOutcome::FutexWait { timeout, .. } => {
-                    assert_eq!(timeout, Some(Duration::from_secs(4)));
-                }
-                other => panic!("expected retained timed wait, got {other:?}"),
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&5_i64.to_ne_bytes());
+        let mut memory = Word {
+            wait,
+            loads: std::cell::Cell::new(0),
+            bytes,
+            refused_load,
+        };
+        let reporter = CompatReporter::default();
+        let futex = crate::thread::FutexTable::new();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1703);
+        let registry = crate::thread::ThreadRegistry::new(tid);
+        let sibling = registry.register_child(0);
+        assert!(registry.is_live(tid) && registry.is_live(sibling));
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([
+                MEM_BASE,
+                LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
+                7,
+                MEM_BASE + 0x100,
+                0,
+                0,
+            ]),
+        );
+        let clock = crate::kernel::container::ClockDomain::deterministic(SystemTime::UNIX_EPOCH);
+        let completion = SyscallCompletionToken::new(
+            PreparedSyscall { request, original_args: request.args }, context.retain_exact(), None,
+        );
+        let operation = completion.relative_futex_wait();
+        let first = dispatch_threaded_futex(
+            &context,
+            &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            tid,
+            &registry,
+            None,
+            None,
+            host_table_futex_queue(),
+        Some(operation),
+        );
+        assert_eq!(first, DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        clock.advance(Duration::from_secs(1)).unwrap();
+        memory.bytes[..8].copy_from_slice(&9_i64.to_ne_bytes());
+        let second = dispatch_threaded_futex(
+            &context,
+            &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            tid,
+            &registry,
+            None,
+            None,
+            host_table_futex_queue(),
+        Some(operation),
+        );
+        match second {
+            DispatchOutcome::FutexWait { timeout, .. } => {
+                assert_eq!(timeout, Some(Duration::from_secs(4)));
             }
-            drop(completion);
-            let successor = SyscallCompletionToken::new(
-                PreparedSyscall {
-                    request,
-                    original_args: request.args,
-                },
-                context.retain_exact(),
-                None,
-            );
-            assert_eq!(
-                successor.relative_futex_wait().retained_remaining(&clock),
-                None
-            );
+            other => panic!("expected retained timed wait, got {other:?}"),
+        }
+        drop(completion);
+        let successor = SyscallCompletionToken::new(
+            PreparedSyscall { request, original_args: request.args }, context.retain_exact(), None,
+        );
+        assert_eq!(successor.relative_futex_wait().retained_remaining(&clock), None);
         }
     }
 
@@ -4812,12 +4545,7 @@ mod overlay_dispatch_tests {
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).
         let mut lin = LinearMemory::new(0x1000, vec![0u8; 8]);
-        assert_eq!(
-            read_futex_word(&mut lin, 0x9_9999_9999),
-            Err(Box::new(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT
-            }))
-        );
+        assert_eq!(read_futex_word(&mut lin, 0x9_9999_9999), Err(Box::new(DispatchOutcome::Errno { errno: LINUX_EFAULT })));
     }
 
     struct CountingMemory {
@@ -4960,7 +4688,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
-            None,
+        None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -5000,7 +4728,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
-            None,
+        None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -5071,7 +4799,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
-            None,
+        None,
         );
 
         assert_eq!(
@@ -5131,7 +4859,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
-            None,
+        None,
         );
 
         match outcome {
@@ -5560,10 +5288,7 @@ mod overlay_dispatch_tests {
 
         description.common().set_status_flags(0);
         // F_SETFL changes mutable flags, never the eventfd access mode.
-        assert_eq!(
-            description.common().status_flags(),
-            carrick_abi::LINUX_O_RDWR
-        );
+        assert_eq!(description.common().status_flags(), carrick_abi::LINUX_O_RDWR);
     }
 
     #[test]
@@ -6060,10 +5785,7 @@ mod hvpatch_in_process_fork_tests {
         assert_eq!(child.proc.lock().membarrier_ready, 0);
         assert_eq!(child.mem().lock().program_break(), 0x1234_0000);
 
-        child
-            .captured_file_table()
-            .write_open_files(None)
-            .remove(&3);
+        child.captured_file_table().write_open_files(None).remove(&3);
         child.mem().lock().seed_brk_current_for_test(0x5678_0000);
         assert!(
             parent
@@ -6580,7 +6302,11 @@ mod hvpatch_in_process_fork_tests {
         );
 
         assert_eq!(
-            returned(call(&mut memory, 57, [target as u64, 0, 0, 0, 0, 0],)),
+            returned(call(
+                &mut memory,
+                57,
+                [target as u64, 0, 0, 0, 0, 0],
+            )),
             0,
         );
         let epoll = dispatcher.open_file(epfd).expect("epoll description");
@@ -8117,10 +7843,7 @@ mod container_policy_dispatch_tests {
             )
             .unwrap();
         assert_eq!(
-            carrick_hal::lookup_fork_projection(
-                shrunk.fork_projection_plan().ranges().unwrap(),
-                heap_base,
-            ),
+            carrick_hal::lookup_fork_projection(shrunk.fork_projection_plan().ranges().unwrap(), heap_base,),
             Some(carrick_hal::ForkLeafDisposition::Preserve)
         );
         assert_eq!(
@@ -8544,20 +8267,8 @@ mod container_clock_tests {
         // Both root entry points must mutate and read the same discipline.
         // Alternate the writer so neither alias is merely a read-only witness.
         for (writer, reader, tick, status, state) in [
-            (
-                carrick_abi::syscall::nr::ADJTIMEX.raw(),
-                SYS_CLOCK_ADJTIME,
-                10_500,
-                LINUX_STA_UNSYNC,
-                LINUX_TIME_ERROR,
-            ),
-            (
-                SYS_CLOCK_ADJTIME,
-                carrick_abi::syscall::nr::ADJTIMEX.raw(),
-                9_500,
-                0,
-                LINUX_TIME_OK,
-            ),
+            (carrick_abi::syscall::nr::ADJTIMEX.raw(), SYS_CLOCK_ADJTIME, 10_500, LINUX_STA_UNSYNC, LINUX_TIME_ERROR),
+            (SYS_CLOCK_ADJTIME, carrick_abi::syscall::nr::ADJTIMEX.raw(), 9_500, 0, LINUX_TIME_OK),
         ] {
             let mut request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
             request.modes = LINUX_ADJ_TICK | LINUX_ADJ_STATUS;
@@ -8572,29 +8283,13 @@ mod container_clock_tests {
                 }
             };
             assert_eq!(
-                dispatcher
-                    .dispatch(
-                        &context,
-                        SyscallRequest::new(writer, args(writer)),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
+                dispatcher.dispatch(&context, SyscallRequest::new(writer, args(writer)), &mut memory, &reporter).unwrap(),
                 DispatchOutcome::Returned { value: state }
             );
             let read_request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-            memory
-                .write_bytes(TIMEX_ADDR, read_request.abi_bytes())
-                .unwrap();
+            memory.write_bytes(TIMEX_ADDR, read_request.abi_bytes()).unwrap();
             assert_eq!(
-                dispatcher
-                    .dispatch(
-                        &context,
-                        SyscallRequest::new(reader, args(reader)),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
+                dispatcher.dispatch(&context, SyscallRequest::new(reader, args(reader)), &mut memory, &reporter).unwrap(),
                 DispatchOutcome::Returned { value: state }
             );
             let reply = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
@@ -8607,20 +8302,10 @@ mod container_clock_tests {
                 SyscallArgs([0; 6])
             };
             assert_eq!(
-                dispatcher
-                    .dispatch(
-                        &context,
-                        SyscallRequest::new(writer, bad_args),
-                        &mut memory,
-                        &reporter
-                    )
-                    .unwrap(),
+                dispatcher.dispatch(&context, SyscallRequest::new(writer, bad_args), &mut memory, &reporter).unwrap(),
                 DispatchOutcome::errno(LINUX_EFAULT)
             );
-            assert_eq!(
-                context.task().container().clock().adjtimex_state().tick,
-                tick
-            );
+            assert_eq!(context.task().container().clock().adjtimex_state().tick, tick);
         }
     }
 
@@ -10714,11 +10399,17 @@ mod inzone_tcp {
 
         g.mem.write_bytes(DATA_SCRATCH, b"reply in-zone").unwrap();
         assert_eq!(
-            g.ok(SYS_WRITE, [accepted_fd as u64, DATA_SCRATCH, 13, 0, 0, 0]),
+            g.ok(
+                SYS_WRITE,
+                [accepted_fd as u64, DATA_SCRATCH, 13, 0, 0, 0]
+            ),
             13
         );
         assert_eq!(
-            g.ok(SYS_READ, [client_fd as u64, read_scratch, 64, 0, 0, 0]),
+            g.ok(
+                SYS_READ,
+                [client_fd as u64, read_scratch, 64, 0, 0, 0]
+            ),
             13
         );
         assert_eq!(
@@ -10736,11 +10427,21 @@ mod inzone_tcp {
         assert_eq!(
             g.ok(
                 SYS_GETPEERNAME,
-                [client_fd as u64, addr_client_peer, len_client_peer, 0, 0, 0,],
+                [
+                    client_fd as u64,
+                    addr_client_peer,
+                    len_client_peer,
+                    0,
+                    0,
+                    0,
+                ],
             ),
             0
         );
-        assert_eq!(g.read_sockaddr_in(addr_client_peer), (port, [127, 0, 0, 1]));
+        assert_eq!(
+            g.read_sockaddr_in(addr_client_peer),
+            (port, [127, 0, 0, 1])
+        );
 
         let addr_accepted_local = ADDR_SCRATCH + 0x20;
         let len_accepted_local = ADDRLEN_SCRATCH + 0x10;
