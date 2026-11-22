@@ -3446,6 +3446,41 @@ mod tests {
         );
     }
 
+    /// #2749 route A: a holder that forwarded a fault with no selection is
+    /// taken by the carrier after a contender stamped the same lane.
+    #[test]
+    fn unselected_fault_intake_ignores_a_peer_selection() {
+        let lane = crate::PortalGrantSlot::new();
+        let holder = ServiceCell::new();
+        let contender = ServiceCell::new();
+        let h = birth(1, 1);
+        let c = birth(2, 1);
+        holder.bind(h).unwrap();
+        contender.bind(c).unwrap();
+        let h_request = holder
+            .publish(h, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let c_window = supply_window(c);
+        assert!(lane.publish_cow_fault_selection(1, c_window));
+        let c_request = contender
+            .publish(
+                c,
+                SnapshotGeneration::INITIAL,
+                fault(),
+                Some(NonZeroU64::MIN),
+            )
+            .unwrap();
+        let mut h_ticket = holder.claim(h_request).unwrap();
+        assert_eq!(h_ticket.take_fault_selection(&lane), Ok(None));
+        let mut c_ticket = contender.claim(c_request).unwrap();
+        assert_eq!(
+            c_ticket.take_fault_selection(&lane),
+            Ok(Some(ServiceFaultSupply::Cow(c_window)))
+        );
+        assert!(h_ticket.complete(false).is_ok());
+        assert!(c_ticket.complete(false).is_ok());
+    }
+
     #[test]
     fn prepared_supply_transfer_retains_exact_owner_across_lane_reuse() {
         let slot = crate::PortalGrantSlot::new();
