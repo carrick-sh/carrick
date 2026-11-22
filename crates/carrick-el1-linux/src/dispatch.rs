@@ -1344,6 +1344,7 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
         releases,
     };
     stage_native_host_file(call, task, validator, &mut namespace)
+        .or_else(|| call.unstaged_for(origin))
 }
 
 /// The byte sources the caller's reservation owner retired, for the
@@ -3807,14 +3808,11 @@ impl<
             return zone_wait;
         }
         if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
-            self.record_refusal(
-                self.frame
-                    .crossing_set()
-                    .refusal_bucket(self.native_number()),
-            );
-            return FamilyCompletion::AccountedComplete(
-                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-            );
+            // A set of host-backed descriptions is the host-readiness
+            // venue's, staged ahead of any route as ppoll's is (#1906). A
+            // set it does not stage is a counted ENOSYS there
+            // (`HostFileCall::unstaged_for`): this caller has no host route.
+            return FamilyCompletion::Forward;
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
@@ -6189,9 +6187,12 @@ impl<
                 )
             }
             nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw() => {
-                let native_service = self.process.as_deref().is_some_and(|process| {
-                    !process.is_root_process() && process.owns_descriptor_namespace()
-                });
+                // A root that owns its descriptor namespace holds its host
+                // sockets in this table as its children do (#1906).
+                let native_service = self
+                    .process
+                    .as_deref()
+                    .is_some_and(|process| process.owns_descriptor_namespace());
                 serve_ring_epoll_ctl(
                     &venue.region,
                     task,

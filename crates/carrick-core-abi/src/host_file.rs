@@ -513,6 +513,108 @@ impl PollWait {
 /// ([`HostCallSerial`]).
 pub const POLL_CALL_SERIAL_ARG: usize = 2;
 
+/// [`HostFileOp::Poll`] `args[3]`: the shape of the set ([`PollShape`]).
+pub const POLL_SHAPE_ARG: usize = 3;
+
+/// Which Linux call a [`HostFileOp::Poll`] record answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum PollShape {
+    /// `poll`/`ppoll`: the input is the caller's `struct pollfd` array and
+    /// the reply is that array with its `revents`.
+    Poll = 0,
+    /// `select`/`pselect6` (#1906): the input is one `struct pollfd` per
+    /// selected descriptor (`events`: [`SELECT_CLASSES`]) and then the
+    /// call's [`SelectSets`]. The reply is the entries alone, each
+    /// `revents` holding the classes select reports ([`select_ready`]),
+    /// and the result counts those classes, as select counts set bits.
+    Select = 1,
+}
+
+impl PollShape {
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Poll),
+            1 => Some(Self::Select),
+            _ => None,
+        }
+    }
+}
+
+/// The `events` bit of each select class, in `readfds`, `writefds`,
+/// `exceptfds` order: Linux `POLLIN`, `POLLOUT` and `POLLPRI`.
+pub const SELECT_CLASSES: [i16; 3] = [0x0001, 0x0004, 0x0002];
+
+/// The select classes of `events` that poll readiness `revents` reports
+/// (select(2)): a hangup or error is readable, an error is writable, and
+/// only priority data is exceptional.
+pub const fn select_ready(events: i16, revents: i16) -> i16 {
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    let [read, write, except] = SELECT_CLASSES;
+    let mut ready = 0;
+    if revents & (read | POLLHUP | POLLERR) != 0 {
+        ready |= read;
+    }
+    if revents & (write | POLLERR) != 0 {
+        ready |= write;
+    }
+    if revents & except != 0 {
+        ready |= except;
+    }
+    ready & events
+}
+
+/// The caller's three `fd_set`s of a [`PollShape::Select`] record: the ring
+/// that staged the call rewrites them from the reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectSets {
+    /// The call's `nfds`: each set holds `nfds` bits, rounded up to words.
+    pub nfds: u32,
+    /// `readfds`, `writefds`, `exceptfds`; 0 for a NULL set.
+    pub sets: [u64; 3],
+}
+
+/// Encoded bytes of a [`SelectSets`].
+pub const SELECT_SETS_BYTES: usize = 32;
+
+impl SelectSets {
+    /// Bytes of each `fd_set` the call reads and rewrites.
+    pub const fn set_bytes(&self) -> usize {
+        (self.nfds as usize).div_ceil(64) * 8
+    }
+
+    pub fn encode(&self) -> [u8; SELECT_SETS_BYTES] {
+        let mut bytes = [0u8; SELECT_SETS_BYTES];
+        bytes[..8].copy_from_slice(&u64::from(self.nfds).to_le_bytes());
+        for (index, set) in self.sets.iter().enumerate() {
+            bytes[8 + index * 8..16 + index * 8].copy_from_slice(&set.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Split a [`PollShape::Select`] input into its `struct pollfd` entries
+    /// and the sets. `None` for a malformed input.
+    pub fn split(input: &[u8]) -> Option<(&[u8], Self)> {
+        let (entries, sets) =
+            input.split_at_checked(input.len().checked_sub(SELECT_SETS_BYTES)?)?;
+        let word = |index: usize| {
+            u64::from_le_bytes(sets[index * 8..index * 8 + 8].try_into().unwrap_or([0; 8]))
+        };
+        Some((
+            entries,
+            Self {
+                nfds: u32::try_from(word(0)).ok()?,
+                sets: [word(1), word(2), word(3)],
+            },
+        ))
+    }
+}
+
 /// One poll call's identity across the records its ring publishes for it
 /// (#2414 review P0-2). The ring stamps a new serial on a call's first
 /// record, at the call's own entry, and keeps it on every record it

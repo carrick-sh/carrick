@@ -3140,12 +3140,14 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
 /// The run root's host network family on x86 (#1906): a TCP connection to a
 /// loopback listener and a UDP exchange (socket, bind, listen, connect,
 /// accept and accept4, socket options and names, sendto/recvfrom,
-/// sendmsg/recvmsg, sendmmsg/recvmmsg, shutdown), readiness on a host socket,
-/// and an AF_UNIX datagram `socketpair`. Network is a real host crossing, so
-/// the root reaches the same shared socket handlers ARM's root does: every
-/// line must match the native oracle, and the census must show no root
-/// refusal of the family (before the x86 crossing set admitted it, `socket`,
-/// `socketpair` and `pselect6` were counted ENOSYS and the rest failed EBADF).
+/// sendmsg/recvmsg, sendmmsg/recvmmsg, shutdown), and readiness on a host
+/// socket through poll, pselect6 and epoll. The root's sockets are
+/// host-backed descriptions of its own ring table, served by the typed
+/// socket venue its children use, so a fork child selects on, reads and
+/// writes the sockets it inherits. Every line must match the native oracle,
+/// and the census must show no refusal of the family by any caller (before
+/// the venue admitted the root, `socket` and `pselect6` were counted ENOSYS
+/// and the rest failed EBADF).
 #[test]
 fn mounted_static_x86_root_network_family_matches_native() {
     if skip_without_kvm() {
@@ -3190,24 +3192,28 @@ fn mounted_static_x86_root_network_family_matches_native() {
     assert!(evidence.complete, "{evidence:?}");
     // x86_64 socket..getsockopt, pselect6, accept4, recvmmsg, sendmmsg.
     let family: Vec<u64> = (41..=55).chain([270, 288, 299, 307]).collect();
-    let root_refused: std::collections::BTreeMap<u64, u64> = evidence
+    let root_refused: std::collections::BTreeMap<(String, u64), u64> = evidence
         .rows
         .iter()
-        .filter(|row| row.caller == carrick_spec::syscall_census::CallerClass::Root)
         .filter(|row| family.contains(&row.nr))
-        .map(|row| (row.nr, row.refused + row.venue_refused))
+        .map(|row| {
+            (
+                (format!("{:?}", row.caller), row.nr),
+                row.refused + row.venue_refused,
+            )
+        })
         .filter(|&(_, total)| total != 0)
         .collect();
     assert_eq!(
         String::from_utf8_lossy(&guest.stdout),
         String::from_utf8_lossy(&native.stdout),
-        "guest stdout vs the native oracle; root refusals (x86 ordinal -> count): {root_refused:?}; stderr: {}",
+        "guest stdout vs the native oracle; refusals ((caller, x86 ordinal) -> count): {root_refused:?}; stderr: {}",
         String::from_utf8_lossy(&guest.stderr)
     );
     assert_eq!(
         root_refused,
         Default::default(),
-        "the root's network calls must cross, never refuse"
+        "no caller's network call may be refused"
     );
     assert_eq!(guest.status.code(), Some(0));
     assert!(

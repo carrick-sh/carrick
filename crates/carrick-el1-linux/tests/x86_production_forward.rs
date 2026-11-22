@@ -1854,7 +1854,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             }) => {
                 let mut record = record.into_vec();
                 let served = if origin == ServiceOrigin::Initial {
-                    dispatcher.serve_host_root_file(&host_root_resources, &mut record)
+                    dispatcher.serve_host_root_file(&host_root_resources, &mut record, None)
                 } else {
                     if resolves_path {
                         let mut access = Vec::new();

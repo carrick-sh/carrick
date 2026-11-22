@@ -976,7 +976,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     let served = if ForwardAuthority::of(task, binding, token.subject())
                         .holds_host_root_resources()
                     {
-                        dispatcher.serve_host_root_file(&binding.host_root_resources, &mut record)
+                        dispatcher.serve_host_root_file(
+                            &binding.host_root_resources,
+                            &mut record,
+                            None,
+                        )
                     } else {
                         dispatcher.serve_native_host_file(&mut record, None)
                     };
@@ -2464,7 +2468,7 @@ fn native_host_file_server<'a>(
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
         let result = match caller.birth.origin {
             carrick_core_abi::service::ServiceOrigin::Initial => {
-                dispatcher.serve_host_root_file(resources, record)
+                dispatcher.serve_host_root_file(resources, record, Some(caller.birth.record))
             }
             carrick_core_abi::service::ServiceOrigin::Descendant => dispatcher
                 .serve_native_host_file_for(record, caller.executable, caller.birth.record),

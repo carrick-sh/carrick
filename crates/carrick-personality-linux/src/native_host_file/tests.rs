@@ -2901,3 +2901,194 @@ fn a_message_send_that_fails_epipe_owes_sigpipe_unless_msg_nosignal() {
         );
     }
 }
+
+/// `pselect6(nfds, read, write, except, timeout, NULL)` with the three
+/// `fd_set`s (one word each) at `BASE`, `BASE + 8` and `BASE + 16`, and a
+/// timespec, when given, after them.
+fn select(sets: [Option<u64>; 3], timespec: Option<(i64, i64)>) -> (HostFileCall, Memory) {
+    let mut bytes = Vec::new();
+    let mut addresses = [0u64; 3];
+    for (index, set) in sets.into_iter().enumerate() {
+        if set.is_some() {
+            addresses[index] = BASE + index as u64 * 8;
+        }
+        bytes.extend_from_slice(&set.unwrap_or(0).to_le_bytes());
+    }
+    let timeout = timespec.map_or(0, |(seconds, nanoseconds)| {
+        let address = BASE + bytes.len() as u64;
+        bytes.extend_from_slice(&seconds.to_le_bytes());
+        bytes.extend_from_slice(&nanoseconds.to_le_bytes());
+        address
+    });
+    (
+        HostFileCall::Select {
+            nfds: 8,
+            sets: addresses,
+            timeout,
+            timeval: false,
+            sigmask: 0,
+        },
+        memory(&bytes),
+    )
+}
+
+#[test]
+fn select_decodes_both_native_spellings() {
+    let args = [8, BASE, BASE + 8, 0, 0x40, 0x50];
+    assert_eq!(
+        HostFileCall::decode(crate::crossing::nr::PSELECT6, &args),
+        Some(HostFileCall::Select {
+            nfds: 8,
+            sets: [BASE, BASE + 8, 0],
+            timeout: 0x40,
+            timeval: false,
+            sigmask: 0x50,
+        })
+    );
+    // x86_64 `select` passes a timeval and no signal mask.
+    assert_eq!(
+        HostFileCall::decode(
+            CanonicalNr::new(carrick_syscall_abi::CARRICK_PRIVATE_X86_SELECT),
+            &args
+        ),
+        Some(HostFileCall::Select {
+            nfds: 8,
+            sets: [BASE, BASE + 8, 0],
+            timeout: 0x40,
+            timeval: true,
+            sigmask: 0,
+        })
+    );
+}
+
+/// #1906: a select over host-backed descriptors (here fd 1, in the read and
+/// write sets) crosses as one select-shaped readiness set, and its
+/// completion rewrites each `fd_set` whole from the carrier's reply.
+#[test]
+fn select_over_host_descriptors_stages_and_completes_its_sets() {
+    use host_file::{PollShape, PollWait, SelectSets};
+    for (timespec, wait) in [
+        (Some((0, 0)), PollWait::Snapshot),
+        (Some((1, 0)), PollWait::MayWait),
+        (None, PollWait::MayWait),
+    ] {
+        let (call, mut user) = select([Some(0b10), Some(0b10), None], timespec);
+        let (mut record, output, resolves_path) = request(run(call, &mut user));
+        assert!(!resolves_path);
+        assert_eq!(
+            output,
+            Some(HostFileOutput {
+                address: 0,
+                len: host_file::POLLFD_BYTES,
+                layout: OutputLayout::Select,
+            })
+        );
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        let header = view.header();
+        assert_eq!(header.op, HostFileOp::Poll);
+        assert_eq!(header.args[0], wait.raw(), "{timespec:?}");
+        assert_eq!(
+            header.args[host_file::POLL_SHAPE_ARG],
+            PollShape::Select.raw()
+        );
+        let (entries, sets) = SelectSets::split(view.input()).unwrap();
+        // One entry: fd 1 with the read and write classes, no revents.
+        assert_eq!(entries, [1, 0, 0, 0, 0x5, 0, 0, 0]);
+        assert_eq!(
+            sets,
+            SelectSets {
+                nfds: 8,
+                sets: [BASE, BASE + 8, 0],
+            }
+        );
+        assert_eq!(view.output_capacity(), entries.len());
+        // The carrier reports fd 1 writable only: one bit.
+        view.reply(1, &[1, 0, 0, 0, 0x5, 0, 0x4, 0]).unwrap();
+        let mut written = Vec::new();
+        let result = complete(&record, output, &mut |address, bytes| {
+            written.push((address, bytes.to_vec()));
+            true
+        });
+        assert_eq!(result, SyscallResult::new(1));
+        assert_eq!(
+            written,
+            [
+                (BASE, 0u64.to_le_bytes().to_vec()),
+                (BASE + 8, 0b10u64.to_le_bytes().to_vec()),
+            ]
+        );
+    }
+}
+
+#[test]
+fn select_sets_the_carrier_cannot_answer_whole_keep_their_route() {
+    // A mixed set (fd 0 is an in-zone pipe) needs the ring's wait (#1051).
+    let (call, mut user) = select([Some(0b11), None, None], Some((0, 0)));
+    assert_eq!(run(call, &mut user), None);
+    // fd 7 is not in the caller's ring table: its owner answers.
+    let (call, mut user) = select([Some(0b1000_0010), None, None], Some((0, 0)));
+    assert_eq!(run(call, &mut user), None);
+    // No descriptor at all is the ring's sleep.
+    let (call, mut user) = select([Some(0), None, None], Some((0, 0)));
+    assert_eq!(run(call, &mut user), None);
+    // A temporary signal mask is the in-ring owner's.
+    let (call, mut user) = select([Some(0b10), None, None], Some((0, 0)));
+    let HostFileCall::Select {
+        nfds,
+        sets,
+        timeout,
+        timeval,
+        ..
+    } = call
+    else {
+        unreachable!()
+    };
+    // The `{ss, ss_len}` pair at `timeout` reads a non-NULL `ss` (the
+    // timespec's bytes are zero, so point it at the read set instead).
+    let masked = HostFileCall::Select {
+        nfds,
+        sets,
+        timeout,
+        timeval,
+        sigmask: BASE,
+    };
+    assert_eq!(run(masked, &mut user), None);
+    // A negative timeout is EINVAL before any crossing.
+    let (call, mut user) = select([Some(0b10), None, None], Some((-1, 0)));
+    assert_eq!(
+        run(call, &mut user),
+        Some(HostFileStage::Returned(SyscallResult::from_errno(
+            carrick_syscall_abi::LINUX_EINVAL
+        )))
+    );
+}
+
+/// #1906: every task's host sockets and host readiness sets are staged,
+/// the run root's included.
+#[test]
+fn the_root_stages_its_host_network_and_readiness_calls() {
+    let args = [2, 1, 0, 0, 0, 0];
+    for canonical in [
+        crate::crossing::nr::SOCKET,
+        crate::crossing::nr::CONNECT,
+        crate::crossing::nr::PPOLL,
+        crate::crossing::nr::PSELECT6,
+    ] {
+        let call = HostFileCall::decode(canonical, &args).unwrap();
+        for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
+            assert!(call.admitted_for(origin, |_| true), "{call:?} {origin:?}");
+        }
+    }
+}
+
+#[test]
+fn an_unstaged_select_never_takes_a_descendants_call_to_the_host() {
+    let (select, _) = select([Some(0b11), None, None], None);
+    assert_eq!(
+        select.unstaged_for(ServiceOrigin::Descendant),
+        Some(HostFileStage::InRing)
+    );
+    assert_eq!(select.unstaged_for(ServiceOrigin::Initial), None);
+    let (ppoll, _) = ppoll(&[(1, 0x4), (0, 0x1)], None);
+    assert_eq!(ppoll.unstaged_for(ServiceOrigin::Descendant), None);
+}
