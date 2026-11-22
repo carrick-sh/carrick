@@ -977,6 +977,54 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #2799 lead 2: the run root exits its group while its forked child's exec is
+/// anywhere between claim and adoption. Two live processes; the root never
+/// waits. Whatever instant the exit lands on, the carrier must finish with the
+/// root's status and every receipt the exec owner reserved must be retired: a
+/// row still live at teardown keeps its prepared successor's frames.
+#[test]
+fn native_fork_child_exec_outlived_by_its_exiting_root_retires_every_preparation() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let mut observed = Vec::new();
+    for spin in [0_u32, 1 << 4, 1 << 8, 1 << 11, 1 << 14, 1 << 17, 1 << 20] {
+        let spin_define = format!("-DPARENT_SPIN={spin}");
+        let elf = native_exit_fixture_with_flags(
+            "native_fork_exec_root_exits.S",
+            &[&define, &spin_define],
+        );
+        for affinity in [ROOT_AFFINITY_LOADED, kvm_pool_fixture::ROOT_AFFINITY_ANY] {
+            let outcome = run_exec_fixture_with_affinity(&elf, 1 << 16, affinity);
+            assert_eq!(
+                outcome.run.exit_code, 0,
+                "spin {spin} affinity {affinity}: the root's own exit status (91 is a refused pipe, fork or read)"
+            );
+            let census = outcome
+                .physical
+                .exec_owner_census()
+                .expect("exec owner census");
+            // The sweep's evidence, one line per run under `--nocapture`.
+            println!("root-exits spin={spin} affinity={affinity} {census:?}");
+            observed.push((spin, affinity, census));
+        }
+    }
+    let live = observed
+        .iter()
+        .filter(|(_, _, census)| census.live() != 0)
+        .collect::<Vec<_>>();
+    assert!(
+        live.is_empty(),
+        "exec preparations still live at carrier exit (spin, affinity, census): {live:?}; every run: {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|(_, _, census)| census.reserved != 0),
+        "no run reached the child's exec, so the sweep proved nothing: {observed:?}"
+    );
+}
+
 /// #2655: a root whose fork needs more residency rows than one table segment
 /// holds must fork, and both processes must run on. The fixture commits
 /// 2,400 one-page mappings that share no grant window, so the parent holds
