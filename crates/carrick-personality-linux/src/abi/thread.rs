@@ -50,13 +50,18 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 21;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 22;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
 
-/// Pool entries per process: a task holds up to four identities ahead of use.
+/// Pool entries in the lifecycle page itself. A process whose live threads
+/// outgrow them links [`ThreadLifecycleSegment`]s to the page (#2734), so
+/// this is the first segment's size, never a limit on live threads.
 pub const THREAD_POOL_ENTRIES: usize = 8;
+
+/// Pool entries, and their thread controls, in one extension segment.
+pub const THREAD_POOL_SEGMENT_ENTRIES: usize = 16;
 
 /// Why a lifecycle service leaves its unchanged syscall to the host.
 #[repr(usize)]
@@ -1495,9 +1500,77 @@ pub struct ThreadLifecyclePage {
     terminal: carrick_core::terminal::ProcessExitCustody,
     /// The Closing owner's last not-ready readiness verdict (census only).
     closing_verdict: ClosingVerdictRecord,
+    /// First extension segment, one alias per venue (as `ledger_*`). A venue
+    /// whose alias is zero sees only this page's entries.
+    extension_host: AtomicU64,
+    extension_guest: AtomicU64,
+    /// Linked segments, published after the link that reaches the newest.
+    extension_segments: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
+
+/// Growth of a process's pool beyond its lifecycle page: more entries, each
+/// with its control binding and its thread control, linked from the page and
+/// never unlinked while a record names the page. The stock owner supplies the
+/// storage; entry indices continue after the page's and never move.
+#[repr(C, align(64))]
+#[derive(::core::fmt::Debug)]
+pub struct ThreadLifecycleSegment {
+    next_host: AtomicU64,
+    next_guest: AtomicU64,
+    entries: [PoolEntry; THREAD_POOL_SEGMENT_ENTRIES],
+    control_addresses: [AtomicU64; THREAD_POOL_SEGMENT_ENTRIES],
+    controls: [ThreadControlSlot; THREAD_POOL_SEGMENT_ENTRIES],
+}
+
+/// This venue's alias of a dual-alias link.
+fn venue_link<'a>(host: &'a AtomicU64, guest: &'a AtomicU64) -> &'a AtomicU64 {
+    #[cfg(target_os = "none")]
+    let word = {
+        let _ = host;
+        guest
+    };
+    #[cfg(not(target_os = "none"))]
+    let word = {
+        let _ = guest;
+        host
+    };
+    word
+}
+
+impl ThreadLifecycleSegment {
+    /// Initialize exclusively owned storage in place, one entry and one
+    /// control at a time: a segment is never built on a ring stack.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be aligned and writable for one segment, with no
+    /// observer of its previous contents.
+    #[inline(never)]
+    pub unsafe fn initialize_at(storage: *mut Self) {
+        // SAFETY: the caller owns the whole extent; each write stays inside
+        // the field it names.
+        unsafe {
+            (&raw mut (*storage).next_host).write(AtomicU64::new(0));
+            (&raw mut (*storage).next_guest).write(AtomicU64::new(0));
+            let entries = (&raw mut (*storage).entries).cast::<PoolEntry>();
+            let addresses = (&raw mut (*storage).control_addresses).cast::<AtomicU64>();
+            let controls = (&raw mut (*storage).controls).cast::<ThreadControlSlot>();
+            for index in 0..THREAD_POOL_SEGMENT_ENTRIES {
+                entries.add(index).write(PoolEntry::new());
+                addresses.add(index).write(AtomicU64::new(0));
+                controls.add(index).write(ThreadControlSlot::new());
+            }
+        }
+    }
+
+    fn next(&self) -> Option<&Self> {
+        let address = venue_link(&self.next_host, &self.next_guest).load(Ordering::Acquire);
+        // SAFETY: a published link names a retained, initialized segment.
+        (address != 0).then(|| unsafe { &*(address as *const Self) })
+    }
+}
 
 /// Shared-page identity for a member born on the host before EL1 can map its
 /// control slab. States: vacant, publication claim, live, cancel requested,
@@ -1649,6 +1722,122 @@ impl ThreadLifecyclePage {
             host_birth_mutations: AtomicU32::new(0),
             terminal: carrick_core::terminal::ProcessExitCustody::new(),
             closing_verdict: ClosingVerdictRecord::new(),
+            extension_host: AtomicU64::new(0),
+            extension_guest: AtomicU64::new(0),
+            extension_segments: AtomicU32::new(0),
+        }
+    }
+
+    /// Segments this venue can reach: zero when the chain was linked through
+    /// the other venue's alias.
+    fn segments(&self) -> usize {
+        if venue_link(&self.extension_host, &self.extension_guest).load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        self.extension_segments.load(Ordering::Acquire) as usize
+    }
+
+    fn segment(&self, number: usize) -> Option<&ThreadLifecycleSegment> {
+        if number >= self.segments() {
+            return None;
+        }
+        let address =
+            venue_link(&self.extension_host, &self.extension_guest).load(Ordering::Acquire);
+        // SAFETY: a published link names a retained, initialized segment.
+        let mut segment = unsafe { &*(address as *const ThreadLifecycleSegment) };
+        for _ in 0..number {
+            segment = segment.next()?;
+        }
+        Some(segment)
+    }
+
+    /// The segment and the index within it of an entry past the page's own.
+    fn extension_slot(&self, index: usize) -> Option<(&ThreadLifecycleSegment, usize)> {
+        let index = index.checked_sub(THREAD_POOL_ENTRIES)?;
+        let segment = self.segment(index / THREAD_POOL_SEGMENT_ENTRIES)?;
+        Some((segment, index % THREAD_POOL_SEGMENT_ENTRIES))
+    }
+
+    fn control_word(&self, index: usize) -> Option<&AtomicU64> {
+        match self.controls.get(index) {
+            Some(word) => Some(word),
+            None => {
+                let (segment, index) = self.extension_slot(index)?;
+                Some(&segment.control_addresses[index])
+            }
+        }
+    }
+
+    /// The thread control of pool entry `index`: `head[index + 1]` for the
+    /// page's own entries (slot zero is the leader's), the segment's own
+    /// control for an extension entry.
+    pub fn pool_control<'a>(
+        &'a self,
+        head: &'a [ThreadControlSlot],
+        index: usize,
+    ) -> Option<&'a ThreadControlSlot> {
+        if index < THREAD_POOL_ENTRIES {
+            return head.get(index + 1);
+        }
+        self.extension_control(index)
+    }
+
+    /// The thread control a linked segment holds for extension entry `index`;
+    /// `None` for the page's own entries, whose controls the page's owner
+    /// keeps in its own slab.
+    pub fn extension_control(&self, index: usize) -> Option<&ThreadControlSlot> {
+        let (segment, index) = self.extension_slot(index)?;
+        Some(&segment.controls[index])
+    }
+
+    /// Link one more initialized segment after the last, then publish its
+    /// entries. The link is stored before the count that makes it reachable.
+    ///
+    /// # Safety
+    ///
+    /// `segment` was initialized by [`ThreadLifecycleSegment::initialize_at`]
+    /// and stays allocated at this address until [`Self::detach_extension`]
+    /// returns it. The caller is the page's one stock owner and serializes
+    /// its own growth; it links through this venue's alias only.
+    pub unsafe fn publish_extension(&self, segment: core::ptr::NonNull<ThreadLifecycleSegment>) {
+        let address = segment.as_ptr() as u64;
+        let count = self.extension_segments.load(Ordering::Acquire) as usize;
+        let head = venue_link(&self.extension_host, &self.extension_guest);
+        if count == 0 {
+            head.store(address, Ordering::Release);
+        } else {
+            // SAFETY: the count names this many linked, retained segments.
+            let mut last =
+                unsafe { &*(head.load(Ordering::Acquire) as *const ThreadLifecycleSegment) };
+            while let Some(next) = last.next() {
+                last = next;
+            }
+            venue_link(&last.next_host, &last.next_guest).store(address, Ordering::Release);
+        }
+        self.extension_segments
+            .store(count as u32 + 1, Ordering::Release);
+    }
+
+    /// Unlink the whole chain and hand each segment back to its supplier.
+    ///
+    /// # Safety
+    ///
+    /// No record, control pin or reader can still name the page's extension
+    /// entries: the stock owner calls this only as it releases the page.
+    pub unsafe fn detach_extension(
+        &self,
+        mut release: impl FnMut(core::ptr::NonNull<ThreadLifecycleSegment>),
+    ) {
+        let head = venue_link(&self.extension_host, &self.extension_guest);
+        let mut address = head.swap(0, Ordering::AcqRel);
+        self.extension_segments.store(0, Ordering::Release);
+        while let Some(segment) = core::ptr::NonNull::new(address as *mut ThreadLifecycleSegment) {
+            // SAFETY: the chain was linked by `publish_extension`.
+            address = unsafe {
+                let segment = segment.as_ref();
+                venue_link(&segment.next_host, &segment.next_guest).load(Ordering::Acquire)
+            };
+            release(segment);
         }
     }
 
@@ -2014,13 +2203,16 @@ impl ThreadLifecyclePage {
         entry: EntryRef,
         address: u64,
     ) -> Result<(), TransitionError> {
+        let word = self
+            .control_word(entry.index())
+            .ok_or(TransitionError::NoSuchEntry)?;
         self.transition(
             entry,
             &[EntryState::Reserved],
             EntryState::Stocking,
             Ordering::AcqRel,
         )?;
-        self.controls[entry.index()].store(address, Ordering::Relaxed);
+        word.store(address, Ordering::Relaxed);
         self.transition(
             entry,
             &[EntryState::Stocking],
@@ -2030,11 +2222,19 @@ impl ThreadLifecyclePage {
     }
     pub fn control_address(&self, entry: EntryRef) -> Option<u64> {
         self.identity(entry)?;
-        Some(self.controls[entry.index()].load(Ordering::Acquire))
+        Some(self.control_word(entry.index())?.load(Ordering::Acquire))
     }
 
     fn entry(&self, index: usize) -> Result<&PoolEntry, TransitionError> {
-        self.entries.get(index).ok_or(TransitionError::NoSuchEntry)
+        match self.entries.get(index) {
+            Some(entry) => Ok(entry),
+            None => {
+                let (segment, index) = self
+                    .extension_slot(index)
+                    .ok_or(TransitionError::NoSuchEntry)?;
+                Ok(&segment.entries[index])
+            }
+        }
     }
 
     /// Kernel: issue `identity` into a `Vacant`, `Reaped` or `Revoked` entry,
@@ -2054,10 +2254,13 @@ impl ThreadLifecyclePage {
         control: Option<carrick_guest_arch::KernelVa>,
     ) -> Result<EntryRef, TransitionError> {
         let e = self.entry(index)?;
+        let control_word = self
+            .control_word(index)
+            .ok_or(TransitionError::NoSuchEntry)?;
         let reference = self.reserve_stock(index)?;
         let next = reference.generation();
         e.tid.store(identity.tid, Ordering::Relaxed);
-        self.controls[index].store(
+        control_word.store(
             control.map_or(0, |address| address.raw()),
             Ordering::Relaxed,
         );
@@ -2095,7 +2298,7 @@ impl ThreadLifecyclePage {
     /// Identity of a reference, read after an acquire of its state. `None` if
     /// the reference is stale or the entry is not past `Stocking`.
     pub fn identity(&self, r: EntryRef) -> Option<EntryIdentity> {
-        let e = self.entries.get(r.index())?;
+        let e = self.entry(r.index()).ok()?;
         let (generation, state) = unpack(e.state.load(Ordering::Acquire));
         if generation != r.generation()
             || matches!(state, EntryState::Vacant | EntryState::Stocking)
@@ -2116,7 +2319,8 @@ impl ThreadLifecyclePage {
         if visible_tid == 0 {
             return None;
         }
-        for (index, entry) in self.entries.iter().enumerate() {
+        for index in 0..Lifecycle::entry_count(self) {
+            let entry = self.entry(index).ok()?;
             let (generation, state) = unpack(entry.state.load(Ordering::Acquire));
             if matches!(state, EntryState::Vacant | EntryState::Stocking) {
                 continue;
@@ -2131,7 +2335,7 @@ impl ThreadLifecyclePage {
     /// Born record of a `Born`, `Published`, `ExitedInZone` or `Reaped`
     /// incarnation. `None` for any other state or a stale reference.
     pub fn born_record(&self, r: EntryRef) -> Option<BornRecord> {
-        let e = self.entries.get(r.index())?;
+        let e = self.entry(r.index()).ok()?;
         let (generation, state) = unpack(e.state.load(Ordering::Acquire));
         if generation != r.generation()
             || !matches!(
@@ -2187,10 +2391,10 @@ impl Lifecycle for ThreadLifecyclePage {
         &self.live
     }
     fn entry_count(&self) -> usize {
-        self.entries.len()
+        THREAD_POOL_ENTRIES + THREAD_POOL_SEGMENT_ENTRIES * self.segments()
     }
     fn entry_word(&self, index: usize) -> Option<&AtomicEntry> {
-        self.entries.get(index).map(|entry| &entry.state)
+        self.entry(index).ok().map(|entry| &entry.state)
     }
     fn activity(&self) -> Option<&ThreadLedgerActivity> {
         self.activity()
@@ -2203,7 +2407,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 47] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 53] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -2251,6 +2455,12 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 47] = [
     ::core::mem::size_of::<carrick_core::affinity::AffinityAuthority>() as u64,
     ::core::mem::offset_of!(ThreadControlSlot, affinity_host_alias) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, affinity_guest_alias) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, extension_host) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, extension_guest) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, extension_segments) as u64,
+    THREAD_POOL_SEGMENT_ENTRIES as u64,
+    ::core::mem::size_of::<ThreadLifecycleSegment>() as u64,
+    ::core::mem::offset_of!(ThreadLifecycleSegment, controls) as u64,
 ];
 
 #[cfg(test)]
@@ -3416,6 +3626,9 @@ mod layout_manifest {
                      host_birth_mutations: _,
                      terminal: _,
                      closing_verdict: _,
+                     extension_host: _,
+                     extension_guest: _,
+                     extension_segments: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
         field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
@@ -3472,6 +3685,16 @@ mod layout_manifest {
             1032,
             88,
             8
+        );
+        field!(ThreadLifecyclePage, extension_host, AtomicU64, 1120, 8, 8);
+        field!(ThreadLifecyclePage, extension_guest, AtomicU64, 1128, 8, 8);
+        field!(
+            ThreadLifecyclePage,
+            extension_segments,
+            AtomicU32,
+            1136,
+            4,
+            4
         );
     }
 }

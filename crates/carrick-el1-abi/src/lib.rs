@@ -1659,10 +1659,30 @@ impl CurrentTask {
                     .checked_add(len as u64)
                     .is_some_and(|end| end <= expected_base + EL1_DYNAMIC_METADATA_SIZE)
         };
+        // A thread born into an extension entry (#2734) keeps its control in
+        // a lifecycle segment, which the ring's metadata allocator may place
+        // in its bootstrap arena rather than a granted extent.
+        let bootstrap_base = {
+            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            {
+                X86_CPL0_BOOTSTRAP_METADATA_BASE
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+            {
+                EL1_BOOTSTRAP_METADATA_BASE
+            }
+        };
+        let in_bootstrap = |address: u64, len: usize| {
+            address >= bootstrap_base
+                && address
+                    .checked_add(len as u64)
+                    .is_some_and(|end| end <= bootstrap_base + EL1_BOOTSTRAP_METADATA_SIZE)
+        };
+        let slot_len = core::mem::size_of::<ThreadControlSlot>();
         if !page.is_multiple_of(16384)
             || !slot.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
             || !contains(page, core::mem::size_of::<ThreadLifecyclePage>())
-            || !contains(slot, core::mem::size_of::<ThreadControlSlot>())
+            || !(contains(slot, slot_len) || in_bootstrap(slot, slot_len))
         {
             return None;
         }
