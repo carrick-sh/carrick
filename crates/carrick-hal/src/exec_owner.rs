@@ -94,14 +94,16 @@ impl ExecOwnerCensus {
 /// any other late owner.
 impl core::fmt::Display for ExecOwnerCensus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (live, retired) = (self.live(), self.retired());
+        let Self {
+            reserved,
+            sealed,
+            adopted,
+            ..
+        } = *self;
         write!(
             f,
-            "live={} reserved={} sealed={} adopted={} retired={}",
-            self.live(),
-            self.reserved,
-            self.sealed,
-            self.adopted,
-            self.retired()
+            "live={live} reserved={reserved} sealed={sealed} adopted={adopted} retired={retired}"
         )
     }
 }
