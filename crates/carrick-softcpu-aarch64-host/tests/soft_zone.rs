@@ -257,19 +257,6 @@ fn timed_wait_elf(timeout: Duration) -> Vec<u8> {
     build_elf(&code, &[(TIMEOUT_OFFSET, &timespec(timeout))])
 }
 
-/// The futex wait was served once in the ring, and never reached the host.
-fn assert_served_once_in_ring(run: &SoftProcessRun<HostBlockRunner>) {
-    let served = sample_el1_served(&run.engine);
-    assert!(
-        served
-            .iter()
-            .any(|&(nr, _, count)| nr == u64::from(NR_FUTEX) && count == 1),
-        "the futex wait must be served once in the ring: {served:?}"
-    );
-    // Only `exit_group` reaches the host.
-    assert_eq!(run.syscalls_dispatched, 1, "{:?}", run.reply_census);
-}
-
 /// A private futex wait with a relative timeout on the root's only thread:
 /// the EL1 ring parks the thread in the zone, the idle vCPU parks in WFI
 /// until the virtual timer, and the wait returns `ETIMEDOUT`, without the
@@ -292,7 +279,7 @@ fn soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer() {
         elapsed >= TIMED_WAIT,
         "the wait returned after {elapsed:?}, before its {TIMED_WAIT:?} timeout"
     );
-    assert_served_once_in_ring(&run);
+    assert_root_served_in_ring(&run, &[NR_FUTEX, NR_EXIT_GROUP]);
     assert!(
         run.engine.vcpu().idle_parks() >= 1 && wfis >= 1,
         "the idle vCPU must park in WFI for the virtual timer"
@@ -334,7 +321,7 @@ fn soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait() {
         elapsed >= TIMED_WAIT,
         "the wait returned after {elapsed:?}, before its {TIMED_WAIT:?} timeout"
     );
-    assert_served_once_in_ring(&run);
+    assert_root_served_in_ring(&run, &[NR_FUTEX, NR_EXIT_GROUP]);
     assert!(
         idle_exits >= 1,
         "the kick's host work must leave the idle loop"
@@ -397,7 +384,7 @@ fn soft_zone_host_futex_wake_reaches_the_parked_ring_waiter() {
         elapsed < LONG_WAIT,
         "the wake must end the wait before its {LONG_WAIT:?} timeout ({elapsed:?})"
     );
-    assert_served_once_in_ring(&run);
+    assert_root_served_in_ring(&run, &[NR_FUTEX, NR_EXIT_GROUP]);
 }
 
 /// The ring served each of `calls` once, and nothing reached the host or
@@ -511,7 +498,12 @@ fn soft_root_prlimit64_copies_out_the_stack_limit_in_ring() {
 fn soft_root_prlimit64_refuses_a_bad_resource_and_a_bad_pointer_in_ring() {
     let _carrier_lock = lock_soft_carrier_test();
     for (resource, old, errno, path) in [
-        (999, DATA_VA + RLIMIT_OFFSET, LINUX_EINVAL, "/prlimit-einval"),
+        (
+            999,
+            DATA_VA + RLIMIT_OFFSET,
+            LINUX_EINVAL,
+            "/prlimit-einval",
+        ),
         (RLIMIT_STACK, 0x10, LINUX_EFAULT, "/prlimit-efault"),
     ] {
         let mut code = Vec::new();

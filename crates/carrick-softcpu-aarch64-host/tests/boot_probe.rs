@@ -2346,17 +2346,6 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
 /// Counted `ENOSYS` the production-dispatch CPython startup still owes, each
 /// with the issue that retires it (decrease-only; see `assert_counted_enosys`).
 const CPYTHON_COUNTED_ENOSYS: &[(u64, u64)] = &[
-    // set_tid_address: no in-ring root process owner yet (#2645).
-    (96, 1),
-    // rt_sigaction installing the SIGINT handler: guest signal delivery (#2645).
-    (134, 1),
-    // getuid, geteuid, getgid, getegid: no in-ring root process owner (#2645).
-    (174, 1),
-    (175, 1),
-    (176, 1),
-    (177, 1),
-    // prlimit64: no in-ring root process owner (#2645).
-    (261, 1),
     // rseq: accepted counted refusal (#1906).
     (293, 1),
 ];

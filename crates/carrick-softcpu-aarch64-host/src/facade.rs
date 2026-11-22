@@ -1684,6 +1684,30 @@ where
                     }
                     HvcImmediateKind::Kick => return Ok(Aarch64Exit::Kicked),
                     HvcImmediateKind::Idle => return Ok(Aarch64Exit::Halt),
+                    HvcImmediateKind::MetadataGrant
+                        if self.read_gpr(0)? == carrick_el1_abi::GRANT_OP_ROOT_EXIT =>
+                    {
+                        // The in-ring root owner's terminal crossing. A
+                        // refused one leaves EL1 to fail closed.
+                        let exit = authenticated_root_exit(
+                            &stage2,
+                            self.read_gpr(1)?,
+                            self.read_gpr(2)?,
+                            self.cpu.named.ttbr0.0,
+                        );
+                        self.write_gpr(
+                            0,
+                            if exit.is_some() {
+                                carrick_el1_abi::METADATA_GRANT_SUCCESS
+                            } else {
+                                carrick_el1_abi::METADATA_GRANT_ERR_DENIED
+                            },
+                        )?;
+                        match exit {
+                            Some(exit) => return Ok(exit),
+                            None => quanta += 1,
+                        }
+                    }
                     HvcImmediateKind::MetadataGrant => {
                         // Single-process soft bring-up does not run a dynamic
                         // metadata allocator; fail closed with `ERR_DENIED`
@@ -1944,6 +1968,113 @@ impl<X> SoftAarch64Vmm<X> {
         SoftRetainedMetadata {
             stage2: Arc::downgrade(&self.stage2),
         }
+    }
+
+    /// Issue this carrier's birth and MM source over its EL1 zone tables, the
+    /// one issuer EL1 and the host kernel share for task, thread and MM
+    /// identities and the PID namespace. Each call issues a distinct source
+    /// identity: a kernel binds exactly one.
+    pub fn birth_serial_source(
+        &self,
+    ) -> Result<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        let zone = self
+            .stage2
+            .try_borrow()?
+            .host_ptr(
+                EL1_REGION_BASE + carrick_el1_abi::EL1_ZONE_OFFSET,
+                size_of::<carrick_el1_abi::ZoneTables>(),
+            )
+            .and_then(|ptr| NonNull::new(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+            .filter(|ptr| ptr.is_aligned())
+            .ok_or_else(|| TrapError::Hypervisor("soft carrier EL1 zone is not mapped".into()))?;
+        let stage2 = Arc::downgrade(&self.stage2);
+        let identity = carrick_hal::birth_serial::BirthSourceIdentity::from_backend_identity(
+            Arc::new(stage2.clone()),
+            NonZeroU64::new(zone.as_ptr() as u64)
+                .ok_or_else(|| TrapError::Hypervisor("null soft carrier EL1 zone".into()))?,
+            NonZeroU64::MIN,
+        );
+        Ok(Arc::new(SoftBirthZone {
+            stage2,
+            zone,
+            identity,
+        }))
+    }
+}
+
+/// The soft carrier's one vCPU, on mailbox slot 0.
+const SOFT_CPU: carrick_guest_arch::CpuId = carrick_guest_arch::CpuId::new(0);
+
+/// Authenticate a stopped soft vCPU's native root-exit crossing
+/// (`GRANT_OP_ROOT_EXIT`) as HVF does: the record lies on this CPU's EL1
+/// stack and names the issued execution installed under `ttbr0`.
+fn authenticated_root_exit(
+    stage2: &SoftStage2,
+    record_va: u64,
+    cpu: u64,
+    ttbr0: u64,
+) -> Option<Aarch64Exit> {
+    use carrick_aarch64::stopped_abi::{RetainedAbiRegion, root_stack_record, stopped_execution};
+
+    if !record_va.is_multiple_of(64) || (cpu != 0 && cpu != u64::from(SOFT_CPU.raw())) {
+        return None;
+    }
+    let base = stage2.host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)?;
+    // SAFETY: the borrowed stage 2 retains the initialized EL1 region, and
+    // its only vCPU is stopped at this crossing.
+    let region = unsafe { RetainedAbiRegion::new(base, EL1_REGION_SIZE as usize) }?;
+    let execution = stopped_execution(region, SOFT_CPU, ttbr0)?;
+    let record = root_stack_record(
+        region,
+        SOFT_CPU,
+        carrick_guest_arch::KernelVa::new(record_va),
+    )?;
+    Some(Aarch64Exit::NativeRootExit {
+        status: record.status_for(execution.binding)?,
+        binding: execution.binding,
+    })
+}
+
+/// One soft carrier's EL1 zone tables, retained for birth and MM issuance.
+/// It names its carrier weakly: once that stage 2 drops, issuance refuses.
+struct SoftBirthZone {
+    stage2: Weak<ExclusiveStage2>,
+    zone: NonNull<carrick_el1_abi::ZoneTables>,
+    identity: carrick_hal::birth_serial::BirthSourceIdentity,
+}
+
+impl core::fmt::Debug for SoftBirthZone {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("SoftBirthZone")
+            .field(&self.identity)
+            .finish()
+    }
+}
+
+// SAFETY: `zone` points into the EL1 region the stage 2 owns; it is only
+// dereferenced while an upgraded `stage2` keeps that mapping alive, and only
+// the zone's atomic issuers and leaf-locked namespace are touched.
+unsafe impl Send for SoftBirthZone {}
+unsafe impl Sync for SoftBirthZone {}
+
+impl carrick_hal::birth_serial::RetainedBirthZone for SoftBirthZone {
+    type Context = carrick_el1_abi::Aarch64ParkedContext;
+
+    fn source_identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
+        &self.identity
+    }
+
+    fn with_retained_zone<T>(
+        &self,
+        op: impl FnOnce(&carrick_el1_abi::ZoneTables) -> T,
+    ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
+        let _stage2 = self
+            .stage2
+            .upgrade()
+            .ok_or(carrick_hal::birth_serial::BirthSourceError::StaleOwner)?;
+        // SAFETY: the upgraded stage 2 owns the EL1 region mapping, which is
+        // never unmapped before the stage 2 drops; `zone` is aligned inside it.
+        Ok(op(unsafe { self.zone.as_ref() }))
     }
 }
 

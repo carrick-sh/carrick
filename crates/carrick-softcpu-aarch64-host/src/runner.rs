@@ -1097,13 +1097,17 @@ where
         }
         let tid = root_ctx.thread().key().tid.raw();
         let file_table_id = root_ctx.resources().files().id().raw();
+        // The root's PID as its own namespace sees it: EL1 admits the root
+        // under this PID, and its control slot's TID must agree with it.
+        let visible_pid = carrick_kernel::namespace::pid::ns_visible_task_pid(root_ctx.task())
+            .ok_or_else(|| "soft root task has no namespace identity".to_owned())?;
         if let Some(one) = NonZeroU64::new(1) {
             publish_current_task(
                 0,
                 El1TaskId::from_linux_tid(tid),
                 SnapshotGeneration::INITIAL,
                 file_table_id,
-                1,
+                visible_pid,
                 false,
                 ContextGeneration::new(one),
             );
@@ -1132,6 +1136,17 @@ where
             }
         }
         aperture_scope.lifecycle = Some(publish_root_lifecycle(&engine, &root_ctx)?);
+        // EL1 admits the root against the zone's own PID namespace and
+        // issuers: hand the kernel's births to them before the first entry,
+        // as the HVF and x86 carriers bind theirs.
+        let births = engine
+            .vm()
+            .birth_serial_source()
+            .map_err(|e| format!("soft carrier birth source: {e}"))?;
+        root_ctx
+            .kernel()
+            .bind_initial_birth_source(births)
+            .map_err(|e| format!("bind the soft carrier birth source: {e}"))?;
     }
 
     dispatcher
@@ -1378,6 +1393,25 @@ where
                     ));
                 }
                 return Err(format!("engine next_syscall failed: {err}"));
+            }
+            // The in-ring root owner retired the process: its terminal
+            // status is the run's result, as on the HVF executor.
+            Err(TrapError::NativeRootExit { status }) => {
+                let (exit_code, _) = carrick_kernel::run_result::native_terminal_exit(status)
+                    .ok_or_else(|| {
+                        format!("native root exit status {status:?} exceeds the result domain")
+                    })?;
+                return Ok(finish_single_process_summary(
+                    engine,
+                    dispatcher,
+                    &kernel,
+                    reporter,
+                    &refused_by_runner,
+                    exit_code,
+                    syscalls_dispatched,
+                    reply_census,
+                    None,
+                ));
             }
             Err(e) => return Err(format!("engine next_syscall failed: {e}")),
         };
