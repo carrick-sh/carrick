@@ -108,6 +108,11 @@ pub enum Outcome {
     Conflict {
         paths: Vec<String>,
         with_base: bool,
+        /// For a train interaction: the earlier merged heads this one
+        /// conflicts with on its own conflicting paths, pairwise. Empty when
+        /// no single earlier head explains it (a many-way interaction).
+        #[serde(default)]
+        partners: Vec<u64>,
     },
 }
 
@@ -169,6 +174,34 @@ fn fetch_sha(root: &Path, remote: &str, refspec: &str) -> Result<String, UnionBu
     git_ok(root, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
 }
 
+/// Merge `ours` and `theirs` in memory (`git merge-tree --write-tree`, no
+/// worktree change): `None` when clean, else the conflicting paths.
+fn merge_tree_conflicts(
+    dir: &Path,
+    ours: &str,
+    theirs: &str,
+) -> Result<Option<Vec<String>>, UnionBuildError> {
+    let args = ["merge-tree", "--write-tree", "--name-only", ours, theirs];
+    let output = git(dir, &args)?;
+    match output.status.code() {
+        Some(0) => Ok(None),
+        // Exit 1 is a conflicted merge: the tree id, then one path per
+        // line, then a blank line before the messages.
+        Some(1) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )),
+        _ => Err(UnionBuildError::Git {
+            args: args.join(" "),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }),
+    }
+}
+
 /// Resolve every head, merge them onto the base in a new worktree and write
 /// the receipt. Returns the receipt; conflicts are outcomes, not errors.
 pub fn union(root: &Path, args: &UnionBuildArgs) -> Result<UnionReceipt, UnionBuildError> {
@@ -210,6 +243,7 @@ pub fn union(root: &Path, args: &UnionBuildArgs) -> Result<UnionReceipt, UnionBu
     let worktree = args.worktree.to_string_lossy().into_owned();
     git_ok(root, &["worktree", "add", "--detach", &worktree, &base_sha])?;
     let mut receipts = Vec::new();
+    let mut merged_heads: Vec<(u64, String)> = Vec::new();
     for (pr, head) in heads {
         let in_base = git(
             &args.worktree,
@@ -242,6 +276,7 @@ pub fn union(root: &Path, args: &UnionBuildArgs) -> Result<UnionReceipt, UnionBu
             ],
         )?;
         if merged.status.success() {
+            merged_heads.push((pr, head.clone()));
             receipts.push(HeadReceipt {
                 pr,
                 head,
@@ -260,22 +295,28 @@ pub fn union(root: &Path, args: &UnionBuildArgs) -> Result<UnionReceipt, UnionBu
         }
         git_ok(&args.worktree, &["merge", "--abort"])?;
         // Against the base alone, in memory (no worktree change).
-        let with_base = !git(
-            &args.worktree,
-            &[
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                &base_sha,
-                &head,
-            ],
-        )?
-        .status
-        .success();
+        let with_base = merge_tree_conflicts(&args.worktree, &base_sha, &head)?.is_some();
+        // A train interaction names its partners: each earlier merged head
+        // that conflicts with this one, pairwise, on a path the union merge
+        // itself conflicted on.
+        let mut partners = Vec::new();
+        if !with_base {
+            for (earlier, earlier_head) in &merged_heads {
+                if let Some(shared) = merge_tree_conflicts(&args.worktree, earlier_head, &head)?
+                    && shared.iter().any(|path| paths.contains(path))
+                {
+                    partners.push(*earlier);
+                }
+            }
+        }
         receipts.push(HeadReceipt {
             pr,
             head,
-            outcome: Outcome::Conflict { paths, with_base },
+            outcome: Outcome::Conflict {
+                paths,
+                with_base,
+                partners,
+            },
         });
     }
     let union_sha = git_ok(&args.worktree, &["rev-parse", "HEAD"])?;
@@ -344,12 +385,25 @@ pub fn render(receipt: &UnionReceipt) -> String {
         let outcome = match &head.outcome {
             Outcome::Merged => "merged".to_owned(),
             Outcome::AlreadyInBase => "already in base".to_owned(),
-            Outcome::Conflict { paths, with_base } => format!(
+            Outcome::Conflict {
+                paths,
+                with_base,
+                partners,
+            } => format!(
                 "CONFLICT {}: {}",
                 if *with_base {
-                    "with the base (rebase it)"
+                    "with the base (rebase it)".to_owned()
+                } else if partners.is_empty() {
+                    "with an earlier head (train interaction, no single partner)".to_owned()
                 } else {
-                    "with an earlier head (train interaction)"
+                    format!(
+                        "with an earlier head (train interaction with {})",
+                        partners
+                            .iter()
+                            .map(|pr| format!("#{pr}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 },
                 paths.join(", ")
             ),
@@ -514,6 +568,7 @@ mod tests {
                     outcome: Outcome::Conflict {
                         paths: vec!["a.txt".to_owned()],
                         with_base: false,
+                        partners: vec![1],
                     }
                 },
                 HeadReceipt {
@@ -527,6 +582,7 @@ mod tests {
                     outcome: Outcome::Conflict {
                         paths: vec!["b.txt".to_owned()],
                         with_base: true,
+                        partners: vec![],
                     }
                 },
             ]
@@ -548,7 +604,8 @@ mod tests {
         assert_eq!(on_disk, receipt);
         assert!(render(&receipt).contains("#2 "), "{}", render(&receipt));
         assert!(
-            render(&receipt).contains("CONFLICT with an earlier head (train interaction): a.txt")
+            render(&receipt)
+                .contains("CONFLICT with an earlier head (train interaction with #1): a.txt")
         );
         assert!(render(&receipt).contains("CONFLICT with the base (rebase it): b.txt"));
         // An existing worktree path is refused rather than reused.
@@ -564,6 +621,47 @@ mod tests {
             },
         );
         assert!(matches!(again, Err(UnionBuildError::WorktreeExists(_))));
+    }
+
+    #[test]
+    fn a_train_conflict_names_only_the_head_it_conflicts_with() {
+        let (dir, clone, [_, _, pr2, _, _]) = fixture();
+        // A fifth head that touches another file merges first and cleanly:
+        // it is in the train before #2 but is not #2's partner.
+        let remote = dir.path().join("remote");
+        sh(&remote, &["checkout", "-q", "-b", "pr5", "main"]);
+        let pr5 = commit(&remote, "c.txt", "c\n", "pr5");
+        sh(&remote, &["checkout", "-q", "main"]);
+        sh(&remote, &["update-ref", "refs/pull/5/head", &pr5]);
+        let receipt = union(
+            &clone,
+            &UnionBuildArgs {
+                prs: ["5", "1", "2"].map(|p| p.parse().unwrap()).to_vec(),
+                base: "main".to_owned(),
+                remote: "origin".to_owned(),
+                worktree: dir.path().join("union"),
+                receipt: None,
+                build: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.heads[2],
+            HeadReceipt {
+                pr: 2,
+                head: pr2,
+                outcome: Outcome::Conflict {
+                    paths: vec!["a.txt".to_owned()],
+                    with_base: false,
+                    partners: vec![1],
+                }
+            }
+        );
+        // A receipt written before partners existed still reads.
+        let old =
+            r#"{"pr":2,"head":"ab","outcome":"conflict","paths":["a.txt"],"with_base":false}"#;
+        let old: HeadReceipt = serde_json::from_str(old).unwrap();
+        assert!(matches!(old.outcome, Outcome::Conflict { partners, .. } if partners.is_empty()));
     }
 
     #[test]
