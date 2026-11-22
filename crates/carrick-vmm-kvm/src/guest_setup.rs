@@ -962,6 +962,7 @@ mod vfork_tests {
 
     #[test]
     fn vfork_rebuild_host_reads_shadow_bytes() {
+        carrick_test_support::require_kvm!();
         let mut ram = GuestRam::new();
         ram.add_window(0x1000, 0x1000, WindowKind::Private).unwrap();
         ram.add_window(0x3000, 0x1000, WindowKind::Shared).unwrap();

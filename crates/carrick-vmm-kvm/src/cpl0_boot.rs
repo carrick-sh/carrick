@@ -3054,6 +3054,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_run_refuses_host_access_without_waiting() {
+        carrick_test_support::require_kvm!();
         let mut carrier = admission_fixture();
         let context = carrier
             .custody
@@ -3087,6 +3088,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_poisoned_admission_is_repeated_typed_fatal() {
+        carrick_test_support::require_kvm!();
         let mut carrier = admission_fixture();
         let execution = Arc::clone(carrier.custody.file_execution());
         let poison = std::panic::catch_unwind(|| {
@@ -3113,6 +3115,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_published_before_guest_entry() {
+        carrick_test_support::require_kvm!();
         let inventory = Arc::new(FrameInventoryAuthority::new())
             .physical_projection(Arc::new(ObjectIdRegistry::new()));
         let carrier =
@@ -3134,6 +3137,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_host_refuses_paused_cpl0_descriptor_transaction() {
+        carrick_test_support::require_kvm!();
         let inventory = Arc::new(FrameInventoryAuthority::new())
             .physical_projection(Arc::new(ObjectIdRegistry::new()));
         let lock_va = X86_CPL0_REGION_BASE
@@ -3205,6 +3209,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_host_mutation_refused_while_cpu_running() {
+        carrick_test_support::require_kvm!();
         use carrick_el1_linux::file_table::admit_host_fd;
         use std::os::fd::AsRawFd;
         let inventory = Arc::new(FrameInventoryAuthority::new())

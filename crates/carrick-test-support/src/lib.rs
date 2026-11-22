@@ -35,6 +35,7 @@ mod el1_region;
 pub mod executable;
 pub use el1_region::TestEl1Region;
 pub mod guest_user;
+pub mod kvm_host;
 pub use guest_user::{GuestUserBuffer, GuestUserValue, assert_guest_args, user_arg};
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {

@@ -1027,6 +1027,7 @@ mod x86_tests {
 
     #[test]
     fn x86_vcpu_exposes_pinned_x86_64_v3_profile() {
+        carrick_test_support::require_kvm!();
         let mut vm = KvmVm::create_empty().expect("create kvm vm");
         let vcpu0 = vm.add_vcpu().expect("create kvm vcpu 0");
         let vcpu1 = vm.add_vcpu().expect("create kvm vcpu 1");
@@ -2189,6 +2190,7 @@ pub(crate) unsafe fn invalidate_icache_host_range(host: *mut u8, len: usize) {
 mod carrier_census_tests {
     #[test]
     fn every_carrier_cpu_retains_a_live_census_guard() {
+        carrick_test_support::require_kvm!();
         let mut machine = crate::carrier_memory::CarrierMachine::create_stopped(3).unwrap();
         for slot in 0..machine.vcpu_count() {
             assert!(machine.cpu_mut(slot).unwrap()._guard.is_some());

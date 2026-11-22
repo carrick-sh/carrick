@@ -16,20 +16,11 @@
 // test-infrastructure errors (e.g. missing binary path components).
 #![allow(clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-fn kvm_required() -> bool {
-    std::env::var_os("CARRICK_REQUIRE_KVM").is_some_and(|value| value == "1")
-}
-
 fn kvm_available() -> bool {
-    let present = Path::new("/dev/kvm").exists();
-    assert!(
-        present || !kvm_required(),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate (`just test-kvm`) must not skip"
-    );
-    present
+    carrick_test_support::kvm_host::usable_or_skip()
 }
 
 /// Locate the `carrick-vmm-kvm` binary relative to the test executable.
@@ -256,7 +247,7 @@ fn test_m2_musl_static_hello() {
          target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64",
     );
     assert!(
-        fixture.exists() || !kvm_required(),
+        fixture.exists() || !carrick_test_support::kvm_host::kvm_required(),
         "CARRICK_REQUIRE_KVM=1 but the musl hello fixture is not built (run `just test-kvm`): {}",
         fixture.display()
     );
