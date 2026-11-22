@@ -6,30 +6,10 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 fn censuses(inputs: &[PathBuf]) -> Result<Vec<carrick_runtime::el1_census::Census>> {
-    let mut out = Vec::new();
-    for input in inputs {
-        let mut files = Vec::new();
-        if input.is_dir() {
-            for entry in crate::debug_el1_census::collect(input)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    files.push(path);
-                }
-            }
-            files.sort();
-        } else {
-            files.push(input.clone());
-        }
-        for file in files {
-            let bytes =
-                std::fs::read(&file).with_context(|| format!("read census {}", file.display()))?;
-            out.push(
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse census {}", file.display()))?,
-            );
-        }
-    }
-    Ok(out)
+    crate::debug_el1_census::collect_json(inputs)?
+        .iter()
+        .map(|file| crate::debug_el1_census::load(file))
+        .collect()
 }
 
 /// The row name of a profile: its parent directory (`<out>/<row>/profile.txt`).
