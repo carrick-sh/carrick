@@ -990,6 +990,18 @@ pub const GIC_SPURIOUS_INTID: u32 = 1023;
 /// queues a thread there (EL1 plan 1c): it ends the target's WFI, or makes
 /// a running target look at its run queue.
 pub const GIC_RESCHED_INTID: u32 = 14;
+/// GIC priority of the virtual timer PPI. Lower values are higher priority:
+/// the timer outranks a reschedule, which outranks the kick. EL1
+/// acknowledges by polling with IRQs masked, so the order only decides
+/// which of several pending interrupts it sees first. Every carrier's
+/// redistributor bring-up programs these.
+pub const GIC_VTIMER_PRIORITY: u8 = 0x80;
+/// GIC priority of the reschedule SGI ([`GIC_VTIMER_PRIORITY`]).
+pub const GIC_RESCHED_PRIORITY: u8 = 0x90;
+/// GIC priority of the kick SGI ([`GIC_VTIMER_PRIORITY`]).
+pub const GIC_KICK_PRIORITY: u8 = 0xa0;
+/// `ICC_PMR_EL1` every carrier programs: every Carrick priority passes.
+pub const GIC_PRIORITY_MASK: u8 = 0xf0;
 
 /// Magic bytes at offset 0 of the EL1 image header: `CEL1`.
 pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";

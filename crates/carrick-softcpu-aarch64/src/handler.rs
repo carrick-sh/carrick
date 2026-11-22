@@ -204,7 +204,7 @@ fn is_sctlr(r: SystemRegister) -> bool {
 }
 
 fn read_system_register(
-    cpu: &CpuState,
+    cpu: &mut CpuState,
     register: SystemRegister,
     rt: OperandRegister,
 ) -> Result<SystemValue, SystemAccessException> {

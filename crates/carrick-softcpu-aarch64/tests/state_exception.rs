@@ -142,7 +142,7 @@ fn sys(fields: (u8, u8, u8, u8, u8)) -> carrick_softcpu_aarch64::SystemRegister 
 }
 #[test]
 fn el0_privileged_register_is_undefined_not_a_system_trap() {
-    let cpu = CpuState::default();
+    let mut cpu = CpuState::default();
     let error = cpu
         .mrs(
             sys((3, 0, 4, 0, 1)),
@@ -168,7 +168,7 @@ fn system_register_roundtrips_and_access_syndromes() {
         ((3, 3, 4, 4, 0), 0x0040_0000),
         ((3, 3, 4, 4, 1), 0x14),
         ((3, 0, 7, 4, 0), 0x1234),
-        ((3, 3, 14, 3, 1), 0x3),
+        ((3, 3, 14, 3, 1), 0x2),
         ((3, 3, 14, 3, 2), 0x1234),
         ((3, 0, 4, 0, 1), 0x1234),
         ((3, 0, 4, 0, 0), 0x1234),

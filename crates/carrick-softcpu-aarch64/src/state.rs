@@ -1,6 +1,7 @@
 //! Virtual EL0/EL1 state. Arm ARM DDI0487G.a D1.6 (PSTATE), C5.2
 //! (special-purpose registers), D13.2 (EL1 registers). No host register access.
 use crate::exception::Syndrome;
+use crate::gic::{GicCpuInterface, VIRTUAL_TIMER_INTID};
 use crate::{NamedSystemRegister, OperandRegister, SystemRegister, VectorRegister};
 
 macro_rules! domain {
@@ -142,6 +143,8 @@ pub struct CpuState {
     pub pstate: Pstate,
     pub el1: El1Registers,
     pub named: NamedRegisters,
+    /// This PE's GIC CPU interface and private interrupts.
+    pub gic: GicCpuInterface,
 }
 /// Undefined access raises EC=0; denied allocated MRS/MSR raises EC=0x18.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +195,34 @@ impl CpuState {
         core::mem::take(&mut self.local_event)
     }
 
+    /// D11.2.4 ISTATUS: the virtual timer is enabled and its condition
+    /// (CNTVCT >= CVAL) is met, whatever IMASK says.
+    pub fn virtual_timer_condition(&self) -> bool {
+        self.named.cntvctl.0 & 1 != 0 && self.named.cntvct.0 >= self.named.cntvcval.0
+    }
+
+    /// The virtual timer's interrupt output: its condition, unmasked.
+    pub fn virtual_timer_asserted(&self) -> bool {
+        self.virtual_timer_condition() && self.named.cntvctl.0 & 2 == 0
+    }
+
+    /// The counter value at which the virtual timer asserts its interrupt,
+    /// when it is enabled and unmasked.
+    pub fn virtual_timer_deadline(&self) -> Option<u64> {
+        (self.named.cntvctl.0 & 3 == 1).then_some(self.named.cntvcval.0)
+    }
+
+    /// The level inputs of this PE's private interrupts.
+    fn interrupt_lines(&self) -> u32 {
+        u32::from(self.virtual_timer_asserted()) << VIRTUAL_TIMER_INTID
+    }
+
+    /// Whether the GIC asserts this PE's IRQ input: an IRQ is taken when
+    /// `PSTATE.I` is clear, and WFI completes either way.
+    pub fn irq_pending(&self) -> bool {
+        self.gic.signals_irq(self.interrupt_lines())
+    }
+
     pub fn sp(&self) -> StackPointer {
         if self.pstate.el == ExceptionLevel::El0 || self.pstate.sp == StackSelect::El0 {
             self.sp_el0
@@ -231,14 +262,27 @@ impl CpuState {
     /// C6.2 MRS/MSR (register), D13 register access pseudocode. Traps carry
     /// D13.2 ESR_EL1 "Trapped MSR, MRS or System instruction" ISS fields.
     /// Rt is required for an exact trapped-instruction syndrome.
+    /// `ICC_IAR1_EL1` acknowledges, so a read may change state.
     pub fn mrs(
-        &self,
+        &mut self,
         r: SystemRegister,
         rt: OperandRegister,
     ) -> Result<SystemValue, SystemAccessException> {
         let slot = self.access(r, rt, true)?;
         Ok(SystemValue(match slot {
+            Slot::Named(NamedSlot::IccIar1) => {
+                let lines = self.interrupt_lines();
+                u64::from(self.gic.acknowledge(lines))
+            }
+            // D13.8.25: ISTATUS is the timer condition, read-only.
+            Slot::Named(NamedSlot::CntvCtl) => {
+                (self.named.cntvctl.0 & 3) | (u64::from(self.virtual_timer_condition()) << 2)
+            }
             Slot::Named(i) => self.named.read(i).0,
+            // D13.8.27: TimerValue is (CVAL - CNTVCT)[31:0].
+            Slot::CntvTval => {
+                u64::from(self.named.cntvcval.0.wrapping_sub(self.named.cntvct.0) as u32)
+            }
             Slot::Elr => self.el1.elr.0,
             Slot::Spsr => self.el1.spsr.0,
             Slot::Esr => self.el1.esr.0,
@@ -272,7 +316,22 @@ impl CpuState {
         let slot = self.access(r, rt, false)?;
         let v = value.0;
         match slot {
+            Slot::Named(NamedSlot::IccEoir1) => self.gic.end_of_interrupt((v & 0xff_ffff) as u32),
+            Slot::Named(NamedSlot::IccSgi1r) => {
+                if let Some(intid) = GicCpuInterface::sgi_for_self(v, self.named.mpidr.0) {
+                    self.gic.set_pending(intid, true);
+                }
+            }
             Slot::Named(i) => self.named.write(i, value),
+            // D13.8.27: CVAL = CNTVCT + SignExtend(TimerValue[31:0]).
+            Slot::CntvTval => {
+                self.named.cntvcval = SystemValue(
+                    self.named
+                        .cntvct
+                        .0
+                        .wrapping_add(i64::from(v as u32 as i32) as u64),
+                );
+            }
             Slot::Elr => self.el1.elr = ProgramCounter(v),
             Slot::Spsr => self.el1.spsr = SavedPstate(v & 0xffff_ffff),
             Slot::Esr => self.el1.esr = Syndrome(v & 0xffff_ffff),
@@ -339,7 +398,7 @@ impl CpuState {
             Slot::Named(NamedSlot::TpidrroEl0) => read,
             Slot::Named(NamedSlot::Cntfrq) => read && self.el1.cntkctl.0 & 3 != 0,
             Slot::Named(NamedSlot::Cntvct) => read && self.el1.cntkctl.0 & 2 != 0,
-            Slot::Named(NamedSlot::CntvCtl | NamedSlot::CntvCval) => {
+            Slot::Named(NamedSlot::CntvCtl | NamedSlot::CntvCval) | Slot::CntvTval => {
                 self.el1.cntkctl.0 & (1 << 8) != 0
             }
             Slot::Ctr => self.el1.sctlr.uct(),
@@ -352,6 +411,7 @@ impl CpuState {
                 slot,
                 Slot::Daif
                     | Slot::Ctr
+                    | Slot::CntvTval
                     | Slot::Named(
                         NamedSlot::Cntfrq
                             | NamedSlot::Cntvct
@@ -380,6 +440,7 @@ enum Slot {
     Tcr,
     Mair,
     Cntkctl,
+    CntvTval,
     Nzcv,
     Daif,
     Pan,
@@ -425,6 +486,7 @@ impl Slot {
                 (3, 0, 2, 0, 2) => Self::Tcr,
                 (3, 0, 10, 2, 0) => Self::Mair,
                 (3, 0, 14, 1, 0) => Self::Cntkctl,
+                (3, 3, 14, 3, 0) => Self::CntvTval,
                 (3, 3, 4, 2, 0) => Self::Nzcv,
                 (3, 0, 4, 2, 4) => Self::Uao,
                 (3, 0, 4, 2, 0) => Self::Spsel,
@@ -435,8 +497,9 @@ impl Slot {
     }
 }
 
-/// D13 named register backing. Timer/GIC values are passive state; A3 owns
-/// time advancement and interrupt-controller effects. FP access is enabled
+/// D13 named register backing. The provider advances CNTVCT; the virtual
+/// timer's condition and the GIC CPU interface (`CpuState::gic`) derive
+/// interrupt state from it. FP access is enabled
 /// in this EL0/EL1 profile (no EL2/EL3 or FP access traps).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NamedRegisters {
@@ -453,9 +516,6 @@ pub struct NamedRegisters {
     pub cntvctl: SystemValue,
     pub cntvcval: SystemValue,
     pub mpidr: SystemValue,
-    pub icciar1: SystemValue,
-    pub icceoir1: SystemValue,
-    pub iccsgi1r: SystemValue,
 }
 #[derive(Clone, Copy)]
 enum NamedSlot {
@@ -499,9 +559,8 @@ impl NamedRegisters {
             // Aff3, U, MT and Aff2:Aff0 come from the virtual CPU topology.
             // D13.2.99 defines bit 31 as RES1 and other bits as RES0.
             NamedSlot::Mpidr => SystemValue((self.mpidr.0 & 0xff_41ff_ffff) | (1 << 31)),
-            NamedSlot::IccIar1 => self.icciar1,
-            NamedSlot::IccEoir1 => self.icceoir1,
-            NamedSlot::IccSgi1r => self.iccsgi1r,
+            // Served by `CpuState::mrs` (IAR) or write-only (EOIR, SGI1R).
+            NamedSlot::IccIar1 | NamedSlot::IccEoir1 | NamedSlot::IccSgi1r => SystemValue(0),
         }
     }
     fn write(&mut self, slot: NamedSlot, value: SystemValue) {
@@ -518,13 +577,12 @@ impl NamedRegisters {
             NamedSlot::Par => self.par = value,
             NamedSlot::Cntfrq => self.cntfrq = SystemValue(value.0 & 0xffff_ffff),
             NamedSlot::Cntvct => self.cntvct = value,
-            // D13.8.25. ISTATUS is supplied by the provider and is read-only.
-            NamedSlot::CntvCtl => self.cntvctl = SystemValue((self.cntvctl.0 & 4) | (value.0 & 3)),
+            // D13.8.25: ENABLE and IMASK; ISTATUS is derived on read.
+            NamedSlot::CntvCtl => self.cntvctl = SystemValue(value.0 & 3),
             NamedSlot::CntvCval => self.cntvcval = value,
             NamedSlot::Mpidr => self.mpidr = value,
-            NamedSlot::IccIar1 => self.icciar1 = value,
-            NamedSlot::IccEoir1 => self.icceoir1 = value,
-            NamedSlot::IccSgi1r => self.iccsgi1r = value,
+            // Served by `CpuState::msr` (EOIR, SGI1R) or read-only (IAR).
+            NamedSlot::IccIar1 | NamedSlot::IccEoir1 | NamedSlot::IccSgi1r => {}
         }
     }
 }
