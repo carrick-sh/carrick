@@ -1252,6 +1252,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_dispatch_witness.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_dispatch_witness.rs", contract = "softcpu.code-residency" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_wake.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
+  { path = "crates/carrick-softcpu-aarch64-host/tests/soft_zone.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },

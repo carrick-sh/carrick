@@ -17,6 +17,16 @@
 # shared with HVF's bring-up (values unchanged). Bound by the soft_wake
 # witnesses on the production idle entry and the soft CPU unit witnesses.
 # The zone stays off on the soft carrier: no syscall routing changes.
+# #2645 slice B part 3: the soft carrier now runs its root in the in-guest
+# zone through the shared HVF paths: process ASID, a carrier-scoped guest
+# scheduler and slot kicker, root executor registration, slot occupancy
+# and publication, and the BIND/open of the root's address space. Private
+# futex waits are now served in the ring (syscall:futex): EL1 parks the
+# root, the idle vCPU waits in WFI on a live virtual counter, and the soft
+# runner serves EL1's idle exit by returning the vCPU to the idle loop.
+# The soft_zone witnesses need the production EL1 image on an arm64 host
+# (soft-aarch64-native job); set_tid_address and prlimit64 stay counted
+# ENOSYS until the root is admitted as a native process (slice C).
 schema_version = 1
 id = "arm.softcpu.hvc2-kernel-dispatch"
 title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
@@ -38,12 +48,15 @@ guest_surfaces = [
   "syscall:set_robust_list",
   "syscall:sigaltstack",
   "syscall:write",
+  "syscall:futex",
   "signal:SIGPIPE",
   "vmm:soft",
 ]
 semantic_authority = [
   "Arm ARM DDI0487G.a D1.10 (exception entry and HVC), D5.4 and D5.8 (stage-1/stage-2 permissions and faults), and D5.10 (TLB maintenance).",
   "man 2 brk, mmap, mprotect, munmap, openat, fstat, read, write, close, clock_gettime, shmget, shmat, pipe2, exit_group.",
+  "man 2 futex (FUTEX_WAIT_PRIVATE with a relative timeout: ETIMEDOUT; FUTEX_WAKE ends the wait with 0).",
+  "Arm ARM DDI0487G.a D11.2 (virtual counter, CNTV_* timer) and D1.16.2 (WFI wake on an asserted IRQ).",
   "man 2 set_robust_list, sigaltstack and sigprocmask (per-thread state served from the thread's published control slot).",
   "man 7 signal (default dispositions: Term, Ign, Stop, Cont) and man 7 pipe (EPIPE and SIGPIPE).",
 ]
@@ -77,9 +90,11 @@ vm_free = [
   "carrick-softcpu-aarch64::gic::tests::sgi1r_targets_follow_affinity_and_irm",
   "carrick-softcpu-aarch64::dispatch::tests::gic_timer_interrupt_preempts_el0_only_when_unmasked",
   "carrick-softcpu-aarch64::handler::virtual_timer_raises_its_ppi_through_the_gic_cpu_interface",
+  "carrick-softcpu-aarch64::handler::live_counter_source_is_read_at_every_count_observation",
 ]
 
 [bindings.unresolved]
+hosted_arm64 = "The in-guest zone witnesses need the production EL1 image on an arm64 host and run in the soft-aarch64-native job's ignored step: carrick-softcpu-aarch64-host::soft_zone::soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer, ::soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait and ::soft_zone_host_futex_wake_reaches_the_parked_ring_waiter."
 embed_structural = "The soft AArch64 single-process runner executes via carrick-softcpu-aarch64-host on Linux arm64 (boot_probe dynamic glibc hello, static musl hello and pinned CPython 3.12.16); CLI carrier wiring lands in a later #1236 slice."
 signed = "macOS signed HVF acceptance covers HvfVmm; soft AArch64 native block execution runs on Linux arm64 CI (soft-aarch64-native)."
 docker = "Dynamic glibc hello, static musl hello and pinned CPython 3.12.16 outputs and exit codes are checked directly against deterministic Linux expectations with zero fixture syscall replies."
