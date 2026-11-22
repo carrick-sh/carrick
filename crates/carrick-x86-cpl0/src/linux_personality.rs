@@ -184,6 +184,14 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     fn settles_owed_work_at_continuation_boundary(&self) -> bool {
         true
     }
+    fn rerun_after_owed_work(&mut self) -> bool {
+        // The crossing table may already have written its refusal into RAX.
+        restart_native_syscall(
+            self.frame,
+            carrick_guest_arch::NativeOrdinal::new(self.call.native.raw()),
+        );
+        true
+    }
 
     fn may_serve_descriptor(&self) -> bool {
         [
@@ -1905,12 +1913,24 @@ impl Personality for LinuxPersonality {
                     process.thread_group_owner(),
                 ) == carrick_el1_linux::dispatch::UnclaimedNativeSyscall::CountedEnosys
             {
-                frame.rax = carrick_el1_linux::dispatch::count_unclaimed_native_refusal(
-                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                    counters,
-                )
-                .0;
-                route = CompletionRoute::Served;
+                if task.linux.has_pending_host_work() {
+                    // The same rule as the shared crossing refusal: an
+                    // effect-free decline under owed work reruns after the
+                    // work boundary, and only the rerun may be refused.
+                    restart_native_syscall(
+                        frame,
+                        carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    );
+                    task.linux.record_completed_with_work();
+                    route = CompletionRoute::WithWork;
+                } else {
+                    frame.rax = carrick_el1_linux::dispatch::count_unclaimed_native_refusal(
+                        carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                        counters,
+                    )
+                    .0;
+                    route = CompletionRoute::Served;
+                }
             }
             if let Some(reason) = process.take_run_failure() {
                 complete_run_failure(task, reason);

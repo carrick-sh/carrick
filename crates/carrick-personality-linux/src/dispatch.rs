@@ -1711,12 +1711,20 @@ fn finish<'a, C: EntryContext + 'a>(
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
         }
-        if let Some(route) = preflight_host_crossing(ordinal, pending) {
+        if let Some(route) =
+            preflight_host_crossing(ordinal, result == FamilyCompletion::Forward, pending)
+        {
             return route;
         }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
+        if ring_first_strict
+            && !crossing_set.is_allowed(canonical)
+            && rerun_declined_for_work(result == FamilyCompletion::Forward, pending)
+        {
+            return CompletionRoute::WithWork;
+        }
         let decision = crate::crossing::evaluate_host_crossing(
             crossing_set,
             ring_first_strict,
@@ -1778,11 +1786,29 @@ fn finish<'a, C: EntryContext + 'a>(
     route
 }
 
+/// An effect-free decline under owed host work is "not now", never a refusal:
+/// the gate may have declined the call for that work alone. Where the ring
+/// would answer ENOSYS, a venue that can rewind the unchanged call does so,
+/// and its work boundary settles the work first; only the rerun's answer is
+/// the call's result (#2731). `true`: the call was rewound and the boundary
+/// published.
+fn rerun_declined_for_work<'a, C: EntryContext + 'a>(
+    effect_free_decline: bool,
+    pending: &mut dyn PendingFamilies<'a, C>,
+) -> bool {
+    if !effect_free_decline || !pending.host_work() || !pending.rerun_after_owed_work() {
+        return false;
+    }
+    pending.publish_work(false);
+    true
+}
+
 /// Settle a crossing whose descriptor operand the venue answered before the
 /// crossing table: `None` lets the table decide. An in-ring refusal is
 /// counted in the same bucket as a table refusal.
 fn preflight_host_crossing<'a, C: EntryContext + 'a>(
     ordinal: u64,
+    effect_free_decline: bool,
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> Option<CompletionRoute> {
     match pending.preflight_host_crossing(ordinal) {
@@ -1790,6 +1816,11 @@ fn preflight_host_crossing<'a, C: EntryContext + 'a>(
         HostCrossingPreflight::BadFd => {
             pending.install_result(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EBADF));
             Some(CompletionRoute::Served)
+        }
+        HostCrossingPreflight::RefusedInRing
+            if rerun_declined_for_work(effect_free_decline, pending) =>
+        {
+            Some(CompletionRoute::WithWork)
         }
         HostCrossingPreflight::RefusedInRing => {
             pending.install_result(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
@@ -1860,7 +1891,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         Some(authority) => authority,
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
-            if let Some(route) = preflight_host_crossing(ordinal, pending) {
+            // No completion authority: nothing ran and nothing reruns.
+            if let Some(route) = preflight_host_crossing(ordinal, false, pending) {
                 return route;
             }
             let set = pending.crossing_set();
