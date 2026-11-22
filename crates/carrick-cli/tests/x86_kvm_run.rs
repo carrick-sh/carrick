@@ -3137,6 +3137,86 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
     );
 }
 
+/// The run root's host network family on x86 (#1906): a TCP connection to a
+/// loopback listener and a UDP exchange (socket, bind, listen, connect,
+/// accept and accept4, socket options and names, sendto/recvfrom,
+/// sendmsg/recvmsg, sendmmsg/recvmmsg, shutdown), readiness on a host socket,
+/// and an AF_UNIX datagram `socketpair`. Network is a real host crossing, so
+/// the root reaches the same shared socket handlers ARM's root does: every
+/// line must match the native oracle, and the census must show no root
+/// refusal of the family (before the x86 crossing set admitted it, `socket`,
+/// `socketpair` and `pselect6` were counted ENOSYS and the rest failed EBADF).
+#[test]
+fn mounted_static_x86_root_network_family_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("root-network");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_root_network.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &[]);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native x86 network oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native oracle stderr: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let census_dir = dir.path().join("census");
+    let (guest, _) = run_mounted_binary_in_archive_with_census(
+        &elf,
+        "root-network",
+        false,
+        &empty_image_archive(),
+        Some(&census_dir),
+    );
+    let census_files: Vec<_> = std::fs::read_dir(&census_dir)
+        .expect("census directory")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1, "{census_files:?}");
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        refusal_evidence: carrick_spec::syscall_census::RefusalEvidence,
+    }
+    let census: Envelope =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).expect("census json");
+    let evidence = census.refusal_evidence;
+    assert!(evidence.complete, "{evidence:?}");
+    // x86_64 socket..getsockopt, pselect6, accept4, recvmmsg, sendmmsg.
+    let family: Vec<u64> = (41..=55).chain([270, 288, 299, 307]).collect();
+    let root_refused: std::collections::BTreeMap<u64, u64> = evidence
+        .rows
+        .iter()
+        .filter(|row| row.caller == carrick_spec::syscall_census::CallerClass::Root)
+        .filter(|row| family.contains(&row.nr))
+        .map(|row| (row.nr, row.refused + row.venue_refused))
+        .filter(|&(_, total)| total != 0)
+        .collect();
+    assert_eq!(
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "guest stdout vs the native oracle; root refusals (x86 ordinal -> count): {root_refused:?}; stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        root_refused,
+        Default::default(),
+        "the root's network calls must cross, never refuse"
+    );
+    assert_eq!(guest.status.code(), Some(0));
+    assert!(
+        guest.stderr.is_empty(),
+        "guest stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_signal_thread_identity_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
