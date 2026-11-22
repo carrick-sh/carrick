@@ -74,6 +74,29 @@ impl ExecOwnerCensus {
     pub const fn retired(&self) -> u64 {
         self.adopted + self.cancelled + self.refused + self.park_cancelled + self.publish_cancelled
     }
+
+    /// Rows reserved and not yet retired. At carrier exit a nonzero count is
+    /// a preparation, and whatever it retains, that outlived its process
+    /// (#2799).
+    pub const fn live(&self) -> u64 {
+        self.reserved.saturating_sub(self.retired())
+    }
+}
+
+/// The lifecycle counts an exit error needs to tell a live preparation from
+/// any other late owner.
+impl core::fmt::Display for ExecOwnerCensus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "live={} reserved={} sealed={} adopted={} retired={}",
+            self.live(),
+            self.reserved,
+            self.sealed,
+            self.adopted,
+            self.retired()
+        )
+    }
 }
 
 /// The ring's exec request as the owner recorded it at claim: the receipt

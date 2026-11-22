@@ -68,7 +68,7 @@ impl ExecFdSources for HostExecFdSources {
 #[derive(Clone)]
 pub struct ExecFilesystem {
     rootfs: Arc<carrick_vfs::RootFsVfs>,
-    mounts: Arc<carrick_vfs::VfsMounts>,
+    mounts: super::fs::state::MountTableAlias,
     cache: super::fs::state::PreparedExecImageCache,
     fanotify: crate::fanotify::FanotifyRegistry,
     host_fallback: bool,
@@ -417,7 +417,10 @@ impl SyscallDispatcher {
     pub fn exec_filesystem(&self) -> ExecFilesystem {
         ExecFilesystem {
             rootfs: Arc::clone(&self.fs.rootfs_vfs),
-            mounts: Arc::clone(&self.fs.vfs_mounts),
+            mounts: self
+                .fs
+                .vfs_mounts
+                .alias(super::fs::state::MountOwnerKind::ExecCapability),
             cache: Arc::clone(&self.fs.hvpatch_exec_cache),
             fanotify: self.fs.fanotify_registry.clone(),
             host_fallback: self.exec_host_fs_fallback(),

@@ -3201,9 +3201,12 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
         ))
     })?;
     if report.deferred != 0 {
+        // #2799: a sealed exec preparation retains its successor's frames
+        // until adoption, so name the exec owner's live rows beside the pins.
         return Err(TrapError::Hypervisor(format!(
-            "carrier-exit terminal global frame cleanup deferred {} pinned owner(s)",
-            report.deferred
+            "carrier-exit terminal global frame cleanup deferred {} pinned owner(s); exec owner {}",
+            report.deferred,
+            custody.exec_owner_census()
         )));
     }
     let carrier_records = custody

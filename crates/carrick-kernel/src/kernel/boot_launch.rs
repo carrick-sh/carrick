@@ -25,7 +25,7 @@ pub struct VmLocal<V, I> {
 pub struct BootLaunchResources {
     pub(crate) namespace: Arc<Container>,
     pub(crate) rootfs: Arc<carrick_vfs::RootFsVfs>,
-    pub(crate) mounts: Arc<carrick_vfs::VfsMounts>,
+    pub(crate) mounts: crate::dispatch::fs::state::MountTableAlias,
     pub(crate) files: Arc<FileTable>,
     pub(crate) fs_context: Arc<FsContext>,
     pub(crate) credentials: Arc<Credentials>,
@@ -46,7 +46,7 @@ impl BootLaunchResources {
     pub fn rootfs(&self) -> &Arc<carrick_vfs::RootFsVfs> {
         &self.rootfs
     }
-    pub fn mounts(&self) -> &Arc<carrick_vfs::VfsMounts> {
+    pub fn mounts(&self) -> &crate::dispatch::fs::state::MountTableAlias {
         &self.mounts
     }
     pub fn file_table_id(&self) -> FileTableId {

@@ -1957,6 +1957,11 @@ mod tests {
                 carrick_kernel::dispatch::fs::state::MountRetirementError::LiveOwners {
                     container,
                     owners: 2,
+                    census: carrick_kernel::dispatch::fs::state::MountOwnerCensus {
+                        exec_capabilities: 1,
+                        retirements: 1,
+                        ..Default::default()
+                    },
                 },
             )
         );

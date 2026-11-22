@@ -351,7 +351,7 @@ impl SyscallDispatcher {
     /// intentionally an additional `Arc` owner, so later reconfiguration
     /// would fail the dispatcher's pre-boot uniqueness invariant.
     pub fn prepare_mount_retirement(&self) -> fs::MountRetirement {
-        fs::MountRetirement::new(self.container().id(), Arc::clone(&self.fs.vfs_mounts))
+        fs::MountRetirement::new(self.container().id(), &self.fs.vfs_mounts)
     }
 
     /// The container installed by `Runtime::execute`, if any. The HVPatch
