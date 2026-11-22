@@ -1798,39 +1798,50 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             record
         };
-        // A socket call runs under the caller's own identity (#231): its
-        // task, pid and credentials, carried in the record.
-        let record =
-            if carrick_core_abi::host_file::request_parts(&record).is_some_and(|(header, _, _)| {
-                header.op == carrick_core_abi::host_file::HostFileOp::NetSyscall
-            }) {
-                let caller = match self.caller_net() {
-                    Ok(caller) => caller,
-                    Err(errno) => {
-                        return Ok(NativeResume::Returned(SyscallResult::from_errno(errno)));
-                    }
-                };
-                carrick_personality_linux::native_host_file::stamp_net_caller(&record, &caller)
-                    .ok_or(NativeProcessError::Invalid)?
-            } else {
-                record
-            };
-        let mut record = record;
+        let mut record = match self.stamp_net_caller(record) {
+            Ok(record) => record,
+            Err(resume) => return resume,
+        };
         carrick_personality_linux::native_host_file::stamp_write_file_size_limit(
             &mut record,
             || self.caller_file_size_soft_limit(),
         )?;
-        // A poll call's ring serial, new at the call's own entry: the
-        // carrier keys the call's deadline on it (#2414).
-        if carrick_core_abi::host_file::request_parts(&record).is_some_and(|(header, _, _)| {
+        self.stamp_poll_serial(&mut record)?;
+        self.publish_host_file(record, output, map, chdir, call)
+    }
+
+    /// A poll call's ring serial, new at the call's own entry: the carrier
+    /// keys the call's deadline on it (#2414). Any other record is left as
+    /// staged.
+    fn stamp_poll_serial(&self, record: &mut [u8]) -> Result<(), NativeProcessError> {
+        if carrick_core_abi::host_file::request_parts(record).is_some_and(|(header, _, _)| {
             header.op == carrick_core_abi::host_file::HostFileOp::Poll
         }) && !carrick_personality_linux::native_host_file::stamp_poll_call(
-            &mut record,
+            record,
             self.next_host_call_serial(),
         ) {
             return Err(NativeProcessError::Invalid);
         }
-        self.publish_host_file(record, output, map, chdir, call)
+        Ok(())
+    }
+
+    /// A socket call runs under the caller's own identity (#231): its task,
+    /// pid and credentials, from its task row, lead the record. Any other
+    /// record is returned as staged. `Err` is the call's own answer.
+    fn stamp_net_caller(
+        &self,
+        record: Box<[u8]>,
+    ) -> Result<Box<[u8]>, Result<NativeResume, NativeProcessError>> {
+        if !carrick_core_abi::host_file::request_parts(&record).is_some_and(|(header, _, _)| {
+            header.op == carrick_core_abi::host_file::HostFileOp::NetSyscall
+        }) {
+            return Ok(record);
+        }
+        let caller = self
+            .caller_net()
+            .map_err(|errno| Ok(NativeResume::Returned(SyscallResult::from_errno(errno))))?;
+        carrick_personality_linux::native_host_file::stamp_net_caller(&record, &caller)
+            .ok_or(Err(NativeProcessError::Invalid))
     }
 
     /// A new host call's ring serial: unique within this runtime.
@@ -1870,9 +1881,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // The carrier retains the root's resource custody (#1714 option
             // A): it resolves paths with the root's filesystem authority and
             // stamps a write's `RLIMIT_FSIZE` from the root's own limits, so
-            // the record crosses unstamped. Only the cwd stays the host's.
+            // its path and write records cross unstamped. Only the cwd stays
+            // the host's.
             carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
                 .map_err(|_| NativeProcessError::Invalid)?;
+            // A socket call is the root's own as every member's is (#1906):
+            // its record leads with its task row's identity, and a poll of
+            // its host sockets carries its call serial.
+            let stamped = match self.stamp_net_caller(record) {
+                Ok(record) => record,
+                Err(resume) => {
+                    let result = self.drain_copyout(resume);
+                    return self.finish_service_handoff(result);
+                }
+            };
+            record = stamped;
+            self.stamp_poll_serial(&mut record)?;
             if chdir {
                 call.counters.record_refusal(
                     call.ordinal,

@@ -352,6 +352,21 @@ pub enum HostFileCall {
         nfds: u64,
         timeout_ms: i32,
     },
+    /// `pselect6(2)`, or x86_64 `select(2)` (`timeval`), that its in-ring
+    /// owner left unrouted (#1906). Only a set whose every selected
+    /// descriptor is host-backed and that installs no signal mask crosses,
+    /// as [`HostFileCall::Ppoll`]'s set does
+    /// ([`host_file::PollShape::Select`]).
+    Select {
+        nfds: u64,
+        /// `readfds`, `writefds`, `exceptfds`.
+        sets: [u64; 3],
+        timeout: u64,
+        /// The timeout is a `struct timeval` (`select`), not a timespec.
+        timeval: bool,
+        /// `pselect6`'s `{sigset_t *ss; size_t ss_len}` pair.
+        sigmask: u64,
+    },
     /// The host network socket family (#231): AF_INET and AF_INET6 sockets
     /// are host objects, and every call on one crosses.
     Socket(SocketCall),
@@ -414,9 +429,11 @@ impl HostFileCall {
         )
     }
 
-    /// Calls only a native child stages: the initial task keeps its existing
-    /// host route for them (its host-task namespace mutations, and its host
-    /// network sockets).
+    /// Calls only a native child stages where the initial task is a host
+    /// task (ARM's root): it keeps its existing host route for them (its
+    /// host-task namespace mutations, and its host network sockets, which
+    /// live in its host descriptor table). A root whose descriptors are all
+    /// its ring table's stages its sockets too ([`Self::admitted_for`]).
     pub const fn child_venue_only(self) -> bool {
         self.uses_child_mutation_venue() || matches!(self, Self::Socket(_))
     }
@@ -459,15 +476,20 @@ impl HostFileCall {
     /// - The initial task's cwd-based readlink keeps its existing route.
     ///   Descendants stage readlink through their own executable custody.
     ///   A directory operand follows the ring descriptor it names.
-    /// - A child's host network calls and its polls of host objects are
-    ///   staged (#231); the initial task keeps its routes for both.
+    /// - Host network calls and readiness sets of host objects (poll, select)
+    ///   are staged for every task (#231, #1906): this root's sockets are
+    ///   host-backed descriptions of its own ring table, with no host route.
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
         match self {
             Self::Chdir { .. } => origin != ServiceOrigin::Initial,
-            // A child's set of host objects (its host network sockets) waits
-            // on its host-readiness queue (#231); the initial task's polls
-            // keep their route.
-            Self::Ppoll { .. } | Self::Poll { .. } => origin != ServiceOrigin::Initial,
+            // A set of host objects (host network sockets) waits on its
+            // caller's host-readiness queue (#231). The root's sockets are
+            // host-backed descriptions of its ring table too (#1906).
+            Self::Ppoll { .. } | Self::Poll { .. } | Self::Select { .. } => true,
+            // Every task's host network socket is a host-backed description
+            // in its own ring table: the root's calls run under the identity
+            // its carrier custody holds (#1906).
+            Self::Socket(_) => true,
             Self::Ftruncate { fd, .. } | Self::Fchmod { fd, .. } | Self::Fchown { fd, .. }
                 if origin == ServiceOrigin::Initial =>
             {
@@ -511,6 +533,16 @@ impl HostFileCall {
             | Self::Lseek { fd, .. } => !delegated(fd),
             _ => false,
         }
+    }
+
+    /// What a call this venue declined to stage does instead. `None` keeps
+    /// the call's existing route. A descendant's select has none: its
+    /// descriptors are its ring table's, so the host crossing the run root's
+    /// select keeps would answer for other objects. It is a counted ENOSYS
+    /// in ring ([`HostFileStage::InRing`]).
+    pub fn unstaged_for(self, origin: ServiceOrigin) -> Option<HostFileStage> {
+        (matches!(self, Self::Select { .. }) && origin == ServiceOrigin::Descendant)
+            .then_some(HostFileStage::InRing)
     }
 
     /// [`Self::decode`] of an ISA's native call. x86_64 `poll(2)` shares
@@ -791,6 +823,18 @@ impl HostFileCall {
                 timeout: args[2],
                 sigmask: args[3],
             },
+            c if c == nr::PSELECT6
+                || c.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_SELECT =>
+            {
+                let timeval = c != nr::PSELECT6;
+                Self::Select {
+                    nfds: args[0],
+                    sets: [args[1], args[2], args[3]],
+                    timeout: args[4],
+                    timeval,
+                    sigmask: if timeval { 0 } else { args[5] },
+                }
+            }
             c if c == LINUX_NR_MMAP
                 && matches!(
                     args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE),
@@ -855,6 +899,9 @@ pub enum OutputLayout {
     Net,
     /// Scatter the record's flat read into the staged Linux iovec regions.
     Vector,
+    /// A select's reply entries, rewritten into the `fd_set`s its record's
+    /// input names; `len` is the reply capacity.
+    Select,
 }
 
 impl HostFileOutput {
@@ -883,7 +930,10 @@ impl HostFileOutput {
     /// whatever the caller's encoding.
     pub const fn reply_capacity(self) -> usize {
         match self.layout {
-            OutputLayout::Bytes | OutputLayout::Net | OutputLayout::Vector => self.len,
+            OutputLayout::Bytes
+            | OutputLayout::Net
+            | OutputLayout::Vector
+            | OutputLayout::Select => self.len,
             OutputLayout::X8664Stat => LINUX_STAT_BYTES,
         }
     }
@@ -895,8 +945,9 @@ impl HostFileOutput {
             OutputLayout::Bytes => {
                 (reply.len() <= self.len).then_some(alloc::borrow::Cow::Borrowed(reply))
             }
-            // Completed per staged range by `socket::complete`.
-            OutputLayout::Net | OutputLayout::Vector => None,
+            // Completed per staged range by `socket::complete`, the vector
+            // scatter and `complete_select`.
+            OutputLayout::Net | OutputLayout::Vector | OutputLayout::Select => None,
             OutputLayout::X8664Stat => {
                 let stat =
                     <carrick_syscall_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(reply)
@@ -1606,7 +1657,10 @@ pub fn stage(
         ..
     }
     | HostFileStage::InRingReply { output, .. } = &staged
-        && !matches!(output.layout, OutputLayout::Net | OutputLayout::Vector)
+        && !matches!(
+            output.layout,
+            OutputLayout::Net | OutputLayout::Vector | OutputLayout::Select
+        )
     {
         let writable = user.writable(output.address, output.len);
         if writable < output.len {
@@ -2518,6 +2572,13 @@ fn stage_call(
             nfds,
             timeout_ms,
         } => return stage_ppoll(&mut staging, user, fds, nfds, timeout_ms.max(-1)),
+        HostFileCall::Select {
+            nfds,
+            sets,
+            timeout,
+            timeval,
+            sigmask,
+        } => return stage_select(&mut staging, user, nfds, sets, timeout, timeval, sigmask),
         HostFileCall::Socket(call) => return socket::stage(call, &mut staging, user),
         HostFileCall::Chdir { path } => {
             let path = match copy_path(user, path) {
@@ -2656,6 +2717,177 @@ fn stage_ppoll(
     ))
 }
 
+/// Largest `nfds` a staged select carries: Linux's default descriptor
+/// limit. A larger one keeps its route.
+const SELECT_NFDS_MAX: usize = 1024;
+
+/// Stage a `select`/`pselect6` its in-ring owner left unrouted as one host
+/// readiness set ([`host_file::PollShape::Select`]), under
+/// [`stage_ppoll`]'s scope: a signal mask, a selected descriptor that is
+/// in-zone or not in the caller's ring table, or a set larger than one
+/// record keeps its route (`None`). The three sets are read once and made
+/// writable before the crossing; completion rewrites them
+/// ([`complete_select`]).
+///
+/// Divergence from Linux: the timeout is not rewritten with the time left.
+fn stage_select(
+    staging: &mut Staging<'_, '_>,
+    user: &mut dyn HostFileUser,
+    nfds: u64,
+    sets: [u64; 3],
+    timeout: u64,
+    timeval: bool,
+    sigmask: u64,
+) -> Option<HostFileStage> {
+    use host_file::{POLLFD_BYTES, PollShape, PollWait, SELECT_CLASSES, SelectSets};
+    let fault = |address: u64, access: Access| Some(HostFileStage::Fault { address, access });
+    let nfds = nfds as i32;
+    if nfds <= 0 || nfds as usize > SELECT_NFDS_MAX {
+        return None;
+    }
+    if sigmask != 0 {
+        let mut pair = [0u8; 16];
+        if !user.copy_in(&mut pair, sigmask) {
+            return fault(sigmask, Access::Read);
+        }
+        if pair[..8] != [0; 8] {
+            return None;
+        }
+    }
+    let timeout_ms = if timeout == 0 {
+        -1
+    } else {
+        let mut spec = [0u8; 16];
+        if !user.copy_in(&mut spec, timeout) {
+            return fault(timeout, Access::Read);
+        }
+        let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
+        let fraction = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
+        let nanoseconds = if timeval {
+            // How Linux treats a `timeval` outside one second is not this
+            // venue's to guess.
+            if !(0..1_000_000).contains(&fraction) {
+                return None;
+            }
+            fraction * 1_000
+        } else {
+            fraction
+        };
+        match ppoll_timeout_ms(seconds, nanoseconds) {
+            Ok(milliseconds) => milliseconds,
+            Err(errno) => return Some(HostFileStage::Returned(SyscallResult::from_errno(errno))),
+        }
+    };
+    let layout = SelectSets {
+        nfds: nfds as u32,
+        sets,
+    };
+    let bytes = layout.set_bytes();
+    let mut bitmaps = [const { Vec::new() }; 3];
+    for (bitmap, address) in bitmaps.iter_mut().zip(sets) {
+        if address == 0 {
+            continue;
+        }
+        bitmap.resize(bytes, 0u8);
+        if !user.copy_in(bitmap, address) {
+            let readable = user.readable(address, bytes);
+            return fault(address.saturating_add(readable as u64), Access::Read);
+        }
+        let writable = user.writable(address, bytes);
+        if writable < bytes {
+            return fault(address.saturating_add(writable as u64), Access::Write);
+        }
+    }
+    let mut entries = Vec::new();
+    for fd in 0..nfds as usize {
+        let events = bitmaps
+            .iter()
+            .zip(SELECT_CLASSES)
+            .filter(|(bitmap, _)| {
+                bitmap
+                    .get(fd / 8)
+                    .is_some_and(|byte| byte & (1 << (fd % 8)) != 0)
+            })
+            .fold(0i16, |events, (_, class)| events | class);
+        if events == 0 {
+            continue;
+        }
+        match staging.descriptor(fd as i32)? {
+            NativeDescriptor::HostBacked { .. } => {}
+            // A mixed set waits on a guest-owned producer the carrier
+            // cannot observe (#1051); a descriptor outside this table is
+            // its own owner's to answer.
+            NativeDescriptor::InZone(_) | NativeDescriptor::Absent => return None,
+        }
+        entries.extend_from_slice(&(fd as i32).to_le_bytes());
+        entries.extend_from_slice(&events.to_le_bytes());
+        entries.extend_from_slice(&[0; 2]);
+    }
+    let len = entries.len();
+    if len == 0 || len > HOST_FILE_CHUNK_BYTES - host_file::SELECT_SETS_BYTES {
+        return None;
+    }
+    debug_assert!(len.is_multiple_of(POLLFD_BYTES));
+    entries.extend_from_slice(&layout.encode());
+    let wait = if timeout_ms == 0 {
+        PollWait::Snapshot
+    } else {
+        PollWait::MayWait
+    };
+    Some(staging.request(
+        HostFileOp::Poll,
+        -1,
+        0,
+        [
+            wait.raw(),
+            i64::from(timeout_ms) as u64,
+            0,
+            PollShape::Select.raw(),
+        ],
+        &entries,
+        Some(HostFileOutput {
+            address: 0,
+            len,
+            layout: OutputLayout::Select,
+        }),
+    ))
+}
+
+/// Rewrite the caller's `fd_set`s from a served select's reply: each set
+/// whole, holding exactly the descriptors the reply reports in its class,
+/// as Linux rewrites them (all clear on a timeout).
+fn complete_select(
+    record: &[u8],
+    output: &[u8],
+    result: i64,
+    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
+) -> SyscallResult {
+    use host_file::{POLLFD_BYTES, SELECT_CLASSES, SelectSets};
+    let Some((_, layout)) = host_file::replied_input(record).and_then(SelectSets::split) else {
+        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+    };
+    for (address, class) in layout.sets.into_iter().zip(SELECT_CLASSES) {
+        if address == 0 {
+            continue;
+        }
+        let mut bitmap = vec![0u8; layout.set_bytes()];
+        for entry in output.chunks_exact(POLLFD_BYTES) {
+            let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let revents = i16::from_le_bytes([entry[6], entry[7]]);
+            if revents & class != 0
+                && let Ok(fd) = usize::try_from(fd)
+                && let Some(byte) = bitmap.get_mut(fd / 8)
+            {
+                *byte |= 1 << (fd % 8);
+            }
+        }
+        if !copy_out(address, &bitmap) {
+            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
+        }
+    }
+    SyscallResult::new(result)
+}
+
 /// A chdir lookup's reply area: `struct stat`, then at most `PATH_MAX` bytes
 /// of the directory's spelling.
 pub const CHDIR_REPLY_BYTES: usize = LINUX_STAT_BYTES + LINUX_PATH_MAX;
@@ -2729,6 +2961,9 @@ pub fn complete(
         return host_file::replied_input(record)
             .and_then(|input| socket::complete(reply.result, input, reply.output, copy_out))
             .unwrap_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
+    }
+    if output.is_some_and(|output| output.layout == OutputLayout::Select) {
+        return complete_select(record, reply.output, reply.result, copy_out);
     }
     if output.is_some_and(|output| output.layout == OutputLayout::Vector) {
         let eio = SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);

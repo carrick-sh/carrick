@@ -385,6 +385,7 @@ impl SyscallDispatcher {
         &self,
         resources: &super::resources::HostRootResources,
         record: &mut [u8],
+        waiter: Option<carrick_el1_abi::RecordRef>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let owner = self
             .kernel_binding
@@ -413,7 +414,7 @@ impl SyscallDispatcher {
             record,
             Some(&resources),
             executable,
-            None,
+            waiter,
         )
     }
 
@@ -782,6 +783,20 @@ impl SyscallDispatcher {
             Some(PollWait::MayWait) => true,
             None => return NativePoll::Served(Served::Refused),
         };
+        use carrick_core_abi::host_file::{PollShape, SelectSets};
+        let Some(shape) =
+            PollShape::from_raw(header.args[carrick_core_abi::host_file::POLL_SHAPE_ARG])
+        else {
+            return NativePoll::Served(Served::Refused);
+        };
+        // A select's entries lead its sets, which only its ring reads.
+        let input = match shape {
+            PollShape::Poll => input,
+            PollShape::Select => match SelectSets::split(input) {
+                Some((entries, _)) => entries,
+                None => return NativePoll::Served(Served::Refused),
+            },
+        };
         if input.is_empty() || !input.len().is_multiple_of(POLLFD_BYTES) || capacity != input.len()
         {
             return NativePoll::Served(Served::Refused);
@@ -807,14 +822,29 @@ impl SyscallDispatcher {
                     }
                     Some(revents)
                 }) {
-                    Ok(Some(revents)) => {
-                        revents
-                            & (events
-                                | carrick_abi::LINUX_POLLERR
-                                | carrick_abi::LINUX_POLLHUP
-                                | carrick_abi::LINUX_POLLNVAL)
-                    }
-                    Err(PinnedHostResourceError::BadFd) => carrick_abi::LINUX_POLLNVAL,
+                    Ok(Some(revents)) => match shape {
+                        PollShape::Poll => {
+                            revents
+                                & (events
+                                    | carrick_abi::LINUX_POLLERR
+                                    | carrick_abi::LINUX_POLLHUP
+                                    | carrick_abi::LINUX_POLLNVAL)
+                        }
+                        PollShape::Select => {
+                            carrick_core_abi::host_file::select_ready(events, revents)
+                        }
+                    },
+                    Err(PinnedHostResourceError::BadFd) => match shape {
+                        PollShape::Poll => carrick_abi::LINUX_POLLNVAL,
+                        // select(2): a descriptor closed since the ring
+                        // staged the set is EBADF, and no set is rewritten.
+                        PollShape::Select => {
+                            if let Some(record) = waiter {
+                                owner.poll_deadlines().clear(record);
+                            }
+                            return NativePoll::Served(Served::errno(carrick_abi::LINUX_EBADF));
+                        }
+                    },
                     Ok(None)
                     | Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) =>
                     {
@@ -823,7 +853,11 @@ impl SyscallDispatcher {
                 }
             };
             entry[6..8].copy_from_slice(&revents.to_le_bytes());
-            ready += i64::from(revents != 0);
+            ready += match shape {
+                PollShape::Poll => i64::from(revents != 0),
+                // select counts every set bit it reports.
+                PollShape::Select => i64::from(revents.count_ones()),
+            };
         }
         if ready != 0 || !may_wait {
             if let Some(record) = waiter {
@@ -4526,7 +4560,7 @@ mod tests {
             );
             fixture
                 .dispatcher
-                .serve_host_root_file(&resources, &mut open)
+                .serve_host_root_file(&resources, &mut open, None)
                 .unwrap();
             let opened = host_file::reply(&open).unwrap().result;
             assert_eq!(opened, 4);
