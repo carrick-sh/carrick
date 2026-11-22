@@ -1317,6 +1317,71 @@ fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
     );
 }
 
+/// A read-only `MAP_SHARED` file mapping the ring serves is held in private
+/// byte-source custody, and `/proc/<pid>/maps` still shows it as the shared
+/// mapping its caller made (`r--s` with the file's path), beside the private
+/// mapping of the same file (`r--p`).
+#[test]
+fn shared_read_only_file_mapping_renders_as_shared_in_proc_maps() {
+    use carrick_el1_abi::FileMapSharing;
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let private = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let source = root.lock().mapping(private).unwrap().host_backing.unwrap();
+    // What guest EL1 does for the shared mapping, with the retained source.
+    let shared = {
+        let mut root = root.lock();
+        let decision = root
+            .mmap_private_file(
+                Placement::Anywhere,
+                PAGE,
+                READ,
+                source,
+                FileMapSharing::SharedReadOnly,
+            )
+            .unwrap();
+        commit(&mut root, decision)
+    };
+    assert!(
+        root.lock()
+            .mapping(shared)
+            .unwrap()
+            .flags
+            .contains(ReservationNodeFlags::SHARED_READ_ONLY)
+    );
+    let private_row = proc_row_at(&dispatcher, private).expect("the private mapping has a row");
+    let shared_row = proc_row_at(&dispatcher, shared).expect("the shared mapping has a row");
+    assert_eq!(private_row.sharing, carrick_vfs::ProcMapSharing::Private);
+    assert_eq!(shared_row.sharing, carrick_vfs::ProcMapSharing::Shared);
+    assert_eq!(
+        (shared_row.read, shared_row.write, shared_row.execute),
+        (true, false, false)
+    );
+    assert_eq!(shared_row.path, private_row.path);
+    assert!(!shared_row.path.is_empty());
+    // A writable shared mapping is never minted through this custody.
+    assert_eq!(
+        root.lock().mmap_private_file(
+            Placement::Anywhere,
+            PAGE,
+            ReservationProtection::READ_WRITE,
+            source,
+            FileMapSharing::SharedReadOnly,
+        ),
+        Err(Refusal::Invalid)
+    );
+}
+
 /// The proc-executable description must use the same owner source custody as
 /// HostFile. An eager copy here asks UserWrite to enter the mutation's own gate.
 #[test]
