@@ -185,6 +185,10 @@ pub struct Census {
     /// `IpcLeave` name (nonzero only; absent in older files).
     #[serde(default)]
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// Delegated-MM anonymous calls EL1 left for the host, by
+    /// `AnonymousLeave` name (nonzero only; absent in older files).
+    #[serde(default)]
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<CensusRow>,
     /// The last counted refusals with what each refused call asked for
     /// (`Counters::refused_calls`), oldest first; absent in older files.
@@ -376,6 +380,15 @@ fn snapshot_counters(
                 })
                 .collect()
         }),
+        anonymous_leaves: counters.map_or_else(Default::default, |c| {
+            carrick_el1_abi::AnonymousLeave::ALL
+                .into_iter()
+                .filter_map(|why| {
+                    let count = c.anonymous_leaves[why as usize].load(Ordering::Relaxed);
+                    (count != 0).then(|| (why.name().to_owned(), count))
+                })
+                .collect()
+        }),
         rows,
         refused_calls: counters.map_or_else(Vec::new, |counters| {
             counters
@@ -550,6 +563,8 @@ pub struct Aggregate {
     pub wall_ns: u64,
     /// `IpcLeave` counts summed across the runs, keyed by variant name.
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// `AnonymousLeave` counts summed across the runs, keyed by variant name.
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<AggregateRow>,
 }
 
@@ -561,9 +576,13 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
     let mut ipc_leaves: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut anonymous_leaves: std::collections::BTreeMap<String, u64> = Default::default();
     for census in censuses {
         for (name, count) in &census.ipc_leaves {
             *ipc_leaves.entry(name.clone()).or_default() += count;
+        }
+        for (name, count) in &census.anonymous_leaves {
+            *anonymous_leaves.entry(name.clone()).or_default() += count;
         }
         if census.schema != 2 {
             return Err(format!("unknown census schema {}", census.schema));
@@ -607,6 +626,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             .sum(),
         wall_ns: censuses.iter().map(|c| c.wall_ns).sum(),
         ipc_leaves,
+        anonymous_leaves,
         rows,
     })
 }
@@ -658,7 +678,25 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             .collect();
         out.push_str(&format!("\nIPC leaves: {}\n", leaves.join(", ")));
     }
+    if !aggregate.anonymous_leaves.is_empty() {
+        let leaves: Vec<_> = aggregate
+            .anonymous_leaves
+            .iter()
+            .map(|(name, count)| format!("{name}: {count}"))
+            .collect();
+        out.push_str(&format!("\nanonymous leaves: {}\n", leaves.join(", ")));
+    }
     out
+}
+
+/// The census of an ISA's mapped counters, as `publish_counters_terminal`
+/// would write it for a run without an identity. For tools that judge a
+/// census (`carrick debug discover`) and their tests.
+pub fn census_of_counters(
+    counters: &carrick_el1_abi::Counters,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Census {
+    snapshot_counters(None, Some(counters), isa)
 }
 
 /// One refused syscall for one caller class, summed over several censuses.
@@ -888,6 +926,7 @@ mod tests {
             process_sys_ns: 4_000,
             wall_ns: 30_000,
             ipc_leaves: Default::default(),
+            anonymous_leaves: Default::default(),
             rows,
             refused_calls: Vec::new(),
             refused_calls_dropped: 0,
@@ -1280,7 +1319,22 @@ mod tests {
             let legacy: Census = serde_json::from_value(legacy).unwrap();
             let legacy = serde_json::to_value(legacy).unwrap();
             assert_eq!(legacy["anonymous_leaves"], serde_json::json!({}));
+            // The table sums them across carriers.
+            let mut a = census.clone();
+            a.rows = vec![row(222, 1, 1)];
+            let aggregate = aggregate(&[a.clone(), a]).unwrap();
+            assert!(
+                render_table(&aggregate, 10)
+                    .contains("anonymous leaves: backing_block: 2, root_declined: 4")
+            );
         }
+        // Every variant is named once, in ordinal order.
+        for (index, why) in AnonymousLeave::ALL.into_iter().enumerate() {
+            assert_eq!(why as usize, index);
+        }
+        let names: std::collections::BTreeSet<_> =
+            AnonymousLeave::ALL.map(AnonymousLeave::name).into();
+        assert_eq!(names.len(), AnonymousLeave::COUNT);
     }
 
     #[test]
