@@ -2121,6 +2121,48 @@ fn mounted_static_x86_signal_segv_fault_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_segv_fault.S", b"SC\n");
 }
 
+/// #1514: a user exception that is not a page fault belongs to the task that
+/// raised it. Fork children execute `ud2`, divide by zero and `int3` beside
+/// three siblings taking fresh page faults; each dies of its own signal and
+/// the parent reaps them all. One more child handles SIGILL and steps over
+/// the instruction. On x86 the first such exception ended the whole run as
+/// `128 + signal`, whichever task raised it.
+#[test]
+fn mounted_static_x86_user_exception_belongs_to_the_task_that_raised_it() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("user-exception");
+    compile_assembly_with_flags(
+        "x86_user_exception_beside_siblings.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native user-exception oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(
+        native.stdout, b"ill=04 fpe=04 trap=04 handled=42 clean=3\n",
+        "native oracle"
+    );
+
+    let guest = run_mounted_binary(&elf, "user-exception-beside-siblings", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 fn skip_without_kvm() -> bool {
     let present = std::path::Path::new("/dev/kvm").exists();
     assert!(
