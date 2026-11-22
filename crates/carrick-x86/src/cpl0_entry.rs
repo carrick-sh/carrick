@@ -413,6 +413,12 @@ pub struct CpuBinding {
     pub stdio_table_admitted: AtomicU64,
     /// Carrier-issued region publication; installed before any guest entry.
     pub file_region: carrick_el1_abi::FileRegionBinding,
+    /// This CPU's CR4, read from hardware once by its first CPL0 user
+    /// access; zero until then (CR4.PAE makes a live long-mode CR4 nonzero).
+    /// The stopped host programs CR4 before the vCPU's first instruction and
+    /// the guest kernel never writes it, so the snapshot stays exact. Under
+    /// SVM every `mov reg, cr4` is an intercepted VM exit (#2679).
+    pub cr4_snapshot: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);

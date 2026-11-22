@@ -82,13 +82,14 @@ impl DrainReceipt {
 }
 
 fn live_root() -> Result<RootGpa, ArchError> {
-    let (cr3, cr4): (u64, u64);
-    // SAFETY: CPL0 may read this CPU's CR3 and CR4. The KVM bootstrap uses
-    // non-global, non-PCID roots; those modes need a separate shootdown.
+    let cr3: u64;
+    // SAFETY: CPL0 may read this CPU's CR3 (not intercepted under nested
+    // paging). The KVM bootstrap uses non-global, non-PCID roots; those modes
+    // need a separate shootdown, so CR4 is checked from the CPU's snapshot.
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
+    let cr4 = super::control::Cr4::current().raw();
     if cr4 & (CR4_PGE | CR4_PCIDE) != 0 || cr3 & ADDRESS_MASK == 0 {
         return Err(ArchError::Unbound);
     }
