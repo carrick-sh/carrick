@@ -3103,9 +3103,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(self.yield_service_checkpoint_as(entry)?);
                 }
                 if error != ObjectWaitError::Changed && failure.is_none() {
-                    return Err(NativeProcessError::ServiceQuarantined(
-                        NativeServiceQuarantine::ParkRefused,
-                    ));
+                    return Err(NativeProcessError::ServiceQuarantined(match error {
+                        ObjectWaitError::Stale => NativeServiceQuarantine::ServiceParkStale,
+                        ObjectWaitError::Busy => NativeServiceQuarantine::ServiceParkBusy,
+                        ObjectWaitError::Exhausted => NativeServiceQuarantine::ServiceParkExhausted,
+                        ObjectWaitError::Occupied | ObjectWaitError::Changed => {
+                            NativeServiceQuarantine::ParkRefused
+                        }
+                    }));
                 }
                 None
             }
@@ -3736,9 +3741,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ));
                 }
                 self.restore_preparation_operation(operation)?;
-                Err(NativeProcessError::ServiceQuarantined(
-                    NativeServiceQuarantine::ParkRefused,
-                ))
+                Err(NativeProcessError::ServiceQuarantined(match error {
+                    ObjectWaitError::Occupied => NativeServiceQuarantine::NoticeParkOccupied,
+                    ObjectWaitError::Stale => NativeServiceQuarantine::NoticeParkStale,
+                    ObjectWaitError::Busy => NativeServiceQuarantine::NoticeParkBusy,
+                    ObjectWaitError::Exhausted => NativeServiceQuarantine::NoticeParkExhausted,
+                    ObjectWaitError::Changed => NativeServiceQuarantine::ParkRefused,
+                }))
             }
         }
     }

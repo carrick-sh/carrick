@@ -345,7 +345,17 @@ pub enum NativeServiceQuarantine {
     AdapterOperationTake,
     AdapterOperationRestore,
     HostCompletionQueue,
+    /// A service park that `park_object_record` refused as `Occupied` with no
+    /// host request to explain it. The other refusals carry their own reason
+    /// so the fatal names the park and the error (#2777).
     ParkRefused,
+    ServiceParkStale,
+    ServiceParkBusy,
+    ServiceParkExhausted,
+    NoticeParkOccupied,
+    NoticeParkStale,
+    NoticeParkBusy,
+    NoticeParkExhausted,
     ParkResultMissing,
     RetainOperation,
     RequeueRefused,

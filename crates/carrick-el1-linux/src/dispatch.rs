@@ -3123,6 +3123,13 @@ fn native_service_fatal_reason(
             }
             Quarantine::HostCompletionQueue => Fatal::NativeServiceQuarantinedHostCompletionQueue,
             Quarantine::ParkRefused => Fatal::NativeServiceQuarantinedParkRefused,
+            Quarantine::ServiceParkStale => Fatal::NativeServiceQuarantinedServiceParkStale,
+            Quarantine::ServiceParkBusy => Fatal::NativeServiceQuarantinedServiceParkBusy,
+            Quarantine::ServiceParkExhausted => Fatal::NativeServiceQuarantinedServiceParkExhausted,
+            Quarantine::NoticeParkOccupied => Fatal::NativeServiceQuarantinedNoticeParkOccupied,
+            Quarantine::NoticeParkStale => Fatal::NativeServiceQuarantinedNoticeParkStale,
+            Quarantine::NoticeParkBusy => Fatal::NativeServiceQuarantinedNoticeParkBusy,
+            Quarantine::NoticeParkExhausted => Fatal::NativeServiceQuarantinedNoticeParkExhausted,
             Quarantine::ParkResultMissing => Fatal::NativeServiceQuarantinedParkResultMissing,
             Quarantine::RetainOperation => Fatal::NativeServiceQuarantinedRetainOperation,
             Quarantine::RequeueRefused => Fatal::NativeServiceQuarantinedRequeueRefused,
@@ -7320,6 +7327,34 @@ mod tests {
             (
                 Quarantine::ParkRefused,
                 Fatal::NativeServiceQuarantinedParkRefused,
+            ),
+            (
+                Quarantine::ServiceParkStale,
+                Fatal::NativeServiceQuarantinedServiceParkStale,
+            ),
+            (
+                Quarantine::ServiceParkBusy,
+                Fatal::NativeServiceQuarantinedServiceParkBusy,
+            ),
+            (
+                Quarantine::ServiceParkExhausted,
+                Fatal::NativeServiceQuarantinedServiceParkExhausted,
+            ),
+            (
+                Quarantine::NoticeParkOccupied,
+                Fatal::NativeServiceQuarantinedNoticeParkOccupied,
+            ),
+            (
+                Quarantine::NoticeParkStale,
+                Fatal::NativeServiceQuarantinedNoticeParkStale,
+            ),
+            (
+                Quarantine::NoticeParkBusy,
+                Fatal::NativeServiceQuarantinedNoticeParkBusy,
+            ),
+            (
+                Quarantine::NoticeParkExhausted,
+                Fatal::NativeServiceQuarantinedNoticeParkExhausted,
             ),
             (
                 Quarantine::ParkResultMissing,

@@ -190,6 +190,13 @@ pub enum EntryBindingFatalReason {
     NativeServiceQuarantinedForkAbortLoan = 172,
     NativeServiceQuarantinedForkSettleCustody = 173,
     NativeServiceQuarantinedNoticePublishDuplicate = 174,
+    NativeServiceQuarantinedServiceParkStale = 175,
+    NativeServiceQuarantinedServiceParkBusy = 176,
+    NativeServiceQuarantinedServiceParkExhausted = 177,
+    NativeServiceQuarantinedNoticeParkOccupied = 178,
+    NativeServiceQuarantinedNoticeParkStale = 179,
+    NativeServiceQuarantinedNoticeParkBusy = 180,
+    NativeServiceQuarantinedNoticeParkExhausted = 181,
     SignalWaitAdapterQuarantine = 200,
     RetainedControlQuarantine = 201,
 }
@@ -359,6 +366,13 @@ impl EntryBindingFatalReason {
             172 => Some(Self::NativeServiceQuarantinedForkAbortLoan),
             173 => Some(Self::NativeServiceQuarantinedForkSettleCustody),
             174 => Some(Self::NativeServiceQuarantinedNoticePublishDuplicate),
+            175 => Some(Self::NativeServiceQuarantinedServiceParkStale),
+            176 => Some(Self::NativeServiceQuarantinedServiceParkBusy),
+            177 => Some(Self::NativeServiceQuarantinedServiceParkExhausted),
+            178 => Some(Self::NativeServiceQuarantinedNoticeParkOccupied),
+            179 => Some(Self::NativeServiceQuarantinedNoticeParkStale),
+            180 => Some(Self::NativeServiceQuarantinedNoticeParkBusy),
+            181 => Some(Self::NativeServiceQuarantinedNoticeParkExhausted),
             200 => Some(Self::SignalWaitAdapterQuarantine),
             201 => Some(Self::RetainedControlQuarantine),
 
@@ -684,7 +698,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=174).chain(200..=201) {
+        for raw in (1..=48).chain(60..=181).chain(200..=201) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -703,8 +717,8 @@ mod tests {
             "reason=MissingNativeFrame at=1646:9"
         );
         assert_eq!(
-            format!("{}", FatalDetail(Some(175), Some(0))),
-            "reason=unknown(0xaf) at=0:0"
+            format!("{}", FatalDetail(Some(182), Some(0))),
+            "reason=unknown(0xb6) at=0:0"
         );
         assert_eq!(
             format!("{}", FatalDetail(None, None)),
