@@ -85,7 +85,7 @@ impl ExecOwnerCensus {
     /// Rows reserved and not yet retired. At carrier exit a nonzero count is
     /// a preparation, and whatever it retains, that outlived its process
     /// (#2799).
-    pub const fn live(&self) -> u64 {
+    pub const fn unretired(&self) -> u64 {
         self.reserved.saturating_sub(self.retired())
     }
 }
@@ -94,7 +94,7 @@ impl ExecOwnerCensus {
 /// any other late owner.
 impl core::fmt::Display for ExecOwnerCensus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let (live, retired) = (self.live(), self.retired());
+        let (unretired, retired) = (self.unretired(), self.retired());
         let Self {
             reserved,
             sealed,
@@ -103,7 +103,7 @@ impl core::fmt::Display for ExecOwnerCensus {
         } = *self;
         write!(
             f,
-            "live={live} reserved={reserved} sealed={sealed} adopted={adopted} retired={retired}"
+            "live={unretired} reserved={reserved} sealed={sealed} adopted={adopted} retired={retired}"
         )
     }
 }

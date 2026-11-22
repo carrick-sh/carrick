@@ -113,7 +113,7 @@ fn the_receipt_is_reserved_at_claim_and_the_seal_reuses_it() {
     owner.stage(first.receipt(), "staged").unwrap();
     assert_eq!(owner.seal(first.receipt()), Ok(first));
     assert_eq!(owner.census().reserved, 2, "the seal reserves nothing");
-    assert_eq!(owner.census().live(), 2, "a sealed row is still live");
+    assert_eq!(owner.census().unretired(), 2, "a sealed row is still live");
     // A retired receipt is never issued again.
     let retired = owner
         .retire(second.receipt(), ExecRetireReason::Refused)
