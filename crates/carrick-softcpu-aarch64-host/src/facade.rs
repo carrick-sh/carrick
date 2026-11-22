@@ -2016,7 +2016,7 @@ fn authenticated_root_exit(
 ) -> Option<Aarch64Exit> {
     use carrick_aarch64::stopped_abi::{RetainedAbiRegion, root_stack_record, stopped_execution};
 
-    if !record_va.is_multiple_of(64) || (cpu != 0 && cpu != u64::from(SOFT_CPU.raw())) {
+    if !record_va.is_multiple_of(64) || cpu != u64::from(SOFT_CPU.raw()) {
         return None;
     }
     let base = stage2.host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)?;
