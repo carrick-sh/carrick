@@ -682,6 +682,20 @@ impl Cpl0Carrier {
         self.custody.birth_serial_source()
     }
 
+    /// The in-kernel KVM statistics of this carrier's two vCPUs, scoped to
+    /// this carrier: the handle outlives the run that consumes the carrier,
+    /// so a witness reads exactly the exits its own guest caused. An absent
+    /// `KVM_GET_STATS_FD` is an error, never an empty census.
+    pub fn kernel_stats(&self) -> Result<crate::kvm::CarrierKernelStats, TrapError> {
+        let cpus = self
+            .cpus
+            .iter()
+            .map(|cpu| crate::kvm::VcpuKernelStats::open(cpu.fd()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| fail(format!("KVM_GET_STATS_FD: {error}")))?;
+        Ok(crate::kvm::CarrierKernelStats::new(cpus))
+    }
+
     /// Replace the bootstrap's provisional identity with the exact root
     /// issued by the shared kernel, before the initial MM is admitted.
     pub fn bind_initial_task_identity(

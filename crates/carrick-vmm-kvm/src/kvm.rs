@@ -203,10 +203,138 @@ pub(crate) fn reset_kvm_stats_for_new_vm() {
     }
 }
 
+/// One vCPU's in-kernel statistics (`KVM_GET_STATS_FD`, Linux 5.14+). They
+/// count the exits the host kernel handles without returning to Carrick (a
+/// control-register read, an MSR, an emulated instruction), which the
+/// userspace exit counters above cannot see. The stats fd holds its own VM
+/// reference, so it stays readable after the vCPU fd is parked or closed.
+pub struct VcpuKernelStats(std::fs::File);
+
+/// The summed in-kernel counters of one carrier's vCPUs, by KVM stat name.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KernelStatTotals(std::collections::BTreeMap<String, u64>);
+
+impl KernelStatTotals {
+    /// A named counter, or `None` when this host kernel does not publish it.
+    pub fn get(&self, name: &str) -> Option<u64> {
+        self.0.get(name).copied()
+    }
+
+    fn add(&mut self, name: String, value: u64) {
+        let entry = self.0.entry(name).or_insert(0);
+        *entry = entry.wrapping_add(value);
+    }
+
+    fn line(&self) -> String {
+        self.0
+            .iter()
+            .filter(|(_, value)| **value != 0)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl VcpuKernelStats {
+    pub(crate) fn open(fd: &VcpuFd) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // KVM_GET_STATS_FD = _IO(KVMIO, 0xce).
+        const KVM_GET_STATS_FD: libc::c_ulong = (0xAE << 8) | 0xCE;
+        // SAFETY: a plain vCPU ioctl on a live vCPU fd owned by this process;
+        // it returns a new fd or -1.
+        let raw = unsafe { libc::ioctl(fd.as_raw_fd(), KVM_GET_STATS_FD as _) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh fd this process now owns.
+        Ok(Self(std::fs::File::from(unsafe {
+            OwnedFd::from_raw_fd(raw)
+        })))
+    }
+
+    /// Add this vCPU's counters to `totals`. The binary layout is KVM's
+    /// documented stats header, descriptor array and u64 data block.
+    pub fn read_into(&self, totals: &mut KernelStatTotals) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let word = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let mut header = [0u8; 24];
+        self.0.read_exact_at(&mut header, 0)?;
+        let name_size = word(&header, 4) as usize;
+        let descriptors = word(&header, 8) as usize;
+        let descriptor_offset = u64::from(word(&header, 16));
+        let data_offset = u64::from(word(&header, 20));
+        let descriptor_size = 16 + name_size;
+        let mut table = vec![0u8; descriptor_size * descriptors];
+        self.0.read_exact_at(&mut table, descriptor_offset)?;
+        for descriptor in table.chunks_exact(descriptor_size) {
+            let size = usize::from(u16::from_le_bytes([descriptor[6], descriptor[7]]));
+            let offset = u64::from(word(descriptor, 8));
+            let name = &descriptor[16..];
+            let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            let mut values = vec![0u8; 8 * size];
+            self.0.read_exact_at(&mut values, data_offset + offset)?;
+            let sum = values
+                .chunks_exact(8)
+                .map(|v| u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+                .fold(0, u64::wrapping_add);
+            totals.add(String::from_utf8_lossy(&name[..end]).into_owned(), sum);
+        }
+        Ok(())
+    }
+}
+
+/// One carrier's vCPU statistics, read together.
+pub struct CarrierKernelStats(Vec<VcpuKernelStats>);
+
+impl CarrierKernelStats {
+    pub(crate) fn new(cpus: Vec<VcpuKernelStats>) -> Self {
+        Self(cpus)
+    }
+
+    /// The summed counters of every vCPU in this census.
+    pub fn totals(&self) -> std::io::Result<KernelStatTotals> {
+        let mut totals = KernelStatTotals::default();
+        for cpu in &self.0 {
+            cpu.read_into(&mut totals)?;
+        }
+        Ok(totals)
+    }
+}
+
+/// `CARRICK_KVM_STATS` diagnostics: every vCPU this process creates, read
+/// once at the stats print.
+static VCPU_KERNEL_STATS: Mutex<Vec<VcpuKernelStats>> = Mutex::new(Vec::new());
+
+fn register_vcpu_kernel_stats(fd: &VcpuFd) {
+    if !kvm_stats_enabled() {
+        return;
+    }
+    if let (Ok(stats), Ok(mut list)) = (VcpuKernelStats::open(fd), VCPU_KERNEL_STATS.lock()) {
+        list.push(stats);
+    }
+}
+
+fn print_vcpu_kernel_stats(reason: &str) {
+    let Ok(list) = VCPU_KERNEL_STATS.lock() else {
+        return;
+    };
+    let mut totals = KernelStatTotals::default();
+    for stats in list.iter() {
+        let _ = stats.read_into(&mut totals);
+    }
+    eprintln!(
+        "[carrick-kvm-kernel-stats pid={} reason={reason} vcpus={}] {}",
+        std::process::id(),
+        list.len(),
+        totals.line()
+    );
+}
+
 pub(crate) fn print_kvm_stats_once(reason: &str) {
     if !kvm_stats_enabled() || KVM_STATS_PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
+    print_vcpu_kernel_stats(reason);
     eprintln!(
         "[carrick-kvm-stats pid={} reason={reason}] runs={} eintr={} io_syscall={} io_fault={} io_other={} mmio={} halt={} kicked={} debug={} internal={} other={} get_regs={} set_regs={} get_sregs={} set_sregs={} get_fpu={} set_fpu={} set_msrs={}",
         std::process::id(),
@@ -1357,6 +1485,7 @@ impl KvmVm {
                     .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
                 #[cfg(target_arch = "x86_64")]
                 self.install_x86_cpuid(&new_fd, vcpu_id)?;
+                register_vcpu_kernel_stats(&new_fd);
                 new_fd
             }
         };
