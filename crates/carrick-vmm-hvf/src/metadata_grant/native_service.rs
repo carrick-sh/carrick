@@ -1906,7 +1906,13 @@ fn settle_backing_and_tables(
 }
 
 /// Why [`retain_ring_record`] could not retain a ring-owned record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(super) enum RingRecordMiss {
     /// No retained metadata covers the whole record.
     Absent,
