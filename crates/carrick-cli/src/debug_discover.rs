@@ -1098,6 +1098,8 @@ pub(crate) struct DiscoverOptions<'a> {
     pub(crate) limit: usize,
     /// The docker CLI for the native-oracle timing phase (`--oracle`).
     pub(crate) oracle: Option<&'a Path>,
+    /// Stop after the oracle phase (`--oracle-only`).
+    pub(crate) oracle_only: bool,
 }
 
 fn instance_name(explicit: Option<&str>) -> String {
@@ -1302,6 +1304,15 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
         )?,
         None => read_oracle(options.out)?,
     };
+    if options.oracle_only {
+        let passed = oracle.iter().filter(|record| record.passed).count();
+        eprintln!(
+            "discover: oracle-only: {passed}/{} oracle runs passed; {} holds the oracle for a later carrick run",
+            oracle.len(),
+            options.out.join("oracle.jsonl").display()
+        );
+        return Ok(());
+    }
     let mut records = Vec::new();
     // First runs of every stage come first, so a short budget still sees
     // every stage once; repeats follow.
@@ -1804,6 +1815,7 @@ mod tests {
             reap: None,
             limit: 50,
             oracle: Some(&docker),
+            oracle_only: false,
         })
         .unwrap();
         assert_eq!(
@@ -1827,6 +1839,43 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(out.join("table.md")).unwrap(),
             table
+        );
+
+        // Two windows: --oracle-only runs Docker alone and no carrick stage;
+        // a later carrick-only run in the same directory ranks against it.
+        let split = dir.path().join("split");
+        std::fs::write(&log, "").unwrap();
+        let options = |oracle, oracle_only| DiscoverOptions {
+            rows: &rows,
+            only: &[],
+            runs: 1,
+            out: &split,
+            carrick: Some(&fake),
+            instance: Some("unit"),
+            label: "t",
+            reap: None,
+            limit: 50,
+            oracle,
+            oracle_only,
+        };
+        discover(options(Some(&docker), true)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "docker pull\ndocker run\ndocker run\n"
+        );
+        assert!(!split.join("runs.jsonl").exists() || read_records(&split).unwrap().is_empty());
+        assert_eq!(read_oracle(&split).unwrap().len(), 2);
+        discover(options(None, false)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "docker pull\ndocker run\ndocker run\ncarrick fast\ncarrick slow\n"
+        );
+        let table = std::fs::read_to_string(split.join("table.md")).unwrap();
+        assert!(
+            table.contains(
+                "| pathological_time | passes at >= 5x the native oracle's time | 1 | 1/1 |"
+            ),
+            "{table}"
         );
     }
 
@@ -2016,6 +2065,7 @@ mod tests {
             reap: None,
             limit: 50,
             oracle: None,
+            oracle_only: false,
         })
         .unwrap();
         let records = read_records(&out).unwrap();
