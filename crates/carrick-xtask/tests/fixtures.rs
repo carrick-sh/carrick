@@ -4789,3 +4789,119 @@ fn signed_accept_failed_build_publishes_fail_without_gate() {
     }
     drop(holder);
 }
+
+use carrick_xtask::signed_gate::{self, SignedGateAction, SignedGateArgs};
+
+/// #2779: a commit on a side branch that publishes the same inventory bytes
+/// as `HEAD`, standing in for a bundle `source_head` the gate's shallow
+/// checkout does not hold. Leaves `HEAD` where it was.
+fn publish_from_side_commit(f: &mut Fixture) -> String {
+    let root = f.repo.path().to_owned();
+    let root = root.as_path();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["checkout", "-q", "-b", "publisher"]);
+    git(root, &["commit", "-q", "--allow-empty", "-m", "publisher"]);
+    let published = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["checkout", "-q", "--detach", &head]);
+    f.manifest.source_head = published.clone().try_into().unwrap();
+    f.republish();
+    published
+}
+
+/// #2779 through the gate path: the checkout's `origin` fetch of the base
+/// and candidate does not bring the bundle's `source_head`, so the gate
+/// fetches it too and the candidate's added probe is classified (here it is
+/// then refused for its own `global_asm`, which only happens after
+/// planning succeeded).
+#[test]
+fn gate_fetches_the_bundles_source_head_and_classifies_added_probes() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let mut f = Fixture::new();
+    let origin = f.repo.path().to_owned();
+    let origin = origin.as_path();
+    git(origin, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let base = git(origin, &["rev-parse", "HEAD"]);
+    let published = publish_from_side_commit(&mut f);
+    let probe =
+        b"#![no_main]\ncore::arch::global_asm!(\".pushsection .rodata\", \".popsection\");\n";
+    let candidate = commit_added_probe_source(origin, "asmprobe", built_row(), probe);
+    git(origin, &["branch", "candidate", &candidate]);
+    let bundle_dir = CanonicalTempDir::new();
+    let bundle = fixtures::archive::pack(&f.path, bundle_dir.path()).unwrap();
+
+    let checkout = CanonicalTempDir::new();
+    let work = checkout.path();
+    git(work, &["init", "-q"]);
+    git(
+        work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", origin.display()),
+        ],
+    );
+    let scratch = CanonicalTempDir::new();
+    let request = scratch.path().join("request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "PullRequest", "prs": [1], "sha": candidate, "base": base,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = scratch.path().join("out");
+    signed_gate::run(
+        work,
+        SignedGateArgs {
+            action: SignedGateAction::CandidateProbes {
+                request,
+                bundle,
+                output: output.clone(),
+            },
+        },
+    )
+    .unwrap();
+    let outcome: signed_gate::CandidateProbesOutcome =
+        serde_json::from_slice(&fs::read(output.join("candidate-probes.json")).unwrap()).unwrap();
+    assert_eq!(
+        outcome.outcome,
+        signed_gate::CandidateProbesVerdict::Refused
+    );
+    let refusal = outcome.refusal.unwrap();
+    assert!(refusal.contains("uses `global_asm`"), "{refusal}");
+    // The shallow checkout got the publisher's commit.
+    git(
+        work,
+        &["cat-file", "-e", &format!("{published}^{{commit}}")],
+    );
+}
+
+/// #2779: an inventory that cannot be read at the bundle's `source_head` is
+/// a clear error, never an input identity refusal naming the PR's own
+/// changes.
+#[test]
+fn unreadable_base_inventory_is_a_typed_error_not_an_identity_refusal() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let mut f = Fixture::new();
+    let root = f.repo.path().to_owned();
+    let root = root.as_path();
+    f.manifest.source_head = "3a5c631249000000000000000000000000000000"
+        .to_owned()
+        .try_into()
+        .unwrap();
+    f.republish();
+    commit_added_probe(root, "newprobe", built_row());
+    let error = candidate_probes::plan(root, &f.path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot read the base probe inventory"),
+        "{error}"
+    );
+}
