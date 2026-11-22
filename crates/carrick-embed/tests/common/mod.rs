@@ -286,8 +286,13 @@ pub fn run_id() -> String {
         )
 }
 
-/// Bound a guest run: if the run outlives `timeout`, reap this run id with
-/// `scripts/sudo/kill.sh`, so a hang is a test failure rather than a wedge.
+/// How long a run may take to end after the watchdog asks it to abort.
+const ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Bound a guest run: if the run outlives `timeout`, capture a post-mortem
+/// and ask the runner to abort, so a hang fails its own test. A run that
+/// outlives the abort too is a wedge: reap this run id with
+/// `scripts/sudo/kill.sh`.
 pub struct Watchdog {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -338,7 +343,27 @@ impl Watchdog {
                         run_id: run_id.clone(),
                     },
                 );
-                std::thread::sleep(std::time::Duration::from_secs(8));
+                // An abort the runner honours ends the run: the test thread
+                // gets its error, fails, and drops this watchdog. Only a run
+                // that is still going after the grace is a wedge to reap,
+                // which takes this whole test binary with it (#1974).
+                let grace = std::time::Instant::now();
+                while grace.elapsed() < ABORT_GRACE {
+                    if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        // A run that ended on its own left the request
+                        // latched; the next test's runner must not take it.
+                        let _ = carrick_kernel::kernel::debug::take_abort_request();
+                        eprintln!(
+                            "WATCHDOG: the run ended {:?} after its abort request; not reaping",
+                            grace.elapsed()
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                eprintln!(
+                    "WATCHDOG: the run outlived its abort request by {ABORT_GRACE:?}; reaping"
+                );
                 let kill_script = repo_root().join("scripts/sudo/kill.sh");
                 let _ = std::process::Command::new(kill_script)
                     .arg(&run_id)
