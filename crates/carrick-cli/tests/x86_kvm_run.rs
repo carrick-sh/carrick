@@ -881,6 +881,54 @@ fn mounted_static_x86_fork_cow_keeps_residency_when_the_table_is_full() {
     );
 }
 
+/// #2813: a munmap that splits a residency row keeps the parts it leaves.
+/// After a fork the parent unmaps every other page of an 8192-page
+/// anonymous mapping, so each hole splits a row and the row count passes
+/// what the table's probe chains hold. A part that found no slot was
+/// silently dropped, and the parent's next write to such a page ended the
+/// run (`owner COW source residency`).
+#[test]
+fn mounted_static_x86_munmap_split_keeps_residency_when_the_table_is_full() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("munmap-split-residency");
+    compile_assembly_with_flags(
+        "x86_munmap_split_residency_capacity.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native munmap-split residency oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"split ok\n", "native oracle");
+
+    // 4096 one-page munmaps and 12288 copy-on-writes: about ten seconds on
+    // a release carrier, so this fixture has its own deadline.
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "munmap-split-residency-capacity",
+        false,
+        &empty_image_archive(),
+        None,
+        Duration::from_secs(90),
+    );
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
@@ -2317,6 +2365,26 @@ fn run_mounted_binary_in_archive_with_census(
     image_archive: &[u8],
     census_dir: Option<&std::path::Path>,
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
+    run_mounted_binary_within(
+        elf,
+        run_id,
+        json,
+        image_archive,
+        census_dir,
+        Duration::from_secs(5),
+    )
+}
+
+/// One mounted run with its own deadline, for a fixture whose work is large
+/// by design. Every other fixture keeps the five-second deadline.
+fn run_mounted_binary_within(
+    elf: &std::path::Path,
+    run_id: &str,
+    json: bool,
+    image_archive: &[u8],
+    census_dir: Option<&std::path::Path>,
+    deadline: Duration,
+) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, image_archive).unwrap();
@@ -2366,7 +2434,7 @@ fn run_mounted_binary_in_archive_with_census(
         .spawn()
         .expect("run mounted x86 Linux binary through carrick");
     if child
-        .wait_timeout(Duration::from_secs(5))
+        .wait_timeout(deadline)
         .expect("wait for mounted x86 Linux binary")
         .is_some()
     {
