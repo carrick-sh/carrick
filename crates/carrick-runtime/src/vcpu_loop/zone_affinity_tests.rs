@@ -120,7 +120,12 @@ fn ring_call_route(
     frame.x[8] = number;
     frame.x[0] = u64::from(tid);
     frame.x[1] = 8;
-    frame.x[2] = core::ptr::from_mut(mask).expose_provenance() as u64;
+    // The kernel copies the mask by its guest user address. A host pointer
+    // to the caller's `mask` is not one: a Linux arm64 stack sits above
+    // `USER_CEILING`, where the checked copy is EFAULT.
+    let operand = carrick_test_support::GuestUserValue::new(*mask);
+    frame.x[2] = operand.arg();
+    carrick_test_support::assert_guest_args(&frame.x[..3]);
     let counters = carrick_el1_abi::Counters::default();
     let mut cpu = carrick_el1_linux::sched::FakeCpu::default();
     let route = carrick_el1_linux::dispatch::dispatch_syscall_with_native(
@@ -157,6 +162,7 @@ fn ring_call_route(
         counters.refused[number as usize].load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+    *mask = operand.get();
     (frame.x[0] as i64, route)
 }
 
