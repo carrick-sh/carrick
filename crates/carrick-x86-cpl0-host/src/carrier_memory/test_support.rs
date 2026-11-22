@@ -1384,6 +1384,197 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     fixture.assert_admitted_exact();
 }
 
+/// #2766: the ring releases the MM's editor after it applies a `Prepare`
+/// and before the carrier settles it, so a sibling thread's `mprotect` or
+/// `munmap` of the same page can land in between. The settlement accepts the
+/// leaf each of those leaves behind; it still refuses a leaf that names
+/// another frame. `retire` picks the sibling's edit.
+///
+/// Returns the first carrier refusal instead of panicking: this harness is
+/// compiled into the library under `test-support`, where the no-panic gate
+/// applies; the `#[test]` callers unwrap the result.
+pub fn prepare_settlement_accepts_a_sibling_edit_of_its_window(
+    _make: fn() -> MemoryTestIo,
+    retire: bool,
+) -> Result<(), String> {
+    use carrick_hal::{
+        FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
+    };
+    use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
+    use carrick_kernel::kernel::{FrameOwner, MmId, ObjectIdRegistry};
+
+    let authority = Arc::new(FrameInventoryAuthority::new());
+    let ids = Arc::new(ObjectIdRegistry::new());
+    let parent_mm = ids.mm_id().unwrap();
+    let child_mm = ids.mm_id().unwrap();
+
+    let inventory_row = |mm: MmId, inherited: Option<FrameId>, gpa: u64| {
+        let mut reservation = authority
+            .reserve(
+                &ids,
+                usize::from(inherited.is_none()),
+                1,
+                FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = inherited.unwrap_or_else(|| reservation.claim_frame().unwrap());
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(nz(1));
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa::new(gpa),
+                length: FrameLength::from_mapping_extent(nz(PAGE)),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let (_, receipt) = authority
+            .apply_with_receipt(
+                FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(nz(mm.raw())),
+                    root_generation: ContextGeneration::new(nz(1)),
+                }),
+                reservation.commit(()),
+            )
+            .unwrap();
+        (
+            BackingIdentity {
+                frame_id: nz(frame.raw()),
+                mapping_id: nz(mapping.raw()),
+                owner_generation: nz(1),
+                inventory_revision: nz(receipt.revision()),
+            },
+            receipt,
+        )
+    };
+
+    let (first, _) = inventory_row(parent_mm, None, 0x800000);
+    let (child_identity, child_receipt) = inventory_row(
+        child_mm,
+        Some(FrameId::from_kernel_allocation(first.frame_id)),
+        0x800000,
+    );
+
+    let mut memory = CarrierMemory::new(_make()).unwrap();
+    memory.install(&[backing(0x1000, 0x8000, 90)]).unwrap();
+    let data = memory.install(&[backing(0x800000, 0x2000, 91)]).unwrap()[0];
+    memory
+        .bind_frame_identities(data, &[(FrameGpa::new(0x800000), first)])
+        .unwrap();
+
+    let parent_context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(parent_mm.raw())),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    let child_context = AddressContext {
+        root: root(0x5000),
+        mm: MmGeneration::new(nz(child_mm.raw())),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    memory
+        .install_root(parent_context.mm.raw(), parent_context)
+        .unwrap();
+    memory
+        .install_root(child_context.mm.raw(), child_context)
+        .unwrap();
+
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+
+    // 1. The faulting thread applies its Prepare in the ring.
+    let parent_tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let map_txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: parent_context.mm.raw(),
+            generation: nz(1),
+        },
+        root: parent_context.root,
+        tables: &parent_tables,
+        op: DescriptorOp::Prepare {
+            span: PageSpan::new(0x4000, PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident: PageSpan::new(0x4000, PAGE),
+            backing: first,
+        },
+    };
+    let receipt = execute_descriptor_txn(
+        &memory.words(),
+        &map_txn,
+        parent_context.root,
+        &mut InlineJournal::new(),
+    );
+    let publication = GuestMmuPublication::from_x86_receipt(&map_txn, &receipt)
+        .ok_or("the Prepare was not applied")?;
+
+    // 2. Its sibling edits the same page before the settlement crossing.
+    let span = PageSpan::new(0x4000, PAGE);
+    let sibling_txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: parent_context.mm.raw(),
+            generation: nz(2),
+        },
+        root: parent_context.root,
+        tables: &[],
+        op: if retire {
+            DescriptorOp::Retire(span)
+        } else {
+            DescriptorOp::Protect {
+                span,
+                permissions: Permissions {
+                    writable: false,
+                    executable: false,
+                    user: true,
+                },
+                ceiling: None,
+            }
+        },
+    };
+    let sibling = execute_descriptor_txn(
+        &memory.words(),
+        &sibling_txn,
+        parent_context.root,
+        &mut InlineJournal::new(),
+    );
+    if GuestMmuPublication::from_x86_receipt(&sibling_txn, &sibling).is_none() {
+        return Err(format!("the sibling edit was not applied: {sibling:?}"));
+    }
+
+    // 3. The Prepare settles against the leaf the sibling left.
+    memory
+        .publish(&map_txn, publication, &mut inventory)
+        .map_err(|error| format!("settlement refused the sibling's leaf: {error}"))?;
+    if memory.is_quarantined() {
+        return Err("settlement quarantined the carrier".to_owned());
+    }
+    let _ = (child_identity, child_receipt, child_context);
+    Ok(())
+}
+
 /// Returns the first carrier refusal instead of panicking: this harness is
 /// compiled into the library under `test-support`, where the no-panic gate
 /// applies; the `#[test]` callers unwrap the result.

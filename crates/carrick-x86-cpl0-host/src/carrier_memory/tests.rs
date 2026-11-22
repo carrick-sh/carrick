@@ -181,3 +181,20 @@ fn ipc_memslots_retain_original_authority_without_copying() {
         "VM destruction releases authority"
     );
 }
+
+#[test]
+fn prepare_settlement_accepts_a_sibling_protect_of_its_window() {
+    test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
+        || test_support::MemoryTestIo::new(TestMemoryIo::default()),
+        false,
+    )
+    .unwrap();
+}
+#[test]
+fn prepare_settlement_accepts_a_sibling_retire_of_its_window() {
+    test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
+        || test_support::MemoryTestIo::new(TestMemoryIo::default()),
+        true,
+    )
+    .unwrap();
+}
