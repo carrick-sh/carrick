@@ -941,6 +941,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 limit,
                 oracle,
                 oracle_only,
+                venue_profiles,
                 report,
             } => {
                 if report {
@@ -960,6 +961,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         limit,
                         oracle: oracle.as_deref(),
                         oracle_only,
+                        venue_profiles: &venue_profiles,
                     })?;
                 }
             }
