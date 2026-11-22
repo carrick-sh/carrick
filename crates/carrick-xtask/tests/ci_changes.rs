@@ -595,6 +595,8 @@ const DRAFT_JOBS: &[&str] = &[
     "loom",
     "x86-host-tests",
     "linux-doc",
+    "linux-unit-arm",
+    "linux-unit-x86",
     "kernel-linux-native",
     "cross-check-freebsd",
     "cross-check-netbsd",
