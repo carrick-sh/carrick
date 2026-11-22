@@ -352,6 +352,11 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn stage_native_host_file(&mut self) -> bool {
         false
     }
+    /// The stage just retained names no host request: the call stays with
+    /// its ring owner.
+    fn staged_for_ring_owner(&self) -> bool {
+        false
+    }
     /// Record a policy refusal together with its caller provenance.
     fn record_refusal(&self, _bucket: usize) {}
     fn publish_forward_work(&self, original_argument0: u64) {
@@ -2706,6 +2711,9 @@ mod ring_first_tests {
         result: i64,
         reruns: u32,
         refused: AtomicU64,
+        /// The venue's host-file staging finds no host request in a call
+        /// it is offered, as x86 staging does for an empty poll set.
+        stages_for_ring_owner: bool,
     }
     impl<'a> PendingFamilies<'a> for OwedWorkVenue {
         fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
@@ -2744,6 +2752,19 @@ mod ring_first_tests {
             self.result = 0x4000_0000;
             FamilyCompletion::Complete(self.result)
         }
+        fn may_serve_poll(&self) -> bool {
+            true
+        }
+        fn poll(&mut self) -> FamilyCompletion {
+            self.result = 0;
+            FamilyCompletion::Complete(0)
+        }
+        fn stage_native_host_file(&mut self) -> bool {
+            self.stages_for_ring_owner
+        }
+        fn staged_for_ring_owner(&self) -> bool {
+            self.stages_for_ring_owner
+        }
         fn rerun_after_owed_work(&mut self) -> bool {
             if self.set == HostCrossingSet::X86 {
                 self.reruns += 1;
@@ -2776,6 +2797,7 @@ mod ring_first_tests {
                 result: UNTOUCHED,
                 reruns: 0,
                 refused: AtomicU64::new(0),
+                stages_for_ring_owner: false,
             };
             venue.state.mark_pending_host_work();
             assert_eq!(
@@ -2813,6 +2835,42 @@ mod ring_first_tests {
             assert_eq!(venue.result, 0x4000_0000, "{set:?}: then success");
             assert_eq!(venue.refused.load(Ordering::Relaxed), 0, "{set:?}");
         }
+    }
+
+    /// #2791: x86 offers an unserved call to its host-file staging before
+    /// the crossing table. An empty poll set names no host description, so
+    /// the stage leaves the call with its ring owner. Declined for owed work,
+    /// that owner has not answered yet: the call is rerun after the work,
+    /// never forwarded to a venue that can only count an ENOSYS.
+    #[test]
+    fn poll_staged_for_its_ring_owner_under_owed_work_is_rerun() {
+        const UNTOUCHED: i64 = 77;
+        let ppoll = crate::crossing::nr::PPOLL.raw();
+        let mut venue = OwedWorkVenue {
+            set: HostCrossingSet::X86,
+            state: crate::abi::entry::LinuxTaskState::new(),
+            result: UNTOUCHED,
+            reruns: 0,
+            refused: AtomicU64::new(0),
+            stages_for_ring_owner: true,
+        };
+        venue.state.mark_pending_host_work();
+        assert_eq!(
+            dispatch(ppoll, 0, &mut venue),
+            CompletionRoute::WithWork,
+            "a decline for owed work settles the work first"
+        );
+        assert_eq!(venue.result, UNTOUCHED, "the declined call has no result");
+        assert_eq!(venue.reruns, 1, "x86 rewinds onto its SYSCALL");
+        assert_eq!(
+            venue.state.take_served_boundary(),
+            Some(crate::abi::entry::ServedBoundary::Completed)
+        );
+        // The boundary took the doorbell: the rerun reaches the ring owner.
+        assert!(venue.state.take_host_work_doorbell().is_some());
+        assert_eq!(dispatch(ppoll, 0, &mut venue), CompletionRoute::Served);
+        assert_eq!(venue.result, 0, "then the ring owner's answer");
+        assert_eq!(venue.refused.load(Ordering::Relaxed), 0);
     }
 
     #[test]

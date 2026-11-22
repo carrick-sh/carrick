@@ -34,6 +34,7 @@ static const struct call calls[] = {
     {"set_tid_address", 218, S},
     {"write0", 1, 1, S, 0},
     {"futex_wake", 202, S, 1, 1},
+    {"poll0", 7, 0, 0, 0},
     {"nanosleep0", 35, S + 2048, 0},
     {"kill0", 62, 0, 0},
 };
