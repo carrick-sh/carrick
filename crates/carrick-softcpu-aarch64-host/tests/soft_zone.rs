@@ -38,13 +38,23 @@ const NR_EXIT_GROUP: u16 = 94;
 const NR_SET_TID_ADDRESS: u16 = 96;
 const NR_GETTID: u16 = 178;
 const NR_PRLIMIT64: u16 = 261;
+const NR_RT_SIGACTION: u16 = 134;
 const RLIMIT_STACK: u16 = 3;
+const SIGUSR1: u16 = 10;
+const SIG_IGN: u64 = 1;
 const LINUX_EFAULT: i32 = 14;
+const LINUX_ENOSYS: i32 = 38;
 const LINUX_EINVAL: i32 = 22;
 /// The root's `clear_child_tid` word.
 const CLEAR_TID_OFFSET: u64 = 0x20;
 /// A `struct rlimit` the ring copies the old limit out to.
 const RLIMIT_OFFSET: u64 = 0x40;
+/// A `struct sigaction` naming a caught handler.
+const SIGACTION_OFFSET: u64 = 0x80;
+/// A `struct sigaction` ignoring the signal.
+const IGNORE_OFFSET: u64 = 0xa0;
+/// A `struct sigaction` the ring copies the old action out to.
+const OLD_SIGACTION_OFFSET: u64 = 0xc0;
 const FUTEX_WAIT_PRIVATE: u16 = 128;
 const LINUX_ETIMEDOUT: i32 = 110;
 
@@ -540,4 +550,82 @@ fn soft_root_exit_group_status_crosses_the_native_root_exit() {
     );
     assert_eq!(run.exit_code, 7);
     assert_root_served_in_ring(&run, &[NR_EXIT_GROUP]);
+}
+
+/// The soft root's owner cannot publish a caught signal's frame yet (its MM
+/// is not portal-admitted, #2645 slice D), so installing a handler stays
+/// unrouted, a counted `ENOSYS`, never an accepted handler the ring cannot
+/// deliver. Ignore and default dispositions need no frame: the ring serves
+/// them, and a query reads the ignore back. Exits
+/// `(handler + ENOSYS) + ignore + query + (old - SIG_IGN)`: 0 iff the handler
+/// was refused and the ignore was installed and read back.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut handler = [0u8; 32];
+    handler[..8].copy_from_slice(&(CODE_VA + 0x800).to_le_bytes());
+    let mut ignore = [0u8; 32];
+    ignore[..8].copy_from_slice(&SIG_IGN.to_le_bytes());
+    let mut code = Vec::new();
+    for (act, old, result) in [
+        (Some(SIGACTION_OFFSET), None, 19),
+        (Some(IGNORE_OFFSET), None, 20),
+        (None, Some(OLD_SIGACTION_OFFSET), 21),
+    ] {
+        code.push(movz(0, SIGUSR1, 0));
+        match act {
+            Some(offset) => code.extend(mov32(1, DATA_VA + offset)),
+            None => code.push(movz(1, 0, 0)),
+        }
+        match old {
+            Some(offset) => code.extend(mov32(2, DATA_VA + offset)),
+            None => code.push(movz(2, 0, 0)),
+        }
+        code.push(movz(3, 8, 0));
+        code.push(movz(8, NR_RT_SIGACTION, 0));
+        code.push(A64_SVC_0);
+        code.push(mov(result, 0));
+    }
+    code.extend(mov32(9, DATA_VA + OLD_SIGACTION_OFFSET));
+    code.push(ldr(22, 9, 0));
+    code.push(sub_imm(22, 22, SIG_IGN as u32));
+    code.push(add_imm(0, 19, LINUX_ENOSYS as u32));
+    code.push(add(0, 0, 20));
+    code.push(add(0, 0, 21));
+    code.push(add(0, 0, 22));
+    exit_with_x0(&mut code);
+    let (run, _) = run(
+        &build_elf(
+            &code,
+            &[(SIGACTION_OFFSET, &handler), (IGNORE_OFFSET, &ignore)],
+        ),
+        "/rt-sigaction",
+        None,
+    );
+    let served = sample_el1_served(&run.engine);
+    println!(
+        "rt_sigaction: exit={} census={:?} served={served:?} counted_enosys={:?}",
+        run.exit_code, run.reply_census, run.counted_enosys
+    );
+    assert_eq!(
+        run.exit_code, 0,
+        "the handler is refused ENOSYS; the ignore is installed and read back"
+    );
+    assert_eq!(
+        run.counted_enosys,
+        vec![(u64::from(NR_RT_SIGACTION), "rt_sigaction", 1)],
+        "the refused handler is counted"
+    );
+    assert!(
+        served
+            .iter()
+            .any(|&(nr, _, count)| nr == u64::from(NR_RT_SIGACTION) && count == 2),
+        "the ring serves the ignore and the query: {served:?}"
+    );
+    assert_eq!(
+        run.reply_census.kernel_dispatched, 0,
+        "no disposition reaches the host's table: {:?}",
+        run.reply_census
+    );
 }
