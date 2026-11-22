@@ -2,6 +2,16 @@
   "schema": 1,
   "authority_debt": [
     {
+      "from": "carrick_runtime::vcpu_loop::signal::DescriptorLaneHatch::current::CARRICK_EL1_DESCRIPTOR_LANE",
+      "to": "carrick_kernel::dispatch::carrier_loop::DescriptorLaneHatch::current::CARRICK_EL1_DESCRIPTOR_LANE",
+      "issue": 2645
+    },
+    {
+      "from": "carrick_runtime::vcpu_loop::signal::DescriptorLaneHatch::current::HATCH",
+      "to": "carrick_kernel::dispatch::carrier_loop::DescriptorLaneHatch::current::HATCH",
+      "issue": 2645
+    },
+    {
       "from": "carrick_vfs::fs_backend::host::cleanup_oldest_trash_checkpoint",
       "to": "carrick_vfs::fs_backend::host::cleanup_oldest_trash_with_limit",
       "issue": 1852
