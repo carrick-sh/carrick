@@ -22,7 +22,7 @@ use carrick_softcpu_aarch64::{Gpr, Hint, Instruction, OperandRegister};
 use carrick_softcpu_aarch64_host::{
     GUEST_PAGE_BYTES, Hvc2ReplyCensus, MappingGeometry, SoftFaultTermination,
     SoftSingleProcessConfig, SoftStage2, Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
-    run_single_process_with_executor_and_setup,
+    run_single_process_with_executor_and_setup, sample_root_publication,
 };
 use carrick_softmmu::block_cache::{CodeBytes, CodeFootprint};
 
@@ -601,6 +601,105 @@ fn soft_facade_serves_single_process_hvc2_syscalls_via_production_kernel() {
     assert!(
         tv_sec > 0 || tv_nsec > 0,
         "expected positive CLOCK_MONOTONIC timespec, got ({tv_sec}, {tv_nsec})"
+    );
+}
+
+/// The production soft entry publishes what the ring needs before the root's
+/// first instruction: its thread lifecycle page and control slot, mapped
+/// (never copied) into the EL1-only dynamic metadata aperture, and the
+/// carrier-bound MM portal the owner-memory wait venue authenticates. Both
+/// retire with the carrier.
+#[test]
+fn soft_cpu_runs_root_lifecycle_and_portal_through_production_dispatch() {
+    let _test_guard = lock_soft_carrier_test();
+    let temp = tempfile::tempdir().expect("create witness rootfs tempdir");
+    std::fs::write(temp.path().join("hello.txt"), FILE_PAYLOAD).expect("write rootfs /hello.txt");
+    let code_words = [
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_STR_X2_X1,
+        A64_LDR_X3_X1,
+        A64_SVC_0,
+        A64_STR_X2_X1,
+        A64_SVC_0,
+        A64_LDR_X3_X1,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_LDR_X3_X1,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_SVC_0,
+        A64_SVC_0,
+    ];
+    let elf = build_witness_elf(
+        &code_words,
+        &[
+            (PATH_OFFSET as usize, b"/hello.txt\0"),
+            (MSG_OFFSET as usize, STDOUT_PAYLOAD),
+        ],
+    );
+    let mailbox_slot = Arc::new(AtomicPtr::new(null_mut()));
+    let executor = ScriptedHvc2Executor {
+        mailbox: Arc::clone(&mailbox_slot),
+        obs: Arc::new(Mutex::new(WitnessObservations::default())),
+        next_seq: 1,
+    };
+    let mut config = SoftSingleProcessConfig::new(&elf, "/witness");
+    config.rootfs_dir = Some(temp.path());
+
+    let observed = Arc::new(Mutex::new(None));
+    let observed_in_setup = Arc::clone(&observed);
+    let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mut vec_stub = [0u8; 8];
+        vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+        vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+        engine
+            .backend()
+            .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+            .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+        let ptr = engine
+            .backend()
+            .host_ptr(
+                LINUX_SYSCALL_MAILBOX_BASE,
+                AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+        mailbox_slot.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+        *observed_in_setup.lock().unwrap() = Some(sample_root_publication(engine)?);
+        Ok(())
+    })
+    .expect("single-process witness should exit cleanly through production kernel");
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(run.stdout, STDOUT_PAYLOAD);
+
+    let entry = observed
+        .lock()
+        .unwrap()
+        .expect("setup observed the pre-entry publication");
+    assert!(
+        entry.ring_ready(),
+        "the root's lifecycle and MM portal must be what the ring expects: {entry:?}"
+    );
+    assert_eq!(entry.control_visible_tid, Some(1), "{entry:?}");
+
+    // Teardown cleared the publication and retired both mappings: the
+    // aperture holds no stage-2 window of this run's root any more.
+    let after = sample_root_publication(&run.engine).expect("read retired region");
+    assert_eq!((after.lifecycle_page, after.control_slot), (0, 0));
+    assert!(
+        run.engine
+            .backend()
+            .host_ptr(entry.lifecycle_page, 1)
+            .is_none()
+            && run
+                .engine
+                .backend()
+                .host_ptr(entry.control_slot, 1)
+                .is_none(),
+        "retired lifecycle mappings must leave stage 2"
     );
 }
 

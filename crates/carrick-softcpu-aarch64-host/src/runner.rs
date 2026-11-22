@@ -559,6 +559,108 @@ where
     })
 }
 
+/// What the host published for the root task on mailbox slot 0, read from
+/// the carrier's EL1 region and, for the lifecycle records, through the
+/// guest's own stage-2 view of the dynamic metadata aperture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftRootPublication {
+    /// `CurrentTask[0]`'s published lifecycle page (guest address, 0: none).
+    pub lifecycle_page: u64,
+    /// `CurrentTask[0]`'s published control slot (guest address, 0: none).
+    pub control_slot: u64,
+    /// Both records lie inside the EL1 dynamic metadata aperture.
+    pub in_metadata_aperture: bool,
+    /// The namespace TID the mapped control slot carries.
+    pub control_visible_tid: Option<u32>,
+    /// The mapped lifecycle page lets EL1 serve thread or sigmask calls.
+    pub page_serves_ring: bool,
+    /// The carrier the MM portal at `EL1_MM_PORTAL_BASE` is bound to.
+    pub portal_carrier: Option<NonZeroU64>,
+    /// The published owner-memory wait venue is this region's zone and portal.
+    pub portal_is_owner_wait_venue: bool,
+}
+
+impl SoftRootPublication {
+    /// Whether the root's lifecycle, control and MM portal are what the EL1
+    /// ring reads on its first entry.
+    #[must_use]
+    pub fn ring_ready(&self) -> bool {
+        self.in_metadata_aperture
+            && self.control_visible_tid.is_some()
+            && self.page_serves_ring
+            && self.portal_carrier.is_some()
+            && self.portal_is_owner_wait_venue
+    }
+}
+
+/// Sample [`SoftRootPublication`] from a brought-up soft carrier.
+pub fn sample_root_publication<X>(
+    engine: &SoftAarch64Engine<X>,
+) -> Result<SoftRootPublication, String>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
+    use carrick_el1_abi::{
+        EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE, EL1_REGION_BASE, EL1_REGION_SIZE,
+        ThreadControlSlot, ThreadLifecyclePage,
+    };
+    use carrick_hal::GuestVmBackend as _;
+
+    let backend = engine.backend();
+    let region = backend
+        .host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)
+        .ok_or_else(|| "soft carrier EL1 region is not mapped".to_owned())?;
+    // SAFETY: the carrier maps the whole fixed EL1 region; `CurrentTask` and
+    // `MmPortalSlots` are aligned ABI records inside it.
+    let (task, portal) = unsafe {
+        (
+            &*region
+                .add(EL1_CURRENT_TASKS_OFFSET as usize)
+                .cast::<CurrentTask>(),
+            &*region
+                .add(EL1_MM_PORTAL_OFFSET as usize)
+                .cast::<MmPortalSlots>(),
+        )
+    };
+    let lifecycle_page = task.metadata.lifecycle_page.load(Ordering::Acquire);
+    let control_slot = task.metadata.control_slot.load(Ordering::Acquire);
+    let inside = |gpa: u64, len: usize| {
+        gpa >= EL1_DYNAMIC_METADATA_BASE
+            && gpa
+                .checked_add(len as u64)
+                .is_some_and(|end| end <= EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE)
+    };
+    let page_len = size_of::<ThreadLifecyclePage>();
+    let control_len = size_of::<ThreadControlSlot>();
+    let in_metadata_aperture =
+        inside(lifecycle_page, page_len) && inside(control_slot, control_len);
+    let mapped = |gpa: u64, len: usize| {
+        in_metadata_aperture
+            .then(|| backend.host_ptr(gpa, len))
+            .flatten()
+    };
+    // SAFETY: a mapped, aligned retained control slot.
+    let control_visible_tid = mapped(control_slot, control_len)
+        .and_then(|ptr| unsafe { &*ptr.cast::<ThreadControlSlot>() }.visible_tid());
+    let page_serves_ring = mapped(lifecycle_page, page_len).is_some_and(|ptr| {
+        // SAFETY: a mapped, aligned retained lifecycle page.
+        let page = unsafe { &*ptr.cast::<ThreadLifecyclePage>() };
+        page.serves_threads() || page.serves_sigmask()
+    });
+    let portal_is_owner_wait_venue = get_el1_region_host_ptr() == region as usize
+        && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
+    Ok(SoftRootPublication {
+        lifecycle_page,
+        control_slot,
+        in_metadata_aperture,
+        control_visible_tid,
+        page_serves_ring,
+        portal_carrier: portal.carrier(),
+        portal_is_owner_wait_venue,
+    })
+}
+
 /// Run a single-process AArch64 Linux ELF to exit on the native arm64 [`HostBlockRunner`].
 pub fn run_single_process(
     config: &SoftSingleProcessConfig<'_>,
