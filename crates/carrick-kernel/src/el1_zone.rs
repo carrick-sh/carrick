@@ -601,9 +601,10 @@ impl Drop for GuestSchedulerScope {
 /// vCPU out of the guest. Registered by the carrier that runs the slots.
 pub type SlotKicker = Box<dyn Fn(SlotId) + Send + Sync>;
 
-/// The registered kicker and the serial of its registration.
-static SLOT_KICKER: parking_lot::RwLock<Option<(u64, SlotKicker)>> = parking_lot::RwLock::new(None);
-static SLOT_KICKER_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The last registration's serial, and the registered kicker with the
+/// serial of its registration.
+static SLOT_KICKER: parking_lot::RwLock<(u64, Option<(u64, SlotKicker)>)> =
+    parking_lot::RwLock::new((0, None));
 
 /// One carrier's registration of its slot kicker. Dropping it unregisters
 /// exactly this kicker, after any kick already running through it returns:
@@ -614,8 +615,12 @@ pub struct SlotKickerRegistration(u64);
 impl Drop for SlotKickerRegistration {
     fn drop(&mut self) {
         let mut kicker = SLOT_KICKER.write();
-        if kicker.as_ref().is_some_and(|(serial, _)| *serial == self.0) {
-            *kicker = None;
+        if kicker
+            .1
+            .as_ref()
+            .is_some_and(|(serial, _)| *serial == self.0)
+        {
+            kicker.1 = None;
         }
     }
 }
@@ -623,8 +628,10 @@ impl Drop for SlotKickerRegistration {
 /// Register the carrier's slot kicker for the life of the returned
 /// registration. A later registration replaces it.
 pub fn register_slot_kicker(kicker: SlotKicker) -> SlotKickerRegistration {
-    let serial = SLOT_KICKER_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    *SLOT_KICKER.write() = Some((serial, kicker));
+    let mut registered = SLOT_KICKER.write();
+    registered.0 += 1;
+    let serial = registered.0;
+    registered.1 = Some((serial, kicker));
     SlotKickerRegistration(serial)
 }
 
@@ -632,7 +639,7 @@ pub fn register_slot_kicker(kicker: SlotKicker) -> SlotKickerRegistration {
 /// (recursively: a waiting unregistration cannot block it), so an
 /// unregistration waits for it.
 fn run_slot_kicker(slot: SlotId) {
-    if let Some((_, kicker)) = SLOT_KICKER.read_recursive().as_ref() {
+    if let Some((_, kicker)) = SLOT_KICKER.read_recursive().1.as_ref() {
         kicker(slot);
     }
 }
