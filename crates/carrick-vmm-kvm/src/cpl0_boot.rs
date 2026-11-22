@@ -1392,6 +1392,46 @@ impl Cpl0Carrier {
             .map_err(|e| fail(e.to_string()))
     }
 
+    /// Put a stopped CPL3 vCPU in the state `KVM_RUN` leaves when it returns
+    /// between accepting an external interrupt and delivering it: `vector`
+    /// is in service in the local APIC and is the vCPU's injected event.
+    pub fn fixture_accept_undelivered_interrupt(
+        &mut self,
+        index: usize,
+        vector: u8,
+    ) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        if !stopped_at_interruptible_user(cpu)? {
+            return Err(fail(
+                "accepted interrupt requires an interruptible CPL3 stop",
+            ));
+        }
+        let mut lapic = cpu
+            .fd()
+            .get_lapic()
+            .map_err(|e| fail(format!("KVM_GET_LAPIC: {e}")))?;
+        // In-service register: eight 32-bit words from offset 0x100.
+        let word = 0x100 + 0x10 * usize::from(vector / 32);
+        lapic.regs[word + usize::from(vector % 32 / 8)] |=
+            (1_u8 << (vector % 8)) as core::ffi::c_char;
+        cpu.fd()
+            .set_lapic(&lapic)
+            .map_err(|e| fail(format!("KVM_SET_LAPIC: {e}")))?;
+        let mut events = cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        events.interrupt.injected = 1;
+        events.interrupt.nr = vector;
+        events.interrupt.soft = 0;
+        cpu.fd()
+            .set_vcpu_events(&events)
+            .map_err(|e| fail(format!("KVM_SET_VCPU_EVENTS: {e}")))
+    }
+
     /// Queue the native KICK on a stopped CPL3 vCPU before its next KVM_RUN.
     /// KVM_INTERRUPT rejects an in-kernel IRQ chip; the retained APIC ID
     /// addresses an MSI directly to this CPU's local APIC instead.

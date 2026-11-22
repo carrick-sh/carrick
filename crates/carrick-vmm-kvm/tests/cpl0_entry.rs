@@ -2838,8 +2838,11 @@ fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
     );
 }
 
-#[test]
-fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
+/// Stop a CPL3 reader on a warmed translation, retire its page from the
+/// peer CPU, apply `before_resume` to the stopped reader, then resume it: its
+/// first load must fault on the retired page, with the debt settled by KICK.
+/// Returns how many KICK generation checks the reader ran.
+fn stopped_reader_kick_checks_after_retire(before_resume: impl FnOnce(&mut Cpl0Carrier)) -> u64 {
     let mut editor = Vec::new();
     for phase in [2_u64, 3] {
         editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
@@ -2882,6 +2885,7 @@ fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
         carrier.fixture_kick_generation_checks(1).unwrap(),
         checks_before
     );
+    before_resume(&mut carrier);
     carrier
         .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
         .expect("first resumed load faults on the retired page");
@@ -2891,10 +2895,26 @@ fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
         "KICK must acknowledge the retirement before the first user load"
     );
     assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
-    assert_eq!(
-        carrier.fixture_kick_generation_checks(1).unwrap(),
-        checks_before + 1
-    );
+    carrier.fixture_kick_generation_checks(1).unwrap() - checks_before
+}
+
+#[test]
+fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
+    assert_eq!(stopped_reader_kick_checks_after_retire(|_| {}), 1);
+}
+
+/// KVM can return from `KVM_RUN` after it accepted an external interrupt for
+/// a CPL3 CPU and before it delivered it (`interrupt.injected`). That vector
+/// is taken at the same instruction boundary on reentry, so a reader stopped
+/// that way still settles its shootdown debt before its next user load.
+#[test]
+fn stopped_cpl3_cpu_with_an_accepted_interrupt_settles_its_shootdown_debt() {
+    let checks = stopped_reader_kick_checks_after_retire(|carrier| {
+        carrier
+            .fixture_accept_undelivered_interrupt(1, carrick_x86::interrupts::KICK_VECTOR)
+            .expect("accepted, undelivered KICK on the stopped CPL3 reader");
+    });
+    assert!(checks >= 1, "the reader must check generations under KICK");
 }
 
 #[test]
