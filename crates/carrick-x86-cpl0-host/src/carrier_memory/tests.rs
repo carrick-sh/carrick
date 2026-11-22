@@ -186,7 +186,7 @@ fn ipc_memslots_retain_original_authority_without_copying() {
 fn prepare_settlement_accepts_a_sibling_protect_of_its_window() {
     test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
         || test_support::MemoryTestIo::new(TestMemoryIo::default()),
-        false,
+        test_support::SiblingEdit::Protect,
     )
     .unwrap();
 }
@@ -194,7 +194,26 @@ fn prepare_settlement_accepts_a_sibling_protect_of_its_window() {
 fn prepare_settlement_accepts_a_sibling_retire_of_its_window() {
     test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
         || test_support::MemoryTestIo::new(TestMemoryIo::default()),
-        true,
+        test_support::SiblingEdit::Retire,
+    )
+    .unwrap();
+}
+/// #2766: the sibling's `munmap` and its owed return both land before the
+/// `Prepare` settles, so the carrier itself has cleared the leaf.
+#[test]
+fn prepare_settlement_accepts_a_page_the_carrier_already_returned() {
+    test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
+        || test_support::MemoryTestIo::new(TestMemoryIo::default()),
+        test_support::SiblingEdit::RetireSettled,
+    )
+    .unwrap();
+}
+/// An empty leaf with no settled return behind it is still a mismatch.
+#[test]
+fn prepare_settlement_refuses_an_empty_leaf_nobody_returned() {
+    test_support::prepare_settlement_accepts_a_sibling_edit_of_its_window(
+        || test_support::MemoryTestIo::new(TestMemoryIo::default()),
+        test_support::SiblingEdit::Vanished,
     )
     .unwrap();
 }

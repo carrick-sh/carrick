@@ -1384,18 +1384,33 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     fixture.assert_admitted_exact();
 }
 
+/// What a sibling thread did to a page of a `Prepare`'s window before the
+/// `Prepare` settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiblingEdit {
+    /// `mprotect`: a `Protect` inside the recorded ceiling.
+    Protect,
+    /// `munmap`: a `Retire`, its owed return not yet settled.
+    Retire,
+    /// `munmap` whose owed return settled too: the carrier cleared the leaf.
+    RetireSettled,
+    /// Not a sibling edit: the leaf reads empty with no settled return.
+    Vanished,
+}
+
 /// #2766: the ring releases the MM's editor after it applies a `Prepare`
 /// and before the carrier settles it, so a sibling thread's `mprotect` or
 /// `munmap` of the same page can land in between. The settlement accepts the
 /// leaf each of those leaves behind; it still refuses a leaf that names
-/// another frame. `retire` picks the sibling's edit.
+/// another frame, and an empty leaf this carrier did not itself clear.
+/// `edit` picks what the sibling did.
 ///
 /// Returns the first carrier refusal instead of panicking: this harness is
 /// compiled into the library under `test-support`, where the no-panic gate
 /// applies; the `#[test]` callers unwrap the result.
 pub fn prepare_settlement_accepts_a_sibling_edit_of_its_window(
     _make: fn() -> MemoryTestIo,
-    retire: bool,
+    edit: SiblingEdit,
 ) -> Result<(), String> {
     use carrick_hal::{
         FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
@@ -1540,7 +1555,7 @@ pub fn prepare_settlement_accepts_a_sibling_edit_of_its_window(
         },
         root: parent_context.root,
         tables: &[],
-        op: if retire {
+        op: if edit != SiblingEdit::Protect {
             DescriptorOp::Retire(span)
         } else {
             DescriptorOp::Protect {
@@ -1564,12 +1579,61 @@ pub fn prepare_settlement_accepts_a_sibling_edit_of_its_window(
         return Err(format!("the sibling edit was not applied: {sibling:?}"));
     }
 
+    // 2b. The sibling's owed return settles first: the carrier itself
+    // clears the retired leaf. `Vanished` clears the word behind the
+    // carrier's back instead, which no ring or carrier path does.
+    if matches!(edit, SiblingEdit::RetireSettled | SiblingEdit::Vanished) {
+        let mut terminals = Vec::new();
+        {
+            let words = memory.words();
+            carrick_el1::memory::owed_retired_terminals::<carrick_el1::memory::X86AnonymousDecode>(
+                &|pa| words.load(pa).ok(),
+                parent_context.root.address().raw(),
+                span.va,
+                span.len,
+                &mut |terminal| terminals.push(terminal),
+            )
+            .map_err(|refusal| format!("the retired leaf was not observed: {refusal:?}"))?;
+            if terminals.len() != 1 {
+                return Err(format!("one retired leaf expected: {terminals:?}"));
+            }
+            if edit == SiblingEdit::Vanished
+                && words.compare_exchange(terminals[0].slot, terminals[0].descriptor, 0) != Ok(true)
+            {
+                return Err("the retired leaf was not cleared".to_owned());
+            }
+        }
+        if edit == SiblingEdit::RetireSettled {
+            memory
+                .clear_settled_return(
+                    parent_context.mm.raw(),
+                    parent_context.root,
+                    span,
+                    &terminals,
+                )
+                .map_err(|error| format!("the owed return did not settle: {error}"))?;
+        }
+    }
+
     // 3. The Prepare settles against the leaf the sibling left.
-    memory
-        .publish(&map_txn, publication, &mut inventory)
-        .map_err(|error| format!("settlement refused the sibling's leaf: {error}"))?;
+    let settled = memory.publish(&map_txn, publication, &mut inventory);
+    if edit == SiblingEdit::Vanished {
+        return match settled {
+            Err(_) if memory.is_quarantined() => Ok(()),
+            _ => Err("settlement accepted an empty leaf nobody returned".to_owned()),
+        };
+    }
+    settled.map_err(|error| format!("settlement refused the sibling's leaf: {error}"))?;
     if memory.is_quarantined() {
         return Err("settlement quarantined the carrier".to_owned());
+    }
+    // A returned page keeps no physical edge: nothing names its frame, so
+    // its slot is free of this window's alias.
+    if edit == SiblingEdit::RetireSettled {
+        let aliases = memory.record(data).map(|slot| slot.alias_count);
+        if !matches!(aliases, Ok(0)) {
+            return Err(format!("a returned page kept an alias edge: {aliases:?}"));
+        }
     }
     let _ = (child_identity, child_receipt, child_context);
     Ok(())
