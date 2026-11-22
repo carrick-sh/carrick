@@ -186,7 +186,10 @@ impl SyscallDispatcher {
             crate::kernel::boot_launch::BootLaunchResources {
                 namespace: context.container(),
                 rootfs: Arc::clone(&self.fs.rootfs_vfs),
-                mounts: Arc::clone(&self.fs.vfs_mounts),
+                mounts: self
+                    .fs
+                    .vfs_mounts
+                    .alias(super::fs::state::MountOwnerKind::BootLaunch),
                 files: context.resources().files(),
                 fs_context: context.resources().fs_context(),
                 credentials: context.resources().credentials(),
@@ -659,7 +662,10 @@ mod tests {
         let mm = context.shared().mm().id();
         let files = context.resources().files();
         let rootfs = Arc::clone(&dispatcher.fs.rootfs_vfs);
-        let mounts = Arc::clone(&dispatcher.fs.vfs_mounts);
+        let mounts = dispatcher
+            .fs
+            .vfs_mounts
+            .alias(crate::dispatch::fs::state::MountOwnerKind::Archive);
         let argv = vec!["/actual/program".into(), "argument".into()];
         let env = vec![b"BYTES=\xff".to_vec()];
         let initial_binding = context.task_binding();
@@ -736,7 +742,7 @@ mod tests {
         assert_eq!(export.resources.env(), env);
         assert!(Arc::ptr_eq(export.resources.namespace(), &container));
         assert!(Arc::ptr_eq(export.resources.rootfs(), &rootfs));
-        assert!(Arc::ptr_eq(export.resources.mounts(), &mounts));
+        assert!(export.resources.mounts().same_table(&mounts));
         assert!(Arc::ptr_eq(&export.resources.files, &files));
         // A retained caller cannot keep a second host process authority alive.
         assert_eq!(context.kernel().registry().task_count(), 0);

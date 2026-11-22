@@ -48,7 +48,7 @@ struct PlannedEntry {
 
 #[derive(Clone)]
 pub struct ArchiveFsAuthority {
-    mounts: Arc<carrick_vfs::VfsMounts>,
+    mounts: super::fs::state::MountTableAlias,
     root: Arc<carrick_vfs::RootFsVfs>,
 }
 
@@ -65,7 +65,10 @@ pub struct ArchiveEntryMetadata {
 impl SyscallDispatcher {
     pub fn archive_authority(&self) -> ArchiveFsAuthority {
         ArchiveFsAuthority {
-            mounts: Arc::clone(&self.fs.vfs_mounts),
+            mounts: self
+                .fs
+                .vfs_mounts
+                .alias(super::fs::state::MountOwnerKind::Archive),
             root: Arc::clone(&self.fs.rootfs_vfs),
         }
     }

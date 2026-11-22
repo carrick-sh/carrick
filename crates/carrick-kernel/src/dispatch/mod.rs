@@ -2486,12 +2486,31 @@ mod mount_retirement_tests {
     fn terminal_mount_retirement_waits_for_every_dispatch_and_archive_alias() {
         let dispatcher = SyscallDispatcher::new();
         let expected = dispatcher.fs.vfs_mounts.len();
+        let container = dispatcher.container().id();
         let archive = dispatcher.archive_authority();
         let mut retirement = dispatcher.prepare_mount_retirement();
 
-        assert!(retirement.prepare().is_err());
+        let census = |dispatchers, archives| fs::state::MountOwnerCensus {
+            dispatchers,
+            archives,
+            retirements: 1,
+            ..Default::default()
+        };
+        let live = |owners, census| {
+            Err(fs::state::MountRetirementError::LiveOwners {
+                container,
+                owners,
+                census,
+            })
+        };
+        assert_eq!(retirement.prepare(), live(3, census(1, 1)));
         drop(dispatcher);
-        assert!(retirement.prepare().is_err());
+        // The survivor is named: the archive endpoint, not a bare count of 2.
+        let named = retirement.prepare();
+        assert_eq!(named, live(2, census(0, 1)));
+        assert!(named.unwrap_err().to_string().ends_with(
+            "2 live mount-table owners (dispatcher=0 fork=0 exec=0 archive=1 boot=0 retirement=1)"
+        ));
         drop(archive);
 
         retirement.prepare().expect("terminal mount owner");

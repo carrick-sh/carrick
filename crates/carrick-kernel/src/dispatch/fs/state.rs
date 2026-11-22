@@ -145,7 +145,7 @@ pub(crate) struct FsState {
     /// path no mount claims (or that a mount returns ENOSYS for)
     /// falls through to the legacy code path, which reads the rootfs +
     /// overlay from [`Self::rootfs_vfs`].
-    pub vfs_mounts: std::sync::Arc<carrick_vfs::VfsMounts>,
+    pub vfs_mounts: MountTableAlias,
     pub bind_cache_cohorts: std::sync::Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
 
     /// The `/` mount: immutable OCI rootfs + writable overlay
@@ -316,14 +316,170 @@ fn host_file_identity(fd: i32) -> Option<HostFileIdentity> {
     })
 }
 
+/// Who holds one alias of a container's mount-routing table. Every alias is
+/// minted with its kind, so a retirement that finds survivors names them
+/// instead of reporting a bare reference count (#2799).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountOwnerKind {
+    /// The dispatcher that built the table.
+    Dispatcher,
+    /// A dispatcher forked from it ([`FsState::fork_clone`]).
+    DispatcherFork,
+    /// An exec filesystem capability (`SyscallDispatcher::exec_filesystem`),
+    /// and so every `ExecFiles` and native exec capability cloned from it.
+    ExecCapability,
+    /// The archive control endpoint.
+    Archive,
+    /// The CPL0 boot launch's admitted resources.
+    BootLaunch,
+    /// The terminal [`MountRetirement`] token.
+    Retirement,
+}
+
+impl MountOwnerKind {
+    const COUNT: usize = 6;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Live mount-table aliases by owner kind, read at one instant per kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MountOwnerCensus {
+    pub dispatchers: usize,
+    pub dispatcher_forks: usize,
+    pub exec_capabilities: usize,
+    pub archives: usize,
+    pub boot_launches: usize,
+    pub retirements: usize,
+}
+
+impl MountOwnerCensus {
+    pub const fn total(&self) -> usize {
+        self.dispatchers
+            + self.dispatcher_forks
+            + self.exec_capabilities
+            + self.archives
+            + self.boot_launches
+            + self.retirements
+    }
+}
+
+impl std::fmt::Display for MountOwnerCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatcher={} fork={} exec={} archive={} boot={} retirement={}",
+            self.dispatchers,
+            self.dispatcher_forks,
+            self.exec_capabilities,
+            self.archives,
+            self.boot_launches,
+            self.retirements
+        )
+    }
+}
+
+struct MountTableShared {
+    mounts: carrick_vfs::VfsMounts,
+    owners: [std::sync::atomic::AtomicUsize; MountOwnerKind::COUNT],
+}
+
+/// One counted, typed alias of a container's mount-routing table. The table
+/// is reachable only through an alias, and an alias exists only with a
+/// [`MountOwnerKind`], so the owner census and the `Arc` count describe the
+/// same set. Lookups deref straight to the table: the lock-free read path is
+/// unchanged.
+pub struct MountTableAlias {
+    shared: std::sync::Arc<MountTableShared>,
+    kind: MountOwnerKind,
+}
+
+impl MountTableAlias {
+    /// The building dispatcher's alias of a new table.
+    pub(crate) fn new(mounts: carrick_vfs::VfsMounts) -> Self {
+        let shared = std::sync::Arc::new(MountTableShared {
+            mounts,
+            owners: Default::default(),
+        });
+        Self::register(shared, MountOwnerKind::Dispatcher)
+    }
+
+    fn register(shared: std::sync::Arc<MountTableShared>, kind: MountOwnerKind) -> Self {
+        shared.owners[kind.index()].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { shared, kind }
+    }
+
+    /// Mint another alias of the same table for an owner of `kind`.
+    pub(crate) fn alias(&self, kind: MountOwnerKind) -> Self {
+        Self::register(std::sync::Arc::clone(&self.shared), kind)
+    }
+
+    pub fn kind(&self) -> MountOwnerKind {
+        self.kind
+    }
+
+    /// Every live alias of this table, this one included.
+    pub fn owners(&self) -> usize {
+        std::sync::Arc::strong_count(&self.shared)
+    }
+
+    pub fn census(&self) -> MountOwnerCensus {
+        let read = |kind: MountOwnerKind| {
+            self.shared.owners[kind.index()].load(std::sync::atomic::Ordering::Acquire)
+        };
+        MountOwnerCensus {
+            dispatchers: read(MountOwnerKind::Dispatcher),
+            dispatcher_forks: read(MountOwnerKind::DispatcherFork),
+            exec_capabilities: read(MountOwnerKind::ExecCapability),
+            archives: read(MountOwnerKind::Archive),
+            boot_launches: read(MountOwnerKind::BootLaunch),
+            retirements: read(MountOwnerKind::Retirement),
+        }
+    }
+
+    /// True when both aliases name the same table.
+    pub fn same_table(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// The table itself, only while this is its sole alias.
+    pub(crate) fn get_mut(&mut self) -> Option<&mut carrick_vfs::VfsMounts> {
+        std::sync::Arc::get_mut(&mut self.shared).map(|shared| &mut shared.mounts)
+    }
+}
+
+impl std::ops::Deref for MountTableAlias {
+    type Target = carrick_vfs::VfsMounts;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared.mounts
+    }
+}
+
+/// A clone is another owner of the same kind (an `ExecFiles` cloned per exec).
+impl Clone for MountTableAlias {
+    fn clone(&self) -> Self {
+        self.alias(self.kind)
+    }
+}
+
+impl Drop for MountTableAlias {
+    fn drop(&mut self) {
+        self.shared.owners[self.kind.index()].fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Exclusive terminal ownership of one container's immutable mount-routing
 /// table. Capturing this token seals mount configuration: every dispatcher
-/// fork and archive endpoint keeps an `Arc` alias while it can still perform a
-/// lookup, and retirement succeeds only after all of those aliases have been
-/// joined and dropped. This preserves the lock-free `entries` read path.
+/// fork, exec capability and archive endpoint keeps a [`MountTableAlias`]
+/// while it can still perform a lookup, and retirement succeeds only after
+/// all of those aliases have been joined and dropped. This preserves the
+/// lock-free `entries` read path.
 pub struct MountRetirement {
     container: crate::kernel::ContainerId,
-    mounts: Option<std::sync::Arc<carrick_vfs::VfsMounts>>,
+    mounts: Option<MountTableAlias>,
     prepared: bool,
 }
 
@@ -341,23 +497,22 @@ pub enum MountRetirementError {
         expected: crate::kernel::ContainerId,
         actual: crate::kernel::ContainerId,
     },
-    #[error("container {container:?} still has {owners} live mount-table owners")]
+    #[error("container {container:?} still has {owners} live mount-table owners ({census})")]
     LiveOwners {
         container: crate::kernel::ContainerId,
         owners: usize,
+        /// The survivors by kind, the retirement token included.
+        census: MountOwnerCensus,
     },
     #[error("container mount table was already retired")]
     AlreadyRetired,
 }
 
 impl MountRetirement {
-    pub(crate) fn new(
-        container: crate::kernel::ContainerId,
-        mounts: std::sync::Arc<carrick_vfs::VfsMounts>,
-    ) -> Self {
+    pub(crate) fn new(container: crate::kernel::ContainerId, mounts: &MountTableAlias) -> Self {
         Self {
             container,
-            mounts: Some(mounts),
+            mounts: Some(mounts.alias(MountOwnerKind::Retirement)),
             prepared: false,
         }
     }
@@ -374,11 +529,12 @@ impl MountRetirement {
             .mounts
             .as_ref()
             .ok_or(MountRetirementError::AlreadyRetired)?;
-        let owners = std::sync::Arc::strong_count(mounts);
+        let owners = mounts.owners();
         if owners != 1 {
             return Err(MountRetirementError::LiveOwners {
                 container: self.container,
                 owners,
+                census: mounts.census(),
             });
         }
         self.prepared = true;
@@ -399,7 +555,7 @@ impl MountRetirement {
     }
 
     /// Drain and drop every mount before the teardown receipt is returned.
-    /// `prepare` made the `try_unwrap` invariant stable; failure here means an
+    /// `prepare` made the sole-alias invariant stable; failure here means an
     /// impossible post-quiesce ownership change, so continuing would fabricate
     /// cleanup evidence.
     pub fn clear(&mut self) -> usize {
@@ -409,19 +565,19 @@ impl MountRetirement {
                 "mount destruction requested without first proving sole ownership"
             );
         }
-        let mounts = self.mounts.take().unwrap_or_else(|| {
+        let mut alias = self.mounts.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "dispatch::mount_retirement",
                 "prepared mount-retirement token lost its mount table before destruction"
             );
         });
-        let mut mounts = std::sync::Arc::try_unwrap(mounts).unwrap_or_else(|shared| {
+        let (owners, census) = (alias.owners(), alias.census());
+        let Some(mounts) = alias.get_mut() else {
             carrick_fatal!(
                 "dispatch::mount_retirement",
-                "a new mount-table owner appeared after sole ownership was proven: strong={}",
-                std::sync::Arc::strong_count(&shared)
+                "a new mount-table owner appeared after sole ownership was proven: strong={owners} ({census})"
             );
-        });
+        };
         let count = mounts.clear_all();
         self.prepared = false;
         count
@@ -664,11 +820,11 @@ pub(super) fn set_host_fd_offset(host_fd: crate::dispatch::HostFd, offset: u64) 
 
 impl FsState {
     pub(in crate::dispatch) fn vfs_mounts_mut(&mut self) -> &mut carrick_vfs::VfsMounts {
-        let strong = std::sync::Arc::strong_count(&self.vfs_mounts);
-        let Some(mounts) = std::sync::Arc::get_mut(&mut self.vfs_mounts) else {
+        let (strong, census) = (self.vfs_mounts.owners(), self.vfs_mounts.census());
+        let Some(mounts) = self.vfs_mounts.get_mut() else {
             carrick_fatal!(
                 "dispatch::fs_mounts",
-                "VFS mounts cannot be reconfigured after guest fork: strong={strong}"
+                "VFS mounts cannot be reconfigured after guest fork: strong={strong} ({census})"
             );
         };
         mounts
@@ -701,7 +857,7 @@ impl FsState {
         Self {
             host_io: std::sync::Arc::new(crate::dispatch::SystemHostIo),
             bind_cache_cohorts: std::sync::Arc::default(),
-            vfs_mounts: std::sync::Arc::new({
+            vfs_mounts: MountTableAlias::new({
                 let mut m = carrick_vfs::VfsMounts::new();
                 m.mount(
                     "/dev",
@@ -790,7 +946,7 @@ impl FsState {
         Self {
             host_io: std::sync::Arc::clone(&self.host_io),
             bind_cache_cohorts: std::sync::Arc::clone(&self.bind_cache_cohorts),
-            vfs_mounts: std::sync::Arc::clone(&self.vfs_mounts),
+            vfs_mounts: self.vfs_mounts.alias(MountOwnerKind::DispatcherFork),
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
             executable_authorities: std::sync::Arc::clone(&self.executable_authorities),
             pty_table: std::sync::Arc::clone(&self.pty_table),
