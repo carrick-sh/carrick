@@ -748,6 +748,71 @@ mod tests {
         }
     }
 
+    /// #2813: a COW never leaves a live page without its residency row.
+    /// The source row covers eight pages and the run replaces its lower
+    /// four, so the COW needs two slots (the replacement row and the row's
+    /// upper fragment) and the table has room for one. A row that finds no
+    /// slot was silently dropped.
+    #[test]
+    fn cow_with_no_residency_slot_loses_no_row() {
+        let (arena, memory) = forked(true);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        let residency = residency_table();
+        let old = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: MM,
+            semantic_base: VA,
+            physical_ipa: OLD,
+            len: 8 * PAGE,
+            mapping_id: 101,
+            frame_id: 102,
+            owner_generation: 103,
+            inventory_revision: 104,
+        };
+        residency.publish(old).unwrap();
+        for offset in (0..8 * PAGE).step_by(PAGE as usize) {
+            assert!(residency.record_commit(residency.lookup(MM, VA + offset).unwrap()));
+        }
+        // Every other slot holds a one-page row of the same MM.
+        let filler = |index: u64| carrick_el1_abi::FrameGrantResidencyIdentity {
+            semantic_base: 0x1_0000_0000 + index * PAGE,
+            physical_ipa: 0x00a0_0000_0000 + index * PAGE,
+            len: PAGE,
+            ..old
+        };
+        for index in 0..4 * residency.slot_capacity() as u64 {
+            if residency.observed_slots_used() == residency.slot_capacity() {
+                break;
+            }
+            let _ = residency.publish(filler(index));
+        }
+        assert_eq!(residency.observed_slots_used(), residency.slot_capacity());
+
+        let words = arena.words();
+        let venue = GuestCowVenue {
+            publish_executable: None,
+            words: &arena.words(),
+            root: SubstrateGpa(ROOT),
+            pool: &pool,
+            residency: &residency,
+            copy_window: crate::cow::CowCopyWindow::target(&words, SubstrateGpa(ROOT)),
+        };
+        let outcome = resolve_guest_cow(
+            &venue,
+            MM,
+            VA,
+            |source, destination| memory.copy_through(&arena, source, destination),
+            || {},
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        for offset in (0..8 * PAGE).step_by(PAGE as usize) {
+            assert!(
+                residency.is_guest_committed(MM, VA + offset),
+                "page {offset:#x} lost its residency row: {outcome:?}"
+            );
+        }
+    }
+
     #[test]
     fn cow_defers_before_copying_a_leased_grant_window() {
         let (arena, memory) = forked(true);

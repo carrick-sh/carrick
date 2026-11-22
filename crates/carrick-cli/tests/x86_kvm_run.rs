@@ -842,6 +842,45 @@ fn mounted_static_x86_fault_death_leaves_the_cpu_to_faulting_siblings() {
     );
 }
 
+/// #2813: a copy-on-write whose residency row finds no slot is not dropped.
+/// Parent and child both write all 2048 pages of an anonymous mapping they
+/// share after a fork. Each resolved write replaces the page's residency row; with the
+/// table's probe chains full the replacement row was silently not
+/// published, and the carrier refused the completion (`owner COW
+/// replacement residency absent`), ending the run.
+#[test]
+fn mounted_static_x86_fork_cow_keeps_residency_when_the_table_is_full() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-cow-residency");
+    compile_assembly_with_flags(
+        "x86_fork_cow_residency_capacity.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native fork-COW residency oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"rounds=1 ok\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "fork-cow-residency-capacity", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
