@@ -1767,7 +1767,7 @@ impl ResidencyExecutor {
                 1 => wx(cpu, 3, CODE_VA),
                 2 => {
                     let va = rx(cpu, 0);
-                    if (va as i64) < 0 || va % GUEST_PAGE_BYTES != 0 {
+                    if (va as i64) < 0 || !va.is_multiple_of(GUEST_PAGE_BYTES) {
                         return Err(format!("mmap(/patch) returned {}", va as i64));
                     }
                     self.mapped.store(va, Ordering::Relaxed);
@@ -1851,7 +1851,7 @@ impl ExecuteBlock for ResidencyExecutor {
                 pc if pc == CODE_VA + 4 && self.svc_visits == 1 => wx(cpu, 3, CODE_VA),
                 pc if pc == CODE_VA + 4 => {
                     let va = rx(cpu, 0);
-                    if (va as i64) < 0 || va % GUEST_PAGE_BYTES != 0 {
+                    if (va as i64) < 0 || !va.is_multiple_of(GUEST_PAGE_BYTES) {
                         return Err(format!("mmap(/patch) returned {}", va as i64));
                     }
                     self.mapped.store(va, Ordering::Relaxed);
