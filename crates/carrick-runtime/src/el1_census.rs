@@ -1257,6 +1257,33 @@ mod tests {
     }
 
     #[test]
+    fn census_json_names_each_nonzero_anonymous_leave() {
+        use carrick_el1_abi::AnonymousLeave;
+        use carrick_spec::syscall_census::CensusIsa;
+        // #2748 step 0: one run must name the arm a delegated anonymous
+        // mmap/brk/munmap/mprotect left EL1 by, on both ISAs.
+        for isa in [CensusIsa::Aarch64, CensusIsa::X86_64] {
+            let counters = carrick_el1_abi::Counters::new();
+            counters.anonymous_leaves[AnonymousLeave::RootDeclined as usize]
+                .store(2, Ordering::Relaxed);
+            counters.anonymous_leaves[AnonymousLeave::BackingBlock as usize]
+                .store(1, Ordering::Relaxed);
+            let census = snapshot_counters(None, Some(&counters), isa);
+            let encoded = serde_json::to_value(&census).unwrap();
+            assert_eq!(
+                encoded["anonymous_leaves"],
+                serde_json::json!({"backing_block": 1, "root_declined": 2})
+            );
+            // Older files have no anonymous leaves.
+            let mut legacy = encoded.clone();
+            legacy.as_object_mut().unwrap().remove("anonymous_leaves");
+            let legacy: Census = serde_json::from_value(legacy).unwrap();
+            let legacy = serde_json::to_value(legacy).unwrap();
+            assert_eq!(legacy["anonymous_leaves"], serde_json::json!({}));
+        }
+    }
+
+    #[test]
     fn aggregate_sums_by_number_and_ranks_by_host_cpu() {
         let a = census(vec![row(56, 10, 1_000), row(79, 5, 9_000)]);
         let b = census(vec![row(56, 10, 2_000)]);
