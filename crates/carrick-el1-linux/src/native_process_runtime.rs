@@ -3471,6 +3471,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .get_mut(&(key.carrier, process))
             .ok_or(NativeProcessError::Stale)?
             .1;
+        process_members
+            .try_reserve(1)
+            .map_err(|_| NativeProcessError::Exhausted)?;
         let (closing, registry_control) = {
             let mut graph = runtime.graph.lock();
             let row = graph
@@ -3504,6 +3507,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             let prepared_member = if already_owned {
                 None
             } else {
+                // The commit below pushes one member row and one namespace
+                // claim. A stock-managed pool reserved both at admission
+                // (`thread_stock::reserve_birth_rows`); any other issuer
+                // reserves here, where a miss is still a refusal (#2734).
+                let resources = row.native_mut().resources_mut();
+                resources
+                    .members
+                    .try_reserve(1)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
+                resources
+                    ._thread_claim
+                    .claims
+                    .try_reserve(1)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
                 let retained = retain_member_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| NativeProcessError::Busy)?;
@@ -3547,6 +3564,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             let mut namespace_claim = if already_owned {
                 None
             } else {
+                let mut claims = Vec::new();
+                claims
+                    .try_reserve_exact(1)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
                 let number = source
                     .zone
                     .namespace()
@@ -3554,9 +3575,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                         view.claim_related(key.task.id().raw(), ClaimKind::Thread)
                     })
                     .map_err(namespace_error)?;
+                claims.push((number, ClaimKind::Thread));
                 Some(NativeClaim {
                     namespace: source.zone.namespace(),
-                    claims: vec![(number, ClaimKind::Thread)],
+                    claims,
                 })
             };
 

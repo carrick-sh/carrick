@@ -18,6 +18,7 @@ pub fn task_id_from_linux_pid(
 
 pub const EPERM: i64 = -1;
 pub const ESRCH: i64 = -3;
+pub const ENOMEM: i64 = -12;
 pub const EACCES: i64 = -13;
 pub const EFAULT: i64 = -14;
 pub const EINVAL: i64 = -22;
@@ -119,6 +120,32 @@ pub struct TaskCredentials {
 }
 
 impl TaskCredentials {
+    /// A copy whose supplementary-group storage is reserved fallibly: a new
+    /// thread inherits its creator's credentials on the clone path, where a
+    /// metadata capacity miss must never be an allocation panic (#2734).
+    pub fn try_clone(&self) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut groups = alloc::vec::Vec::new();
+        groups.try_reserve_exact(self.groups.len())?;
+        groups.extend_from_slice(&self.groups);
+        Ok(Self {
+            ruid: self.ruid,
+            euid: self.euid,
+            suid: self.suid,
+            fsuid: self.fsuid,
+            rgid: self.rgid,
+            egid: self.egid,
+            sgid: self.sgid,
+            fsgid: self.fsgid,
+            groups,
+            groups_installed: self.groups_installed,
+            cap_permitted: self.cap_permitted,
+            cap_effective: self.cap_effective,
+            cap_inheritable: self.cap_inheritable,
+            cap_ambient: self.cap_ambient,
+            cap_bounding: self.cap_bounding,
+        })
+    }
+
     pub const ROOT: Self = Self {
         ruid: TaskUid::ROOT,
         euid: TaskUid::ROOT,
