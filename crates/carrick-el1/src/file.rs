@@ -1001,7 +1001,6 @@ mod atomic_copy_tests {
     use carrick_core::user_copy::{CopyOutcome, UserCopy as TypedCopy};
     use carrick_guest_arch::{Access, UserVa};
     use core::cell::Cell;
-    use core::sync::atomic::AtomicU32;
 
     struct Backing(Cell<bool>);
     impl MemoryValidator for Backing {
@@ -1016,8 +1015,8 @@ mod atomic_copy_tests {
     #[test]
     fn typed_atomic_word_defers_without_changing_memory_or_output() {
         let task = CurrentTask::new();
-        let word = AtomicU32::new(0x12345678);
-        let address = UserVa::new(word.as_ptr() as u64);
+        let word = carrick_test_support::GuestUserValue::new(0x12345678_u32);
+        let address = word.va();
         let backing = Backing(Cell::new(false));
         let mut copy = ValidatedCopy {
             task: &task,
@@ -1033,7 +1032,7 @@ mod atomic_copy_tests {
             CopyOutcome::NotYet(request) if request.access == Access::Write)
         );
         assert_eq!(observed, 0xfeed);
-        assert_eq!(word.load(Ordering::Acquire), 0x12345678);
+        assert_eq!(word.get(), 0x12345678);
         backing.0.set(true);
         // Exercise the blanket &mut adapter as well as the native adapter.
         let mut borrowed = &mut copy;
@@ -1047,13 +1046,13 @@ mod atomic_copy_tests {
             CopyOutcome::Done
         );
         assert_eq!(observed, 0x12345678);
-        assert_eq!(word.load(Ordering::Acquire), 0x12345678);
+        assert_eq!(word.get(), 0x12345678);
         assert_eq!(
             borrowed.atomic_compare_exchange_u32(address, observed, 7, &mut observed),
             CopyOutcome::Done
         );
         assert_eq!(observed, 0x12345678);
-        assert_eq!(word.load(Ordering::Acquire), 7);
+        assert_eq!(word.get(), 7);
     }
 
     #[test]
@@ -1096,8 +1095,8 @@ fn diagnosed_copy_distinguishes_validation_from_guarded_fault() {
     }
     let task = carrick_el1_abi::CurrentTask::new();
     let mut dst = [0; 8];
-    let src = [7u8; 8];
-    let address = src.as_ptr() as u64;
+    let src = carrick_test_support::GuestUserBuffer::from_bytes(&[7u8; 8]);
+    let address = src.arg();
     let mut copy = ValidatedCopy {
         task: &task,
         validator: &Refuse,
@@ -1115,7 +1114,7 @@ fn diagnosed_copy_distinguishes_validation_from_guarded_fault() {
     SIMULATE_COPY_FAULT.with(|flag| flag.store(false, Ordering::Relaxed));
     assert_eq!(result, Err(CopyRefusalReason::GuardedFault));
     assert_eq!(copy.copy_in_diagnosed(&mut dst, address), Ok(()));
-    assert_eq!(dst, src);
+    assert_eq!(dst, src.as_bytes());
 }
 
 #[cfg(test)]
