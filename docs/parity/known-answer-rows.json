@@ -8,7 +8,20 @@
       },
       "timeout_secs": 300,
       "stages": [
-        {"name": "echo", "command": ["/bin/sh", "-c", "echo KA_OK"], "expect": "KA_OK"}
+        {
+          "name": "echo",
+          "command": [
+            "/bin/sh",
+            "-c",
+            "echo KA_OK"
+          ],
+          "expect": "KA_OK",
+          "known_answer": {
+            "x86_64": [
+              "refused rseq(nr=334) caller=root venue=ring"
+            ]
+          }
+        }
       ]
     },
     {
@@ -21,20 +34,40 @@
       "stages": [
         {
           "name": "errno",
-          "command": ["/bin/sh", "-c", "echo 'E: Select has failed (38)' >&2; exit 7"],
+          "command": [
+            "/bin/sh",
+            "-c",
+            "echo 'E: Select has failed (38)' >&2; exit 7"
+          ],
           "expect": "NEVER_PRINTED",
           "known_answer": {
-            "arm64": ["guest_errno ENOSYS: E: Select has failed (#)", "exit rc=7", "missing_marker NEVER_PRINTED"],
-            "x86_64": ["guest_errno ENOSYS: E: Select has failed (#)", "exit rc=7", "missing_marker NEVER_PRINTED"]
+            "arm64": [
+              "guest_errno ENOSYS: E: Select has failed (#)",
+              "exit rc=7",
+              "missing_marker NEVER_PRINTED"
+            ],
+            "x86_64": [
+              "guest_errno ENOSYS: E: Select has failed (#)",
+              "exit rc=7",
+              "missing_marker NEVER_PRINTED"
+            ]
           }
         },
         {
           "name": "timeout",
-          "command": ["/bin/sh", "-c", "sleep 600"],
+          "command": [
+            "/bin/sh",
+            "-c",
+            "sleep 600"
+          ],
           "timeout_secs": 20,
           "known_answer": {
-            "arm64": ["timeout stage timeout"],
-            "x86_64": ["timeout stage timeout"]
+            "arm64": [
+              "timeout stage timeout"
+            ],
+            "x86_64": [
+              "timeout stage timeout"
+            ]
           }
         }
       ]
