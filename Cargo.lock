@@ -538,6 +538,7 @@ dependencies = [
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-syscall-abi",
+ "carrick-test-support",
  "loom",
 ]
 

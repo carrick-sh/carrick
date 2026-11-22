@@ -44,14 +44,9 @@ impl LockWait<Aarch64ParkedContext> for HostWait {
     }
 }
 
-fn zone() -> Box<ZoneTables> {
-    let layout = std::alloc::Layout::new::<ZoneTables>();
+fn zone() -> carrick_test_support::ZeroedBox<ZoneTables> {
     // SAFETY: all-zero is the valid empty zone.
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-        assert!(!ptr.is_null());
-        Box::from_raw(ptr)
-    }
+    unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() }
 }
 
 fn identity(tid: u64) -> ThreadIdentity {
@@ -547,7 +542,7 @@ fn an_idle_vcpu_parks_in_wfi_after_its_spin() {
 /// that work from sleeping in WFI without an interrupt.
 #[test]
 fn host_service_posted_at_idle_boundary_does_not_sleep_in_wfi() {
-    let zone = std::sync::Arc::<ZoneTables>::from(zone());
+    let zone = std::sync::Arc::new(zone());
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
@@ -1868,7 +1863,7 @@ fn idle_round_trip_then_switch_in(
     seal: bool,
 ) -> (
     std::thread::Result<carrick_el1_abi::Action>,
-    Box<ZoneTables>,
+    carrick_test_support::ZeroedBox<ZoneTables>,
     FakeCpu,
     u64,
 ) {
@@ -1883,7 +1878,7 @@ fn round_trip_then_switch_in(
     before: impl FnOnce(&ZoneTables),
 ) -> (
     std::thread::Result<carrick_el1_abi::Action>,
-    Box<ZoneTables>,
+    carrick_test_support::ZeroedBox<ZoneTables>,
     FakeCpu,
     u64,
 ) {

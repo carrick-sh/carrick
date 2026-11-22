@@ -12190,7 +12190,8 @@ fn native_child_resources(mapping_last: Option<bool>) {
         host_file.restore_parent_view().unwrap();
     }
     // Aligned, zero-initialized ABI storage; no process-global fixture pointer.
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -12456,7 +12457,8 @@ fn serial_host_native_fork_concurrent_sibling_table_publish_does_not_einval() {
         .unwrap();
     reader.install(table.id(), fd::Fd(3), false).unwrap();
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -12562,7 +12564,8 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
     )
     .unwrap();
     let owner = Arc::new(HostIpc::with_limits(1 << 20, IpcLimits::ZONE).unwrap());
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -12733,7 +12736,8 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     reader.install(table.id(), fd::Fd(0), false).unwrap();
     writer.install(table.id(), fd::Fd(1), false).unwrap();
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -13024,7 +13028,8 @@ fn serial_host_native_prepared_fork_parent_poll_observes_child_pipe_write() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_zone_poll_output_owner_wait_preserves_ready_answer() {
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: aligned, zero-valid ABI storage owned for the complete test.
     let zone = unsafe {
         &*region
@@ -13489,7 +13494,8 @@ fn native_descriptor_argument_witness(
         description
     });
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -15588,7 +15594,8 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     reader.install(table.id(), fd::Fd(3), false).unwrap();
     writer.install(table.id(), fd::Fd(4), false).unwrap();
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()
@@ -16936,7 +16943,8 @@ fn closed_gate_service_entry(retained_ipc: bool) {
             .unwrap();
         description.install(table, fd::Fd(0), false).unwrap();
         drop(description);
-        let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+        let storage =
+            carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
         // SAFETY: this typed fixture owns the aligned, zero-valid map storage.
         let map = unsafe {
             &*storage

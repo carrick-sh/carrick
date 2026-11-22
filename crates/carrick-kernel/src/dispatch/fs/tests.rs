@@ -5092,7 +5092,8 @@ fn native_child_close_replays_posix_lock_release_before_last_alias() {
         .expect("child fd 3");
     table.replace_slot(fd::Fd(3), &slot).unwrap();
     table.replace_slot(fd::Fd(4), &slot).unwrap();
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region =
+        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
             .as_ptr()

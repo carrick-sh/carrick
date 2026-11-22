@@ -324,15 +324,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             std::sync::OnceLock::new();
         let map = carrick_el1_abi::ipc_table_map_host().unwrap_or_else(|| {
             MAP.get_or_init(|| {
-                let layout = std::alloc::Layout::new::<carrick_el1_abi::ipc_tables::IpcTableMap>();
-                // SAFETY: typed aligned zeroed allocation is a valid empty IpcTableMap
+                // SAFETY: a zeroed mapping is a valid empty IpcTableMap,
                 // retained for the life of the isolated test process.
-                unsafe {
-                    let ptr = std::alloc::alloc_zeroed(layout)
-                        .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>();
-                    assert!(!ptr.is_null());
-                    Box::leak(Box::from_raw(ptr))
-                }
+                carrick_test_support::ZeroedBox::leak(unsafe { carrick_test_support::ZeroedBox::<carrick_el1_abi::ipc_tables::IpcTableMap>::new_zeroed() })
             })
         });
         Some((self.native_ipc?, map))
@@ -778,14 +772,11 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
         ),
         make_words: fn(AddressContext<RootGpa>) -> C,
     ) -> Self {
-        let layout = std::alloc::Layout::new::<ZoneTables<C>>();
-        // SAFETY: one aligned allocation owns this zero-valid compact zone for
+        // SAFETY: one lazily committed mapping owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
-        let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<C>>();
-            assert!(!ptr.is_null());
-            Box::leak(Box::from_raw(ptr))
-        };
+        let zone = carrick_test_support::ZeroedBox::leak(unsafe {
+            carrick_test_support::ZeroedBox::<ZoneTables<C>>::new_zeroed()
+        });
         let (binding, process, process_birth, file_table) = identity(zone);
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));

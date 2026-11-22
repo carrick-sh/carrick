@@ -1026,13 +1026,9 @@ mod tests {
     use super::*;
     #[test]
     fn notification_source_busy_is_not_exhaustion_and_release_allows_admission() {
-        let layout = std::alloc::Layout::new::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>();
         // SAFETY: exact aligned, zero-valid scheduler allocation owned by Box.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout)
-                .cast::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            carrick_test_support::ZeroedBox::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>::new_zeroed()
         };
         let controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
         let page = Box::new(ThreadLifecyclePage::new());
