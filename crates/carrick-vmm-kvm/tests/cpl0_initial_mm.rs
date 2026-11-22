@@ -3606,6 +3606,28 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
     );
 }
 
+/// #2749: a copy-on-write replacement grant is the MM's, in its pool: any
+/// member of the MM may claim one that is ready. The x86 host kept each
+/// supplied grant as pending on the CPU that asked for it, for that CPU's
+/// page, so a sibling that claimed it and rang its settlement from the other
+/// CPU found nothing pending there and no selection, and the carrier died
+/// with `owner fault selection absent`. Two live threads and two live
+/// processes: the worker is held between its supply and its resolution while
+/// the leader stores to another copy-on-write page.
+#[test]
+fn production_sibling_claims_a_cow_grant_another_cpu_asked_for() {
+    let elf = native_exit_fixture("native_cow_supply_claimed_by_sibling.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("sibling claim of a held COW supply run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_cow_supply_claimed_by_sibling.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2716 (review P0): the host holds a supplied COW grant as pending on the
 /// CPU that asked for it, so only that CPU's member may ring its settlement.
 /// A sibling's kernel copy that rang it for the MM's completion found nothing
