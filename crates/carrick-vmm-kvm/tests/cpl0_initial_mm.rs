@@ -7714,3 +7714,44 @@ reservation_shape_witness!(
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
      committed page and the child reserves 1 GiB more."
 );
+
+/// #2749 fatal 1: two threads of one forked child run `mmap`, first touch,
+/// `mprotect` and `munmap` at once on their shared MM. They contend for the
+/// MM's reservation root and descriptor editor. Contention is "not now": no
+/// call may come back as an errno, and none may leave the ring.
+#[test]
+fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
+    let elf = native_exit_fixture("native_child_threaded_mm.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 1 << 20, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("threaded mm run");
+    let counters = outcome.physical.syscall_counters().expect("counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    // x86 numbers: 9 mmap, 10 mprotect, 11 munmap.
+    let mm = |bucket: &[std::sync::atomic::AtomicU64]| [9, 10, 11].map(|nr| load(&bucket[nr]));
+    let leaves = counters.anonymous_leaves.each_ref().map(load);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "child exit (0 = Linux; else the first errno). mmap/mprotect/munmap served {:?} \
+         refused {:?} refused_child {:?}; anonymous leaves {leaves:?}",
+        mm(&counters.served),
+        mm(&counters.refused),
+        mm(&counters.refused_child),
+    );
+    assert_eq!(
+        [mm(&counters.refused), mm(&counters.refused_child)],
+        [[0; 3]; 2],
+        "mmap/mprotect/munmap refusals; anonymous leaves {leaves:?}"
+    );
+}
