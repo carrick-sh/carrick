@@ -173,6 +173,7 @@ pub(crate) fn run_debug(
             limit,
             oracle,
             oracle_only,
+            venue_profiles,
             report,
         } => {
             if report {
@@ -192,6 +193,7 @@ pub(crate) fn run_debug(
                     limit,
                     oracle: oracle.as_deref(),
                     oracle_only,
+                    venue_profiles: &venue_profiles,
                 })?;
             }
         }

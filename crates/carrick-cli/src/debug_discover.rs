@@ -23,7 +23,11 @@
 //!   tasks holding unserved host work), read before the kill, since a killed
 //!   carrier writes no census;
 //! - with `--oracle`, each stage that passes at 5x the native Docker
-//!   oracle's time or more (`pathological_time`).
+//!   oracle's time or more (`pathological_time`);
+//! - with `--venue-profile <row>=<file>`, each call shape the row makes on
+//!   the native oracle that Carrick's static route answers ENOSYS, on either
+//!   ISA (`venue_gap`, from `crate::venue_gaps`): the stops past the ones the
+//!   runs reached.
 //!
 //! The output is one ranked table (instance, ISA, row, stage, kind, site,
 //! count, runs, real values) in `<out>/table.md` and `<out>/table.json`, and
@@ -34,6 +38,7 @@
 //! it reads is the same opt-in `CARRICK_EL1_CENSUS` every run can write.
 
 use anyhow::{Context, Result, bail, ensure};
+use carrick_guest_arch::GuestIsa;
 use carrick_runtime::el1_census::{Census, RefusalRank};
 use carrick_spec::syscall_census::{CallerClass, CensusIsa};
 use std::collections::{BTreeMap, BTreeSet};
@@ -175,6 +180,10 @@ pub(crate) enum FindingKind {
     /// Docker oracle's time (`--oracle`): structurally wrong work.
     Pathological,
     Refused,
+    /// A call shape the row makes on the native oracle that Carrick's static
+    /// route answers ENOSYS (`--venue-profile`). No run produced it: it is a
+    /// stop past the ones the runs reached.
+    VenueGap,
     GuestErrno,
     Exit,
     MissingMarker,
@@ -193,6 +202,7 @@ impl FindingKind {
             Self::Hang => "hang",
             Self::Pathological => "pathological_time",
             Self::Refused => "refused",
+            Self::VenueGap => "venue_gap",
             Self::GuestErrno => "guest_errno",
             Self::Exit => "exit",
             Self::MissingMarker => "missing_marker",
@@ -881,6 +891,13 @@ pub(crate) fn rank(records: &[RunRecord], oracle: &[OracleRecord]) -> Vec<TableR
         })
         .collect();
     rows.extend(pathological_rows(records, oracle));
+    sort_rows(&mut rows);
+    rows
+}
+
+/// The table's order: most telling kind first, then the most runs, then the
+/// most counts.
+fn sort_rows(rows: &mut [TableRow]) {
     rows.sort_by(|a, b| {
         a.kind
             .cmp(&b.kind)
@@ -888,9 +905,117 @@ pub(crate) fn rank(records: &[RunRecord], oracle: &[OracleRecord]) -> Vec<TableR
             .then(b.count.cmp(&a.count))
             .then(a.row.cmp(&b.row))
             .then(a.stage.cmp(&b.stage))
+            .then(a.isa.cmp(&b.isa))
             .then(a.site.cmp(&b.site))
     });
-    rows
+}
+
+/// The stage column of a venue-gap row: the oracle's profile, not a stage.
+const VENUE_STAGE: &str = "oracle-profile";
+/// The instance column of a venue-gap row: Carrick's static route, which no
+/// host ran.
+const VENUE_INSTANCE: &str = "static-route";
+
+fn venue_dir(out: &Path) -> PathBuf {
+    out.join("venue")
+}
+
+/// Admit each `--venue-profile <row>=<file>`: the row is one of the rows
+/// file's and the profile parses. The profile is kept at
+/// `<out>/venue/<row>/profile.txt`, so `--report` ranks it again.
+fn admit_venue_profiles(rows: &RowsFile, specs: &[String], out: &Path) -> Result<()> {
+    for spec in specs {
+        let (row, file) = spec
+            .split_once('=')
+            .with_context(|| format!("--venue-profile {spec}: want <row>=<file>"))?;
+        ensure!(
+            rows.rows.iter().any(|known| known.name == row),
+            "--venue-profile: no row named {row}"
+        );
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("read venue profile {file}"))?;
+        crate::venue_gaps::parse_profile(&text)
+            .and_then(|profile| crate::venue_gaps::gap_rows(&profile).map(drop))
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("venue profile {file}"))?;
+        let dir = venue_dir(out).join(row);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        std::fs::write(dir.join("profile.txt"), text)
+            .with_context(|| format!("write {}", dir.join("profile.txt").display()))?;
+    }
+    Ok(())
+}
+
+/// One row's venue gaps: a table row per call shape and ISA whose static
+/// route is a gap (`Route::is_gap`), counted by the oracle's calls.
+pub(crate) fn venue_gap_rows(
+    row: &str,
+    profile: &crate::venue_gaps::Profile,
+) -> Result<Vec<TableRow>> {
+    let mut rows = Vec::new();
+    for gap in crate::venue_gaps::gap_rows(profile).map_err(anyhow::Error::msg)? {
+        let shape = if gap.shape.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", gap.shape)
+        };
+        for (isa, route) in &gap.routes {
+            if !route.is_gap() {
+                continue;
+            }
+            rows.push(TableRow {
+                instance: VENUE_INSTANCE.to_owned(),
+                isa: match isa {
+                    GuestIsa::X86_64 => RowIsa::X86_64,
+                    GuestIsa::Aarch64 => RowIsa::Arm64,
+                },
+                row: row.to_owned(),
+                stage: VENUE_STAGE.to_owned(),
+                kind: FindingKind::VenueGap,
+                site: format!(
+                    "{}{shape} caller={} route={}",
+                    gap.name,
+                    caller_name(gap.key.caller()),
+                    route.label().replace("**", "")
+                ),
+                count: gap.counts.calls,
+                runs: 0,
+                of_runs: 0,
+                values: vec![format!(
+                    "native oracle nr={}: calls={} enosys={} errors={}",
+                    gap.key.nr, gap.counts.calls, gap.counts.enosys, gap.counts.errors
+                )],
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// The venue-gap rows of every profile a directory holds (`<out>/venue/`);
+/// none when it has none.
+fn venue_rows(out: &Path) -> Result<Vec<TableRow>> {
+    let dir = venue_dir(out);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", dir.display())),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+        names.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    let mut rows = Vec::new();
+    for row in names {
+        let path = dir.join(&row).join("profile.txt");
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let profile = crate::venue_gaps::parse_profile(&text)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("venue profile {}", path.display()))?;
+        rows.extend(venue_gap_rows(&row, &profile)?);
+    }
+    Ok(rows)
 }
 
 /// The table as Markdown, with a per-stage verdict line first: passes, the
@@ -1100,6 +1225,8 @@ pub(crate) struct DiscoverOptions<'a> {
     pub(crate) oracle: Option<&'a Path>,
     /// Stop after the oracle phase (`--oracle-only`).
     pub(crate) oracle_only: bool,
+    /// Native-oracle syscall profiles, `<row>=<file>` (`--venue-profile`).
+    pub(crate) venue_profiles: &'a [String],
 }
 
 fn instance_name(explicit: Option<&str>) -> String {
@@ -1125,7 +1252,9 @@ fn write_outputs(
     oracle: &[OracleRecord],
     limit: usize,
 ) -> Result<String> {
-    let rows = rank(records, oracle);
+    let mut rows = rank(records, oracle);
+    rows.extend(venue_rows(out)?);
+    sort_rows(&mut rows);
     let table = render(records, oracle, &rows, limit);
     std::fs::write(out.join("table.md"), &table)
         .with_context(|| format!("write {}", out.join("table.md").display()))?;
@@ -1279,6 +1408,7 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
     let instance = instance_name(options.instance);
     std::fs::create_dir_all(options.out)
         .with_context(|| format!("create {}", options.out.display()))?;
+    admit_venue_profiles(&rows, options.venue_profiles, options.out)?;
     let mut runs_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1816,6 +1946,7 @@ mod tests {
             limit: 50,
             oracle: Some(&docker),
             oracle_only: false,
+            venue_profiles: &[],
         })
         .unwrap();
         assert_eq!(
@@ -1857,6 +1988,7 @@ mod tests {
             limit: 50,
             oracle,
             oracle_only,
+            venue_profiles: &[],
         };
         discover(options(Some(&docker), true)).unwrap();
         assert_eq!(
@@ -2066,6 +2198,7 @@ mod tests {
             limit: 50,
             oracle: None,
             oracle_only: false,
+            venue_profiles: &[],
         })
         .unwrap();
         let records = read_records(&out).unwrap();
@@ -2097,5 +2230,101 @@ mod tests {
             std::fs::read_to_string(out.join("table.md")).unwrap(),
             table
         );
+    }
+
+    /// A recorder-format profile: the root's `socket(AF_INET, SOCK_DGRAM)`
+    /// and a forked child's two calls of an unknown syscall number, which no
+    /// route serves.
+    const VENUE_PROFILE: &str = "VENUEPROFILE1|ready|root=7|isa=0
+VENUEPROFILE1|complete|root=7
+
+@calls[0, 41, 2, 2]: 1
+@calls[1, 510, 0, 0]: 2
+@enosys[1, 510, 0, 0]: 2
+";
+
+    #[test]
+    fn a_venue_profiles_gaps_rank_as_rows_and_survive_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("carrick");
+        std::fs::write(&fake, "#!/bin/sh\necho OK\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let rows = dir.path().join("rows.json");
+        std::fs::write(
+            &rows,
+            r#"{"rows":[{"name":"go","image":{"x86_64":"u","arm64":"u"},"timeout_secs":20,
+                "stages":[{"name":"row","command":["go"],"expect":"OK"}]}]}"#,
+        )
+        .unwrap();
+        let profile = dir.path().join("go.profile.txt");
+        std::fs::write(&profile, VENUE_PROFILE).unwrap();
+        let out = dir.path().join("out");
+        let run = |specs: &[String], out: &Path| {
+            discover(DiscoverOptions {
+                rows: &rows,
+                only: &[],
+                runs: 1,
+                out,
+                carrick: Some(&fake),
+                instance: Some("unit"),
+                label: "t",
+                reap: None,
+                limit: 50,
+                oracle: None,
+                oracle_only: false,
+                venue_profiles: specs,
+            })
+        };
+        run(&[format!("go={}", profile.display())], &out).unwrap();
+        let table = std::fs::read_to_string(out.join("table.md")).unwrap();
+        // The unknown call is a gap on the profile's own ISA, with the
+        // oracle's counts.
+        let gap = table
+            .lines()
+            .find(|line| line.contains("| venue_gap |") && line.contains("| x86_64 |"))
+            .unwrap_or_else(|| panic!("no x86_64 venue_gap row in\n{table}"));
+        assert!(
+            gap.contains("| static-route | x86_64 | go | oracle-profile | venue_gap |"),
+            "{gap}"
+        );
+        assert!(gap.contains("caller=child route=ENOSYS"), "{gap}");
+        assert!(
+            gap.contains("| 2 | 0/0 | `native oracle nr=510: calls=2 enosys=2 errors=0` |"),
+            "{gap}"
+        );
+        // Every venue row is one of `venue_gaps::gap_rows`'s gaps.
+        let parsed = crate::venue_gaps::parse_profile(VENUE_PROFILE).unwrap();
+        let gaps: usize = crate::venue_gaps::gap_rows(&parsed)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.routes
+                    .iter()
+                    .filter(|(_, route)| route.is_gap())
+                    .count()
+            })
+            .sum();
+        assert_eq!(table.matches("| venue_gap |").count(), gaps, "{table}");
+        // The profile is kept beside the runs, so a report ranks it again.
+        std::fs::remove_file(out.join("table.md")).unwrap();
+        report(&out, 50).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("table.md")).unwrap(),
+            table
+        );
+        // A profile for a row the rows file lacks, a spec with no `=`, and a
+        // file that is no profile are refused before anything runs.
+        let other = dir.path().join("other");
+        for (spec, want) in [
+            (format!("npm={}", profile.display()), "no row named npm"),
+            (profile.display().to_string(), "want <row>=<file>"),
+            (format!("go={}", rows.display()), "venue profile"),
+        ] {
+            let error = run(&[spec], &other).expect_err(want);
+            assert!(format!("{error:#}").contains(want), "{error:#}");
+            assert!(!other.join("runs.jsonl").exists());
+        }
     }
 }
