@@ -4,6 +4,12 @@
 //! production EL1 image (`CARRICK_A64_ELF`) serves private futex waits in the
 //! ring and parks its idle vCPU until the virtual timer or a kick.
 //!
+//! Slice C admits the root itself: the carrier binds the kernel's births to
+//! the zone's issuers and publishes the root's own namespace PID, so EL1
+//! admits a root process owner on the first call, serves its process calls
+//! (`set_tid_address`, `prlimit64`, `exit_group`) in the ring, and ends the
+//! run through the native root-exit crossing.
+//!
 //! The guests are raw A64 words in a static ELF, run on the native arm64
 //! [`HostBlockRunner`] through the production soft entry
 //! (`run_single_process_with_executor_and_setup`).
@@ -29,6 +35,16 @@ const TIMEOUT_OFFSET: u64 = 0x10;
 
 const NR_FUTEX: u16 = 98;
 const NR_EXIT_GROUP: u16 = 94;
+const NR_SET_TID_ADDRESS: u16 = 96;
+const NR_GETTID: u16 = 178;
+const NR_PRLIMIT64: u16 = 261;
+const RLIMIT_STACK: u16 = 3;
+const LINUX_EFAULT: i32 = 14;
+const LINUX_EINVAL: i32 = 22;
+/// The root's `clear_child_tid` word.
+const CLEAR_TID_OFFSET: u64 = 0x20;
+/// A `struct rlimit` the ring copies the old limit out to.
+const RLIMIT_OFFSET: u64 = 0x40;
 const FUTEX_WAIT_PRIVATE: u16 = 128;
 const LINUX_ETIMEDOUT: i32 = 110;
 
@@ -62,6 +78,41 @@ fn mov32(rd: u32, value: u64) -> [u32; 2] {
 /// C6.2.231 NEG (shifted register): `neg xd, xm` (`sub xd, xzr, xm`).
 const fn neg(rd: u32, rm: u32) -> u32 {
     0xcb00_0000 | (rm << 16) | (31 << 5) | rd
+}
+
+/// C6.2.205 MOV (register): `mov xd, xm` (`orr xd, xzr, xm`).
+const fn mov(rd: u32, rm: u32) -> u32 {
+    0xaa00_0000 | (rm << 16) | (31 << 5) | rd
+}
+
+/// C6.2.4 ADD (shifted register): `add xd, xn, xm`.
+const fn add(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x8b00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// C6.2.308 SUB (shifted register): `sub xd, xn, xm`.
+const fn sub(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xcb00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// C6.2.2 ADD (immediate): `add xd, xn, #imm12`.
+const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
+}
+
+/// C6.2.306 SUB (immediate): `sub xd, xn, #imm12`.
+const fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0xd100_0000 | (imm12 << 10) | (rn << 5) | rd
+}
+
+/// C6.2.200 LSR (immediate): `lsr xd, xn, #shift` (`ubfm xd, xn, #shift, #63`).
+const fn lsr(rd: u32, rn: u32, shift: u32) -> u32 {
+    0xd340_fc00 | (shift << 16) | (rn << 5) | rd
+}
+
+/// C6.2.170 LDR (immediate, unsigned offset): `ldr xt, [xn, #offset]`.
+const fn ldr(rt: u32, rn: u32, offset: u32) -> u32 {
+    0xf940_0000 | ((offset / 8) << 10) | (rn << 5) | rt
 }
 
 /// A static ELF: one page of code at [`CODE_VA`], one RW page at [`DATA_VA`].
@@ -347,4 +398,154 @@ fn soft_zone_host_futex_wake_reaches_the_parked_ring_waiter() {
         "the wake must end the wait before its {LONG_WAIT:?} timeout ({elapsed:?})"
     );
     assert_served_once_in_ring(&run);
+}
+
+/// The ring served each of `calls` once, and nothing reached the host or
+/// was refused: the root's process owner answered them all.
+fn assert_root_served_in_ring(run: &SoftProcessRun<HostBlockRunner>, calls: &[u16]) {
+    let served = sample_el1_served(&run.engine);
+    for &nr in calls {
+        assert!(
+            served
+                .iter()
+                .any(|&(served_nr, _, count)| served_nr == u64::from(nr) && count == 1),
+            "syscall {nr} must be served once in the ring: {served:?}"
+        );
+    }
+    assert_eq!(run.counted_enosys, Vec::new(), "nothing is refused");
+    assert_eq!(
+        run.reply_census.kernel_dispatched, 0,
+        "no call reaches the host: {:?}",
+        run.reply_census
+    );
+}
+
+/// `exit_group` of `code` computed into x0.
+fn exit_with_x0(code: &mut Vec<u32>) {
+    code.push(movz(8, NR_EXIT_GROUP, 0));
+    code.push(A64_SVC_0);
+}
+
+/// `prlimit64(0, resource, NULL, old)` with the result in x19.
+fn prlimit_query(code: &mut Vec<u32>, resource: u16, old: u64) {
+    code.push(movz(0, 0, 0));
+    code.push(movz(1, resource, 0));
+    code.push(movz(2, 0, 0));
+    code.extend(mov32(3, old));
+    code.push(movz(8, NR_PRLIMIT64, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+}
+
+/// The root's first call, `set_tid_address`, returns its own TID: the ring
+/// admits the root process owner and answers in the ring, and the TID it
+/// returns is positive and the one `gettid` reports. Exits
+/// `set_tid_address() - gettid() + (set_tid_address() < 0)`: 0 iff they
+/// agree on a positive TID.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_set_tid_address_returns_its_own_tid_in_ring() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut code = Vec::new();
+    code.extend(mov32(0, DATA_VA + CLEAR_TID_OFFSET));
+    code.push(movz(8, NR_SET_TID_ADDRESS, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    code.push(movz(8, NR_GETTID, 0));
+    code.push(A64_SVC_0);
+    code.push(sub(0, 19, 0));
+    code.push(lsr(20, 19, 63));
+    code.push(add(0, 0, 20));
+    exit_with_x0(&mut code);
+    let (run, _) = run(&build_elf(&code, &[]), "/set-tid-address", None);
+    println!(
+        "set_tid_address: exit={} census={:?} served={:?} counted_enosys={:?}",
+        run.exit_code,
+        run.reply_census,
+        sample_el1_served(&run.engine),
+        run.counted_enosys
+    );
+    assert_eq!(run.exit_code, 0, "set_tid_address returns the caller's TID");
+    assert_root_served_in_ring(&run, &[NR_SET_TID_ADDRESS, NR_EXIT_GROUP]);
+}
+
+/// `prlimit64` queries the root's `RLIMIT_STACK` in the ring and copies it
+/// out: the launch's 8 MiB soft limit and an unlimited hard limit, the same
+/// limits the host kernel's root task starts with. Exits
+/// `ret + (rlim_cur >> 20) - 8 + (rlim_max + 1)`: 0 iff the call succeeded
+/// and copied out exactly those limits.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_prlimit64_copies_out_the_stack_limit_in_ring() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut code = Vec::new();
+    code.extend(mov32(9, DATA_VA + RLIMIT_OFFSET));
+    prlimit_query(&mut code, RLIMIT_STACK, DATA_VA + RLIMIT_OFFSET);
+    code.push(ldr(20, 9, 0));
+    code.push(ldr(21, 9, 8));
+    code.push(lsr(20, 20, 20));
+    code.push(sub_imm(20, 20, 8));
+    code.push(add_imm(21, 21, 1));
+    code.push(add(0, 19, 20));
+    code.push(add(0, 0, 21));
+    exit_with_x0(&mut code);
+    let (run, _) = run(&build_elf(&code, &[]), "/prlimit-stack", None);
+    println!(
+        "prlimit64 RLIMIT_STACK: exit={} census={:?} served={:?} counted_enosys={:?}",
+        run.exit_code,
+        run.reply_census,
+        sample_el1_served(&run.engine),
+        run.counted_enosys
+    );
+    assert_eq!(
+        run.exit_code, 0,
+        "prlimit64 copies out 8 MiB / RLIM_INFINITY for RLIMIT_STACK"
+    );
+    assert_root_served_in_ring(&run, &[NR_PRLIMIT64, NR_EXIT_GROUP]);
+}
+
+/// The ring refuses a `prlimit64` of an unknown resource with `EINVAL` and
+/// an unmapped output pointer with `EFAULT`, as Linux does.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_prlimit64_refuses_a_bad_resource_and_a_bad_pointer_in_ring() {
+    let _carrier_lock = lock_soft_carrier_test();
+    for (resource, old, errno, path) in [
+        (999, DATA_VA + RLIMIT_OFFSET, LINUX_EINVAL, "/prlimit-einval"),
+        (RLIMIT_STACK, 0x10, LINUX_EFAULT, "/prlimit-efault"),
+    ] {
+        let mut code = Vec::new();
+        prlimit_query(&mut code, resource, old);
+        code.push(neg(0, 19));
+        exit_with_x0(&mut code);
+        let (run, _) = run(&build_elf(&code, &[]), path, None);
+        println!(
+            "prlimit64({resource}, {old:#x}): exit={} census={:?} served={:?} counted_enosys={:?}",
+            run.exit_code,
+            run.reply_census,
+            sample_el1_served(&run.engine),
+            run.counted_enosys
+        );
+        assert_eq!(run.exit_code, errno, "{path}");
+        assert_root_served_in_ring(&run, &[NR_PRLIMIT64, NR_EXIT_GROUP]);
+    }
+}
+
+/// The root's `exit_group` is the ring's: its status crosses to the host
+/// through the native root exit, and the run ends with it in full.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_exit_group_status_crosses_the_native_root_exit() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut code = vec![movz(0, 7, 0)];
+    exit_with_x0(&mut code);
+    let (run, _) = run(&build_elf(&code, &[]), "/exit-seven", None);
+    println!(
+        "exit_group(7): exit={} census={:?} served={:?}",
+        run.exit_code,
+        run.reply_census,
+        sample_el1_served(&run.engine)
+    );
+    assert_eq!(run.exit_code, 7);
+    assert_root_served_in_ring(&run, &[NR_EXIT_GROUP]);
 }
