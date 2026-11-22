@@ -2,11 +2,15 @@
 # an rt_sigaction installing a handler unrouted (counted ENOSYS) rather than
 # accepting a handler it never delivers. The shared personality asks the
 # owner (ProcessSignals::delivers_caught_signals); the EL1 owner answers from
-# its service (NativeProcessService::signal_frames_reach), which on ARM is
-# exactly the MM portal admission the frame copy itself requires. Default and
-# ignore dispositions and queries are unchanged. HVF and x86 roots are
-# admitted, so their semantics, bindings and budgets are unchanged; the soft
-# AArch64 root (legacy-opened MM, #2814) refuses handlers until slice D.
+# its service (NativeProcessService::signal_frames_reach). The ARM service
+# answers from the carrier's typed SignalFrameCustody, published in the MM
+# portal: Carrier (HVF, x86, and any carrier that publishes nothing) reaches
+# every MM, admitted or not; AdmittedOwner (the soft carrier) requires the MM
+# portal admission the frame copy itself needs. Default and ignore
+# dispositions and queries are unchanged. HVF and x86 semantics, bindings and
+# budgets are unchanged by construction, including an unadmitted HVF MM
+# (descriptor lane off, census refusal, a stale MM); the soft AArch64 root
+# (legacy-opened MM, #2814) refuses handlers until slice D.
 # #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
 # (enter_mm_executor_then_register, the leased-root check and
 # open_first_address_space) and the stopped zone-slot publication move to
@@ -97,6 +101,7 @@ vm_free = [
   "carrick-conformance-contract::personality_boundary::tests::x86_signal_delivery_selects_through_one_shared_owner",
   "carrick-core-abi::entry::event_identity_tests::event_identity_rejects_reused_execution_or_thread_generation",
   "carrick-el1-abi::signal_ingress::tests::{full_queue_retains_owned_admission_until_drain,external_event_rejects_reused_task_binding_and_record,concurrent_ingress_delivers_every_record_once}",
+  "carrick-el1-linux::aarch64_process_tests::arm_rt_sigaction_handler_gate_follows_carrier_signal_frame_custody",
   "carrick-el1-linux::aarch64_process_tests::{arm_native_signal_calls_route_to_shared_owner,arm_native_sigsuspend_dispatches_to_owned_continuation,native_child_sigsuspend_wakes_from_parent_signal,arm_wait4_reports_sigpipe_from_native_signal_owner,arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint,arm_parked_wait4_signal_wake_without_sa_restart_retains_eintr}",
   "carrick-el1-linux::arm_signal::tests::{arm_public_signal_frame*,arm_public_return_restores_internal_daif_and_preserves_el0_user_flags,arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags,arm_signal_delivery_separates_interrupted_sp_from_altstack_placement}",
   "carrick-el1-linux::lifecycle::tests::{arm_sigaltstack_minimum_is_5120,arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags,arm_sigaltstack_onstack_boundaries_use_open_base_closed_top,sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm,sigprocmask_oldset_fault_keeps_new_mask,sigprocmask_oldset_fault_preserves_pending_signal_work}",
