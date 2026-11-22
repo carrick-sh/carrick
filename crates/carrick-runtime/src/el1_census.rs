@@ -185,6 +185,11 @@ pub struct Census {
     /// `IpcLeave` name (nonzero only; absent in older files).
     #[serde(default)]
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// Delegated anonymous mm calls the ring left for the host, by
+    /// `AnonymousLeave` name (nonzero only; absent in older files). In a
+    /// native child each one is a refused call.
+    #[serde(default)]
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<CensusRow>,
 }
 
@@ -286,6 +291,15 @@ fn snapshot_counters(
                 .into_iter()
                 .filter_map(|why| {
                     let count = c.ipc_leaves[why as usize].load(Ordering::Relaxed);
+                    (count != 0).then(|| (why.name().to_owned(), count))
+                })
+                .collect()
+        }),
+        anonymous_leaves: counters.map_or_else(Default::default, |c| {
+            carrick_el1_abi::AnonymousLeave::ALL
+                .into_iter()
+                .filter_map(|why| {
+                    let count = c.anonymous_leaves[why as usize].load(Ordering::Relaxed);
                     (count != 0).then(|| (why.name().to_owned(), count))
                 })
                 .collect()
@@ -455,6 +469,8 @@ pub struct Aggregate {
     pub wall_ns: u64,
     /// `IpcLeave` counts summed across the runs, keyed by variant name.
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// `AnonymousLeave` counts summed across the runs, keyed by variant name.
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<AggregateRow>,
 }
 
@@ -466,9 +482,13 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
     let mut ipc_leaves: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut anonymous_leaves: std::collections::BTreeMap<String, u64> = Default::default();
     for census in censuses {
         for (name, count) in &census.ipc_leaves {
             *ipc_leaves.entry(name.clone()).or_default() += count;
+        }
+        for (name, count) in &census.anonymous_leaves {
+            *anonymous_leaves.entry(name.clone()).or_default() += count;
         }
         if census.schema != 2 {
             return Err(format!("unknown census schema {}", census.schema));
@@ -512,6 +532,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             .sum(),
         wall_ns: censuses.iter().map(|c| c.wall_ns).sum(),
         ipc_leaves,
+        anonymous_leaves,
         rows,
     })
 }
@@ -562,6 +583,14 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             .map(|(name, count)| format!("{name}: {count}"))
             .collect();
         out.push_str(&format!("\nIPC leaves: {}\n", leaves.join(", ")));
+    }
+    if !aggregate.anonymous_leaves.is_empty() {
+        let leaves: Vec<_> = aggregate
+            .anonymous_leaves
+            .iter()
+            .map(|(name, count)| format!("{name}: {count}"))
+            .collect();
+        out.push_str(&format!("\nAnonymous mm leaves: {}\n", leaves.join(", ")));
     }
     out
 }
@@ -793,6 +822,7 @@ mod tests {
             process_sys_ns: 4_000,
             wall_ns: 30_000,
             ipc_leaves: Default::default(),
+            anonymous_leaves: Default::default(),
             rows,
         }
     }
