@@ -494,6 +494,13 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
     free: BTreeSet<u32>,
     aliases: BTreeMap<NonZeroU64, BTreeMap<u64, Alias>>,
     alias_visits: usize,
+    /// Per MM, the pages whose retired leaf this carrier cleared (a settled
+    /// owed return) before the `Prepare` that made the leaf was published
+    /// here: VA to the frame the leaf named. That `Prepare`'s publication
+    /// consumes its window's rows; the MM's retirement drops the rest.
+    returned_unpublished: BTreeMap<NonZeroU64, BTreeMap<u64, u64>>,
+    /// The pages the last `publish` found already returned.
+    returned_in_publication: Vec<u64>,
     roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
     /// Slots each MM is admitted to (`Slot::allowed`), so retiring an MM
     /// never scans every slot.
@@ -557,6 +564,8 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             free: (0..limit).collect(),
             aliases: BTreeMap::new(),
             alias_visits: 0,
+            returned_unpublished: BTreeMap::new(),
+            returned_in_publication: Vec::new(),
             roots: BTreeMap::new(),
             admitted: BTreeMap::new(),
             drained_by: BTreeMap::new(),
@@ -804,6 +813,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }
         // Phase 2: bookkeeping, infallible after the checks above.
         self.roots.remove(&mm);
+        self.returned_unpublished.remove(&mm);
         let mut aliases = 0;
         for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
             if let Some(slot) = self.slots.get_mut(&alias.slot) {
@@ -1310,6 +1320,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         inventory: &mut I,
     ) -> Result<GuestMmuPublication, MemoryError> {
         self.admit()?;
+        self.returned_in_publication.clear();
         if let Err(reason) = self.admit_guest_edit(txn) {
             self.quarantined = true;
             return Err(reason);
@@ -1327,8 +1338,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }
         if let Err((va, entry)) = self.guest_postcondition(txn) {
             self.quarantined = true;
+            let returned = self
+                .returned_unpublished
+                .get(&txn.id.mm_key)
+                .and_then(|rows| rows.get(&va));
             return Err(error(format!(
-                "guest MMU publication live descriptor mismatch: va={va:#x} entry={entry:#x} op={:?}",
+                "guest MMU publication live descriptor mismatch: va={va:#x} entry={entry:#x} returned={returned:x?} op={:?}",
                 txn.op
             )));
         }
@@ -1380,7 +1395,38 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 },
             );
         }
+        // Pages of this window whose owed return settled before this
+        // publication: the postcondition matched each to the frame this
+        // `Prepare` gave it. Their leaves are gone, so they keep no edge.
+        if let DescriptorOp::Prepare { span, output, .. } = txn.op
+            && let Some(rows) = self.returned_unpublished.get_mut(&txn.id.mm_key)
+        {
+            let end = span.va.saturating_add(span.len);
+            let returned: Vec<u64> = rows
+                .range(span.va..end)
+                .filter(|&(&va, &frame)| output.raw().checked_add(va - span.va) == Some(frame))
+                .map(|(&va, _)| va)
+                .collect();
+            for va in &returned {
+                rows.remove(va);
+            }
+            if rows.is_empty() {
+                self.returned_unpublished.remove(&txn.id.mm_key);
+            }
+            for &va in &returned {
+                self.remove_aliases(txn.id.mm_key, PageSpan::new(va, PAGE), context);
+                if self.quarantined {
+                    return Err(error("guest alias publication became indeterminate"));
+                }
+            }
+            self.returned_in_publication = returned;
+        }
         Ok(publication)
+    }
+    /// The pages of the last published `Prepare` whose owed return had
+    /// already settled: this carrier cleared their leaves itself.
+    pub fn returned_in_publication(&self) -> &[u64] {
+        &self.returned_in_publication
     }
 
     /// Read the terminal graph after the guest edit. Only bounded terminal
@@ -1408,22 +1454,36 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             // The ring released this MM's editor before the settlement
             // crossing: a sibling thread may have protected or retired a
             // page of this window since (its mapping can lie inside it).
+            // A retired page's owed return may have settled as well: the
+            // leaf is then empty, and this carrier holds the row of the
+            // frame it cleared there.
             if let DescriptorOp::Prepare {
                 output,
                 permissions,
                 ..
             } = txn.op
-                && output
-                    .raw()
-                    .checked_add(va - span.va)
-                    .and_then(|page| PreparedLeafSuccessor::classify(entry, page, permissions))
-                    .is_some()
+                && let Some(page) = output.raw().checked_add(va - span.va)
             {
-                let Some(next) = va.checked_add(size - (va & (size - 1))) else {
-                    return Err((va, entry));
-                };
-                va = next.min(end);
-                continue;
+                if entry == 0
+                    && self
+                        .returned_unpublished
+                        .get(&txn.id.mm_key)
+                        .and_then(|rows| rows.get(&va))
+                        == Some(&page)
+                {
+                    let Some(next) = va.checked_add(PAGE) else {
+                        return Err((va, entry));
+                    };
+                    va = next.min(end);
+                    continue;
+                }
+                if PreparedLeafSuccessor::classify(entry, page, permissions).is_some() {
+                    let Some(next) = va.checked_add(size - (va & (size - 1))) else {
+                        return Err((va, entry));
+                    };
+                    va = next.min(end);
+                    continue;
+                }
             }
             let expected_base = match txn.op {
                 DescriptorOp::Map { output, .. } | DescriptorOp::Prepare { output, .. } => {
@@ -1623,6 +1683,23 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         if !cleared {
             self.quarantined = true;
             return Err(error("owed return terminal changed under exclusion"));
+        }
+        // A cleared page whose slot was never published came from a
+        // `Prepare` whose publication has not reached this carrier yet (the
+        // ring releases the editor before that crossing). Keep the frame
+        // the leaf named, so that publication can tell this return from a
+        // leaf its `Prepare` never wrote.
+        for terminal in terminals.iter().filter(|terminal| terminal.span == PAGE) {
+            let frame = terminal.descriptor & ADDRESS;
+            if self
+                .locate(FrameGpa::new(frame), PAGE as usize)
+                .is_some_and(|slot| slot.allowed.is_empty() && slot.alias_count == 0)
+            {
+                self.returned_unpublished
+                    .entry(mm)
+                    .or_default()
+                    .insert(terminal.va, frame);
+            }
         }
         self.remove_aliases(mm, span, context);
         if self.quarantined {

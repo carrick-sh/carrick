@@ -131,6 +131,11 @@ impl PrivateAnonymousWitness {
                     {
                         continue;
                     }
+                    // Its owed return settled as well: the publication
+                    // matched the cleared leaf to this grant's frame.
+                    if entry == 0 && grant.memory.returned_in_publication().contains(&va) {
+                        continue;
+                    }
                     if size != PAGE
                         || entry & PRIVATE == 0
                         || entry & (PRESENT | PREPARED) == 0

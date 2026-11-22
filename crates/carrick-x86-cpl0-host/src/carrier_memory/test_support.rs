@@ -1630,6 +1630,12 @@ pub fn prepare_settlement_accepts_a_sibling_edit_of_its_window(
     // A returned page keeps no physical edge: nothing names its frame, so
     // its slot is free of this window's alias.
     if edit == SiblingEdit::RetireSettled {
+        if memory.returned_in_publication() != [span.va] {
+            return Err(format!(
+                "the returned page was not reported: {:?}",
+                memory.returned_in_publication()
+            ));
+        }
         let aliases = memory.record(data).map(|slot| slot.alias_count);
         if !matches!(aliases, Ok(0)) {
             return Err(format!("a returned page kept an alias edge: {aliases:?}"));
