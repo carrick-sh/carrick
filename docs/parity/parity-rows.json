@@ -1,0 +1,76 @@
+{
+  "rows": [
+    {
+      "name": "probe-1335",
+      "image": {
+        "arm64": "docker.io/library/ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5",
+        "x86_64": "docker.io/library/ubuntu:24.04@sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec"
+      },
+      "timeout_secs": 300,
+      "stages": [
+        {"name": "row", "command": ["/bin/sh", "-c", "mkdir /tmp/a; ls -ld /tmp && echo PROBE_OK"], "expect": "PROBE_OK"}
+      ]
+    },
+    {
+      "name": "go-hello",
+      "image": {
+        "arm64": "docker.io/library/golang:1.23@sha256:60deed95d3888cc5e4d9ff8a10c54e5edc008c6ae3fba6187be6fb592e19e8c0",
+        "x86_64": "docker.io/library/golang:1.23@sha256:e87b2a5f6df2dff71ea330d55d54f4979eb380ae58a7e3aabc9d53121243e689"
+      },
+      "timeout_secs": 900,
+      "stages": [
+        {"name": "version", "command": ["sh", "-c", "go version && go env GOROOT GOARCH && echo GOVER_OK"], "expect": "GOVER_OK", "timeout_secs": 300},
+        {"name": "vet", "command": ["sh", "-c", "cd /tmp && printf 'package main\\nfunc main(){println(\"ok\")}\\n' > h.go && GOCACHE=/tmp/gc go vet ./h.go && echo VET_OK"], "expect": "VET_OK"},
+        {"name": "row", "command": ["sh", "-c", "cd /tmp && printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go && GOCACHE=/tmp/gc go build -o h ./h.go && ./h && echo BUILD_OK"], "expect": "BUILD_OK"}
+      ]
+    },
+    {
+      "name": "go-real",
+      "image": {
+        "arm64": "docker.io/library/golang:1.23@sha256:60deed95d3888cc5e4d9ff8a10c54e5edc008c6ae3fba6187be6fb592e19e8c0",
+        "x86_64": "docker.io/library/golang:1.23@sha256:e87b2a5f6df2dff71ea330d55d54f4979eb380ae58a7e3aabc9d53121243e689"
+      },
+      "timeout_secs": 900,
+      "stages": [
+        {"name": "row", "command": ["sh", "-c", "cd /tmp && GOFLAGS=-mod=mod GOCACHE=/tmp/gc go install golang.org/x/example/hello@v0.0.0-20240925201127-4ac1d1bdc3e3 && /go/bin/hello && echo GOREAL_OK"], "expect": "GOREAL_OK"}
+      ]
+    },
+    {
+      "name": "pip",
+      "image": {
+        "arm64": "docker.io/library/python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+        "x86_64": "docker.io/library/python:3.12-slim@sha256:05a994d2344eb364cc186910f4fc8786a38215f39f00d0acc25bff33a08f4177"
+      },
+      "timeout_secs": 900,
+      "stages": [
+        {"name": "version", "command": ["sh", "-c", "pip --version && echo PIPV_OK"], "expect": "PIPV_OK", "timeout_secs": 300},
+        {"name": "stdlib", "command": ["python", "-c", "import ssl, socket, hashlib, subprocess, multiprocessing, sqlite3; subprocess.run(['true'], check=True); print('STDLIB_OK')"], "expect": "STDLIB_OK", "timeout_secs": 300},
+        {"name": "row", "command": ["sh", "-c", "pip install --no-cache-dir requests==2.32.3 && python -c \"import requests;print(requests.__version__)\" && echo PIP_OK"], "expect": "PIP_OK"}
+      ]
+    },
+    {
+      "name": "npm",
+      "image": {
+        "arm64": "docker.io/library/node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee",
+        "x86_64": "docker.io/library/node:22-slim@sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc"
+      },
+      "timeout_secs": 900,
+      "stages": [
+        {"name": "node", "command": ["node", "-e", "require('child_process').execFileSync('true'); console.log('NODE_OK')"], "expect": "NODE_OK", "timeout_secs": 300},
+        {"name": "row", "command": ["sh", "-c", "mkdir -p /tmp/a && cd /tmp/a && npm init -y >/dev/null && npm install --no-audit --no-fund lodash@4.17.21 && node -e \"console.log(require(\\\"lodash\\\").VERSION)\" && echo NPM_OK"], "expect": "NPM_OK"}
+      ]
+    },
+    {
+      "name": "shell",
+      "image": {
+        "arm64": "docker.io/library/ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5",
+        "x86_64": "docker.io/library/ubuntu:24.04@sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec"
+      },
+      "timeout_secs": 900,
+      "stages": [
+        {"name": "update", "command": ["sh", "-c", "apt-get update && echo UPDATE_OK"], "expect": "UPDATE_OK"},
+        {"name": "row", "command": ["sh", "-c", "apt-get update && apt-get install -y git gcc && cd /tmp && printf \"int main(){return 0;}\" > t.c && gcc t.c -o t && ./t && git --version && echo SHELL_OK"], "expect": "SHELL_OK"}
+      ]
+    }
+  ]
+}

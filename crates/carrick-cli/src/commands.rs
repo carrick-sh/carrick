@@ -929,6 +929,36 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     export_loader_spans.as_deref(),
                 )?;
             }
+            DebugCommand::Discover {
+                rows,
+                only,
+                runs,
+                out,
+                carrick,
+                instance,
+                label,
+                reap,
+                limit,
+                report,
+            } => {
+                if report {
+                    crate::debug_discover::report(&out, limit)?;
+                } else {
+                    crate::debug_discover::discover(crate::debug_discover::DiscoverOptions {
+                        rows: rows
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("--rows is required"))?,
+                        only: &only,
+                        runs,
+                        out: &out,
+                        carrick: carrick.as_deref(),
+                        instance: instance.as_deref(),
+                        label: &label,
+                        reap: reap.as_deref(),
+                        limit,
+                    })?;
+                }
+            }
             DebugCommand::El1Census {
                 inputs,
                 limit,

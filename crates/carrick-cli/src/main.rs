@@ -128,6 +128,7 @@ mod commands;
 mod debug;
 mod debug_amplification;
 mod debug_core;
+mod debug_discover;
 mod debug_el1_census;
 mod debug_exec_stamps;
 mod debug_venue_gaps;
