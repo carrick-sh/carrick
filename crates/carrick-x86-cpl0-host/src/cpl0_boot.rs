@@ -1317,9 +1317,29 @@ pub enum ForwardBindingRefusal {
         stopped: u64,
         registered: u64,
     },
-    TaskIdMismatch {
+}
+
+/// Who the stopped execution is in the process whose root it runs on.
+///
+/// The carrier registers one binding per root, issued to the process leader.
+/// A `CLONE_VM` member shares that root and generation; it is the same
+/// process and never the leader. Serving it is a decision for the forward's
+/// caller, made on this type: a member holds none of the leader's host task
+/// authority (#2780).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum ForwardSubject {
+    /// The task the root's registered binding was issued to.
+    Leader,
+    /// Another member of the leader's thread group.
+    Member {
+        leader: carrick_el1_abi::EntryTaskKey,
         stopped: carrick_el1_abi::EntryTaskKey,
-        expected: carrick_el1_abi::EntryTaskKey,
     },
 }
 
@@ -1333,10 +1353,11 @@ struct ForwardExecution {
 
 impl ForwardExecution {
     /// Authenticate the CR3-registered carrier binding against the execution
-    /// the stopped CPU's own lifecycle record names: the address context, the
-    /// execution generation, and the issued entry key must match. A `CLONE_VM`
-    /// sibling sharing a child root is refused: its own control slot cannot
-    /// issue authority to forward on that root.
+    /// the stopped CPU's own lifecycle record names: the address context and
+    /// the execution generation must match. Whether the stopped task is the
+    /// binding's leader is [`Self::subject`], not a refusal: a `CLONE_VM`
+    /// member's own control slot issues no authority on the root, so it is
+    /// never served as the leader.
     fn authenticate_typed(
         &self,
         binding: carrick_hal::guest_arch_binding::GuestArchBinding,
@@ -1350,13 +1371,18 @@ impl ForwardExecution {
                 registered: binding.task().execution.raw().get(),
             });
         }
-        if self.binding.task != self.leader_task {
-            return Err(ForwardBindingRefusal::TaskIdMismatch {
-                stopped: self.binding.task,
-                expected: self.leader_task,
-            });
-        }
         Ok(())
+    }
+
+    fn subject(&self) -> ForwardSubject {
+        if self.binding.task == self.leader_task {
+            ForwardSubject::Leader
+        } else {
+            ForwardSubject::Member {
+                leader: self.leader_task,
+                stopped: self.binding.task,
+            }
+        }
     }
 
     fn with_leader_task(mut self, leader_task: carrick_el1_abi::EntryTaskKey) -> Self {
@@ -1706,12 +1732,13 @@ mod forward_execution_tests {
     }
 
     #[test]
-    fn forward_venue_refuses_mismatched_child_entry_key() {
+    fn forward_venue_names_another_child_entry_key_a_member() {
         let mut fx = ForwardVenueFixture::new();
         let root_exec = fx
             .enter_venue(0, fx.root_binding.context().root)
             .expect("issued root task enters forward venue");
         assert_eq!(root_exec.authenticate_typed(fx.root_binding), Ok(()));
+        assert_eq!(root_exec.subject(), ForwardSubject::Leader);
 
         let child = fx.install_child_mm(0x7000, 302, 2, 12, 22);
         let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
@@ -1722,21 +1749,40 @@ mod forward_execution_tests {
         fx.stop_child_on_peer(child, issued, 102);
         let matching = fx.enter_venue(1, child.context().root).unwrap();
         assert_eq!(matching.authenticate_typed(child), Ok(()));
+        assert_eq!(matching.subject(), ForwardSubject::Leader);
 
         let mismatched = carrick_el1_abi::EntryTaskKey::from_raw(45);
         fx.stop_child_on_peer(child, mismatched, 105);
         let execution = fx.enter_venue(1, child.context().root).unwrap();
+        assert_eq!(execution.authenticate_typed(child), Ok(()));
         assert_eq!(
-            execution.authenticate_typed(child),
-            Err(ForwardBindingRefusal::TaskIdMismatch {
+            execution.subject(),
+            ForwardSubject::Member {
+                leader: issued,
                 stopped: mismatched,
-                expected: issued,
-            })
+            }
         );
-        assert!(
-            execution
-                .authenticate(child, "forward capture MM binding mismatch")
-                .is_err()
+    }
+
+    /// #2780: a member of the run's root is the root's member, whatever key
+    /// its own stopped record carries; it never becomes the leader.
+    #[test]
+    fn forward_venue_names_a_root_member_a_member() {
+        let mut fx = ForwardVenueFixture::new();
+        let root = fx.root_binding;
+        let leader = carrick_el1_abi::EntryTaskKey::from_raw(41);
+        let member = carrick_el1_abi::EntryTaskKey::from_raw(43);
+        fx.stop_child_on_peer(root, member, 103);
+        let execution = fx
+            .enter_venue(1, root.context().root)
+            .expect("a root member enters the forward venue");
+        assert_eq!(execution.authenticate_typed(root), Ok(()));
+        assert_eq!(
+            execution.subject(),
+            ForwardSubject::Member {
+                leader,
+                stopped: member,
+            }
         );
     }
 
@@ -1763,12 +1809,13 @@ mod forward_execution_tests {
         let other = carrick_el1_abi::EntryTaskKey::from_raw(45);
         fx.stop_child_on_peer(successor, other, 203);
         let wrong_key = fx.enter_venue(1, successor.context().root).unwrap();
+        assert_eq!(admitted.subject(), ForwardSubject::Leader);
         assert_eq!(
-            wrong_key.authenticate_typed(successor),
-            Err(ForwardBindingRefusal::TaskIdMismatch {
+            wrong_key.subject(),
+            ForwardSubject::Member {
+                leader: issued,
                 stopped: other,
-                expected: issued,
-            })
+            }
         );
 
         fx.stop_child_on_peer(predecessor, issued, 102);
@@ -1825,7 +1872,7 @@ mod forward_execution_tests {
     }
 
     #[test]
-    fn forward_venue_refuses_clone_vm_sibling_on_child_root() {
+    fn forward_venue_names_clone_vm_sibling_a_member_of_the_child_root() {
         let mut fx = ForwardVenueFixture::new();
         let child = fx.install_child_mm(0x7000, 302, 2, 12, 22);
         let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
@@ -1836,18 +1883,17 @@ mod forward_execution_tests {
 
         fx.stop_clone_vm_sibling_on_peer(child, issued, sibling, 103);
         let execution = fx.enter_venue(1, child.context().root).unwrap();
-        assert_eq!(
-            execution.authenticate_typed(child),
-            Err(ForwardBindingRefusal::TaskIdMismatch {
-                stopped: sibling,
-                expected: issued,
-            })
-        );
+        let member = ForwardSubject::Member {
+            leader: issued,
+            stopped: sibling,
+        };
+        assert_eq!(execution.subject(), member);
         assert_eq!(execution.binding.task, sibling);
         assert_eq!(execution.leader_task, issued);
 
         // Even if the sibling's own control slot carries a matching birth
-        // record, no host-issued authority for this child root authorizes it.
+        // record, no host-issued authority for this child root makes it the
+        // leader.
         let sibling_slot_offset = carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET;
         let birth_serial =
             carrick_sched_core::process::TaskSerial::from_raw_u64(child.task().task.raw().get())
@@ -1869,13 +1915,7 @@ mod forward_execution_tests {
             sibling_control.publish_host_birth_identity(self_birth);
         }
         let execution_with_slot_birth = fx.enter_venue(1, child.context().root).unwrap();
-        assert_eq!(
-            execution_with_slot_birth.authenticate_typed(child),
-            Err(ForwardBindingRefusal::TaskIdMismatch {
-                stopped: sibling,
-                expected: issued,
-            })
-        );
+        assert_eq!(execution_with_slot_birth.subject(), member);
     }
 
     #[test]
@@ -1883,11 +1923,15 @@ mod forward_execution_tests {
         let mm = MmGeneration::new(NonZeroU64::new(302).unwrap());
         let stopped = carrick_el1_abi::EntryTaskKey::from_raw(43);
         let issued = carrick_el1_abi::EntryTaskKey::from_raw(42);
-        let leader = forward_leader_task(None, mm, issued).unwrap();
+        let leader = forward_leader_task(None, mm, Some(issued)).unwrap();
         assert_eq!(leader, issued);
+        assert!(
+            forward_leader_task(None, mm, None).is_err(),
+            "a child root without an issued entry key has no leader"
+        );
         let successor_mm = MmGeneration::new(NonZeroU64::new(303).unwrap());
         assert_eq!(
-            forward_leader_task(None, successor_mm, issued).unwrap(),
+            forward_leader_task(None, successor_mm, Some(issued)).unwrap(),
             issued,
             "exec successor keeps the predecessor's registered child key"
         );
@@ -1901,10 +1945,17 @@ mod forward_execution_tests {
             admit_forward_execution(cpu, cpu, sibling, context, context.root, context.generation)
                 .unwrap()
                 .with_leader_task(leader);
-        assert!(matches!(
+        assert_eq!(
             admitted.authenticate_typed(carrier_binding(context, 12)),
-            Err(ForwardBindingRefusal::TaskIdMismatch { .. })
-        ));
+            Ok(())
+        );
+        assert_eq!(
+            admitted.subject(),
+            ForwardSubject::Member {
+                leader: issued,
+                stopped,
+            }
+        );
     }
 
     /// #2142: after a root `execve`, the forward leader rule names the run
@@ -1943,9 +1994,9 @@ mod forward_execution_tests {
         };
         let predecessor = GuestArchBinding::x86(task(1), context(0x7000, 302, 9));
         let successor = GuestArchBinding::x86(task(1), context(0x9000, 303, 10));
-        let issued = carrick_el1_abi::EntryTaskKey::from_raw(41);
+        let child_key = carrick_el1_abi::EntryTaskKey::from_raw(42);
         assert_eq!(
-            forward_leader_task(Some(initial), MmGeneration::new(nz(302)), issued).unwrap(),
+            forward_leader_task(Some(initial), MmGeneration::new(nz(302)), None).unwrap(),
             carrick_el1_abi::EntryTaskKey::from_raw(41)
         );
 
@@ -1957,17 +2008,20 @@ mod forward_execution_tests {
         assert_eq!(replaced.thread.serial, 202);
         assert_eq!(replaced.task, initial.task);
         assert_eq!(
-            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), issued).unwrap(),
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), None).unwrap(),
             carrick_el1_abi::EntryTaskKey::from_raw(41)
         );
-        assert!(
-            forward_leader_task(
-                Some(replaced),
-                MmGeneration::new(nz(303)),
-                carrick_el1_abi::EntryTaskKey::from_raw(42),
-            )
-            .is_err(),
-            "another task cannot lead the run root"
+        assert_eq!(
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), Some(child_key))
+                .unwrap(),
+            carrick_el1_abi::EntryTaskKey::from_raw(41),
+            "another task's key cannot lead the run root"
+        );
+        assert_eq!(
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(302)), Some(child_key))
+                .unwrap(),
+            child_key,
+            "the predecessor MM is no longer the root's"
         );
         assert!(
             replaced
@@ -2081,8 +2135,9 @@ mod forward_execution_tests {
     /// Every forward phase (idle-peer identity, capture, completion) admits a
     /// CR3-registered binding through this one comparison; a binding whose
     /// address context or execution generation names another issue of the
-    /// task, or a `CLONE_VM` sibling sharing the root's CR3 and generation,
-    /// must not be served as the stopped execution.
+    /// task must not be served as the stopped execution, and a `CLONE_VM`
+    /// sibling sharing the root's CR3 and generation is a member, never the
+    /// leader.
     #[test]
     fn forward_binding_authentication_requires_exact_context_generation_and_task_id() {
         let (binding, context) = execution();
@@ -2153,20 +2208,15 @@ mod forward_execution_tests {
         .with_leader_task(binding.task);
         assert_eq!(
             sibling_admitted.authenticate_typed(carrier_binding(context, 12)),
-            Err(ForwardBindingRefusal::TaskIdMismatch {
-                stopped: carrick_el1_abi::EntryTaskKey::from_raw(43),
-                expected: carrick_el1_abi::EntryTaskKey::from_raw(42),
-            })
+            Ok(())
         );
-        let err = sibling_admitted
-            .authenticate(
-                carrier_binding(context, 12),
-                "idle peer forward binding mismatch",
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("TaskIdMismatch"),
-            "unexpected error: {err:?}"
+        assert_eq!(admitted.subject(), ForwardSubject::Leader);
+        assert_eq!(
+            sibling_admitted.subject(),
+            ForwardSubject::Member {
+                leader: binding.task,
+                stopped: carrick_el1_abi::EntryTaskKey::from_raw(43),
+            }
         );
     }
 
@@ -2404,6 +2454,13 @@ pub struct ProductionForwardFrame {
     frame: NativeFrame,
 }
 
+impl ProductionForwardFrame {
+    /// Who captured this forward: the root binding's leader, or a member.
+    pub fn subject(&self) -> ForwardSubject {
+        self.execution.subject()
+    }
+}
+
 /// Bytes still reachable from a stopped task's CPL0 RSP. The physical stack
 /// may be reused after the task releases its executor; its call chain belongs
 /// to the task until it is reloaded on the same physical slot.
@@ -2616,15 +2673,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         })?;
         drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
-        if let Some(issued) = self
-            .cpu
-            .registered_child_entry_task(execution.context.root)?
-            && execution.binding.task != issued
-        {
-            return Err(fail(
-                "idle peer child entry key differs from fork settlement",
-            ));
-        }
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
     }
@@ -4314,25 +4362,26 @@ impl InitialTaskBinding {
     }
 }
 
-/// The process leader a stopped forward must name. The run root leads its
-/// own MM by its issued TID; descendants retain their issued entry key.
+/// The process leader of the MM a stopped forward runs on. The run root
+/// leads its own MM by its issued TID; a descendant's leader is the entry
+/// key its fork settlement issued (`issued`, `None` on the root's MM). The
+/// stopped task's own key never chooses the leader: a member differs from it
+/// and is a [`ForwardSubject::Member`].
 fn forward_leader_task(
     initial: Option<InitialTaskBinding>,
     mm: MmGeneration,
-    issued: carrick_el1_abi::EntryTaskKey,
+    issued: Option<carrick_el1_abi::EntryTaskKey>,
 ) -> Result<carrick_el1_abi::EntryTaskKey, TrapError> {
-    if issued.raw() == 0 {
+    let leader = match initial {
+        Some(initial) if mm == initial.mm => {
+            carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
+        }
+        _ => issued.ok_or_else(|| fail("child forward root has no issued entry key"))?,
+    };
+    if leader.raw() == 0 {
         return Err(fail("stopped forward task has no issued entry key"));
     }
-    match initial {
-        Some(initial) if mm == initial.mm => {
-            let root = carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid);
-            (issued == root)
-                .then_some(root)
-                .ok_or_else(|| fail("stopped root forward task key mismatch"))
-        }
-        _ => Ok(issued),
-    }
+    Ok(leader)
 }
 
 /// A single movable view into metadata retained by `Cpl0HostCustody`.
@@ -4565,11 +4614,9 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             .initial_task
             .is_some_and(|initial| initial.mm == context.mm)
         {
-            binding.task
+            None
         } else {
-            children
-                .entry_task(context.root)?
-                .ok_or_else(|| fail("child forward root has no issued entry key"))?
+            children.entry_task(context.root)?
         };
         let leader_task = forward_leader_task(custody.initial_task, context.mm, issued)?;
         let execution = admit_forward_execution(
@@ -4590,6 +4637,11 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
 
     pub fn cpu(&self) -> carrick_guest_arch::CpuId {
         self.execution.cpu
+    }
+
+    /// Who is stopped here: the root binding's leader, or a member of it.
+    pub fn subject(&self) -> ForwardSubject {
+        self.execution.subject()
     }
 
     /// Authenticate that the stopped task's own CPL0 file table holds a live
