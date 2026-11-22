@@ -11,7 +11,9 @@ pub(crate) fn collect(directory: &Path) -> Result<std::fs::ReadDir> {
         .with_context(|| format!("read census directory {}", directory.display()))
 }
 
-fn collect_json(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// The census JSON files named by `inputs`: files as given, directories'
+/// `*.json` entries sorted. Shared with `debug venue-gaps`.
+pub(crate) fn collect_json(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for input in inputs {
         if input.is_dir() {
@@ -28,7 +30,8 @@ fn collect_json(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn load(path: &Path) -> Result<carrick_runtime::el1_census::Census> {
+/// Read and parse one census file.
+pub(crate) fn load(path: &Path) -> Result<carrick_runtime::el1_census::Census> {
     let bytes = std::fs::read(path).with_context(|| format!("read census {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse census {}", path.display()))
 }
