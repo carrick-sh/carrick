@@ -1,0 +1,43 @@
+{
+  "rows": [
+    {
+      "name": "ka-clean",
+      "image": {
+        "arm64": "docker.io/library/ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5",
+        "x86_64": "docker.io/library/ubuntu:24.04@sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec"
+      },
+      "timeout_secs": 300,
+      "stages": [
+        {"name": "echo", "command": ["/bin/sh", "-c", "echo KA_OK"], "expect": "KA_OK"}
+      ]
+    },
+    {
+      "name": "ka-fail",
+      "image": {
+        "arm64": "docker.io/library/ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5",
+        "x86_64": "docker.io/library/ubuntu:24.04@sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec"
+      },
+      "timeout_secs": 300,
+      "stages": [
+        {
+          "name": "errno",
+          "command": ["/bin/sh", "-c", "echo 'E: Select has failed (38)' >&2; exit 7"],
+          "expect": "NEVER_PRINTED",
+          "known_answer": {
+            "arm64": ["guest_errno ENOSYS: E: Select has failed (#)", "exit rc=7", "missing_marker NEVER_PRINTED"],
+            "x86_64": ["guest_errno ENOSYS: E: Select has failed (#)", "exit rc=7", "missing_marker NEVER_PRINTED"]
+          }
+        },
+        {
+          "name": "timeout",
+          "command": ["/bin/sh", "-c", "sleep 600"],
+          "timeout_secs": 20,
+          "known_answer": {
+            "arm64": ["timeout stage timeout"],
+            "x86_64": ["timeout stage timeout"]
+          }
+        }
+      ]
+    }
+  ]
+}
