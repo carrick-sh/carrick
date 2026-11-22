@@ -1142,8 +1142,13 @@ pub(crate) enum DebugCommand {
         /// `--out` is used. Never run carrick elsewhere on the host meanwhile.
         #[arg(long, value_name = "DOCKER")]
         oracle: Option<PathBuf>,
+        /// Stop after the `--oracle` phase: write `<out>/oracle.jsonl` and
+        /// run no carrick stage, so a Docker-only window records the oracle
+        /// and a later carrick-only run in the same `--out` ranks against it.
+        #[arg(long, requires = "oracle", conflicts_with_all = ["carrick", "reap"])]
+        oracle_only: bool,
         /// Re-rank a finished `--out` directory without running anything.
-        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle"])]
+        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle", "oracle_only"])]
         report: bool,
     },
     /// Rank EL1 census files (written by runs with
