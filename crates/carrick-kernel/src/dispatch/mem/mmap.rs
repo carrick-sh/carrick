@@ -62,8 +62,10 @@ fn retire_anonymous_mapping_backing_with_residency<
                         dispatcher.mm_authority().mm_id.raw(),
                         request.address,
                         request.length,
+                        // The host venue cannot grow the guest's table.
+                        carrick_el1_abi::SplitRowCustody::Declinable,
                     )
-                    .ok_or(MemoryError::MetadataAllocation)
+                    .map_err(|_| MemoryError::MetadataAllocation)
             })
             .transpose()?;
         memory.unmap_range(request.address, request.length_usize)?;

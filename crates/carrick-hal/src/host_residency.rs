@@ -197,15 +197,21 @@ impl HostResidencyView {
         start: u64,
         len: u64,
     ) -> Option<HostResidencyRetirement> {
-        let (mm_key, start, end) = self
+        // The host venue cannot grow the guest's table: a split row's part
+        // that finds no slot is declined, as before.
+        let preclaim = self
             .table()
-            .begin_retire_overlapping(mm_key, start, len)?
-            .into_preclaimed_range();
+            .begin_retire_overlapping(
+                mm_key,
+                start,
+                len,
+                carrick_el1_abi::SplitRowCustody::Declinable,
+            )
+            .ok()?
+            .into_preclaim();
         Some(HostResidencyRetirement {
             view: self,
-            mm_key,
-            start,
-            end,
+            preclaim,
             active: true,
         })
     }
@@ -215,9 +221,7 @@ impl HostResidencyView {
 /// exact-MM host alias install or unmap transaction.
 pub struct HostResidencyRetirement {
     view: HostResidencyView,
-    mm_key: u64,
-    start: u64,
-    end: u64,
+    preclaim: carrick_el1_abi::ResidencyRetirementPreclaim,
     active: bool,
 }
 
@@ -226,10 +230,10 @@ impl HostResidencyRetirement {
     /// unreachable. Exact-MM exclusion makes a failed commit an invariant error.
     #[must_use]
     pub fn commit(mut self) -> bool {
-        let committed =
-            self.view
-                .table()
-                .commit_preclaimed_retirement(self.mm_key, self.start, self.end);
+        let committed = self
+            .view
+            .table()
+            .commit_preclaimed_retirement(self.preclaim);
         self.active = false;
         committed
     }
@@ -240,7 +244,7 @@ impl Drop for HostResidencyRetirement {
         if self.active {
             self.view
                 .table()
-                .cancel_preclaimed_retirement(self.mm_key, self.start, self.end);
+                .cancel_preclaimed_retirement(self.preclaim);
         }
     }
 }
