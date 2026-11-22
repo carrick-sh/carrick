@@ -313,6 +313,8 @@ fn soft_idle_wfi_parks_until_the_virtual_timer_and_acknowledges_it() {
         exits, 1,
         "the vCPU left only at the idle hvc: a WFI is a park, not an exit"
     );
+    // One park for the timer; the SGI was pending before the second WFI.
+    assert_eq!(vcpu.idle_parks(), 1, "parks per idle period");
 }
 
 /// A host kick ends a parked WFI long before its far timer: the vCPU leaves

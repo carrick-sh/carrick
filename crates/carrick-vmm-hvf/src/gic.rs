@@ -52,14 +52,13 @@ const _: () = assert!(
     "the vtimer is a PPI"
 );
 
-/// Lower value is higher priority: the timer outranks a reschedule, which
-/// outranks the kick. EL1 acknowledges by polling with IRQs masked, so the
-/// order only decides which of several pending interrupts it sees first.
-const VTIMER_PRIORITY: u8 = 0x80;
-const RESCHED_PRIORITY: u8 = 0x90;
-const KICK_PRIORITY: u8 = 0xa0;
+/// The priorities and priority mask every carrier's GIC bring-up programs.
+use carrick_el1_abi::{
+    GIC_KICK_PRIORITY as KICK_PRIORITY, GIC_PRIORITY_MASK,
+    GIC_RESCHED_PRIORITY as RESCHED_PRIORITY, GIC_VTIMER_PRIORITY as VTIMER_PRIORITY,
+};
 /// CPU-interface priority mask: every Carrick priority passes.
-const ICC_PMR: u64 = 0xf0;
+const ICC_PMR: u64 = GIC_PRIORITY_MASK as u64;
 /// Every SGI and PPI bit of the `*R0` redistributor registers.
 const ALL_PRIVATE: u64 = 0xffff_ffff;
 const HV_NO_RESOURCES: sys::hv_return_t = 0xfae9_4005_u32 as sys::hv_return_t;

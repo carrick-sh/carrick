@@ -2602,6 +2602,7 @@ mod cpu_profile;
 pub use cpu_profile::{GUEST_CPU_PROFILE, GuestCpuProfile};
 pub mod dispatch;
 pub mod exception;
+pub mod gic;
 pub mod handler;
 pub mod mmu;
 mod simd;
