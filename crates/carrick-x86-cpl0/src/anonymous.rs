@@ -464,11 +464,7 @@ impl X86AnonymousVenue<'_> {
                         *context = saved;
                         Ok((record, false))
                     },
-                    || {
-                        SpaceWaitCause::ALL.into_iter().any(|cause| {
-                            source.key(cause) == key && source.observe(cause) == snapshot.observed()
-                        })
-                    },
+                    || source.still_at(key, snapshot.observed()),
                 );
                 if result.is_err()
                     && let Some((record, previous)) = replaced
@@ -801,7 +797,7 @@ pub(super) fn park_contended_fault(
                     *saved = *context;
                     Ok((record, false))
                 },
-                || lease.key(cause) == key && lease.observe(cause) == snapshot.observed(),
+                || lease.still_at(key, snapshot.observed()),
             );
             if result.is_err()
                 && let Some((record, previous)) = replaced
