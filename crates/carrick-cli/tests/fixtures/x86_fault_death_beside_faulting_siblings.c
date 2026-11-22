@@ -37,7 +37,7 @@ void start_c(void) {
     int segv = 0, clean = 0;
     for (int i = 0; i < FAULTERS; i++) {
         int status = 0;
-        if (sc(61, faulters[i], (long)&status, 0, 0) == faulters[i] && status == 11) segv++;
+        if (sc(61, faulters[i], (long)&status, 0, 0) == faulters[i] && (status & 0x7f) == 11) segv++;
     }
     for (int i = 0; i < TOUCHERS; i++) {
         int status = -1;
