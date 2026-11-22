@@ -89,6 +89,11 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn stage_native_host_file(&mut self) -> bool {
         false
     }
+    /// The stage just retained names no host request: the call stays with
+    /// its ring owner.
+    fn staged_for_ring_owner(&self) -> bool {
+        false
+    }
     fn release_host_object(
         &mut self,
         _binding: carrick_el1_abi::HostObjectBinding,
@@ -4177,6 +4182,9 @@ impl<
     }
     fn stage_native_host_file(&mut self) -> bool {
         self.frame.stage_native_host_file()
+    }
+    fn staged_for_ring_owner(&self) -> bool {
+        self.frame.staged_for_ring_owner()
     }
     fn record_refusal(&self, bucket: usize) {
         self.counters.record_refusal(
