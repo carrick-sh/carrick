@@ -5932,11 +5932,13 @@ fn high_byte_register_memory_operands_survive_the_r14_rebase() {
 /// R14: the original base and index no longer address anything, so non-REX
 /// CMPXCHG forms whose addressing plus implicit AL name all of RAX..RBX
 /// still encode (#671 M1-3 review P0-2), in 64- and 32-bit address size.
+/// (code, rcx, rdx, rbx, offset, stored byte)
+type HighByteCmpxchgCase = (&'static [u8], u64, u64, u64, u64, u8);
+
 #[test]
 fn high_byte_cmpxchg_with_a_full_base_index_pair_survives_the_r14_rebase() {
     let data = 0x2000_0000u64;
-    // (code, rcx, rdx, rbx, offset, stored byte)
-    let cases: [(&[u8], u64, u64, u64, u64, u8); 4] = [
+    let cases: [HighByteCmpxchgCase; 4] = [
         // cmpxchg [rcx + rbx], dh
         (&[0x0f, 0xb0, 0x34, 0x19], data, 0xab00, 0x10, 0x10, 0xab),
         // cmpxchg [rcx + rdx], bh
