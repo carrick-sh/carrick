@@ -1195,6 +1195,17 @@ pub enum CandidateProbesVerdict {
     Built,
 }
 
+/// The commit that published `bundle`, from its manifest.
+fn bundle_source_head(bundle: &Path) -> Result<String, ReceiptError> {
+    let unpacked =
+        crate::fixtures::archive::unpack_bundle(bundle).map_err(|e| fail(e.to_string()))?;
+    let manifest: crate::fixtures::Manifest = fs::read(unpacked.manifest())
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+        .map_err(fail)?;
+    Ok(String::from(manifest.source_head))
+}
+
 /// Build the candidate's added probes beside the merge base's trusted bundle
 /// (#1980), in a detached worktree of the candidate, with this (main's)
 /// publisher build code. A refusal is recorded, not raised: the Mac admits
@@ -1227,6 +1238,20 @@ fn candidate_probes(
                 run_checked(
                     "git",
                     ["fetch", "--no-tags", "origin", &request.base, &request.sha],
+                    Some(root),
+                )
+            },
+            std::thread::sleep,
+        )?;
+        // `plan` reads the base inventory at the bundle's `source_head`, which
+        // a shallow checkout may lack (#2779). The manifest digest still
+        // authenticates those bytes in `classify_inputs`.
+        let source_head = bundle_source_head(&bundle)?;
+        fetch_with_retry(
+            || {
+                run_checked(
+                    "git",
+                    ["fetch", "--no-tags", "--depth=1", "origin", &source_head],
                     Some(root),
                 )
             },
