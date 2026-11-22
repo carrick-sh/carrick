@@ -3150,13 +3150,31 @@ fn mounted_x86_exec_child_allowlisted_crossings_class_witness() {
 /// and the rest failed EBADF).
 #[test]
 fn mounted_static_x86_root_network_family_matches_native() {
+    compare_socket_fixture_with_native("x86_root_network.c");
+}
+
+/// The local socket families glibc's resolver opens (#1906): a netlink
+/// route socket and AF_UNIX sockets, made by the run root and by a fork
+/// child, match the native run, and no caller's socket call is refused.
+/// Before the venue decoded their `socket`, both were counted ENOSYS for
+/// every caller.
+#[test]
+fn mounted_static_x86_netlink_and_unix_sockets_match_native() {
+    compare_socket_fixture_with_native("x86_local_sockets.c");
+}
+
+/// Run a static socket fixture natively and as the mounted x86 root: the
+/// two outputs match, and the census holds no refusal of the socket family
+/// by any caller.
+fn compare_socket_fixture_with_native(fixture: &str) {
     if skip_without_kvm() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("root-network");
-    let source =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_root_network.c");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
     x86_process_entry::compile_static_fixture(&source, &elf, &[]);
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
