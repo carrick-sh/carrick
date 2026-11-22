@@ -295,6 +295,9 @@ jobs:
               cargo build --locked --offline -p carrick-kernel-example --tests
               cargo test --locked --offline --no-run -p carrick-kernel-example --tests
               cargo test --locked --offline --no-run -p carrick-el1-linux --lib
+              # linux-unit-arm (#2809) compiles the unit test union.
+              export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
+              just xtask test-batch --no-run test
               ;;
           esac
       - name: Compiler cache statistics after critical replay
