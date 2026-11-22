@@ -1254,6 +1254,7 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_dispatch_witness.rs", contract = "arm.softcpu.handoff-residency" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_dispatch_witness.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/soft_dispatch_witness.rs", contract = "softcpu.code-residency" },
+  { path = "crates/carrick-softcpu-aarch64-host/tests/soft_wake.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-softcpu-aarch64/src/cpu_profile.rs", contract = "softcpu.a64.el0-fp" },
   # Copy-through dispatcher over the ExecuteBlock seam (#1236), driven by the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "arm.softcpu.cache-hot-set" },
@@ -1264,6 +1265,8 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64/src/dispatch.rs", contract = "softcpu.code-residency" },
   # Virtual exception entry and return for the test-only arm64 lane.
   { path = "crates/carrick-softcpu-aarch64/src/exception.rs", contract = "softcpu.a64.el0-fp" },
+  # GIC CPU interface and private interrupts of one soft PE (#2645).
+  { path = "crates/carrick-softcpu-aarch64/src/gic.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   # Copy-through exit handlers for the test-only arm64 lane (#1236).
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64/src/handler.rs", contract = "arm.softcpu.handoff-residency" },
