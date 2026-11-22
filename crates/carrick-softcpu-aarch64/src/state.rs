@@ -164,7 +164,7 @@ pub struct CounterSource {
 
 impl CounterSource {
     /// A live count: `read()` less `offset`.
-    pub const fn live(read: fn() -> u64, offset: u64) -> Self {
+    pub const fn provider(read: fn() -> u64, offset: u64) -> Self {
         Self {
             read: Some(read),
             offset,
