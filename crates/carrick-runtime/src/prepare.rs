@@ -2332,6 +2332,30 @@ mod tests {
         }
     }
 
+    /// Whether this host has an execution backend for [`hvpatch_run_spec`],
+    /// read from the production plan resolver rather than from the target
+    /// architecture: Linux arm64, FreeBSD and NetBSD build this crate and have
+    /// none yet. The preparation tests below hold on both kinds of host: with
+    /// a backend they prepare, and without one `prepare` refuses with
+    /// [`RuntimeError::Unsupported`] and must roll back just the same.
+    fn host_has_execution_backend() -> bool {
+        match carrick_kernel::page_profile::resolve_execution_plan(&hvpatch_run_spec()) {
+            Ok(_) => true,
+            Err(RuntimeError::Unsupported(_)) => false,
+            Err(error) => panic!("the plan resolver only refuses an unsupported host: {error}"),
+        }
+    }
+
+    /// A missing rootfs layer fails preparation in the filesystem backend; a
+    /// host without an execution backend is refused before that.
+    fn assert_missing_layer_refusal(error: &RuntimeError) {
+        if host_has_execution_backend() {
+            assert!(matches!(error, RuntimeError::FsBackend(_)), "{error}");
+        } else {
+            assert!(matches!(error, RuntimeError::Unsupported(_)), "{error}");
+        }
+    }
+
     /// The independent carrier gate, `process_carrier` and `vm_lifecycle` are
     /// process-wide, while the parallel partition runs tests on many threads.
     /// Every test that asserts them clean takes this lock first, so one test's
@@ -2489,7 +2513,7 @@ mod tests {
         let err = Runtime::prepare(&spec, test_launch(), RuntimeExtensions::default())
             .err()
             .expect("a missing layer must fail preparation");
-        assert!(matches!(err, RuntimeError::FsBackend(_)), "{err}");
+        assert_missing_layer_refusal(&err);
     }
 
     #[test]
@@ -2505,14 +2529,21 @@ mod tests {
             &hvpatch_run_spec(),
             lease,
             RuntimeExtensions::default(),
-        )
-        .expect("empty rootfs prepares");
-        assert_eq!(
-            carrier.snapshot().expect("snapshot").registered_containers,
-            1
         );
-        assert_eq!(carrier.snapshot().expect("snapshot").live_containers, 0);
-        drop(prepared);
+        if host_has_execution_backend() {
+            let prepared = prepared.expect("empty rootfs prepares");
+            assert_eq!(
+                carrier.snapshot().expect("snapshot").registered_containers,
+                1
+            );
+            assert_eq!(carrier.snapshot().expect("snapshot").live_containers, 0);
+            drop(prepared);
+        } else {
+            let error = prepared
+                .err()
+                .expect("a host without an execution backend refuses preparation");
+            assert!(matches!(error, RuntimeError::Unsupported(_)), "{error}");
+        }
         assert_eq!(
             carrier.snapshot().expect("snapshot").registered_containers,
             0
@@ -2528,7 +2559,7 @@ mod tests {
         let error = prepare_on(&carrier, &missing, lease, RuntimeExtensions::default())
             .err()
             .expect("missing layer must fail");
-        assert!(matches!(error, RuntimeError::FsBackend(_)), "{error}");
+        assert_missing_layer_refusal(&error);
         assert_eq!(
             carrier.snapshot().expect("snapshot").registered_containers,
             0
