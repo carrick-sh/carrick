@@ -746,6 +746,64 @@ fn mounted_static_x86_native_executable_link_follows_fork_and_exec() {
     );
 }
 
+/// #2731: the first syscall an exec'd image makes arrives with host work
+/// owed. A call declined for that work must run once the work has settled; it
+/// was answered ENOSYS, which kills a static glibc image before `main`.
+/// Sixteen fork children each exec the fixture to make one call first, then
+/// the root execs itself: no row may be refused only because it was first.
+#[test]
+fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("first-call");
+    compile_assembly_with_flags(
+        "x86_first_call_after_exec.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let rows = |stdout: &[u8], label: &str| -> Vec<(String, String)> {
+        std::str::from_utf8(stdout)
+            .unwrap_or_else(|e| panic!("{label} utf8: {e}"))
+            .lines()
+            .map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                assert_eq!(parts.len(), 4, "{label} malformed row: {line:?}");
+                (parts[0].to_owned(), parts[3].to_owned())
+            })
+            .collect()
+    };
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native first-call oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let native_rows = rows(&native.stdout, "native");
+    assert!(
+        native_rows.len() > 2 && native_rows.iter().all(|(_, verdict)| verdict == "same"),
+        "native Linux refuses no first call: {native_rows:?}"
+    );
+
+    let guest = run_mounted_binary(&elf, "first-call-after-exec", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "93 is exec failure, 95 a child that did not exit 0. Stdout: {stdout} Stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        rows(&guest.stdout, "guest"),
+        native_rows,
+        "a first call was refused for owed work:\n{stdout}"
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
