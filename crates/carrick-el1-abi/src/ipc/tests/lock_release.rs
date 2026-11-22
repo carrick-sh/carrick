@@ -4,15 +4,12 @@ use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
 use carrick_sched_core::object_wait::ipc_release::{IpcLockIndex, IpcLockReleaseVenue};
 use carrick_sched_core::refusal::{Attempt, ContentionSource, Refusal, ReleaseCause};
 use carrick_sched_core::{ThreadCtx, Waker, ZoneTables};
+use carrick_test_support::ZeroedBox;
 use core::num::NonZeroU64;
 
-fn zone<C: crate::EntryContext>() -> Box<ZoneTables<C>> {
-    // SAFETY: zero is the initial scheduler state; allocate aligned off-stack.
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(Layout::new::<ZoneTables<C>>()).cast::<ZoneTables<C>>();
-        assert!(!ptr.is_null());
-        Box::from_raw(ptr)
-    }
+fn zone<C: crate::EntryContext>() -> ZeroedBox<ZoneTables<C>> {
+    // SAFETY: zero is the initial scheduler state; mapped off-stack.
+    unsafe { ZeroedBox::new_zeroed() }
 }
 fn complete<C: crate::EntryContext>(_: &ZoneTables<C>, effects: OwnedObjectWakeEffects<'_, C>) {
     let _ = effects.deliver_handbacks(&mut |_| panic!("unexpected handback"));

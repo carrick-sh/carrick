@@ -3150,7 +3150,7 @@ mod tests {
 
     // ---- the world: region (host-initialized), zone, one slot, task A ----
     enum TestZone {
-        Standalone(Box<ZoneTables>),
+        Standalone(carrick_test_support::ZeroedBox<ZoneTables>),
         Carrier(Box<crate::mm_portal::test_support::Region>),
     }
     impl core::ops::Deref for TestZone {
@@ -3174,6 +3174,13 @@ mod tests {
         map: &'static IpcTableMap,
         tables: MapTables<'static>,
         a_tid: u64,
+        /// The IPC directory, pool and table map behind the `'static` views
+        /// above, which must not outlive the world. Unmapped last (#2822).
+        _backing: (
+            carrick_test_support::ZeroedPages,
+            carrick_test_support::ZeroedPages,
+            carrick_test_support::ZeroedBox<IpcTableMap>,
+        ),
     }
 
     fn identity(tid: u64, mm: u64) -> ThreadIdentity {
@@ -3191,27 +3198,22 @@ mod tests {
     }
 
     fn world() -> World {
-        let zone =
-            unsafe { Box::from_raw(std::alloc::alloc_zeroed(Layout::new::<ZoneTables>()).cast()) };
+        // SAFETY: all-zero is a valid empty zone table.
+        let zone = unsafe { carrick_test_support::ZeroedBox::new_zeroed() };
         world_with_zone(TestZone::Standalone(zone))
     }
 
     fn world_with_zone(zone: TestZone) -> World {
-        let dir = unsafe {
-            std::alloc::alloc_zeroed(
-                Layout::from_size_align(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES, 4096).unwrap(),
-            )
-            .cast::<IpcDirectory>()
-        };
-        let pool_len = 32 << 20;
-        let pool =
-            unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
+        // Committed only where touched, as the carrier's reservation is.
+        let dir = carrick_test_support::ZeroedPages::new(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES);
+        let pool = carrick_test_support::ZeroedPages::new(32 << 20);
+        // SAFETY: the world owns `dir` and `pool` and drops them after its views.
         let region = unsafe {
             IpcRegion::initialize(
-                dir,
+                dir.as_ptr().cast::<IpcDirectory>(),
                 carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES,
-                pool,
-                pool_len,
+                pool.as_ptr(),
+                pool.len(),
                 42,
                 carrick_el1_abi::ipc::IpcLimits::ZONE,
             )
@@ -3244,9 +3246,9 @@ mod tests {
         task.mm.thread_generation.store(1101, Ordering::Relaxed);
         let a_tid = task.execution.task.load(Ordering::Relaxed);
         // SAFETY: all-zero is the empty table map.
-        let map: &'static IpcTableMap = unsafe {
-            &*std::alloc::alloc_zeroed(Layout::new::<IpcTableMap>()).cast::<IpcTableMap>()
-        };
+        let map_backing = unsafe { carrick_test_support::ZeroedBox::<IpcTableMap>::new_zeroed() };
+        // SAFETY: the world drops `map_backing` after every view of it.
+        let map: &'static IpcTableMap = unsafe { &*core::ptr::from_ref(&*map_backing) };
         // The fake CPU records switches and SGIs in vectors: reserve them so
         // allocation accounting sees only the code under test.
         let mut cpu = FakeCpu::default();
@@ -3263,6 +3265,7 @@ mod tests {
             map,
             tables: MapTables(map),
             a_tid,
+            _backing: (dir, pool, map_backing),
         }
     }
 

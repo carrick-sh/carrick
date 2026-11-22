@@ -1021,7 +1021,7 @@ fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
 }
 
 struct RetainedPublicationFixture {
-    bytes: Box<carrick_test_support::TestEl1Region>,
+    bytes: carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>,
     carrier: std::num::NonZeroU64,
     released: Arc<parking_lot::Mutex<Vec<u64>>>,
 }

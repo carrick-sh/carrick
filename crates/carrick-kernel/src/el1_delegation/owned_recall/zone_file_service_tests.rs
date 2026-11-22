@@ -29,7 +29,7 @@ mod serial_host {
 
     struct Region {
         _lock: parking_lot::MutexGuard<'static, ()>,
-        _buffer: Box<carrick_test_support::TestEl1Region>,
+        _buffer: carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>,
     }
     impl Region {
         fn new() -> Self {

@@ -12,6 +12,10 @@
 //! [`TestEl1Region`] provides aligned backing for VM-free tests that address
 //! cache-line-aligned ABI records in a synthetic EL1 region.
 //!
+//! [`ZeroedPages`] and [`ZeroedBox`] provide large zeroed, page-aligned
+//! backing (carrier regions, IPC directories) that commits only the pages a
+//! test touches and unmaps them on drop.
+//!
 //! [`GuestUserBuffer`] provides guest user memory, below the user ceiling on
 //! every host, for hosted kernel tests that pass user pointers; its
 //! [`assert_guest_args`] check catches a host pointer posing as one.
@@ -37,6 +41,8 @@ pub use el1_region::TestEl1Region;
 pub mod guest_user;
 pub mod kvm_host;
 pub use guest_user::{GuestUserBuffer, GuestUserValue, assert_guest_args, user_arg};
+mod zeroed_pages;
+pub use zeroed_pages::{ZeroedBox, ZeroedPages};
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
     gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))

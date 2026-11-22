@@ -105,7 +105,7 @@ pub(in crate::dispatch) struct Root {
     pub(in crate::dispatch) mm: ReservationMm,
 }
 
-struct CarrierRegion(Box<carrick_test_support::TestEl1Region>);
+struct CarrierRegion(carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>);
 impl std::ops::Deref for CarrierRegion {
     type Target = SharedReservations;
     fn deref(&self) -> &Self::Target {

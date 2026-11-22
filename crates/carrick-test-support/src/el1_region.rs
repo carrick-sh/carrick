@@ -1,5 +1,6 @@
 //! Owned, aligned bytes for VM-free tests of the EL1 region layout.
 
+use crate::ZeroedBox;
 use carrick_el1_abi::{
     CurrentTask, DelegatedFile, DelegatedInotify, DelegatedOpenFile, EL1_REGION_SIZE, ZoneTables,
 };
@@ -19,11 +20,11 @@ const _: () = {
 };
 
 impl TestEl1Region {
-    pub fn zeroed() -> Box<Self> {
+    /// A zeroed region that costs only the pages the test touches (a
+    /// `Box::new_zeroed` of this alignment commits all 128 MiB, #2822).
+    pub fn zeroed() -> ZeroedBox<Self> {
         // SAFETY: the only field is a byte array; every zero byte is valid.
-        // Box allocates with this type's alignment without a region-sized
-        // temporary on the test thread's stack.
-        unsafe { Box::<Self>::new_zeroed().assume_init() }
+        unsafe { ZeroedBox::new_zeroed() }
     }
 
     pub fn as_ptr(&self) -> *const u8 {

@@ -56,14 +56,9 @@ const MUSL_FLAGS: u64 = 0x007d_0f00;
 /// Go `newosproc`.
 const GO_FLAGS: u64 = 0x0005_0f00;
 
-fn zone() -> Box<ZoneTables> {
-    let layout = std::alloc::Layout::new::<ZoneTables>();
+fn zone() -> carrick_test_support::ZeroedBox<ZoneTables> {
     // SAFETY: all-zero is the valid empty zone.
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-        assert!(!ptr.is_null());
-        Box::from_raw(ptr)
-    }
+    unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() }
 }
 
 /// A process's lifecycle state as the host would publish it: the page, the
@@ -136,7 +131,7 @@ impl LifecycleVenue for Venue {
 
 /// One vCPU slot running the process's leader, loaded by its executor.
 struct World {
-    zone: Box<ZoneTables>,
+    zone: carrick_test_support::ZeroedBox<ZoneTables>,
     tasks: [CurrentTask; 4],
     cpu: FakeCpu,
     counters: Box<Counters>,

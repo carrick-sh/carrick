@@ -7,6 +7,7 @@ extern crate std;
 
 use super::*;
 use carrick_fd_core::{AccessMode, BoundedSpin, Description, Fd, StatusFlags, TableId};
+use carrick_test_support::ZeroedPages;
 use core::cell::Cell;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::boxed::Box;
@@ -53,10 +54,12 @@ const EL1: BoundedSpin = BoundedSpin(1024);
 
 // ---- fixture: zeroed directory + pool, published by the "host" ----
 struct Fixture {
+    /// Valid while `_backing` lives: views must not outlive the fixture.
     region: &'static IpcRegion<'static>,
     /// Next free byte of the ring area, and of the descriptor area.
     next_descriptor: Cell<u64>,
     pool_len: u64,
+    _backing: RegionBacking,
 }
 static IDENTITY: AtomicU64 = AtomicU64::new(0x1_0000);
 
@@ -69,11 +72,46 @@ impl crate::DescriptorCeiling for TestCeiling {
 }
 static TEST_CEILING: TestCeiling = TestCeiling(core::sync::atomic::AtomicU32::new(2));
 
-/// A zeroed directory mapping (lazily committed by the system allocator).
-pub(super) fn zeroed_directory() -> *mut IpcDirectory {
-    let layout = Layout::from_size_align(IPC_DIRECTORY_BYTES, 4096).unwrap();
-    // SAFETY: nonzero layout; the leaked mapping outlives every view.
-    unsafe { std::alloc::alloc_zeroed(layout) }.cast()
+/// A region's zeroed directory and pool, committed only where touched (as
+/// the carrier's reservation is) and unmapped when dropped (#2822).
+pub(super) struct RegionBacking {
+    dir: ZeroedPages,
+    pool: ZeroedPages,
+}
+impl RegionBacking {
+    pub(super) fn new(pool_len: usize) -> Self {
+        Self {
+            dir: ZeroedPages::new(IPC_DIRECTORY_BYTES),
+            pool: ZeroedPages::new(pool_len),
+        }
+    }
+    pub(super) fn dir(&self) -> *mut IpcDirectory {
+        self.dir.as_ptr().cast()
+    }
+    pub(super) fn pool(&self) -> *mut u8 {
+        self.pool.as_ptr()
+    }
+    pub(super) fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+    /// Publish a region over this backing, as the host does.
+    ///
+    /// # Safety
+    /// The returned view, and every view made from it, must not be used
+    /// after `self` drops.
+    pub(super) unsafe fn initialize(&self, identity: u64, limits: IpcLimits) -> IpcRegion<'static> {
+        unsafe {
+            IpcRegion::initialize(
+                self.dir(),
+                IPC_DIRECTORY_BYTES,
+                self.pool(),
+                self.pool_len(),
+                identity,
+                limits,
+            )
+        }
+        .unwrap()
+    }
 }
 
 fn fixture(pool_len: usize) -> Fixture {
@@ -81,19 +119,15 @@ fn fixture(pool_len: usize) -> Fixture {
 }
 
 fn fixture_with_limits(pool_len: usize, limits: IpcLimits) -> Fixture {
-    let dir = zeroed_directory();
-    let pool =
-        unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
+    let backing = RegionBacking::new(pool_len);
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
-    let region = unsafe {
-        IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity, limits)
-    }
-    .unwrap()
-    .with_ceiling(&TEST_CEILING);
+    // SAFETY: the fixture owns the backing and drops it after every view.
+    let region = unsafe { backing.initialize(identity, limits) }.with_ceiling(&TEST_CEILING);
     Fixture {
         region: Box::leak(Box::new(region)),
         next_descriptor: Cell::new(ipc_descriptor_area(pool_len as u64).start),
         pool_len: pool_len as u64,
+        _backing: backing,
     }
 }
 impl Fixture {
@@ -277,9 +311,10 @@ fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
 #[test]
 fn el1_ipc_region_attach_authenticates_the_header() {
     let len = 1 << 20;
-    let dir = zeroed_directory();
+    // Outlives every view below, which this test uses only before it returns.
+    let backing = RegionBacking::new(len);
+    let (dir, pool) = (backing.dir(), backing.pool());
     let dl = IPC_DIRECTORY_BYTES;
-    let pool = unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(len, 4096).unwrap()) };
     // Unpublished: zeroed memory never attaches.
     assert_eq!(
         unsafe { IpcRegion::attach(dir, dl, pool, len) }.err(),
@@ -1936,8 +1971,8 @@ fn el1_ipc_file_lock_layout_refuses_the_previous_abi() {
     let len = 1 << 20;
     let dl = IPC_DIRECTORY_BYTES;
     for (field, old) in [(0, VERSION_8_MAGIC), (1, VERSION_8_LAYOUT_HASH)] {
-        let dir = zeroed_directory();
-        let pool = unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(len, 4096).unwrap()) };
+        let backing = RegionBacking::new(len);
+        let (dir, pool) = (backing.dir(), backing.pool());
         unsafe { IpcRegion::initialize(dir, dl, pool, len, 79, IpcLimits::ZONE) }.unwrap();
         assert!(unsafe { IpcRegion::attach(dir, dl, pool, len) }.is_ok());
         let header = unsafe { &(*dir).header };

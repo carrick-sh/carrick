@@ -30,14 +30,11 @@ impl<C: ProcessContext + 'static> Fixture<C> {
         let process = binding.task;
         let process_birth =
             carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap());
-        let layout = std::alloc::Layout::new::<ZoneTables<C>>();
-        // SAFETY: one aligned allocation owns this zero-valid compact zone for
+        // SAFETY: one lazily committed mapping owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
-        let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<C>>();
-            assert!(!ptr.is_null());
-            Box::leak(Box::from_raw(ptr))
-        };
+        let zone = carrick_test_support::ZeroedBox::leak(unsafe {
+            carrick_test_support::ZeroedBox::<ZoneTables<C>>::new_zeroed()
+        });
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
         let task = Box::leak(Box::new(CurrentTask::new()));
