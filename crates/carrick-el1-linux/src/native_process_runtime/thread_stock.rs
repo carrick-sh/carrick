@@ -81,7 +81,7 @@ unsafe fn release_segment_storage(storage: *mut u8) {
 /// Host tests run the ring at host addresses, where a thread's control is
 /// admitted only inside the metadata window the fixtures map. Take the next
 /// free chunk of that window, never replacing a mapping.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 const TEST_SEGMENT_BYTES: usize =
     core::mem::size_of::<ThreadLifecycleSegment>().next_multiple_of(16384);
 #[cfg(test)]
