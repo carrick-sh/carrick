@@ -36,6 +36,27 @@ pub struct HostResolverSnapshot {
     provider_nameservers: Vec<std::net::IpAddr>,
 }
 
+/// Where the host keeps its resolver configuration.
+struct HostResolverFiles<'a> {
+    /// The resolver file a host program reads, first readable one wins:
+    /// `/etc/resolv.conf` on Linux, configd's rendered copy behind the
+    /// `/etc -> /private/etc` symlink chain on macOS.
+    rendered: &'a [&'a str],
+    /// systemd-resolved's list of the upstream servers it forwards to.
+    resolved_upstream: &'a str,
+}
+
+impl HostResolverFiles<'static> {
+    const LAUNCH: Self = Self {
+        rendered: &[
+            "/etc/resolv.conf",
+            "/var/run/resolv.conf",
+            "/private/var/run/resolv.conf",
+        ],
+        resolved_upstream: "/run/systemd/resolve/resolv.conf",
+    };
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HostResolverLaunchError {
     #[error("host network launch has no usable nameserver in the captured resolver snapshot")]
@@ -63,13 +84,13 @@ impl HostResolverSnapshot {
 
     /// Capture configd's rendered resolver file using only in-process file I/O.
     pub fn capture_launch() -> Self {
-        const HOST_RESOLV_CONF_PATHS: [&str; 3] = [
-            "/etc/resolv.conf",
-            "/var/run/resolv.conf",
-            "/private/var/run/resolv.conf",
-        ];
-        let contents = HOST_RESOLV_CONF_PATHS
-            .into_iter()
+        Self::capture_from(&HostResolverFiles::LAUNCH)
+    }
+
+    fn capture_from(files: &HostResolverFiles<'_>) -> Self {
+        let contents = files
+            .rendered
+            .iter()
             .find_map(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_default();
         Self {
@@ -374,6 +395,90 @@ mod tests {
             HostResolverSnapshot::capture_for_network(&explicit),
             Ok(None)
         );
+    }
+
+    /// Write a host resolver layout into a temp dir: the rendered
+    /// `/etc/resolv.conf` and, when given, systemd-resolved's upstream list.
+    fn host_resolver_layout(
+        rendered: &str,
+        upstream: Option<&str>,
+    ) -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered_path = dir.path().join("resolv.conf");
+        std::fs::write(&rendered_path, rendered).unwrap();
+        let upstream_path = dir.path().join("systemd-resolve-resolv.conf");
+        if let Some(upstream) = upstream {
+            std::fs::write(&upstream_path, upstream).unwrap();
+        }
+        (
+            dir,
+            rendered_path.to_str().unwrap().to_string(),
+            upstream_path.to_str().unwrap().to_string(),
+        )
+    }
+
+    fn captured_guest_resolv_conf(rendered: &str, upstream: Option<&str>) -> String {
+        let (_dir, rendered_path, upstream_path) = host_resolver_layout(rendered, upstream);
+        let files = HostResolverFiles {
+            rendered: &[rendered_path.as_str()],
+            resolved_upstream: upstream_path.as_str(),
+        };
+        let snapshot = HostResolverSnapshot::capture_from(&files);
+        String::from_utf8(ResolvConfVfs::from_host_snapshot(&snapshot).contents).unwrap()
+    }
+
+    /// A systemd-resolved host's `/etc/resolv.conf` names only its loopback
+    /// stub, `127.0.0.53`, which the guest cannot reach: the guest's loopback
+    /// is its own. Docker documents the same case and reads
+    /// `/run/systemd/resolve/resolv.conf`, the upstream servers the stub
+    /// forwards to, instead. The guest must get those.
+    #[test]
+    fn a_loopback_stub_resolver_is_replaced_by_the_resolved_upstream_servers() {
+        let contents = captured_guest_resolv_conf(
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n",
+            Some("nameserver 192.0.2.1\nnameserver 2001:db8::1\nsearch example.test\n"),
+        );
+        assert!(contents.contains("nameserver 192.0.2.1\n"), "{contents:?}");
+        assert!(
+            contents.contains("nameserver 2001:db8::1\n"),
+            "{contents:?}"
+        );
+        assert!(contents.contains("search example.test\n"), "{contents:?}");
+        assert!(!contents.contains("127.0.0.53"), "{contents:?}");
+    }
+
+    #[test]
+    fn a_reachable_rendered_resolver_is_kept_beside_a_resolved_upstream_file() {
+        let contents =
+            captured_guest_resolv_conf("nameserver 192.0.2.7\n", Some("nameserver 192.0.2.1\n"));
+        assert!(contents.contains("nameserver 192.0.2.7\n"), "{contents:?}");
+        assert!(!contents.contains("192.0.2.1"), "{contents:?}");
+    }
+
+    /// One reachable server beside the stub keeps the file as it is: only an
+    /// all-loopback file is a stub.
+    #[test]
+    fn a_mixed_loopback_and_reachable_resolver_is_kept() {
+        let contents = captured_guest_resolv_conf(
+            "nameserver 127.0.0.1\nnameserver 192.0.2.7\n",
+            Some("nameserver 192.0.2.1\n"),
+        );
+        assert!(contents.contains("nameserver 127.0.0.1\n"), "{contents:?}");
+        assert!(!contents.contains("192.0.2.1"), "{contents:?}");
+    }
+
+    /// Without systemd-resolved's upstream file, or with one that names only
+    /// loopback servers too, the stub stays: there is nothing better to hand
+    /// the guest, and the launch validation still sees a nameserver.
+    #[test]
+    fn a_loopback_stub_without_reachable_upstream_servers_is_kept() {
+        for upstream in [None, Some("nameserver ::1\n"), Some("# empty\n")] {
+            let contents = captured_guest_resolv_conf("nameserver 127.0.0.53\n", upstream);
+            assert!(
+                contents.contains("nameserver 127.0.0.53\n"),
+                "{upstream:?}: {contents:?}"
+            );
+        }
     }
 
     #[test]
