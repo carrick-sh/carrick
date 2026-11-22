@@ -57,6 +57,13 @@
 # its capture); ARM admission, set_tid_address and clear-child-tid paths
 # are unchanged. Rerun the existing control:
 # carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue
+# #2645 slice C: the stopped-CPU ABI readers (RetainedAbiRegion,
+# stopped_execution, root_stack_record, ...) move from carrick-vmm-hvf
+# metadata_grant to carrick-aarch64 stopped_abi, unchanged, and the soft
+# carrier authenticates its root-exit crossing through them. The zone birth
+# source becomes one RetainedBirthZone blanket impl in carrick-hal. HVF
+# semantics, bindings and budgets are unchanged; new VM-free witness:
+# carrick-aarch64 stopped_abi::tests::root_exit_authenticates_only_the_stopped_lane_that_wrote_it.
 schema_version = 1
 id = "process.native.arm-admission"
 title = "ARM root setup and process calls share one authenticated native owner"
@@ -121,6 +128,7 @@ rationale = "Admission creates one native process owner for the retained root an
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
+  "carrick-aarch64::stopped_abi::tests::root_exit_authenticates_only_the_stopped_lane_that_wrote_it",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_signal_checkpoint_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_signal_checkpoint_returns_a_stale_admission_refusal",

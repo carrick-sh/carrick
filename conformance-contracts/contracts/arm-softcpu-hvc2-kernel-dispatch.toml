@@ -27,6 +27,16 @@
 # The soft_zone witnesses need the production EL1 image on an arm64 host
 # (soft-aarch64-native job); set_tid_address and prlimit64 stay counted
 # ENOSYS until the root is admitted as a native process (slice C).
+# #2645 slice C: the soft carrier binds the kernel's births to its zone
+# issuers (the shared RetainedBirthZone source HVF and x86 use) and
+# publishes the root's own namespace PID, so EL1 admits the root's process
+# owner on its first call. The ring serves set_tid_address, prlimit64,
+# gettid, the identity getters, rt_sigaction and exit_group; exit_group
+# crosses back through HVC #6 GRANT_OP_ROOT_EXIT, authenticated by the
+# shared stopped-CPU readers (carrick-aarch64 stopped_abi), and ends the
+# run with its full status. glibc hello and CPython now count only rseq
+# (293, #1906); musl hello counts nothing. Caught-signal delivery to a
+# ring-installed handler is slice D.
 schema_version = 1
 id = "arm.softcpu.hvc2-kernel-dispatch"
 title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
@@ -49,6 +59,10 @@ guest_surfaces = [
   "syscall:sigaltstack",
   "syscall:write",
   "syscall:futex",
+  "syscall:set_tid_address",
+  "syscall:gettid",
+  "syscall:prlimit64",
+  "syscall:exit_group",
   "signal:SIGPIPE",
   "vmm:soft",
 ]
@@ -58,11 +72,12 @@ semantic_authority = [
   "man 2 futex (FUTEX_WAIT_PRIVATE with a relative timeout: ETIMEDOUT; FUTEX_WAKE ends the wait with 0).",
   "Arm ARM DDI0487G.a D11.2 (virtual counter, CNTV_* timer) and D1.16.2 (WFI wake on an asserted IRQ).",
   "man 2 set_robust_list, sigaltstack and sigprocmask (per-thread state served from the thread's published control slot).",
+  "man 2 set_tid_address (returns the caller's TID), man 2 gettid, man 2 prlimit (old limit copied out; EINVAL for an unknown resource, EFAULT for an unmapped pointer) and man 2 exit_group (the process's full exit status).",
   "man 7 signal (default dispositions: Term, Ign, Stop, Cont) and man 7 pipe (EPIPE and SIGPIPE).",
 ]
 fixture = "carrick-softcpu-aarch64-host::soft_dispatch_witness"
 scale_points = [1]
-rationale = "Single-process AArch64 guests on the soft CPU must route forwarded HVC #2 syscalls through the shared Aarch64EngineCore<SoftAarch64Vmm> and production SyscallDispatcher with zero fixture syscall replies, taking a pending kernel signal's default action at the guest return boundary, enforcing stage-1/stage-2 R/W/X permissions, post-mprotect/munmap synchronous faults, and ExtentTable code-page invalidations. Before the root's first instruction the carrier publishes its thread lifecycle page and control slot, mapped (never copied) into the EL1 dynamic metadata aperture, and a carrier-bound MM portal; both lifecycle mappings retire with the carrier."
+rationale = "Single-process AArch64 guests on the soft CPU must route forwarded HVC #2 syscalls through the shared Aarch64EngineCore<SoftAarch64Vmm> and production SyscallDispatcher with zero fixture syscall replies, taking a pending kernel signal's default action at the guest return boundary, enforcing stage-1/stage-2 R/W/X permissions, post-mprotect/munmap synchronous faults, and ExtentTable code-page invalidations. Before the root's first instruction the carrier publishes its thread lifecycle page and control slot, mapped (never copied) into the EL1 dynamic metadata aperture, and a carrier-bound MM portal; both lifecycle mappings retire with the carrier. The carrier binds its births to the zone's issuers so EL1 admits the root's process owner, which serves the root's process calls in the ring and ends the run through the authenticated native root-exit crossing."
 structural_budgets = []
 
 [bindings]
@@ -76,6 +91,8 @@ vm_free = [
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_stage2_enforces_execute_permission_and_extent_code_generations",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_sysv_shm_alias_publishes_kernel_frame_inventory",
   "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_cpu_runs_root_lifecycle_and_portal_through_production_dispatch",
+  "carrick-aarch64::stopped_abi::tests::root_exit_authenticates_only_the_stopped_lane_that_wrote_it",
+  "carrick-kernel::run_result::tests::native_terminal_exit_keeps_codes_and_names_signals",
   "carrick-aarch64::esr::tests::decodes_el0_translation_and_permission_fault_access",
   "carrick-aarch64::esr::tests::decodes_el0_abort_stage1_fault_kind",
   "carrick-aarch64::esr::tests::lowers_el0_aborts_and_debug_faults_to_linux_signal_triples",
@@ -94,7 +111,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
-hosted_arm64 = "The in-guest zone witnesses need the production EL1 image on an arm64 host and run in the soft-aarch64-native job's ignored step: carrick-softcpu-aarch64-host::soft_zone::soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer, ::soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait and ::soft_zone_host_futex_wake_reaches_the_parked_ring_waiter."
+hosted_arm64 = "The in-guest zone witnesses need the production EL1 image on an arm64 host and run in the soft-aarch64-native job's ignored step: carrick-softcpu-aarch64-host::soft_zone::soft_zone_private_futex_timed_wait_expires_on_the_virtual_timer, ::soft_zone_kicked_idle_exit_returns_to_the_parked_timed_wait and ::soft_zone_host_futex_wake_reaches_the_parked_ring_waiter. The root admission witnesses run there too: ::soft_root_set_tid_address_returns_its_own_tid_in_ring, ::soft_root_prlimit64_copies_out_the_stack_limit_in_ring, ::soft_root_prlimit64_refuses_a_bad_resource_and_a_bad_pointer_in_ring and ::soft_root_exit_group_status_crosses_the_native_root_exit."
 embed_structural = "The soft AArch64 single-process runner executes via carrick-softcpu-aarch64-host on Linux arm64 (boot_probe dynamic glibc hello, static musl hello and pinned CPython 3.12.16); CLI carrier wiring lands in a later #1236 slice."
 signed = "macOS signed HVF acceptance covers HvfVmm; soft AArch64 native block execution runs on Linux arm64 CI (soft-aarch64-native)."
 docker = "Dynamic glibc hello, static musl hello and pinned CPython 3.12.16 outputs and exit codes are checked directly against deterministic Linux expectations with zero fixture syscall replies."
