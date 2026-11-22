@@ -2093,6 +2093,142 @@ jobs:
         if: ${{ always() }}
         run: just ci-cache-finish
 
+  # The host unit lane on Linux: `just test`, split into its shards, on hosted
+  # arm64 and x86_64 runners. `just check-test-shards` (lint-gates) proves the
+  # shards' union equals `just test` on Linux. While the macOS jobs are off
+  # (owner 2026-11-22, #231) this is the only job that runs the unit set, and
+  # Linux arm64 is the ARM coverage for ISA-neutral host code.
+  # One job per runner, each with a literal runs-on (tests/ci_cache.rs).
+  # Never export CARGO_BUILD_JOBS here: carrick-xtask's fixtures tests refuse
+  # an ambient value.
+  linux-unit-arm:
+    needs: changes
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-tools
+        with:
+          tools: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-arm64 read-only
+      - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-arm64-
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug-v2
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
+      - name: Install per-user compiler cache
+        uses: ./.github/actions/install-tools
+        with:
+          tools: sccache
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
+      - name: Host unit tests, one shard of `just test`
+        if: ${{ !cancelled() }}
+        run: just test-shard-${{ matrix.shard }}
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just ci-cache-finish
+
+  linux-unit-x86:
+    needs: changes
+    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-tools
+        with:
+          tools: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
+      - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug-v2
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
+      - name: Install per-user compiler cache
+        uses: ./.github/actions/install-tools
+        with:
+          tools: sccache
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
+      - name: Host unit tests, one shard of `just test`
+        if: ${{ !cancelled() }}
+        run: just test-shard-${{ matrix.shard }}
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just ci-cache-finish
+
   # Native Linux aarch64 run of carrick-el1-linux's non-macOS process/template/
   # IPC/poll tests (#1297, #1303). Gated on PRs touching carrick-el1-linux's
   # workspace closure and on every merge_group; el1-native-gate compares the

@@ -107,6 +107,46 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .count(),
         shards.len()
     );
+    // The Linux unit lane (#2809) runs every shard on hosted arm64 and x86_64
+    // runners. With the macOS jobs off it is the only job running the unit set.
+    for (job, runner, next) in [
+        ("linux-unit-arm", "ubuntu-24.04-arm", "linux-unit-x86"),
+        ("linux-unit-x86", "ubuntu-latest", "el1-native-tests"),
+    ] {
+        let body = &jobs[job];
+        assert_eq!(
+            body["strategy"]["matrix"]["shard"]
+                .as_vec()
+                .unwrap_or_else(|| panic!("{job} shard matrix"))
+                .iter()
+                .map(|v| format!("test-shard-{}", v.as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            shards,
+            "{job} must run every test-shard-* recipe"
+        );
+        assert_eq!(body["strategy"]["fail-fast"].as_bool(), Some(false));
+        assert_eq!(body["runs-on"].as_str(), Some(runner), "{job}");
+        assert!(
+            body["steps"]
+                .as_vec()
+                .unwrap()
+                .iter()
+                .any(|s| s["run"].as_str() == Some("just test-shard-${{ matrix.shard }}")),
+            "{job} must run the shard recipe itself"
+        );
+        // carrick-xtask's fixtures tests refuse an ambient CARGO_BUILD_JOBS.
+        let text = workflow
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("\n  {next}:\n")).next())
+            .unwrap_or_else(|| panic!("{job} job text"));
+        assert!(
+            !text.lines().any(
+                |line| !line.trim_start().starts_with('#') && line.contains("CARGO_BUILD_JOBS")
+            ),
+            "{job} must not set CARGO_BUILD_JOBS"
+        );
+    }
     // Only same-repo pull_request jobs and merge groups (whose code is
     // already same-repo) may reach a self-hosted macOS runner; forks and
     // cache-saving push/schedule stay hosted (#650; merge groups moved by the
