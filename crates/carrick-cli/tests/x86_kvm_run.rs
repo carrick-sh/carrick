@@ -749,7 +749,7 @@ fn mounted_static_x86_native_executable_link_follows_fork_and_exec() {
 /// #2731: the first syscall an exec'd image makes arrives with host work
 /// owed. A call declined for that work must run once the work has settled; it
 /// was answered ENOSYS, which kills a static glibc image before `main`.
-/// Sixteen fork children each exec the fixture to make one call first, then
+/// Fifteen fork children each exec the fixture to make one call first, then
 /// the root execs itself: no row may be refused only because it was first.
 #[test]
 fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {

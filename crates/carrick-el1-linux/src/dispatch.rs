@@ -113,6 +113,12 @@ pub trait GuestDispatchFrame: SyscallFrame {
     ) -> bool {
         false
     }
+    /// Rewind the unchanged call for a rerun after this venue's work
+    /// boundary settles owed host work. `false` on ARM, whose
+    /// `ForwardOriginal` boundary re-enters the call itself.
+    fn rerun_after_owed_work(&mut self) -> bool {
+        false
+    }
     /// Re-enter this ISA's syscall instruction after argument preparation.
     fn restart_syscall(&mut self) {
         let frame = self
@@ -4154,6 +4160,9 @@ impl<
     }
     fn settles_owed_work_at_continuation_boundary(&self) -> bool {
         self.frame.settles_owed_work_at_continuation_boundary()
+    }
+    fn rerun_after_owed_work(&mut self) -> bool {
+        self.frame.rerun_after_owed_work()
     }
     fn native_number(&self) -> Option<carrick_personality_linux::crossing::NativeNr> {
         Some(carrick_personality_linux::crossing::NativeNr(
