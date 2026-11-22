@@ -28,13 +28,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use carrick_runtime::el1_census::{Census, RefusalRank};
 use carrick_spec::syscall_census::{CallerClass, CensusIsa};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The ISA a row runs on: the host's, since a carrier runs its own ISA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RowIsa {
     Arm64,
@@ -68,14 +69,14 @@ impl From<CensusIsa> for RowIsa {
 }
 
 /// A rows file: `{"rows": [...]}`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RowsFile {
     pub(crate) rows: Vec<RowSpec>,
 }
 
 /// One parity row: an image per ISA and the stages to run in it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RowSpec {
     pub(crate) name: String,
@@ -87,7 +88,7 @@ pub(crate) struct RowSpec {
 }
 
 /// One independently runnable step of a row, started in a fresh container.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StageSpec {
     pub(crate) name: String,
@@ -150,7 +151,9 @@ fn is_label(name: &str) -> bool {
 
 /// What a finding is. Ordered by how much it says about the row: a carrier
 /// fatal first, contention leaves last.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FindingKind {
     Fatal,
@@ -184,7 +187,7 @@ impl FindingKind {
 
 /// One failure site one run produced, with how often and the real values
 /// behind it (refused-call registers, the fatal message, the guest's line).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Finding {
     pub(crate) kind: FindingKind,
     pub(crate) site: String,
@@ -209,7 +212,7 @@ impl Finding {
 }
 
 /// One run of one stage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RunRecord {
     pub(crate) instance: String,
     pub(crate) isa: RowIsa,
@@ -535,7 +538,7 @@ pub(crate) fn judge(
 }
 
 /// One aggregated row of the ranked table.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct TableRow {
     pub(crate) instance: String,
     pub(crate) isa: RowIsa,
