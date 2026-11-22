@@ -2046,13 +2046,9 @@ fn soft_cpu_runs_dynamic_glibc_hello_through_production_dispatch() {
         .as_ref()
         .expect("production SoftProcessRun must back glibc relocation and IFUNC inspection");
     assert_production_glibc_relocations_and_ifuncs(&program, &libc_bytes, run, compiler);
-    // `set_tid_address` (96) and `prlimit64` (261) wait on the in-ring root
-    // process owner (#2645); `rseq` (293) is an accepted refusal (#1906).
-    assert_counted_enosys(
-        &receipt.counted_enosys,
-        &[(96, 1), (261, 1), (293, 1)],
-        "glibc hello",
-    );
+    // The in-ring root process owner serves `set_tid_address` (96) and
+    // `prlimit64` (261) (#2645); `rseq` (293) is an accepted refusal (#1906).
+    assert_counted_enosys(&receipt.counted_enosys, &[(293, 1)], "glibc hello");
 }
 
 /// Root-publication witness on the production soft entry: before the dynamic
@@ -2110,20 +2106,17 @@ fn soft_cpu_runs_dynamic_glibc_hello_with_published_root_lifecycle_through_produ
     );
     assert_eq!(run.exit_code, 0);
     assert_eq!(run.stdout, b"dynamic glibc hello\n");
-    // The ring serves `set_robust_list` (99) from the published control slot;
-    // the root process owner's calls stay counted until slice C admits it.
+    // The ring serves `set_robust_list` (99) from the published control
+    // slot, and the admitted root process owner serves `set_tid_address`
+    // (96), `prlimit64` (261) and the terminal `exit_group` (94).
     assert_eq!(
         served
             .iter()
             .map(|&(nr, _, count)| (nr, count))
             .collect::<Vec<_>>(),
-        [(99, 1)]
+        [(94, 1), (96, 1), (99, 1), (261, 1)]
     );
-    assert_counted_enosys(
-        &run.counted_enosys,
-        &[(96, 1), (261, 1), (293, 1)],
-        "glibc hello",
-    );
+    assert_counted_enosys(&run.counted_enosys, &[(293, 1)], "glibc hello");
     let after = carrick_softcpu_aarch64_host::sample_root_publication(&run.engine)
         .expect("sample the retired publication");
     assert_eq!((after.lifecycle_page, after.control_slot), (0, 0));
@@ -2197,20 +2190,19 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
     assert_production_replies(&receipt.census, receipt.syscalls_dispatched, 5);
     assert_eq!(receipt.exit_code, 0);
     assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
-    // `set_tid_address` (96) waits on the in-ring root process owner, and
-    // Rust std's stack-overflow guard's two `SIGSEGV`/`SIGBUS` handler
-    // installs (134) on guest signal delivery in the single-process runner
-    // (both #2645). With the root's control slot published, the ring serves
-    // the per-thread setup calls from it: the guard's `sigaltstack` (132)
-    // and `rt_sigprocmask` (135).
-    assert_counted_enosys(&receipt.counted_enosys, &[(96, 1), (134, 2)], "musl hello");
+    // The admitted root process owner serves `set_tid_address` (96), Rust
+    // std's `rt_sigaction` (134) queries and `SIGSEGV`/`SIGBUS` guard
+    // handler installs, and the terminal `exit_group` (94) in the ring; the
+    // root's control slot serves the guard's `sigaltstack` (132) and
+    // `rt_sigprocmask` (135). Nothing is refused (#2645).
+    assert_counted_enosys(&receipt.counted_enosys, &[], "musl hello");
     assert_eq!(
         served.map(|served| served
             .into_iter()
             .map(|(nr, _, count)| (nr, count))
             .collect::<Vec<_>>()),
-        Some(vec![(132, 3), (135, 1)]),
-        "musl hello: per-thread setup calls served in ring"
+        Some(vec![(94, 1), (96, 1), (132, 3), (134, 5), (135, 1)]),
+        "musl hello: the root's calls served in ring"
     );
 }
 
