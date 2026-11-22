@@ -166,7 +166,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: bits != 0,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             }
@@ -230,7 +230,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     },
                 )
             }
@@ -4147,6 +4147,8 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
         SpaceWaitCause::Reservations,
         SpaceWaitCause::Editor,
         SpaceWaitCause::PreparedOverlap,
+        // A host pause of the MM (#2749): its raised gate is contention too.
+        SpaceWaitCause::Gate,
     ] {
         let region = Region::new();
         let zone = region.zone();
@@ -4249,6 +4251,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 )
                 .unwrap()
         });
+        let held_gate = (cause == SpaceWaitCause::Gate).then(|| {
+            access
+                .try_exclude_editor(zone.spaces.find(mm.raw()).unwrap(), mm.raw())
+                .unwrap()
+        });
         assert_eq!(
             serve_delegated_anonymous(
                 &mut frame,
@@ -4260,6 +4267,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 None
             ),
             DelegatedAnonymous::Contended(cause),
+            "leaves={:?}",
+            counters
+                .anonymous_leaves
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
         );
         let mut cpu = FakeCpu::default();
         let mut sched = Sched {
@@ -4291,6 +4303,7 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
         assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
         drop(held_root);
         drop(held_editor);
+        drop(held_gate);
         if let Some((permit, request)) = prepared {
             portal.cancel_prepared(permit, request, 0).unwrap();
         }
@@ -4317,7 +4330,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 .each_ref()
                 .map(|counter| counter.load(Ordering::Relaxed)),
         );
-        for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
+        for leave in [
+            AnonymousLeave::RootBusy,
+            AnonymousLeave::EditorBusy,
+            AnonymousLeave::NoGrant,
+        ] {
             assert_eq!(
                 counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
                 0
@@ -4490,6 +4507,164 @@ fn anonymous_edit_wait_never_parks_for_metadata_required() {
         |_, _, _| panic!("metadata has no per-MM release publisher"),
     );
     assert_eq!(outcome, EditWaitOutcome::Refused);
+}
+
+/// #2620 (ARM twin of the x86 KVM `production_mprotect_*` witnesses): the
+/// guest's `mprotect` (nr 226) through the delegated production entry flips
+/// resident private pages first published RW (no execute tag) to R|X, then
+/// R|W|X, in ring: the root's `VM_MAY*` ceiling bounds them, not the leaf's
+/// first-publish permissions.
+#[test]
+fn delegated_mprotect_flips_resident_rw_private_pages_rx_in_ring() {
+    delegated_mprotect_resident_pages(false);
+}
+
+#[test]
+fn delegated_mprotect_edits_both_resident_runs_across_an_untouched_page() {
+    delegated_mprotect_resident_pages(true);
+}
+
+fn delegated_mprotect_resident_pages(sparse: bool) {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
+        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let _parent = admit(&region, &spaces, 77, ROOT, if sparse { 3 } else { 2 }, 0);
+    let parent_tables = Tables::new(ROOT, IPA, 0);
+    let child = Tables::new(ROOT + 0x10_0000, 0, 0);
+    let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    let (page_offsets, run_len, range_len): (&[u64], u64, u64) = if sparse {
+        (&[0, 8192], 4096, 12288)
+    } else {
+        (&[0], 8192, 8192)
+    };
+    for &offset in page_offsets {
+        let prepared = execute_descriptor_op(
+            &parent_tables.live(&CallerInvalidatesAsid),
+            SubstrateGpa(ROOT),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: VA + offset,
+                    ipa: IPA + offset,
+                    len: run_len,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(VA + offset, run_len),
+                backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
+            },
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        );
+        assert!(
+            matches!(prepared, DescriptorOutcome::Applied(_)),
+            "{prepared:?}"
+        );
+    }
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let leaf = |va: u64| -> u64 {
+        let mut table = ROOT;
+        for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+            let descriptor = words.load(table + ((va >> shift) & 511) * 8).unwrap();
+            if level == 3 || descriptor & 3 != 3 {
+                return descriptor;
+            }
+            table = descriptor & 0x0000_ffff_ffff_f000;
+        }
+        unreachable!()
+    };
+    let counters = Box::new(Counters::default());
+    let guest_mprotect = |prot: u64| {
+        let task = CurrentTask::new();
+        task.execution.task.store(177, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(77, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA;
+        frame.x[1] = range_len;
+        frame.x[2] = prot;
+        frame.x[8] = 226;
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: supply.words.as_ptr().cast_mut(),
+                physical_base: supply.base,
+                byte_len: supply.words.len() * 8,
+            },
+        };
+        let route = serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        );
+        (route, frame.x[0] as i64)
+    };
+    let protections: &[u64] = if sparse { &[0, 5, 3] } else { &[5, 7, 3] };
+    for &prot in protections {
+        assert_eq!(
+            guest_mprotect(prot),
+            (DelegatedAnonymous::Served, 0),
+            "prot {prot}; BackingMultiRun={}",
+            counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::BackingMultiRun as usize]
+                .load(Ordering::Relaxed)
+        );
+        for page in 0..range_len / 4096 {
+            let d = leaf(VA + page * 4096);
+            if sparse && page == 1 {
+                assert_eq!(d, 0, "untouched page must remain unbacked");
+                continue;
+            }
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Read),
+                prot != 0,
+                "prot {prot} page {page}"
+            );
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Execute),
+                prot & 4 != 0,
+                "prot {prot} page {page}"
+            );
+            assert_eq!(
+                terminal_descriptor_permits_el0(d, LeafAccess::Write),
+                prot & 2 != 0,
+                "prot {prot} page {page}"
+            );
+        }
+    }
+    assert!(
+        counters
+            .anonymous_leaves
+            .iter()
+            .all(|leave| leave.load(Ordering::Relaxed) == 0),
+        "no mprotect left the ring"
+    );
 }
 
 #[test]

@@ -351,9 +351,58 @@ fn guest_protect_refuses_host_map_leaf() {
                     writable: false,
                     executable: false,
                     user: true
-                }
+                },
+                ceiling: None
             },
             &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
+#[test]
+fn sparse_protect_refuses_a_later_host_leaf_without_editing_the_first_run() {
+    let words = Words::new();
+    let va = 0x4000;
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(PageSpan::new(va, PAGE), 0x800000, writable),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            map(va + 2 * PAGE, 0x802000, PAGE, LeafSize::Page),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span: PageSpan::new(va, 3 * PAGE),
+                permissions: Permissions {
+                    writable: false,
+                    ..writable
+                },
+                ceiling: Some(GuestPermissionCeiling {
+                    readable: true,
+                    writable: true,
+                    executable: true,
+                }),
+            },
+            &[],
         ),
         DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
     );
@@ -389,11 +438,255 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
         },
     ] {
         assert_eq!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &[]),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    ceiling: None
+                },
+                &[]
+            ),
             DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
         );
         assert_eq!(*words.words.borrow(), before);
     }
+}
+
+/// #2620: the reservation root's ceiling (Linux `VM_MAY*`), not the leaf's
+/// first-publish permissions, bounds a private leaf: RW to RX and R to RW are
+/// served, while a narrow ceiling (a shared node) still refuses whole.
+#[test]
+fn guest_protect_widens_a_private_leaf_to_the_root_ceiling() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let readwrite = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, readwrite),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let rwx = GuestPermissionCeiling {
+        readable: true,
+        writable: true,
+        executable: true,
+    };
+    let protect = |permissions, ceiling| {
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions,
+                ceiling,
+            },
+            &[],
+        )
+    };
+    let leaf = || {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+            .unwrap()
+            .0
+    };
+    let readexec = Permissions {
+        writable: false,
+        executable: true,
+        user: true,
+    };
+    // A narrow ceiling refuses before any store.
+    let before = words.words.borrow().clone();
+    for ceiling in [
+        GuestPermissionCeiling {
+            executable: false,
+            ..rwx
+        },
+        GuestPermissionCeiling {
+            readable: false,
+            writable: false,
+            executable: false,
+        },
+    ] {
+        assert_eq!(
+            protect(readexec, Some(ceiling)),
+            DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+        );
+        assert_eq!(*words.words.borrow(), before);
+    }
+    // RW to RX: executable, not writable, execute ceiling recorded.
+    assert!(matches!(
+        protect(readexec, Some(rwx)),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (WRITE | NX), 0);
+    assert_ne!(leaf() & MAY_EXEC, 0);
+    // And back to RW, then R|W|X.
+    assert!(matches!(
+        protect(readwrite, Some(rwx)),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (WRITE | NX), WRITE | NX);
+    assert!(matches!(
+        protect(
+            Permissions {
+                executable: true,
+                ..readwrite
+            },
+            Some(rwx)
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (WRITE | NX), WRITE);
+
+    // A leaf first published read-only gains write within the ceiling.
+    let other = PageSpan::new(0x5000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(
+                other,
+                0x801000,
+                Permissions {
+                    writable: false,
+                    ..readwrite
+                }
+            ),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span: other,
+                permissions: readwrite,
+                ceiling: Some(rwx),
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (widened, _) =
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(other.va)).unwrap();
+    assert_eq!(widened & (WRITE | MAY_WRITE), WRITE | MAY_WRITE);
+    let before_none = leaf();
+    // PROT_NONE removes user access without discarding the private frame.
+    assert!(matches!(
+        protect(
+            Permissions {
+                writable: false,
+                executable: false,
+                user: false,
+            },
+            Some(rwx),
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        leaf() & (PRESENT | PREPARED | USER | WRITE | NX),
+        PREPARED | NX
+    );
+    assert_eq!(leaf() & ADDRESS, before_none & ADDRESS);
+    assert!(matches!(
+        apply(&words, DescriptorOp::Retire(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_ne!(leaf() & RETIRED, 0);
+}
+
+/// #2620: fork arms a read-only private leaf too, with no write intent, so
+/// a later ceiling-admitted `mprotect(PROT_WRITE)` only records intent and
+/// never grants WRITE onto the frame the other side still maps.
+#[test]
+fn fork_arms_a_read_only_private_leaf_so_widening_stays_private() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let readwrite = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, readwrite),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let readonly = Permissions {
+        writable: false,
+        ..readwrite
+    };
+    let rwx = Some(GuestPermissionCeiling {
+        readable: true,
+        writable: true,
+        executable: true,
+    });
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: readonly,
+                ceiling: rwx,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = || {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+            .unwrap()
+            .0
+    };
+    assert_ne!(leaf() & MAY_WRITE, 0, "the narrowed leaf kept its ceiling");
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (COW | WRITE | MAY_WRITE), COW, "armed, no intent");
+    // Without the root's ceiling an armed leaf is still refused.
+    let armed = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: readwrite,
+                ceiling: None,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+    );
+    assert_eq!(*words.words.borrow(), armed);
+    // With it, write intent is recorded but WRITE is never granted.
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: readwrite,
+                ceiling: rwx,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (COW | WRITE | MAY_WRITE), COW | MAY_WRITE);
+    // Fork again keeps that intent armed.
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (COW | WRITE | MAY_WRITE), COW | MAY_WRITE);
 }
 
 #[test]
@@ -422,7 +715,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: readonly
+                permissions: readonly,
+                ceiling: None
             },
             &[]
         ),
@@ -437,7 +731,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: writable
+                permissions: writable,
+                ceiling: None
             },
             &[]
         ),
@@ -994,7 +1289,8 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     writable: true,
                     executable: false,
                     user: true
-                }
+                },
+                ceiling: None
             },
             &[]
         ),
@@ -1049,6 +1345,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 executable: true,
                 user: true,
             },
+            ceiling: None,
         },
         &[],
     );
@@ -1233,7 +1530,15 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
             user: true,
         };
         assert!(matches!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &grants),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    ceiling: None
+                },
+                &grants
+            ),
             DescriptorOutcome::Applied { .. }
         ));
         assert_eq!(
@@ -1258,6 +1563,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     writable: true,
                     ..permissions
                 },
+                ceiling: None,
             },
             &[],
         );
@@ -1314,7 +1620,8 @@ fn failed_split_restores_all_512_children_and_parent() {
                         writable: false,
                         executable: false,
                         user: true
-                    }
+                    },
+                    ceiling: None
                 },
                 &[root(0x4000)]
             ),
@@ -1407,6 +1714,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 executable: false,
                 user: true,
             },
+            ceiling: None,
         },
         &[],
     );

@@ -1104,6 +1104,7 @@ pub enum OwnerFaultSupplyOutcome {
     Wait(carrick_el1_abi::PortalOwnerWait),
     Unavailable,
     PolicyDeclined,
+    ProtectionDeclined,
     Selected,
     CowSelected,
 }
@@ -1309,9 +1310,9 @@ impl<'s> FaultSupply<'s> {
         .flatten()
     }
 
-    fn decline(self) {
+    fn decline(self, outcome: OwnerFaultSupplyOutcome) {
         if let Some(owner) = self.owner() {
-            owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+            owner.outcome.set(outcome);
         }
     }
 
@@ -1553,12 +1554,12 @@ fn dispatch_classified_fault<
                     return Action::Forward;
                 }
                 RootFaultAdmission::Declined => {
-                    supply.decline();
+                    supply.decline(OwnerFaultSupplyOutcome::ProtectionDeclined);
                     supply.note(FaultVerdict::RootDeclined);
                     return Action::Forward;
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
-                    supply.decline();
+                    supply.decline(OwnerFaultSupplyOutcome::PolicyDeclined);
                     supply.note(FaultVerdict::RootUnmapped);
                     return Action::Forward;
                 }
@@ -1650,11 +1651,11 @@ fn dispatch_classified_fault<
                 .unwrap_or(RootFaultAdmission::Busy)
             {
                 RootFaultAdmission::Declined => {
-                    supply.decline();
+                    supply.decline(OwnerFaultSupplyOutcome::ProtectionDeclined);
                     supply.note(FaultVerdict::RootDeclined);
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
-                    supply.decline();
+                    supply.decline(OwnerFaultSupplyOutcome::PolicyDeclined);
                     supply.note(FaultVerdict::RootUnmapped);
                 }
                 RootFaultAdmission::Busy => supply.note(FaultVerdict::RootBusy),
@@ -1707,13 +1708,13 @@ fn dispatch_classified_fault<
             .unwrap_or(RootFaultAdmission::Busy)
         {
             RootFaultAdmission::Declined => {
-                supply.decline();
+                supply.decline(OwnerFaultSupplyOutcome::ProtectionDeclined);
                 supply.note(FaultVerdict::RootDeclined);
                 return Action::Forward;
             }
             RootFaultAdmission::Unmapped => {
                 if supply.is_owner() {
-                    supply.decline();
+                    supply.decline(OwnerFaultSupplyOutcome::PolicyDeclined);
                 }
                 supply.note(FaultVerdict::RootUnmapped);
                 return Action::Forward;
@@ -1800,11 +1801,13 @@ fn dispatch_classified_fault<
                 carrick_el1_abi::ReservationProtection::from_bits(access)?,
             ) {
                 Ok(window) => window,
-                Err(
-                    crate::memory::reservations::Refusal::Hole
-                    | crate::memory::reservations::Refusal::Limit,
-                ) => {
-                    owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+                Err(crate::memory::reservations::Refusal::Hole) => {
+                    supply.decline(OwnerFaultSupplyOutcome::PolicyDeclined);
+                    supply.note(FaultVerdict::WindowHole);
+                    return None;
+                }
+                Err(crate::memory::reservations::Refusal::Limit) => {
+                    supply.decline(OwnerFaultSupplyOutcome::ProtectionDeclined);
                     supply.note(FaultVerdict::WindowHole);
                     return None;
                 }

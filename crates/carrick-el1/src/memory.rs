@@ -1651,14 +1651,16 @@ fn serve_delegated_anonymous_for_origin<
             let _ = pending.cancel(model);
             forward(why)
         };
-    let (Some(grant), Some(owner)) = (
-        spaces.grant(index, mm_key),
-        frame
-            .slot()
-            .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
-    ) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
+    // The editor before the roots: its admission names a raised gate (a host
+    // pause of this MM, which lowers) as `Gate`, and the call parks on that
+    // release. Reading the grant first saw the same pause as "no grant" and
+    // forwarded, which a native child answers with ENOSYS (#2749).
     let _editor_guard =
         match spaces
             .table()
@@ -1677,6 +1679,13 @@ fn serve_delegated_anonymous_for_origin<
                 return refuse(pending, &mut model, Leave::RootUnavailableStale);
             }
         };
+    // This editor was admitted with the gate open, and a host pause that
+    // raises it now finds the editor and backs off. So only a closed
+    // (retiring) or re-keyed entry has no roots here; a raised count does
+    // not refuse the editor its own MM.
+    let Some(grant) = spaces.table().installed_grant(index, mm_key) else {
+        return refuse(pending, &mut model, Leave::NoGrant);
+    };
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
@@ -1703,13 +1712,13 @@ fn serve_delegated_anonymous_for_origin<
         frame.set_result(carrick_guest_arch::NativeReturnWord(0));
         return DelegatedAnonymous::Served;
     }
-    // A discard can retire sparse residency in one descriptor transaction:
-    // the retirement planners skip absent entries and validate every
-    // populated terminal before publishing the edit.
+    // A discard or a protect covers sparse residency in one descriptor
+    // transaction: the planners skip absent entries and validate every
+    // populated terminal before storing any change.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
-        _ if request.operation == Discard => Some((va, len)),
+        _ if matches!(request.operation, Discard | Protect) => Some((va, len)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
     // A fresh mapping into a root hole over this MM's first-touch stock
@@ -1757,7 +1766,7 @@ fn serve_delegated_anonymous_for_origin<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
-            let cow_ceiling = if request.operation == Protect {
+            let ceiling = if request.operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
@@ -1775,7 +1784,7 @@ fn serve_delegated_anonymous_for_origin<
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
-                cow_ceiling,
+                ceiling,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -2016,7 +2025,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         readable: prot & PROT_READ != 0,
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
-        cow_ceiling: None,
+        ceiling: None,
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
@@ -2232,7 +2241,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    ceiling: None,
                 }
             )]
         );
@@ -3670,7 +3679,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: Some(GuestPermissionCeiling {
+                            ceiling: Some(GuestPermissionCeiling {
                                 readable: true,
                                 writable: true,
                                 executable: true,
@@ -4101,7 +4110,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            ceiling: None,
                         }
                     ),
                 ]
@@ -4182,7 +4191,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        ceiling: None,
                     }
                 )]
             );

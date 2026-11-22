@@ -470,6 +470,16 @@ pub struct EditPermissions {
     pub user: bool,
 }
 
+/// A mapping's protection ceiling (Linux `VM_MAY*`), as the MM's reservation
+/// root records it. A permission edit carrying one is bounded by it on every
+/// private leaf, whatever permissions the leaf was first published with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPermissionCeiling {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
 /// Host-authenticated output backing, never inferred from a page-table word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditBacking {
@@ -517,6 +527,10 @@ pub enum EditOperation {
     },
     Protect {
         permissions: EditPermissions,
+        /// The reservation root's ceiling. Its coverage lets the editor
+        /// skip absent descriptors inside the range. With `None`, leaf tags
+        /// bound the edit and holes or COW-armed leaves are refused.
+        ceiling: Option<GuestPermissionCeiling>,
     },
     ArmCow {
         kernel_only: bool,

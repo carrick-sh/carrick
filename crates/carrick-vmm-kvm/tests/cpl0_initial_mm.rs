@@ -7107,12 +7107,11 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
     );
 }
 
-/// #2722: a large `PROT_NONE|MAP_NORESERVE` reservation must find a gap in the
-/// initial mmap arena. The fixture reserves, commits a part and writes it, and
-/// exits 7 on success, or with the errno of the first failing call (see
-/// `native_child_mprotect_shapes.S` for the cases). The same binary runs
-/// natively first, as the Linux oracle.
-fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+/// #2620 part B: V8's `OS::SetPermissions` aborts when an `mprotect` returns
+/// non-zero. A forked child performs one V8-shaped protection edit and exits
+/// 7 on success, or with the errno of the first failing call (see
+/// `native_child_mprotect_shapes.S` for the cases).
+fn run_mprotect_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DCASE={case}");
     let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&define]);
     let dir = tempfile::tempdir().expect("oracle directory");
@@ -7125,54 +7124,195 @@ fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPool
         .expect("run native oracle");
     assert_eq!(native.status.code(), Some(7), "native oracle case {case}");
     try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
-        .expect("reservation shape run")
+        .expect("mprotect shape run")
 }
 
-macro_rules! reservation_shape_witness {
-    ($name:ident, $case:expr, $doc:expr) => {
+macro_rules! mprotect_shape_witness {
+    ($name:ident, $case:expr, $doc:expr $(, #[$attr:meta])*) => {
         #[doc = $doc]
         #[test]
+        $(#[$attr])*
         fn $name() {
-            let outcome = run_reservation_shape($case);
+            let outcome = run_mprotect_shape($case);
+            let counters = outcome.physical.syscall_counters().expect("counters");
+            let at = |bucket: &[std::sync::atomic::AtomicU64]| -> Vec<(usize, u64)> {
+                bucket
+                    .iter()
+                    .enumerate()
+                    .map(|(nr, c)| (nr, c.load(std::sync::atomic::Ordering::Acquire)))
+                    .filter(|(nr, c)| *c != 0 && matches!(nr, 9 | 10 | 11 | 28))
+                    .collect()
+            };
+            let mprotect = |bucket: &[std::sync::atomic::AtomicU64]| {
+                bucket[10].load(std::sync::atomic::Ordering::Acquire)
+            };
+            eprintln!(
+                "case {} exit {} (x86 nr 9 mmap, 10 mprotect, 11 munmap) served {:?} forwarded {:?} \
+                 refused {:?} refused_child {:?} venue_refused {:?} venue_refused_child {:?}",
+                $case,
+                outcome.run.exit_code,
+                at(&counters.served),
+                at(&counters.forwarded),
+                at(&counters.refused),
+                at(&counters.refused_child),
+                at(&counters.venue_refused),
+                at(&counters.venue_refused_child),
+            );
             assert_eq!(
                 (outcome.run.exit_code, outcome.run.terminating_signal),
                 (7, None),
-                "case {} exit (7 = Linux; else the errno, +100 from mmap): {:?}",
+                "case {} child exit (7 = Linux; else the errno): {:?}; BackingMultiRun={} EditRefused={}",
                 $case,
-                outcome.run
+                outcome.run,
+                counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::BackingMultiRun as usize]
+                    .load(std::sync::atomic::Ordering::Acquire),
+                counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::EditRefused as usize]
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+            // Served in the ring: no mprotect left it, to the host or as a
+            // counted refusal.
+            assert_eq!(
+                [
+                    mprotect(&counters.forwarded),
+                    mprotect(&counters.refused),
+                    mprotect(&counters.refused_child),
+                    mprotect(&counters.venue_refused),
+                    mprotect(&counters.venue_refused_child),
+                ],
+                [0; 5],
+                "case {} mprotect forwarded/refused/refused_child/venue_refused/venue_refused_child",
+                $case
             );
         }
     };
 }
 
-reservation_shape_witness!(
+mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_noreserve_reservation,
     1,
-    "A forked child's 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
+    "A 1 GiB PROT_NONE|MAP_NORESERVE reserve, 1 MiB committed RW inside it."
 );
-reservation_shape_witness!(
+mprotect_shape_witness!(
+    production_mprotect_flips_rw_anonymous_to_rx_and_calls_it,
+    2,
+    "RW anonymous page, code written, mprotect R|X, then executed."
+);
+mprotect_shape_witness!(
+    production_mprotect_makes_rw_anonymous_rwx_and_calls_it,
+    3,
+    "As the R|X flip, with R|W|X."
+);
+mprotect_shape_witness!(
+    production_mprotect_spans_two_adjacent_vmas,
+    4,
+    "One mprotect across the boundary of two adjacent VMAs."
+);
+mprotect_shape_witness!(
+    production_mprotect_commits_then_flips_rx_inside_a_4gib_reservation,
+    5,
+    "V8's cage shape: 4 GiB reserve, 64 KiB commit RW, code, flip R|X, run.",
+    #[ignore = "#2722: the 4 GiB reserving mmap itself returns ENOMEM on the x86 pool"]
+);
+mprotect_shape_witness!(
     production_mprotect_commits_inside_a_16_mib_reservation,
     6,
     "Size probe: as the GiB reserve, at 16 MiB."
 );
-reservation_shape_witness!(
+mprotect_shape_witness!(
     production_mprotect_commits_inside_a_256_mib_reservation,
     7,
     "Size probe: as the GiB reserve, at 256 MiB."
 );
-reservation_shape_witness!(
+mprotect_shape_witness!(
     production_mprotect_commits_inside_a_gib_reservation_in_the_root,
     8,
-    "The GiB reserve issued by the run root, no fork."
+    "Size probe: the GiB reserve issued by the run root, no fork."
 );
-reservation_shape_witness!(
-    production_mprotect_commits_three_gib_into_a_4gib_reservation,
+mprotect_shape_witness!(
+    production_mprotect_flips_an_inherited_page_rx_with_the_parent_alive,
+    9,
+    "The parent maps RW and writes code before fork; the child flips the \
+     inherited page R|X and calls it while the parent waits; the parent's \
+     own copy stays writable."
+);
+mprotect_shape_witness!(
+    production_mprotect_commits_after_a_touch_then_flips_rx_in_a_reservation,
     10,
+    "A 16 MiB PROT_NONE reserve: commit RW and touch one part, commit RW \
+     elsewhere, write code there, flip R|X, call it."
+);
+mprotect_shape_witness!(
+    production_mprotect_widens_an_inherited_read_only_page_privately,
+    11,
+    "The parent makes a marked page R before fork; the child widens it to RW \
+     and overwrites it; the parent's marker is unchanged."
+);
+
+mprotect_shape_witness!(
+    production_mprotect_commits_three_gib_into_a_4gib_reservation,
+    16,
     "A 4 GiB reserve, 1 MiB committed RW 3 GiB into it."
 );
-reservation_shape_witness!(
+mprotect_shape_witness!(
     production_fork_child_runs_beside_a_parent_holding_a_4gib_reservation,
-    9,
+    15,
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
      committed page and the child reserves 1 GiB more."
 );
+mprotect_shape_witness!(
+    production_mprotect_sparse_minimal_to_none,
+    12,
+    "Protect both resident runs and their untouched gap."
+);
+mprotect_shape_witness!(
+    production_mprotect_sparse_chunk_to_none,
+    13,
+    "Protect a fully touched code run and header across guard holes."
+);
+mprotect_shape_witness!(
+    production_mprotect_sparse_chunk_to_rw,
+    14,
+    "Widen a sparse code chunk including its guard holes."
+);
+
+/// #2749 fatal 1: two threads of one forked child run `mmap`, first touch,
+/// `mprotect` and `munmap` at once on their shared MM. They contend for the
+/// MM's reservation root and descriptor editor. Contention is "not now": no
+/// call may come back as an errno, and none may leave the ring.
+#[test]
+#[ignore = "#2766: a fault crossing races the sibling's ring edit and the host owner fails the run"]
+fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
+    let elf = native_exit_fixture("native_child_threaded_mm.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 1 << 20, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("threaded mm run");
+    let counters = outcome.physical.syscall_counters().expect("counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    // x86 numbers: 9 mmap, 10 mprotect, 11 munmap.
+    let mm = |bucket: &[std::sync::atomic::AtomicU64]| [9, 10, 11].map(|nr| load(&bucket[nr]));
+    let leaves = counters.anonymous_leaves.each_ref().map(load);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "child exit (0 = Linux; else the first errno). mmap/mprotect/munmap served {:?} \
+         refused {:?} refused_child {:?}; anonymous leaves {leaves:?}",
+        mm(&counters.served),
+        mm(&counters.refused),
+        mm(&counters.refused_child),
+    );
+    assert_eq!(
+        [mm(&counters.refused), mm(&counters.refused_child)],
+        [[0; 3]; 2],
+        "mmap/mprotect/munmap refusals; anonymous leaves {leaves:?}"
+    );
+}
