@@ -49,6 +49,7 @@ surfaces = [
   { path = "crates/carrick-cli/src/debug_a64_census.rs", contracts = [] },
   { path = "crates/carrick-cli/src/debug_soft_run.rs", contracts = [] },
   { path = "crates/carrick-cli/src/debug_venue_gaps.rs", contracts = [] },
+  { path = "crates/carrick-cli/src/debug_discover.rs", contracts = [] },
   { path = "crates/carrick-cli/src/debug_zonedump.rs", contracts = [] },
   { path = "crates/carrick-cli/src/venue_gaps.rs", contracts = [] },
   { path = "crates/carrick-cli/tests/fixtures/x86_b1_files.S", contract = "kernel.native.host-file-venue" },
