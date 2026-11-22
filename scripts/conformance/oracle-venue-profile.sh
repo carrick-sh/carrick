@@ -62,11 +62,22 @@ CMD[shell]='apt-get update && apt-get install -y git gcc && cd /tmp && printf "i
 # `@calls[0, 41, 2, 2]: 1` and `@calls[1, 41, 1, 1]: 1` (x86_64 numbers).
 IMG[known-answer]=$PY
 CMD[known-answer]='exec python3 -c "import os,ctypes; l=ctypes.CDLL(None); l.syscall(511); l.socket(2, 2, 0); p=os.fork(); (l.syscall(510), l.syscall(510), l.socket(1, 1, 0), os._exit(0)) if p == 0 else os.waitpid(p, 0)"'
+# The bound known-answer row (not a parity row): a workload that outlives
+# VENUE_PROFILE_BOUND. Run with a short bound, the script must exit non-zero
+# within about the bound and leave no container behind.
+IMG[bound-hang]=$PY
+CMD[bound-hang]='exec sleep 1000000'
 ALL=(go-hello go-real pip npm shell)
 [ $# -gt 0 ] || set -- "${ALL[@]}"
 
 mkdir -p "$out"
 status=0
+# The live workload container: removed on any exit, so a Ctrl-C, a `set -e`
+# stop or a hung row never leaves Docker running into a carrick phase.
+live=""
+trap '[ -z "$live" ] || docker rm -f "$live" "$live-observer" > /dev/null 2>&1 || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for row in "$@"; do
   [ -n "${IMG[$row]:-}" ] || { echo "unknown row $row (rows: ${ALL[*]})" >&2; exit 2; }
   d="$out/$row"
@@ -74,13 +85,14 @@ for row in "$@"; do
   mkdir -p "$d"
   name="venue-profile-$row-$$"
   docker pull -q "${IMG[$row]}" > /dev/null
+  live=$name
   # The workload stops itself before the row command, so bpftrace attaches
   # first; docker-init is pid 1, so the row's shell (pid 2) can stop.
   docker run -d --init --name "$name" -e ROWCMD="${CMD[$row]}" "${IMG[$row]}" \
     sh -c 'kill -STOP $$; exec sh -c "$ROWCMD"' > /dev/null
   # The observer: the host's bpftrace, as root in the host's pid namespace.
   init_pid=$(docker inspect -f '{{.State.Pid}}' "$name")
-  docker run --rm --privileged --pid=host -v /:/host \
+  docker run --rm --name "$name-observer" --privileged --pid=host -v /:/host \
     -e INIT_PID="$init_pid" -e BOUND="$bound" -e ISA_CODE="$isa_code" -e BPFTRACE="$bpftrace_bin" \
     -e BT="$bt" -e PROFILE="$(cd "$d" && pwd -P)/profile.txt" \
     "${IMG[$row]}" chroot /host /bin/sh -c '
@@ -102,17 +114,34 @@ for row in "$@"; do
       grep -q "VENUEPROFILE1|ready" "$PROFILE" || { kill "$bt"; echo "VENUEPROFILE1|error=not-ready" >&2; exit 3; }
       kill -CONT "$root"
       wait "$bt"
-    ' || { status=1; echo "row $row: observer failed" >&2; docker kill "$name" > /dev/null 2>&1 || true; }
-  rc=$(docker wait "$name")
+    ' &
+  # In the background, so a signal to this script runs its trap now rather
+  # than after the observer returns.
+  wait "$!" || { status=1; echo "row $row: observer failed" >&2; docker kill "$name" > /dev/null 2>&1 || true; }
+  # bpftrace exits 0 at its bound (`error=bound`), so the observer's status
+  # alone never says the row finished: without the complete marker, the
+  # workload is killed rather than waited on.
+  if ! grep -q 'VENUEPROFILE1|complete' "$d/profile.txt" 2> /dev/null; then
+    echo "row $row: profile incomplete, killing the workload" >&2
+    status=1
+    docker kill "$name" > /dev/null 2>&1 || true
+  fi
+  # The workload has finished (complete) or been killed; the wait is bounded
+  # anyway, so no path waits on a live row.
+  if ! rc=$(timeout 60 docker wait "$name"); then
+    echo "row $row: docker wait did not return, removing the workload" >&2
+    status=1
+    rc=timeout
+  fi
   docker logs "$name" > "$d/workload.out" 2> "$d/workload.err" || true
-  docker rm -f "$name" > /dev/null
+  docker rm -f "$name" > /dev/null 2>&1 || true
+  live=""
   echo "$rc" > "$d/rc"
   {
     echo "row=$row isa=$isa image=${IMG[$row]}"
     echo "kernel=$(uname -r) docker=$(docker version -f '{{.Server.Version}}') bpftrace=$($bpftrace_bin -V)"
     echo "script_sha256=$(sha256sum "$bt" | cut -c1-64) head=$(git -C "$repo" rev-parse HEAD)"
   } > "$d/receipt.txt"
-  grep -q 'VENUEPROFILE1|complete' "$d/profile.txt" || { echo "row $row: profile incomplete" >&2; status=1; }
   echo "ROW $row isa=$isa rc=$rc profile=$d/profile.txt"
 done
 exit "$status"
