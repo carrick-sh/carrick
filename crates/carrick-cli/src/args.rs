@@ -1174,6 +1174,18 @@ pub(crate) enum DebugCommand {
         /// and a later carrick-only run in the same `--out` ranks against it.
         #[arg(long, requires = "oracle", conflicts_with_all = ["carrick", "reap"])]
         oracle_only: bool,
+        /// A row's native-oracle syscall profile, `<row>=<file>` (repeat the
+        /// flag; `scripts/conformance/oracle-venue-profile.sh` records one).
+        /// Each call shape the row makes natively that Carrick's static route
+        /// answers ENOSYS is ranked as `venue_gap`, for both ISAs: the stops
+        /// past the ones the runs reached (`carrick debug venue-gaps` prints
+        /// one row's full diff). Kept in `<out>/venue/` for `--report`.
+        #[arg(
+            long = "venue-profile",
+            value_name = "ROW=FILE",
+            conflicts_with = "report"
+        )]
+        venue_profiles: Vec<String>,
         /// Re-rank a finished `--out` directory without running anything.
         #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle", "oracle_only"])]
         report: bool,
