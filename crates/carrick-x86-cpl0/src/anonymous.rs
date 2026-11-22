@@ -676,11 +676,7 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
         let root = root.raw();
         let va = va.raw();
         let len = len.raw();
-        let Some(residency) = carrick_el1::isa::frame_grant_residency_guest()
-            .begin_retire_overlapping(mm.raw(), va, len)
-        else {
-            return Err(carrick_mmu_core::aarch64::GuestRetirementError::ResidencyBusy);
-        };
+        let residency = carrick_el1::memory::begin_guest_residency_retirement(mm, va, len)?;
         self.edit(
             RootGpa::page_aligned(FrameGpa::new(root))
                 .ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
@@ -693,6 +689,9 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
             return Err(carrick_mmu_core::aarch64::GuestRetirementError::RollbackFailed);
         }
         Ok(())
+    }
+    fn grow_residency(&mut self) -> bool {
+        carrick_el1::memory::grow_guest_residency()
     }
 }
 

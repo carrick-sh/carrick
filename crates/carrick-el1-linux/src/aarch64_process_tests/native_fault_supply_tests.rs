@@ -137,12 +137,15 @@ impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
             DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
             execute_descriptor_op,
         };
-        let Some(residency) =
-            self.residency
-                .begin_retire_overlapping(mm.raw(), address.raw(), len.raw())
-        else {
-            return Err(carrick_mmu_core::aarch64::GuestRetirementError::ResidencyBusy);
-        };
+        let residency = self
+            .residency
+            .begin_retire_overlapping(
+                mm.raw(),
+                address.raw(),
+                len.raw(),
+                carrick_el1_abi::SplitRowCustody::Reserved,
+            )
+            .map_err(carrick_el1::memory::residency_retirement_error)?;
         assert!(matches!(
             execute_descriptor_op(
                 self.words,

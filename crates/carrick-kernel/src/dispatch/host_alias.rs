@@ -161,9 +161,14 @@ impl HostAliasTransaction {
         mm_mutation::test_support::with_permit(coordinator, |permit| {
             self.claim_with_retirement(permit, |mm_key, start, len| {
                 residency
-                    .begin_retire_overlapping(mm_key, start, len)
+                    .begin_retire_overlapping(
+                        mm_key,
+                        start,
+                        len,
+                        carrick_el1_abi::SplitRowCustody::Declinable,
+                    )
                     .map(|retirement| Some(HostAliasResidencyRetirement::Borrowed(retirement)))
-                    .ok_or(())
+                    .map_err(|_| ())
             })
             .map(use_install)
         })

@@ -2489,7 +2489,12 @@ fn private_file_4k_grants_scale_past_initial_residency<
     // Explicit host munmap retirement through resolved segment aliases releases
     // all slots across every segment with zero leaked rows.
     let retirement = host_view
-        .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
+        .begin_retire_overlapping(
+            mm.raw(),
+            VA,
+            TOTAL_PAGES as u64 * 4096,
+            carrick_core_abi::mm::residency::SplitRowCustody::Declinable,
+        )
         .expect("no active transfer pins");
     assert!(retirement.commit());
     assert_eq!(host_view.observed_slots_used(), 0);
@@ -2781,7 +2786,12 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
     // retirement epoch advance and the exact untouched slot succeeds without growth.
     assert!(
         host_view
-            .begin_retire_overlapping(mm.raw(), VA, 4096)
+            .begin_retire_overlapping(
+                mm.raw(),
+                VA,
+                4096,
+                carrick_core_abi::mm::residency::SplitRowCustody::Declinable
+            )
             .expect("retire first page")
             .commit()
     );
@@ -2799,7 +2809,12 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
     // Full host retirement across both segments leaves zero live/leaked rows.
     assert!(
         host_view
-            .begin_retire_overlapping(mm.raw(), VA, TOTAL_PAGES as u64 * 4096)
+            .begin_retire_overlapping(
+                mm.raw(),
+                VA,
+                TOTAL_PAGES as u64 * 4096,
+                carrick_core_abi::mm::residency::SplitRowCustody::Declinable
+            )
             .expect("retire all segments")
             .commit()
     );

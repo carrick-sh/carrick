@@ -179,9 +179,7 @@ impl Drop for FrameGrantTransferPin<'_> {
 /// drops this token to reopen transfer admission without changing residency.
 pub struct FrameGrantResidencyRetirement<'a> {
     table: FrameGrantResidencyTable<ResidencyRows<'a>>,
-    mm_key: u64,
-    start: u64,
-    end: u64,
+    preclaim: ResidencyRetirementPreclaim,
     active: bool,
 }
 impl FrameGrantResidencyRetirement<'_> {
@@ -189,29 +187,67 @@ impl FrameGrantResidencyRetirement<'_> {
     /// Exact-MM exclusion makes a failed commit an invariant violation.
     #[must_use]
     pub fn commit(mut self) -> bool {
-        let committed = self
-            .table
-            .commit_retirement(self.mm_key, self.start, self.end);
         self.active = false;
-        committed
+        self.table.commit_retirement(self.preclaim)
     }
 
     /// Transfer the active preclaim to an owned host guard that retains the
     /// same resolved residency view until [`FrameGrantResidencyTable::commit_preclaimed_retirement`]
     /// or [`FrameGrantResidencyTable::cancel_preclaimed_retirement`] runs.
     #[must_use]
-    pub fn into_preclaimed_range(mut self) -> (u64, u64, u64) {
+    pub fn into_preclaim(mut self) -> ResidencyRetirementPreclaim {
         self.active = false;
-        (self.mm_key, self.start, self.end)
+        self.preclaim
     }
 }
 impl Drop for FrameGrantResidencyRetirement<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.table
-                .cancel_retirement(self.mm_key, self.start, self.end);
+            self.table.cancel_retirement(self.preclaim);
         }
     }
+}
+
+/// One admitted retirement: its range, and the slots reserved for the parts
+/// of the rows it splits. Only [`FrameGrantResidencyTable::begin_retire_overlapping`]
+/// makes one, and it is spent on the same resolved view by a commit or a
+/// cancel.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidencyRetirementPreclaim {
+    mm_key: u64,
+    start: u64,
+    end: u64,
+    /// The slot for the part below the range of the row that crosses its
+    /// start, and for the part above the range of the row that crosses its
+    /// end. Rows of one MM never overlap, so there is at most one of each.
+    lower: Option<usize>,
+    upper: Option<usize>,
+}
+
+/// What a retirement owes the parts of a split row that lie outside it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitRowCustody {
+    /// The row is its pages' custody record (an MM whose owner serves its
+    /// faults from this table). Each outside part has its slot reserved
+    /// before anything changes, or the retirement is refused with
+    /// [`ResidencyRetirementRefusal::Capacity`] and the caller grows the
+    /// table and reruns (#2813).
+    Reserved,
+    /// The venue keeps its own ledger and cannot grow the table (the host
+    /// venue): the row only accelerates. A part with no slot is declined, as
+    /// an initial publication at capacity is.
+    Declinable,
+}
+
+/// Why [`FrameGrantResidencyTable::begin_retire_overlapping`] changed nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyRetirementRefusal {
+    InvalidRange,
+    /// A grant-window lease holds a row the retirement would retire.
+    Leased,
+    /// No slot for a part of a split row that lies outside the retired
+    /// range. The table needs a segment.
+    Capacity,
 }
 
 /// Why [`FrameGrantResidencyTable::begin_replacement`] changed nothing.
@@ -1600,16 +1636,32 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
     /// Close transfer admission for every live row the descriptor retirement
     /// will replace. No row or committed bit changes until [`commit`](FrameGrantResidencyRetirement::commit),
     /// and dropping the token restores the exact preclaim state.
+    ///
+    /// A row the range splits keeps its parts outside the range: `custody`
+    /// says whether their slots are reserved here, so that the commit cannot
+    /// lose one, or whether a part without a slot is declined.
     pub fn begin_retire_overlapping(
         &self,
         mm_key: u64,
         start: u64,
         len: u64,
-    ) -> Option<FrameGrantResidencyRetirement<'_>> {
-        let end = start.checked_add(len)?;
+        custody: SplitRowCustody,
+    ) -> Result<FrameGrantResidencyRetirement<'_>, ResidencyRetirementRefusal> {
+        let Some(end) = start.checked_add(len) else {
+            return Err(ResidencyRetirementRefusal::InvalidRange);
+        };
         if mm_key == 0 || start >= end {
-            return None;
+            return Err(ResidencyRetirementRefusal::InvalidRange);
         }
+        let mut preclaim = ResidencyRetirementPreclaim {
+            mm_key,
+            start,
+            end,
+            lower: None,
+            upper: None,
+        };
+        let (cut_start, cut_end) = Self::retirement_cut(start, end);
+        let (mut below, mut above) = (None, None);
         for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
@@ -1633,25 +1685,64 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 )
                 .is_err()
             {
-                self.cancel_retirement(mm_key, start, end);
-                return None;
+                self.cancel_retirement(preclaim);
+                return Err(ResidencyRetirementRefusal::Leased);
             }
             if record.state.load(Ordering::Acquire) != state || record.identity() != identity {
                 record.transfer_pins.store(0, Ordering::Release);
-                self.cancel_retirement(mm_key, start, end);
-                return None;
+                self.cancel_retirement(preclaim);
+                return Err(ResidencyRetirementRefusal::Leased);
+            }
+            let base = identity.semantic_base;
+            let grant_end = base + identity.len;
+            if base < cut_start.min(grant_end) {
+                below = Some((base, cut_start.min(grant_end) - base));
+            }
+            if cut_end.max(base) < grant_end {
+                above = Some((cut_end.max(base), grant_end - cut_end.max(base)));
             }
         }
-        Some(FrameGrantResidencyRetirement {
+        for (upper, part) in [(false, below), (true, above)] {
+            let Some((base, len)) = part else {
+                continue;
+            };
+            let reserved = self.reserve_slot(mm_key, base, len);
+            if reserved.is_none() && custody == SplitRowCustody::Reserved {
+                self.cancel_retirement(preclaim);
+                return Err(ResidencyRetirementRefusal::Capacity);
+            }
+            if upper {
+                preclaim.upper = reserved;
+            } else {
+                preclaim.lower = reserved;
+            }
+        }
+        Ok(FrameGrantResidencyRetirement {
             table: self.storage.rows().as_table(),
-            mm_key,
-            start,
-            end,
+            preclaim,
             active: true,
         })
     }
 
-    fn cancel_retirement(&self, mm_key: u64, start: u64, end: u64) {
+    /// The page-aligned range a retirement of `[start, end)` removes.
+    fn retirement_cut(start: u64, end: u64) -> (u64, u64) {
+        (
+            start & !(GRANT_PAGE_SIZE - 1),
+            end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1),
+        )
+    }
+
+    fn cancel_retirement(&self, preclaim: ResidencyRetirementPreclaim) {
+        let ResidencyRetirementPreclaim {
+            mm_key,
+            start,
+            end,
+            lower,
+            upper,
+        } = preclaim;
+        for slot in [lower, upper].into_iter().flatten() {
+            self.release_reserved_slot(slot);
+        }
         for record in self.slots() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
@@ -1673,20 +1764,42 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         }
     }
 
-    /// Commit a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// Commit a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaim`]
     /// on the same resolved view.
     #[must_use]
-    pub fn commit_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
-        self.commit_retirement(mm_key, start, end)
+    pub fn commit_preclaimed_retirement(&self, preclaim: ResidencyRetirementPreclaim) -> bool {
+        self.commit_retirement(preclaim)
     }
 
-    /// Cancel a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaimed_range`]
+    /// Cancel a preclaim transferred via [`FrameGrantResidencyRetirement::into_preclaim`]
     /// on the same resolved view.
-    pub fn cancel_preclaimed_retirement(&self, mm_key: u64, start: u64, end: u64) {
-        self.cancel_retirement(mm_key, start, end);
+    pub fn cancel_preclaimed_retirement(&self, preclaim: ResidencyRetirementPreclaim) {
+        self.cancel_retirement(preclaim);
     }
 
-    fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
+    fn commit_retirement(&self, preclaim: ResidencyRetirementPreclaim) -> bool {
+        let ResidencyRetirementPreclaim {
+            mm_key,
+            start,
+            end,
+            mut lower,
+            mut upper,
+        } = preclaim;
+        let committed = self.commit_claimed_rows(mm_key, start, end, &mut lower, &mut upper);
+        for slot in [lower, upper].into_iter().flatten() {
+            self.release_reserved_slot(slot);
+        }
+        committed
+    }
+
+    fn commit_claimed_rows(
+        &self,
+        mm_key: u64,
+        start: u64,
+        end: u64,
+        lower: &mut Option<usize>,
+        upper: &mut Option<usize>,
+    ) -> bool {
         for (slot, record) in self.slots().enumerate() {
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK != GRANT_LIVE {
@@ -1696,7 +1809,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             if identity.mm_key == mm_key
                 && identity.semantic_base < end
                 && start < identity.semantic_base.saturating_add(identity.len)
-                && !self.retire_claimed_fragment(slot, identity, start, end)
+                && !self.retire_claimed_fragment(slot, identity, start, end, lower, upper)
             {
                 return false;
             }
@@ -1739,7 +1852,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         if !self.retire(slot, identity) {
             return false;
         }
-        self.publish_retirement_fragments(identity, bits, start, end);
+        self.publish_retirement_fragments(identity, bits, start, end, &mut None, &mut None);
         true
     }
 
@@ -1749,6 +1862,8 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         identity: FrameGrantResidencyIdentity,
         start: u64,
         end: u64,
+        lower: &mut Option<usize>,
+        upper: &mut Option<usize>,
     ) -> bool {
         let Some((record, dirty)) = self.slot_entry(slot) else {
             return false;
@@ -1779,33 +1894,40 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             .directory
             .retirement_epoch
             .fetch_add(1, Ordering::Release);
-        self.publish_retirement_fragments(identity, bits, start, end);
+        self.publish_retirement_fragments(identity, bits, start, end, lower, upper);
         true
     }
 
+    /// Republish the parts of the retired row `identity` outside
+    /// `[start, end)`, each into the slot its admission reserved. A part
+    /// with no reserved slot (a [`SplitRowCustody::Declinable`] admission, or
+    /// a retirement that took none) takes one now, or is declined.
     fn publish_retirement_fragments(
         &self,
         identity: FrameGrantResidencyIdentity,
         bits: [u64; 8],
         start: u64,
         end: u64,
+        lower: &mut Option<usize>,
+        upper: &mut Option<usize>,
     ) {
         let base = identity.semantic_base;
         let grant_end = base + identity.len;
-        let cut_start = start & !(GRANT_PAGE_SIZE - 1);
-        let cut_end = end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1);
-        for (fragment_start, fragment_end) in [
-            (base, cut_start.min(grant_end)),
-            (cut_end.max(base), grant_end),
+        let (cut_start, cut_end) = Self::retirement_cut(start, end);
+        for (fragment_start, fragment_end, reserved) in [
+            (base, cut_start.min(grant_end), lower),
+            (cut_end.max(base), grant_end, upper),
         ] {
             if fragment_start >= fragment_end {
                 continue;
             }
-            if let Some(fragment_slot) = self.reserve_slot(
-                identity.mm_key,
-                fragment_start,
-                fragment_end - fragment_start,
-            ) {
+            if let Some(fragment_slot) = reserved.take().or_else(|| {
+                self.reserve_slot(
+                    identity.mm_key,
+                    fragment_start,
+                    fragment_end - fragment_start,
+                )
+            }) {
                 self.write_fragment(fragment_slot, identity, bits, fragment_start, fragment_end);
             }
         }
@@ -1891,13 +2013,102 @@ mod tests {
         // exact row makes its slot available to the next request.
         let stale = table.lookup(first.mm_key, first.semantic_base).unwrap();
         let retirement = table
-            .begin_retire_overlapping(first.mm_key, first.semantic_base, first.len)
+            .begin_retire_overlapping(
+                first.mm_key,
+                first.semantic_base,
+                first.len,
+                SplitRowCustody::Reserved,
+            )
             .unwrap();
         assert!(retirement.commit());
         assert_eq!(table.try_publish(next), Ok(stale.slot));
         assert!(!table.record_commit(stale));
         assert!(table.is_guest_committed(first.mm_key, first.semantic_base + GRANT_PAGE_SIZE));
         assert!(!table.is_guest_committed(next.mm_key, next.semantic_base));
+    }
+
+    /// #2813: a retirement that splits a row never loses the parts outside
+    /// the retired range. A hole in the middle of a 16-page row needs two
+    /// slots (the old row keeps its own until the commit) and the table has
+    /// none: the admission refuses with `Capacity` and changes nothing. With
+    /// room, the same retirement publishes both parts with their committed
+    /// bits, and a dropped admission returns its reserved slots.
+    #[test]
+    fn retirement_reserves_a_split_rows_parts_or_changes_nothing() {
+        let table = table();
+        let row = identity();
+        let pages = row.len / GRANT_PAGE_SIZE;
+        table.publish(row).unwrap();
+        for page in 0..pages {
+            let page = table
+                .lookup(row.mm_key, row.semantic_base + page * GRANT_PAGE_SIZE)
+                .unwrap();
+            assert!(table.record_commit(page));
+        }
+        // Every other slot holds a one-page row of the same MM.
+        const FILLER_BASE: u64 = 0x1_0000_0000;
+        for index in 0..64 * table.slot_capacity() as u64 {
+            if table.observed_slots_used() == table.slot_capacity() {
+                break;
+            }
+            let _ = table.publish(FrameGrantResidencyIdentity {
+                semantic_base: FILLER_BASE + index * GRANT_PAGE_SIZE,
+                physical_ipa: 0x00a0_0000_0000 + index * GRANT_PAGE_SIZE,
+                len: GRANT_PAGE_SIZE,
+                ..row
+            });
+        }
+        assert_eq!(table.observed_slots_used(), table.slot_capacity());
+
+        let hole = row.semantic_base + 4 * GRANT_PAGE_SIZE;
+        let hole_len = 4 * GRANT_PAGE_SIZE;
+        assert_eq!(
+            table
+                .begin_retire_overlapping(row.mm_key, hole, hole_len, SplitRowCustody::Reserved)
+                .err(),
+            Some(ResidencyRetirementRefusal::Capacity)
+        );
+        for page in 0..pages {
+            assert!(
+                table.is_guest_committed(row.mm_key, row.semantic_base + page * GRANT_PAGE_SIZE),
+                "page {page} lost its row to a refused retirement"
+            );
+        }
+        let whole = table.lookup(row.mm_key, row.semantic_base).unwrap();
+        assert_eq!(whole.identity, row);
+        assert!(table.pin_transfer(whole).is_some(), "admission reopened");
+        assert_eq!(table.observed_slots_used(), table.slot_capacity());
+
+        // Room: every filler retires. An admission that is dropped changes
+        // nothing and keeps no slot.
+        assert!(table.retire_overlapping(row.mm_key, FILLER_BASE, 1 << 40));
+        let used = table.observed_slots_used();
+        drop(
+            table
+                .begin_retire_overlapping(row.mm_key, hole, hole_len, SplitRowCustody::Reserved)
+                .unwrap(),
+        );
+        assert_eq!(table.observed_slots_used(), used);
+        assert_eq!(table.lookup(row.mm_key, hole).unwrap().identity, row);
+
+        let retirement = table
+            .begin_retire_overlapping(row.mm_key, hole, hole_len, SplitRowCustody::Reserved)
+            .unwrap();
+        assert!(retirement.commit());
+        for page in 0..pages {
+            let va = row.semantic_base + page * GRANT_PAGE_SIZE;
+            if (4..8).contains(&page) {
+                assert!(
+                    table.lookup(row.mm_key, va).is_none(),
+                    "page {page} retired"
+                );
+                continue;
+            }
+            let part = table.lookup(row.mm_key, va).unwrap();
+            assert_eq!(part.expected_ipa, row.physical_ipa + page * GRANT_PAGE_SIZE);
+            assert!(table.is_guest_committed(row.mm_key, va), "page {page}");
+        }
+        assert_eq!(table.observed_slots_used(), used + 1, "one row became two");
     }
 
     #[test]
@@ -1918,8 +2129,10 @@ mod tests {
                     identity.mm_key,
                     identity.semantic_base + GRANT_PAGE_SIZE,
                     2 * GRANT_PAGE_SIZE,
+                    SplitRowCustody::Reserved,
                 )
-                .is_none(),
+                .err()
+                == Some(ResidencyRetirementRefusal::Leased),
             "a live transfer must refuse before descriptor retirement"
         );
         drop(pin);
@@ -1929,6 +2142,7 @@ mod tests {
                 identity.mm_key,
                 identity.semantic_base + GRANT_PAGE_SIZE,
                 2 * GRANT_PAGE_SIZE,
+                SplitRowCustody::Reserved,
             )
             .unwrap();
         assert!(
@@ -1946,6 +2160,7 @@ mod tests {
                 identity.mm_key,
                 identity.semantic_base + GRANT_PAGE_SIZE,
                 2 * GRANT_PAGE_SIZE,
+                SplitRowCustody::Reserved,
             )
             .unwrap();
         assert!(retirement.commit());
@@ -2021,14 +2236,24 @@ mod tests {
         let pin = view.pin_transfer(last).expect("exact extension pin");
         let len = (FRAME_GRANT_RESIDENCY_SLOTS + 1) as u64 * GRANT_PAGE_SIZE;
         assert!(
-            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
-                .is_none()
+            view.begin_retire_overlapping(
+                first.mm_key,
+                first.semantic_base,
+                len,
+                SplitRowCustody::Reserved
+            )
+            .is_err()
         );
         drop(pin);
         assert!(
-            view.begin_retire_overlapping(first.mm_key, first.semantic_base, len)
-                .expect("pins released across both segments")
-                .commit()
+            view.begin_retire_overlapping(
+                first.mm_key,
+                first.semantic_base,
+                len,
+                SplitRowCustody::Reserved
+            )
+            .expect("pins released across both segments")
+            .commit()
         );
         assert_eq!(view.observed_slots_used(), 0);
         assert!(view.pin_transfer(last).is_none());
@@ -2213,7 +2438,12 @@ mod tests {
         let epoch_before_bulk = host_view.retirement_epoch();
         assert!(
             host_view
-                .begin_retire_overlapping(first.mm_key, first.semantic_base, total_len)
+                .begin_retire_overlapping(
+                    first.mm_key,
+                    first.semantic_base,
+                    total_len,
+                    SplitRowCustody::Reserved
+                )
                 .expect("retire across bootstrap and dynamic segments")
                 .commit()
         );

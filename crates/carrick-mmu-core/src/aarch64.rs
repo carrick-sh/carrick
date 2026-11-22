@@ -791,6 +791,10 @@ pub enum GuestRetirementError {
     NotPrivateAnonymous,
     /// A live grant-window transfer still holds residency publication.
     ResidencyBusy,
+    /// The range splits a residency row and the table has no slot for a
+    /// part that stays. Nothing changed: the caller releases the MM editor,
+    /// grows the table and reruns (#2813).
+    ResidencyCapacity,
     /// A failed retirement could not restore its pre-image: editor
     /// exclusion was violated and the MM's table graph is indeterminate.
     RollbackFailed,

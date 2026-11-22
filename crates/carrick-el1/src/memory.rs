@@ -604,6 +604,14 @@ pub trait AnonymousPermissionEditor {
 pub trait AnonymousRetirementEditor {
     fn bind_resident_edit(&mut self, _generation: AnonymousEditGeneration) {}
 
+    /// Grow the residency table by one segment after a retirement answered
+    /// [`GuestRetirementError::ResidencyCapacity`]. The caller holds no MM
+    /// editor. `true` means rerun the retirement: a segment was published,
+    /// or another CPU is publishing one.
+    fn grow_residency(&mut self) -> bool {
+        false
+    }
+
     fn retire_and_invalidate(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -644,6 +652,48 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
     }
 }
 
+/// Why a retirement's residency admission refused, as its editor reports it.
+pub fn residency_retirement_error(
+    refusal: carrick_core_abi::mm::residency::ResidencyRetirementRefusal,
+) -> GuestRetirementError {
+    use carrick_core_abi::mm::residency::ResidencyRetirementRefusal as Refusal;
+    match refusal {
+        Refusal::Capacity => GuestRetirementError::ResidencyCapacity,
+        Refusal::InvalidRange | Refusal::Leased => GuestRetirementError::ResidencyBusy,
+    }
+}
+
+/// Admit an in-ring retirement of `[address, address + len)` on the guest's
+/// residency table. The MM's owner serves its faults from these rows, so the
+/// parts of a split row are reserved before any leaf changes.
+#[cfg(target_os = "none")]
+pub fn begin_guest_residency_retirement(
+    mm: carrick_el1_abi::ReservationMm,
+    address: u64,
+    len: u64,
+) -> Result<
+    carrick_core_abi::mm::residency::FrameGrantResidencyRetirement<'static>,
+    GuestRetirementError,
+> {
+    crate::isa::frame_grant_residency_guest()
+        .begin_retire_overlapping(
+            mm.raw(),
+            address,
+            len,
+            carrick_core_abi::mm::residency::SplitRowCustody::Reserved,
+        )
+        .map_err(residency_retirement_error)
+}
+
+/// Grow the guest's residency table by one segment, outside any MM editor.
+#[cfg(target_os = "none")]
+pub fn grow_guest_residency() -> bool {
+    carrick_core::mm::frames::grow_residency_for_cow(
+        crate::isa::frame_grant_residency_guest(),
+        &crate::alloc::GLOBAL_ALLOCATOR,
+    )
+}
+
 #[cfg(target_os = "none")]
 pub struct HardwareAnonymousRetirementEditor;
 
@@ -659,13 +709,7 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         let ttbr0 = ttbr0.raw();
         let address = address.raw();
         let len = len.raw();
-        let Some(residency) = crate::isa::frame_grant_residency_guest().begin_retire_overlapping(
-            mm.raw(),
-            address,
-            len,
-        ) else {
-            return Err(GuestRetirementError::ResidencyBusy);
-        };
+        let residency = begin_guest_residency_retirement(mm, address, len)?;
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
@@ -688,6 +732,9 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(())
+    }
+    fn grow_residency(&mut self) -> bool {
+        grow_guest_residency()
     }
 }
 
@@ -1227,6 +1274,9 @@ impl AnonymousRetirementEditor for HardwareAnonymousEditor {
     ) -> Result<(), GuestRetirementError> {
         HardwareAnonymousRetirementEditor.retire_and_invalidate(mm, ttbr0, address, len)
     }
+    fn grow_residency(&mut self) -> bool {
+        grow_guest_residency()
+    }
 }
 
 /// Where a delegated MM's anonymous syscall went.
@@ -1517,6 +1567,17 @@ pub fn serve_delegated_anonymous<
     )
 }
 
+/// Whether one delegated attempt may ask for a larger residency table.
+enum ResidencyGrowth {
+    /// A retirement with no slot for a split row's part asks, changing
+    /// nothing.
+    Available,
+    /// The attempt released every guard and asks for one segment.
+    Needed,
+    /// The table cannot grow: the retirement is refused through the root.
+    Refused,
+}
+
 #[inline(never)]
 fn serve_delegated_anonymous_for_origin<
     E: AnonymousDescriptorEditor,
@@ -1530,6 +1591,48 @@ fn serve_delegated_anonymous_for_origin<
     table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     editor: &mut E,
     mapping: NativeMapping,
+) -> DelegatedAnonymous {
+    let mut growth = ResidencyGrowth::Available;
+    loop {
+        let outcome = serve_delegated_anonymous_attempt(
+            frame,
+            counters,
+            current,
+            spaces,
+            table,
+            editor,
+            mapping,
+            &mut growth,
+        );
+        // The attempt changed nothing and holds no guard (its outcome is
+        // not an answer): grow outside the MM editor and rerun against the
+        // larger table. A table that cannot grow reruns once to refuse.
+        if !matches!(growth, ResidencyGrowth::Needed) {
+            return outcome;
+        }
+        growth = if editor.grow_residency() {
+            ResidencyGrowth::Available
+        } else {
+            ResidencyGrowth::Refused
+        };
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn serve_delegated_anonymous_attempt<
+    E: AnonymousDescriptorEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &mut (impl AnonymousCallView + ?Sized),
+    counters: &carrick_el1_abi::Counters,
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    editor: &mut E,
+    mapping: NativeMapping,
+    growth: &mut ResidencyGrowth,
 ) -> DelegatedAnonymous {
     let nr = frame.canonical().raw();
     let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
@@ -1815,6 +1918,18 @@ fn serve_delegated_anonymous_for_origin<
                 Err(GuestRetirementError::RollbackFailed) => {
                     panic!("EL1 anonymous retirement rollback failed")
                 }
+                // No leaf and no row changed. Undo this attempt's proposal
+                // and release both guards before the table grows.
+                Err(GuestRetirementError::ResidencyCapacity)
+                    if matches!(growth, ResidencyGrowth::Available) =>
+                {
+                    model.release_return(slot);
+                    let _ = pending.cancel(&mut model);
+                    drop(_editor_guard);
+                    drop(model);
+                    *growth = ResidencyGrowth::Needed;
+                    return DelegatedAnonymous::Forward;
+                }
                 Err(_) => {
                     model.release_return(slot);
                     return refuse(pending, &mut model, Leave::EditRefused);
@@ -1951,7 +2066,9 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
             GuestRetirementError::TableOutsidePrimary
             | GuestRetirementError::MissingTable
             | GuestRetirementError::NotPrivateAnonymous
-            | GuestRetirementError::ResidencyBusy,
+            | GuestRetirementError::ResidencyBusy
+            // The host venue retires the range on its own ledger.
+            | GuestRetirementError::ResidencyCapacity,
         ) => MunmapDisposition::Forward,
         Err(GuestRetirementError::RollbackFailed) => {
             panic!("EL1 anonymous retirement rollback failed")
@@ -2553,6 +2670,10 @@ mod tests {
             runs: Option<&'static [(u64, u64)]>,
             calls: Vec<Call>,
             sequences: Vec<ReservationSequence>,
+            /// How many retirements still answer `ResidencyCapacity`.
+            retire_capacity: usize,
+            grow_refused: bool,
+            growths: usize,
         }
         impl Editor {
             fn over(backing: RangeBacking) -> Self {
@@ -2564,6 +2685,9 @@ mod tests {
                     runs: None,
                     calls: Vec::new(),
                     sequences: Vec::new(),
+                    retire_capacity: 0,
+                    grow_refused: false,
+                    growths: 0,
                 }
             }
         }
@@ -2638,10 +2762,18 @@ mod tests {
                 let address = address.raw();
                 let len = len.raw();
                 self.calls.push(Call::Retire(ttbr0, address, len));
+                if self.retire_capacity > 0 {
+                    self.retire_capacity -= 1;
+                    return Err(GuestRetirementError::ResidencyCapacity);
+                }
                 if let Some(live) = &self.live {
                     live.retire(*self.sequences.last().unwrap(), address, len);
                 }
                 Ok(())
+            }
+            fn grow_residency(&mut self) -> bool {
+                self.growths += 1;
+                !self.grow_refused
             }
         }
 
@@ -3702,6 +3834,72 @@ mod tests {
                 counters.forwarded[SYS_MUNMAP as usize].load(Ordering::Relaxed),
                 0
             );
+        }
+
+        /// #2813: a resident retirement that splits a residency row, with no
+        /// slot for a part that stays, changes nothing: the table grows and
+        /// the same call reruns (capacity once, then success). A table that
+        /// cannot grow refuses through the root, which is unchanged.
+        #[test]
+        fn delegated_retirement_without_a_residency_slot_grows_the_table_and_reruns() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                mmap_fixed(ARENA, 0x4000),
+            );
+            let mut editor = Editor::over(RangeBacking::Private);
+            editor.retire_capacity = 1;
+            let (route, result) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MUNMAP,
+                [ARENA + 0x1000, 0x1000, 0, 0, 0, 0],
+            );
+            assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+            assert_eq!(editor.growths, 1);
+            let retire = Call::Retire(task.ttbr0, ARENA + 0x1000, 0x1000);
+            assert_eq!(
+                editor.calls.iter().filter(|call| **call == retire).count(),
+                2,
+                "the refused retirement reran once"
+            );
+            {
+                let mut model = root(&spaces, &table, &task);
+                assert_eq!(model.mapping(ARENA + 0x1000), None);
+                assert_eq!(owed_returns(&model).len(), 1, "one retirement, one return");
+            }
+            assert_eq!(
+                counters.served[SYS_MUNMAP as usize].load(Ordering::Relaxed),
+                1
+            );
+
+            let mut stuck = Editor::over(RangeBacking::Private);
+            stuck.retire_capacity = usize::MAX;
+            stuck.grow_refused = true;
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut stuck,
+                SYS_MUNMAP,
+                [ARENA + 0x3000, 0x1000, 0, 0, 0, 0],
+            );
+            assert_eq!(route, DelegatedAnonymous::Forward);
+            assert_eq!(stuck.growths, 1, "a refused growth is not asked again");
+            let mut model = root(&spaces, &table, &task);
+            assert!(model.mapping(ARENA + 0x3000).is_some());
+            assert_eq!(owed_returns(&model).len(), 1);
         }
 
         #[test]

@@ -535,9 +535,16 @@ where
             // one guest operation under the caller's exact-MM editor. Host
             // custody retains both backing owners until this receipt settles.
             let cow_retirement = if let DescriptorOp::CowRepoint { va, len, .. } = txn.op {
-                match residency.begin_retire_overlapping(mm_key, va, len) {
-                    Some(retirement) => Some(retirement),
-                    None => {
+                // The carrier submitted this repoint and keeps its own
+                // ledger: a split row's part with no slot is declined.
+                match residency.begin_retire_overlapping(
+                    mm_key,
+                    va,
+                    len,
+                    carrick_core_abi::mm::residency::SplitRowCustody::Declinable,
+                ) {
+                    Ok(retirement) => Some(retirement),
+                    Err(_) => {
                         let receipt = claimed.complete(
                             DescriptorOutcome::Refused(DescriptorRefusal::Contended),
                             invalidate_asid,
