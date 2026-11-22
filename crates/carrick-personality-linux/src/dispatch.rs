@@ -279,6 +279,13 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn resumes_operation(&self) -> bool {
         false
     }
+    /// Rewind the unchanged call onto its syscall instruction, so the guest
+    /// makes it again once this venue's work boundary has settled the owed
+    /// host work. `false`: the venue has another replay (ARM's
+    /// `ForwardOriginal` boundary) or none.
+    fn rerun_after_owed_work(&mut self) -> bool {
+        false
+    }
     fn ipc_available(&self) -> bool {
         false
     }
@@ -2598,6 +2605,123 @@ mod ring_first_tests {
         );
         assert_eq!(pending.result, 123);
         assert!(pending.state.has_pending_host_work());
+    }
+
+    /// A venue whose reservation owner serves `brk` whenever it is offered
+    /// the call, and whose host work is the task's real doorbell word.
+    struct OwedWorkVenue {
+        set: HostCrossingSet,
+        state: crate::abi::entry::LinuxTaskState,
+        result: i64,
+        reruns: u32,
+        refused: AtomicU64,
+    }
+    impl<'a> PendingFamilies<'a> for OwedWorkVenue {
+        fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+            match self.set {
+                HostCrossingSet::X86 => carrick_guest_arch::GuestIsa::X86_64,
+                HostCrossingSet::Aarch64 => carrick_guest_arch::GuestIsa::Aarch64,
+            }
+        }
+        fn binding(&self) -> Option<ExecutionBinding> {
+            Some(ExecutionBinding {
+                task: EntryTaskKey::from_raw(1),
+                generation: SnapshotGeneration::from_raw(1),
+                mm: EntryMmKey::from_raw(1),
+                thread_generation: EntryThreadGeneration::from_raw(1),
+            })
+        }
+        fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
+            Some(&self.state)
+        }
+        fn crossing_set(&self) -> HostCrossingSet {
+            self.set
+        }
+        fn ring_first_strict(&self) -> bool {
+            true
+        }
+        fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
+            Some(carrick_syscall_abi::NativeNr(match self.set {
+                HostCrossingSet::X86 => 12,
+                HostCrossingSet::Aarch64 => 214,
+            }))
+        }
+        fn record_refusal(&self, _: usize) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        fn anonymous(&mut self, _: AnonymousCall) -> FamilyCompletion {
+            self.result = 0x4000_0000;
+            FamilyCompletion::Complete(self.result)
+        }
+        fn rerun_after_owed_work(&mut self) -> bool {
+            if self.set == HostCrossingSet::X86 {
+                self.reruns += 1;
+                true
+            } else {
+                false
+            }
+        }
+        fn original_argument0(&self) -> u64 {
+            0
+        }
+        fn install_result(&mut self, result: SyscallResult) {
+            self.result = result.raw();
+        }
+    }
+
+    /// #2731: the first call an exec'd image makes arrives with host work
+    /// owed. A `brk` declined for that work is "not now": the venue settles
+    /// the work and the guest makes the unchanged call again. It is never
+    /// answered ENOSYS and never counted as a refusal.
+    #[test]
+    fn brk_declined_for_owed_work_is_rerun_not_refused() {
+        const UNTOUCHED: i64 = 77;
+        // Canonical `brk`, as `AnonymousCall::from_canonical` names it.
+        let brk = 214;
+        for set in [HostCrossingSet::X86, HostCrossingSet::Aarch64] {
+            let mut venue = OwedWorkVenue {
+                set,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                result: UNTOUCHED,
+                reruns: 0,
+                refused: AtomicU64::new(0),
+            };
+            venue.state.mark_pending_host_work();
+            assert_eq!(
+                dispatch(brk, 0, &mut venue),
+                CompletionRoute::WithWork,
+                "{set:?}: a decline for owed work settles the work first"
+            );
+            assert_eq!(
+                venue.result, UNTOUCHED,
+                "{set:?}: the declined call has no result"
+            );
+            assert_eq!(venue.refused.load(Ordering::Relaxed), 0, "{set:?}");
+            let boundary = venue.state.take_served_boundary();
+            match set {
+                HostCrossingSet::X86 => {
+                    assert_eq!(venue.reruns, 1, "x86 rewinds onto its SYSCALL");
+                    assert_eq!(
+                        boundary,
+                        Some(crate::abi::entry::ServedBoundary::Completed),
+                        "the x86 work port settles and replays nothing"
+                    );
+                }
+                HostCrossingSet::Aarch64 => {
+                    assert_eq!(venue.reruns, 0);
+                    assert_eq!(
+                        boundary,
+                        Some(crate::abi::entry::ServedBoundary::ForwardOriginal { x0: 0 }),
+                        "ARM's boundary re-enters the original call"
+                    );
+                }
+            }
+            // The boundary took the doorbell: the rerun finds no owed work.
+            assert!(venue.state.take_host_work_doorbell().is_some());
+            assert_eq!(dispatch(brk, 0, &mut venue), CompletionRoute::Served);
+            assert_eq!(venue.result, 0x4000_0000, "{set:?}: then success");
+            assert_eq!(venue.refused.load(Ordering::Relaxed), 0, "{set:?}");
+        }
     }
 
     #[test]
