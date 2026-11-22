@@ -14,26 +14,31 @@ struct NativeWriteVenue<'a> {
     slots: &'a MmPortalSlots,
     prepared: carrick_el1::fault::X86PreparedResolver<'a, InitialWords>,
     cow: carrick_el1_linux::cow_resolver::X86CowResolver<'a, InitialWords>,
-    /// This venue's `supply_cow` crossed, so the host holds a COW grant as
-    /// pending on this CPU until this CPU rings its settlement.
-    grant_pending: bool,
 }
 impl NativeWriteVenue<'_> {
-    /// Ring this CPU's settlement crossing once its own supplied grant can
-    /// be settled. The host holds a supplied grant as pending on the CPU
-    /// that asked for it, and reads that CPU's next owner-grant crossing as
-    /// its settlement: a selection that resolved a COW must ring it before
-    /// any later crossing asks for a new supply. The pool's completions are
-    /// MM-wide, so a sibling's completion alone never rings it: the host
-    /// has nothing pending for this CPU then (#2716).
-    fn settle_cow_grant(&mut self, handle: carrick_el1_abi::El1MmHandle) {
-        if self.grant_pending && self.pool.has_completions_for(handle.mm().raw()) {
-            carrick_x86_carrier::entry::cross_owner_grant(
-                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-                self.address,
-            );
-            self.grant_pending = false;
+    /// Ring the settlement of this MM's copy-on-write completions. A
+    /// completion is the MM's, in its pool, and the carrier settles every
+    /// one of the MM under one exclusion: whichever member sees one rings,
+    /// from either CPU, a sibling's completion included (#2749). One still
+    /// in the pool after the crossing means the carrier met the MM's editor
+    /// held on the other CPU: the copy is contended, and its retry rings
+    /// again.
+    fn settle_cow_grants(
+        &mut self,
+        handle: carrick_el1_abi::El1MmHandle,
+    ) -> Result<(), NativeProcessError> {
+        let mm = handle.mm().raw();
+        if !self.pool.has_completions_for(mm) {
+            return Ok(());
         }
+        carrick_x86_carrier::entry::cross_owner_grant(
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+            self.address,
+        );
+        if self.pool.has_completions_for(mm) {
+            return Err(NativeProcessError::Busy);
+        }
+        Ok(())
     }
 }
 impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
@@ -51,17 +56,15 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         }
     }
     fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
-        self.settle_cow_grant(request.handle);
-        Ok(())
+        self.settle_cow_grants(request.handle)
     }
     /// A preparation resolves the same COW grants as a write (#2716): it
-    /// owes the host the same settlement before it returns.
+    /// rings the same settlement before it returns.
     fn settle_preparation(
         &mut self,
         target: &carrick_core::mm::transaction::UserWriteTarget,
     ) -> Result<(), Self::Error> {
-        self.settle_cow_grant(target.handle);
-        Ok(())
+        self.settle_cow_grants(target.handle)
     }
     fn supply_cow(
         &mut self,
@@ -75,11 +78,28 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         {
             return Err(NativeProcessError::Busy);
         }
+        // The crossing names the selected page: a copy that spans pages
+        // may need its grant for a later page than the one it starts on.
         carrick_x86_carrier::entry::cross_owner_grant(
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-            self.address,
+            UserVa::new(window.fault_page),
         );
-        self.grant_pending = true;
+        // The carrier met this MM's editor held on the other CPU and
+        // supplied nothing: the selection is still this CPU's. Withdraw it;
+        // the copy is contended, not failed.
+        let slot = self
+            .slots
+            .grant(usize::from(self.slot.raw()))
+            .ok_or(NativeProcessError::Stale)?;
+        if let Some((_, unserved)) =
+            slot.pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
+        {
+            return Err(if slot.take_cow_fault_selection(unserved) {
+                NativeProcessError::Busy
+            } else {
+                NativeProcessError::Stale
+            });
+        }
         Ok(())
     }
     fn supply_backing(
@@ -185,7 +205,6 @@ impl Service {
                 residency,
                 completion: None,
             },
-            grant_pending: false,
         };
         #[cfg(feature = "test-support")]
         let held = crate::test_support::hold_editor_for_early_release(self.task);
