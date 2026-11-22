@@ -1,3 +1,11 @@
+# #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
+# (enter_mm_executor_then_register, the leased-root check and
+# open_first_address_space) and the stopped zone-slot publication move to
+# carrick-kernel dispatch/carrier_loop.rs; the retained lifecycle slab walk,
+# dedup, publication and retirement move to dispatch/carrier_lifecycle.rs
+# behind carrick-hal retained_metadata (HVF keeps a thin adapter). Probes,
+# error states, gate semantics and the HVF fatal are unchanged; this
+# contract's semantics, bindings and work budgets are unchanged.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.

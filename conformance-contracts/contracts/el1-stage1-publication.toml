@@ -1,3 +1,11 @@
+# #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
+# (enter_mm_executor_then_register, the leased-root check and
+# open_first_address_space) and the stopped zone-slot publication move to
+# carrick-kernel dispatch/carrier_loop.rs; the retained lifecycle slab walk,
+# dedup, publication and retirement move to dispatch/carrier_lifecycle.rs
+# behind carrick-hal retained_metadata (HVF keeps a thin adapter). Probes,
+# error states, gate semantics and the HVF fatal are unchanged; this
+# contract's semantics, bindings and work budgets are unchanged.
 # #2480 slice 1 (N1 vocabulary): aarch64::LeafAccess moved verbatim into the
 # neutral carrick-mmu-core stage1 module (crates/carrick-mmu-core/src/stage1.rs)
 # and aarch64.rs re-exports it; x86::descriptor_txn::Access is now the same

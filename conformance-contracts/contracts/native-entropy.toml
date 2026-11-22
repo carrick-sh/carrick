@@ -2,6 +2,12 @@
 # "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
 # reruns the fork. Witnesses are bound under kernel.el1.fork-cow.
 # This family's contract expectations, bindings and budgets are unchanged.
+# #2645 slice A: behaviour-preserving move of the HVF BIND/open helpers,
+# stopped zone-slot publication and retained lifecycle publication into
+# carrick-kernel dispatch/{carrier_loop,carrier_lifecycle}.rs behind
+# carrick-hal retained_metadata. Probes, error states and gate semantics are
+# unchanged; this contract's semantics, bindings and work budgets are
+# unchanged.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.

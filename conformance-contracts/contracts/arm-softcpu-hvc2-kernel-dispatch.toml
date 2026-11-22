@@ -1,3 +1,9 @@
+# #2645 slice A: behaviour-preserving move of the HVF BIND/open helpers,
+# stopped zone-slot publication and retained lifecycle publication into
+# carrick-kernel dispatch/{carrier_loop,carrier_lifecycle}.rs behind
+# carrick-hal retained_metadata. Probes, error states and gate semantics are
+# unchanged; this contract's semantics, bindings and work budgets are
+# unchanged.
 schema_version = 1
 id = "arm.softcpu.hvc2-kernel-dispatch"
 title = "Serve single-process soft AArch64 HVC #2 syscalls through production kernel dispatch"
