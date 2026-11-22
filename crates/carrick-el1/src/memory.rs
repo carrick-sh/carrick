@@ -3442,7 +3442,9 @@ mod tests {
                 .0,
                 DelegatedAnonymous::Served
             );
-            // A shared file mapping is never served from a private source.
+            // A writable shared file mapping is never served from a private
+            // source (the read-only one is: see
+            // `read_only_shared_file_mapping_is_served_and_stays_unwritable`).
             let (route, _) = syscall_with_file(
                 &delegated,
                 &spaces,
@@ -3450,7 +3452,7 @@ mod tests {
                 &counters,
                 &mut editor,
                 SYS_MMAP,
-                [0, 0x1000, PROT_READ, MAP_SHARED, 3, 0],
+                [0, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0],
                 Some(source),
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
