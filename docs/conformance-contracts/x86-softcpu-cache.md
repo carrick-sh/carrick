@@ -15,8 +15,9 @@ A TLB miss authenticates the frame again through the walker: remaps, local
 invalidation, CR3 changes and domain shootdowns cannot reuse stale authority.
 Generation changes invalidate alias writes. Clearing or retiring a code page
 also refuses reuse. Debug single-instruction policy and caller block limits
-participate in cache identity. The cache owns at most 1,024 immutable RX blocks;
-one-at-a-time eviction occurs between blocks. Shared plans avoid copying decoded vectors on
+participate in cache identity. The cache owns at most `X86_RESIDENCY` immutable
+RX blocks (16,384 blocks and 64 MiB of mappings, #2717); one-at-a-time eviction
+occurs between blocks. Shared plans avoid copying decoded vectors on
 hits. No executable pointer survives its owning cache entry.
 
 Host fixture writes use the typed physical host-copy API, which authenticates
@@ -70,12 +71,16 @@ the invalidation completion does not cancel the published debt; activation
 retires no backing storage. Publication exhaustion makes the domain terminal.
 Repeated activation of an already active frame publishes no new invalidation.
 
-The cache is a keyed map with 1,024 resident translations and one-at-a-time FIFO
-eviction. A changed code incarnation replaces the existing key and its RX owner
-in place. FIFO order contains each resident key once. The capacity is bounded
-independently of execution count, and eviction happens between block executions.
-The capacity witness fills 1,025 distinct keys and verifies the second key stays
-resident after the oldest is evicted. This replaces the reviewed 128-entry full-clear policy.
+The cache is a keyed map bounded by the owner's `ResidencyBudget` (block count
+and code bytes) with one-at-a-time use-aware (CLOCK) eviction, shared with the
+AArch64 soft CPU in `carrick-softmmu::block_cache`; see
+[`softcpu-code-residency.md`](softcpu-code-residency.md). A changed code
+incarnation replaces the existing key and its RX owner in place. The clock holds
+each resident key once. The capacity is bounded independently of execution
+count, and eviction happens between block executions. The capacity witness
+fills one more distinct key than the block budget and verifies exactly one
+eviction and that the second key stays resident. This replaced a 1,024-entry
+FIFO, which replaced the reviewed 128-entry full-clear policy.
 
 The additional contracts `x86.softcpu.cache-hot-set` and
 `x86.softcpu.cache-smc` preserve the original unchanged-loop limits rather than
