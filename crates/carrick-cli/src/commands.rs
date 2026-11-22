@@ -942,6 +942,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 results.as_deref(),
                 refusals,
             )?,
+            DebugCommand::VenueGaps {
+                profiles,
+                census,
+                all,
+            } => crate::debug_venue_gaps::run_venue_gaps(&profiles, &census, all)?,
             DebugCommand::Zonedump {
                 run_id,
                 post_mortem,

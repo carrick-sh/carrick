@@ -173,6 +173,13 @@ pub(crate) fn run_debug(
                 refusals,
             )?;
         }
+        DebugCommand::VenueGaps {
+            profiles,
+            census,
+            all,
+        } => {
+            crate::debug_venue_gaps::run_venue_gaps(&profiles, &census, all)?;
+        }
         DebugCommand::Zonedump {
             run_id,
             post_mortem,

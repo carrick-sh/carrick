@@ -1,0 +1,222 @@
+/*
+ * The native oracle's syscall and argument-shape profile of one workload,
+ * split by caller: the run root (the workload's first process, threads and
+ * exec included) and every forked descendant (a native child under Carrick).
+ * `carrick debug venue-gaps` reads the map dump and diffs it against
+ * Carrick's routing for a root and for a native child (#1906).
+ *
+ * Run it in the privileged Docker observer, Docker-only phase (never beside
+ * carrick), with tracefs mounted and --pid=host, as
+ * `scripts/conformance/oracle-venue-profile.sh` does:
+ *   bpftrace -B line oracle-venue-profile.bt <stopped-root-tid> <bound-seconds> <isa>
+ * where <isa> is 0 for x86_64 and 1 for aarch64 (the native numbers differ).
+ * Resume the root only after VENUEPROFILE1|ready.
+ *
+ * Scope follows oracle-syscall-mix.bt: TIDs from sched_process_fork, the root
+ * is the stopped TID's thread group. raw_syscalls supplies native numbers.
+ * Count-only instrumentation perturbs timing; nothing here is speed evidence.
+ *
+ * Keys are [caller, native nr, s0, s1]: caller 0 is the root, 1 a child.
+ * s0 and s1 are the arguments that pick Carrick's route (mmap flags and prot,
+ * socket domain and type, fcntl command, ...); 0 for calls without a shape.
+ * @calls counts entries, @enosys returns of -38 and @errors other errors.
+ * @unentered[caller, nr, ret] counts exits with no traced entry: calls that
+ * Docker's seccomp profile refused (seccomp runs before sys_enter fires),
+ * plus the root's one kill() that stopped it before tracing began.
+ */
+
+BEGIN
+{
+    @tracked[$1] = 1;
+    @started = nsecs;
+    printf("VENUEPROFILE1|ready|root=%d|isa=%d\n", $1, $3);
+}
+
+tracepoint:sched:sched_process_fork
+/@tracked[args->parent_pid]/
+{
+    @tracked[args->child_pid] = 1;
+}
+
+tracepoint:raw_syscalls:sys_enter
+/@tracked[tid]/
+{
+    $nr = (int64)args->id;
+    $isa = (int64)$3;
+    $a0 = (uint64)args->args[0];
+    $a1 = (uint64)args->args[1];
+    $a2 = (uint64)args->args[2];
+    $a3 = (uint64)args->args[3];
+    $a4 = (uint64)args->args[4];
+    $s0 = (uint64)0;
+    $s1 = (uint64)0;
+    /* mmap: route-picking flags, prot (+0x100 when a file backs it) */
+    if (($isa == 0 && ($nr == 9)) || ($isa == 1 && ($nr == 222))) {
+        $s0 = $a3 & 0x1ff133;
+        $s1 = $a2 & 0xf;
+    }
+    /* mprotect prot, madvise advice, msync flags */
+    if (($isa == 0 && ($nr == 10 || $nr == 28 || $nr == 26)) || ($isa == 1 && ($nr == 226 || $nr == 233 || $nr == 227))) {
+        $s0 = $a2;
+    }
+    /* mremap flags */
+    if (($isa == 0 && ($nr == 25)) || ($isa == 1 && ($nr == 216))) {
+        $s0 = $a3;
+    }
+    /* ioctl request, fcntl command */
+    if (($isa == 0 && ($nr == 16 || $nr == 72)) || ($isa == 1 && ($nr == 29 || $nr == 25))) {
+        $s0 = $a1 & 0xffffffff;
+    }
+    /* socket, socketpair: domain, base type */
+    if (($isa == 0 && ($nr == 41 || $nr == 53)) || ($isa == 1 && ($nr == 198 || $nr == 199))) {
+        $s0 = $a0;
+        $s1 = $a1 & 0xf;
+    }
+    /* setsockopt, getsockopt: level, option */
+    if (($isa == 0 && ($nr == 54 || $nr == 55)) || ($isa == 1 && ($nr == 208 || $nr == 209))) {
+        $s0 = $a1;
+        $s1 = $a2;
+    }
+    /* futex command without FUTEX_PRIVATE_FLAG */
+    if (($isa == 0 && ($nr == 202)) || ($isa == 1 && ($nr == 98))) {
+        $s0 = $a1 & 0xff7f;
+    }
+    /* clone flags without the exit signal */
+    if (($isa == 0 && ($nr == 56)) || ($isa == 1 && ($nr == 220))) {
+        $s0 = $a0 & 0xffffff00;
+    }
+    /* prctl option, x86 arch_prctl code */
+    if (($isa == 0 && ($nr == 157 || $nr == 158)) || ($isa == 1 && ($nr == 167))) {
+        $s0 = $a0;
+    }
+    /* clock_gettime, clock_getres, clock_nanosleep, timerfd_create: clock */
+    if (($isa == 0 && ($nr == 228 || $nr == 229 || $nr == 230 || $nr == 283)) || ($isa == 1 && ($nr == 113 || $nr == 114 || $nr == 115 || $nr == 85))) {
+        $s0 = $a0;
+    }
+    /* fadvise64 advice */
+    if (($isa == 0 && ($nr == 221)) || ($isa == 1 && ($nr == 223))) {
+        $s0 = $a3;
+    }
+    /* epoll_ctl op */
+    if (($isa == 0 && ($nr == 233)) || ($isa == 1 && ($nr == 21))) {
+        $s0 = $a1;
+    }
+    /* openat: access mode, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_PATH, O_TMPFILE */
+    if (($isa == 0 && ($nr == 257)) || ($isa == 1 && ($nr == 56))) {
+        $s0 = $a2 & 0x630043;
+    }
+    /* x86 open: the same flags */
+    if (($isa == 0 && ($nr == 2))) {
+        $s0 = $a1 & 0x630043;
+    }
+    /* select, pselect6: nfds */
+    if (($isa == 0 && ($nr == 23 || $nr == 270)) || ($isa == 1 && ($nr == 72))) {
+        $s0 = $a0;
+    }
+    /* poll, ppoll: nfds */
+    if (($isa == 0 && ($nr == 7 || $nr == 271)) || ($isa == 1 && ($nr == 73))) {
+        $s0 = $a1;
+    }
+    /* wait4 options */
+    if (($isa == 0 && ($nr == 61)) || ($isa == 1 && ($nr == 260))) {
+        $s0 = $a2;
+    }
+    /* waitid idtype */
+    if (($isa == 0 && ($nr == 247)) || ($isa == 1 && ($nr == 95))) {
+        $s0 = $a0;
+    }
+    /* prlimit64 resource */
+    if (($isa == 0 && ($nr == 302)) || ($isa == 1 && ($nr == 261))) {
+        $s0 = $a1;
+    }
+    /* pipe2, eventfd2 flags */
+    if (($isa == 0 && ($nr == 293 || $nr == 290)) || ($isa == 1 && ($nr == 59 || $nr == 19))) {
+        $s0 = $a1;
+    }
+    /* getrandom flags */
+    if (($isa == 0 && ($nr == 318)) || ($isa == 1 && ($nr == 278))) {
+        $s0 = $a2;
+    }
+    /* sendmsg, recvmsg flags */
+    if (($isa == 0 && ($nr == 46 || $nr == 47)) || ($isa == 1 && ($nr == 211 || $nr == 212))) {
+        $s0 = $a2;
+    }
+    /* sendmmsg, recvmmsg flags */
+    if (($isa == 0 && ($nr == 307 || $nr == 299)) || ($isa == 1 && ($nr == 269 || $nr == 243))) {
+        $s0 = $a3;
+    }
+    if ((($isa == 0 && $nr == 9) || ($isa == 1 && $nr == 222)) && $a4 != 0xffffffffffffffff && $a4 != 0xffffffff) {
+        $s1 = $s1 | 0x100;
+    }
+    $caller = (uint64)1;
+    if (pid == $1) {
+        $caller = (uint64)0;
+    }
+    @calls[$caller, $nr, $s0, $s1] = count();
+    @key0[tid] = $s0;
+    @key1[tid] = $s1;
+    @keynr[tid] = $nr;
+    @active[tid] = 1;
+}
+
+tracepoint:raw_syscalls:sys_exit
+/@tracked[tid]/
+{
+    $caller = (uint64)1;
+    if (pid == $1) {
+        $caller = (uint64)0;
+    }
+    if (@active[tid]) {
+        if (args->ret == -38) {
+            @enosys[$caller, @keynr[tid], @key0[tid], @key1[tid]] = count();
+        } else if (args->ret < 0 && args->ret > -4096) {
+            @errors[$caller, @keynr[tid], @key0[tid], @key1[tid]] = count();
+        }
+        delete(@active[tid]);
+    } else {
+        /* An exit without an entry: a call seccomp refused before the entry
+         * tracepoint (Docker's default profile), or the root's own kill()
+         * that stopped it before tracing began. Keyed by return value. */
+        @unentered[$caller, args->id, args->ret] = count();
+    }
+}
+
+tracepoint:sched:sched_process_exit
+/@tracked[tid] && tid != $1/
+{
+    delete(@tracked[tid]);
+    if (has_key(@active, tid)) {
+        delete(@active[tid]);
+    }
+    if (has_key(@keynr, tid)) {
+        delete(@key0[tid]);
+        delete(@key1[tid]);
+        delete(@keynr[tid]);
+    }
+}
+
+tracepoint:sched:sched_process_exit
+/tid == $1/
+{
+    delete(@tracked[tid]);
+    printf("VENUEPROFILE1|complete|root=%d\n", $1);
+    exit();
+}
+
+interval:s:1
+/nsecs - @started > (uint64)$2 * 1000000000/
+{
+    printf("VENUEPROFILE1|error=bound\n");
+    exit();
+}
+
+/* Maps print once at natural termination; drop the bookkeeping first. */
+END
+{
+    delete(@started);
+    clear(@tracked);
+    clear(@active);
+    clear(@key0);
+    clear(@key1);
+    clear(@keynr);
+}

@@ -1120,6 +1120,23 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         refusals: bool,
     },
+    /// Diff native-oracle syscall profiles (`scripts/conformance/oracle-venue-profile.sh`)
+    /// against Carrick's routing for the run root and a native child, on
+    /// both ISAs: one table per workload of the calls Carrick would answer
+    /// ENOSYS (#1906). `--census` adds the counted refusals of a Carrick
+    /// run of the same workload.
+    VenueGaps {
+        /// `profile.txt` files, one per workload (`<out>/<row>/profile.txt`).
+        #[arg(required = true)]
+        profiles: Vec<PathBuf>,
+        /// EL1 census JSON files or directories from a Carrick run of the
+        /// same workloads (`CARRICK_EL1_CENSUS`).
+        #[arg(long)]
+        census: Vec<PathBuf>,
+        /// List every shape, not only the gaps.
+        #[arg(long)]
+        all: bool,
+    },
     /// Print one carrier's in-guest scheduler zone: slots with their run
     /// queues, the idle and queued slot maps, futex buckets and object wait
     /// queues (head, tail, epoch), every record in use (claim, tid, mm, and
