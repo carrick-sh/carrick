@@ -926,6 +926,12 @@ impl ServiceNotice {
         }
         Err(ServiceNoticeBusy::Corrupt)
     }
+    /// Whether an untaken selector is published, whichever record it names.
+    /// Zero stores. The lane that published it owes the carrier an exit (or
+    /// a host-work mark): nothing else announces a notice.
+    pub fn is_published(&self) -> bool {
+        self.record.load(Ordering::Acquire) != 0
+    }
     /// Whether the notice still names `record`'s untaken selector. Zero
     /// stores: a publisher that parked first probes once here, so a selector
     /// carrier intake already took (or is taking) needs no further doorbell.

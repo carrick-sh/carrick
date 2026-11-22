@@ -6956,6 +6956,9 @@ mod native_child_tid_cow {
             memory: &'a Memory,
             pool: &'a CowGrantPool,
             residency: &'a FrameGrantResidencyTable,
+            /// The next resolution is refused: the selection fails after
+            /// its supply crossed.
+            refuse: bool,
         }
         impl CowResolver for TypedCow<'_> {
             fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
@@ -6967,6 +6970,12 @@ mod native_child_tid_cow {
                 mm: u64,
                 far: u64,
             ) -> carrick_el1::fault::CowResolution {
+                if self.refuse {
+                    return carrick_el1::fault::handle_cow_outcome(
+                        Err(carrick_el1::cow::CowError::Refused),
+                        &mut None,
+                    );
+                }
                 let words = self.arena.words();
                 let outcome = resolve_guest_cow(
                     &GuestCowVenue {
@@ -6991,6 +7000,7 @@ mod native_child_tid_cow {
             spaces: &'a AddressSpaces,
             refuse: bool,
             no_progress: bool,
+            select_fails: bool,
             supplied: usize,
             copied: usize,
             settled: usize,
@@ -7029,6 +7039,7 @@ mod native_child_tid_cow {
                     return if self.supplied <= 2 { Ok(()) } else { Err(()) };
                 }
                 self.cow.pool.publish(MM, GRANT, backing()).unwrap();
+                self.cow.refuse = self.select_fails;
                 Ok(())
             }
             fn copy(
@@ -7049,7 +7060,12 @@ mod native_child_tid_cow {
                 true
             }
         }
-        for (refuse, no_progress) in [(true, false), (false, true), (false, false)] {
+        for (refuse, no_progress, select_fails) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
             let (arena, memory) = forked(true);
             let parent = memory.page(OLD);
             let pool = CowGrantPool::new();
@@ -7068,11 +7084,13 @@ mod native_child_tid_cow {
                     memory: &memory,
                     pool: &pool,
                     residency: &residency,
+                    refuse: false,
                 },
                 prepared: NoopPreparedResolver,
                 spaces: &spaces,
                 refuse,
                 no_progress,
+                select_fails,
                 supplied: 0,
                 copied: 0,
                 settled: 0,
@@ -7094,12 +7112,22 @@ mod native_child_tid_cow {
                     Err(UserWriteError::Mechanics(()))
                 } else if no_progress {
                     Err(UserWriteError::Busy)
+                } else if select_fails {
+                    Err(UserWriteError::Owner(
+                        carrick_core::mm::transaction::MmError::Core,
+                    ))
                 } else {
                     Ok(())
                 }
             );
             assert_eq!(venue.supplied, 1);
-            assert_eq!(venue.copied, usize::from(!refuse && !no_progress));
+            assert_eq!(
+                venue.copied,
+                usize::from(!refuse && !no_progress && !select_fails)
+            );
+            // Every selection is followed by the venue's settlement, the one
+            // that fails after its supply crossed included (#2716): the host
+            // holds that supply's grant as pending until it is rung.
             assert_eq!(venue.settled, if refuse { 1 } else { 2 });
             assert_eq!(
                 pool.declined()[CowDecline::PoolEmpty as usize],
@@ -7107,7 +7135,7 @@ mod native_child_tid_cow {
             );
             assert_eq!(pool.ready(MM + 1).count(), 1);
             assert_eq!(memory.page(OLD), parent, "the parent bytes remain private");
-            if !refuse && !no_progress {
+            if !refuse && !no_progress && !select_fails {
                 assert_eq!(&memory.page(GRANT)[..4], &tid);
             }
         }

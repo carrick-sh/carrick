@@ -3175,6 +3175,66 @@ fn production_initial_stack_grows_below_the_built_pages() {
     );
 }
 
+/// #2716: a kernel copy-out resolves a fork parent's copy-on-write with a
+/// host grant (`prepare_user_write`), and the parent's next user-mode store
+/// to another inherited page needs a grant of its own. The copy-out's
+/// preparation path never rang its settlement crossing, so the host still
+/// held that CPU's grant as pending and read the user fault's supply request
+/// as the missing settlement: it supplied nothing, the rerun found the pool
+/// empty, and the carrier refused the fault (`reason 9`, glibc's first
+/// `printf` after a `read`). Two live processes: the child is blocked on a
+/// pipe while the parent copies and stores, and checks its own pages after.
+#[test]
+fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
+    let elf = native_exit_fixture("native_fork_parent_copyout_then_store.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    // The loaded CPU runs the parent through the fork, the copy-out and the
+    // store, so one CPU's grant custody sees all three.
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_LOADED)
+        .expect("fork parent copy-out then store run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_fork_parent_copyout_then_store.S): {:?}",
+        outcome.run
+    );
+}
+
+/// #2716 (review P0): the host holds a supplied COW grant as pending on the
+/// CPU that asked for it, so only that CPU's member may ring its settlement.
+/// A sibling's kernel copy that rang it for the MM's completion found nothing
+/// pending on its own CPU and no selection, and the carrier died with `owner
+/// fault selection absent`. Two live threads and two live processes: the
+/// worker is held between its COW completion and its settlement while the
+/// leader `read(2)`s into another copy-on-write page, whose preparation
+/// selects before the leader's CPU has asked the host for anything.
+#[test]
+fn production_sibling_copy_leaves_another_cpus_cow_settlement_alone() {
+    let elf = native_exit_fixture("native_cow_sibling_copy_settle.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("sibling copy during a held COW settlement run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_cow_sibling_copy_settle.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
@@ -6113,6 +6173,44 @@ fn production_sched_yield_hands_the_cpu_to_a_queued_sibling() {
          93: a clone's exit was not observed (see native_yield_sibling_progress.S): {:?}",
         outcome.run
     );
+}
+
+/// #2749 fatal 3 on x86: five threads of the root share two guest CPUs. The
+/// root and three workers make no call but `sched_yield`, while one worker
+/// is parked on a futex the yielders wake. Every yield returns 0, the park
+/// ends, and the workers' raw
+/// exits and the root's `exit_group` (with `LIVE_YIELDER`, beside a worker
+/// still yielding) end the run. The ARM scheduler's version of this yield
+/// reported a switch it had not made and killed the carrier.
+#[test]
+fn production_sched_yield_spinners_let_parked_root_siblings_finish() {
+    let bound = format!("-DBOUND_TICKS={}", 5 * tsc_ticks_per_second());
+    for flags in [vec![bound.as_str()], vec![bound.as_str(), "-DLIVE_YIELDER"]] {
+        let elf = native_exit_fixture_with_flags("native_yield_spin_parked_siblings.S", &flags);
+        let dir = tempfile::tempdir().expect("oracle directory");
+        let oracle = dir.path().join("oracle");
+        carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+        let native = std::process::Command::new("timeout")
+            .args(["20", "taskset", "-c", "0"])
+            .arg(&oracle)
+            .output()
+            .expect("Linux oracle");
+        assert_eq!(
+            native.status.code(),
+            Some(0),
+            "native Linux oracle {flags:?}"
+        );
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, 1 << 16, ROOT_AFFINITY_LOADED)
+            .unwrap_or_else(|error| panic!("yield spinners {flags:?}: {error:?}"));
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.terminating_signal),
+            (0, None),
+            "91: the parks did not end within 5 s; 93: a worker's exit was not observed; \
+             94: a yield returned nonzero; 95 or 96: a park failed \
+             (see native_yield_spin_parked_siblings.S) {flags:?}: {:?}",
+            outcome.run
+        );
+    }
 }
 
 /// A full journal held by exited children must reclaim their fork quarantine

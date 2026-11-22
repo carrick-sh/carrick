@@ -3724,6 +3724,63 @@ fn arm_empty_pool_clone_wait_leaves_sibling_running() {
     assert_eq!(clone_rc, 44);
 }
 
+/// A clone that waits for stock published its carrier-work notice with no
+/// doorbell, so the vCPU owes the carrier an exit (#2749: the root of a
+/// yield-spinning ladder waited seconds per clone). A runnable sibling queued
+/// behind the caller must not take that exit away: nothing else tells the
+/// carrier the notice exists while the sibling keeps the vCPU in the ring.
+#[test]
+fn arm_empty_pool_clone_behind_a_ready_sibling_leaves_for_the_carrier() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    // A second live thread of the root, ready at EL0 on the root's own run
+    // queue (a preempted yield spinner).
+    let ready_control = publish_host_born_sibling_only(f, 45);
+    let (ready, _ready_cpu) =
+        adopt_host_sibling_on_slot(h.env, SlotId::new(3), ready_control, false);
+    f.zone
+        .leave_guest(SlotId::new(3), &carrick_sched_core::ShortLockSpin);
+    let mut handed = None;
+    f.zone
+        .drain_slot(SlotId::new(3), &mut |record, _| handed = Some(record));
+    assert_eq!(handed.map(|record| record.id), Some(ready));
+    f.zone.unhome(SlotId::new(3), ready, 1);
+    f.zone
+        .place_from_host(ready)
+        .expect("the ready sibling is placed");
+    assert!(
+        matches!(f.zone.record(ready).claim(), carrick_sched_core::Claim::Queued { slot, .. } if slot == SlotId::new(0)),
+        "the ready sibling waits on the root's run queue: {:?}",
+        f.zone.record(ready).claim()
+    );
+
+    let caller = f.zone.slot(SlotId::new(0)).current().unwrap();
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, _, _) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert!(
+        h.env.tasks[0].service_notice.names_record(caller),
+        "the waiting clone published its carrier work"
+    );
+    assert_eq!(
+        (route, f.zone.slot(SlotId::new(0)).current()),
+        (
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            None
+        ),
+        "the vCPU leaves for the carrier with the notice; the sibling stays queued"
+    );
+    assert!(matches!(
+        f.zone.record(ready).claim(),
+        carrick_sched_core::Claim::Queued { slot, .. } if slot == SlotId::new(0)
+    ));
+}
+
 /// Lost wakeup: stock that lands after the clone observed the empty pool but
 /// before the host consumed its request is not missed; the rerun after the
 /// carrier's reply probes the pool again.

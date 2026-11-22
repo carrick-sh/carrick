@@ -14,6 +14,27 @@ struct NativeWriteVenue<'a> {
     slots: &'a MmPortalSlots,
     prepared: carrick_el1::fault::X86PreparedResolver<'a, InitialWords>,
     cow: carrick_el1_linux::cow_resolver::X86CowResolver<'a, InitialWords>,
+    /// This venue's `supply_cow` crossed, so the host holds a COW grant as
+    /// pending on this CPU until this CPU rings its settlement.
+    grant_pending: bool,
+}
+impl NativeWriteVenue<'_> {
+    /// Ring this CPU's settlement crossing once its own supplied grant can
+    /// be settled. The host holds a supplied grant as pending on the CPU
+    /// that asked for it, and reads that CPU's next owner-grant crossing as
+    /// its settlement: a selection that resolved a COW must ring it before
+    /// any later crossing asks for a new supply. The pool's completions are
+    /// MM-wide, so a sibling's completion alone never rings it: the host
+    /// has nothing pending for this CPU then (#2716).
+    fn settle_cow_grant(&mut self, handle: carrick_el1_abi::El1MmHandle) {
+        if self.grant_pending && self.pool.has_completions_for(handle.mm().raw()) {
+            carrick_x86_carrier::entry::cross_owner_grant(
+                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+                self.address,
+            );
+            self.grant_pending = false;
+        }
+    }
 }
 impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
     type Prepared = carrick_el1::fault::X86PreparedResolver<'a, InitialWords>;
@@ -30,12 +51,16 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         }
     }
     fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
-        if self.pool.has_completions_for(request.handle.mm().raw()) {
-            carrick_x86_carrier::entry::cross_owner_grant(
-                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-                self.address,
-            );
-        }
+        self.settle_cow_grant(request.handle);
+        Ok(())
+    }
+    /// A preparation resolves the same COW grants as a write (#2716): it
+    /// owes the host the same settlement before it returns.
+    fn settle_preparation(
+        &mut self,
+        target: &carrick_core::mm::transaction::UserWriteTarget,
+    ) -> Result<(), Self::Error> {
+        self.settle_cow_grant(target.handle);
         Ok(())
     }
     fn supply_cow(
@@ -54,6 +79,7 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
             self.address,
         );
+        self.grant_pending = true;
         Ok(())
     }
     fn supply_backing(
@@ -159,6 +185,7 @@ impl Service {
                 residency,
                 completion: None,
             },
+            grant_pending: false,
         };
         #[cfg(feature = "test-support")]
         let held = crate::test_support::hold_editor_for_early_release(self.task);

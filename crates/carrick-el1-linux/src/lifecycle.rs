@@ -75,6 +75,17 @@ impl<
         (venue.binding() == binding).then_some(venue)
     }
 
+    /// A native transfer parked the caller with nothing on the vCPU: run a
+    /// thread already ready on this run queue instead of leaving for the
+    /// host, unless the park published this lane's service notice.
+    ///
+    /// A notice published at a syscall entry has no doorbell: the park's
+    /// `Left` is its carrier exit (`EntryExitVenue::DirectCarrierExit`), the
+    /// only thing that brings the carrier to intake. Switching a ready
+    /// sibling in here took that exit away, and a sibling that never leaves
+    /// the ring (a `sched_yield` spinner) kept the request unserved until an
+    /// unrelated exit (#2749). The ready threads stay queued; the vCPU's
+    /// next entry runs them.
     fn run_ready_after_native_transfer(&mut self, outcome: &mut LifecycleOutcome) {
         if let LifecycleOutcome::Transferred { progress, .. } = outcome
             && matches!(progress, carrick_core::Served::Idle)
@@ -92,6 +103,9 @@ impl<
                         super::dispatch::NativeInvariant::EntryBinding,
                     )
                 });
+                if task.service_notice.is_published() {
+                    return;
+                }
                 if let Some(ready) =
                     native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
                         .run_ready(frame)
@@ -354,30 +368,7 @@ impl<
         options: LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         let mut outcome = self.process_venue()?.waitid(id, info, options);
-        if let LifecycleOutcome::Transferred { progress, .. } = &mut outcome
-            && matches!(progress, carrick_core::Served::Idle)
-        {
-            let task_index = self.frame.task_index();
-            let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                let slot = slot.unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
-                    *progress = ready;
-                }
-            }
-        }
+        self.run_ready_after_native_transfer(&mut outcome);
         Some(outcome)
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
