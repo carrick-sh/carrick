@@ -590,7 +590,7 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             .iter()
             .map(|(name, count)| format!("{name}: {count}"))
             .collect();
-        out.push_str(&format!("\nAnonymous mm leaves: {}\n", leaves.join(", ")));
+        out.push_str(&format!("\nanonymous leaves: {}\n", leaves.join(", ")));
     }
     out
 }
@@ -1172,10 +1172,17 @@ mod tests {
             );
             let table = render_table(&aggregate, 10);
             assert!(
-                table.contains("Anonymous mm leaves: root_declined: 6, root_unavailable_busy: 2"),
+                table.contains("anonymous leaves: root_declined: 6, root_unavailable_busy: 2"),
                 "{table}"
             );
         }
+        // Every variant is named once, in ordinal order.
+        for (index, why) in AnonymousLeave::ALL.into_iter().enumerate() {
+            assert_eq!(why as usize, index);
+        }
+        let names: std::collections::BTreeSet<_> =
+            AnonymousLeave::ALL.map(AnonymousLeave::name).into();
+        assert_eq!(names.len(), AnonymousLeave::COUNT);
     }
 
     #[test]
