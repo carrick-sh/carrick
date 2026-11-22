@@ -17,7 +17,13 @@
 //!   implemented`, `... (38)`), a wrong-errno candidate;
 //! - every contention leave the census counted (`anonymous_leaves`,
 //!   `ipc_leaves`);
-//! - a timeout, a nonzero exit, or a missing success marker.
+//! - a timeout, a nonzero exit, or a missing success marker;
+//! - for a run past its timeout, what the hung carrier was doing: its live
+//!   `carrick debug zonedump` (parked records' saved syscalls, vCPUs and
+//!   tasks holding unserved host work), read before the kill, since a killed
+//!   carrier writes no census;
+//! - with `--oracle`, each stage that passes at 5x the native Docker
+//!   oracle's time or more (`pathological_time`).
 //!
 //! The output is one ranked table (instance, ISA, row, stage, kind, site,
 //! count, runs, real values) in `<out>/table.md` and `<out>/table.json`, and
@@ -162,6 +168,9 @@ pub(crate) enum FindingKind {
     Panic,
     CarrierError,
     Timeout,
+    /// What a carrier past its stage timeout was doing: its scheduler zone,
+    /// read live through `carrick debug zonedump` before the kill.
+    Hang,
     /// A stage that passes, but at a pathological multiple of the native
     /// Docker oracle's time (`--oracle`): structurally wrong work.
     Pathological,
@@ -181,6 +190,7 @@ impl FindingKind {
             Self::Panic => "panic",
             Self::CarrierError => "carrier_error",
             Self::Timeout => "timeout",
+            Self::Hang => "hang",
             Self::Pathological => "pathological_time",
             Self::Refused => "refused",
             Self::GuestErrno => "guest_errno",
@@ -529,6 +539,103 @@ pub(crate) struct Ending {
     pub(crate) exit_code: Option<i32>,
     pub(crate) signal: Option<i32>,
     pub(crate) timed_out: bool,
+}
+
+/// The value of `key=` in a zonedump line: up to the next space, or up to
+/// the closing bracket of a `[...]` list.
+fn token<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!(" {key}=");
+    let start = if let Some(rest) = line.strip_prefix(&needle[1..]) {
+        line.len() - rest.len()
+    } else {
+        line.find(&needle)? + needle.len()
+    };
+    let rest = &line[start..];
+    let end = if rest.starts_with('[') {
+        rest.find(']').map_or(rest.len(), |i| i + 1)
+    } else {
+        rest.find(' ').unwrap_or(rest.len())
+    };
+    Some(&rest[..end])
+}
+
+/// Findings from a hung carrier's zonedump (`carrick debug zonedump
+/// --run-id`, taken at the stage timeout before the kill): every parked
+/// record's saved syscall, every vCPU and task that holds host work nobody
+/// served. A dump that read no zone is one site, so a hang never reads as
+/// "no evidence" silently.
+pub(crate) fn hang_findings(isa: RowIsa, zonedump: &str) -> Vec<Finding> {
+    let census_isa = match isa {
+        RowIsa::Arm64 => CensusIsa::Aarch64,
+        RowIsa::X86_64 => CensusIsa::X86_64,
+    };
+    let mut by_site: BTreeMap<String, Finding> = BTreeMap::new();
+    let mut add = |site: String, value: String| {
+        let entry = by_site
+            .entry(site.clone())
+            .or_insert_with(|| Finding::new(FindingKind::Hang, site, 0));
+        entry.count += 1;
+        push_value(&mut entry.values, value);
+    };
+    let mut read_zone = false;
+    for line in zonedump.lines().map(str::trim) {
+        read_zone |= line.starts_with("zone slot ");
+        if line.starts_with("zone record ") && line.contains(" parked: ") {
+            let Some(nr) = token(line, "saved_nr").and_then(|n| n.parse::<u64>().ok()) else {
+                continue;
+            };
+            add(
+                format!(
+                    "parked in {}(nr={nr}) resume={}",
+                    carrick_runtime::el1_census::refusal_name(census_isa, nr),
+                    token(line, "resume").unwrap_or("?")
+                ),
+                format!(
+                    "saved_args={} saved_pc={}",
+                    token(line, "saved_args").unwrap_or("?"),
+                    token(line, "saved_pc").unwrap_or("?")
+                ),
+            );
+        } else if line.starts_with("vcpu:") && token(line, "pending_host_work") == Some("true") {
+            add(
+                "vcpu holds unserved host work".to_owned(),
+                format!(
+                    "cpu={} phase={} served_with_work={} last_stopped_rip={}",
+                    token(line, "cpu").unwrap_or("?"),
+                    token(line, "phase").unwrap_or("?"),
+                    token(line, "served_with_work").unwrap_or("?"),
+                    token(line, "last_stopped_rip")
+                        .or_else(|| token(line, "last_stopped_pc"))
+                        .unwrap_or("?")
+                ),
+            );
+        } else if line.starts_with("el1 task slot ")
+            && token(line, "pending_host_work").is_some_and(|n| n != "0")
+        {
+            add(
+                "task holds unserved host work".to_owned(),
+                format!(
+                    "tid={} pid={} mm={} pending_host_work={} service_notice={}",
+                    token(line, "tid").unwrap_or("?"),
+                    token(line, "pid").unwrap_or("?"),
+                    token(line, "mm").unwrap_or("?"),
+                    token(line, "pending_host_work").unwrap_or("?"),
+                    token(line, "service_notice").unwrap_or("?")
+                ),
+            );
+        }
+    }
+    if !read_zone {
+        let first = zonedump
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("(empty)");
+        add(
+            "zonedump read no zone".to_owned(),
+            first.trim().chars().take(300).collect(),
+        );
+    }
+    by_site.into_values().collect()
 }
 
 /// Whether the stage's success marker is a line of its stdout (always, when
@@ -898,31 +1005,84 @@ pub(crate) fn known_answer_misses(rows: &RowsFile, records: &[RunRecord]) -> Vec
     misses
 }
 
-/// Wait for `child` at most `timeout`; on expiry kill exactly that process.
-fn wait_bounded(mut child: std::process::Child, timeout: Duration) -> Result<Ending> {
+/// Wait for `child` at most `timeout`; on expiry run `at_deadline` (the
+/// child still alive, so it can be inspected) and then kill exactly that
+/// process.
+fn wait_bounded(
+    mut child: std::process::Child,
+    timeout: Duration,
+    at_deadline: &mut dyn FnMut(),
+) -> Result<Ending> {
     use std::os::unix::process::ExitStatusExt;
     let pid = child.id();
     let (sender, receiver) = std::sync::mpsc::channel();
+    // The waiter only observes the exit (`WNOWAIT`): the child stays
+    // unreaped until `child.wait()` below, so its pid cannot be recycled
+    // while the deadline hook runs or the kill is sent.
     let waiter = std::thread::spawn(move || {
-        let status = child.wait();
+        // SAFETY: an all-zero `siginfo_t` is a valid output buffer.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: `info` is valid writable storage; `pid` is our child.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
         let _ = sender.send(());
-        status
     });
     let timed_out = receiver.recv_timeout(timeout).is_err();
     if timed_out {
-        // SAFETY: `pid` is our own unreaped child: the waiter thread has not
-        // returned, so the pid cannot have been recycled.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        at_deadline();
+        if receiver.try_recv().is_err() {
+            // SAFETY: `pid` is our own child, still unreaped (only
+            // `child.wait()` below reaps it), so it names this process.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
     }
-    let status = waiter
+    let status = child.wait().context("wait for carrier")?;
+    waiter
         .join()
-        .map_err(|_| anyhow::anyhow!("carrier waiter panicked"))?
-        .context("wait for carrier")?;
+        .map_err(|_| anyhow::anyhow!("carrier waiter panicked"))?;
     Ok(Ending {
         exit_code: status.code(),
         signal: status.signal(),
         timed_out,
     })
+}
+
+/// How long a hung carrier's zonedump may take before it is abandoned.
+const ZONEDUMP_SECS: u64 = 60;
+
+/// Read a live carrier's scheduler zone (`<carrick> debug zonedump
+/// --run-id <run_id>`, through the run's debug endpoint, without stopping
+/// it) into `path`. Best effort: a dump that fails leaves its error there,
+/// and `hang_findings` reports a dump that read no zone.
+fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path) {
+    let Ok(file) = std::fs::File::create(path) else {
+        return;
+    };
+    let Ok(err) = file.try_clone() else {
+        return;
+    };
+    let Ok(child) = std::process::Command::new(carrick)
+        .args(["debug", "zonedump", "--run-id", run_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .stderr(err)
+        .spawn()
+    else {
+        return;
+    };
+    let _ = wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {});
 }
 
 /// Options for one discovery run.
@@ -1057,7 +1217,7 @@ fn run_oracle(
                     .spawn()
                     .with_context(|| format!("start {}", docker.display()))?;
                 let timeout = Duration::from_secs(stage.timeout_secs.unwrap_or(row.timeout_secs));
-                let ending = wait_bounded(child, timeout)?;
+                let ending = wait_bounded(child, timeout, &mut || {})?;
                 let secs = started.elapsed().as_secs_f64();
                 if ending.timed_out {
                     let _ = std::process::Command::new(docker)
@@ -1181,7 +1341,10 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
                     .spawn()
                     .with_context(|| format!("start {}", carrick.display()))?;
                 let timeout = Duration::from_secs(stage.timeout_secs.unwrap_or(row.timeout_secs));
-                let ending = wait_bounded(child, timeout)?;
+                let zonedump_path = base.with_extension("zonedump");
+                let _ = std::fs::remove_file(&zonedump_path);
+                let mut dump_zone = || capture_zonedump(&carrick, &run_id, &zonedump_path);
+                let ending = wait_bounded(child, timeout, &mut dump_zone)?;
                 let secs = started.elapsed().as_secs_f64();
                 if let Some(reap) = options.reap {
                     // The repo's run-id reaper (`scripts/sudo/kill.sh`), the
@@ -1197,7 +1360,11 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
                 let stdout = String::from_utf8_lossy(&std::fs::read(&stdout_path)?).into_owned();
                 let stderr = String::from_utf8_lossy(&std::fs::read(&stderr_path)?).into_owned();
                 let censuses = load_censuses(&census)?;
-                let (passed, findings) = judge(stage, ending, &stdout, &stderr, &censuses);
+                let (passed, mut findings) = judge(stage, ending, &stdout, &stderr, &censuses);
+                if ending.timed_out {
+                    let zonedump = std::fs::read(&zonedump_path).unwrap_or_default();
+                    findings.extend(hang_findings(isa, &String::from_utf8_lossy(&zonedump)));
+                }
                 let record = RunRecord {
                     instance: instance.clone(),
                     isa,
@@ -1664,6 +1831,55 @@ mod tests {
     }
 
     #[test]
+    fn a_hung_carriers_zonedump_names_its_parked_calls_and_unserved_host_work() {
+        // Lines of the live zonedump of x86 npm/row run 2 on the round-2
+        // union (a1f8dbe05), 787 s into its 900 s stage, 4 s of CPU.
+        let zonedump = "run: discover-x86u3-npm-row-2\n\
+            zone slot 0: state=IdleWfi driver=1 away=false mm=1 installed=0\n\
+            zone record 1: claim=Parked { seq: 7 } handback=None tid=233966 serial=6 mm=7 gen=2\n\
+            zone record 1 parked: first_wait_mm=1 first_wait_address=0xffffffffa80009a0 resume=OwnerContinuation(Syscall) saved_pc=0x60000d7bd3 saved_nr=61 saved_args=[ffffffff, fffffef70c, 0, 0, 3, 1]\n\
+            el1 task slot 0: tid=233966 serial=6 mm=7 pending_host_work=0 served_with_work=0 generation=2 pid=233966 service_notice=empty\n\
+            el1 task slot 1: tid=233969 serial=18 mm=11 pending_host_work=1 served_with_work=0 generation=2 pid=4 service_notice=empty\n\
+            vcpu: cpu=0 phase=running bound_task_serial=5 last_stopped_rip=0xffffffff8000ab74 pending_host_work=false served_with_work=0\n\
+            vcpu: cpu=1 phase=running bound_task_serial=0 last_stopped_rip=0xffffffff8000372d last_stopped_rflags=0x2 actual_guest_run=true pending_host_work=true served_with_work=0\n";
+        let findings = hang_findings(RowIsa::X86_64, zonedump);
+        let keys: Vec<String> = findings.iter().map(Finding::key).collect();
+        assert_eq!(
+            keys,
+            [
+                "hang parked in wait4(nr=61) resume=OwnerContinuation(Syscall)",
+                "hang task holds unserved host work",
+                "hang vcpu holds unserved host work",
+            ],
+        );
+        assert_eq!(
+            findings[0].values,
+            ["saved_args=[ffffffff, fffffef70c, 0, 0, 3, 1] saved_pc=0x60000d7bd3"]
+        );
+        assert_eq!(
+            findings[1].values,
+            ["tid=233969 pid=4 mm=11 pending_host_work=1 service_notice=empty"]
+        );
+        assert_eq!(
+            findings[2].values,
+            ["cpu=1 phase=running served_with_work=0 last_stopped_rip=0xffffffff8000372d"]
+        );
+        // The same parked number names the ISA's own call.
+        let arm = hang_findings(
+            RowIsa::Arm64,
+            "zone slot 0: state=IdleWfi\nzone record 1 parked: resume=OwnerContinuation(Syscall) saved_nr=260 saved_args=[0]\n",
+        );
+        assert_eq!(
+            arm[0].site,
+            "parked in wait4(nr=260) resume=OwnerContinuation(Syscall)"
+        );
+        // A dump that read no zone is a site of its own.
+        let failed = hang_findings(RowIsa::X86_64, "\nError: no debug endpoint for run x\n");
+        assert_eq!(failed[0].site, "zonedump read no zone");
+        assert_eq!(failed[0].values, ["Error: no debug endpoint for run x"]);
+    }
+
+    #[test]
     fn known_answers_must_appear_in_every_run() {
         let rows: RowsFile = serde_json::from_str(
             r#"{"rows":[{"name":"go","image":{"x86_64":"img"},"timeout_secs":5,
@@ -1743,8 +1959,16 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
         let child = std::process::Command::new(&fake).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
         let started = std::time::Instant::now();
-        let ending = wait_bounded(child, Duration::from_millis(200)).unwrap();
+        // The deadline hook sees the hung child still alive.
+        let mut alive_at_deadline = None;
+        let ending = wait_bounded(child, Duration::from_millis(200), &mut || {
+            // SAFETY: signal 0 only probes that our unreaped child exists.
+            alive_at_deadline = Some(unsafe { libc::kill(pid, 0) } == 0);
+        })
+        .unwrap();
+        assert_eq!(alive_at_deadline, Some(true));
         assert!(ending.timed_out);
         assert_eq!(ending.signal, Some(libc::SIGKILL));
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -1752,8 +1976,10 @@ mod tests {
             .args(["-c", "exit 3"])
             .spawn()
             .unwrap();
-        let ending = wait_bounded(child, Duration::from_secs(10)).unwrap();
+        let mut hook_ran = false;
+        let ending = wait_bounded(child, Duration::from_secs(10), &mut || hook_ran = true).unwrap();
         assert_eq!((ending.exit_code, ending.timed_out), (Some(3), false));
+        assert!(!hook_ran);
     }
 
     #[test]

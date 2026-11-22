@@ -737,7 +737,10 @@ pub struct RefusalRanking {
     pub rows: Vec<RefusalRank>,
 }
 
-fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
+/// The name of native syscall `native` on `isa` (`overflow` past the
+/// table, else `nr<N>`): the name refusal rankings and `carrick debug
+/// discover` print.
+pub fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
     use carrick_spec::syscall_census::CensusIsa;
     let name = match isa {
         CensusIsa::Aarch64 => carrick_abi::syscall::lookup_aarch64(native).map(|s| s.name),
