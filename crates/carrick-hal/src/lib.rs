@@ -42,6 +42,7 @@ pub mod fork_stock;
 pub mod host_residency;
 pub mod native_exec;
 pub mod physical_grants;
+pub mod retained_metadata;
 pub mod return_settlement;
 pub mod stage1_exclusive;
 pub mod stage1_mm;

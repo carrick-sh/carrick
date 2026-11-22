@@ -645,6 +645,7 @@ macro_rules! mutation_syscall_table {
 
 mod abi_args;
 pub mod archive;
+pub mod carrier_lifecycle;
 pub mod carrier_loop;
 pub(crate) mod copyout;
 #[cfg(test)]

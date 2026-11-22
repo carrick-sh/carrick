@@ -446,31 +446,6 @@ pub(crate) enum TerminalRetireSubscription {
     },
 }
 
-/// Occupy the executor's vCPU slot with the task's MM, then publish the
-/// vCPU registration. The occupancy comes first so a pause of the MM can
-/// see the vCPU before the registration lets it run.
-pub(crate) fn enter_mm_executor_then_register<F>(
-    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
-    thread: Option<carrick_kernel::kernel::ThreadRef>,
-    registry: Arc<dyn carrick_hal::VcpuRegistry>,
-    tid: ThreadId,
-    slot: carrick_kernel::kernel::ExecutionSlot,
-    register: F,
-) -> Result<
-    (
-        carrick_kernel::dispatch::MmExecutorParticipation,
-        carrick_hal::VcpuRegistrationEnrollment,
-    ),
-    carrick_kernel::kernel::MmOccupancyError,
->
-where
-    F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
-{
-    let participation = dispatcher.enter_mm_executor_for_thread(thread, registry, tid, slot)?;
-    let enrollment = register();
-    Ok((participation, enrollment))
-}
-
 pub(super) fn registration_wake_uses_control(
     phase: &HvpatchProductionPhase,
     pending_control_quantum: bool,
@@ -4779,7 +4754,7 @@ where
                 )
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                 let (participation, enrollment) = loop {
-                    match enter_mm_executor_then_register(
+                    match carrick_kernel::dispatch::carrier_loop::enter_mm_executor_then_register(
                         &self.kernel.dispatcher,
                         self.state.kernel_thread.as_ref().map(Arc::clone),
                         Arc::clone(&self.state.kicker),
@@ -4857,51 +4832,16 @@ where
                     };
                     let mut owner_admission_error = None;
                     binding.publish_address_space(|lease_ttbr0| {
-                        let asid = lease_ttbr0 >> 48;
-                        carrick_observability::probes::hvpatch_el1_root_candidate(
-                            asid,
-                            1,
-                            lease_ttbr0,
-                            0,
-                        );
-                        let Some((ttbr0, ttbr1)) = engine.el1_switchable_roots() else {
-                            carrick_observability::probes::hvpatch_el1_root_candidate(
-                                asid,
-                                2,
-                                lease_ttbr0,
-                                0,
-                            );
-                            return None;
-                        };
-                        if ttbr0 != lease_ttbr0 {
-                            carrick_observability::probes::hvpatch_el1_root_candidate(
-                                asid, 3, ttbr0, ttbr1,
-                            );
-                            return None;
-                        }
-                        let Some(closed) = self.kernel.dispatcher.publish_bound_address_space(
+                        carrick_kernel::dispatch::carrier_loop::publish_leased_first_address_space(
+                            &self.kernel.dispatcher,
                             participation,
                             &mut *engine,
-                            ttbr0,
-                            ttbr1,
-                        ) else {
-                            carrick_observability::probes::hvpatch_el1_root_candidate(
-                                asid, 4, ttbr0, ttbr1,
-                            );
-                            return None;
-                        };
-                        match super::signal::open_first_address_space(engine, closed) {
-                            Ok(publication) => {
-                                carrick_observability::probes::hvpatch_el1_root_candidate(
-                                    asid, 5, ttbr0, ttbr1,
-                                );
-                                Some(publication)
-                            }
-                            Err(error) => {
-                                owner_admission_error = Some(error);
-                                None
-                            }
-                        }
+                            lease_ttbr0,
+                        )
+                        .unwrap_or_else(|error| {
+                            owner_admission_error = Some(error);
+                            None
+                        })
                     });
                     if let Some(error) = owner_admission_error {
                         return Err(RuntimeError::Configuration(format!(
@@ -13290,100 +13230,6 @@ mod tests {
     }
 
     #[test]
-    fn occupancy_precedes_registry_publication() {
-        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
-        let dispatcher = SyscallDispatcher::new();
-        let context = dispatcher.capture_one_task_context().expect("task context");
-        let thread = context.thread().clone();
-        let first = ThreadId::synthetic_for_tests(70_201);
-        let second = ThreadId::synthetic_for_tests(70_202);
-        let (first_slot, second_slot) = (
-            carrick_kernel::kernel::HostExecutionSlot::allocate().unwrap(),
-            carrick_kernel::kernel::HostExecutionSlot::allocate().unwrap(),
-        );
-        let _first_participation = dispatcher
-            .enter_mm_executor_for_thread(None, registry.clone(), first, first_slot.slot())
-            .expect("first participation");
-        let freeze = match registry.subscribe_lease_drain(first, Arc::new(|| {})) {
-            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
-            _ => panic!("first thread must freeze an empty sibling lease set"),
-        };
-        let second_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        let occupants = dispatcher.mm_occupancy_probe();
-
-        let (second_participation, attempt) = enter_mm_executor_then_register(
-            &dispatcher,
-            Some(thread.clone()),
-            registry.clone(),
-            second,
-            second_slot.slot(),
-            || {
-                assert_eq!(
-                    occupants(),
-                    2,
-                    "slot occupancy must precede registry publication"
-                );
-                assert!(
-                    thread.is_crash_safe_point_participant(),
-                    "crash participation must precede registry publication"
-                );
-                registry.subscribe_register(
-                    second,
-                    registration_test_handle(),
-                    &second_in_guest,
-                    Arc::new(|| {}),
-                )
-            },
-        )
-        .expect("second participation");
-
-        assert_eq!(occupants(), 2);
-        assert!(matches!(
-            &attempt,
-            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
-        ));
-        assert_eq!(
-            registry.poll_lease_drain(first),
-            carrick_hal::VcpuLeaseDrainPoll::Complete
-        );
-        drop(second_participation);
-        assert_eq!(occupants(), 1);
-        drop(attempt);
-        drop(freeze);
-    }
-
-    #[test]
-    fn failed_crash_admission_suppresses_registry_publication() {
-        let dispatcher = SyscallDispatcher::new();
-        let context = dispatcher.capture_one_task_context().expect("task context");
-        let thread = context.thread().clone();
-        let _outside = thread
-            .enter_crash_safe_point_participation()
-            .expect("outside crash participation");
-        let register_called = std::sync::atomic::AtomicBool::new(false);
-        let slot = carrick_kernel::kernel::HostExecutionSlot::allocate().unwrap();
-
-        assert!(matches!(
-            enter_mm_executor_then_register(
-                &dispatcher,
-                Some(thread.clone()),
-                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
-                ThreadId::synthetic_for_tests(70_205),
-                slot.slot(),
-                || {
-                    register_called.store(true, std::sync::atomic::Ordering::Release);
-                    panic!("failed admission must not invoke registry publication")
-                }
-            ),
-            Err(carrick_kernel::kernel::MmOccupancyError::CrashParticipationAlreadyActive {
-                thread: rejected
-            }) if rejected == thread.key()
-        ));
-        assert!(!register_called.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
-    }
-
-    #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn fork_owner_registration_ignores_raised_barrier_and_preserves_phase() {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
@@ -13400,22 +13246,23 @@ mod tests {
         };
         let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
 
-        let (participation, enrollment) = enter_mm_executor_then_register(
-            &dispatcher,
-            None,
-            registry.clone(),
-            owner,
-            slot.slot(),
-            || {
-                registry.subscribe_register(
-                    owner,
-                    registration_test_handle(),
-                    &owner_in_guest,
-                    Arc::new(|| {}),
-                )
-            },
-        )
-        .expect("owner participation");
+        let (participation, enrollment) =
+            carrick_kernel::dispatch::carrier_loop::enter_mm_executor_then_register(
+                &dispatcher,
+                None,
+                registry.clone(),
+                owner,
+                slot.slot(),
+                || {
+                    registry.subscribe_register(
+                        owner,
+                        registration_test_handle(),
+                        &owner_in_guest,
+                        Arc::new(|| {}),
+                    )
+                },
+            )
+            .expect("owner participation");
 
         assert!(matches!(
             enrollment,

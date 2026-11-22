@@ -15,8 +15,8 @@ use carrick_core::mm::frames::{
     SelectedBackingPlan, publication_next_action,
 };
 use carrick_el1_abi::{
-    Aarch64ParkedContext, El1TaskId, MmPortalSlots, PortalOwnerWait, RecordRef, ThreadIdentity,
-    ZoneTables,
+    Aarch64ParkedContext, El1TaskId, MmPortalSlots, PortalOwnerWait, RecordRef, SlotId,
+    ThreadIdentity, ZoneTables,
 };
 use carrick_guest_mem::{Gpa, GuestVa, MappingSharing, MemoryError};
 use carrick_hal::{
@@ -724,10 +724,714 @@ pub fn resolve_host_first_touch_with_owner_wait<E: ThreadedEngine>(
     }
 }
 
+/// Occupy the executor's vCPU slot with the task's MM, then publish the
+/// vCPU registration. The occupancy comes first so a pause of the MM can
+/// see the vCPU before the registration lets it run.
+pub fn enter_mm_executor_then_register<F>(
+    dispatcher: &SyscallDispatcher,
+    thread: Option<crate::kernel::ThreadRef>,
+    registry: Arc<dyn carrick_hal::VcpuRegistry>,
+    tid: carrick_hal::ThreadId,
+    slot: crate::kernel::ExecutionSlot,
+    register: F,
+) -> Result<
+    (
+        crate::dispatch::MmExecutorParticipation,
+        carrick_hal::VcpuRegistrationEnrollment,
+    ),
+    crate::kernel::MmOccupancyError,
+>
+where
+    F: FnOnce() -> carrick_hal::VcpuRegistrationEnrollment,
+{
+    let participation = dispatcher.enter_mm_executor_for_thread(thread, registry, tid, slot)?;
+    let enrollment = register();
+    Ok((participation, enrollment))
+}
+
+/// The operator's choice for the guest descriptor lane, read once per carrier.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+enum DescriptorLaneHatch {
+    /// The lane is admitted wherever the writer census admits it.
+    Default,
+    /// `CARRICK_EL1_DESCRIPTOR_LANE=0`: every MM stays on the host-owned
+    /// lane, whatever the census says.
+    Disabled,
+}
+
+impl DescriptorLaneHatch {
+    /// Parse `CARRICK_EL1_DESCRIPTOR_LANE`: exactly `0` (trimmed) disables.
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(value) if value.trim() == "0" => Self::Disabled,
+            _ => Self::Default,
+        }
+    }
+
+    /// This carrier's hatch.
+    fn current() -> Self {
+        static HATCH: std::sync::OnceLock<DescriptorLaneHatch> = std::sync::OnceLock::new();
+        *HATCH.get_or_init(|| {
+            Self::from_env_value(
+                ::std::env::var("CARRICK_EL1_DESCRIPTOR_LANE")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+}
+
+/// Every host writer family that still stores live stage-1 descriptors. The
+/// guest-owned lane is admitted for an MM only when every one of them submits
+/// descriptor transactions instead; a single unconverted writer would be
+/// refused on that lane and turn an ordinary host edit into a guest fault.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+struct GuestDescriptorLanePrecondition {
+    /// The descriptor transaction slots are placed in the installed EL1 region.
+    slots_placed: bool,
+    /// Bulk first-touch frame grants (this path).
+    frame_grants: bool,
+    /// Host syscall copyout into prepared pages (`commit_prepared_host_write`).
+    host_copyout: bool,
+    /// Fork parent COW arming (`build_process_spec`): built as EL1
+    /// transactions, applied synchronously on the forking vCPU through the
+    /// host-driven drain call and settled before the fork commits
+    /// (`apply_guest_fork_arm`); EL1 drains an MM's submissions before any of
+    /// its threads returns to EL0.
+    fork_parent_arming: bool,
+    /// Backend COW, sparse/foreign materialization and exec publication.
+    backend_writers: bool,
+}
+
+impl GuestDescriptorLanePrecondition {
+    /// The writer census of this build. Host copyout publishes through the
+    /// verified EL1 Publish/Write receipt before the kernel commits residency
+    /// (`commit_prepared_host_write` -> `publish_copyout`). Every backend
+    /// writer family submits descriptor transactions on the guest lane: the
+    /// shared terminal rule (mprotect, munmap retirement, retired reset, BUS
+    /// tags, fork arming), table reclaim receipts, alias maps, retained
+    /// reuse, sparse/file materialization, frame-grant replacement and
+    /// foreign-MM COW; exec publishes an offline image before the new MM
+    /// selects its lane.
+    fn current() -> Self {
+        Self {
+            slots_placed: carrick_el1_abi::descriptor_txn_slots_host().is_some(),
+            frame_grants: true,
+            host_copyout: true,
+            fork_parent_arming: true,
+            backend_writers: true,
+        }
+    }
+
+    fn admits(self) -> bool {
+        self.slots_placed
+            && self.frame_grants
+            && self.host_copyout
+            && self.fork_parent_arming
+            && self.backend_writers
+    }
+
+    /// Whether an MM may select the guest lane under `hatch`. The operator
+    /// hatch is its own reason, never folded into a census field.
+    fn admission(
+        self,
+        hatch: DescriptorLaneHatch,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestLaneRefusal> {
+        use carrick_mmu_core::aarch64::GuestLaneRefusal;
+        if hatch == DescriptorLaneHatch::Disabled {
+            return Err(GuestLaneRefusal::OperatorHatch);
+        }
+        if !self.admits() {
+            return Err(GuestLaneRefusal::Census);
+        }
+        Ok(())
+    }
+}
+
+/// Publish a first load's closed address space from the root its stage-1
+/// lease names, and open it. `None` declines publication (the engine's
+/// switchable roots are absent or are not the leased root, or the
+/// dispatcher refused the exact BIND); the MM then stays host-installed.
+/// An `Err` is an owner-admission failure after the BIND was published.
+pub fn publish_leased_first_address_space<E: ThreadedEngine>(
+    dispatcher: &SyscallDispatcher,
+    participation: &mut crate::dispatch::MmExecutorParticipation,
+    engine: &mut E,
+    lease_ttbr0: u64,
+) -> Result<Option<crate::kernel::AddressSpacePublication>, TrapError> {
+    let asid = lease_ttbr0 >> 48;
+    carrick_observability::probes::hvpatch_el1_root_candidate(asid, 1, lease_ttbr0, 0);
+    let Some((ttbr0, ttbr1)) = engine.el1_switchable_roots() else {
+        carrick_observability::probes::hvpatch_el1_root_candidate(asid, 2, lease_ttbr0, 0);
+        return Ok(None);
+    };
+    if ttbr0 != lease_ttbr0 {
+        carrick_observability::probes::hvpatch_el1_root_candidate(asid, 3, ttbr0, ttbr1);
+        return Ok(None);
+    }
+    let Some(closed) =
+        dispatcher.publish_bound_address_space(participation, &mut *engine, ttbr0, ttbr1)
+    else {
+        carrick_observability::probes::hvpatch_el1_root_candidate(asid, 4, ttbr0, ttbr1);
+        return Ok(None);
+    };
+    let publication = open_first_address_space(engine, closed)?;
+    carrick_observability::probes::hvpatch_el1_root_candidate(asid, 5, ttbr0, ttbr1);
+    Ok(Some(publication))
+}
+
+/// Finish the first-load publication while its root is still closed. Exact
+/// reservation import and legacy root-fact release ran before this call;
+/// the owner guard excludes host copies from BIND through descriptor/venue
+/// selection and the final EL1 installation-gate opening.
+pub fn open_first_address_space<E: ThreadedEngine>(
+    engine: &mut E,
+    closed: crate::kernel::UnpublishedInitialAddressSpace,
+) -> Result<crate::kernel::AddressSpacePublication, TrapError> {
+    use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+    carrick_observability::probes::hvpatch_el1_owner_selection(0);
+    if engine.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+        if let Err(reason) =
+            GuestDescriptorLanePrecondition::current().admission(DescriptorLaneHatch::current())
+        {
+            carrick_observability::probes::hvpatch_el1_owner_selection(1);
+            engine.record_guest_descriptor_lane_refusal(reason);
+            return Ok(closed.open_legacy());
+        }
+    }
+    let Some(authority) = engine.user_memory_admission_authority() else {
+        carrick_observability::probes::hvpatch_el1_owner_selection(2);
+        return Ok(closed.open_legacy());
+    };
+    let carrier = engine.owner_transfer_carrier().ok_or_else(|| {
+        carrick_observability::probes::hvpatch_el1_owner_selection(3);
+        TrapError::Hypervisor("admitted user-memory backend lost its transfer carrier".into())
+    })?;
+    let token = closed.bind_token(carrier).ok_or_else(|| {
+        carrick_observability::probes::hvpatch_el1_owner_selection(4);
+        TrapError::Hypervisor("first-load root is not an exact closed BIND publication".into())
+    })?;
+    let mut guard = authority.begin_selection().map_err(|reason| {
+        TrapError::Hypervisor(format!(
+            "first-load user-memory admission guard refused: {reason:?}"
+        ))
+    })?;
+    carrick_observability::probes::hvpatch_el1_owner_selection(5);
+    let selected = engine.select_live_descriptor_owner_under_guard(
+        LiveDescriptorOwner::Guest,
+        &mut guard,
+        Some(token),
+    )?;
+    carrick_observability::probes::hvpatch_el1_owner_selection(6);
+    if !selected || guard.selection_handle().is_none() {
+        carrick_observability::probes::hvpatch_el1_owner_selection(8);
+        return Err(TrapError::Hypervisor(
+            "first-load owner failed to select immediate live backing".into(),
+        ));
+    }
+    carrick_observability::probes::hvpatch_el1_owner_selection(7);
+    closed
+        .open_admitted(&guard)
+        .map_err(|_| TrapError::Hypervisor("first-load owner guard selected another MM".into()))
+}
+
+/// The zone's driver identity of an executor. Never 0, which means none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZoneSlotDriver(std::num::NonZeroU64);
+
+impl ZoneSlotDriver {
+    pub const fn new(raw: std::num::NonZeroU64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// The task a stopped vCPU slot is about to run: its slot, its executor's
+/// driver identity and guest-CPU binding, the loaded thread's MM and
+/// serial, and its affinity source.
+#[derive(Clone, Copy, Debug)]
+pub struct StoppedSlotLoad {
+    pub slot: SlotId,
+    pub driver: ZoneSlotDriver,
+    pub mm: crate::kernel::MmId,
+    pub serial: crate::kernel::ThreadSerial,
+    /// The guest CPU the slot's executor is bound to. `None`: any.
+    pub bound_cpu: Option<carrick_hal::GuestCpuId>,
+    pub affinity: carrick_sched_core::AffinitySource,
+}
+
+/// The backend mechanics of a stopped-slot publication: how the slot's vCPU
+/// is interrupted, and the executor-local driver handoff.
+pub trait StoppedSlotBackend {
+    type Error;
+    /// The reschedule target that reaches this slot's vCPU, published before
+    /// its first entry so a remote affinity kick cannot be lost.
+    fn reschedule_target(&mut self) -> Result<u64, Self::Error>;
+    /// Hand this executor's driver role to `slot`, vacating a slot it drove
+    /// before, before the driver and CPU publish together.
+    fn prepare_driver(&mut self, slot: SlotId, driver: ZoneSlotDriver) -> Result<(), Self::Error>;
+}
+
+/// What the slot still held when a task was loaded on it: the record EL1
+/// left switched in (its claim, identity, pending object operation and
+/// handback), the slot's host record and its queue.
+#[derive(Debug)]
+pub struct StoppedSlotHeld {
+    pub current: Option<(
+        carrick_sched_core::RecordId,
+        carrick_sched_core::Claim,
+        ThreadIdentity,
+        bool,
+        Option<carrick_sched_core::Handback>,
+    )>,
+    pub host_record: Option<carrick_sched_core::RecordId>,
+    pub queued: usize,
+}
+
+impl core::fmt::Display for StoppedSlotHeld {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "current={:?} host_record={:?} queued={}",
+            self.current, self.host_record, self.queued
+        )
+    }
+}
+
+/// Why a stopped-slot publication did not complete.
+#[derive(Debug)]
+pub enum StoppedSlotRefusal<E> {
+    Backend(E),
+    /// A protocol violation the backend reports as its carrier fault.
+    Held(Box<StoppedSlotHeld>),
+}
+
+/// Publish the zone identity of the task just loaded on a stopped slot: its
+/// process's zone key (0 when the zone is off, so EL1 forwards every futex
+/// operation), its thread serial, and the slot's reschedule target. No
+/// thread may be switched in on the slot (the previous residency's last exit
+/// settled it); queued threads stay (one of another address space waits for
+/// this executor to load it), and a slot this executor drove before is left.
+pub fn publish_stopped_zone_slot<B: StoppedSlotBackend>(
+    load: StoppedSlotLoad,
+    backend: &mut B,
+) -> Result<(), StoppedSlotRefusal<B::Error>> {
+    let StoppedSlotLoad {
+        slot,
+        driver,
+        mm,
+        serial,
+        bound_cpu,
+        affinity,
+    } = load;
+    let bound_cpu = bound_cpu.map(carrick_hal::GuestCpuId::as_u32);
+    let Some(zone) = crate::el1_zone::zone() else {
+        if let Some(zone) = carrick_el1_abi::zone_tables() {
+            zone.slot(slot)
+                .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
+            zone.publish_slot_with_affinity(slot, 0, bound_cpu, affinity);
+        }
+        carrick_el1_abi::publish_zone_identity(slot.index(), 0, serial.raw());
+        return Ok(());
+    };
+    // A compute-only residency must be reachable before its first entry;
+    // publishing this only in EL1 idle would lose a remote affinity kick.
+    zone.slot(slot).set_sgi_target(
+        backend
+            .reschedule_target()
+            .map_err(StoppedSlotRefusal::Backend)?,
+    );
+    backend
+        .prepare_driver(slot, driver)
+        .map_err(StoppedSlotRefusal::Backend)?;
+    // What the slot still holds, for the refusal below.
+    let current = zone.slot(slot).current().map(|record| {
+        let rec = zone.record(record);
+        (
+            record,
+            rec.claim(),
+            rec.identity(),
+            rec.has_object_operation(),
+            rec.handback(),
+        )
+    });
+    let host_record = zone.slot(slot).host_record();
+    let queued = zone.slot(slot).queued();
+    // The reset clears the slot's timer: a timed park another executor's
+    // thread left on it goes to the host first.
+    crate::el1_zone::hand_back_foreign_timer(slot);
+    if !zone.reset_slot(slot) {
+        return Err(StoppedSlotRefusal::Held(Box::new(StoppedSlotHeld {
+            current,
+            host_record,
+            queued,
+        })));
+    }
+    // Threads queued here for another address space stay: EL1 leaves
+    // the vCPU for this executor when one reaches the head, and the
+    // executor loads it.
+    zone.drive_and_publish(slot, driver.raw(), mm.raw(), bound_cpu, affinity);
+    carrick_el1_abi::publish_zone_identity(slot.index(), mm.raw(), serial.raw());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn every_writer_family_is_converted_and_the_hatch_refuses_by_its_own_reason() {
+        use carrick_mmu_core::aarch64::GuestLaneRefusal;
+        let current = GuestDescriptorLanePrecondition::current();
+        assert!(current.frame_grants && current.fork_parent_arming);
+        assert!(current.host_copyout && current.backend_writers);
+        let placed = GuestDescriptorLanePrecondition {
+            slots_placed: true,
+            ..current
+        };
+        assert_eq!(placed.admission(DescriptorLaneHatch::Default), Ok(()));
+        assert_eq!(
+            placed.admission(DescriptorLaneHatch::Disabled),
+            Err(GuestLaneRefusal::OperatorHatch)
+        );
+        let unplaced = GuestDescriptorLanePrecondition {
+            slots_placed: false,
+            ..current
+        };
+        assert_eq!(
+            unplaced.admission(DescriptorLaneHatch::Default),
+            Err(GuestLaneRefusal::Census)
+        );
+        assert_eq!(
+            unplaced.admission(DescriptorLaneHatch::Disabled),
+            Err(GuestLaneRefusal::OperatorHatch),
+            "the hatch is reported as itself, never as a census gap"
+        );
+        for (value, hatch) in [
+            (None, DescriptorLaneHatch::Default),
+            (Some("0"), DescriptorLaneHatch::Disabled),
+            (Some(" 0\n"), DescriptorLaneHatch::Disabled),
+            (Some("1"), DescriptorLaneHatch::Default),
+            (Some(""), DescriptorLaneHatch::Default),
+            (Some("00"), DescriptorLaneHatch::Default),
+        ] {
+            assert_eq!(
+                DescriptorLaneHatch::from_env_value(value),
+                hatch,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lane_is_refused_while_any_writer_family_is_unconverted() {
+        let all = GuestDescriptorLanePrecondition {
+            slots_placed: true,
+            frame_grants: true,
+            host_copyout: true,
+            fork_parent_arming: true,
+            backend_writers: true,
+        };
+        assert!(all.admits());
+        for missing in 0..5 {
+            let mut partial = all;
+            match missing {
+                0 => partial.slots_placed = false,
+                1 => partial.frame_grants = false,
+                2 => partial.host_copyout = false,
+                3 => partial.fork_parent_arming = false,
+                _ => partial.backend_writers = false,
+            }
+            assert!(!partial.admits(), "missing writer {missing}");
+        }
+    }
+
+    struct RegistrationTestKick;
+
+    impl carrick_hal::VcpuKickDyn for RegistrationTestKick {
+        fn kick(&self) {}
+    }
+
+    #[test]
+    fn occupancy_precedes_registry_publication() {
+        use carrick_hal::VcpuRegistry;
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let thread = context.thread().clone();
+        let first = carrick_hal::ThreadId::synthetic_for_tests(70_201);
+        let second = carrick_hal::ThreadId::synthetic_for_tests(70_202);
+        let (first_slot, second_slot) = (
+            crate::kernel::HostExecutionSlot::allocate().unwrap(),
+            crate::kernel::HostExecutionSlot::allocate().unwrap(),
+        );
+        let _first_participation = dispatcher
+            .enter_mm_executor_for_thread(None, registry.clone(), first, first_slot.slot())
+            .expect("first participation");
+        let freeze = match registry.subscribe_lease_drain(first, Arc::new(|| {})) {
+            carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => guard,
+            _ => panic!("first thread must freeze an empty sibling lease set"),
+        };
+        let second_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let occupants = dispatcher.mm_occupancy_probe();
+
+        let (second_participation, attempt) = enter_mm_executor_then_register(
+            &dispatcher,
+            Some(thread.clone()),
+            registry.clone(),
+            second,
+            second_slot.slot(),
+            || {
+                assert_eq!(
+                    occupants(),
+                    2,
+                    "slot occupancy must precede registry publication"
+                );
+                assert!(
+                    thread.is_crash_safe_point_participant(),
+                    "crash participation must precede registry publication"
+                );
+                registry.subscribe_register(
+                    second,
+                    Box::new(RegistrationTestKick),
+                    &second_in_guest,
+                    Arc::new(|| {}),
+                )
+            },
+        )
+        .expect("second participation");
+
+        assert_eq!(occupants(), 2);
+        assert!(matches!(
+            &attempt,
+            carrick_hal::VcpuRegistrationEnrollment::Waiting { .. }
+        ));
+        assert_eq!(
+            registry.poll_lease_drain(first),
+            carrick_hal::VcpuLeaseDrainPoll::Complete
+        );
+        drop(second_participation);
+        assert_eq!(occupants(), 1);
+        drop(attempt);
+        drop(freeze);
+    }
+
+    #[test]
+    fn failed_crash_admission_suppresses_registry_publication() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let thread = context.thread().clone();
+        let _outside = thread
+            .enter_crash_safe_point_participation()
+            .expect("outside crash participation");
+        let register_called = std::sync::atomic::AtomicBool::new(false);
+        let slot = crate::kernel::HostExecutionSlot::allocate().unwrap();
+
+        assert!(matches!(
+            enter_mm_executor_then_register(
+                &dispatcher,
+                Some(thread.clone()),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::ThreadId::synthetic_for_tests(70_205),
+                slot.slot(),
+                || {
+                    register_called.store(true, std::sync::atomic::Ordering::Release);
+                    panic!("failed admission must not invoke registry publication")
+                }
+            ),
+            Err(crate::kernel::MmOccupancyError::CrashParticipationAlreadyActive {
+                thread: rejected
+            }) if rejected == thread.key()
+        ));
+        assert!(!register_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
+    }
+
+    fn heap_zone() -> &'static ZoneTables {
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        // SAFETY: all-zero is the valid empty zone state; the fixture is
+        // leaked so the scoped test binding may name it as `'static`.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!ptr.is_null());
+            &*ptr
+        }
+    }
+
+    /// Records each backend call; `target` answers the reschedule target.
+    struct RecordingSlotBackend {
+        target: Result<u64, &'static str>,
+        targets: usize,
+        drivers: Vec<(SlotId, ZoneSlotDriver)>,
+    }
+
+    impl StoppedSlotBackend for RecordingSlotBackend {
+        type Error = &'static str;
+        fn reschedule_target(&mut self) -> Result<u64, Self::Error> {
+            self.targets += 1;
+            self.target
+        }
+        fn prepare_driver(
+            &mut self,
+            slot: SlotId,
+            driver: ZoneSlotDriver,
+        ) -> Result<(), Self::Error> {
+            self.drivers.push((slot, driver));
+            Ok(())
+        }
+    }
+
+    const STOPPED_MM: u64 = 0x51;
+
+    fn stopped_load(slot: SlotId) -> StoppedSlotLoad {
+        StoppedSlotLoad {
+            slot,
+            driver: ZoneSlotDriver::new(std::num::NonZeroU64::new(7).unwrap()),
+            mm: crate::kernel::MmId::from_raw_u64(STOPPED_MM).unwrap(),
+            serial: crate::kernel::ThreadSerial::from_raw_u64(9).unwrap(),
+            bound_cpu: Some(carrick_hal::GuestCpuId::new(2)),
+            affinity: carrick_sched_core::AffinitySource::UNBOUND,
+        }
+    }
+
+    #[test]
+    fn stopped_slot_publication_targets_then_drives_the_loaded_task() {
+        let zone = heap_zone();
+        let slot = SlotId::new(4);
+        let mut backend = RecordingSlotBackend {
+            target: Ok(0x55),
+            targets: 0,
+            drivers: Vec::new(),
+        };
+        let published = crate::el1_zone::with_test_zone(zone, || {
+            publish_stopped_zone_slot(stopped_load(slot), &mut backend)
+        });
+        assert!(published.is_ok());
+        assert_eq!(backend.targets, 1);
+        assert_eq!(
+            backend.drivers,
+            [(
+                slot,
+                ZoneSlotDriver::new(std::num::NonZeroU64::new(7).unwrap())
+            )]
+        );
+        assert_eq!(zone.slot(slot).sgi_target(), 0x55);
+        assert_eq!(zone.slot(slot).driver(), Some(7));
+        assert_eq!(zone.slot(slot).mm(), STOPPED_MM);
+        assert_eq!(zone.slot(slot).current(), None);
+    }
+
+    #[test]
+    fn failed_reschedule_target_publishes_nothing_on_the_slot() {
+        let zone = heap_zone();
+        let slot = SlotId::new(4);
+        let mut backend = RecordingSlotBackend {
+            target: Err("stale vCPU"),
+            targets: 0,
+            drivers: Vec::new(),
+        };
+        let published = crate::el1_zone::with_test_zone(zone, || {
+            publish_stopped_zone_slot(stopped_load(slot), &mut backend)
+        });
+        assert!(matches!(
+            published,
+            Err(StoppedSlotRefusal::Backend("stale vCPU"))
+        ));
+        assert!(
+            backend.drivers.is_empty(),
+            "no driver handoff after a refusal"
+        );
+        assert_eq!(zone.slot(slot).sgi_target(), 0);
+        assert_eq!(zone.slot(slot).driver(), None);
+        assert_eq!(zone.slot(slot).mm(), 0);
+    }
+
+    #[test]
+    fn held_slot_refuses_publication_and_is_left_undriven() {
+        let zone = heap_zone();
+        let slot = SlotId::new(4);
+        let uaddr = 0x1000;
+        // A thread EL1 left switched in on the slot.
+        let identity = ThreadIdentity {
+            tid: 11,
+            serial: 110,
+            mm: STOPPED_MM,
+            file_table: 1,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let record = zone.alloc_record(identity).unwrap();
+        let guard = zone
+            .lock(
+                ZoneTables::bucket_of_with_context(STOPPED_MM, uaddr),
+                &HostLockWait,
+            )
+            .unwrap();
+        let seq = zone.next_seq(record);
+        zone.enqueue(&guard, record, seq, STOPPED_MM, uaddr, u32::MAX, 0)
+            .unwrap();
+        zone.publish_park(record, seq);
+        // Another executor drives the slot and runs this address space.
+        zone.drive(slot, 3);
+        zone.publish_slot(slot, STOPPED_MM, None, 0);
+        let here = carrick_sched_core::occupancy::ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, STOPPED_MM));
+        let mut woken = [const { carrick_el1_abi::WakeRecord::Empty }; 4];
+        let count = zone.wake(
+            &guard,
+            STOPPED_MM,
+            uaddr,
+            u32::MAX,
+            1,
+            carrick_sched_core::Waker::El1 { slot },
+            &mut woken,
+        );
+        drop(guard);
+        assert_eq!(count, 1);
+        for woken in &mut woken[..1] {
+            let _ = woken.take_ready(&HostLockWait, &|owned| {
+                let _ = owned.into_parts();
+            });
+        }
+        assert_eq!(zone.switch_in(slot), Some(record));
+        let mut backend = RecordingSlotBackend {
+            target: Ok(0x55),
+            targets: 0,
+            drivers: Vec::new(),
+        };
+        let published = crate::el1_zone::with_test_zone(zone, || {
+            publish_stopped_zone_slot(stopped_load(slot), &mut backend)
+        });
+        let Err(StoppedSlotRefusal::Held(held)) = published else {
+            panic!("a switched-in record must refuse the load");
+        };
+        assert_eq!(held.current.map(|current| current.0), Some(record));
+        assert!(held.to_string().starts_with("current=Some(("));
+        // The refusal leaves the slot as EL1 left it: its previous driver
+        // and target, the record still switched in.
+        assert_eq!(zone.slot(slot).driver(), Some(3));
+        assert_eq!(zone.slot(slot).current(), Some(record));
+    }
 
     #[test]
     fn apply_first_touch_enforces_linux_stage1_access_matrix() {
