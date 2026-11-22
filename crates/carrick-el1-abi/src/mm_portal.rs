@@ -127,7 +127,14 @@ pub use carrick_core_abi::PortalWaitEnrollment;
 /// Who writes a caught signal's frame into a process's user memory, as the
 /// carrier publishes it in [`MmPortalSlots`]. EL1 accepts a caught handler
 /// only where its frame can be delivered.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum SignalFrameCustody {
     /// The carrier's delivery reaches every MM it runs, admitted to the MM
     /// portal owner or not (HVF and x86 until #2814 unifies delivery). The
