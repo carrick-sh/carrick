@@ -162,6 +162,9 @@ pub(crate) enum FindingKind {
     Panic,
     CarrierError,
     Timeout,
+    /// A stage that passes, but at a pathological multiple of the native
+    /// Docker oracle's time (`--oracle`): structurally wrong work.
+    Pathological,
     Refused,
     GuestErrno,
     Exit,
@@ -178,6 +181,7 @@ impl FindingKind {
             Self::Panic => "panic",
             Self::CarrierError => "carrier_error",
             Self::Timeout => "timeout",
+            Self::Pathological => "pathological_time",
             Self::Refused => "refused",
             Self::GuestErrno => "guest_errno",
             Self::Exit => "exit",
@@ -527,6 +531,130 @@ pub(crate) struct Ending {
     pub(crate) timed_out: bool,
 }
 
+/// Whether the stage's success marker is a line of its stdout (always, when
+/// it names none).
+fn marker_seen(stage: &StageSpec, stdout: &str) -> bool {
+    stage
+        .expect
+        .as_deref()
+        .is_none_or(|marker| stdout.lines().any(|line| line.trim() == marker))
+}
+
+/// A passing stage at this multiple of the native oracle's median time or
+/// more is pathological: AGENTS.md counts a 5x ratio as structurally wrong
+/// work, a correctness bug, not a performance gap (the perf bar is 2x).
+pub(crate) const PATHOLOGICAL_RATIO: f64 = 5.0;
+
+/// The smallest oracle time a ratio divides by, so a stage the oracle runs
+/// in a few milliseconds is not flagged for carrick's fixed start cost.
+const MIN_ORACLE_SECS: f64 = 0.25;
+
+/// One run of one stage on the native Docker oracle (`--oracle`), in the
+/// Docker-only phase before any carrick run.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OracleRecord {
+    pub(crate) isa: RowIsa,
+    pub(crate) row: String,
+    pub(crate) stage: String,
+    pub(crate) run: u32,
+    pub(crate) image: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
+    pub(crate) secs: f64,
+    pub(crate) passed: bool,
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    })
+}
+
+type StageKey = (RowIsa, String, String);
+
+/// Each stage's median time over its passing oracle runs.
+fn oracle_medians(oracle: &[OracleRecord]) -> BTreeMap<StageKey, f64> {
+    let mut by_stage: BTreeMap<StageKey, Vec<f64>> = BTreeMap::new();
+    for record in oracle.iter().filter(|r| r.passed) {
+        by_stage
+            .entry((record.isa, record.row.clone(), record.stage.clone()))
+            .or_default()
+            .push(record.secs);
+    }
+    by_stage
+        .into_iter()
+        .filter_map(|(key, secs)| median(secs).map(|m| (key, m)))
+        .collect()
+}
+
+/// The pathological-time rows: for each stage the oracle passed, the
+/// passing carrick runs at `PATHOLOGICAL_RATIO` times its median or more.
+/// A failing run's time says nothing about cost (it stopped early), and a
+/// run past its timeout is already a timeout row.
+fn pathological_rows(records: &[RunRecord], oracle: &[OracleRecord]) -> Vec<TableRow> {
+    let medians = oracle_medians(oracle);
+    let mut groups: BTreeMap<(String, RowIsa, String, String), Vec<&RunRecord>> = BTreeMap::new();
+    for record in records {
+        groups
+            .entry((
+                record.instance.clone(),
+                record.isa,
+                record.row.clone(),
+                record.stage.clone(),
+            ))
+            .or_default()
+            .push(record);
+    }
+    let mut rows = Vec::new();
+    for ((instance, isa, row, stage), runs) in groups {
+        let Some(&oracle_secs) = medians.get(&(isa, row.clone(), stage.clone())) else {
+            continue;
+        };
+        let floor = oracle_secs.max(MIN_ORACLE_SECS);
+        let slow: Vec<&RunRecord> = runs
+            .iter()
+            .copied()
+            .filter(|r| r.passed && r.secs >= PATHOLOGICAL_RATIO * floor)
+            .collect();
+        if slow.is_empty() {
+            continue;
+        }
+        let mut values = Vec::new();
+        for run in &slow {
+            push_value(
+                &mut values,
+                format!(
+                    "run {}: carrick {:.1}s vs oracle median {:.2}s ({:.0}x)",
+                    run.run,
+                    run.secs,
+                    oracle_secs,
+                    run.secs / floor
+                ),
+            );
+        }
+        rows.push(TableRow {
+            instance,
+            isa,
+            row,
+            stage,
+            kind: FindingKind::Pathological,
+            site: format!("passes at >= {PATHOLOGICAL_RATIO}x the native oracle's time"),
+            count: slow.len() as u64,
+            runs: slow.len(),
+            of_runs: runs.len(),
+            values,
+        });
+    }
+    rows
+}
+
 /// Judge one run from how it ended, its streams and its censuses.
 pub(crate) fn judge(
     stage: &StageSpec,
@@ -557,10 +685,7 @@ pub(crate) fn judge(
         }
         findings.push(finding);
     }
-    let marker_seen = stage
-        .expect
-        .as_deref()
-        .is_none_or(|marker| stdout.lines().any(|line| line.trim() == marker));
+    let marker_seen = marker_seen(stage, stdout);
     if !marker_seen {
         findings.push(Finding::new(
             FindingKind::MissingMarker,
@@ -590,7 +715,9 @@ pub(crate) struct TableRow {
 
 /// The ranked table over every run: one line per (instance, ISA, row, stage,
 /// site), most telling kind first, then the most runs, then the most counts.
-pub(crate) fn rank(records: &[RunRecord]) -> Vec<TableRow> {
+/// With oracle runs, a stage that passes at a pathological multiple of the
+/// oracle's time is a row too.
+pub(crate) fn rank(records: &[RunRecord], oracle: &[OracleRecord]) -> Vec<TableRow> {
     type Key = (String, RowIsa, String, String, FindingKind, String);
     let mut of_runs: BTreeMap<(String, RowIsa, String, String), usize> = BTreeMap::new();
     let mut by_key: BTreeMap<Key, TableRow> = BTreeMap::new();
@@ -646,6 +773,7 @@ pub(crate) fn rank(records: &[RunRecord]) -> Vec<TableRow> {
             row
         })
         .collect();
+    rows.extend(pathological_rows(records, oracle));
     rows.sort_by(|a, b| {
         a.kind
             .cmp(&b.kind)
@@ -658,10 +786,24 @@ pub(crate) fn rank(records: &[RunRecord]) -> Vec<TableRow> {
     rows
 }
 
-/// The table as Markdown, with a per-stage verdict line first.
-pub(crate) fn render(records: &[RunRecord], rows: &[TableRow], limit: usize) -> String {
+/// The table as Markdown, with a per-stage verdict line first: passes, the
+/// median carrick time, and with oracle runs the oracle's median and the
+/// ratio of the passing runs' median to it.
+pub(crate) fn render(
+    records: &[RunRecord],
+    oracle: &[OracleRecord],
+    rows: &[TableRow],
+    limit: usize,
+) -> String {
+    #[derive(Default)]
+    struct Verdict {
+        passed: usize,
+        runs: usize,
+        secs: Vec<f64>,
+        passing_secs: Vec<f64>,
+    }
     let mut out = String::new();
-    let mut verdicts: BTreeMap<(String, RowIsa, String, String), (usize, usize)> = BTreeMap::new();
+    let mut verdicts: BTreeMap<(String, RowIsa, String, String), Verdict> = BTreeMap::new();
     for record in records {
         let entry = verdicts
             .entry((
@@ -671,16 +813,33 @@ pub(crate) fn render(records: &[RunRecord], rows: &[TableRow], limit: usize) -> 
                 record.stage.clone(),
             ))
             .or_default();
-        entry.1 += 1;
+        entry.runs += 1;
+        entry.secs.push(record.secs);
         if record.passed {
-            entry.0 += 1;
+            entry.passed += 1;
+            entry.passing_secs.push(record.secs);
         }
     }
-    out.push_str("| instance | isa | row | stage | passed |\n|---|---|---|---|---:|\n");
-    for ((instance, isa, row, stage), (passed, runs)) in &verdicts {
+    let medians = oracle_medians(oracle);
+    out.push_str(
+        "| instance | isa | row | stage | passed | median secs | oracle secs | ratio |\n\
+         |---|---|---|---|---:|---:|---:|---:|\n",
+    );
+    for ((instance, isa, row, stage), verdict) in verdicts {
+        let secs = median(verdict.secs).map_or_else(|| "-".to_owned(), |s| format!("{s:.1}"));
+        let oracle_secs = medians.get(&(isa, row.clone(), stage.clone())).copied();
+        let ratio = match (median(verdict.passing_secs), oracle_secs) {
+            (Some(passing), Some(oracle)) => {
+                format!("{:.1}x", passing / oracle.max(MIN_ORACLE_SECS))
+            }
+            _ => "-".to_owned(),
+        };
         out.push_str(&format!(
-            "| {instance} | {} | {row} | {stage} | {passed}/{runs} |\n",
-            isa.name()
+            "| {instance} | {} | {row} | {stage} | {}/{} | {secs} | {} | {ratio} |\n",
+            isa.name(),
+            verdict.passed,
+            verdict.runs,
+            oracle_secs.map_or_else(|| "-".to_owned(), |s| format!("{s:.2}")),
         ));
     }
     out.push_str(&format!(
@@ -777,6 +936,8 @@ pub(crate) struct DiscoverOptions<'a> {
     pub(crate) label: &'a str,
     pub(crate) reap: Option<&'a Path>,
     pub(crate) limit: usize,
+    /// The docker CLI for the native-oracle timing phase (`--oracle`).
+    pub(crate) oracle: Option<&'a Path>,
 }
 
 fn instance_name(explicit: Option<&str>) -> String {
@@ -796,9 +957,14 @@ fn instance_name(explicit: Option<&str>) -> String {
     "unknown".to_owned()
 }
 
-fn write_outputs(out: &Path, records: &[RunRecord], limit: usize) -> Result<String> {
-    let rows = rank(records);
-    let table = render(records, &rows, limit);
+fn write_outputs(
+    out: &Path,
+    records: &[RunRecord],
+    oracle: &[OracleRecord],
+    limit: usize,
+) -> Result<String> {
+    let rows = rank(records, oracle);
+    let table = render(records, oracle, &rows, limit);
     std::fs::write(out.join("table.md"), &table)
         .with_context(|| format!("write {}", out.join("table.md").display()))?;
     std::fs::write(out.join("table.json"), serde_json::to_vec_pretty(&rows)?)
@@ -816,12 +982,117 @@ fn read_records(out: &Path) -> Result<Vec<RunRecord>> {
         .collect()
 }
 
+/// The oracle runs of a directory (`oracle.jsonl`); none when it has none.
+fn read_oracle(out: &Path) -> Result<Vec<OracleRecord>> {
+    let path = out.join("oracle.jsonl");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).with_context(|| format!("parse oracle {line}")))
+        .collect()
+}
+
 /// `carrick debug discover --report <out>`: re-rank a finished directory.
 pub(crate) fn report(out: &Path, limit: usize) -> Result<()> {
     let records = read_records(out)?;
     ensure!(!records.is_empty(), "{} holds no runs", out.display());
-    print!("{}", write_outputs(out, &records, limit)?);
+    print!(
+        "{}",
+        write_outputs(out, &records, &read_oracle(out)?, limit)?
+    );
     Ok(())
+}
+
+/// The Docker-only phase: time every selected stage `runs` times on the
+/// native oracle (`docker run --rm <image> <command...>`), each image
+/// pulled once first and untimed. It runs before any carrick run and never
+/// beside one (AGENTS.md: never carrick and Docker at once). A stage past
+/// its timeout has its container removed by name, since killing the docker
+/// CLI leaves the container running.
+fn run_oracle(
+    docker: &Path,
+    selected: &[&RowSpec],
+    isa: RowIsa,
+    runs: u32,
+    label: &str,
+    out: &Path,
+) -> Result<Vec<OracleRecord>> {
+    use std::io::Write;
+    let quiet = std::process::Stdio::null;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out.join("oracle.jsonl"))?;
+    for row in selected {
+        if let Some(image) = row.image.get(&isa) {
+            let _ = std::process::Command::new(docker)
+                .args(["pull", "-q", image])
+                .stdout(quiet())
+                .stderr(quiet())
+                .status();
+        }
+    }
+    let mut records = Vec::new();
+    for run in 1..=runs {
+        for row in selected {
+            let Some(image) = row.image.get(&isa) else {
+                continue;
+            };
+            for stage in &row.stages {
+                let name = format!("discover-oracle-{label}-{}-{}-{run}", row.name, stage.name);
+                let base = out.join(format!("oracle-{}-{}-{run}", row.name, stage.name));
+                let stdout_path = base.with_extension("out");
+                let started = std::time::Instant::now();
+                let child = std::process::Command::new(docker)
+                    .args(["run", "--rm", "--name", &name])
+                    .arg(image)
+                    .args(&stage.command)
+                    .stdin(quiet())
+                    .stdout(std::fs::File::create(&stdout_path)?)
+                    .stderr(std::fs::File::create(base.with_extension("err"))?)
+                    .spawn()
+                    .with_context(|| format!("start {}", docker.display()))?;
+                let timeout = Duration::from_secs(stage.timeout_secs.unwrap_or(row.timeout_secs));
+                let ending = wait_bounded(child, timeout)?;
+                let secs = started.elapsed().as_secs_f64();
+                if ending.timed_out {
+                    let _ = std::process::Command::new(docker)
+                        .args(["rm", "-f", &name])
+                        .stdout(quiet())
+                        .stderr(quiet())
+                        .status();
+                }
+                let stdout = String::from_utf8_lossy(&std::fs::read(&stdout_path)?).into_owned();
+                let passed =
+                    ending.exit_code == Some(0) && !ending.timed_out && marker_seen(stage, &stdout);
+                eprintln!(
+                    "discover: oracle {}/{} run {run}: {} in {secs:.2}s",
+                    row.name,
+                    stage.name,
+                    if passed { "pass" } else { "FAIL" }
+                );
+                let record = OracleRecord {
+                    isa,
+                    row: row.name.clone(),
+                    stage: stage.name.clone(),
+                    run,
+                    image: image.clone(),
+                    exit_code: ending.exit_code,
+                    timed_out: ending.timed_out,
+                    secs,
+                    passed,
+                };
+                writeln!(file, "{}", serde_json::to_string(&record)?)?;
+                file.flush()?;
+                records.push(record);
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// `carrick debug discover --rows <file> --out <dir>`: run every selected
@@ -859,6 +1130,18 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
         .iter()
         .filter(|row| options.only.is_empty() || options.only.contains(&row.name))
         .collect();
+    // The oracle phase finishes before the first carrick run starts.
+    let oracle = match options.oracle {
+        Some(docker) => run_oracle(
+            docker,
+            &selected,
+            isa,
+            options.runs,
+            options.label,
+            options.out,
+        )?,
+        None => read_oracle(options.out)?,
+    };
     let mut records = Vec::new();
     // First runs of every stage come first, so a short budget still sees
     // every stage once; repeats follow.
@@ -943,7 +1226,10 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
             }
         }
     }
-    print!("{}", write_outputs(options.out, &records, options.limit)?);
+    print!(
+        "{}",
+        write_outputs(options.out, &records, &oracle, options.limit)?
+    );
     let misses = known_answer_misses(&rows, &records);
     if !misses.is_empty() {
         for miss in &misses {
@@ -1212,12 +1498,12 @@ mod tests {
             ),
             record("go", 3, true, vec![]),
         ];
-        let rows = rank(&records);
+        let rows = rank(&records, &[]);
         assert_eq!(rows[0].kind, FindingKind::Fatal);
         assert_eq!((rows[1].count, rows[1].runs, rows[1].of_runs), (10, 2, 3));
         assert_eq!(rows[1].values, ["a", "b"]);
         assert_eq!(rows[2].kind, FindingKind::IpcLeave);
-        let table = render(&records, &rows, 10);
+        let table = render(&records, &[], &rows, 10);
         assert!(
             table.contains("| hz-vm | x86_64 | go | build | 1/3 |"),
             "{table}"
@@ -1225,6 +1511,155 @@ mod tests {
         assert!(
             table.contains("| 2 | hz-vm | x86_64 | go | build | refused | mmap(nr=9) caller=child venue=ring | 10 | 2/3 | `a`<br>`b` |"),
             "{table}"
+        );
+    }
+
+    fn oracle(stage: &str, run: u32, secs: f64, passed: bool) -> OracleRecord {
+        OracleRecord {
+            isa: RowIsa::X86_64,
+            row: "pip".to_owned(),
+            stage: stage.to_owned(),
+            run,
+            image: "img".to_owned(),
+            exit_code: Some(i32::from(!passed)),
+            timed_out: false,
+            secs,
+            passed,
+        }
+    }
+
+    #[test]
+    fn a_passing_stage_at_five_times_the_oracle_is_a_pathological_row() {
+        // pip's stdlib stage as the x86 rows measured it: about 102 s on
+        // carrick, about 0.47 s on the native Docker oracle. Run 3 failed,
+        // so its time is no cost evidence; the vet stage is under 5x.
+        let at = |stage: &str, run, secs, passed| RunRecord {
+            row: "pip".to_owned(),
+            stage: stage.to_owned(),
+            secs,
+            ..record("pip", run, passed, vec![])
+        };
+        let records = vec![
+            at("stdlib", 1, 102.2, true),
+            at("stdlib", 2, 101.4, true),
+            at("stdlib", 3, 300.0, false),
+            at("vet", 1, 2.0, true),
+        ];
+        let oracle = vec![
+            oracle("stdlib", 1, 0.48, true),
+            oracle("stdlib", 2, 0.44, true),
+            oracle("stdlib", 3, 9.0, false),
+            oracle("vet", 1, 0.5, true),
+        ];
+        let rows = rank(&records, &oracle);
+        let slow: Vec<&TableRow> = rows
+            .iter()
+            .filter(|r| r.kind == FindingKind::Pathological)
+            .collect();
+        assert_eq!(slow.len(), 1, "{rows:?}");
+        assert_eq!(
+            (slow[0].stage.as_str(), slow[0].runs, slow[0].of_runs),
+            ("stdlib", 2, 3)
+        );
+        assert_eq!(
+            slow[0].values[0],
+            "run 1: carrick 102.2s vs oracle median 0.46s (222x)"
+        );
+        let table = render(&records, &oracle, &rows, 10);
+        assert!(
+            table.contains("| hz-vm | x86_64 | pip | stdlib | 2/3 | 102.2 | 0.46 | 221.3x |"),
+            "{table}"
+        );
+        assert!(
+            table.contains("| hz-vm | x86_64 | pip | vet | 1/1 | 2.0 | 0.50 | 4.0x |"),
+            "{table}"
+        );
+        assert!(
+            table.contains("| pathological_time | passes at >= 5x"),
+            "{table}"
+        );
+        // Without oracle runs nothing is pathological and the columns say so.
+        assert!(
+            !rank(&records, &[])
+                .iter()
+                .any(|r| r.kind == FindingKind::Pathological)
+        );
+        assert!(
+            render(&records, &[], &rank(&records, &[]), 10).contains("| 2/3 | 102.2 | - | - |")
+        );
+    }
+
+    #[test]
+    fn the_oracle_phase_times_each_stage_before_any_carrick_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("order.log");
+        let script = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        };
+        // Stand-ins (cfg(test) only): a docker CLI that answers at once, and
+        // a carrier that is slow on the `slow` stage. Both log their calls.
+        let docker = dir.path().join("docker");
+        script(
+            &docker,
+            &format!(
+                "#!/bin/sh\necho \"docker $1\" >> {log}\n[ \"$1\" = run ] && echo OK\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        let fake = dir.path().join("carrick");
+        script(
+            &fake,
+            &format!(
+                "#!/bin/sh\necho \"carrick $3\" >> {log}\n[ \"$3\" = slow ] && sleep 1.5\necho OK\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        let rows = dir.path().join("rows.json");
+        std::fs::write(
+            &rows,
+            r#"{"rows":[{"name":"r","image":{"x86_64":"u","arm64":"u"},"timeout_secs":20,
+                "stages":[{"name":"fast","command":["fast"],"expect":"OK"},
+                          {"name":"slow","command":["slow"],"expect":"OK"}]}]}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("out");
+        discover(DiscoverOptions {
+            rows: &rows,
+            only: &[],
+            runs: 1,
+            out: &out,
+            carrick: Some(&fake),
+            instance: Some("unit"),
+            label: "t",
+            reap: None,
+            limit: 50,
+            oracle: Some(&docker),
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "docker pull\ndocker run\ndocker run\ncarrick fast\ncarrick slow\n"
+        );
+        let oracle = read_oracle(&out).unwrap();
+        assert_eq!(oracle.len(), 2);
+        assert!(oracle.iter().all(|r| r.passed), "{oracle:?}");
+        let table = std::fs::read_to_string(out.join("table.md")).unwrap();
+        assert!(
+            table.contains(
+                "| pathological_time | passes at >= 5x the native oracle's time | 1 | 1/1 |"
+            ),
+            "{table}"
+        );
+        assert!(!table.contains("| fast | pathological_time"), "{table}");
+        // --report keeps the oracle's columns and rows.
+        std::fs::remove_file(out.join("table.md")).unwrap();
+        report(&out, 50).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("table.md")).unwrap(),
+            table
         );
     }
 
@@ -1354,6 +1789,7 @@ mod tests {
             label: "t",
             reap: None,
             limit: 50,
+            oracle: None,
         })
         .unwrap();
         let records = read_records(&out).unwrap();
