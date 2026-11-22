@@ -2543,22 +2543,31 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         // Keep this exclusion through allocation and the read-only table plan:
         // a contended native call waits before creating any physical journal.
-        let pending = self.prepare_backing_grant(execution, window, file, reply)?;
+        let pending = self.prepare_backing_grant(execution, window, file, reply, &pause)?;
         drop(pause);
         wake.finish()?;
         Ok(Ok(pending))
     }
 
-    pub(super) fn prepare_backing_grant(
+    /// Stage and submit one selected window. `pause` is the caller's
+    /// exclusion of this MM's editor: the table plan reads the live root
+    /// under it, and takes no second exclusion. A nested probe can meet a
+    /// sibling's editor admission backing off the raised gate and read it as
+    /// `Busy` (#2659).
+    fn prepare_backing_grant(
         &mut self,
         execution: GrantExecution,
         window: PortalGrantWindow,
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
+        pause: &CowPause<'_>,
     ) -> Result<BackingPreparation, TrapError> {
         let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();
+        if pause.proof().key() != mm.get() {
+            return Err(fail("owner grant exclusion MM mismatch"));
+        }
         if self.grant_portal()?.carrier() != Some(window.operation.carrier)
             || window.range.len() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
         {
@@ -2672,38 +2681,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             },
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
-        let ram = Arc::clone(&self.ram);
-        let demand = (|| -> Result<
-            Result<usize, carrick_mmu_core::descriptor_refusal::DescriptorRefusal>,
-            TrapError,
-        > {
-            let zone = retained_cow_zone(&ram)?;
-            let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
-            let delivery = |zone: &X86Cpl0Zone,
-                            waker: Waker,
-                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                '_,
-                carrick_sched_core::ParkedContextWords,
-            >| wake.deliver(zone, waker, owned);
-            let pause = self.settled_pause_or_fail(
-                SpaceReleaseVenue {
-                    zone,
-                    waker: Waker::Host,
-                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                        &delivery,
-                    ),
-                },
-                mm.get(),
-            )?;
-            let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
-                self._vm.admit_guest_edit(native).map_err(|error| fail(error.to_string()))?;
-                Ok(carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)
-                    .map(|plan| plan.tables_linked))
-            }).map_err(|error| fail(format!("owner grant table plan projection: {error:?}")));
-            drop(pause);
-            wake.finish()?;
-            planned?
-        })();
+        let demand = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
+            self._vm
+                .admit_guest_edit(native)
+                .map_err(|error| fail(error.to_string()))?;
+            Ok(carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(
+                &self._vm.words(),
+                native,
+                root,
+            )
+            .map(|plan| plan.tables_linked))
+        })
+        .map_err(|error| fail(format!("owner grant table plan projection: {error:?}")))
+        .and_then(|planned| planned);
         let required = match demand {
             Ok(Ok(required)) => required,
             Ok(Err(refusal)) => {
