@@ -791,6 +791,53 @@ fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {
     );
 }
 
+/// `getcwd`, `uname`, `getrlimit`, `prlimit64`, `getrusage` and `sysinfo`
+/// into a mapped page the guest never touched succeed on Linux: the copy
+/// fills the page in. The root and a forked child (with a copy-on-write
+/// page too) must report the native rows, never EFAULT.
+#[test]
+fn mounted_static_x86_sysinfo_output_to_an_untouched_page_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("sysinfo-output");
+    compile_assembly_with_flags(
+        "x86_sysinfo_unsupplied_output.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native sysinfo-output oracle");
+    let native_rows = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        native.status.code(),
+        Some(7),
+        "native oracle: {native_rows}"
+    );
+    assert!(
+        native_rows.lines().count() == 20 && !native_rows.contains("MISSING"),
+        "native Linux fills every buffer: {native_rows}"
+    );
+
+    let guest = run_mounted_binary(&elf, "sysinfo-unsupplied-output", false);
+    let guest_rows = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        guest_rows,
+        native_rows,
+        "exit {:?} (95/96: a child did not exit 0). Stderr: {}",
+        guest.status.code(),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), Some(7));
+}
+
 /// #2832: an exec'd fork child's thread asks the host for a file. The exec
 /// gave the process leader a new execution generation; a thread born after
 /// it carries its own. The host compared the two and ended the run
