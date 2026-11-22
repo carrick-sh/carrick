@@ -1283,6 +1283,15 @@ check-netbsd:
 # queue. Off-macOS, Clang compiles C sources (`carrick-vmm-hvf` and `ring`) in
 # sysroot-less mode (`-nostdlibinc -DRING_CORE_NOSTDLIBINC=1`) against the
 # documented `TargetConditionals.h` shim in `scripts/ci/darwin-check-include`.
+#
+# It then runs the two compile-only gates a Mac runs, with the Mac's own
+# selection (#2805): `just clippy` (whole workspace, default features, all
+# targets) and `just doc` (whole workspace, private items), both for
+# aarch64-apple-darwin. The closure above leaves out the workspace crates
+# `carrick-cli` does not depend on, `carrick-conformance-next` among them, and
+# no other Linux job runs rustdoc for Darwin. The compiler, target, features and
+# lints are the Mac's; only build scripts run on this host, and none of the
+# workspace's build scripts branches on a host cfg.
 cross-check-macos *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1299,7 +1308,9 @@ cross-check-macos *ARGS:
         exit 1
     fi
     {{_admit}} {{_cargo}} check --target aarch64-apple-darwin --no-default-features --features "$macos_features" --all-targets $macos_crates {{ARGS}}
-    exec {{_admit}} {{_cargo}} clippy --target aarch64-apple-darwin --no-default-features --features "$macos_features" --all-targets --keep-going $macos_crates {{ARGS}} -- -D warnings
+    {{_admit}} {{_cargo}} clippy --target aarch64-apple-darwin --no-default-features --features "$macos_features" --all-targets --keep-going $macos_crates {{ARGS}} -- -D warnings
+    {{_admit}} {{_cargo}} clippy --target aarch64-apple-darwin --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
+    exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_cargo}} doc --target aarch64-apple-darwin --workspace --no-deps --document-private-items {{ARGS}}
 
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
