@@ -91,7 +91,7 @@ impl HostResolverSnapshot {
 
     /// Capture configd's rendered resolver file using only in-process file I/O.
     /// The host read stays here, the launch owner of this I/O; the choice of
-    /// which file to serve is [`Self::capture_with`]'s.
+    /// which file to serve is `capture_with`'s.
     pub fn capture_launch() -> Self {
         Self::capture_with(&HostResolverFiles::LAUNCH, |path| {
             std::fs::read_to_string(path).ok()
