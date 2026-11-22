@@ -5803,84 +5803,29 @@ impl PhysicalBirthSource {
             live,
         })
     }
-    fn with_zone<T>(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        op: impl FnOnce(&X86Cpl0Zone) -> T,
-    ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
-        use carrick_hal::birth_serial::BirthSourceError;
-        let live = self.live.read().map_err(|_| BirthSourceError::StaleOwner)?;
-        if expected != &self.identity || !*live {
-            return Err(BirthSourceError::StaleOwner);
-        }
-        // SAFETY: physical bootstrap initialized this zone in immutable windows;
-        // the owning Arc<GuestRam> retains every mapped byte through this borrow.
-        Ok(op(unsafe { self.zone.as_ref() }))
-    }
 }
 // SAFETY: zone is derived once from the retained initialized GuestRam. Only
 // atomic issuers and leaf-locked namespace are accessed under the
 // physical-custody revocation guard.
 unsafe impl Send for PhysicalBirthSource {}
 unsafe impl Sync for PhysicalBirthSource {}
-impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
-    fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
+impl carrick_hal::birth_serial::RetainedBirthZone for PhysicalBirthSource {
+    type Context = carrick_sched_core::ParkedContextWords;
+    fn source_identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
         &self.identity
     }
-    fn with_namespace(
+    fn with_retained_zone<T>(
         &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        op: &mut dyn FnMut(&mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>),
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| {
-            zone.namespace()
-                .with_view(&carrick_sched_core::ShortLockSpin, op);
-        })
-    }
-    fn allocate_mm(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-    ) -> Result<carrick_guest_arch::MmGeneration, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.mm_issuer().allocate())?
-            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
-    }
-    fn adopt_initial_mm(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        high_water: carrick_guest_arch::MmGeneration,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_zone(expected, |zone| zone.mm_issuer().adopt_initial(high_water))? {
-            Ok(())
-        } else {
-            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
+        op: impl FnOnce(&X86Cpl0Zone) -> T,
+    ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
+        use carrick_hal::birth_serial::BirthSourceError;
+        let live = self.live.read().map_err(|_| BirthSourceError::StaleOwner)?;
+        if !*live {
+            return Err(BirthSourceError::StaleOwner);
         }
-    }
-    fn allocate(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-    ) -> Result<NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.serial_issuer().allocate())?
-            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
-    }
-    fn adopt_initial(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        high_water: NonZeroU64,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_zone(expected, |zone| {
-            zone.serial_issuer().adopt_initial(high_water)
-        })? {
-            Ok(())
-        } else {
-            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
-        }
-    }
-    fn advance_past(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        issued: NonZeroU64,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.serial_issuer().advance_past(issued))
+        // SAFETY: physical bootstrap initialized this zone in immutable windows;
+        // the owning Arc<GuestRam> retains every mapped byte through this borrow.
+        Ok(op(unsafe { self.zone.as_ref() }))
     }
 }
 

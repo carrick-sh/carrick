@@ -47,45 +47,14 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Raw view of the retained kernel ABI mapping. It carries no shared byte
-/// slice: a wire reply mutates its stopped CPU's stack while other CPUs may
-/// use disjoint atomic ABI records in the same mapping.
+// The stopped-CPU ABI readers are shared with the soft carrier.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+use carrick_aarch64::stopped_abi::root_execution; // the root-terminal witness
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
-pub(crate) struct RetainedAbiRegion<'a> {
-    base: core::ptr::NonNull<u8>,
-    _retained: core::marker::PhantomData<&'a core::cell::UnsafeCell<u8>>,
-}
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> RetainedAbiRegion<'a> {
-    /// # Safety
-    /// The caller retains an initialized EL1 mapping of `len` bytes through
-    /// `'a`. Only the synchronously stopped CPU may access its wire stack;
-    /// shared fixed records use their ABI atomics and ownership protocol.
-    pub(crate) unsafe fn new(base: *mut u8, len: usize) -> Option<Self> {
-        let base = core::ptr::NonNull::new(base)?;
-        if len != carrick_el1_abi::EL1_REGION_SIZE as usize {
-            return None;
-        }
-        Some(Self {
-            base,
-            _retained: core::marker::PhantomData,
-        })
-    }
-    fn record_ptr<T>(self, offset: usize) -> Option<*mut T> {
-        if offset.checked_add(core::mem::size_of::<T>())?
-            > carrick_el1_abi::EL1_REGION_SIZE as usize
-        {
-            return None;
-        }
-        // SAFETY: checked offset remains inside the retained mapping.
-        let pointer = unsafe { self.base.as_ptr().add(offset) };
-        pointer
-            .addr()
-            .is_multiple_of(core::mem::align_of::<T>())
-            .then_some(pointer.cast())
-    }
-}
+pub(crate) use carrick_aarch64::stopped_abi::{
+    RetainedAbiRegion, abi_stack_ptr, abi_stack_record, root_stack_record, stopped_execution,
+    stopped_records,
+};
 
 /// Runtime-owned handback venue for an already enrolled parent wait.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2705,64 +2674,6 @@ fn classify_metadata_trap(
     })
 }
 
-/// Read only a complete aligned terminal record on the stopped CPU's ABI stack.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn root_stack_record<'a>(
-    region: RetainedAbiRegion<'a>,
-    cpu: carrick_guest_arch::CpuId,
-    address: carrick_guest_arch::KernelVa,
-) -> Option<&'a NativeRootExit> {
-    let pointer = abi_stack_ptr::<NativeRootExit>(region, cpu, address)?;
-    // SAFETY: complete aligned immutable record on a retained stopped stack.
-    Some(unsafe { &*pointer })
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn abi_stack_record<'a, T>(
-    region: RetainedAbiRegion<'a>,
-    cpu: carrick_guest_arch::CpuId,
-    address: carrick_guest_arch::KernelVa,
-) -> Option<&'a T> {
-    let pointer = abi_stack_ptr::<T>(region, cpu, address)?;
-    // SAFETY: complete aligned immutable record retained on the stopped CPU stack.
-    Some(unsafe { &*pointer })
-}
-
-/// Resolve only this CPU's complete aligned kernel-stack record. The address
-/// type cannot be passed to the physical table-frame resolver.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn abi_stack_ptr<T>(
-    region: RetainedAbiRegion<'_>,
-    cpu: carrick_guest_arch::CpuId,
-    address: carrick_guest_arch::KernelVa,
-) -> Option<*mut T> {
-    if cpu.raw() >= carrick_el1_abi::EL1_STACK_SLOTS as u32 {
-        return None;
-    }
-    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let start = carrick_el1_abi::stack_slot_usable_base(slot.raw() as usize);
-    let top = carrick_el1_abi::stack_slot_top(slot.raw() as usize);
-    let end = address
-        .raw()
-        .checked_add(core::mem::size_of::<T>() as u64)?;
-    if address.raw() < start
-        || end > top
-        || !address
-            .raw()
-            .is_multiple_of(core::mem::align_of::<T>() as u64)
-    {
-        return None;
-    }
-    region.record_ptr::<T>(
-        usize::try_from(
-            address
-                .raw()
-                .checked_sub(carrick_el1_abi::EL1_REGION_BASE)?,
-        )
-        .ok()?,
-    )
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retained_abi_region(
     _custody: &crate::trap::CarrierVmCustody,
@@ -2774,34 +2685,6 @@ pub(crate) fn retained_abi_region(
             carrick_el1_abi::EL1_REGION_SIZE as usize,
         )
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn stopped_execution(
-    region: RetainedAbiRegion<'_>,
-    cpu: carrick_guest_arch::CpuId,
-    ttbr0: u64,
-) -> Option<crate::fork_stock::GrantExecution> {
-    let (task, zone) = stopped_records(region, cpu)?;
-    root_execution(cpu, task, zone, ttbr0)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn stopped_records<'a>(
-    region: RetainedAbiRegion<'a>,
-    cpu: carrick_guest_arch::CpuId,
-) -> Option<(
-    &'a carrick_el1_abi::CurrentTask,
-    &'a carrick_el1_abi::ZoneTables,
-)> {
-    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let task_offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
-        + usize::from(slot.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>();
-    let task = region.record_ptr::<carrick_el1_abi::CurrentTask>(task_offset)?;
-    let zone = region
-        .record_ptr::<carrick_el1_abi::ZoneTables>(carrick_el1_abi::EL1_ZONE_OFFSET as usize)?;
-    // SAFETY: initialized disjoint fixed ABI records; mutation uses their atomics.
-    Some(unsafe { (&*task, &*zone) })
 }
 
 /// Terminal-only observation. Do not require the execution binding whose
@@ -2864,24 +2747,6 @@ fn diagnostic_identity(
 
 /// Root retirement has released its record. Authenticate the stopped lane
 /// against its retained host execution, installed MM grant and hardware root.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn root_execution(
-    cpu: carrick_guest_arch::CpuId,
-    task: &carrick_el1_abi::CurrentTask,
-    zone: &carrick_el1_abi::ZoneTables,
-    ttbr0: u64,
-) -> Option<crate::fork_stock::GrantExecution> {
-    crate::fork_stock::GrantExecution::from_stopped_lane(
-        cpu,
-        carrick_core::entry::binding(&task.execution, &task.mm),
-        task.root_generation(),
-        zone,
-        carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
-            ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
-        ))?,
-    )
-}
-
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod ownership_tests {
     use super::*;
@@ -3963,15 +3828,17 @@ unsafe impl Send for CarrierBirthSource {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Sync for CarrierBirthSource {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CarrierBirthSource {
-    fn with_zone<T>(
+impl carrick_hal::birth_serial::RetainedBirthZone for CarrierBirthSource {
+    type Context = carrick_el1_abi::Aarch64ParkedContext;
+    fn source_identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
+        &self.identity
+    }
+    fn with_retained_zone<T>(
         &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
         op: impl FnOnce(&carrick_el1_abi::ZoneTables) -> T,
     ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
         let state = self.custody.state.lock();
-        if expected != &self.identity
-            || !matches!(state.lifecycle, crate::trap::CarrierVmLifecycle::Live(g) if g == self.generation)
+        if !matches!(state.lifecycle, crate::trap::CarrierVmLifecycle::Live(g) if g == self.generation)
             || !self.backing.live.load(Ordering::Acquire)
         {
             return Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner);
@@ -3987,67 +3854,6 @@ impl CarrierBirthSource {
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
         Ok(op(zone))
-    }
-}
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_hal::birth_serial::BirthSerialSource for CarrierBirthSource {
-    fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
-        &self.identity
-    }
-    fn with_namespace(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        op: &mut dyn FnMut(&mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>),
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| {
-            zone.namespace()
-                .with_view(&carrick_sched_core::ShortLockSpin, op);
-        })
-    }
-    fn allocate_mm(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-    ) -> Result<carrick_guest_arch::MmGeneration, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.mm_issuer().allocate())?
-            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
-    }
-    fn adopt_initial_mm(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        high_water: carrick_guest_arch::MmGeneration,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_zone(expected, |zone| zone.mm_issuer().adopt_initial(high_water))? {
-            Ok(())
-        } else {
-            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
-        }
-    }
-    fn allocate(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-    ) -> Result<core::num::NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.serial_issuer().allocate())?
-            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
-    }
-    fn adopt_initial(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        high_water: core::num::NonZeroU64,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_zone(expected, |zone| {
-            zone.serial_issuer().adopt_initial(high_water)
-        })? {
-            Ok(())
-        } else {
-            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
-        }
-    }
-    fn advance_past(
-        &self,
-        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        issued: core::num::NonZeroU64,
-    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_zone(expected, |zone| zone.serial_issuer().advance_past(issued))
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

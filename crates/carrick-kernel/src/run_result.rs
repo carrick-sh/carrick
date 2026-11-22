@@ -142,9 +142,39 @@ impl RunResult {
     }
 }
 
+/// A native terminal status as a run's `(exit_code, terminating_signal)`:
+/// an exit keeps its code; a signal death takes the shell's `128 + signum`
+/// and names its signal. `None` when the code exceeds the result domain.
+pub fn native_terminal_exit(
+    status: carrick_sched_core::process::TerminationStatus,
+) -> Option<(i32, Option<i32>)> {
+    let code = i32::try_from(status.code()).ok()?;
+    Some(match status.kind() {
+        carrick_sched_core::process::TerminationKind::Exited => (code, None),
+        carrick_sched_core::process::TerminationKind::Signaled { .. } => (128 + code, Some(code)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_terminal_exit_keeps_codes_and_names_signals() {
+        use carrick_sched_core::process::TerminationStatus;
+        assert_eq!(
+            native_terminal_exit(TerminationStatus::exited(7)),
+            Some((7, None))
+        );
+        assert_eq!(
+            native_terminal_exit(TerminationStatus::signaled(9, false)),
+            Some((137, Some(9)))
+        );
+        assert_eq!(
+            native_terminal_exit(TerminationStatus::signaled(11, true)),
+            Some((139, Some(11)))
+        );
+    }
 
     fn result(exit_code: i32, terminating_signal: Option<i32>) -> RunResult {
         RunResult {

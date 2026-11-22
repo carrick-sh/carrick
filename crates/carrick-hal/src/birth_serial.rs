@@ -83,6 +83,95 @@ pub trait BirthSerialSource: Send + Sync + core::fmt::Debug {
     ) -> Result<(), BirthSourceError>;
 }
 
+/// One carrier's retained access to its initialized zone tables: the single
+/// backend mechanic of a [`BirthSerialSource`]. The blanket implementation
+/// authenticates the expected incarnation and serves every issuance from the
+/// lent zone's own words, so each carrier supplies only custody and liveness.
+pub trait RetainedBirthZone: Send + Sync + core::fmt::Debug {
+    type Context: Copy + Send + Sync + zerocopy::FromZeros + 'static;
+    fn source_identity(&self) -> &BirthSourceIdentity;
+    /// Lend this exact live carrier's zone for `op`, or refuse a retired one.
+    /// The zone stays retained, and the carrier live, through `op`.
+    fn with_retained_zone<T>(
+        &self,
+        op: impl FnOnce(&carrick_sched_core::ZoneTables<Self::Context>) -> T,
+    ) -> Result<T, BirthSourceError>;
+}
+
+/// Lend `source`'s zone only to a caller naming its exact incarnation.
+fn with_expected_zone<R: RetainedBirthZone, T>(
+    source: &R,
+    expected: &BirthSourceIdentity,
+    op: impl FnOnce(&carrick_sched_core::ZoneTables<R::Context>) -> T,
+) -> Result<T, BirthSourceError> {
+    if expected != source.source_identity() {
+        return Err(BirthSourceError::StaleOwner);
+    }
+    source.with_retained_zone(op)
+}
+
+impl<R: RetainedBirthZone> BirthSerialSource for R {
+    fn identity(&self) -> &BirthSourceIdentity {
+        self.source_identity()
+    }
+    fn with_namespace(
+        &self,
+        expected: &BirthSourceIdentity,
+        op: &mut dyn FnMut(&mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>),
+    ) -> Result<(), BirthSourceError> {
+        with_expected_zone(self, expected, |zone| {
+            zone.namespace()
+                .with_view(&carrick_sched_core::ShortLockSpin, op);
+        })
+    }
+    fn allocate_mm(
+        &self,
+        expected: &BirthSourceIdentity,
+    ) -> Result<carrick_guest_arch::MmGeneration, BirthSourceError> {
+        with_expected_zone(self, expected, |zone| zone.mm_issuer().allocate())?
+            .ok_or(BirthSourceError::Exhausted)
+    }
+    fn adopt_initial_mm(
+        &self,
+        expected: &BirthSourceIdentity,
+        high_water: carrick_guest_arch::MmGeneration,
+    ) -> Result<(), BirthSourceError> {
+        if with_expected_zone(self, expected, |zone| {
+            zone.mm_issuer().adopt_initial(high_water)
+        })? {
+            Ok(())
+        } else {
+            Err(BirthSourceError::StaleOwner)
+        }
+    }
+    fn allocate(&self, expected: &BirthSourceIdentity) -> Result<NonZeroU64, BirthSourceError> {
+        with_expected_zone(self, expected, |zone| zone.serial_issuer().allocate())?
+            .ok_or(BirthSourceError::Exhausted)
+    }
+    fn adopt_initial(
+        &self,
+        expected: &BirthSourceIdentity,
+        high_water: NonZeroU64,
+    ) -> Result<(), BirthSourceError> {
+        if with_expected_zone(self, expected, |zone| {
+            zone.serial_issuer().adopt_initial(high_water)
+        })? {
+            Ok(())
+        } else {
+            Err(BirthSourceError::StaleOwner)
+        }
+    }
+    fn advance_past(
+        &self,
+        expected: &BirthSourceIdentity,
+        issued: NonZeroU64,
+    ) -> Result<(), BirthSourceError> {
+        with_expected_zone(self, expected, |zone| {
+            zone.serial_issuer().advance_past(issued);
+        })
+    }
+}
+
 /// VM-free fixture backing; never part of a product capability implementation.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
@@ -142,82 +231,23 @@ pub mod test_support {
         pub fn retire(&self) {
             self.live.store(false, Ordering::Release);
         }
-        fn check(&self, expected: &BirthSourceIdentity) -> Result<(), BirthSourceError> {
-            if expected == &self.identity && self.live.load(Ordering::Acquire) {
-                Ok(())
-            } else {
-                Err(BirthSourceError::StaleOwner)
-            }
-        }
     }
-    impl<C: Copy + Send + Sync + zerocopy::FromZeros + 'static> BirthSerialSource
+    impl<C: Copy + Send + Sync + zerocopy::FromZeros + 'static> RetainedBirthZone
         for OwnedBirthZone<C>
     {
-        fn identity(&self) -> &BirthSourceIdentity {
+        type Context = C;
+        fn source_identity(&self) -> &BirthSourceIdentity {
             &self.identity
         }
-        fn with_namespace(
+        fn with_retained_zone<T>(
             &self,
-            expected: &BirthSourceIdentity,
-            op: &mut dyn FnMut(
-                &mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>,
-            ),
-        ) -> Result<(), BirthSourceError> {
-            self.check(expected)?;
-            self.zone
-                .namespace()
-                .with_view(&carrick_sched_core::ShortLockSpin, op);
-            Ok(())
-        }
-        fn allocate_mm(
-            &self,
-            expected: &BirthSourceIdentity,
-        ) -> Result<carrick_guest_arch::MmGeneration, BirthSourceError> {
-            self.check(expected)?;
-            self.zone
-                .mm_issuer()
-                .allocate()
-                .ok_or(BirthSourceError::Exhausted)
-        }
-        fn adopt_initial_mm(
-            &self,
-            expected: &BirthSourceIdentity,
-            high_water: carrick_guest_arch::MmGeneration,
-        ) -> Result<(), BirthSourceError> {
-            self.check(expected)?;
-            if self.zone.mm_issuer().adopt_initial(high_water) {
-                Ok(())
+            op: impl FnOnce(&ZoneTables<C>) -> T,
+        ) -> Result<T, BirthSourceError> {
+            if self.live.load(Ordering::Acquire) {
+                Ok(op(&self.zone))
             } else {
                 Err(BirthSourceError::StaleOwner)
             }
-        }
-        fn allocate(&self, expected: &BirthSourceIdentity) -> Result<NonZeroU64, BirthSourceError> {
-            self.check(expected)?;
-            self.zone
-                .serial_issuer()
-                .allocate()
-                .ok_or(BirthSourceError::Exhausted)
-        }
-        fn adopt_initial(
-            &self,
-            expected: &BirthSourceIdentity,
-            high_water: NonZeroU64,
-        ) -> Result<(), BirthSourceError> {
-            self.check(expected)?;
-            if self.zone.serial_issuer().adopt_initial(high_water) {
-                Ok(())
-            } else {
-                Err(BirthSourceError::StaleOwner)
-            }
-        }
-        fn advance_past(
-            &self,
-            expected: &BirthSourceIdentity,
-            issued: NonZeroU64,
-        ) -> Result<(), BirthSourceError> {
-            self.check(expected)?;
-            self.zone.serial_issuer().advance_past(issued);
-            Ok(())
         }
     }
 }
