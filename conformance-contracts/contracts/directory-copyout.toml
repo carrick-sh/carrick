@@ -1,3 +1,11 @@
+# #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
+# (enter_mm_executor_then_register, the leased-root check and
+# open_first_address_space) and the stopped zone-slot publication move to
+# carrick-kernel dispatch/carrier_loop.rs; the retained lifecycle slab walk,
+# dedup, publication and retirement move to dispatch/carrier_lifecycle.rs
+# behind carrick-hal retained_metadata (HVF keeps a thin adapter). Probes,
+# error states, gate semantics and the HVF fatal are unchanged; this
+# contract's semantics, bindings and work budgets are unchanged.
 # #1733: `vcpu_loop/mod.rs` only gains a test-engine frame-COW resolver hook.
 # #1733/#2020: `vcpu_loop/binding.rs` settles the faulting MM's EL1 COW
 # completions before the EL0 fault refill (witness bound under

@@ -1,3 +1,16 @@
+# #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
+# (enter_mm_executor_then_register, the leased-root check and
+# open_first_address_space) and the stopped zone-slot publication move to
+# carrick-kernel dispatch/carrier_loop.rs; the retained lifecycle slab walk,
+# dedup, publication and retirement move to dispatch/carrier_lifecycle.rs
+# behind carrick-hal retained_metadata (HVF keeps a thin adapter). Probes,
+# error states, gate semantics and the HVF fatal are unchanged; this
+# contract's semantics, bindings and work budgets are unchanged.
+# New VM-free witnesses of the shared stopped-slot publication:
+# carrick-kernel dispatch::carrier_loop::tests::
+# stopped_slot_publication_targets_then_drives_the_loaded_task,
+# failed_reschedule_target_publishes_nothing_on_the_slot,
+# held_slot_refuses_publication_and_is_left_undriven.
 # #2354: a guest sched_yield is a turn boundary on every ISA. The shared
 # policy is sched-core's `YieldTurn` (rotate while a runnable thread waits on
 # the caller's slot); ARM's EL1 scheduler and x86's native process owner

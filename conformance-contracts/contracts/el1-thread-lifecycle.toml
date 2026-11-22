@@ -1,3 +1,16 @@
+# #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
+# (enter_mm_executor_then_register, the leased-root check and
+# open_first_address_space) and the stopped zone-slot publication move to
+# carrick-kernel dispatch/carrier_loop.rs; the retained lifecycle slab walk,
+# dedup, publication and retirement move to dispatch/carrier_lifecycle.rs
+# behind carrick-hal retained_metadata (HVF keeps a thin adapter). Probes,
+# error states, gate semantics and the HVF fatal are unchanged; this
+# contract's semantics, bindings and work budgets are unchanged.
+# New VM-free witnesses of the shared lifecycle publisher:
+# carrick-kernel dispatch::carrier_lifecycle::tests::
+# publication_maps_each_slab_once_per_carrier_and_retires_it_once,
+# stale_carrier_generation_publishes_and_maps_nothing,
+# failed_map_publication_rolls_back_the_slot_and_retires_partial_maps_once.
 # #2359: a raw exit whose clear-child-tid copy-out is refused "not now"
 # (x86: a sibling exit holds the MM editor; ARM: the word is not yet
 # writable) keeps its owned call, restores its membership and admission,
