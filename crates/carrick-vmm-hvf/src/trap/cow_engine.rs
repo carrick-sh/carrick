@@ -319,49 +319,23 @@ pub(crate) struct PendingEl1GrantPublication {
     pub(crate) alias: AliasBacking,
 }
 
-/// MM-owned ledger of [`PendingEl1GrantPublication`]s. The sole producer is
-/// inserted during preparation and removed by completion or rollback before
+impl carrick_hal::grant_ledger::PendingGrant for PendingEl1GrantPublication {
+    type Grant = carrick_hal::threaded::El1FrameGrantRollback;
+    fn grant(&self) -> &carrick_hal::threaded::El1FrameGrantRollback {
+        &self.grant
+    }
+    /// The semantic span the grant replaces.
+    fn span(&self) -> (u64, u64) {
+        (self.grant.semantic_base, self.grant.len)
+    }
+}
+
+/// MM-owned ledger of [`PendingEl1GrantPublication`]s: the shared
+/// [`carrick_hal::grant_ledger::PendingGrantLedger`]. The sole producer
+/// inserts during preparation and removes by completion or rollback before
 /// the holder returns. A leaf lock: never held while taking another.
-#[derive(::core::fmt::Debug, ::core::default::Default)]
-pub(crate) struct PendingEl1GrantPublications {
-    entries: Vec<PendingEl1GrantPublication>,
-}
-
-impl PendingEl1GrantPublications {
-    /// Whether any pending publication overlaps `[va, va + len)`.
-    pub(crate) fn overlaps(&self, va: u64, len: u64) -> bool {
-        let end = va.saturating_add(len);
-        self.entries.iter().any(|entry| {
-            entry.grant.semantic_base < end
-                && va < entry.grant.semantic_base.saturating_add(entry.grant.len)
-        })
-    }
-
-    /// Record a prepared publication. `false`: its span overlaps one already
-    /// pending (the caller declines before publishing, so this never holds
-    /// two owners for one span).
-    pub(crate) fn insert(&mut self, entry: PendingEl1GrantPublication) -> bool {
-        if self.overlaps(entry.grant.semantic_base, entry.grant.len) {
-            return false;
-        }
-        self.entries.push(entry);
-        true
-    }
-
-    /// Remove and return the replacement pending for exactly `grant`. A grant
-    /// with the same span but another owner generation or frame never
-    /// matches: it is a different incarnation.
-    pub(crate) fn take(
-        &mut self,
-        grant: &carrick_hal::threaded::El1FrameGrantRollback,
-    ) -> Option<PendingEl1GrantPublication> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.grant == *grant)?;
-        Some(self.entries.swap_remove(index))
-    }
-}
+pub(crate) type PendingEl1GrantPublications =
+    carrick_hal::grant_ledger::PendingGrantLedger<PendingEl1GrantPublication>;
 
 /// How the registry rows of a retirement's leases stand.
 #[derive(

@@ -1136,15 +1136,7 @@ fn supply_user_fault(
         &mut cow,
     );
     if result == Action::Served {
-        if cow.completion.is_some() {
-            #[cfg(feature = "test-support")]
-            crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                fault.address,
-            );
-        }
-        return UserFaultSupply::Served;
+        return settle_served_cow(binding, fault, cow_pool, mm_key, cow.completion.is_some());
     }
     use carrick_el1::fault::OwnerFaultSupplyOutcome;
     match supply.outcome() {
@@ -1163,11 +1155,32 @@ fn supply_user_fault(
         OwnerFaultSupplyOutcome::Unavailable => {
             UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8))
         }
-        OwnerFaultSupplyOutcome::CowSelected => {
+        // The replacement grant this member asks for is supplied to the MM's
+        // pool, where any member holding the editor may claim it. So each
+        // pass asks once and resolves again; a pass that selects again lost
+        // its grant to a sibling's copy-on-write, which made progress with
+        // it, and asks again (#2749).
+        OwnerFaultSupplyOutcome::CowSelected => loop {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
+            let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
+                return UserFaultSupply::Unresolved(9);
+            };
+            // The carrier met this MM's editor held on the other CPU and
+            // supplied nothing: the selection is still this CPU's. Withdraw
+            // it and park on that editor's release.
+            if let Some((_, unserved)) =
+                grant_slot.pending_cow_fault_selection(mm_key, fault.address.raw())
+            {
+                if !grant_slot.take_cow_fault_selection(unserved) {
+                    return UserFaultSupply::Unresolved(9);
+                }
+                return UserFaultSupply::MmRelease(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                );
+            }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_supply();
             let supply = match handle {
@@ -1197,9 +1210,21 @@ fn supply_user_fault(
                 }),
                 &mut cow,
             );
-            if result != Action::Served || cow.completion.is_none() {
-                return match supply.outcome() {
-                    OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
+            if result == Action::Served {
+                // Resolved with a grant, or already resolved by a sibling's
+                // write to the same page: an unclaimed grant stays ready
+                // for the MM's next copy-on-write.
+                return settle_served_cow(
+                    binding,
+                    fault,
+                    cow_pool,
+                    mm_key,
+                    cow.completion.is_some(),
+                );
+            }
+            match supply.outcome() {
+                OwnerFaultSupplyOutcome::PolicyDeclined => {
+                    return UserFaultSupply::Signal {
                         signum: LINUX_SIGSEGV,
                         code: if fault.present {
                             LINUX_SEGV_ACCERR
@@ -1207,22 +1232,18 @@ fn supply_user_fault(
                             LINUX_SEGV_MAPERR
                         },
                         address: fault.address,
-                    },
-                    OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
-                    // The rerun after the COW supply: bit 24 marks it (#2668).
-                    _ => {
-                        UserFaultSupply::Unresolved(9 | (supply.verdict().code() << 8) | (1 << 24))
-                    }
-                };
+                    };
+                }
+                OwnerFaultSupplyOutcome::Wait(wait) => return UserFaultSupply::TypedRelease(wait),
+                OwnerFaultSupplyOutcome::CowSelected => {}
+                // The rerun after the COW supply: bit 24 marks it (#2668).
+                _ => {
+                    return UserFaultSupply::Unresolved(
+                        9 | (supply.verdict().code() << 8) | (1 << 24),
+                    );
+                }
             }
-            #[cfg(feature = "test-support")]
-            crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
-                fault.address,
-            );
-            UserFaultSupply::Served
-        }
+        },
         OwnerFaultSupplyOutcome::Selected => {
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
@@ -1230,6 +1251,41 @@ fn supply_user_fault(
             serve_selected_window(binding, task, fault, grant_slot, residency, &words)
         }
     }
+}
+
+/// A served fault's settlement of its MM's copy-on-write completions.
+///
+/// A completion is the MM's, in its pool, and the carrier settles every one
+/// of the MM under one exclusion. So the crossing is not this CPU's debt for
+/// its own grant: whichever member sees a completion of its MM rings it, and
+/// the carrier settles them all, a sibling's included (#2749). A completion
+/// still in the pool after the crossing means the carrier met the MM's
+/// editor held on the other CPU: the member parks on that editor's release,
+/// its rerun finds the page resolved, and it rings again here.
+fn settle_served_cow(
+    binding: &CpuBinding,
+    fault: carrick_guest_arch::FaultInfo,
+    pool: &carrick_el1_abi::CowGrantPool,
+    mm_key: u64,
+    completed: bool,
+) -> UserFaultSupply {
+    if !completed && !pool.has_completions_for(mm_key) {
+        return UserFaultSupply::Served;
+    }
+    #[cfg(feature = "test-support")]
+    if completed {
+        crate::test_support::hold_armed_cow_settle();
+    }
+    cross_owner_grant(
+        carrick_guest_arch::CpuId::new(binding.cpu_slot),
+        fault.address,
+    );
+    if pool.has_completions_for(mm_key) {
+        return UserFaultSupply::MmRelease(
+            carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+        );
+    }
+    UserFaultSupply::Served
 }
 
 /// Serve this CPU's owner-selected window, then settle it through the

@@ -1894,6 +1894,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 continue;
             };
             let memory = std::cell::RefCell::new(&mut self._vm);
+            let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
             let settled = self.fork_stock.settle_exec_predecessor(
                 &mut carrick_hal::fork_stock::NoTableLedger,
                 receipt,
@@ -1909,7 +1910,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         &mut memory.borrow_mut(),
                         &*inventory,
                         absence,
-                        anonymous_owner::ChildRelease::Retired { returns, zone },
+                        anonymous_owner::ChildRelease::Retired {
+                            returns,
+                            zone,
+                            supplied: &mut supplied.borrow_mut(),
+                        },
                     )
                     .is_ok()
                 },

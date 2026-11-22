@@ -4429,10 +4429,12 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
         carrick_hal::exec_owner::AuthenticatedExecMm,
         exec_service::RootExecLoad,
     )>,
-    anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
-    /// Per CPU: a COW completion another exclusion published before the
-    /// faulting CPU's settlement crossing arrived (#1482 P0-3).
-    cow_published: [Option<carrick_hal::fork_stock::GrantExecution>; 2],
+    /// Per CPU: the owner-selected window this CPU's member is serving. The
+    /// ring settles or withdraws it before the member can park.
+    anonymous_pending: [Option<anonymous_owner::PendingPrepare>; 2],
+    /// Carrier-wide, owned by each grant's MM: the copy-on-write replacement
+    /// grants supplied to the pool and not yet settled (#2749).
+    cow_supplied: anonymous_owner::SuppliedCowGrants,
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     /// Refused or withdrawn backings settled while their MM's exclusion was
@@ -5868,7 +5870,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             exec_predecessors: exec_service::ExecPredecessorCustody::default(),
             root_exec_load: None,
             anonymous_pending: [None, None],
-            cow_published: [None, None],
+            cow_supplied: Default::default(),
             native_backing_pending: std::collections::BTreeMap::new(),
             cancelled_backing_pending: Vec::new(),
             owner_grant_crossings: 0,

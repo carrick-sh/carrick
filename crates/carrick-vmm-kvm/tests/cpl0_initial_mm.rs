@@ -3628,14 +3628,17 @@ fn production_sibling_claims_a_cow_grant_another_cpu_asked_for() {
     );
 }
 
-/// #2716 (review P0): the host holds a supplied COW grant as pending on the
-/// CPU that asked for it, so only that CPU's member may ring its settlement.
-/// A sibling's kernel copy that rang it for the MM's completion found nothing
-/// pending on its own CPU and no selection, and the carrier died with `owner
-/// fault selection absent`. Two live threads and two live processes: the
-/// worker is held between its COW completion and its settlement while the
-/// leader `read(2)`s into another copy-on-write page, whose preparation
-/// selects before the leader's CPU has asked the host for anything.
+/// #2716 (review P0), #2749: a sibling's kernel copy sees the MM's COW
+/// completion and rings its settlement from a CPU that asked the host for
+/// nothing. While the host held each supplied grant as pending on the CPU
+/// that asked for it, that crossing found nothing pending and no selection,
+/// and the carrier died with `owner fault selection absent`. The grant and
+/// its completion are the MM's: the sibling's crossing settles it, and the
+/// worker's own later crossing finds nothing left. Two live threads and two
+/// live processes: the worker is held between its COW completion and its
+/// settlement while the leader `read(2)`s into another copy-on-write page,
+/// whose preparation selects before the leader's CPU has asked the host for
+/// anything.
 #[test]
 fn production_sibling_copy_leaves_another_cpus_cow_settlement_alone() {
     let elf = native_exit_fixture("native_cow_sibling_copy_settle.S");

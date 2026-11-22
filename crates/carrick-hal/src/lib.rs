@@ -21,6 +21,7 @@ pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod fd_ceiling;
 pub mod foreign_mm;
+pub mod grant_ledger;
 pub use fd_ceiling::FdCeilingPublisher;
 pub use foreign_mm::{
     ForeignAsid, ForeignAsidGeneration, ForeignCowInvalidationGeneration, ForeignCowKernelProof,
