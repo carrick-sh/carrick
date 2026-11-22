@@ -1122,6 +1122,49 @@ pub(crate) enum DebugCommand {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Full-depth diagnosis of parity rows: run every stage of every row N
+    /// times through `carrick run`, each stage in a fresh container so an
+    /// early stop never hides a later stage, and rank EVERY failure the runs
+    /// produced (counted refusals with their recorded arguments, carrier
+    /// fatal sites, panics, guest-reported errnos, contention leaves,
+    /// timeouts and exits) in one table: `<out>/table.md` and `table.json`,
+    /// with each run in `<out>/runs.jsonl`. Diagnostics only. Run it under
+    /// the host's guest lease (`just lease gate carrick debug discover ...`).
+    Discover {
+        /// The rows file (JSON; `docs/parity/parity-rows.json`).
+        #[arg(long, required_unless_present = "report")]
+        rows: Option<PathBuf>,
+        /// Only these rows (repeat the flag); default every row.
+        #[arg(long = "row")]
+        only: Vec<String>,
+        /// Runs of each stage.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Output directory: every run's streams, census and the table.
+        #[arg(long)]
+        out: PathBuf,
+        /// The carrick binary to run the rows with (a union build's, say);
+        /// default this binary.
+        #[arg(long)]
+        carrick: Option<PathBuf>,
+        /// The instance column (default the host name).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Label stamped into every `CARRICK_RUN_ID`
+        /// (`discover-<label>-<row>-<stage>-<run>`).
+        #[arg(long, default_value = "local")]
+        label: String,
+        /// Reap each run by its run id with this script under `sudo -n`
+        /// (`scripts/sudo/kill.sh`).
+        #[arg(long)]
+        reap: Option<PathBuf>,
+        /// Rows to print in the table.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Re-rank a finished `--out` directory without running anything.
+        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap"])]
+        report: bool,
+    },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
     /// syscall class, host services and their thread CPU, continuation
