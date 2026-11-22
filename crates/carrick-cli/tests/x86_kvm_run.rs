@@ -842,6 +842,47 @@ fn mounted_static_x86_fault_death_leaves_the_cpu_to_faulting_siblings() {
     );
 }
 
+/// #2776: a process reads its thread group from `/proc/self/task`, and a
+/// second process reads it from `/proc/<tgid>/task`. Two live threads: the
+/// leader lists itself, then itself and a worker; the joined worker's tid
+/// leaves the listing; a fork child lists its own group and its parent's.
+/// A negative count is the negated errno of the open or the `getdents64`.
+#[test]
+fn mounted_static_x86_proc_self_task_lists_the_live_thread_group() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("proc-self-task");
+    compile_assembly_with_flags(
+        "x86_proc_self_task.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native task-listing oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(
+        native.stdout, b"initial=1 live=2 joined=1 child_status=0\n",
+        "native oracle"
+    );
+
+    let guest = run_mounted_binary(&elf, "proc-self-task", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
