@@ -42,8 +42,11 @@ struct HostResolverFiles<'a> {
     /// `/etc/resolv.conf` on Linux, configd's rendered copy behind the
     /// `/etc -> /private/etc` symlink chain on macOS.
     rendered: &'a [&'a str],
-    /// systemd-resolved's list of the upstream servers it forwards to.
-    resolved_upstream: &'a str,
+    /// systemd-resolved's list of the upstream servers its loopback stub
+    /// forwards to, read only when `rendered` names nothing but loopback
+    /// servers. Linux only: macOS has no such file, and its configd file
+    /// names the real servers, so its launch path reads exactly what it did.
+    resolved_upstream: Option<&'a str>,
 }
 
 impl HostResolverFiles<'static> {
@@ -53,7 +56,11 @@ impl HostResolverFiles<'static> {
             "/var/run/resolv.conf",
             "/private/var/run/resolv.conf",
         ],
-        resolved_upstream: "/run/systemd/resolve/resolv.conf",
+        resolved_upstream: if cfg!(target_os = "linux") {
+            Some("/run/systemd/resolve/resolv.conf")
+        } else {
+            None
+        },
     };
 }
 
@@ -93,6 +100,22 @@ impl HostResolverSnapshot {
             .iter()
             .find_map(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_default();
+        // A systemd-resolved host's /etc/resolv.conf names only its loopback
+        // stub (127.0.0.53). The guest's loopback is its own, so that server is
+        // unreachable from it. Docker documents the same case and hands its
+        // containers the upstream servers in /run/systemd/resolve/resolv.conf;
+        // do the same, but only when that file names a reachable server.
+        let contents = match files.resolved_upstream {
+            Some(upstream) if names_only_loopback_servers(&contents) => {
+                std::fs::read_to_string(upstream)
+                    .ok()
+                    .filter(|upstream| {
+                        nameserver_addresses(upstream).any(|address| !address.is_loopback())
+                    })
+                    .unwrap_or(contents)
+            }
+            _ => contents,
+        };
         Self {
             contents,
             provider_nameservers: Vec::new(),
@@ -124,20 +147,28 @@ impl HostResolverSnapshot {
 
     pub fn has_usable_nameserver(&self) -> bool {
         !self.provider_nameservers.is_empty()
-            || self.contents.lines().any(|line| {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("nameserver") else {
-                    return false;
-                };
-                let Some(address) = rest.split_whitespace().next() else {
-                    return false;
-                };
-                let address = address
-                    .split_once('%')
-                    .map_or(address, |(address, _)| address);
-                address.parse::<std::net::IpAddr>().is_ok()
-            })
+            || nameserver_addresses(&self.contents).next().is_some()
     }
+}
+
+/// The addresses of a resolv.conf's well-formed `nameserver` lines, with any
+/// `%zone` suffix dropped.
+fn nameserver_addresses(contents: &str) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+    contents.lines().filter_map(|line| {
+        let rest = line.trim().strip_prefix("nameserver")?;
+        let address = rest.split_whitespace().next()?;
+        let address = address
+            .split_once('%')
+            .map_or(address, |(address, _)| address);
+        address.parse::<std::net::IpAddr>().ok()
+    })
+}
+
+/// A resolv.conf that names at least one server, and only loopback ones: a
+/// host-local stub such as systemd-resolved's 127.0.0.53.
+fn names_only_loopback_servers(contents: &str) -> bool {
+    let mut addresses = nameserver_addresses(contents).peekable();
+    addresses.peek().is_some() && addresses.all(|address| address.is_loopback())
 }
 
 pub struct ResolvConfVfs {
@@ -421,7 +452,7 @@ mod tests {
         let (_dir, rendered_path, upstream_path) = host_resolver_layout(rendered, upstream);
         let files = HostResolverFiles {
             rendered: &[rendered_path.as_str()],
-            resolved_upstream: upstream_path.as_str(),
+            resolved_upstream: Some(upstream_path.as_str()),
         };
         let snapshot = HostResolverSnapshot::capture_from(&files);
         String::from_utf8(ResolvConfVfs::from_host_snapshot(&snapshot).contents).unwrap()
@@ -479,6 +510,16 @@ mod tests {
                 "{upstream:?}: {contents:?}"
             );
         }
+    }
+
+    /// The systemd-resolved fallback is a Linux-host behaviour: on macOS the
+    /// launch reads configd's file and nothing else, as before.
+    #[test]
+    fn launch_reads_the_resolved_upstream_list_only_on_linux() {
+        assert_eq!(
+            HostResolverFiles::LAUNCH.resolved_upstream.is_some(),
+            cfg!(target_os = "linux")
+        );
     }
 
     #[test]

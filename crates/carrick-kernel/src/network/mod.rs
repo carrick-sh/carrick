@@ -515,7 +515,7 @@ fn linux_model_for_spec(
                     &probed
                 }
             };
-            model::LinuxNetworkModel::host_mirror(wire)
+            model::LinuxNetworkModel::host_mirror(wire).with_explicit_resolver(spec)
         }
         NetworkMode::Bridge | NetworkMode::None => model::LinuxNetworkModel::from_spec(spec),
     }

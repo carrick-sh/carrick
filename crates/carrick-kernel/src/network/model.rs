@@ -523,6 +523,17 @@ impl LinuxNetworkModel {
         }
     }
 
+    /// Host mode mirrors the host's wire, but an explicit `--dns` still names
+    /// the guest's resolver, as `docker run --net host --dns` does. Without
+    /// one the resolver stays empty and the launch's host snapshot serves
+    /// `/etc/resolv.conf`.
+    pub(crate) fn with_explicit_resolver(mut self, spec: &NetworkNamespaceSpec) -> Self {
+        if !spec.dns_servers.is_empty() {
+            self.resolver = resolver_from_spec(spec);
+        }
+        self
+    }
+
     /// The link with this guest name, if the namespace has one.
     pub(crate) fn link_by_name(&self, name: &str) -> Option<&LinuxNetworkLink> {
         self.links.iter().find(|link| link.name == name)
