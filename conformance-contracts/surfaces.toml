@@ -590,6 +590,7 @@ surfaces = [
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "process.exec.native-exe-link" },
+  { path = "crates/carrick-hal/src/grant_ledger.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-hal/src/guest_arch.rs", contract = "kernel.mm.user-va-ceiling" },
   { path = "crates/carrick-hal/src/guest_timer_bridge.rs", contract = "kernel.timer.delivery-gate" },
   { path = "crates/carrick-hal/src/host_residency.rs", contract = "kernel.mm.private-file-fixed-replacement" },
