@@ -97,6 +97,12 @@ impl JitCodeBuffer {
         self.work
     }
 
+    /// Bytes this buffer maps, page rounding included: what it holds of the
+    /// host's memory until it is dropped and unmapped.
+    pub fn mapped_bytes(&self) -> usize {
+        self.capacity
+    }
+
     /// Publish under W^X, returning an RX address only after mprotect succeeds.
     /// The owner must ensure no previously published code is executing while
     /// this exclusive publication changes the mapping back to RW. Returns
@@ -202,6 +208,8 @@ mod tests {
     #[test]
     fn publish_copies_at_aligned_cursor_and_refuses_bad_sizes() {
         let mut jit = JitCodeBuffer::new(4096).unwrap();
+        assert_eq!(jit.mapped_bytes(), 4096);
+        assert_eq!(JitCodeBuffer::new(4097).unwrap().mapped_bytes(), 8192);
         let first = jit.publish(&[1, 2, 3]).unwrap();
         let second = jit.publish(&[4, 5]).unwrap();
         assert_eq!(second - first, 16);

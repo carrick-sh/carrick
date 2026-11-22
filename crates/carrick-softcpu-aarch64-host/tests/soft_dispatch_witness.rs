@@ -14,7 +14,7 @@ use carrick_guest_arch::FrameGpa;
 use carrick_guest_mem::GuestMemory as _;
 use carrick_hal::{GuestVmBackend, MemPerms};
 use carrick_mem::memory::{LINUX_EL1_VECTORS_BASE, LINUX_SYSCALL_MAILBOX_BASE};
-use carrick_softcpu_aarch64::dispatch::ExecuteBlock;
+use carrick_softcpu_aarch64::dispatch::{AARCH64_RESIDENCY, ExecuteBlock};
 use carrick_softcpu_aarch64::handler::GuestMemory as SoftGuestMemory;
 use carrick_softcpu_aarch64::state::{CpuState, ExceptionLevel, RegisterValue, VirtualAddress};
 use carrick_softcpu_aarch64::translate::{Terminator, TranslatedBlock};
@@ -24,6 +24,7 @@ use carrick_softcpu_aarch64_host::{
     SoftSingleProcessConfig, SoftStage2, Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
     run_single_process_with_executor_and_setup,
 };
+use carrick_softmmu::block_cache::{CodeBytes, CodeFootprint};
 
 const CODE_VA: u64 = 0x0040_0000;
 const DATA_VA: u64 = 0x0040_1000;
@@ -2259,8 +2260,15 @@ impl WorkingSetPlan {
 }
 
 /// Code whose drop is observed: `live` counts every prepared block that is
-/// still owned, by the cache or by a launch in flight.
-struct LiveCode(Arc<LiveCodeCensus>);
+/// still owned, by the cache or by a launch in flight. It declares a host
+/// footprint, which the carrier charges to its code-byte budget.
+struct LiveCode(Arc<LiveCodeCensus>, CodeBytes);
+
+impl CodeFootprint for LiveCode {
+    fn code_bytes(&self) -> CodeBytes {
+        self.1
+    }
+}
 
 #[derive(Default)]
 struct LiveCodeCensus {
@@ -2284,6 +2292,7 @@ struct WorkingSetExecutor {
     chunks_entered: usize,
     emitted: Arc<Mutex<std::collections::BTreeMap<u64, u64>>>,
     code: Arc<LiveCodeCensus>,
+    code_bytes: CodeBytes,
 }
 
 impl WorkingSetExecutor {
@@ -2334,7 +2343,7 @@ impl ExecuteBlock for WorkingSetExecutor {
             .or_default() += 1;
         let live = self.code.live.fetch_add(1, Ordering::Relaxed) + 1;
         self.code.peak.fetch_max(live, Ordering::Relaxed);
-        Ok(LiveCode(Arc::clone(&self.code)))
+        Ok(LiveCode(Arc::clone(&self.code), self.code_bytes))
     }
 
     fn execute(
@@ -2373,7 +2382,10 @@ impl WorkingSetRun {
     }
 }
 
-fn run_working_set(plan: WorkingSetPlan) -> Result<WorkingSetRun, String> {
+/// One page, as a published host mapping of a small block holds.
+const PAGE_CODE: CodeBytes = CodeBytes::new(4096);
+
+fn run_working_set(plan: WorkingSetPlan, code_bytes: CodeBytes) -> Result<WorkingSetRun, String> {
     let words = plan.text();
     let text_bytes = (words.len() * 4).next_multiple_of(0x1000);
     let elf = build_text_elf(&words, text_bytes, WORKING_SET_DATA_VA, &[]);
@@ -2392,6 +2404,7 @@ fn run_working_set(plan: WorkingSetPlan) -> Result<WorkingSetRun, String> {
         chunks_entered: 0,
         emitted: Arc::clone(&emitted),
         code: Arc::clone(&code),
+        code_bytes,
     };
     let config = SoftSingleProcessConfig::new(&elf, "/working-set");
     let run = run_single_process_with_executor_and_setup(&config, executor, |engine| {
@@ -2414,10 +2427,13 @@ fn soft_carrier_keeps_a_4096_block_working_set_resident_across_passes() {
     let _test_guard = lock_soft_carrier_test();
     let mut census = Vec::new();
     for passes in [3, 10, 30] {
-        let ws = run_working_set(WorkingSetPlan::Repeat {
-            blocks: 4096,
-            passes,
-        })
+        let ws = run_working_set(
+            WorkingSetPlan::Repeat {
+                blocks: 4096,
+                passes,
+            },
+            PAGE_CODE,
+        )
         .expect("working-set witness must finish through the production carrier");
         assert_eq!(ws.run.exit_code, 0);
         assert_eq!(ws.run.terminating_fault, None);
@@ -2454,11 +2470,15 @@ fn soft_carrier_keeps_a_hot_loop_resident_through_a_cold_scan() {
     let plan = WorkingSetPlan::Scan {
         chunks: SCAN_CHUNKS,
     };
-    let ws =
-        run_working_set(plan).expect("scan witness must finish through the production carrier");
+    let ws = run_working_set(plan, PAGE_CODE)
+        .expect("scan witness must finish through the production carrier");
     assert_eq!(ws.run.exit_code, 0);
     assert_eq!(ws.run.terminating_fault, None);
     let cold = (SCAN_CHUNKS * COLD_CHUNK_BLOCKS) as u64;
+    assert!(
+        cold > 2 * AARCH64_RESIDENCY.blocks.get() as u64,
+        "the scan must exceed the resident budget"
+    );
     assert!(ws.first_sights() >= cold + HOT_BLOCKS as u64);
     let hot: Vec<u64> = plan
         .hot_pcs()
@@ -2478,9 +2498,10 @@ fn soft_carrier_keeps_a_hot_loop_resident_through_a_cold_scan() {
     );
 }
 
-/// Owned code the carrier may keep for the budget witness: at most this
-/// many blocks are live at once, cache and launch in flight together.
-const LIVE_CODE_BOUND: u64 = 65;
+/// Blocks of the budget witness's footprint that fit the code-byte budget.
+const BUDGET_BLOCKS: usize = 64;
+/// The resident blocks plus the one just prepared, before its insert evicts.
+const LIVE_CODE_BOUND: u64 = BUDGET_BLOCKS as u64 + 1;
 
 /// The cache keeps at most its code budget, and evicted code is released
 /// as it is evicted: the live code never exceeds the bound across a working
@@ -2488,17 +2509,32 @@ const LIVE_CODE_BOUND: u64 = 65;
 #[test]
 fn soft_carrier_releases_evicted_code_within_its_budget() {
     let _test_guard = lock_soft_carrier_test();
-    let ws = run_working_set(WorkingSetPlan::Repeat {
-        blocks: 4096,
-        passes: 3,
-    })
+    let budget = AARCH64_RESIDENCY.code_bytes;
+    let ws = run_working_set(
+        WorkingSetPlan::Repeat {
+            blocks: 4096,
+            passes: 3,
+        },
+        CodeBytes::new(budget.get() / BUDGET_BLOCKS),
+    )
     .expect("budget witness must finish through the production carrier");
     assert_eq!(ws.run.exit_code, 0);
     let peak = ws.code.peak.load(Ordering::Relaxed);
+    let residency = ws
+        .run
+        .engine
+        .vcpu()
+        .code_residency()
+        .expect("the handoff cache is on");
     println!(
-        "first_sights={} emitted_blocks={} peak_live_code={peak}",
+        "first_sights={} emitted_blocks={} peak_live_code={peak} residency={residency:?}",
         ws.first_sights(),
         ws.emissions()
+    );
+    assert!(residency.peak_code_bytes <= budget);
+    assert!(
+        residency.evictions > 0,
+        "the working set must exceed the budget"
     );
     assert!(
         peak <= LIVE_CODE_BOUND,

@@ -5752,18 +5752,22 @@ fn translation_cache_hot_set_timing() {
 
 #[test]
 fn capacity_eviction_keeps_other_resident_blocks() {
-    let (mut cpu, mut mem, va) = setup_hot_set(1025);
-    for _ in 0..1025 {
+    let capacity = carrick_softcpu_x86::X86_RESIDENCY.blocks.get();
+    let (mut cpu, mut mem, va) = setup_hot_set(capacity + 1);
+    for _ in 0..=capacity {
         cpu.step_block(&mut mem).unwrap();
     }
-    assert_eq!(cpu.translation_count(), 1025);
-    // FIFO evicted the oldest key only. The second key is still resident.
+    assert_eq!(cpu.translation_count(), capacity as u64 + 1);
+    let residency = cpu.code_residency();
+    assert_eq!((residency.blocks, residency.evictions), (capacity, 1));
+    // One key was evicted, the oldest unreferenced one. The second key is
+    // still resident.
     cpu.context_mut().rip = va + 16;
     assert_eq!(
         cpu.step_block(&mut mem).unwrap(),
         SoftCpuExit::Continue { next_rip: va + 32 }
     );
-    assert_eq!(cpu.translation_count(), 1025);
+    assert_eq!(cpu.translation_count(), capacity as u64 + 1);
 }
 
 #[test]

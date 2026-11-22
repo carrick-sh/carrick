@@ -17,9 +17,12 @@ use alloc::{sync::Arc, vec::Vec};
 use carrick_guest_arch::{FrameGpa, Gpa, GuestVa};
 use carrick_mmu_core::stage1::{LeafAccess, Stage1Leaf};
 use carrick_softmmu::ExtentTableId;
-use carrick_softmmu::block_cache::BlockCache;
+use carrick_softmmu::block_cache::{
+    BlockCache, CodeBytes, CodeFootprint, ResidencyBudget, ResidencyCensus, ResidentBlocks,
+};
 use carrick_softmmu::physical_tlb::PhysicalTlb;
 use core::fmt;
+use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Permission-checked virtual page tags and RAM loans, live for one launch.
@@ -89,7 +92,8 @@ impl<C> ChainExit<C> {
 /// The implementation owns executable memory; this crate never executes it.
 pub trait ExecuteBlock {
     type Error;
-    type Code;
+    /// Its footprint is charged to the owner's [`ResidencyBudget`].
+    type Code: CodeFootprint;
 
     /// Whether the dispatcher may keep prepared blocks resident.
     fn retain_blocks(&self) -> bool {
@@ -350,6 +354,17 @@ struct CacheContext {
     inline_memory: bool,
 }
 
+/// The AArch64 soft CPU's resident code budget. CPython startup touches
+/// ~78k distinct blocks, but its hot set fits well inside this bound under
+/// use-aware eviction (#2717). Each block owns one page-rounded executable
+/// mapping, so the byte budget binds first only for blocks over 4 KiB; the
+/// block count also keeps the per-block mappings far below the host's
+/// mapping-count limit.
+pub const AARCH64_RESIDENCY: ResidencyBudget = ResidencyBudget::use_aware(
+    ResidentBlocks::new(NonZeroUsize::new(16 * 1024).unwrap()),
+    CodeBytes::new(64 << 20),
+);
+
 /// Compiled code kept resident across [`run_controlled`] calls, so provider
 /// exits and quanta do not discard the hot set. It holds code only: every
 /// call starts with no stage-1 translations and no native links, and every
@@ -364,14 +379,23 @@ pub struct DispatchCache<C> {
 
 impl<C> Default for DispatchCache<C> {
     fn default() -> Self {
-        Self {
-            context: None,
-            blocks: BlockCache::default(),
-        }
+        Self::new(AARCH64_RESIDENCY)
     }
 }
 
 impl<C> DispatchCache<C> {
+    pub fn new(budget: ResidencyBudget) -> Self {
+        Self {
+            context: None,
+            blocks: BlockCache::new(budget),
+        }
+    }
+
+    /// Resident code now, and its high-water mark.
+    pub fn census(&self) -> ResidencyCensus {
+        self.blocks.census()
+    }
+
     /// Drop all resident code.
     pub fn clear(&mut self) {
         self.context = None;
@@ -512,7 +536,7 @@ pub fn run<X: ExecuteBlock>(
     budget: u64,
 ) -> Report<X::Error> {
     // A plain run keeps code only for its own duration.
-    let mut cache = DispatchCache::default();
+    let mut cache = DispatchCache::new(AARCH64_RESIDENCY);
     run_inner(
         cpu, monitor, memory, executor, limits, budget, None, &mut cache,
     )
@@ -648,62 +672,63 @@ fn run_inner<X: ExecuteBlock>(
         };
         let uncached;
         let cached = cache.get(&key);
-        let (resident, (block, executable)) = if let Some(resident) =
-            cached.filter(|r| Some(r.identity) == code)
-        {
-            (Some(resident), resident.prepared())
-        } else {
-            if chaining && let Some(stale) = cached {
-                executor.unlink(Some(stale.identity.frame));
-            }
-            let Ok(first) = read_word(memory, pa) else {
-                break Stop::Fetch(VirtualAddress(cpu.pc.0));
-            };
-            work.decoded_blocks += 1;
-            let mut fetched_whole_block = true;
-            let guest = split_block_for_run(
-                cpu.pc,
-                limits,
-                cpu.pstate.el,
-                inline_memory && mmu::enabled(cpu),
-                |pc| {
-                    let word = if pc == cpu.pc {
-                        Some(first)
-                    } else {
-                        fetch_address(cpu, memory, pc)
-                            .ok()
-                            .and_then(|pa| read_word(memory, pa).ok())
-                    };
-                    fetched_whole_block &= word.is_some();
-                    word
-                },
-            );
-            work.emitted_blocks += 1;
-            let block = match emit_block_for_run(&guest, chaining) {
-                Ok(block) => block,
-                Err(error) => break Stop::Translate(error),
-            };
-            let executable = match executor.prepare(&block) {
-                Ok(code) => code,
-                Err(error) => break Stop::Execute(error),
-            };
-            let prepared = (block, executable);
-            let identity = if retain_blocks && fetched_whole_block {
-                memory
-                    .inner
-                    .mark_code_page(frame)
-                    .map(|generation| CodeIdentity { frame, generation })
-            } else {
-                None
-            };
-            if let Some(identity) = identity {
-                let resident = cache.insert(key, Arc::new(ResidentBlock { identity, prepared }));
+        let (resident, (block, executable)) =
+            if let Some(resident) = cached.filter(|r| Some(r.identity) == code) {
                 (Some(resident), resident.prepared())
             } else {
-                uncached = prepared;
-                (None, (&uncached.0, &uncached.1))
-            }
-        };
+                if chaining && let Some(stale) = cached {
+                    executor.unlink(Some(stale.identity.frame));
+                }
+                let Ok(first) = read_word(memory, pa) else {
+                    break Stop::Fetch(VirtualAddress(cpu.pc.0));
+                };
+                work.decoded_blocks += 1;
+                let mut fetched_whole_block = true;
+                let guest = split_block_for_run(
+                    cpu.pc,
+                    limits,
+                    cpu.pstate.el,
+                    inline_memory && mmu::enabled(cpu),
+                    |pc| {
+                        let word = if pc == cpu.pc {
+                            Some(first)
+                        } else {
+                            fetch_address(cpu, memory, pc)
+                                .ok()
+                                .and_then(|pa| read_word(memory, pa).ok())
+                        };
+                        fetched_whole_block &= word.is_some();
+                        word
+                    },
+                );
+                work.emitted_blocks += 1;
+                let block = match emit_block_for_run(&guest, chaining) {
+                    Ok(block) => block,
+                    Err(error) => break Stop::Translate(error),
+                };
+                let executable = match executor.prepare(&block) {
+                    Ok(code) => code,
+                    Err(error) => break Stop::Execute(error),
+                };
+                let prepared = (block, executable);
+                let identity = if retain_blocks && fetched_whole_block {
+                    memory
+                        .inner
+                        .mark_code_page(frame)
+                        .map(|generation| CodeIdentity { frame, generation })
+                } else {
+                    None
+                };
+                if let Some(identity) = identity {
+                    let bytes = prepared.1.code_bytes();
+                    let resident =
+                        cache.insert(key, Arc::new(ResidentBlock { identity, prepared }), bytes);
+                    (Some(resident), resident.prepared())
+                } else {
+                    uncached = prepared;
+                    (None, (&uncached.0, &uncached.1))
+                }
+            };
         if chaining && let Some(resident) = resident {
             executor.link_block(resident);
         }

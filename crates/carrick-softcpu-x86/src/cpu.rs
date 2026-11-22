@@ -1,6 +1,8 @@
 //! Level 0 `SoftCpu` execution engine and executable code-buffer management.
 
-use carrick_softmmu::block_cache::BlockCache;
+use carrick_softmmu::block_cache::{
+    BlockCache, CodeBytes, ResidencyBudget, ResidencyCensus, ResidentBlocks,
+};
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
 
@@ -55,6 +57,14 @@ pub enum SoftCpuExit {
 pub use carrick_host_jit::JitCodeBuffer;
 
 type BlockKey = (u64, (usize, usize, bool));
+
+/// The x86 soft CPU's resident code budget (#2717): use-aware eviction
+/// within the same bound as the AArch64 soft CPU. Each block owns one
+/// page-rounded executable mapping.
+pub const X86_RESIDENCY: ResidencyBudget = ResidencyBudget::use_aware(
+    ResidentBlocks::new(core::num::NonZeroUsize::new(16 * 1024).unwrap()),
+    CodeBytes::new(64 << 20),
+);
 
 struct CachedBlock {
     plan: std::sync::Arc<PlannedBlock>,
@@ -291,7 +301,7 @@ impl SoftCpu {
             cpuid,
             translations: 0,
             emissions: 0,
-            blocks: BlockCache::default(),
+            blocks: BlockCache::new(ResidencyBudget::for_owner(X86_RESIDENCY)),
             max_block_insns: 64,
             max_block_span: 4096,
         })
@@ -392,6 +402,11 @@ impl SoftCpu {
     /// Blocks planned from instruction bytes on translation misses.
     pub fn translation_count(&self) -> u64 {
         self.translations
+    }
+
+    /// Resident translated code now, and its high-water mark.
+    pub fn code_residency(&self) -> ResidencyCensus {
+        self.blocks.census()
     }
 
     fn raise(&mut self, exc: X86Exception) -> Result<SoftCpuExit, EmitError> {
@@ -520,6 +535,7 @@ impl SoftCpu {
                                 detail: "translation cache publication failed".to_string(),
                             })?;
                     let entry = crate::mmu::HostVa::new(entry as usize);
+                    let bytes = CodeBytes::new(code.mapped_bytes());
                     self.blocks.insert(
                         key,
                         CachedBlock {
@@ -527,6 +543,7 @@ impl SoftCpu {
                             _code: code,
                             entry,
                         },
+                        bytes,
                     );
                     entry
                 };

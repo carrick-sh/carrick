@@ -1,0 +1,33 @@
+schema_version = 1
+id = "softcpu.code-residency"
+title = "Keep a soft CPU's working set and hot code resident within a typed code budget"
+guest_surfaces = ["isa:aarch64", "isa:x86_64", "vmm:soft", "syscall:getpid", "syscall:exit_group"]
+semantic_authority = [
+  "Arm ARM DDI0487G.a C6.2 instruction semantics for SVC, B and BR.",
+  "Intel SDM Vol. 2 JMP (rel8, rel32, r/m64).",
+  "Residency changes only cost: every reuse still re-translates the PC and matches frame and code generation (arm.softcpu.handoff-residency, x86.softcpu.cache-smc).",
+]
+fixture = "carrick-softcpu-aarch64-host::soft_dispatch_witness"
+scale_points = [3, 10, 30]
+rationale = "Each soft CPU owns one carrick-softmmu BlockCache bounded by its ResidencyBudget (AARCH64_RESIDENCY, X86_RESIDENCY: 16,384 blocks and 64 MiB of executable mappings). Eviction is CLOCK: a hit sets a reference bit, so a hot loop outlives cold one-shot code. The FIFO(1,024) it replaces re-decoded 98.71% of CPython startup's decodes (#2717)."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "softcpu_block_emits"
+maximum = 4113
+layers = ["vm-free"]
+rationale = "A 4,096-block working set plus its loop, svc and EL1 vector blocks is 4,105 first sights at 3, 10 and 30 passes; at most 8 more. The FIFO emitted 12,307, 41,007 and 123,007."
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_keeps_a_4096_block_working_set_resident_across_passes",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_keeps_a_hot_loop_resident_through_a_cold_scan",
+  "carrick-softcpu-aarch64-host::soft_dispatch_witness::soft_carrier_releases_evicted_code_within_its_budget",
+  "carrick-softcpu-x86::softcpu_level0::working_set_of_4096_blocks_stays_resident_across_passes",
+  "carrick-softcpu-x86::softcpu_level0::hot_loop_survives_a_cold_scan",
+  "carrick-softcpu-x86::softcpu_level0::capacity_eviction_keeps_other_resident_blocks",
+]
+[bindings.unresolved]
+embed_structural = "The soft carriers run in their crates' test binaries; CLI carrier wiring lands in a later #1236 slice."
+signed = "The soft carriers do not boot through HVF; native ARM64 block execution and the CPython production-dispatch run are on the hosted soft-aarch64-native job."
+docker = "The witnesses count emitted blocks and live code directly. No Docker ratio is claimed for the soft lane."
