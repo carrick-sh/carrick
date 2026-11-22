@@ -22,6 +22,11 @@
  *      as F, then pselect6(nfds, {P, F}, {F}, NULL, {5 s}, NULL): a regular
  *      file is always readable and writable, so the answer is 2 with F's
  *      bit in both sets and P's clear (apt's download target).
+ *   -DCLOSE_MEMBER: S, now a member of the poller's host set, is closed;
+ *      pselect6(nfds, {P}, {S}, NULL, {0, 20 ms}, NULL) is EBADF (no stale
+ *      member answers for it). A new socket S' takes S's number and
+ *      connects to the same peer; pselect6(nfds, {P}, {S'}, NULL, {5 s},
+ *      NULL) is exactly S''s write bit (it enrols afresh).
  * A select that fails exits with its errno (38: ENOSYS, the refusal);
  * exit 7 = success; every other code names the failed stage. */
 .global _start
@@ -252,6 +257,70 @@ poller:
     cmp %r15, write_set(%rip)      /* and F's write bit */
     jne fail_sets
 #endif
+#ifdef CLOSE_MEMBER
+    /* 2. Close S while it is a host-set member: the closed number is EBADF. */
+    mov sock(%rip), %edi
+    mov $3, %eax                   /* close(S) */
+    syscall
+    test %rax, %rax
+    jnz fail_close
+    call bits
+    mov %r14, read_set(%rip)
+    mov %r15, write_set(%rip)
+    movq $0, select_time(%rip)
+    movq $20000000, select_time+8(%rip)
+    call nfds
+    lea read_set(%rip), %rsi
+    lea write_set(%rip), %rdx
+    xor %r10d, %r10d
+    lea select_time(%rip), %r8
+    xor %r9d, %r9d
+    mov $270, %eax                 /* pselect6 */
+    syscall
+    cmp $-9, %rax                  /* EBADF */
+    jne fail_closed_member
+    /* 3. S' reuses the number, connects, and enrols afresh. */
+    mov $2, %edi                   /* AF_INET */
+    mov $0x801, %esi               /* SOCK_STREAM | SOCK_NONBLOCK */
+    xor %edx, %edx
+    mov $41, %eax                  /* socket */
+    syscall
+    test %rax, %rax
+    js fail_socket
+    cmp sock(%rip), %eax
+    jne fail_reuse
+    mov %eax, %edi
+    lea tcp_peer(%rip), %rsi
+    mov $16, %edx
+    mov $42, %eax                  /* connect: 0 or EINPROGRESS */
+    syscall
+    test %rax, %rax
+    jz 1f
+    cmp $-115, %rax
+    jne fail_connect
+1:
+    call bits
+    mov %r14, read_set(%rip)
+    mov %r15, write_set(%rip)
+    movq $5, select_time(%rip)
+    movq $0, select_time+8(%rip)
+    call nfds
+    lea read_set(%rip), %rsi
+    lea write_set(%rip), %rdx
+    xor %r10d, %r10d
+    lea select_time(%rip), %r8
+    xor %r9d, %r9d
+    mov $270, %eax                 /* pselect6 */
+    syscall
+    test %rax, %rax
+    js fail_errno
+    cmp $1, %rax
+    jne fail_result
+    cmpq $0, read_set(%rip)        /* P stays empty */
+    jne fail_sets
+    cmp %r15, write_set(%rip)      /* exactly S''s write bit */
+    jne fail_sets
+#endif
 #if defined(SOCKET_WAKE) || defined(PIPE_WAKE) || defined(SET_TIMEOUT)
     /* 2. Read interest in both: P empty, nothing sent on S yet. */
     call bits
@@ -338,6 +407,15 @@ fail_connect_sets:
     jmp exit
 fail_open:
     mov $23, %edi
+    jmp exit
+fail_close:
+    mov $24, %edi
+    jmp exit
+fail_closed_member:
+    mov $25, %edi
+    jmp exit
+fail_reuse:
+    mov $26, %edi
 exit:
     mov $231, %eax
     syscall

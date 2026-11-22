@@ -475,6 +475,15 @@ fn native_child_pselect6_mixed_set_reports_a_host_regular_file() {
     native_mixed_select("FILE_SET");
 }
 
+/// #2730: a host socket closed while it is a member of the child's host
+/// select set leaves no stale member: selecting on the closed number is
+/// EBADF, and a new socket that reuses the number (connected to the same
+/// peer) enrols afresh, so the next pselect6 is exactly its write bit.
+#[test]
+fn native_child_pselect6_host_set_member_closed_then_reused() {
+    native_mixed_select("CLOSE_MEMBER");
+}
+
 /// Run `native_mixed_select.S`'s `variant` against a loopback TCP peer.
 /// The parent sends the poller pid through the gate socket and acts only
 /// once the host saw the poller enrolled in a wait (and, for the host-side
