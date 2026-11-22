@@ -690,6 +690,16 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
     out
 }
 
+/// The census of an ISA's mapped counters, as `publish_counters_terminal`
+/// would write it for a run without an identity. For tools that judge a
+/// census (`carrick debug discover`) and their tests.
+pub fn census_of_counters(
+    counters: &carrick_el1_abi::Counters,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Census {
+    snapshot_counters(None, Some(counters), isa)
+}
+
 /// One refused syscall for one caller class, summed over several censuses.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RefusalRank {
