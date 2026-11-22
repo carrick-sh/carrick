@@ -319,7 +319,13 @@ fn host_file_identity(fd: i32) -> Option<HostFileIdentity> {
 /// Who holds one alias of a container's mount-routing table. Every alias is
 /// minted with its kind, so a retirement that finds survivors names them
 /// instead of reporting a bare reference count (#2799).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum MountOwnerKind {
     /// The dispatcher that built the table.
     Dispatcher,
@@ -345,7 +351,14 @@ impl MountOwnerKind {
 }
 
 /// Live mount-table aliases by owner kind, read at one instant per kind.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct MountOwnerCensus {
     pub dispatchers: usize,
     pub dispatcher_forks: usize,
@@ -368,15 +381,17 @@ impl MountOwnerCensus {
 
 impl std::fmt::Display for MountOwnerCensus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
+        let Self {
+            dispatchers,
+            dispatcher_forks,
+            exec_capabilities,
+            archives,
+            boot_launches,
+            retirements,
+        } = *self;
+        ::core::write!(
             f,
-            "dispatcher={} fork={} exec={} archive={} boot={} retirement={}",
-            self.dispatchers,
-            self.dispatcher_forks,
-            self.exec_capabilities,
-            self.archives,
-            self.boot_launches,
-            self.retirements
+            "dispatcher={dispatchers} fork={dispatcher_forks} exec={exec_capabilities} archive={archives} boot={boot_launches} retirement={retirements}"
         )
     }
 }
