@@ -374,6 +374,14 @@ pub trait ProcessSignals {
 
     fn raise_sigpipe(&mut self) {}
 
+    /// Whether this owner can publish a caught signal's frame to the
+    /// process's user memory. An owner that cannot leaves an `rt_sigaction`
+    /// installing a handler unrouted: accepting a handler it never delivers
+    /// is a wrong result. Default and ignore dispositions need no frame.
+    fn delivers_caught_signals(&mut self) -> bool {
+        true
+    }
+
     fn rt_sigaction(
         &mut self,
         signum: carrick_signal_core::policy::Signal,
@@ -595,6 +603,17 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             // The owner exchanges old/new under one sighand admission.
             let current = {
                 let signals = native.process_signals()?;
+                // A handler the owner can never deliver is not accepted: the
+                // call stays unrouted, a counted ENOSYS, until it can (#2645).
+                if new_action.as_ref().is_some_and(|action| {
+                    matches!(
+                        action.disposition,
+                        carrick_signal_core::policy::Disposition::Handler(_)
+                    )
+                }) && !signals.delivers_caught_signals()
+                {
+                    return None;
+                }
                 match signals.rt_sigaction(signum, new_action) {
                     Ok(action) => action,
                     Err(error) => {
