@@ -124,10 +124,57 @@ pub const EL1_MM_PORTAL_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0xC_0000;
 pub const EL1_MM_PORTAL_BASE: u64 = crate::EL1_REGION_BASE + EL1_MM_PORTAL_OFFSET;
 pub use carrick_core_abi::PortalWaitEnrollment;
 
+/// Who writes a caught signal's frame into a process's user memory, as the
+/// carrier publishes it in [`MmPortalSlots`]. EL1 accepts a caught handler
+/// only where its frame can be delivered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignalFrameCustody {
+    /// The carrier's delivery reaches every MM it runs, admitted to the MM
+    /// portal owner or not (HVF and x86 until #2814 unifies delivery). The
+    /// zero word, so a carrier that publishes nothing keeps it.
+    #[default]
+    Carrier,
+    /// Only the MM portal owner writes frames, so only an owner-admitted MM
+    /// can receive one (the soft carrier, #2645).
+    AdmittedOwner,
+}
+
+impl SignalFrameCustody {
+    const CARRIER: u64 = 0;
+    const ADMITTED_OWNER: u64 = 1;
+
+    /// Decode the published word. An unknown word fails closed to the
+    /// narrower custody: a refused handler is a counted ENOSYS, an accepted
+    /// undeliverable one is a wrong result.
+    pub const fn from_word(word: u64) -> Self {
+        match word {
+            Self::CARRIER => Self::Carrier,
+            _ => Self::AdmittedOwner,
+        }
+    }
+    pub const fn word(self) -> u64 {
+        match self {
+            Self::Carrier => Self::CARRIER,
+            Self::AdmittedOwner => Self::ADMITTED_OWNER,
+        }
+    }
+    /// Whether a caught signal's frame reaches an MM; `admitted` is asked
+    /// only when the owner alone writes frames.
+    pub fn reaches(self, admitted: impl FnOnce() -> bool) -> bool {
+        match self {
+            Self::Carrier => true,
+            Self::AdmittedOwner => admitted(),
+        }
+    }
+}
+
 #[repr(C, align(64))]
 pub struct MmPortalSlots {
     carrier: AtomicU64,
     executable: [carrick_core_abi::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
+    /// [`SignalFrameCustody`] word; it sits in the padding before `forks`,
+    /// so the record's size and every older offset are unchanged.
+    signal_frames: AtomicU64,
     forks: [crate::PortalForkSlot; crate::EL1_STACK_SLOTS as usize],
     grants: [crate::PortalGrantSlot; crate::EL1_STACK_SLOTS as usize],
     slots: [PortalTransferSlot; crate::EL1_STACK_SLOTS as usize],
@@ -143,6 +190,7 @@ impl MmPortalSlots {
             carrier: AtomicU64::new(0),
             executable: [const { carrick_core_abi::PortalExecutableSlot::new() };
                 crate::EL1_STACK_SLOTS as usize],
+            signal_frames: AtomicU64::new(SignalFrameCustody::Carrier.word()),
             forks: [const { crate::PortalForkSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             grants: [const { crate::PortalGrantSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             slots: [const { PortalTransferSlot::new() }; crate::EL1_STACK_SLOTS as usize],
@@ -186,6 +234,22 @@ impl MmPortalSlots {
     }
     pub fn carrier(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.carrier.load(Ordering::Acquire))
+    }
+    /// Publish this carrier's signal-frame custody once, before the first
+    /// entry. Republishing the same custody is idempotent; a different one
+    /// is refused.
+    pub fn publish_signal_frame_custody(&self, custody: SignalFrameCustody) -> bool {
+        self.signal_frames
+            .compare_exchange(
+                SignalFrameCustody::Carrier.word(),
+                custody.word(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_or_else(|current| current == custody.word(), |_| true)
+    }
+    pub fn signal_frame_custody(&self) -> SignalFrameCustody {
+        SignalFrameCustody::from_word(self.signal_frames.load(Ordering::Acquire))
     }
     pub fn executable(&self, slot: usize) -> Option<&carrick_core_abi::PortalExecutableSlot> {
         self.executable.get(slot)
@@ -247,6 +311,7 @@ mod layout_manifest {
         let _ = |MmPortalSlots {
                      carrier: _,
                      executable: _,
+                     signal_frames: _,
                      forks: _,
                      grants: _,
                      slots: _,
@@ -260,6 +325,7 @@ mod layout_manifest {
             28672,
             8
         );
+        field!(MmPortalSlots, signal_frames, AtomicU64, 28680, 8, 8);
         field!(
             MmPortalSlots,
             forks,

@@ -1454,6 +1454,8 @@ pub struct Aarch64NativeProcessService<'a, X = HvcForkStockCrossing> {
     pub crossing: X,
     pub words: Option<&'a (dyn LiveDescriptorWords + 'a)>,
     residency: Option<&'a carrick_el1_abi::FrameGrantResidencyTable>,
+    /// Who writes this carrier's signal frames, as its MM portal publishes.
+    signal_frames: carrick_el1_abi::SignalFrameCustody,
 }
 
 /// ARM mechanics for the shared exact-MM native user-write continuation.
@@ -1564,6 +1566,7 @@ impl<'a> Aarch64NativeProcessService<'a, HvcForkStockCrossing> {
             crossing: HvcForkStockCrossing,
             words: None,
             residency: None,
+            signal_frames: slots.signal_frame_custody(),
         })
     }
 }
@@ -1730,7 +1733,18 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
             crossing,
             words: None,
             residency: None,
+            signal_frames: carrick_el1_abi::SignalFrameCustody::Carrier,
         }
+    }
+
+    /// The carrier's published signal-frame custody (`new` reads it from
+    /// the MM portal).
+    pub fn with_signal_frame_custody(
+        mut self,
+        custody: carrick_el1_abi::SignalFrameCustody,
+    ) -> Self {
+        self.signal_frames = custody;
+        self
     }
 
     pub fn with_words(mut self, words: &'a (dyn LiveDescriptorWords + 'a)) -> Self {
@@ -2696,23 +2710,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
     }
 
-    /// The owner writes a signal frame only into an MM its portal admitted
-    /// (`access_user_target`); a root opened on the legacy venue has
-    /// none, so no caught handler could ever be delivered there.
+    /// On a carrier whose owner alone writes signal frames (the soft
+    /// carrier), a frame reaches only an MM its portal admitted
+    /// (`access_user_target`): a root opened on the legacy venue has none.
+    /// HVF and x86 carriers deliver to every MM they run.
     fn signal_frames_reach(&self, mm: &Mm) -> bool {
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let Ok(owner) = self.portal() else {
-                return false;
-            };
+        let _ = self.signal_frames;
+        self.portal().is_ok_and(|owner| {
             ReservationMm::new(mm.mm.raw().get())
                 .is_some_and(|key| owner.admitted_handle(key, self.worker()).is_ok())
-        }
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-        {
-            let _ = mm;
-            true
-        }
+        })
     }
 
     #[inline(never)]
