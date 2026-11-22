@@ -128,6 +128,7 @@ mod commands;
 mod debug;
 mod debug_amplification;
 mod debug_core;
+mod debug_discover;
 mod debug_el1_census;
 mod debug_exec_stamps;
 #[cfg(target_os = "linux")]
