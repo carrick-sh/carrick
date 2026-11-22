@@ -636,17 +636,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             record,
         )?;
         frame.x[0] = 0;
-        let (loaded, requeue) = self.preempt_record(frame, record, CpuExitCause::Svc);
-        if self.zone.slot(self.slot).current() == Some(record) {
-            return Some(Served::Returned { switched: false });
-        }
-        let receipt = carrick_core::entry::publish_handoff_yield(start, requeue);
-        self.record_handoff(receipt);
-        if loaded {
-            self.program_timer(true);
-            Some(Served::Returned { switched: true })
-        } else {
-            Some(self.service_exit())
+        let preempted = self.preempt_record(frame, record, CpuExitCause::Svc);
+        match YieldHandoff::publish(start, preempted) {
+            YieldHandoff::Kept => Some(Served::Returned { switched: false }),
+            YieldHandoff::Refused => None,
+            YieldHandoff::Transferred { receipt, loaded } => {
+                self.record_handoff(Some(receipt));
+                if loaded {
+                    self.program_timer(true);
+                    Some(Served::Returned { switched: true })
+                } else {
+                    Some(self.service_exit())
+                }
+            }
         }
     }
 
@@ -1098,18 +1100,20 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let Ok(prev) = self.current_record() else {
             return true;
         };
-        self.preempt_record(frame, prev, CpuExitCause::Interrupted)
-            .0
+        match self.preempt_record(frame, prev, CpuExitCause::Interrupted) {
+            Preempted::Queued { loaded } => loaded,
+            Preempted::Kept => true,
+            Preempted::Refused => false,
+        }
     }
 
-    /// Switch `prev` out for the run queue's head. Returns whether a thread
-    /// is loaded, and the exact requeue of `prev` that licenses its receipt.
+    /// Switch `prev` out for the run queue's head ([`Preempted`]).
     fn preempt_record(
         &mut self,
         frame: &mut TrapFrame,
         prev: carrick_el1_abi::RecordId,
         exit: CpuExitCause,
-    ) -> (bool, carrick_sched_core::Requeue) {
+    ) -> Preempted {
         let (zone, slot) = (self.zone, self.slot);
         let fresh = zone.slot(slot).current().is_none();
         // SAFETY: `prev` holds the running thread (a fresh home record, or
@@ -1120,10 +1124,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             Some(switched) => {
                 if !requeue_owned(zone, slot, prev) {
                     // Hosted builds only: the target build failed closed.
-                    return (
-                        false,
-                        carrick_sched_core::Requeue::Refused(zone.record(prev).claim()),
-                    );
+                    return Preempted::Refused;
                 }
                 let loaded = match self.load(frame, switched) {
                     LoadResult::Running => true,
@@ -1132,18 +1133,23 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                         matches!(self.run_next(frame, 0), Served::Returned { switched: true })
                     }
                 };
-                (loaded, carrick_sched_core::Requeue::Queued)
+                Preempted::Queued { loaded }
+            }
+            // EL1 may not run the head: it waits for its executor (a host
+            // service handback, or an address space EL1 may not install
+            // now). `prev` gives up the CPU exactly as it does for a head
+            // EL1 can run, and the vCPU leaves for that executor (#2749).
+            None if zone.head_needs_host(slot) && requeue_owned(zone, slot, prev) => {
+                Preempted::Queued { loaded: false }
             }
             None => {
-                // The head changed under us (it cannot: only this vCPU takes
-                // from its queue). Keep running `prev`.
+                // Nothing to switch to (the head left the queue, or a hosted
+                // requeue failed closed): `prev` keeps running, and the home
+                // record made for it alone is returned unpublished.
                 if fresh {
                     zone.discard_unpublished(slot, prev);
                 }
-                (
-                    true,
-                    carrick_sched_core::Requeue::Refused(zone.record(prev).claim()),
-                )
+                Preempted::Kept
             }
         }
     }
@@ -1214,6 +1220,60 @@ impl<C: ThreadCpu, U: UserWord> WakeMechanics for Sched<'_, C, U> {
 
 #[path = "sched/hw.rs"]
 pub mod hw;
+
+/// What [`Sched::preempt_record`] did with the thread it was asked to switch
+/// out. Only [`Self::Queued`] moved that thread off the CPU, so only it can
+/// license a handoff receipt ([`YieldHandoff`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preempted {
+    /// The thread is at the tail of the run queue with its registers.
+    /// `loaded`: another thread now runs on the vCPU; otherwise the vCPU
+    /// must leave for the head's executor with no thread on it.
+    Queued { loaded: bool },
+    /// The thread still runs: nothing was switched in and it was not queued.
+    Kept,
+    /// Hosted builds only: the requeue failed closed after a switch-in (the
+    /// target build is fatal there).
+    Refused,
+}
+
+/// A guest yield's outcome. A yield reports a switch only by holding the
+/// receipt of the caller's own requeue: there is no way to say "switched"
+/// for a caller that was kept or whose record was discarded (#2749).
+enum YieldHandoff {
+    /// The caller keeps the CPU; its completed yield returns in place.
+    Kept,
+    /// The caller left the CPU for the run queue, and `receipt` proves it.
+    Transferred {
+        receipt: carrick_el1_abi::EntryHandoffReceipt<Aarch64ParkedContext>,
+        loaded: bool,
+    },
+    /// Hosted builds only ([`Preempted::Refused`]).
+    Refused,
+}
+
+impl YieldHandoff {
+    fn publish(
+        start: carrick_core::entry::HandoffStart<'_, Aarch64ParkedContext>,
+        preempted: Preempted,
+    ) -> Self {
+        match preempted {
+            Preempted::Kept => Self::Kept,
+            Preempted::Refused => Self::Refused,
+            Preempted::Queued { loaded } => {
+                // No receipt: the rotation ran every other thread off the
+                // queue and loaded the caller again, so it kept the CPU.
+                match carrick_core::entry::publish_handoff_yield(
+                    start,
+                    carrick_sched_core::Requeue::Queued,
+                ) {
+                    Some(receipt) => Self::Transferred { receipt, loaded },
+                    None => Self::Kept,
+                }
+            }
+        }
+    }
+}
 
 /// Requeue this vCPU's own record: its running thread, or the fresh home
 /// record it just allocated. Only this vCPU moves that record, so a refusal
