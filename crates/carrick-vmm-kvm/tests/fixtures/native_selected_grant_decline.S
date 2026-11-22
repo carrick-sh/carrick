@@ -6,7 +6,7 @@
  *   -DINHERITED Occupied, in a fork child that holds inherited prepared
  *               outputs: the access reruns, the replan publishes, and the
  *               inherited pages keep their parent's data.
- *   -DTERMINAL  StaleRoot: no rerun and no replan; the access never
+ *   -DTERMINAL  WrongMm: no rerun and no replan; the access never
  *               completes (exit 7 means it wrongly did).
  * Exit 7 is success; 90-99 name the failed step.
  */
