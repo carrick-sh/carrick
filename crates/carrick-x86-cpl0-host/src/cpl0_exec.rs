@@ -977,6 +977,36 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)
     }
+
+    /// Apply the exec owner's carrier-exit verdict (#2799): every row the run
+    /// left unadopted is retired, and a staged successor's tables, data
+    /// frames and build extent go back exactly as a ring cancellation (a
+    /// sealed row) or a refusal (an unsealed one) returns them. A claimed or
+    /// parked row holds no carrier frames. Call only once every CPU lane has
+    /// stopped. Returns the rows retired.
+    pub(crate) fn retire_native_execs_at_carrier_exit(&mut self) -> Result<usize, TrapError> {
+        let retired = self.exec_owner.retire_at_carrier_exit();
+        let rows = retired.len();
+        for row in retired {
+            let ExecRetained::Staged(preparation) = row.held else {
+                continue;
+            };
+            let ram = Arc::clone(&self.ram);
+            let (roots, zone) = Self::exec_tables(&ram)?;
+            let mut frames = CarrierExecFrames {
+                vm: &mut self._vm,
+                next: &mut self.anonymous_next_gpa,
+                inventory: &self.frame_inventory,
+                rollback_fault: &self.initial_rollback_fault,
+            };
+            if row.retirement.sealed {
+                cancel_x86_exec(preparation, &mut self.fork_stock, &mut frames)?;
+            } else {
+                release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)?;
+            }
+        }
+        Ok(rows)
+    }
 }
 
 /// What a parked row of the carrier's exec owner resumes with: the claimed

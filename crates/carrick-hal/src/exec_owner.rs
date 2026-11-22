@@ -59,6 +59,8 @@ pub struct ExecOwnerCensus {
     pub park_cancelled: u64,
     /// Sealed rows whose publication the ring had already cancelled.
     pub publish_cancelled: u64,
+    /// Rows still unadopted when the carrier exited, retired by its exit.
+    pub carrier_exit: u64,
     /// Adopted execs settled on the lane that serves their origin.
     pub settled: u64,
     /// Settlements handed back, unchanged, from a lane that cannot serve them.
@@ -72,7 +74,12 @@ pub struct ExecOwnerCensus {
 impl ExecOwnerCensus {
     /// Rows retired for any reason.
     pub const fn retired(&self) -> u64 {
-        self.adopted + self.cancelled + self.refused + self.park_cancelled + self.publish_cancelled
+        self.adopted
+            + self.cancelled
+            + self.refused
+            + self.park_cancelled
+            + self.publish_cancelled
+            + self.carrier_exit
     }
 
     /// Rows reserved and not yet retired. At carrier exit a nonzero count is
@@ -199,6 +206,9 @@ pub enum ExecRetireReason {
     /// The ring had cancelled the ticket before the sealed manifest reached
     /// it.
     PublishCancelled,
+    /// The carrier exited with the row unadopted: its process died with the
+    /// run, and no ring remains to adopt or cancel it.
+    CarrierExit,
 }
 
 /// One row's retirement: every receipt the owner reserved ends in exactly
@@ -817,6 +827,47 @@ impl<D, P, A> ExecPreparations<D, P, A> {
                 sealed,
             },
         })
+    }
+
+    /// Retire every row still live when the carrier exits (#2799). The run's
+    /// terminal owner calls this once no execution lane can reach the owner
+    /// again: a process that died with the run between its exec's claim and
+    /// its adoption left a row no ring will adopt or cancel. Each row is
+    /// retired `CarrierExit`, in any phase, and what it held is handed back
+    /// for the backend to release.
+    pub fn retire_at_carrier_exit(&mut self) -> Vec<ExecRetired<D, P, A>> {
+        let rows = core::mem::take(&mut self.rows);
+        self.census.carrier_exit += rows.len() as u64;
+        rows.into_values()
+            .map(
+                |ExecRow {
+                     claim,
+                     phase,
+                     attachment,
+                 }| {
+                    let sealed = matches!(phase, RowPhase::Sealed(_));
+                    let held = match phase {
+                        RowPhase::Claimed => ExecRetained::Claimed,
+                        RowPhase::Parked { parked, .. } => {
+                            ExecRetained::Parked(parked.continuation)
+                        }
+                        RowPhase::Staged(data) | RowPhase::Sealed(data) => {
+                            ExecRetained::Staged(data)
+                        }
+                    };
+                    ExecRetired {
+                        held,
+                        attachment,
+                        retirement: ExecRetirement {
+                            receipt: claim.receipt(),
+                            origin: claim.origin(),
+                            reason: ExecRetireReason::CarrierExit,
+                            sealed,
+                        },
+                    }
+                },
+            )
+            .collect()
     }
 
     /// Route the ring's settlement of `predecessor` → `successor`, served on
