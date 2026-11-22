@@ -75,8 +75,8 @@ use carrick_x86::arch_context::X86ArchContext;
 use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuIo, CarrierRunExit};
 use carrick_x86_cpl0_host::carrier_memory::CarrierMemoryIo;
 use carrick_x86_cpl0_host::cpl0_boot::{
-    GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot, ProductionCpuFactory,
-    ProductionCpuLease, ProductionForwardFrame,
+    ForwardSubject, GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot,
+    ProductionCpuFactory, ProductionCpuLease, ProductionForwardFrame,
 };
 use carrick_x86_cpl0_host::host_readiness::{
     BoundHostFds, HostReadinessRequest, HostReadinessStep, ReadinessCrossing, ReadinessWait,
@@ -483,24 +483,36 @@ enum ForwardDecision {
 /// whose [`Cpl0TaskBinding`] this executor holds has a host `KernelContext`
 /// and (on a loaded lane) a host execution lease. A CPL0-forked child has
 /// neither: its fd table, credentials and waits live in the ring, and the
-/// root's context or lease must never stand in for them.
+/// root's context or lease must never stand in for them. A member of the
+/// bound task's own thread group (#2780) shares the process, so it holds the
+/// process's host-root resources; the context and the lease stay the
+/// leader's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForwardAuthority {
     Task,
+    TaskMember,
     InZoneChild,
 }
 
 impl ForwardAuthority {
-    fn of(task: TaskIdentity, binding: &Cpl0TaskBinding) -> Self {
-        if task == binding.arch().task() {
-            Self::Task
-        } else {
-            Self::InZoneChild
+    fn of(task: TaskIdentity, binding: &Cpl0TaskBinding, subject: ForwardSubject) -> Self {
+        if task != binding.arch().task() {
+            return Self::InZoneChild;
+        }
+        match subject {
+            ForwardSubject::Leader => Self::Task,
+            ForwardSubject::Member { .. } => Self::TaskMember,
         }
     }
 
     const fn may_use_host_task_context(self) -> bool {
         matches!(self, Self::Task)
+    }
+
+    /// Host-root file resources belong to the bound task's process: every
+    /// member of its thread group resolves host files through them.
+    const fn holds_host_root_resources(self) -> bool {
+        matches!(self, Self::Task | Self::TaskMember)
     }
 }
 
@@ -510,7 +522,8 @@ impl ForwardAuthority {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardAuthorityRefusal {
     /// The call needs a host task context (fd table, offsets, credentials)
-    /// that an in-zone child does not have. A broken invariant: the ring
+    /// that an in-zone child, or a member of the bound task's thread group,
+    /// does not have. For a child it is a broken invariant: the ring
     /// answers a fork child's unstaged crossing in ring with a counted
     /// ENOSYS (`carrick_el1_linux::dispatch::unclaimed_native_syscall`), so
     /// none should reach the carrier.
@@ -534,7 +547,7 @@ impl std::fmt::Display for ForwardAuthorityRefusal {
         match self {
             Self::HostTaskContext { native } => write!(
                 formatter,
-                "forward refused: x86 syscall {native} from an in-zone child reached the carrier (broken invariant: the ring answers it); it needs a host task context it does not own"
+                "forward refused: x86 syscall {native} from an in-zone child or a thread-group member reached the carrier (the ring answers it); it needs a host task context it does not own"
             ),
             Self::BlockingWait => formatter.write_str(
                 "forward refused: a blocking wait needs the stopped task's own execution lease",
@@ -640,9 +653,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 &root
             }
         };
-        let authority = ForwardAuthority::of(task, binding);
-        // Only the bound task may park, and only on the lease this lane holds.
-        let can_block = authority == ForwardAuthority::Task && submission.is_some();
+        let has_submission = submission.is_some();
         let stats = &self.stats;
         let refuse = |refusal: ForwardAuthorityRefusal| -> Result<ForwardDecision, TrapError> {
             stats.record_authority_refusal(refusal)?;
@@ -653,6 +664,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .lock()
             .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
         let (decision, token) = self.physical.capture_forward(task, |venue, frame| {
+            // The stopped CPU names who asks: the bound task, a member of its
+            // thread group, or an in-zone child.
+            let authority = ForwardAuthority::of(task, binding, venue.subject());
+            // Only the bound task may park, and only on the lease this lane holds.
+            let can_block = authority == ForwardAuthority::Task && has_submission;
             if frame.rax == carrick_el1_abi::HostFileCrossing::NUMBER {
                 stats.record(crate::prepare::InitialForwardClass::Host("host-file"))?;
                 if frame.rcx != carrick_el1_abi::HostFileCrossing::FRAME_TAG {
@@ -824,12 +840,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 }
             };
             let class = crate::prepare::classify_initial_x86_forward(raw.native_number, raw.args);
-            if authority == ForwardAuthority::InZoneChild
+            if !authority.may_use_host_task_context()
                 && matches!(class, crate::prepare::InitialForwardClass::Host(_))
             {
                 // The ring answers a fork child's unstaged crossing in ring
                 // (`unclaimed_native_syscall`); one reaching here is a broken
-                // invariant, never served under the root's authority.
+                // invariant, never served under the root's authority. A
+                // member of the bound task's thread group has no host thread
+                // of its own (#2193): the leader's context is not its own.
                 return refuse(ForwardAuthorityRefusal::HostTaskContext {
                     native: raw.native_number.0,
                 });
@@ -884,7 +902,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 let source = if carrick_core_abi::host_file::reply(&record).is_some() {
                     None
                 } else {
-                    let served = if authority == ForwardAuthority::Task {
+                    let served = if ForwardAuthority::of(task, binding, token.subject())
+                        .holds_host_root_resources()
+                    {
                         dispatcher.serve_host_root_file(&binding.host_root_resources, &mut record)
                     } else {
                         dispatcher.serve_native_host_file(&mut record, None)
@@ -1936,6 +1956,9 @@ mod tests {
     fn in_zone_child_host_fd_write_predicate_refuses_root_task_context() {
         assert!(ForwardAuthority::Task.may_use_host_task_context());
         assert!(!ForwardAuthority::InZoneChild.may_use_host_task_context());
+        assert!(!ForwardAuthority::TaskMember.may_use_host_task_context());
+        assert!(ForwardAuthority::TaskMember.holds_host_root_resources());
+        assert!(!ForwardAuthority::InZoneChild.holds_host_root_resources());
     }
 
     #[derive(Default)]
