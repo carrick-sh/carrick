@@ -683,7 +683,12 @@ fn soft_cpu_runs_root_lifecycle_and_portal_through_production_dispatch() {
         entry.ring_ready(),
         "the root's lifecycle and MM portal must be what the ring expects: {entry:?}"
     );
-    assert_eq!(entry.control_visible_tid, Some(1), "{entry:?}");
+    // The mapped control slot names the task loaded on the slot.
+    assert_eq!(
+        entry.control_visible_tid.map(u64::from),
+        Some(entry.task_tid),
+        "{entry:?}"
+    );
 
     // Teardown cleared the publication and retired both mappings: the
     // aperture holds no stage-2 window of this run's root any more.
