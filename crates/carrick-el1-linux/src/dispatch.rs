@@ -7691,8 +7691,26 @@ mod tests {
             ),
             None
         );
-        // AF_UNIX keeps its ring owner: it is not a host network socket.
-        frame.x[0] = 1;
+        // A named AF_UNIX socket and a netlink socket are the carrier's too
+        // (#1906): the ring owns only the AF_UNIX stream `socketpair`.
+        for domain in [1, 16] {
+            frame.x[0] = domain;
+            let staged = native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| panic!("socket names no descriptor"),
+                &mut |_| 0,
+            );
+            assert!(
+                matches!(staged, Some(HostFileStage::Request { .. })),
+                "a fork child's socket of domain {domain} crosses: {staged:?}"
+            );
+        }
+        // Any other domain (AF_PACKET) has no venue: a counted ENOSYS.
+        frame.x[0] = 17;
         assert_eq!(
             native_host_file_stage(
                 &frame,
