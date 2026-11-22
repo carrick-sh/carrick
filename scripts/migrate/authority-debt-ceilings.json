@@ -5562,7 +5562,7 @@
     {
       "family": "global_config_debug",
       "operation": "global:env_var",
-      "owner": "carrick_runtime::vcpu_loop::signal::DescriptorLaneHatch::current::CARRICK_EL1_DESCRIPTOR_LANE",
+      "owner": "carrick_kernel::dispatch::carrier_loop::DescriptorLaneHatch::current::CARRICK_EL1_DESCRIPTOR_LANE",
       "lane": "shared",
       "ceiling": 1
     },
@@ -6192,7 +6192,7 @@
     {
       "family": "global_config_debug",
       "operation": "global:static",
-      "owner": "carrick_runtime::vcpu_loop::signal::DescriptorLaneHatch::current::HATCH",
+      "owner": "carrick_kernel::dispatch::carrier_loop::DescriptorLaneHatch::current::HATCH",
       "lane": "shared",
       "ceiling": 1
     },

@@ -242,7 +242,7 @@ impl HvpatchPersistentExecutorFactory {
         authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
     ) -> Self {
         let lifecycle_mappings = authority.reservation_metadata_access().map(|access| {
-            Arc::new(crate::vcpu_loop::thread_lifecycle::CarrierLifecycleMappings::new(access))
+            Arc::new(crate::vcpu_loop::thread_lifecycle::carrier_lifecycle_mappings(access))
         });
         Self {
             authority,
@@ -1396,8 +1396,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             publish_zone_slot(
                 slot,
                 self.raw_vcpu_id,
-                task.binding().identity().mm.raw(),
-                task.thread_key().serial.raw(),
+                task.binding().identity().mm,
+                task.thread_key().serial,
                 self.bound_cpu,
                 task.lease()
                     .control_lease()
@@ -1405,7 +1405,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                         TrapError::Hypervisor("loaded thread lost affinity authority".into())
                     })?
                     .affinity_source(),
-                zone_driver(self.executor_id),
+                zone_slot_driver(self.executor_id),
             )?;
             attach_loaded_affinity_route(slot, |slot| task.lease().attach_affinity_slot(slot))?;
         }
@@ -2207,7 +2207,16 @@ pub(crate) fn driven_zone_slot() -> Option<(carrick_el1_abi::SlotId, u64)> {
 
 /// The zone's driver identity of an executor (never 0, which means none).
 pub(crate) fn zone_driver(executor: ExecutorId) -> u64 {
-    u64::from(executor.raw()) + 1
+    zone_slot_driver(executor).raw()
+}
+
+/// [`zone_driver`] as the shared stopped-slot publication's typed input.
+pub(crate) fn zone_slot_driver(
+    executor: ExecutorId,
+) -> carrick_kernel::dispatch::carrier_loop::ZoneSlotDriver {
+    carrick_kernel::dispatch::carrier_loop::ZoneSlotDriver::new(
+        std::num::NonZeroU64::MIN.saturating_add(u64::from(executor.raw())),
+    )
 }
 
 /// Prepare the driver handoff before atomic CPU/driver publication: a slot it drove
@@ -2291,70 +2300,67 @@ fn attach_loaded_affinity_route(
     }
 }
 
-/// Publish the zone identity of the task just loaded on mailbox `slot`: its
-/// process's zone key (0 when the zone is off, so EL1 forwards every futex
-/// operation), its thread serial, and the slot's vCPU for zone kicks. No
-/// thread may be switched in on the slot (the previous residency's last exit
-/// settled it); queued threads stay (one of another address space waits for
-/// this executor to load it), and a slot this executor drove before is left.
+/// The HVF mechanics of a stopped-slot publication: the GIC reschedule
+/// target of the slot's vCPU, and this executor thread's driver handoff.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvfStoppedSlot {
+    vcpu: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_kernel::dispatch::carrier_loop::StoppedSlotBackend for HvfStoppedSlot {
+    type Error = TrapError;
+
+    fn reschedule_target(&mut self) -> Result<u64, TrapError> {
+        carrick_vmm_hvf::gic::reschedule_target(self.vcpu)
+    }
+
+    fn prepare_driver(
+        &mut self,
+        slot: carrick_el1_abi::SlotId,
+        driver: carrick_kernel::dispatch::carrier_loop::ZoneSlotDriver,
+    ) -> Result<(), TrapError> {
+        prepare_zone_driver(slot, driver.raw())
+    }
+}
+
+/// Bind the slot's vCPU for zone kicks, then publish the task just loaded on
+/// mailbox `slot` through the shared stopped-slot publication
+/// ([`carrick_kernel::dispatch::carrier_loop::publish_stopped_zone_slot`]).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn publish_zone_slot(
     slot: usize,
     vcpu: u64,
-    mm: u64,
-    serial: u64,
+    mm: carrick_kernel::kernel::MmId,
+    serial: carrick_kernel::kernel::ThreadSerial,
     bound_cpu: Option<u32>,
     affinity: carrick_sched_core::AffinitySource,
-    driver: u64,
+    driver: carrick_kernel::dispatch::carrier_loop::ZoneSlotDriver,
 ) -> Result<(), TrapError> {
+    use carrick_kernel::dispatch::carrier_loop::{
+        StoppedSlotLoad, StoppedSlotRefusal, publish_stopped_zone_slot,
+    };
     carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
-    let Some(zone) = carrick_kernel::el1_zone::zone() else {
-        if let Some((zone, lane)) =
-            carrick_el1_abi::zone_tables().zip(carrick_sched_core::SlotId::from_index(slot))
-        {
-            zone.slot(lane)
-                .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
-            zone.publish_slot_with_affinity(lane, 0, bound_cpu, affinity);
-        }
-        carrick_el1_abi::publish_zone_identity(slot, 0, serial);
+    let Some(lane) = carrick_el1_abi::SlotId::from_index(slot) else {
         return Ok(());
     };
-    if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
-        // A compute-only residency must be reachable before its first entry;
-        // publishing this only in EL1 idle would lose a remote affinity kick.
-        zone.slot(zone_slot)
-            .set_sgi_target(carrick_vmm_hvf::gic::reschedule_target(vcpu)?);
-        prepare_zone_driver(zone_slot, driver)?;
-        // What the slot still holds, for the fatal below: the record EL1
-        // left switched in, its claim, identity, pending object operation and
-        // handback, and the slot's queue.
-        let held = zone.slot(zone_slot).current().map(|record| {
-            let rec = zone.record(record);
-            (
-                record,
-                rec.claim(),
-                rec.identity(),
-                rec.has_object_operation(),
-                rec.handback(),
-            )
-        });
-        let host_record = zone.slot(zone_slot).host_record();
-        let queued = zone.slot(zone_slot).queued();
-        // The reset clears the slot's timer: a timed park another executor's
-        // thread left on it goes to the host first.
-        carrick_kernel::el1_zone::hand_back_foreign_timer(zone_slot);
-        if !zone.reset_slot(zone_slot) {
-            fail_zone_slot(format_args!(
-                "EL1 zone slot {slot} still held threads when a task was loaded on it: \
-                 current={held:?} host_record={host_record:?} queued={queued} \
-                 loading mm={mm:#x} serial={serial} driver={driver}"
-            ));
-        }
-        // Threads queued here for another address space stay: EL1 leaves
-        // the vCPU for this executor when one reaches the head, and the
-        // executor loads it.
-        zone.drive_and_publish(zone_slot, driver, mm, bound_cpu, affinity);
+    let load = StoppedSlotLoad {
+        slot: lane,
+        driver,
+        mm,
+        serial,
+        bound_cpu: bound_cpu.map(carrick_hal::GuestCpuId::new),
+        affinity,
+    };
+    match publish_stopped_zone_slot(load, &mut HvfStoppedSlot { vcpu }) {
+        Ok(()) => Ok(()),
+        Err(StoppedSlotRefusal::Backend(error)) => Err(error),
+        Err(StoppedSlotRefusal::Held(held)) => fail_zone_slot(format_args!(
+            "EL1 zone slot {slot} still held threads when a task was loaded on it: \
+             {held} loading mm={:#x} serial={} driver={}",
+            mm.raw(),
+            serial.raw(),
+            driver.raw()
+        )),
     }
-    carrick_el1_abi::publish_zone_identity(slot, mm, serial);
-    Ok(())
 }

@@ -451,18 +451,7 @@ pub struct MetadataGrantStats {
     pub inline_hvc_traps: u64,
 }
 
-/// Storage published read/write to EL1 without copying it.
-///
-/// # Safety
-/// The range must remain allocated and at a stable address until this owner
-/// drops. It must contain only shared ABI data, permit concurrent atomic
-/// access, and be aligned and sized to the host's 16 KiB mapping granule.
-/// The host VM object must also remain stable while published (for example,
-/// MAP_SHARED backing); host COW must not replace the object mapped by HVF.
-pub unsafe trait RetainedMetadataBacking: std::fmt::Debug + Send + Sync {
-    fn host_base(&self) -> carrick_guest_mem::HostVa;
-    fn mapped_len(&self) -> usize;
-}
+pub use carrick_hal::retained_metadata::RetainedMetadataBacking;
 
 #[derive(::core::fmt::Debug)]
 enum MetadataBacking {
