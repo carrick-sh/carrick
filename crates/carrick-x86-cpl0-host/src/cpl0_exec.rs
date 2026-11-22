@@ -32,8 +32,9 @@ use carrick_core_abi::service::{
     ExecSuccessorEntry, ServiceOrigin,
 };
 use carrick_core_abi::successor_image::{ImageRow, ImageStack};
+pub use carrick_el1::isa::x86_initial_mm::ImageFrameDemand;
 use carrick_el1::isa::x86_initial_mm::{
-    ImageFrameDemand, InitialMmError, InitialStackSpec, build_initial_stack, image_frame_demand,
+    InitialMmError, InitialStackSpec, build_initial_stack, image_frame_demand,
 };
 use carrick_el1::memory::reservations::{
     NoRootWait, Refusal, X86Cpl0Root, X86Cpl0RootReleaseVenue,
@@ -906,6 +907,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         })
     }
 
+    /// Attach this carrier's clock overlay (the vvar and vDSO regions boot
+    /// mapped for the initial image) to a successor. The Exec service does
+    /// this to every image before it reserves, so the demand it stages is
+    /// the image's own plus the overlay's.
+    fn attach_clock_overlay(&self, image: &mut X86ExecImage) -> Result<(), LinuxErrno> {
+        match self.clock_vvar {
+            Some(clock) => image.attach_vdso(clock),
+            None => Ok(()),
+        }
+    }
+
     /// The host Exec service on the stopped `cpu` for the claimed row
     /// `receipt`; see [`stage_x86_exec`].
     pub(crate) fn stage_native_exec(
@@ -916,9 +928,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         wake: StockReleaseWake,
         random: [u8; 16],
     ) -> Result<X86ExecStage, TrapError> {
-        if let Some(clock) = self.clock_vvar
-            && let Err(errno) = request.image.attach_vdso(clock)
-        {
+        if let Err(errno) = self.attach_clock_overlay(&mut request.image) {
             return Ok(X86ExecStage::Refused(errno));
         }
         let ram = Arc::clone(&self.ram);
@@ -2064,6 +2074,19 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             .claim(identity, successor, root_generation)
             .map(|claim| claim.receipt())
             .map_err(|error| fail(format!("fixture exec claim: {error:?}")))
+    }
+
+    /// What the Exec service would reserve for `image` on this carrier: its
+    /// demand after the same overlay attachment `stage_native_exec` makes.
+    /// A test that sizes fork-stock pressure asks here, so it never restates
+    /// what the carrier adds to a successor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_staged_exec_demand(
+        &self,
+        mut image: X86ExecImage,
+    ) -> Result<ImageFrameDemand, LinuxErrno> {
+        self.0.attach_clock_overlay(&mut image)?;
+        Ok(image.demand())
     }
 
     /// Hold all but `left` stock tables, as a live holder (a pending fork,

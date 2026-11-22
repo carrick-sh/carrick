@@ -1264,9 +1264,8 @@ fn run_exec_fixture_with_stock_pressure(
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
     let program =
         carrick_mem::elf::ElfProgram::load(successor, 62, &|_| None).expect("successor ELF");
-    let demand = X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
-        .expect("successor demand")
-        .demand();
+    let image = X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
+        .expect("successor image");
     let caller = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
@@ -1281,7 +1280,12 @@ fn run_exec_fixture_with_stock_pressure(
         |carrier| {
             // Leave capacity for the two fork children and one fewer table
             // than their exec successor needs. The first child's retirement
-            // must return its own tables to satisfy that exec.
+            // must return its own tables to satisfy that exec. The carrier
+            // says what the service stages for the successor: the image's
+            // own demand plus the vvar and vDSO the service attaches.
+            let demand = carrier
+                .fixture_staged_exec_demand(image)
+                .expect("staged successor demand");
             let left = demand.tables + 13;
             *held.lock().expect("held stock slot") = Some(
                 carrier
@@ -1810,7 +1814,16 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
         successor,
         root_generation,
     };
-    let demand = request().image.demand();
+    // The service attaches the carrier's vvar and vDSO before it reserves,
+    // so the staged demand is the carrier's answer, not the bare image's.
+    let bare = request().image.demand();
+    let demand = carrier
+        .fixture_staged_exec_demand(*request().image)
+        .expect("staged successor demand");
+    assert!(
+        demand.tables >= bare.tables && demand.data >= bare.data + 2,
+        "the staged successor carries the vvar and vDSO pages: {demand:?} over {bare:?}"
+    );
     let stock = carrier.fork_table_stock();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
@@ -3507,9 +3520,29 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
     let mappings = carrier.initial_reservation_census().expect("fork census");
     assert_eq!(
         mappings.len(),
-        plan.regions.len() + 2,
-        "fork must inherit every ELF region, the built stack top and the stack's growable rest"
+        plan.regions.len() + 4,
+        "fork must inherit every ELF region, the vvar and vDSO regions, the built stack top and the stack's growable rest"
     );
+    {
+        use carrick_mem::vdso::{
+            LINUX_VDSO_BASE, LINUX_VDSO_SIZE, LINUX_VVAR_BASE, LINUX_VVAR_SIZE,
+        };
+        let write = carrick_el1_abi::ReservationProtection::WRITE;
+        for (name, base, size) in [
+            ("vvar", LINUX_VVAR_BASE, LINUX_VVAR_SIZE),
+            ("vDSO", LINUX_VDSO_BASE, LINUX_VDSO_SIZE),
+        ] {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.range.start() == base)
+                .unwrap_or_else(|| panic!("the carrier maps the {name} region at load"));
+            assert_eq!(mapping.range.end(), base + size, "{name} extent");
+            assert!(
+                !mapping.protection.permits(write),
+                "{name} is read-only to the guest"
+            );
+        }
+    }
     let stack_top = carrick_vmm_kvm::cpl0_boot::INITIAL_STACK_TOP;
     assert!(mappings.iter().any(|mapping| {
         mapping.range.start() == stack_top - carrick_vmm_kvm::cpl0_boot::INITIAL_STACK_RESERVATION
