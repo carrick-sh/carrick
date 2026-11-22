@@ -102,7 +102,6 @@ pub mod dtrace_symbols;
 pub mod el1_census;
 pub mod host_process;
 pub mod interactive_supervisor;
-pub mod venue_gaps;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/archive/build-decomposition-design.md §3.A-A1). Re-exported under the original
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
