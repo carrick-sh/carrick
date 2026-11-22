@@ -10,11 +10,20 @@ struct Native {
     args: [u64; 6],
     calls: usize,
     fail: bool,
+    /// The `sa_handler` a copied-in action names.
+    handler: u64,
+    /// Whether the owner can publish a caught signal's frame.
+    frames: bool,
 }
 impl UserCopy for Native {
     fn copy_in(&mut self, bytes: &mut [u8], _: UserVa) -> carrick_core::user_copy::CopyOutcome {
         carrick_core::user_copy::CopyOutcome::from_completed({
             bytes.fill(0);
+            if bytes.len()
+                == core::mem::size_of::<carrick_personality_linux::abi::signal::LinuxSigaction>()
+            {
+                bytes[..8].copy_from_slice(&self.handler.to_le_bytes());
+            }
             if bytes.len() == core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>() {
                 let info = carrick_syscall_abi::LinuxSiginfo::kill(10, -1, 1, 0);
                 bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&info));
@@ -71,6 +80,9 @@ impl<'a> SignalNative<'a> for Native {
     }
 }
 impl ProcessSignals for Native {
+    fn delivers_caught_signals(&mut self) -> bool {
+        self.frames
+    }
     fn take_deliverable(
         &mut self,
         blocked: SigBlockMask,
@@ -155,6 +167,8 @@ fn querying_kill_and_stop_succeeds() {
             args: [sig, 0, 1, 8, 0, 0],
             calls: 0,
             fail: false,
+            handler: 0,
+            frames: true,
         };
         assert_eq!(
             result(invoke(SignalCall::RtSigaction, &mut native)),
@@ -169,6 +183,53 @@ fn old_and_new_action_use_one_owner_exchange() {
         args: [10, 1, 2, 8, 0, 0],
         calls: 0,
         fail: false,
+        handler: 0,
+        frames: true,
+    };
+    assert_eq!(
+        result(invoke(SignalCall::RtSigaction, &mut native)),
+        Some(0)
+    );
+    assert_eq!(native.calls, 1);
+}
+#[test]
+fn a_handler_the_owner_cannot_deliver_stays_unrouted() {
+    let mut native = Native {
+        args: [10, 1, 2, 8, 0, 0],
+        calls: 0,
+        fail: false,
+        handler: 0x40_0800,
+        frames: false,
+    };
+    assert!(invoke(SignalCall::RtSigaction, &mut native).is_none());
+    assert_eq!(native.calls, 0, "the owner never installs the handler");
+}
+#[test]
+fn dispositions_and_queries_need_no_frame_delivery() {
+    for (act, handler) in [(1, 0), (1, 1), (0, 0x40_0800)] {
+        let mut native = Native {
+            args: [10, act, 2, 8, 0, 0],
+            calls: 0,
+            fail: false,
+            handler,
+            frames: false,
+        };
+        assert_eq!(
+            result(invoke(SignalCall::RtSigaction, &mut native)),
+            Some(0),
+            "act={act} handler={handler:#x}"
+        );
+        assert_eq!(native.calls, 1);
+    }
+}
+#[test]
+fn a_deliverable_handler_is_installed() {
+    let mut native = Native {
+        args: [10, 1, 2, 8, 0, 0],
+        calls: 0,
+        fail: false,
+        handler: 0x40_0800,
+        frames: true,
     };
     assert_eq!(
         result(invoke(SignalCall::RtSigaction, &mut native)),
@@ -182,6 +243,8 @@ fn owner_errno_is_negative() {
         args: [10, 1, 2, 8, 0, 0],
         calls: 0,
         fail: true,
+        handler: 0,
+        frames: true,
     };
     assert_eq!(
         result(invoke(SignalCall::RtSigaction, &mut native)),
@@ -195,6 +258,8 @@ fn signal_owner_errno_has_positive_typed_domain() {
         args: [0; 6],
         calls: 0,
         fail: true,
+        handler: 0,
+        frames: true,
     };
     let result: Result<Action, carrick_syscall_abi::LinuxErrno> = native.rt_sigaction(
         carrick_signal_core::policy::Signal::from_number(10).unwrap(),
@@ -210,6 +275,8 @@ fn signal_owner_admits_validated_requests_and_selectors() {
         args: [0; 6],
         calls: 0,
         fail: false,
+        handler: 0,
+        frames: true,
     };
     let result = native.kill(
         SignalProcessSelector::from_abi(1),
@@ -240,6 +307,8 @@ fn suspend_restore_rechecks_delivery_at_the_same_user_return() {
         args: [0; 6],
         calls: 0,
         fail: false,
+        handler: 0,
+        frames: true,
     };
     let usr1 = carrick_signal_core::policy::Signal::from_number(10).unwrap();
     let temporary = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(usr1));
@@ -297,6 +366,8 @@ fn invalid_signal_requests_are_served_without_owner_fallback() {
                 args,
                 calls: 0,
                 fail: false,
+                handler: 0,
+                frames: true,
             };
             assert_eq!(
                 result(invoke(call, &mut native)),
@@ -315,6 +386,8 @@ fn installing_kill_and_stop_is_served_einval() {
             args: [number, 1, 0, 8, 0, 0],
             calls: 0,
             fail: false,
+            handler: 0,
+            frames: true,
         };
         assert_eq!(
             result(invoke(SignalCall::RtSigaction, &mut native)),
@@ -338,6 +411,8 @@ fn malformed_signal_sizes_and_thread_groups_are_served_einval() {
             args,
             calls: 0,
             fail: false,
+            handler: 0,
+            frames: true,
         };
         assert_eq!(result(invoke(call, &mut native)), Some(-22), "{call:?}");
         assert_eq!(native.calls, 0);
@@ -355,6 +430,8 @@ fn nonpositive_queue_targets_match_native_esrch() {
                 args: [pid, signal, 1, 0, 0, 0],
                 calls: 0,
                 fail: false,
+                handler: 0,
+                frames: true,
             };
             assert_eq!(
                 result(invoke(SignalCall::RtSigqueueinfo, &mut native)),

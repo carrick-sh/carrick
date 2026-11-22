@@ -991,6 +991,11 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, bytes)
     }
+    /// Whether [`Self::copy_signal_frame_bytes`] can reach `mm` at all: the
+    /// owner path writes a signal frame only into an owner-admitted MM.
+    fn signal_frames_reach(&self, _mm: &Self::Mm) -> bool {
+        true
+    }
     /// Exact-MM signal-frame output for retained handler-setup continuations.
     fn copy_signal_frame_bytes(
         &mut self,
@@ -6357,13 +6362,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let _ = self.take_retained_thread_stock_reply();
         self.thread_stock_reply = None;
     }
-    pub fn copy_signal_frame(
-        &mut self,
-        address: UserVa,
-        bytes: &[u8],
-    ) -> Result<(), NativeProcessError> {
-        self.discard_rerun_answers();
-        let mm = self
+    /// The calling process's MM, as its owner graph retains it.
+    fn process_mm(&self) -> Result<M, NativeProcessError> {
+        Ok(self
             .runtime
             .graph
             .lock()
@@ -6373,7 +6374,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .native()
             .resources()
             .mm
-            .clone();
+            .clone())
+    }
+
+    pub fn copy_signal_frame(
+        &mut self,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.discard_rerun_answers();
+        let mm = self.process_mm()?;
         // #2080: an owner wait is contention, so it parks the signal-frame
         // setup and retries instead of becoming a fault. #1883's diagnostic
         // records only the refusals that remain refusals.
@@ -11987,6 +11997,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     carrick_personality_linux::signal::ProcessSignals for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn delivers_caught_signals(&mut self) -> bool {
+        self.process_mm()
+            .is_ok_and(|mm| self.service.signal_frames_reach(&mm))
+    }
+
     fn force_sigsegv(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
