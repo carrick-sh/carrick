@@ -2364,6 +2364,26 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         carrier_root: carrick_mem::memory::CarrierMaintenanceRoot,
         frame_va: u64,
     ) -> Result<Aarch64Exit, TrapError> {
+        Self::enter_idle_entry_on_vcpu(vcpu, carrier_root, frame_va)?;
+        crate::owed_kick::run_idle_entry(vcpu)
+    }
+
+    /// Point this engine's vCPU at the idle entry (see
+    /// [`Self::run_idle_entry_on_vcpu`]) without running it: its next run
+    /// enters the EL1 scheduler with no thread loaded. A single-vCPU
+    /// carrier whose only thread EL1 parked in the zone returns its vCPU
+    /// here after serving an idle exit; EL1 then runs the thread again when
+    /// its wait ends, and the thread's next exit is the carrier's as usual.
+    pub fn enter_idle_entry(&mut self, frame_va: u64) -> Result<(), TrapError> {
+        let carrier_root = self.vm.carrier_maintenance_root()?;
+        Self::enter_idle_entry_on_vcpu(self.vcpu.get_mut(), carrier_root, frame_va)
+    }
+
+    fn enter_idle_entry_on_vcpu(
+        vcpu: &mut V::Vcpu,
+        carrier_root: carrick_mem::memory::CarrierMaintenanceRoot,
+        frame_va: u64,
+    ) -> Result<(), TrapError> {
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
         const TCR_AS: u64 = 1 << 36;
         let root = carrier_root.raw();
@@ -2378,8 +2398,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr1, root)?;
         vcpu.set_reg(Reg::X(16), frame_va)?;
         vcpu.set_reg(Reg::Pc, carrick_mem::memory::el1_idle_entry_va())?;
-        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
-        crate::owed_kick::run_idle_entry(vcpu)
+        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)
     }
 
     fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
