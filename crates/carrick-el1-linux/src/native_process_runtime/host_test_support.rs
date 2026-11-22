@@ -8,6 +8,11 @@ use carrick_sched_core::ParkedContextWords;
 std::thread_local! {
     pub(crate) static FUTEX_MAPPING: core::cell::Cell<Option<Result<bool, NativeProcessError>>> = const { core::cell::Cell::new(None) };
     static TERMINAL_VACATES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Which owner this thread's `Physical` services name for an entryless
+    /// member's retirement: a lane with a host thread per member (the
+    /// default), or one with none.
+    static ENTRYLESS_RETIREMENT: core::cell::Cell<EntrylessRetirement> =
+        const { core::cell::Cell::new(EntrylessRetirement::HostThread) };
 }
 
 #[cfg(test)]
@@ -200,6 +205,11 @@ impl<C: ProcessContext> Drop for HostExecSlot<'_, C> {
     }
 }
 impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
+    #[cfg(test)]
+    fn entryless_retirement(&self) -> EntrylessRetirement {
+        ENTRYLESS_RETIREMENT.with(core::cell::Cell::get)
+    }
+
     fn vacate_terminal_space(
         &mut self,
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
@@ -5279,14 +5289,26 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
 
 #[cfg(test)]
 fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
+    exec_drain_is_upgraded_by_terminal_sibling_on(signal, EntrylessRetirement::HostThread);
+}
+
+/// Both ISAs' contexts, on a lane that names `retirement` as the owner of
+/// the entryless leader's retirement.
+#[cfg(test)]
+fn exec_drain_is_upgraded_by_terminal_sibling_on(
+    signal: Option<u8>,
+    retirement: EntrylessRetirement,
+) {
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(retirement));
     exec_drain_is_upgraded_by_terminal_sibling_for::<
         ParkedContextWords,
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
-    >(words, signal);
+    >(words, signal, retirement);
     exec_drain_is_upgraded_by_terminal_sibling_for::<
         carrick_el1_abi::Aarch64ParkedContext,
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
-    >(arm_words, signal);
+    >(arm_words, signal, retirement);
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::HostThread));
 }
 
 #[cfg(test)]
@@ -5296,6 +5318,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling_for<
 >(
     make_words: fn(AddressContext<RootGpa>) -> C,
     signal: Option<u8>,
+    retirement: EntrylessRetirement,
 ) {
     let _ = take_exec_cancellations();
     let fixture = native_exec_fixture_for::<C, B>(make_words);
@@ -5428,28 +5451,55 @@ fn exec_drain_is_upgraded_by_terminal_sibling_for<
                 &mut root_service,
             )
             .unwrap();
-        assert!(matches!(
-            root.resume_pending_lifecycle(),
-            Some(LifecycleOutcome::HostCustody)
-        ));
+        let outcome = root.resume_pending_lifecycle();
         let failure = root.take_run_failure();
         assert!(
             failure.is_none(),
             "losing exec owner failed run: {failure:?}"
         );
-        // Host-born retirement publication below is deliberately the host's
-        // half of the production protocol. The ring-owned sibling branches in
-        // this suite use `resume_pending_lifecycle` instead.
-        fixture
-            .page
-            .reserve_cancelled_member_exit()
-            .unwrap()
-            .publish();
-        let birth = fixture.control.host_birth_identity().unwrap();
-        fixture
-            .page
-            .publish_exact_host_retirement(fixture.control, birth.retirement());
-        root.lifecycle_admission_settled().unwrap();
+        match retirement {
+            EntrylessRetirement::HostThread => {
+                assert!(matches!(outcome, Some(LifecycleOutcome::HostCustody)));
+                // Host-born retirement publication below is deliberately the
+                // host's half of the production protocol. The ring-owned
+                // sibling branches in this suite use
+                // `resume_pending_lifecycle` instead.
+                fixture
+                    .page
+                    .reserve_cancelled_member_exit()
+                    .unwrap()
+                    .publish();
+                let birth = fixture.control.host_birth_identity().unwrap();
+                fixture
+                    .page
+                    .publish_exact_host_retirement(fixture.control, birth.retirement());
+                root.lifecycle_admission_settled().unwrap();
+            }
+            EntrylessRetirement::Ring => {
+                // No host half: the ring committed the leader's membership,
+                // published its exact receipt, released its record and woke
+                // the closing owner.
+                assert!(
+                    matches!(
+                        outcome,
+                        Some(LifecycleOutcome::Transferred {
+                            progress: carrick_core::Served::Idle,
+                            ..
+                        })
+                    ),
+                    "the ring retires the entryless leader"
+                );
+                assert!(root.take_handoff_receipt().is_some());
+                let birth = fixture.control.host_birth_identity().unwrap();
+                assert!(
+                    fixture
+                        .control
+                        .host_retirement()
+                        .is_some_and(|receipt| receipt.acknowledges(birth)),
+                    "the leader's exact retirement receipt is published"
+                );
+            }
+        }
     }
 
     let resume_slot = [fixture.slot, sibling.slot]
@@ -5493,6 +5543,23 @@ fn exit_group_wins_over_an_in_progress_native_exec_drain() {
 #[test]
 fn sigkill_wins_over_an_in_progress_native_exec_drain() {
     exec_drain_is_upgraded_by_terminal_sibling(Some(9));
+}
+
+/// #2780: on a lane with no host thread per member, a sibling's
+/// `exit_group` retires the entryless leader in the ring, and the closing
+/// owner then settles with its own status. Two live members, both ISAs'
+/// contexts.
+#[cfg(test)]
+#[test]
+fn sibling_exit_group_retires_an_entryless_leader_in_the_ring() {
+    exec_drain_is_upgraded_by_terminal_sibling_on(None, EntrylessRetirement::Ring);
+}
+
+/// #2780: as above for a sibling's fatal signal.
+#[cfg(test)]
+#[test]
+fn sibling_fatal_signal_retires_an_entryless_leader_in_the_ring() {
+    exec_drain_is_upgraded_by_terminal_sibling_on(Some(6), EntrylessRetirement::Ring);
 }
 
 /// Missing cwd is the other access-admission refusal from #1409. Exercise
