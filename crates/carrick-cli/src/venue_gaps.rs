@@ -721,12 +721,13 @@ VENUEPROFILE1|complete|root=19767
     }
 
     #[test]
-    fn a_childs_madvise_is_a_root_only_crossing_on_arm() {
-        // #1846: madvise is a Temporary crossing; a native child has none.
-        let arm = route(GuestIsa::X86_64, GuestIsa::Aarch64, key(true, 28, 4, 0));
-        assert_eq!(arm, Route::RootOnlyCrossing(HostCrossingKind::Temporary));
+    fn a_childs_madvise_is_served_in_ring_on_arm() {
+        // #2744: a private madvise discard is the ring's anonymous family,
+        // for a native child and the root alike.
+        let child = route(GuestIsa::X86_64, GuestIsa::Aarch64, key(true, 28, 4, 0));
+        assert!(matches!(child, Route::Ring(_)), "{child:?}");
         let root = route(GuestIsa::X86_64, GuestIsa::Aarch64, key(false, 28, 4, 0));
-        assert_eq!(root, Route::Crossing(HostCrossingKind::Temporary));
+        assert_eq!(root, child);
     }
 
     #[test]
