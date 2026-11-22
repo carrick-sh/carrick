@@ -484,9 +484,10 @@ enum ForwardDecision {
 /// and (on a loaded lane) a host execution lease. A CPL0-forked child has
 /// neither: its fd table, credentials and waits live in the ring, and the
 /// root's context or lease must never stand in for them. A member of the
-/// bound task's own thread group (#2780) shares the process, so it holds the
-/// process's host-root resources; the context and the lease stay the
-/// leader's.
+/// bound task's own thread group (#2780) shares the process: the host fd
+/// table, credentials and host-root resources are the process's, so its
+/// crossing is served under the process's context as a
+/// [`HostContextCrossing::Member`]. The execution lease stays the leader's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForwardAuthority {
     Task,
@@ -505,8 +506,16 @@ impl ForwardAuthority {
         }
     }
 
-    const fn may_use_host_task_context(self) -> bool {
-        matches!(self, Self::Task)
+    /// How a crossing that needs the process's host task context is served
+    /// for this authority; `None` when the stopped task owns no such context.
+    const fn host_context_crossing(self, has_submission: bool) -> Option<HostContextCrossing> {
+        match self {
+            Self::Task => Some(HostContextCrossing::Owner {
+                may_park: has_submission,
+            }),
+            Self::TaskMember => Some(HostContextCrossing::Member),
+            Self::InZoneChild => None,
+        }
     }
 
     /// Host-root file resources belong to the bound task's process: every
@@ -516,14 +525,67 @@ impl ForwardAuthority {
     }
 }
 
+/// Whose crossing runs under the bound process's host task context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostContextCrossing {
+    /// The bound task itself. A call that must wait parks on the execution
+    /// lease this lane holds, when it holds one.
+    Owner { may_park: bool },
+    /// Another member of the bound task's thread group. The decision stays
+    /// keyed on the member's own task key and generation (the stopped CPU's
+    /// authenticated [`ForwardSubject::Member`]); only the process-wide host
+    /// state is shared. Its outcome is a [`MemberCrossing`].
+    Member,
+}
+
+/// The outcome of a thread-group member's crossing (#2780). A member has no
+/// execution lease on this lane, so the split between a call that finished
+/// and one that must wait is a type: nothing can park the stopped CPU, or
+/// the leader's lease, on a member's wait.
+enum MemberCrossing {
+    /// The call finished without waiting; the stopped CPU resumes the member
+    /// with this result.
+    NonBlocking(InitialSyscallDisposition),
+    /// The call must wait. It needs a continuation the member owns; the
+    /// carrier builds none yet, so the run fails closed with
+    /// [`ForwardAuthorityRefusal::BlockingWait`].
+    Continuation,
+}
+
+impl MemberCrossing {
+    /// Classify a member's dispatch outcome. A process terminal is never a
+    /// member's crossing: the ring owns thread and group exit.
+    fn of(outcome: &DispatchOutcome, native: u64) -> Result<Self, ForwardAuthorityRefusal> {
+        match outcome {
+            DispatchOutcome::Returned { value } => {
+                Ok(Self::NonBlocking(InitialSyscallDisposition::Return(*value)))
+            }
+            DispatchOutcome::Errno { errno } => Ok(Self::NonBlocking(
+                InitialSyscallDisposition::Refused(*errno),
+            )),
+            DispatchOutcome::Exit { .. } | DispatchOutcome::ThreadExit { .. } => {
+                Err(ForwardAuthorityRefusal::HostTaskContext { native })
+            }
+            _ => Ok(Self::Continuation),
+        }
+    }
+
+    fn settle(self) -> Result<ForwardDecision, ForwardAuthorityRefusal> {
+        match self {
+            Self::NonBlocking(disposition) => Ok(ForwardDecision::Immediate(disposition)),
+            Self::Continuation => Err(ForwardAuthorityRefusal::BlockingWait),
+        }
+    }
+}
+
 /// A forward refused before any forward token is taken, because serving it
 /// would borrow an authority the stopped task does not own. The run fails
 /// closed with this reason; parking for in-zone children is follow-up work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardAuthorityRefusal {
     /// The call needs a host task context (fd table, offsets, credentials)
-    /// that an in-zone child, or a member of the bound task's thread group,
-    /// does not have. For a child it is a broken invariant: the ring
+    /// that an in-zone child does not have, or is a process terminal from a
+    /// thread-group member. For a child it is a broken invariant: the ring
     /// answers a fork child's unstaged crossing in ring with a counted
     /// ENOSYS (`carrick_el1_linux::dispatch::unclaimed_native_syscall`), so
     /// none should reach the carrier.
@@ -547,7 +609,7 @@ impl std::fmt::Display for ForwardAuthorityRefusal {
         match self {
             Self::HostTaskContext { native } => write!(
                 formatter,
-                "forward refused: x86 syscall {native} from an in-zone child or a thread-group member reached the carrier (the ring answers it); it needs a host task context it does not own"
+                "forward refused: x86 syscall {native} from an in-zone child, or a process terminal from a thread-group member, reached the carrier (the ring answers it); it needs a host task context it does not own"
             ),
             Self::BlockingWait => formatter.write_str(
                 "forward refused: a blocking wait needs the stopped task's own execution lease",
@@ -668,7 +730,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             // thread group, or an in-zone child.
             let authority = ForwardAuthority::of(task, binding, venue.subject());
             // Only the bound task may park, and only on the lease this lane holds.
-            let can_block = authority == ForwardAuthority::Task && has_submission;
+            let host_context = authority.host_context_crossing(has_submission);
+            let can_block = host_context == Some(HostContextCrossing::Owner { may_park: true });
             if frame.rax == carrick_el1_abi::HostFileCrossing::NUMBER {
                 stats.record(crate::prepare::InitialForwardClass::Host("host-file"))?;
                 if frame.rcx != carrick_el1_abi::HostFileCrossing::FRAME_TAG {
@@ -755,11 +818,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                             "unexpected arch_prctl normalizing x86 write".into(),
                         ));
                     };
-                    if !authority.may_use_host_task_context() {
+                    let Some(host_context) = host_context else {
                         return refuse(ForwardAuthorityRefusal::HostTaskContext {
                             native: raw.native_number.0,
                         });
-                    }
+                    };
                     let kernel = binding.fresh_context()?;
                     let request =
                         SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
@@ -770,6 +833,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                                 "dispatch x86 host object write: {error}"
                             ))
                         })?;
+                    if host_context == HostContextCrossing::Member {
+                        return MemberCrossing::of(&outcome, raw.native_number.0)
+                            .and_then(MemberCrossing::settle)
+                            .or_else(refuse);
+                    }
                     return match outcome {
                         DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
                             InitialSyscallDisposition::Return(value),
@@ -840,14 +908,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 }
             };
             let class = crate::prepare::classify_initial_x86_forward(raw.native_number, raw.args);
-            if !authority.may_use_host_task_context()
+            if host_context.is_none()
                 && matches!(class, crate::prepare::InitialForwardClass::Host(_))
             {
                 // The ring answers a fork child's unstaged crossing in ring
                 // (`unclaimed_native_syscall`); one reaching here is a broken
-                // invariant, never served under the root's authority. A
-                // member of the bound task's thread group has no host thread
-                // of its own (#2193): the leader's context is not its own.
+                // invariant, never served under the root's authority.
                 return refuse(ForwardAuthorityRefusal::HostTaskContext {
                     native: raw.native_number.0,
                 });
@@ -873,6 +939,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             let outcome = dispatcher
                 .dispatch(&kernel, request, venue, &self.reporter)
                 .map_err(|error| TrapError::Hypervisor(format!("dispatch x86 syscall: {error}")))?;
+            if host_context == Some(HostContextCrossing::Member) {
+                return MemberCrossing::of(&outcome, raw.native_number.0)
+                    .and_then(MemberCrossing::settle)
+                    .or_else(refuse);
+            }
             match outcome {
                 DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
                     InitialSyscallDisposition::Return(value),
@@ -1954,11 +2025,68 @@ mod tests {
     /// in-zone child that can own a host fd, tracked by #599 and #586.
     #[test]
     fn in_zone_child_host_fd_write_predicate_refuses_root_task_context() {
-        assert!(ForwardAuthority::Task.may_use_host_task_context());
-        assert!(!ForwardAuthority::InZoneChild.may_use_host_task_context());
-        assert!(!ForwardAuthority::TaskMember.may_use_host_task_context());
+        assert_eq!(
+            ForwardAuthority::Task.host_context_crossing(true),
+            Some(HostContextCrossing::Owner { may_park: true })
+        );
+        assert_eq!(
+            ForwardAuthority::InZoneChild.host_context_crossing(true),
+            None
+        );
+        assert_eq!(
+            ForwardAuthority::TaskMember.host_context_crossing(true),
+            Some(HostContextCrossing::Member)
+        );
         assert!(ForwardAuthority::TaskMember.holds_host_root_resources());
         assert!(!ForwardAuthority::InZoneChild.holds_host_root_resources());
+    }
+
+    /// #2780: a member's finished call resumes it; a call that must wait
+    /// is a `Continuation` and fails closed; a process terminal is refused.
+    #[test]
+    fn member_crossing_splits_finished_from_waiting() {
+        let finished = MemberCrossing::of(&DispatchOutcome::Returned { value: 2 }, 1);
+        assert!(matches!(
+            finished,
+            Ok(MemberCrossing::NonBlocking(
+                InitialSyscallDisposition::Return(2)
+            ))
+        ));
+        assert!(matches!(
+            finished.and_then(MemberCrossing::settle),
+            Ok(ForwardDecision::Immediate(
+                InitialSyscallDisposition::Return(2)
+            ))
+        ));
+        assert!(matches!(
+            MemberCrossing::of(
+                &DispatchOutcome::Errno {
+                    errno: carrick_abi::LINUX_EBADF
+                },
+                1
+            ),
+            Ok(MemberCrossing::NonBlocking(
+                InitialSyscallDisposition::Refused(carrick_abi::LINUX_EBADF)
+            ))
+        ));
+        let waiting = MemberCrossing::of(
+            &DispatchOutcome::WaitOnFds {
+                fds: WaitFds::host_readiness(Vec::new()),
+                timeout: None,
+                sig_mask: carrick_abi::WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            0,
+        );
+        assert!(matches!(waiting, Ok(MemberCrossing::Continuation)));
+        assert!(matches!(
+            waiting.and_then(MemberCrossing::settle),
+            Err(ForwardAuthorityRefusal::BlockingWait)
+        ));
+        assert!(matches!(
+            MemberCrossing::of(&DispatchOutcome::Exit { code: 0 }, 231),
+            Err(ForwardAuthorityRefusal::HostTaskContext { native: 231 })
+        ));
     }
 
     #[derive(Default)]
