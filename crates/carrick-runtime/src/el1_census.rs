@@ -1104,6 +1104,50 @@ mod tests {
         assert!(render_table(&aggregate, 10).contains("epoll_not_zone: 5"));
     }
 
+    /// #2748 step 0: a census names why the ring left each delegated
+    /// anonymous mm call for the host, so one run names the arm behind a
+    /// native child's refused `mmap`, `munmap`, `mprotect` or `madvise`.
+    /// The counters are shared by both ISAs' rings.
+    #[test]
+    fn census_json_names_each_nonzero_anonymous_leave() {
+        use carrick_el1_abi::AnonymousLeave;
+        use carrick_spec::syscall_census::CensusIsa;
+        for isa in [CensusIsa::Aarch64, CensusIsa::X86_64] {
+            let counters = carrick_el1_abi::Counters::new();
+            counters.anonymous_leaves[AnonymousLeave::RootDeclined as usize]
+                .store(3, Ordering::Relaxed);
+            counters.anonymous_leaves[AnonymousLeave::RootUnavailableBusy as usize]
+                .store(1, Ordering::Relaxed);
+            let census = snapshot_counters(None, Some(&counters), isa);
+            let encoded = serde_json::to_value(&census).unwrap();
+            assert_eq!(
+                encoded["anonymous_leaves"],
+                serde_json::json!({"root_declined": 3, "root_unavailable_busy": 1})
+            );
+            // Older files carry no such field and still load.
+            let mut legacy = encoded.clone();
+            legacy.as_object_mut().unwrap().remove("anonymous_leaves");
+            let legacy: Census = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.pid, census.pid);
+            // Aggregation sums them across carriers.
+            let mut a = census.clone();
+            a.rows = vec![row(56, 1, 1)];
+            let mut b = census;
+            b.rows = vec![row(56, 1, 1)];
+            let aggregate = aggregate(&[a, b]).unwrap();
+            let summed = serde_json::to_value(&aggregate).unwrap();
+            assert_eq!(
+                summed["anonymous_leaves"],
+                serde_json::json!({"root_declined": 6, "root_unavailable_busy": 2})
+            );
+            let table = render_table(&aggregate, 10);
+            assert!(
+                table.contains("Anonymous mm leaves: root_declined: 6, root_unavailable_busy: 2"),
+                "{table}"
+            );
+        }
+    }
+
     #[test]
     fn aggregate_sums_by_number_and_ranks_by_host_cpu() {
         let a = census(vec![row(56, 10, 1_000), row(79, 5, 9_000)]);
