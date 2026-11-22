@@ -242,6 +242,7 @@ const X86_LEGACY_NAMES: &[(u64, &str)] = &[
     (94, "lchown"),
     (111, "getpgrp"),
     (133, "mknod"),
+    (201, "time"),
     (232, "epoll_wait"),
     (284, "eventfd"),
 ];
@@ -259,6 +260,19 @@ const VDSO_CALLS: &[(u64, u64)] = &[
     (201, u64::MAX),
     (309, 168),
 ];
+
+/// The canonical number of a native call on its own ISA, if it has one.
+fn canonical_of_profile(isa: GuestIsa, nr: u64) -> Option<u64> {
+    match isa {
+        GuestIsa::X86_64 => {
+            let c = carrick_personality_linux::entry::decode_x86_64(nr, [0; 6], 0)
+                .canonical
+                .raw();
+            (c != u64::MAX).then_some(c)
+        }
+        GuestIsa::Aarch64 => Some(nr),
+    }
+}
 
 /// Native arguments carrying the recorded shape in the positions the
 /// bpftrace script read it from (named, so one table serves both ISAs), a
@@ -480,20 +494,12 @@ pub fn render(
         total,
         rows.len()
     );
-    let census_col = census.is_some();
     let _ = write!(
         out,
         "| syscall | nr | shape | caller | oracle calls | oracle errno (ENOSYS/other) | x86_64 route | aarch64 route |"
     );
-    if census_col {
-        let _ = write!(out, " census refused ({}) |", isa_name(isa));
-    }
     let _ = writeln!(out, " gap |");
-    let _ = write!(out, "|---|---:|---|---|---:|---|---|---|");
-    if census_col {
-        let _ = write!(out, "---:|");
-    }
-    let _ = writeln!(out, "---|");
+    let _ = writeln!(out, "|---|---:|---|---|---:|---|---|---|---|");
     let mut served = 0usize;
     for r in &rows {
         let linux_refused = r.counts.enosys == r.counts.calls && r.counts.calls > 0;
@@ -503,14 +509,10 @@ pub fn render(
             .filter(|(_, route)| route.is_gap())
             .map(|(isa, _)| isa_name(*isa))
             .collect();
-        let refused = census.and_then(|c| c.get(&(isa_name(isa), r.key.nr, r.key.child)).copied());
         let gap = if linux_refused {
             "none (Linux refuses it too)".to_owned()
         } else if gaps.is_empty() {
-            match refused {
-                Some(n) if n > 0 => "census refusal (shape or family decline)".to_owned(),
-                _ => String::new(),
-            }
+            String::new()
         } else {
             format!("**{}**", gaps.join(", "))
         };
@@ -531,9 +533,6 @@ pub fn render(
             r.routes[0].1.label(),
             r.routes[1].1.label(),
         );
-        if census_col {
-            let _ = write!(out, " {} |", refused.map_or("-".into(), |n| n.to_string()));
-        }
         let _ = writeln!(out, " {gap} |");
     }
     if !all {
@@ -541,6 +540,58 @@ pub fn render(
             out,
             "\n{served} more shapes are routed on both ISAs (`--all` lists them)."
         );
+    }
+    if let Some(census) = census {
+        let rows: Vec<_> = census
+            .iter()
+            .filter(|((i, _, _), n)| *i == isa_name(isa) && **n > 0)
+            .collect();
+        let _ = writeln!(
+            out,
+            "\nCarrick's own census of this row ({} run): counted refusals by call and caller. \
+             `predicted` means the table above lists the call as a gap; `decline` means its \
+             owner is routed but refused a shape at run time.\n",
+            isa_name(isa)
+        );
+        let _ = writeln!(out, "| syscall | nr | caller | refused | static verdict |");
+        let _ = writeln!(out, "|---|---:|---|---:|---|");
+        for ((_, nr, child), n) in rows {
+            let predicted = profile
+                .shapes
+                .keys()
+                .filter(|k| k.nr == *nr && k.child == *child)
+                .any(|k| route(isa, isa, *k).is_gap())
+                || VDSO_CALLS.iter().any(|&(x, a)| {
+                    (if isa == GuestIsa::X86_64 { x } else { a }) == *nr
+                        && route(
+                            isa,
+                            isa,
+                            ShapeKey {
+                                child: *child,
+                                nr: *nr,
+                                s0: 0,
+                                s1: 0,
+                            },
+                        )
+                        .is_gap()
+                });
+            let accepted = canonical_of_profile(isa, *nr) == Some(ACCEPTED_RSEQ);
+            let verdict = if accepted {
+                "accepted (#1906)"
+            } else if predicted {
+                "predicted"
+            } else if *nr == 512 {
+                "overflow bucket (unknown number)"
+            } else {
+                "**decline** (routed owner refused a shape)"
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {nr} | {} | {n} | {verdict} |",
+                syscall_name(isa, *nr),
+                if *child { "child" } else { "root" }
+            );
+        }
     }
     let mut vdso = Vec::new();
     for &(x86, arm) in VDSO_CALLS {
