@@ -53,6 +53,12 @@ impl RunControl {
         self.0.fetch_or(Self::IRQ, Ordering::Release);
     }
 
+    /// Whether a kick or IRQ request is outstanding, without taking it: a
+    /// parked provider probes this after enrolling for its wake.
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire) & (Self::KICK | Self::IRQ) != 0
+    }
+
     fn take(&self, mask: u8) -> bool {
         self.0.load(Ordering::Acquire) & mask != 0
             && self.0.fetch_and(!mask, Ordering::AcqRel) & mask != 0
@@ -619,14 +625,18 @@ fn run_inner<X: ExecuteBlock>(
         if blocks >= budget {
             break Stop::Budget;
         }
-        if let Some(control) = control {
-            if control.take(RunControl::KICK) {
-                break Stop::Kicked;
-            }
-            if !cpu.pstate.daif.irq_masked() && control.take(RunControl::IRQ) {
-                monitor.clear();
-                take_exception(cpu, Exception::Irq);
-            }
+        if let Some(control) = control
+            && control.take(RunControl::KICK)
+        {
+            break Stop::Kicked;
+        }
+        // D1.13.4: an unmasked IRQ is taken at the next instruction
+        // boundary, from the provider's line or the GIC CPU interface.
+        if !cpu.pstate.daif.irq_masked()
+            && (control.is_some_and(|control| control.take(RunControl::IRQ)) || cpu.irq_pending())
+        {
+            monitor.clear();
+            take_exception(cpu, Exception::Irq);
         }
         // DDI0487G.a D1.12.4: PC alignment precedes instruction aborts
         // and illegal execution state, so both checks precede block fetch.
@@ -1107,6 +1117,43 @@ mod tests {
             }
         ));
         assert_eq!(r.work.retired_instructions, 2);
+    }
+
+    /// D1.13.4: the GIC's IRQ output is taken at a block boundary while
+    /// `PSTATE.I` is clear, at the lower-EL AArch64 IRQ vector with the
+    /// interrupted PC; while masked it waits and the thread runs on.
+    #[test]
+    fn gic_timer_interrupt_preempts_el0_only_when_unmasked() {
+        let mut m = Flat::default();
+        // nop; hvc #2 (at EL0: undefined), and hvc #2 at the IRQ vector.
+        m.code(ENTRY, &[0xd503_201f, 0xd400_0042]);
+        m.code(VBAR + 0x480, &[0xd400_0042]);
+        let mut cpu = el1();
+        cpu.pstate.el = ExceptionLevel::El0;
+        cpu.pstate.sp = StackSelect::El0;
+        cpu.gic.enable(crate::gic::VIRTUAL_TIMER_INTID, 0x80);
+        cpu.gic.configure(0xf0, true);
+        cpu.named.cntvcval = crate::state::SystemValue(10);
+        cpu.named.cntvctl = crate::state::SystemValue(1);
+        cpu.named.cntvct = crate::state::SystemValue(10);
+        cpu.pstate.daif = crate::state::InterruptMasks(2);
+        let masked = go(&mut cpu.clone(), &mut m, &mut GuestSemantics, 1);
+        assert!(matches!(masked.stop, Stop::Budget));
+
+        cpu.pstate.daif = crate::state::InterruptMasks(0);
+        let r = go(&mut cpu, &mut m, &mut GuestSemantics, 10);
+        assert!(matches!(
+            r.stop,
+            Stop::Event {
+                event: Event::ProviderExit(_),
+                ..
+            }
+        ));
+        assert_eq!(cpu.el1.elr, ProgramCounter(ENTRY));
+        assert_eq!(cpu.pstate.el, ExceptionLevel::El1);
+        assert!(cpu.pstate.daif.irq_masked());
+        // Taken, not acknowledged: the GIC still signals it.
+        assert!(cpu.irq_pending());
     }
 
     #[test]

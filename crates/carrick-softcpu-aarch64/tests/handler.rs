@@ -150,14 +150,13 @@ fn production_sysreg_reads_use_virtual_cpu_state() {
     r.cpu.named.par = SystemValue(0x8123);
     r.cpu.named.cntfrq = SystemValue(0xffff_ffff_017d_7840);
     r.cpu.named.cntvct = SystemValue(0x2345_6789_abcd_ef00);
-    r.cpu.named.icciar1 = SystemValue(0x3ff);
 
     for (mrs, expected) in [
         (0xd53800a1, 0x0000_00ab_c103_0201), // MPIDR_EL1
         (0xd5387401, 0x8123),                // PAR_EL1
         (0xd53be001, 25_000_000),            // CNTFRQ_EL0
         (0xd53be041, 0x2345_6789_abcd_ef00), // CNTVCT_EL0
-        (0xd538cc01, 0x3ff),                 // ICC_IAR1_EL1
+        (0xd538cc01, 0x3ff),                 // ICC_IAR1_EL1: nothing pending
     ] {
         let pc = r.pc();
         assert_eq!(r.run(mrs), Outcome::Continue, "MRS {mrs:#x}");
@@ -169,7 +168,6 @@ fn production_sysreg_reads_use_virtual_cpu_state() {
 #[test]
 fn production_sysreg_writes_update_their_owned_slots() {
     let mut r = Rig::el1();
-    r.cpu.named.cntvctl = SystemValue(4); // provider's read-only ISTATUS
     for (msr, input) in [
         (0xd5182020, 0x1234_abcd_8000),      // TTBR1_EL1
         (0xd51be320, 0xffff_ffff_ffff_fffb), // CNTV_CTL_EL0
@@ -183,10 +181,68 @@ fn production_sysreg_writes_update_their_owned_slots() {
         assert_eq!(r.pc(), pc + 4, "MSR {msr:#x}");
     }
     assert_eq!(r.cpu.named.ttbr1.0, 0x1234_abcd_8000);
-    assert_eq!(r.cpu.named.cntvctl.0, 7);
+    // ISTATUS (bit 2) is not writable: only ENABLE and IMASK are stored.
+    assert_eq!(r.cpu.named.cntvctl.0, 3);
     assert_eq!(r.cpu.named.cntvcval.0, 0x1_2345_6789);
-    assert_eq!(r.cpu.named.icceoir1.0, 0x29);
-    assert_eq!(r.cpu.named.iccsgi1r.0, 0x100_0001);
+    // SGI 1 to TargetList bit 0 of affinity 0.0.0: this PE (MPIDR 0).
+    assert!(r.cpu.gic.is_latched(1));
+}
+
+/// D11.2.4/D13.8.25-27: the EL1 virtual timer's condition, its TimerValue
+/// view and its interrupt through the GIC CPU interface (IHI 0069 12.2).
+#[test]
+fn virtual_timer_raises_its_ppi_through_the_gic_cpu_interface() {
+    const MRS_X1_CNTV_CTL: u32 = 0xd53be321;
+    const MRS_X1_CNTV_TVAL: u32 = 0xd53be301;
+    const MSR_CNTV_TVAL_X0: u32 = 0xd51be300;
+    const MSR_CNTV_CTL_X0: u32 = 0xd51be320;
+    const MRS_X1_IAR1: u32 = 0xd538cc01;
+    const MSR_EOIR1_X1: u32 = 0xd518cc21;
+    let mut r = Rig::el1();
+    r.cpu.gic.enable(27, 0x80);
+    r.cpu.gic.configure(0xf0, true);
+    r.cpu.named.cntvct = SystemValue(1_000);
+    // TVAL is signed: CVAL = CNTVCT + SignExtend(-16).
+    r.set(0, 0xffff_fff0);
+    assert_eq!(r.run(MSR_CNTV_TVAL_X0), Outcome::Continue);
+    assert_eq!(r.cpu.named.cntvcval.0, 984);
+    r.set(0, 500);
+    assert_eq!(r.run(MSR_CNTV_TVAL_X0), Outcome::Continue);
+    assert_eq!(r.cpu.named.cntvcval.0, 1_500);
+    assert_eq!(r.run(MRS_X1_CNTV_TVAL), Outcome::Continue);
+    assert_eq!(r.get(1), 500);
+    // Enabled, condition unmet: no ISTATUS, no interrupt.
+    r.set(0, 1);
+    assert_eq!(r.run(MSR_CNTV_CTL_X0), Outcome::Continue);
+    assert_eq!(r.run(MRS_X1_CNTV_CTL), Outcome::Continue);
+    assert_eq!(r.get(1), 1);
+    assert!(!r.cpu.irq_pending());
+    assert_eq!(r.run(MRS_X1_IAR1), Outcome::Continue);
+    assert_eq!(r.get(1), 1023);
+    // The counter reaches CVAL: ISTATUS, and the PPI is signalled.
+    r.cpu.named.cntvct = SystemValue(1_500);
+    assert_eq!(r.run(MRS_X1_CNTV_CTL), Outcome::Continue);
+    assert_eq!(r.get(1), 5);
+    assert!(r.cpu.irq_pending());
+    // IMASK hides the interrupt but not ISTATUS.
+    r.set(0, 3);
+    assert_eq!(r.run(MSR_CNTV_CTL_X0), Outcome::Continue);
+    assert_eq!(r.run(MRS_X1_CNTV_CTL), Outcome::Continue);
+    assert_eq!(r.get(1), 7);
+    assert!(!r.cpu.irq_pending());
+    r.set(0, 1);
+    assert_eq!(r.run(MSR_CNTV_CTL_X0), Outcome::Continue);
+    // Acknowledge: active, no longer signalled; EOI with the line still
+    // asserted makes it pending again.
+    assert_eq!(r.run(MRS_X1_IAR1), Outcome::Continue);
+    assert_eq!(r.get(1), 27);
+    assert!(!r.cpu.irq_pending());
+    assert_eq!(r.run(MSR_EOIR1_X1), Outcome::Continue);
+    assert!(r.cpu.irq_pending());
+    // Disabling the timer drops the line.
+    r.set(0, 0);
+    assert_eq!(r.run(MSR_CNTV_CTL_X0), Outcome::Continue);
+    assert!(!r.cpu.irq_pending());
 }
 
 #[test]

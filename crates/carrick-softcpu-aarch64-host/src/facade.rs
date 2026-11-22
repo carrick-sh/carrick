@@ -65,6 +65,8 @@ use carrick_softcpu_aarch64::translate::BlockLimits;
 use carrick_softcpu_aarch64::{Gpr, Hint, OperandRegister};
 use carrick_softmmu::block_cache::{ResidencyBudget, ResidencyCensus};
 use carrick_softmmu::{ExtentRecord, ExtentTable, OwnerGeneration, PAGE_SIZE_4K};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use crate::HostBlockRunner;
 
@@ -80,8 +82,14 @@ const SOFT_ALIAS_GPA_LIMIT: u64 = 0xFF_0000_0000;
 /// Default soft-CPU block slice per `run_controlled` poll and total slice cap per exit.
 const DEFAULT_BLOCK_QUANTUM: u64 = 250_000;
 const DEFAULT_MAX_QUANTA_PER_EXIT: u64 = 400;
+/// The virtual counter counts nanoseconds since the vCPU's boot instant, so
+/// a counter value is directly a host duration from it.
 const DEFAULT_CNTFRQ_HZ: u64 = 1_000_000_000;
 const MPIDR_AFF0_RES1: u64 = 0x8000_0000;
+const _: () = assert!(
+    carrick_softcpu_aarch64::gic::VIRTUAL_TIMER_INTID == carrick_el1_abi::GIC_VTIMER_INTID,
+    "the soft CPU's timer PPI is the one Carrick's EL1 acknowledges"
+);
 
 #[cfg(target_os = "linux")]
 const MAP_NORESERVE_OPT: libc::c_int = libc::MAP_NORESERVE;
@@ -1161,15 +1169,56 @@ impl RetainedMetadataExtent for SoftRetainedExtent {
     }
 }
 
-/// Cross-thread kick handle interrupting `SoftAarch64Vcpu::run` at a block boundary.
+/// One soft vCPU's run seat: the requests its dispatcher services at block
+/// boundaries, and the wake a WFI parks on.
+#[derive(Default)]
+struct SoftRunSeat {
+    control: RunControl,
+    parked: Mutex<()>,
+    wake: Condvar,
+}
+
+impl SoftRunSeat {
+    /// Request the vCPU leave `run`, and end a WFI park.
+    fn kick(&self) {
+        self.control.kick();
+        // Publish under the park lock: a parking vCPU either probes the
+        // request after enrolling or is already waiting for this notify.
+        drop(self.parked.lock().unwrap_or_else(|p| p.into_inner()));
+        self.wake.notify_all();
+    }
+
+    /// D1.16.2 WFI: wait until a kick, or until `deadline` (the virtual
+    /// timer's), whichever is first. Enrol on the wake, then probe once;
+    /// a spurious condvar return re-probes.
+    fn park(&self, deadline: Option<Instant>) {
+        let mut guard = self.parked.lock().unwrap_or_else(|p| p.into_inner());
+        while !self.control.requested() {
+            let now = Instant::now();
+            guard = match deadline {
+                Some(deadline) if deadline <= now => return,
+                Some(deadline) => {
+                    self.wake
+                        .wait_timeout(guard, deadline - now)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0
+                }
+                None => self.wake.wait(guard).unwrap_or_else(|p| p.into_inner()),
+            };
+        }
+    }
+}
+
+/// Cross-thread kick handle interrupting `SoftAarch64Vcpu::run` at a block
+/// boundary, or in its WFI park.
 #[derive(Clone)]
 pub struct SoftKickHandle {
-    control: Arc<RunControl>,
+    seat: Arc<SoftRunSeat>,
 }
 
 impl VcpuKick for SoftKickHandle {
     fn kick(&self) {
-        self.control.kick();
+        self.seat.kick();
     }
 }
 
@@ -1182,7 +1231,7 @@ pub struct SoftAarch64Vcpu<X: ExecuteBlock> {
     /// `CARRICK_SOFT_AARCH64_HANDOFF_CACHE=0`.
     code: Option<DispatchCache<X::Code>>,
     stage2: Arc<ExclusiveStage2>,
-    control: Arc<RunControl>,
+    seat: Arc<SoftRunSeat>,
     mailbox: Option<MailboxSlot>,
     actlr_el1: u64,
     cpacr_el1: u64,
@@ -1194,6 +1243,7 @@ pub struct SoftAarch64Vcpu<X: ExecuteBlock> {
     block_quantum: u64,
     max_quanta_per_exit: u64,
     work: RunWork,
+    idle_parks: u64,
 }
 
 impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
@@ -1208,6 +1258,23 @@ impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
     #[must_use]
     pub fn code_residency(&self) -> Option<ResidencyCensus> {
         self.code.as_ref().map(DispatchCache::census)
+    }
+
+    /// How many times a WFI parked this vCPU's thread.
+    #[must_use]
+    pub const fn idle_parks(&self) -> u64 {
+        self.idle_parks
+    }
+
+    /// Advance the virtual counter to the host's monotonic clock.
+    fn sample_counter(&mut self) {
+        let elapsed_ns = u64::try_from(self.boot_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.cpu.named.cntvct = SystemValue(elapsed_ns);
+    }
+
+    /// The host instant the virtual counter reaches `count`.
+    fn counter_instant(&self, count: u64) -> Option<Instant> {
+        self.boot_instant.checked_add(Duration::from_nanos(count))
     }
 
     fn sync_shared_overrides(&mut self) {
@@ -1506,25 +1573,27 @@ where
     }
 
     fn kick(&self) -> Result<(), TrapError> {
-        self.control.kick();
+        self.seat.kick();
         Ok(())
     }
 
+    /// The owed kick is the kick SGI made pending in this vCPU's
+    /// redistributor, and withdrawn once served (as on HVF's GIC).
     fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
-        if pending {
-            self.control.request_irq();
-        }
+        self.cpu
+            .gic
+            .set_pending(carrick_el1_abi::GIC_KICK_INTID, pending);
         Ok(())
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
         self.sync_shared_overrides();
-        let mut stage2 = self.stage2.try_borrow()?;
+        let stage2_owner = Arc::clone(&self.stage2);
+        let mut stage2 = stage2_owner.try_borrow()?;
         let mut discarded = DispatchCache::default();
-        for _ in 0..self.max_quanta_per_exit {
-            let elapsed_ns =
-                u64::try_from(self.boot_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.cpu.named.cntvct = SystemValue(elapsed_ns);
+        let mut quanta = 0;
+        while quanta < self.max_quanta_per_exit {
+            self.sample_counter();
             let code = match self.code.as_mut() {
                 Some(code) => code,
                 None => {
@@ -1539,15 +1608,35 @@ where
                 &mut self.executor,
                 BlockLimits::default(),
                 self.block_quantum,
-                &self.control,
+                &self.seat.control,
                 code,
             );
             self.work.accumulate(report.work);
             match report.stop {
-                Stop::Budget => continue,
+                Stop::Budget => quanta += 1,
                 Stop::Kicked => return Ok(Aarch64Exit::Kicked),
+                // The WFI retired. It completes when the GIC asserts this
+                // PE's IRQ input, masked or not; until then the thread parks
+                // outside the stage-2 borrow for the timer or a kick.
                 Stop::Event {
-                    event: Event::Hint(Hint::Wfi | Hint::Wfe),
+                    event: Event::Hint(Hint::Wfi),
+                    ..
+                } => {
+                    self.sample_counter();
+                    if self.cpu.irq_pending() {
+                        continue;
+                    }
+                    let deadline = self
+                        .cpu
+                        .virtual_timer_deadline()
+                        .and_then(|count| self.counter_instant(count));
+                    drop(stage2);
+                    self.idle_parks += 1;
+                    self.seat.park(deadline);
+                    stage2 = stage2_owner.try_borrow()?;
+                }
+                Stop::Event {
+                    event: Event::Hint(Hint::Wfe),
                     ..
                 } => return Ok(Aarch64Exit::Halt),
                 Stop::Event {
@@ -1573,7 +1662,7 @@ where
                                 0,
                             );
                         }
-                        continue;
+                        quanta += 1;
                     }
                     HvcImmediateKind::SyscallOrFault => {
                         if let Some(mailbox) = self.mailbox.as_mut() {
@@ -1676,7 +1765,7 @@ enum PendingAliasInventory {
 pub struct SoftAarch64Vmm<X = HostBlockRunner> {
     stage2: Arc<ExclusiveStage2>,
     protections: Arc<MemoryProtections>,
-    control: Arc<RunControl>,
+    seat: Arc<SoftRunSeat>,
     next_alias_gpa: u64,
     pending_alias_inventory: Option<PendingAliasInventory>,
     next_inventory_generation: u64,
@@ -1723,7 +1812,7 @@ where
 
         let stage2 = Arc::new(ExclusiveStage2::new(stage2));
         let protections = Arc::new(MemoryProtections::default());
-        let control = Arc::new(RunControl::default());
+        let seat = Arc::new(SoftRunSeat::default());
         let boot_instant = Instant::now();
 
         let staged = StagedCpu::initial_root(&RootBootFields {
@@ -1736,6 +1825,22 @@ where
         let mut cpu = CpuState::default();
         cpu.named.cntfrq = SystemValue(DEFAULT_CNTFRQ_HZ);
         cpu.named.mpidr = SystemValue(MPIDR_AFF0_RES1);
+        // What a driver's CPU bring-up programs on every carrier's GIC (HVF:
+        // `carrick-vmm-hvf/src/gic.rs`): Carrick's three private interrupts
+        // enabled in group 1 with their priorities, and the priority mask.
+        cpu.gic.enable(
+            carrick_el1_abi::GIC_VTIMER_INTID,
+            carrick_el1_abi::GIC_VTIMER_PRIORITY,
+        );
+        cpu.gic.enable(
+            carrick_el1_abi::GIC_RESCHED_INTID,
+            carrick_el1_abi::GIC_RESCHED_PRIORITY,
+        );
+        cpu.gic.enable(
+            carrick_el1_abi::GIC_KICK_INTID,
+            carrick_el1_abi::GIC_KICK_PRIORITY,
+        );
+        cpu.gic.configure(carrick_el1_abi::GIC_PRIORITY_MASK, true);
 
         let mut vcpu = SoftAarch64Vcpu {
             cpu,
@@ -1745,7 +1850,7 @@ where
                 != Some(std::ffi::OsStr::new("0")))
             .then(|| DispatchCache::new(ResidencyBudget::for_owner(AARCH64_RESIDENCY))),
             stage2: Arc::clone(&stage2),
-            control: Arc::clone(&control),
+            seat: Arc::clone(&seat),
             mailbox,
             actlr_el1: 0,
             cpacr_el1: 0,
@@ -1757,6 +1862,7 @@ where
             block_quantum: DEFAULT_BLOCK_QUANTUM,
             max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
             work: RunWork::default(),
+            idle_parks: 0,
         };
         vcpu.restore(&staged.snapshot())?;
         if vcpu.mailbox.is_some() {
@@ -1766,7 +1872,7 @@ where
         let vmm = Self {
             stage2,
             protections,
-            control,
+            seat,
             next_alias_gpa: SOFT_ALIAS_GPA_BASE,
             pending_alias_inventory: None,
             next_inventory_generation: 1,
@@ -2258,7 +2364,7 @@ where
 
     fn kick_handle(&self) -> Self::KickHandle {
         SoftKickHandle {
-            control: Arc::clone(&self.control),
+            seat: Arc::clone(&self.seat),
         }
     }
 
