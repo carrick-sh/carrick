@@ -1437,6 +1437,8 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RootAdmission {
     Admitted,
+    // Only the crate's own tests build an unadmitted root.
+    #[cfg_attr(not(test), allow(dead_code))]
     Unadmitted,
 }
 
@@ -1578,6 +1580,7 @@ impl Fixture {
             RootAdmission::Admitted,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn with_identity_arena_and_import(
         root_gpa: u64,
         asid: carrick_guest_arch::Asid,
