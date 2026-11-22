@@ -58,8 +58,8 @@ use carrick_softcpu_aarch64::handler::{
     CodeGeneration, Event, ExclusiveMonitor, GuestMemory as SoftGuestMemory, InlineRam, MemoryFault,
 };
 use carrick_softcpu_aarch64::state::{
-    CpuState, ProgramCounter, Pstate, RegisterValue, SavedPstate, Sctlr, StackPointer, SystemValue,
-    VirtualAddress,
+    CounterSource, CpuState, ProgramCounter, Pstate, RegisterValue, SavedPstate, Sctlr,
+    StackPointer, SystemValue, VirtualAddress,
 };
 use carrick_softcpu_aarch64::translate::BlockLimits;
 use carrick_softcpu_aarch64::{Gpr, Hint, OperandRegister};
@@ -82,14 +82,27 @@ const SOFT_ALIAS_GPA_LIMIT: u64 = 0xFF_0000_0000;
 /// Default soft-CPU block slice per `run_controlled` poll and total slice cap per exit.
 const DEFAULT_BLOCK_QUANTUM: u64 = 250_000;
 const DEFAULT_MAX_QUANTA_PER_EXIT: u64 = 400;
-/// The virtual counter counts nanoseconds since the vCPU's boot instant, so
-/// a counter value is directly a host duration from it.
+/// The virtual counter counts nanoseconds since the vCPU's boot, so a
+/// counter value is directly a host duration from it.
 const DEFAULT_CNTFRQ_HZ: u64 = 1_000_000_000;
 const MPIDR_AFF0_RES1: u64 = 0x8000_0000;
 const _: () = assert!(
     carrick_softcpu_aarch64::gic::VIRTUAL_TIMER_INTID == carrick_el1_abi::GIC_VTIMER_INTID,
     "the soft CPU's timer PPI is the one Carrick's EL1 acknowledges"
 );
+
+/// The soft carrier's physical count: nanoseconds since one process epoch.
+/// A vCPU's virtual count is this less its boot count, so the guest
+/// programs, compares and is interrupted against one live count, and a
+/// host deadline converts it back to an instant.
+fn soft_physical_count() -> u64 {
+    u64::try_from(soft_counter_epoch().elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn soft_counter_epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
 
 #[cfg(target_os = "linux")]
 const MAP_NORESERVE_OPT: libc::c_int = libc::MAP_NORESERVE;
@@ -1239,7 +1252,8 @@ pub struct SoftAarch64Vcpu<X: ExecuteBlock> {
     tpidrro_dirty: AtomicBool,
     sp_pending: AtomicU64,
     sp_dirty: AtomicBool,
-    boot_instant: Instant,
+    /// The physical count at this vCPU's boot: its virtual count's offset.
+    boot_count: u64,
     block_quantum: u64,
     max_quanta_per_exit: u64,
     work: RunWork,
@@ -1268,13 +1282,12 @@ impl<X: ExecuteBlock> SoftAarch64Vcpu<X> {
 
     /// Advance the virtual counter to the host's monotonic clock.
     fn sample_counter(&mut self) {
-        let elapsed_ns = u64::try_from(self.boot_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.cpu.named.cntvct = SystemValue(elapsed_ns);
+        self.cpu.sample_counter();
     }
 
     /// The host instant the virtual counter reaches `count`.
     fn counter_instant(&self, count: u64) -> Option<Instant> {
-        self.boot_instant.checked_add(Duration::from_nanos(count))
+        soft_counter_epoch().checked_add(Duration::from_nanos(count.checked_add(self.boot_count)?))
     }
 
     fn sync_shared_overrides(&mut self) {
@@ -1813,7 +1826,6 @@ where
         let stage2 = Arc::new(ExclusiveStage2::new(stage2));
         let protections = Arc::new(MemoryProtections::default());
         let seat = Arc::new(SoftRunSeat::default());
-        let boot_instant = Instant::now();
 
         let staged = StagedCpu::initial_root(&RootBootFields {
             entry: image.entry(),
@@ -1824,6 +1836,9 @@ where
         });
         let mut cpu = CpuState::default();
         cpu.named.cntfrq = SystemValue(DEFAULT_CNTFRQ_HZ);
+        let boot_count = soft_physical_count();
+        cpu.counter = CounterSource::live(soft_physical_count, boot_count);
+        cpu.sample_counter();
         cpu.named.mpidr = SystemValue(MPIDR_AFF0_RES1);
         // What a driver's CPU bring-up programs on every carrier's GIC (HVF:
         // `carrick-vmm-hvf/src/gic.rs`): Carrick's three private interrupts
@@ -1858,7 +1873,7 @@ where
             tpidrro_dirty: AtomicBool::new(false),
             sp_pending: AtomicU64::new(0),
             sp_dirty: AtomicBool::new(false),
-            boot_instant,
+            boot_count,
             block_quantum: DEFAULT_BLOCK_QUANTUM,
             max_quanta_per_exit: DEFAULT_MAX_QUANTA_PER_EXIT,
             work: RunWork::default(),

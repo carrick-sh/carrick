@@ -145,7 +145,56 @@ pub struct CpuState {
     pub named: NamedRegisters,
     /// This PE's GIC CPU interface and private interrupts.
     pub gic: GicCpuInterface,
+    /// The provider's live virtual count.
+    pub counter: CounterSource,
 }
+
+/// D11.1.2 The provider's system counter, read live at every guest access
+/// of the count, the virtual timer and the IRQ acknowledge, so a guest that
+/// polls the counter inside one dispatch quantum sees time pass, and its
+/// timer condition is judged against the same count. The virtual count is
+/// the physical one less `offset` (D11.2.2, as `CNTVOFF_EL2`). Without a
+/// source the provider samples `NamedRegisters::cntvct` itself, between
+/// quanta.
+#[derive(Clone, Copy, Default)]
+pub struct CounterSource {
+    read: Option<fn() -> u64>,
+    offset: u64,
+}
+
+impl CounterSource {
+    /// A live count: `read()` less `offset`.
+    pub const fn live(read: fn() -> u64, offset: u64) -> Self {
+        Self {
+            read: Some(read),
+            offset,
+        }
+    }
+
+    /// The virtual count now, if this source is live.
+    pub fn count(self) -> Option<u64> {
+        self.read.map(|read| read().wrapping_sub(self.offset))
+    }
+}
+
+impl core::fmt::Debug for CounterSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.read {
+            Some(_) => write!(f, "CounterSource(live, offset {:#x})", self.offset),
+            None => f.write_str("CounterSource(sampled)"),
+        }
+    }
+}
+
+/// Two states are equal whatever counter function each reads: the count
+/// they last observed is architectural state, the clock is the provider's.
+impl PartialEq for CounterSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.read.is_some() == other.read.is_some() && self.offset == other.offset
+    }
+}
+
+impl Eq for CounterSource {}
 /// Undefined access raises EC=0; denied allocated MRS/MSR raises EC=0x18.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemAccessException {
@@ -193,6 +242,13 @@ impl CpuState {
 
     pub(crate) fn consume_local_event(&mut self) -> bool {
         core::mem::take(&mut self.local_event)
+    }
+
+    /// Read the provider's live count into `CNTVCT`, when it has one.
+    pub fn sample_counter(&mut self) {
+        if let Some(count) = self.counter.count() {
+            self.named.cntvct = SystemValue(count);
+        }
     }
 
     /// D11.2.4 ISTATUS: the virtual timer is enabled and its condition
@@ -269,6 +325,9 @@ impl CpuState {
         rt: OperandRegister,
     ) -> Result<SystemValue, SystemAccessException> {
         let slot = self.access(r, rt, true)?;
+        if slot.reads_counter() {
+            self.sample_counter();
+        }
         Ok(SystemValue(match slot {
             Slot::Named(NamedSlot::IccIar1) => {
                 let lines = self.interrupt_lines();
@@ -314,6 +373,9 @@ impl CpuState {
         value: SystemValue,
     ) -> Result<(), SystemAccessException> {
         let slot = self.access(r, rt, false)?;
+        if slot.reads_counter() {
+            self.sample_counter();
+        }
         let v = value.0;
         match slot {
             Slot::Named(NamedSlot::IccEoir1) => self.gic.end_of_interrupt((v & 0xff_ffff) as u32),
@@ -451,6 +513,17 @@ enum Slot {
     Dczid,
 }
 impl Slot {
+    /// Whether an access observes the count: the count itself, the timer
+    /// condition (ISTATUS), TimerValue, and the IRQ acknowledge, whose
+    /// timer line derives from the count.
+    fn reads_counter(self) -> bool {
+        matches!(
+            self,
+            Self::Named(NamedSlot::Cntvct | NamedSlot::CntvCtl | NamedSlot::IccIar1)
+                | Self::CntvTval
+        )
+    }
+
     fn decode(r: SystemRegister) -> Option<Self> {
         use NamedSystemRegister as N;
         Some(match N::from_encoding(r) {

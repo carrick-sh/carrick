@@ -245,6 +245,61 @@ fn virtual_timer_raises_its_ppi_through_the_gic_cpu_interface() {
     assert!(!r.cpu.irq_pending());
 }
 
+/// D11.1.2: with a provider counter source, every guest observation of the
+/// count reads it live, so a guest polling the counter inside one dispatch
+/// quantum sees time pass, and its timer condition and acknowledge judge the
+/// same count, with no provider sampling in between.
+#[test]
+fn live_counter_source_is_read_at_every_count_observation() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(1_000);
+    fn live() -> u64 {
+        COUNT.load(Ordering::Relaxed)
+    }
+    const MRS_X1_CNTVCT: u32 = 0xd53be041;
+    const MRS_X1_CNTPCT: u32 = 0xd53be021;
+    const MRS_X1_CNTV_CTL: u32 = 0xd53be321;
+    const MRS_X1_CNTV_TVAL: u32 = 0xd53be301;
+    const MSR_CNTV_TVAL_X0: u32 = 0xd51be300;
+    const MSR_CNTV_CTL_X0: u32 = 0xd51be320;
+    const MRS_X1_IAR1: u32 = 0xd538cc01;
+    let mut r = Rig::el1();
+    r.cpu.gic.enable(27, 0x80);
+    r.cpu.gic.configure(0xf0, true);
+    // The virtual count is the live one less its offset.
+    r.cpu.counter = CounterSource::live(live, 0);
+    // A stale provider sample: never what the guest reads.
+    r.cpu.named.cntvct = SystemValue(7);
+    assert_eq!(r.run(MRS_X1_CNTVCT), Outcome::Continue);
+    assert_eq!(r.get(1), 1_000);
+    COUNT.store(1_100, Ordering::Relaxed);
+    assert_eq!(r.run(MRS_X1_CNTPCT), Outcome::Continue);
+    assert_eq!(r.get(1), 1_100);
+    // TimerValue programs against the live count.
+    COUNT.store(2_000, Ordering::Relaxed);
+    r.set(0, 500);
+    assert_eq!(r.run(MSR_CNTV_TVAL_X0), Outcome::Continue);
+    assert_eq!(r.cpu.named.cntvcval.0, 2_500);
+    r.set(0, 1);
+    assert_eq!(r.run(MSR_CNTV_CTL_X0), Outcome::Continue);
+    COUNT.store(2_400, Ordering::Relaxed);
+    assert_eq!(r.run(MRS_X1_CNTV_TVAL), Outcome::Continue);
+    assert_eq!(r.get(1), 100);
+    assert_eq!(r.run(MRS_X1_CNTV_CTL), Outcome::Continue);
+    assert_eq!(r.get(1), 1, "the deadline is still ahead");
+    // The count passes CVAL with no provider sample: the guest's own polls
+    // observe ISTATUS and acknowledge the timer's interrupt.
+    COUNT.store(2_600, Ordering::Relaxed);
+    assert_eq!(r.run(MRS_X1_CNTV_CTL), Outcome::Continue);
+    assert_eq!(r.get(1), 5);
+    assert_eq!(r.run(MRS_X1_IAR1), Outcome::Continue);
+    assert_eq!(r.get(1), 27);
+    // D11.2.2: the virtual count is the live count less the offset.
+    r.cpu.counter = CounterSource::live(live, 600);
+    assert_eq!(r.run(MRS_X1_CNTVCT), Outcome::Continue);
+    assert_eq!(r.get(1), 2_000);
+}
+
 #[test]
 fn msr_at_el0_to_an_el1_register_is_undefined() {
     let mut r = Rig::el0();

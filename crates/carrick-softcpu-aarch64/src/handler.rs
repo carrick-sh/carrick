@@ -224,6 +224,7 @@ fn read_system_register(
         if cpu.pstate.el == ExceptionLevel::El0 && cpu.el1.cntkctl.0 & 1 == 0 {
             return Err(SystemAccessException::sys64(register, rt, true));
         }
+        cpu.sample_counter();
         return Ok(cpu.named.cntvct);
     }
     cpu.mrs(register, rt)
