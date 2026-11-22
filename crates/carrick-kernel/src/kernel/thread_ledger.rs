@@ -468,14 +468,7 @@ impl ThreadIdentityPool {
         // Only this pool publishes host stock. Hold its lock from slot
         // selection through publication so concurrent refillers cannot spend
         // identities on the same slot.
-        let Some(index) = (0..page.entry_count()).find(|&index| {
-            page.state(index).is_some_and(|(_, state)| {
-                matches!(
-                    state,
-                    EntryState::Vacant | EntryState::Reaped | EntryState::Revoked
-                )
-            })
-        }) else {
+        let Some(index) = page.first_stockable() else {
             return false;
         };
         if entries.try_reserve(1).is_err()

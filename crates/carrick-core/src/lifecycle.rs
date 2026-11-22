@@ -734,6 +734,14 @@ pub fn retire_cancelled_pool_member(
     membership.publish();
     Ok(())
 }
+/// The states a stock reservation may replace: an entry that never held an
+/// identity, or one whose identity is fully retired.
+fn accepts_stock(state: EntryState) -> bool {
+    matches!(
+        state,
+        EntryState::Vacant | EntryState::Reaped | EntryState::Revoked
+    )
+}
 
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
@@ -1027,16 +1035,22 @@ pub trait Lifecycle {
         }
     }
 
+    /// The first entry [`Self::reserve_stock`] would accept now. A refiller
+    /// asks this before it spends an identity, so a full page costs no tid.
+    fn first_stockable(&self) -> Option<usize> {
+        (0..self.entry_count()).find(|&index| {
+            self.state(index)
+                .is_some_and(|(_, state)| accepts_stock(state))
+        })
+    }
+
     /// Reserve payload initialization in a `Vacant`, `Reaped` or `Revoked` entry,
     /// bumping the generation. Returns the reference to the new incarnation.
     fn reserve_stock(&self, index: usize) -> Result<EntryRef, TransitionError> {
         let e = self.entry_word(index).ok_or(TransitionError::NoSuchEntry)?;
         let cur = e.load(Ordering::Acquire);
         let (generation, state) = unpack(cur);
-        if !matches!(
-            state,
-            EntryState::Vacant | EntryState::Reaped | EntryState::Revoked
-        ) {
+        if !accepts_stock(state) {
             return Err(TransitionError::WrongState(state));
         }
         let next = generation + 1;
