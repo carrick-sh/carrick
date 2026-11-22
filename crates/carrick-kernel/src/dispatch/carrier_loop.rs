@@ -131,13 +131,31 @@ pub fn finish_host_alias_stage1_install<E: ThreadedEngine>(
     })
 }
 
+/// Run a carrier's MM mutation as the task's `executor` when the carrier
+/// holds it, else under a fresh exact-MM executor admission.
+fn with_carrier_mutation<T>(
+    dispatcher: &mut SyscallDispatcher,
+    executor: Option<&mut crate::dispatch::MmExecutorParticipation>,
+    run: impl FnOnce(
+        &mut SyscallDispatcher,
+        &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
+    ) -> T,
+) -> Result<T, crate::dispatch::DispatchError> {
+    match executor {
+        Some(executor) => dispatcher.with_mm_executor_mutation_by(executor, run),
+        None => dispatcher.with_mm_executor_mutation(run),
+    }
+}
+
 /// Reserve frame inventory, install a host alias through `engine`, apply its
 /// [`FrameInventoryCommit`] to `context`'s kernel authority, and finish the
-/// stage-1 protection/VMA commit under `dispatcher`'s MM mutation lease.
+/// stage-1 protection/VMA commit under `dispatcher`'s MM mutation lease, as
+/// `executor` when the carrier holds the task's executor participation.
 #[allow(clippy::too_many_arguments)]
 pub fn install_host_alias_with_inventory<E: ThreadedEngine>(
     engine: &mut E,
     dispatcher: &mut SyscallDispatcher,
+    executor: Option<&mut crate::dispatch::MmExecutorParticipation>,
     context: &KernelContext,
     transaction: HostAliasTransaction,
     va: GuestVa,
@@ -150,8 +168,10 @@ pub fn install_host_alias_with_inventory<E: ThreadedEngine>(
     success_retval: i64,
 ) -> Result<i64, String> {
     let shared = backing.is_shared();
-    dispatcher
-        .with_mm_executor_mutation(|disp, mutation| -> Result<i64, String> {
+    with_carrier_mutation(
+        dispatcher,
+        executor,
+        |disp, mutation| -> Result<i64, String> {
             let permit = mutation.host_alias_permit();
             let Some(install) = transaction.claim(&permit) else {
                 drop(backing);
@@ -207,8 +227,9 @@ pub fn install_host_alias_with_inventory<E: ThreadedEngine>(
                     failure.site, failure.message
                 )),
             }
-        })
-        .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))?
+        },
+    )
+    .map_err(|e| format!("MM executor mutation for MapHostAlias: {e}"))?
 }
 
 /// Apply Linux stage-1 first-touch permission rules: any accessible leaf in
@@ -684,9 +705,11 @@ pub fn rerun_after_owner_release<'v, T>(
 /// [`rerun_after_owner_release`] at the published EL1 aperture on
 /// [`ReservationBusy`]. Returns whether the fault was resolved and how many
 /// owner waits it took.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_host_first_touch_with_owner_wait<E: ThreadedEngine>(
     engine: &mut E,
     dispatcher: &mut SyscallDispatcher,
+    mut executor: Option<&mut crate::dispatch::MmExecutorParticipation>,
     context: &KernelContext,
     wake_slot: &SingleCarrierHandbackWait,
     address: u64,
@@ -695,14 +718,13 @@ pub fn resolve_host_first_touch_with_owner_wait<E: ThreadedEngine>(
 ) -> Result<(bool, u64), String> {
     let (step, owner_waits) =
         rerun_after_owner_release(context, wake_slot, OwnerWaitVenue::published, || {
-            dispatcher
-                .with_mm_executor_mutation(|disp, mutation| {
-                    resolve_host_first_touch_or_stale(
-                        disp, engine, mutation, address, access, fault_kind,
-                    )
-                })
-                .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))?
-                .map_err(|e| format!("first-touch fault resolution trap error: {e}"))
+            with_carrier_mutation(dispatcher, executor.as_deref_mut(), |disp, mutation| {
+                resolve_host_first_touch_or_stale(
+                    disp, engine, mutation, address, access, fault_kind,
+                )
+            })
+            .map_err(|e| format!("MM executor mutation for first-touch fault: {e}"))?
+            .map_err(|e| format!("first-touch fault resolution trap error: {e}"))
         })?;
     match step {
         HostFirstTouchStep {
@@ -945,6 +967,73 @@ pub fn open_first_address_space<E: ThreadedEngine>(
     closed
         .open_admitted(&guard)
         .map_err(|_| TrapError::Hypervisor("first-load owner guard selected another MM".into()))
+}
+
+/// Enter and leave the zone around a carrier executor's run of its vCPU on
+/// `slot`, including entries following a host-served syscall. While the
+/// slot is in the guest, a host claim of a thread EL1 holds there kicks it.
+pub fn run_guest<R>(
+    thread: Option<&crate::kernel::Thread>,
+    zone_slot: Option<(&ZoneTables, SlotId)>,
+    run: impl FnOnce() -> R,
+) -> R {
+    if let Some((zone, slot)) = zone_slot {
+        if let Some(thread) = thread {
+            zone.bind_slot_affinity(slot, thread.control_slot().affinity_source());
+        }
+        zone.enter_guest(slot);
+    }
+    let result = run();
+    if let Some((zone, slot)) = zone_slot {
+        zone.leave_guest(slot, &crate::el1_zone::HostLockWait);
+    }
+    result
+}
+
+/// What an executor's stopped slot holds for it at an exit, once
+/// [`settle_zone_exit`] settled the slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneExitSettlement {
+    /// EL1 switched the executor's own thread back in and it simply runs
+    /// again: its record is retired, and the exit is the thread's.
+    Released,
+    /// The own thread was switched in at the SVC of its pending object
+    /// operation, which never re-executed (EL1 left with host work after the
+    /// switch, or a kick stopped it at EL0): its record `own` is back at the
+    /// head of the run queue. The thread settles into its zone wait on it,
+    /// exactly as a thread EL1 parked or preempted; its next load resumes
+    /// the operation, and this exit (no call of the thread's) is abandoned.
+    Requeued { own: carrick_sched_core::RecordId },
+    /// Anything else: the switched-in record and the slot's own (host)
+    /// record, for the executor to settle.
+    Held {
+        current: Option<carrick_sched_core::RecordId>,
+        own: Option<carrick_sched_core::RecordId>,
+    },
+}
+
+/// Settle what EL1 did on `slot` since its executor last ran it, before
+/// anything uses the exit: complete the detached wake claims EL1
+/// transferred, sweep cancelled records, hand back what the host wants, and
+/// move another thread's timed park on this slot's timer to the host
+/// (nothing serves the timer until the vCPU returns). Nothing of the
+/// executor's own thread stays switched in on the slot past this boundary.
+pub fn settle_zone_exit(zone: &ZoneTables, slot: SlotId) -> ZoneExitSettlement {
+    crate::el1_zone::hand_back_completions();
+    zone.sweep_cancelled(slot);
+    crate::el1_zone::hand_back_wanted(slot);
+    crate::el1_zone::hand_back_foreign_timer(slot);
+    let s = zone.slot(slot);
+    let (current, own) = (s.current(), s.host_record());
+    if let (Some(switched), Some(own)) = (current, own)
+        && switched == own
+    {
+        return match zone.release_current(slot, own, &crate::el1_zone::HostLockWait) {
+            carrick_sched_core::CurrentRelease::Released => ZoneExitSettlement::Released,
+            carrick_sched_core::CurrentRelease::Requeued => ZoneExitSettlement::Requeued { own },
+        };
+    }
+    ZoneExitSettlement::Held { current, own }
 }
 
 /// The zone's driver identity of an executor. Never 0, which means none.

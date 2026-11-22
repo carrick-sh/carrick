@@ -4312,6 +4312,19 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     task.publish_lifecycle(0, 0);
     task.linux.retire_served_boundary();
     task.mm.key.store(0, Ordering::Release);
+    prepare_idle_frame(slot)
+}
+
+/// Prepare only `slot`'s idle-entry frame (the slot index, syndrome and ELR
+/// 0), keeping its task record: the slot's executor still has its task
+/// loaded, parked by EL1 in the zone, and returns the vCPU to the EL1 idle
+/// loop it left. Returns the frame's address, for `x16` at the entry;
+/// `None` if the region is not mapped.
+pub fn prepare_idle_frame(slot: usize) -> Option<u64> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
     let frame = el1_slot_frame_va(slot);
     let frame_offset = (frame - EL1_REGION_BASE) as usize;
     // SAFETY: the frame lies on the slot's EL1 stack in the mapped region,

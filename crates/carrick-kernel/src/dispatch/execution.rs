@@ -83,16 +83,57 @@ impl SyscallDispatcher {
         if !kernel.kernel().source_host_dispatch_available() {
             return Err(DispatchError::SourceKernelAuthorityTransferred);
         }
-        // Tree-wide forward-progress beat for the deadlock watchdog.
-        crate::deadlock_watchdog::tick();
-        let request = syscall.request;
         let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
+        self.dispatch_prepared_in_executor(&mut executor, kernel, syscall, memory, reporter, lease)
+    }
+
+    /// Single-threaded dispatch by the exact-MM executor that runs the
+    /// calling task: a carrier that holds its task's participation across
+    /// its residency dispatches under it, rather than admitting a second
+    /// executor of the same MM that its own would then count as a peer.
+    pub fn dispatch_with_mm_executor(
+        &mut self,
+        executor: &mut MmExecutorParticipation,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let authority = self.mm_binding.current.load_full();
+        if !executor.authorizes(&authority) || executor.mm_id() != kernel.shared().mm().id() {
+            return Err(DispatchError::MmMutationPeerExecutor);
+        }
+        match self.prepare_syscall(kernel, request, reporter)? {
+            PreparedDispatch::Invoke(syscall) => {
+                if !kernel.kernel().source_host_dispatch_available() {
+                    return Err(DispatchError::SourceKernelAuthorityTransferred);
+                }
+                self.dispatch_prepared_in_executor(
+                    executor, kernel, syscall, memory, reporter, None,
+                )
+            }
+            PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
+        }
+    }
+
+    fn dispatch_prepared_in_executor(
+        &mut self,
+        executor: &mut MmExecutorParticipation,
+        kernel: &crate::kernel::KernelContext,
+        syscall: PreparedSyscall,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Tree-wide forward-progress beat for the deadlock watchdog.
+        crate::deadlock_watchdog::tick();
+        let request = syscall.request;
         if syscall_requires_mm_mutation(request.number.raw(), request.args) {
             let coordinator = executor.mutation_coordinator();
             let mm = executor.mm_id();
-            super::mm_quiesce::with_sole_mm_stage1(&mut executor, |authority| {
+            super::mm_quiesce::with_sole_mm_stage1(executor, |authority| {
                 let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
                 self.dispatch_inner(
                     kernel,
@@ -117,7 +158,7 @@ impl SyscallDispatcher {
                 OrdinaryDispatchRoute {
                     host_wait: None,
                     lease,
-                    mm_executor: Some(&mut executor),
+                    mm_executor: Some(executor),
                 },
             )
         }
@@ -131,9 +172,22 @@ impl SyscallDispatcher {
         let mut executor = self
             .enter_mm_executor()
             .map_err(DispatchError::MmExecutorAdmission)?;
+        self.with_mm_executor_mutation_by(&mut executor, run)
+    }
+
+    /// Run a non-threaded completion as the exact-MM `executor` that runs
+    /// the calling task (see [`Self::dispatch_with_mm_executor`]).
+    pub fn with_mm_executor_mutation_by<T>(
+        &mut self,
+        executor: &mut MmExecutorParticipation,
+        run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
+    ) -> Result<T, DispatchError> {
+        if !executor.authorizes(&self.mm_binding.current.load_full()) {
+            return Err(DispatchError::MmMutationPeerExecutor);
+        }
         let coordinator = executor.mutation_coordinator();
         let mm = executor.mm_id();
-        super::mm_quiesce::with_sole_mm_stage1(&mut executor, |authority| {
+        super::mm_quiesce::with_sole_mm_stage1(executor, |authority| {
             let mut guard = mm_mutation::from_sole_executor(authority, coordinator, mm);
             run(self, &mut guard)
         })

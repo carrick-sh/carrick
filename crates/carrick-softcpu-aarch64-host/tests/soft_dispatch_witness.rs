@@ -2147,7 +2147,7 @@ fn soft_carrier_emits_the_hot_set_once_across_provider_exits() {
         emitted.push(prepared);
     }
     assert!(
-        emitted.iter().all(|&e| e <= LOOP_EMISSION_BUDGET),
+        emitted.iter().all(|&e| e <= LOOP_EMISSION_BUDGET) && emitted[0] == emitted[1],
         "the carrier re-emits its hot set at provider exits: emitted {emitted:?} \
          for 10 and 100 handoffs, budget {LOOP_EMISSION_BUDGET}"
     );

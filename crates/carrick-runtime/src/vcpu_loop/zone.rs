@@ -23,10 +23,11 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    Aarch64ParkedContext, CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx,
-    ThreadIdentity, ZoneTables,
+    Aarch64ParkedContext, CurrentHandback, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity,
+    ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
+use carrick_kernel::dispatch::carrier_loop::ZoneExitSettlement;
 use carrick_kernel::el1_zone::HostLockWait;
 
 fn load_zone_futex_word(
@@ -329,25 +330,7 @@ pub(super) fn zone_slot<E: ThreadedEngine>(engine: &E) -> Option<(&'static ZoneT
     ))
 }
 
-/// Enter and leave the zone around the production executor's hardware run,
-/// including entries following a host-served syscall.
-pub(super) fn run_guest<R>(
-    thread: Option<&carrick_kernel::kernel::Thread>,
-    zone_slot: Option<(&ZoneTables, SlotId)>,
-    run: impl FnOnce() -> R,
-) -> R {
-    if let Some((zone, slot)) = zone_slot {
-        if let Some(thread) = thread {
-            zone.bind_slot_affinity(slot, thread.control_slot().affinity_source());
-        }
-        zone.enter_guest(slot);
-    }
-    let result = run();
-    if let Some((zone, slot)) = zone_slot {
-        zone.leave_guest(slot, &HostLockWait);
-    }
-    result
-}
+pub(super) use carrick_kernel::dispatch::carrier_loop::run_guest;
 
 #[cfg(test)]
 #[path = "zone_affinity_tests.rs"]
@@ -460,44 +443,21 @@ where
         let Some((zone, slot)) = zone_slot(engine) else {
             return Ok(None);
         };
-        carrick_kernel::el1_zone::hand_back_completions();
-        zone.sweep_cancelled(slot);
-        carrick_kernel::el1_zone::hand_back_wanted(slot);
-        // Every exit: nothing serves this slot's timer until the vCPU
-        // returns, so another thread's timed park on it goes to the host.
-        carrick_kernel::el1_zone::hand_back_foreign_timer(slot);
-        let s = zone.slot(slot);
-        let (mut current, own) = (s.current(), s.host_record());
-        let mut requeued = false;
-        if let (Some(switched), Some(own)) = (current, own)
-            && switched == own
-        {
-            // EL1 switched this job's own thread back in. Nothing stays
-            // switched in on the slot past this boundary.
-            match zone.release_current(slot, own, &HostLockWait) {
-                // It is simply running again: its record is retired.
-                CurrentRelease::Released => {
+        let (current, own, requeued) =
+            match carrick_kernel::dispatch::carrier_loop::settle_zone_exit(zone, slot) {
+                ZoneExitSettlement::Released => {
                     return self.own_space_installed(zone, slot).map(|()| None);
                 }
-                // It was switched in at the SVC of its pending object
-                // operation, which never re-executed (EL1 left with host
-                // work after the switch, or a kick stopped it at EL0): its
-                // record is back at the head of the run queue, and the
-                // thread settles into its zone wait on it below, exactly as
-                // a thread EL1 parked or preempted. Its next load resumes
-                // the operation; this exit (no call of the thread's) is
-                // abandoned.
-                CurrentRelease::Requeued => {
+                ZoneExitSettlement::Requeued { own } => {
                     crate::probes::el1_zone_requeue_operation(
                         u32::from(slot.raw()),
                         u32::from(matches!(exit, ZoneExit::Syscall { .. })),
                         own.raw().into(),
                     );
-                    current = None;
-                    requeued = true;
+                    (None, Some(own), true)
                 }
-            }
-        }
+                ZoneExitSettlement::Held { current, own } => (current, own, false),
+            };
         let state = match (current, own) {
             (None, None) => return self.own_space_installed(zone, slot).map(|()| None),
             (Some(current), _) => {
