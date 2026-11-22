@@ -7280,7 +7280,7 @@ mprotect_shape_witness!(
 /// MM's reservation root and descriptor editor. Contention is "not now": no
 /// call may come back as an errno, and none may leave the ring.
 #[test]
-#[ignore = "#2763: the x86 shootdown rendezvous is never acknowledged under threaded mm calls"]
+#[ignore = "#2766: a fault crossing races the sibling's ring edit and the host owner fails the run"]
 fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
     let elf = native_exit_fixture("native_child_threaded_mm.S");
     let dir = tempfile::tempdir().expect("oracle directory");
