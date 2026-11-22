@@ -20,6 +20,13 @@ use crate::native_process;
 /// A guest wait releases its record and installed-space membership before
 /// this function selects another runnable task or enters architectural HLT.
 pub fn schedule(slot: SlotId) -> ! {
+    // Nothing that reaches the scheduler returns through a user #PF entry
+    // frame: a fault parked on an owner resumes from its record, and a fault
+    // ended by a fatal signal resumes nowhere (#2792). Every such path ends
+    // the fault's custody of this CPU here, before another task runs on it.
+    if let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() {
+        carrick_x86_carrier::entry::leave_user_page_fault(binding);
+    }
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
     if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
