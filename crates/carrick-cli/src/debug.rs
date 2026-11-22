@@ -172,6 +172,7 @@ pub(crate) fn run_debug(
             reap,
             limit,
             oracle,
+            oracle_only,
             report,
         } => {
             if report {
@@ -190,6 +191,7 @@ pub(crate) fn run_debug(
                     reap: reap.as_deref(),
                     limit,
                     oracle: oracle.as_deref(),
+                    oracle_only,
                 })?;
             }
         }
