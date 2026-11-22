@@ -211,6 +211,16 @@ impl GuestThreads {
             .ok_or(carrick_personality_linux::identity::ESRCH)
     }
 
+    /// Reserve rows for a group of `total` threads, so the births a thread
+    /// stock has admitted never allocate when they publish their row.
+    pub fn try_reserve_total(
+        &mut self,
+        total: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        self.threads
+            .try_reserve(total.saturating_sub(self.threads.len()))
+    }
+
     #[inline(never)]
     pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) -> Result<(), i64> {
         let (creds, comm) = {
@@ -219,12 +229,21 @@ impl GuestThreads {
                 .iter()
                 .find(|t| t.tid == caller_tid)
                 .ok_or(carrick_personality_linux::identity::ESRCH)?;
-            (caller.credentials.clone(), caller.comm)
+            // Fallible: a metadata capacity miss here is ENOMEM for this
+            // clone, never an allocation panic in the ring (#2734).
+            let credentials = caller
+                .credentials
+                .try_clone()
+                .map_err(|_| carrick_personality_linux::identity::ENOMEM)?;
+            (credentials, caller.comm)
         };
         if let Some(entry) = self.threads.iter_mut().find(|t| t.tid == child_tid) {
             entry.credentials = creds;
             entry.comm = comm;
         } else {
+            self.threads
+                .try_reserve(1)
+                .map_err(|_| carrick_personality_linux::identity::ENOMEM)?;
             self.threads.push(GuestThreadState {
                 tid: child_tid,
                 credentials: creds,

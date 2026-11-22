@@ -32,6 +32,9 @@ pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     namespace_exhausted: bool,
     /// The last refill needed a segment and the metadata owner had none.
     segment_missed: bool,
+    /// The last clone admission could not reserve the rows its birth
+    /// publishes (thread, member, namespace claim): the same "not now".
+    rows_missed: bool,
     segment_misses: u8,
 }
 
@@ -42,16 +45,28 @@ std::thread_local! {
         const { core::cell::Cell::new(0) };
 }
 
-fn allocate_segment() -> Option<core::ptr::NonNull<ThreadLifecycleSegment>> {
-    #[cfg(test)]
-    if INJECT_SEGMENT_MISSES
+/// Consume one injected metadata capacity miss, if a test armed any.
+#[cfg(test)]
+fn injected_miss(misses: &'static std::thread::LocalKey<core::cell::Cell<u32>>) -> bool {
+    misses
         .try_with(|misses| {
             let left = misses.get();
             misses.set(left.saturating_sub(1));
             left != 0
         })
         .unwrap_or(false)
-    {
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Birth-row reservations to refuse, as a metadata capacity miss does.
+    pub(crate) static INJECT_ROW_MISSES: core::cell::Cell<u32> =
+        const { core::cell::Cell::new(0) };
+}
+
+fn allocate_segment() -> Option<core::ptr::NonNull<ThreadLifecycleSegment>> {
+    #[cfg(test)]
+    if injected_miss(&INJECT_SEGMENT_MISSES) {
         return None;
     }
     let segment = core::ptr::NonNull::new(segment_storage().cast::<ThreadLifecycleSegment>())?;
@@ -245,6 +260,7 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                         identities,
                         namespace_exhausted: false,
                         segment_missed: false,
+                        rows_missed: false,
                         segment_misses: 0,
                         waiters,
                         release: Arc::new(ControlRelease {
@@ -363,6 +379,75 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
     let limit = at_limit(graph, key, caller)?;
     let namespace = graph.namespace;
     let visible_namespace = graph.visible_namespace;
+    refill(
+        runtime,
+        graph,
+        key,
+        caller,
+        limit,
+        namespace,
+        visible_namespace,
+        growth,
+    )?;
+    if growth == StockGrowth::ForClone {
+        reserve_birth_rows(graph, key)?;
+    }
+    Ok(())
+}
+
+/// A birth publishes a thread row, a member row and a namespace claim. Each
+/// is a vector push that must never allocate: the birth is past its last
+/// refusal by then, and a metadata capacity miss there was an allocation
+/// panic in the ring (#2734). Reserve all three for every entry the pool has
+/// (plus the leader) while this clone can still answer "not now". Admission
+/// runs this after the refill, so a pool that just grew is covered.
+fn reserve_birth_rows<M: Clone, C: ProcessContext>(
+    graph: &mut Graph<'_, M, C>,
+    key: TaskKey,
+) -> Result<(), NativeFailure> {
+    let task = graph
+        .owner
+        .task_mut(key)
+        .map_err(|_| NativeFailure::Stale)?;
+    let total = {
+        let resources = task.native().resources();
+        if resources.thread_stock.is_none() {
+            return Ok(());
+        }
+        carrick_el1_abi::Lifecycle::entry_count(resources.page) + 1
+    };
+    #[cfg(test)]
+    let injected = injected_miss(&INJECT_ROW_MISSES);
+    #[cfg(not(test))]
+    let injected = false;
+    // Births the pool can still admit: each adds one row to each vector,
+    // whatever other rows (the leader's role claims) a vector already holds.
+    let births = total.saturating_sub(task.threads.threads.len());
+    let reserved = !injected && task.threads.try_reserve_total(total).is_ok() && {
+        let resources = task.native_mut().resources_mut();
+        resources.members.try_reserve(births).is_ok()
+            && resources._thread_claim.claims.try_reserve(births).is_ok()
+    };
+    if let Some(stock) = task.native_mut().resources_mut().thread_stock.as_mut() {
+        if reserved && stock.rows_missed {
+            stock.segment_misses = 0;
+        }
+        stock.rows_missed = !reserved;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refill<'a, M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'a, M, C>,
+    graph: &mut Graph<'a, M, C>,
+    key: TaskKey,
+    caller: u32,
+    limit: bool,
+    namespace: &'a NamespaceTable,
+    visible_namespace: VisibleNamespace,
+    growth: StockGrowth,
+) -> Result<(), NativeFailure> {
     let task = graph
         .owner
         .task_mut(key)
@@ -598,7 +683,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         limit = true;
                         return Err(ObjectWaitError::Changed);
                     }
-                    if stock.segment_missed && stock.identities.standing(resources.page) == 0 {
+                    if stock.rows_missed
+                        || (stock.segment_missed && stock.identities.standing(resources.page) == 0)
+                    {
                         let stock = graph
                             .owner
                             .task_mut(self.key)

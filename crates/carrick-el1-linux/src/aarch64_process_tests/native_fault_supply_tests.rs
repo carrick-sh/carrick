@@ -225,6 +225,177 @@ fn native_fork_child_admits_sixteen_live_siblings() {
     child_thread_admission(16, 1, ChildStockCase::Reuse);
 }
 
+/// #2734 "miss once, then success": the ninth live sibling needs a new
+/// segment and the metadata allocator has none this round. The clone keeps
+/// its call, releases its lease through a carrier-work round and reruns:
+/// never EAGAIN, never ENOMEM, and nothing is linked by the miss.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_segment_miss_reruns_the_clone_after_a_carrier_round() {
+    child_thread_admission(16, 1, ChildStockCase::CapacityMiss(CapacityMiss::Segment));
+}
+
+/// #2734: the rows a birth publishes (thread, member, namespace claim) are
+/// reserved at admission. A reservation the allocator misses is the same
+/// "not now", where the birth's own push was an allocation panic in the ring.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_birth_row_miss_reruns_the_clone_after_a_carrier_round() {
+    child_thread_admission(16, 1, ChildStockCase::CapacityMiss(CapacityMiss::BirthRows));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq)]
+enum CapacityMiss {
+    Segment,
+    BirthRows,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl CapacityMiss {
+    fn injector(self) -> &'static std::thread::LocalKey<core::cell::Cell<u32>> {
+        use crate::native_process_runtime::thread_stock;
+        match self {
+            Self::Segment => &thread_stock::INJECT_SEGMENT_MISSES,
+            Self::BirthRows => &thread_stock::INJECT_ROW_MISSES,
+        }
+    }
+    /// Whether clone number `admitted` (from zero) meets the miss: the first
+    /// one that finds every entry of the lifecycle page held for a segment,
+    /// an early one for the birth rows.
+    fn meets(self, page: &ThreadLifecyclePage, admitted: u32) -> bool {
+        match self {
+            Self::Segment => {
+                page.entry_count() == carrick_el1_abi::THREAD_POOL_ENTRIES
+                    && (0..page.entry_count()).all(|index| {
+                        page.state(index).is_some_and(|(_, state)| {
+                            matches!(
+                                state,
+                                carrick_el1_abi::EntryState::Born
+                                    | carrick_el1_abi::EntryState::Published
+                            )
+                        })
+                    })
+            }
+            Self::BirthRows => admitted == 2,
+        }
+    }
+}
+
+/// The carrier's side of a clone's "not now": claim the parked caller's exact
+/// carrier-work notice, acknowledge it and notify its service queue. Then
+/// give each queued peer one scheduler turn until the caller is selected
+/// again, and resume it: the owned clone reruns.
+#[cfg(not(target_os = "macos"))]
+fn rerun_clone_after_carrier_work(
+    fixture: &'static Fixture,
+    caller: carrick_el1_abi::RecordRef,
+    page: &ThreadLifecyclePage,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+    service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    counters: &carrick_el1_abi::Counters,
+) {
+    let identity = fixture.zone.record(caller.id).identity();
+    // SAFETY: the fixture retains the caller's control for the whole test.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let notice = fixture
+        .task
+        .service_notice
+        .take()
+        .expect("readable service notice")
+        .expect("the clone published its carrier work");
+    assert_eq!(notice.record, caller, "the clone caller's own notice");
+    let key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(caller).unwrap();
+    let complete: &dyn Fn(
+        carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
+    ) = &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned);
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin, complete)
+        .unwrap();
+    // SAFETY: the fixture authenticates the notice under the member's own
+    // service queue, as production intake does.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &control.service,
+            notice,
+            NonZeroU64::MIN,
+            identity,
+        )
+    }
+    .unwrap();
+    assert!(
+        matches!(
+            ticket.request().operation,
+            carrick_core_abi::service::ServiceOperation::CarrierWork {
+                demand: carrick_core_abi::service::CarrierDemand::Work,
+                ..
+            }
+        ),
+        "a capacity miss asks for one carrier round, not for host thread stock"
+    );
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut Default::default())
+        .unwrap();
+    drop(queue);
+    let mut handoff = None;
+    if fixture.zone.slot(fixture.slot).current().is_none() {
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut *cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                counters,
+                fixture.slot,
+                &mut handoff,
+            )
+            .idle_entry(frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    // Each queued peer takes one real scheduler turn; no clock, no retry.
+    for _ in 0..page.live() {
+        if fixture.zone.slot(fixture.slot).current() == Some(caller.id) {
+            break;
+        }
+        frame.x[8] = 178;
+        loan_call(fixture, frame, cpu, service, counters);
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut *cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert!(
+            crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                counters,
+                fixture.slot,
+                &mut handoff,
+            )
+            .yield_queued(frame)
+            .is_some()
+        );
+    }
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(caller.id));
+    assert!(matches!(
+        crate::aarch64_process::resume_production_with_service(
+            fixture.zone,
+            &fixture.task,
+            fixture.slot,
+            caller.id,
+            service,
+        ),
+        crate::sched::ResumeAction::RetrySyscall
+    ));
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_waits_for_final_retired_control_pin() {
@@ -287,6 +458,7 @@ enum ChildStockCase {
     Claimed,
     Exiting,
     GroupExit(GroupExitCaller),
+    CapacityMiss(CapacityMiss),
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -500,6 +672,49 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         for admitted in 0..count {
             frame.x[8] = 220;
             frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
+            if let ChildStockCase::CapacityMiss(miss) = case
+                && miss.meets(page, admitted)
+            {
+                let caller = fixture
+                    .zone
+                    .record_ref(fixture.zone.slot(fixture.slot).current().unwrap());
+                let entries = page.entry_count();
+                miss.injector().with(|misses| misses.set(1));
+                let missed = loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
+                assert_eq!(
+                    miss.injector().with(|misses| misses.get()),
+                    0,
+                    "the clone met the injected capacity miss"
+                );
+                assert_ne!(
+                    missed,
+                    carrick_personality_linux::dispatch::CompletionRoute::Forward,
+                    "a capacity miss stays with the clone's native owner"
+                );
+                assert_ne!(
+                    fixture.zone.slot(fixture.slot).current(),
+                    Some(caller.id),
+                    "not now: the clone releases its execution lease, no errno"
+                );
+                assert!(fixture.zone.live(caller).is_some());
+                assert_eq!(page.entry_count(), entries, "a miss links nothing");
+                assert_eq!(page.live(), admitted + 1, "a miss births nothing");
+                rerun_clone_after_carrier_work(
+                    fixture,
+                    caller,
+                    page,
+                    &mut frame,
+                    &mut cpu,
+                    &mut service,
+                    &counters,
+                );
+                assert_eq!(frame.x[8], 220, "resumption preserves the owned clone");
+                assert_eq!(
+                    frame.x[..6],
+                    [0x50f00, VA + 0x12000, 0, 0, 0, 0],
+                    "not now writes no result over the clone's arguments"
+                );
+            }
             let route = loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
             if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
                 assert_eq!(
@@ -531,6 +746,18 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             tids.push(frame.x[0] as u32);
         }
         if case == ChildStockCase::FirstBirth {
+            return;
+        }
+        if let ChildStockCase::CapacityMiss(_) = case {
+            assert_eq!(
+                page.entry_count(),
+                carrick_el1_abi::THREAD_POOL_ENTRIES + carrick_el1_abi::THREAD_POOL_SEGMENT_ENTRIES,
+                "the rerun linked exactly one segment"
+            );
+            assert!(
+                tids.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "a miss burns no thread id: {tids:?}"
+            );
             return;
         }
         if let ChildStockCase::GroupExit(caller) = case {

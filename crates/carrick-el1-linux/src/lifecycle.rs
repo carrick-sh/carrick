@@ -300,6 +300,13 @@ impl<
             });
         match admission {
             ThreadBirthAdmission::Owned(mut outcome) => {
+                // "Not now" answered within this entry (a capacity miss whose
+                // carrier round completed inline, #2734): the clone reruns,
+                // so its frame goes back onto the syscall instruction, as for
+                // the unmanaged pool's wait below.
+                if matches!(outcome, LifecycleOutcome::Redispatch) {
+                    self.frame.restart_syscall();
+                }
                 self.run_ready_after_native_transfer(&mut outcome);
                 ThreadBirthAdmission::Owned(outcome)
             }
