@@ -2813,7 +2813,7 @@ mod ring_first_tests {
                 HostCrossingSet::Aarch64 => 214,
             }))
         }
-        fn record_refusal(&self, _: usize) {
+        fn record_refusal(&self, _: usize, _: u64) {
             self.refused.fetch_add(1, Ordering::Relaxed);
         }
         fn anonymous(&mut self, _: AnonymousCall) -> FamilyCompletion {
