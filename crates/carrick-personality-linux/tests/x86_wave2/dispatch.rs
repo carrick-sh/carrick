@@ -8,6 +8,7 @@ use carrick_el1_linux::{
     dispatch::{El1PendingFamilies, Zone, dispatch_syscall_with_regions},
     inotify, sched,
 };
+use carrick_test_support::GuestUserBuffer;
 use core::sync::atomic::Ordering;
 
 #[test]
@@ -279,7 +280,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
         doorbell.settled();
     }
     tasks[0].linux.take_served_boundary();
-    let mut buf = [0u8; 16];
+    let buf = GuestUserBuffer::zeroed(16);
     let mut cache_mem = [0u8; 4096];
     let cache_ptr = cache_mem.as_mut_ptr();
     let task_ref = &tasks[0];
@@ -290,7 +291,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
 
     let mut frame_write = TrapFrame::default();
     frame_write.x[0] = 3; // fd
-    frame_write.x[1] = buf.as_mut_ptr() as u64; // buf
+    frame_write.x[1] = buf.arg(); // buf
     frame_write.x[2] = 16; // count
     frame_write.x[8] = 64; // SYS_write
 
@@ -489,10 +490,10 @@ fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
     let path_hash = hash_path(path);
     name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
 
-    let mut path_str = *b"test.txt\0";
+    let path_str = GuestUserBuffer::from_bytes(b"test.txt\0");
     let mut frame_add = TrapFrame::default();
     frame_add.x[0] = 4; // inotify fd
-    frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
+    frame_add.x[1] = path_str.arg(); // pathname
     frame_add.x[2] = 0x01; // IN_ACCESS
     frame_add.x[8] = 27; // inotify_add_watch
 
@@ -522,10 +523,10 @@ fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
 
     // A read of the watched file, served in-guest, queues IN_ACCESS and
     // returns through the host boundary to deliver the owed wake.
-    let mut read_buf = [0u8; 16];
+    let read_buf = GuestUserBuffer::zeroed(16);
     let mut frame_read = TrapFrame::default();
     frame_read.x[0] = 3; // file fd
-    frame_read.x[1] = read_buf.as_mut_ptr() as u64;
+    frame_read.x[1] = read_buf.arg();
     frame_read.x[2] = 16;
     frame_read.x[8] = 63; // read
 
@@ -610,12 +611,12 @@ fn test_two_open_files_share_one_inode_with_independent_offsets() {
         assert_eq!(action, Action::Served, "fd {fd} nr {nr}");
         frame.x[0] as i64
     };
-    let mut hello = *b"hello";
-    assert_eq!(run(3, 64, hello.as_mut_ptr() as u64, 5), 5); // write via fd 3
-    let mut out = [0u8; 5];
+    let hello = GuestUserBuffer::from_bytes(b"hello");
+    assert_eq!(run(3, 64, hello.arg(), 5), 5); // write via fd 3
+    let out = GuestUserBuffer::zeroed(5);
     // fd 4 has its own offset (0) and sees fd 3's bytes.
-    assert_eq!(run(4, 63, out.as_mut_ptr() as u64, 5), 5);
-    assert_eq!(&out, b"hello");
+    assert_eq!(run(4, 63, out.arg(), 5), 5);
+    assert_eq!(out.as_bytes(), b"hello");
     assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 5);
     assert_eq!(open_table[1].offset.load(Ordering::Relaxed), 5);
     assert_eq!(run(3, 62, 1, 0), 1); // lseek fd 3 to 1 leaves fd 4 at 5
@@ -672,10 +673,10 @@ fn test_inotify_add_watch_write_rm_watch_read_served() {
     let path_hash = hash_path(path);
     name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
 
-    let mut path_str = *b"test.txt\0";
+    let path_str = GuestUserBuffer::from_bytes(b"test.txt\0");
     let mut frame_add = TrapFrame::default();
     frame_add.x[0] = 4; // inotify fd
-    frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
+    frame_add.x[1] = path_str.arg(); // pathname
     frame_add.x[2] = 0x02; // IN_MODIFY
     frame_add.x[8] = 27; // inotify_add_watch
 
@@ -702,10 +703,10 @@ fn test_inotify_add_watch_write_rm_watch_read_served() {
     assert!(object_table[0].has_marks());
 
     // 2. write to file should be served at EL1 and enqueue IN_MODIFY
-    let mut write_buf = [0x55u8; 16];
+    let write_buf = GuestUserBuffer::from_bytes(&[0x55u8; 16]);
     let mut frame_write = TrapFrame::default();
     frame_write.x[0] = 3; // file fd
-    frame_write.x[1] = write_buf.as_mut_ptr() as u64;
+    frame_write.x[1] = write_buf.arg();
     frame_write.x[2] = 16;
     frame_write.x[8] = 64; // write
 
@@ -751,10 +752,10 @@ fn test_inotify_add_watch_write_rm_watch_read_served() {
     assert_eq!(inotify_table[0].queued_bytes.load(Ordering::Relaxed), 32); // IN_MODIFY + IN_IGNORED
 
     // 4. read from inotify fd should be served at EL1 and drain 2 events (32 bytes)
-    let mut read_buf = [0u8; 64];
+    let read_buf = GuestUserBuffer::zeroed(64);
     let mut frame_read = TrapFrame::default();
     frame_read.x[0] = 4; // inotify fd
-    frame_read.x[1] = read_buf.as_mut_ptr() as u64;
+    frame_read.x[1] = read_buf.arg();
     frame_read.x[2] = 64;
     frame_read.x[8] = 63; // read
 
@@ -802,10 +803,10 @@ fn test_inotify_cache_miss_forwards() {
 
     let name_cache = InotifyNameCache::new(); // empty name cache -> miss!
 
-    let mut path_str = *b"unknown.txt\0";
+    let path_str = GuestUserBuffer::from_bytes(b"unknown.txt\0");
     let mut frame = TrapFrame::default();
     frame.x[0] = 4;
-    frame.x[1] = path_str.as_mut_ptr() as u64;
+    frame.x[1] = path_str.arg();
     frame.x[2] = 0x02; // IN_MODIFY
     frame.x[8] = 27; // inotify_add_watch
 

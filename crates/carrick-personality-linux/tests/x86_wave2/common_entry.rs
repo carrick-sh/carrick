@@ -390,11 +390,11 @@ fn two_tasks_publish_only_their_own_robust_heads() {
 fn x86_block_pending_unblock_owes_work_before_return() {
     const SIGUSR1_BIT: u64 = 1 << 9;
     let w = World::new(LifecycleHatches::ON);
-    let set = Box::new(SIGUSR1_BIT);
+    let set = carrick_test_support::GuestUserValue::new(SIGUSR1_BIT);
     let sigprocmask = |how| NativeFrame {
         rax: 14,
         rdi: how,
-        rsi: (&*set as *const u64) as u64,
+        rsi: set.arg(),
         r10: 8,
         rsp: 0x7fff_0000,
         ..Default::default()
