@@ -2640,7 +2640,7 @@ enum ChildCrossingGapKind {
 /// entry is the live ceiling. Lowering is automatic: the witness fails while
 /// the table is shorter than the ceiling, so the same change that serves a
 /// crossing removes its row and lowers the ceiling.
-const CHILD_CROSSING_GAP_CEILING: usize = 34;
+const CHILD_CROSSING_GAP_CEILING: usize = 30;
 const CHILD_CROSSING_GAP_ADMISSIONS: &[(usize, IssueNumber, &str)] = &[(
     CHILD_CROSSING_GAP_CEILING,
     IssueNumber(2581),
@@ -2741,6 +2741,9 @@ fn oracle_comparison(name: &str) -> OracleComparison {
     match name {
         "getcwd" => OracleComparison::SuccessOrSameErrno("length of a run-specific cwd path"),
         "readlinkat" => OracleComparison::SuccessOrSameErrno("length of the run-specific exe path"),
+        "times" => {
+            OracleComparison::SuccessOrSameErrno("clock ticks since an arbitrary past point")
+        }
         "getdents64" => {
             OracleComparison::SuccessOrSameErrno("record sizes depend on the directory")
         }

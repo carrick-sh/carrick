@@ -2764,6 +2764,19 @@ impl Cpl0Carrier {
         self.custody.fixture_publish_exec_successor(successor)
     }
 
+    /// What the Exec service would reserve for `image` on this carrier: its
+    /// demand once the service has attached this carrier's vvar and vDSO.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_staged_exec_demand(
+        &self,
+        image: carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
+    ) -> Result<
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::ImageFrameDemand,
+        carrick_abi::LinuxErrno,
+    > {
+        self.custody.fixture_staged_exec_demand(image)
+    }
+
     /// Hold all but `left` fork-stock tables, as a live holder would.
     #[cfg(feature = "test-fixtures")]
     pub fn fixture_hold_fork_stock(
