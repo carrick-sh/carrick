@@ -250,7 +250,9 @@ extern "C" fn carrick_progress_interrupt(
             addr_of_mut!((*active).xsave),
             1,
         );
-        *zone().record(record).ctx_mut() = park_native_context(&*active);
+        // A timer save names the interrupted instruction.
+        *zone().record(record).ctx_mut() =
+            park_native_context(&*active, carrick_sched_core::SavedSyscallPc::AtSyscall);
     }
     // SAFETY: single fixture vCPU with IF=0; `turns` is not borrowed.
     let turn = unsafe { addr_of!((*state).turns).read() } as usize;

@@ -1,6 +1,6 @@
 //! Shared CPL0 parked-context ABI. Machine conversion belongs to the ISA leaf.
 
-use carrick_guest_arch::{AddressContext, RootGpa};
+use carrick_guest_arch::{AddressContext, RootGpa, SavedSyscallPc};
 
 /// The zero-valid x86 save area in a shared scheduler record.
 /// Its frame words are the fifteen PUSH registers followed by IRET's five.
@@ -20,7 +20,11 @@ pub struct ParkedContextWords {
     generation: u64,
     pub fs_base: u64,
     pub gs_base: u64,
-    _xsave_align: [u8; 56],
+    /// Where RIP sits relative to the syscall that saved it (#2851): a
+    /// SYSCALL entry saves the instruction after `SYSCALL`; an interrupt or a
+    /// fault saves the interrupted instruction, which is never rewound.
+    saved_syscall_pc: u64,
+    _xsave_align: [u8; 48],
     pub xsave: [u8; X86_XSAVE_BYTES],
 }
 
@@ -99,7 +103,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ParkedContextWords, generation) == 176);
     assert!(core::mem::offset_of!(ParkedContextWords, fs_base) == 184);
     assert!(core::mem::offset_of!(ParkedContextWords, gs_base) == 192);
-    assert!(core::mem::offset_of!(ParkedContextWords, _xsave_align) == 200);
+    assert!(core::mem::offset_of!(ParkedContextWords, saved_syscall_pc) == 200);
+    assert!(core::mem::offset_of!(ParkedContextWords, _xsave_align) == 208);
     assert!(core::mem::offset_of!(ParkedContextWords, xsave) == 256);
     assert!(core::mem::size_of::<ParkedContextWords>() == 1088);
     assert!(core::mem::align_of::<ParkedContextWords>() == 64);
@@ -113,11 +118,14 @@ impl ParkedContextWords {
         generation: 0,
         fs_base: 0,
         gs_base: 0,
-        _xsave_align: [0; 56],
+        saved_syscall_pc: 0,
+        _xsave_align: [0; 48],
         xsave: [0; X86_XSAVE_BYTES],
     };
 
     /// The caller holds the record's claim while publishing this typed owner.
+    /// A new image or a SYSCALL save names the instruction after `SYSCALL`;
+    /// an interrupt or fault save replaces it with [`Self::replace_saved_pc`].
     pub fn from_parts(
         frame: [u64; 20],
         address: AddressContext<RootGpa>,
@@ -132,8 +140,32 @@ impl ParkedContextWords {
             generation: address.generation.raw().get(),
             fs_base,
             gs_base,
-            _xsave_align: [0; 56],
+            saved_syscall_pc: Self::encode_saved_syscall_pc(SavedSyscallPc::AfterSyscall),
+            _xsave_align: [0; 48],
             xsave,
+        }
+    }
+
+    const fn encode_saved_syscall_pc(position: SavedSyscallPc) -> u64 {
+        match position {
+            SavedSyscallPc::AfterSyscall => 0,
+            SavedSyscallPc::AtSyscall => 1,
+        }
+    }
+
+    /// Replace the saved RIP and its syscall-relative meaning together.
+    pub fn replace_saved_pc(&mut self, rip: u64, position: SavedSyscallPc) {
+        self.frame[15] = rip;
+        self.saved_syscall_pc = Self::encode_saved_syscall_pc(position);
+    }
+
+    /// Interpret the position stored with this exact saved context; `None`
+    /// is a corrupt record.
+    pub fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
+        match self.saved_syscall_pc {
+            0 => Some(SavedSyscallPc::AfterSyscall),
+            1 => Some(SavedSyscallPc::AtSyscall),
+            _ => None,
         }
     }
 
@@ -178,7 +210,10 @@ impl ParkedContextWords {
     pub fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
         let mut frame = self.frame;
         frame[10] = 0; // RAX in the ISA-owned interrupt save order.
-        Self::from_parts(frame, address, self.fs_base, self.gs_base, self.xsave)
+        Self {
+            saved_syscall_pc: self.saved_syscall_pc,
+            ..Self::from_parts(frame, address, self.fs_base, self.gs_base, self.xsave)
+        }
     }
 
     pub fn set_syscall_return(&mut self, value: u64) {
@@ -238,8 +273,18 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     fn syscall_return(&self) -> u64 {
         ParkedContextWords::syscall_return(self)
     }
+    /// Only a RIP after `SYSCALL` moves: a context already at its `SYSCALL`
+    /// (rewound once, or interrupted before the instruction ran) keeps it.
     fn restart_syscall(&mut self) {
-        self.frame[15] = self.frame[15].wrapping_sub(carrick_guest_arch::X86_64_SYSCALL_LEN);
+        if self.saved_syscall_pc() == Some(SavedSyscallPc::AfterSyscall) {
+            self.replace_saved_pc(
+                self.frame[15].wrapping_sub(carrick_guest_arch::X86_64_SYSCALL_LEN),
+                SavedSyscallPc::AtSyscall,
+            );
+        }
+    }
+    fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
+        ParkedContextWords::saved_syscall_pc(self)
     }
 }
 
@@ -322,6 +367,26 @@ mod anonymous_restart_tests {
         words.restart_syscall();
         assert_eq!(words.frame[15], 0x428bb5);
         assert_eq!(words.syscall_return(), 0x1c);
+    }
+
+    #[test]
+    fn an_interrupted_context_is_never_rewound() {
+        use carrick_guest_arch::SavedSyscallPc;
+        let mut words = super::ParkedContextWords::ZERO;
+        words.replace_saved_pc(0x401234, SavedSyscallPc::AtSyscall);
+        words.restart_syscall();
+        assert_eq!(words.frame[15], 0x401234);
+        let child = words.fork_child(carrick_guest_arch::AddressContext {
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                0x6000,
+            ))
+            .unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(2).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(
+                core::num::NonZeroU64::new(1).unwrap(),
+            ),
+        });
+        assert_eq!(child.saved_syscall_pc(), Some(SavedSyscallPc::AtSyscall));
     }
 }
 

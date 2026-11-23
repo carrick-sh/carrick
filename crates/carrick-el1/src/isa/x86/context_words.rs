@@ -13,8 +13,11 @@ use crate::isa::x86::context::native;
 #[allow(dead_code)] // Host unit tests use only native context records.
 pub(crate) mod scheduler;
 
-pub fn from_native(context: &scheduler::NativeContext) -> ParkedContextWords {
-    scheduler::park_native_context(context)
+pub fn from_native(
+    context: &scheduler::NativeContext,
+    position: carrick_sched_core::SavedSyscallPc,
+) -> ParkedContextWords {
+    scheduler::park_native_context(context, position)
 }
 
 pub fn into_native(
@@ -157,7 +160,7 @@ mod tests {
     fn syscall_conversion_preserves_register_order_tls_and_early_xsave() {
         let (frame, address, xsave) = syscall_fixture();
         let context = from_syscall(&frame, address, 0x4000, 0x5000, &xsave).unwrap();
-        let words = from_native(&context);
+        let words = from_native(&context, carrick_sched_core::SavedSyscallPc::AfterSyscall);
         assert_eq!(
             words.frame,
             [
@@ -247,7 +250,7 @@ mod tests {
             irq.frame
         );
         for (word, value) in [(16, 8), (19, 16)] {
-            let mut words = from_native(&context);
+            let mut words = from_native(&context, carrick_sched_core::SavedSyscallPc::AfterSyscall);
             words.frame[word] = value;
             let invalid = scheduler::NativeContext {
                 frame: scheduler::InterruptFrame {
@@ -302,7 +305,7 @@ mod tests {
             gs_base: 0x5000,
             xsave,
         };
-        let words = from_native(&native);
+        let words = from_native(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall);
         let restored = into_native(words, expected).unwrap();
         assert_eq!(restored.frame, native.frame);
         assert_eq!(restored.address, native.address);

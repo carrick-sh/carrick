@@ -875,10 +875,13 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     fn set_user_stack(&mut self, stack: u64);
     fn set_syscall_return(&mut self, value: u64);
     /// Restore the syscall instruction PC while preserving all arguments.
+    /// A context whose PC already names the instruction keeps it: a saved
+    /// syscall may be rerun more than once before it executes (#2851).
     fn restart_syscall(&mut self);
-    fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
-        Some(SavedSyscallPc::AfterSyscall)
-    }
+    /// Where the saved PC sits; `None` is a corrupt record. Each context
+    /// stores its own: a default would claim `AfterSyscall` for a context
+    /// already at its syscall instruction.
+    fn saved_syscall_pc(&self) -> Option<SavedSyscallPc>;
     fn with_syscall_return(mut self, value: u64) -> Self {
         self.set_syscall_return(value);
         self
