@@ -158,6 +158,9 @@ pub(crate) fn run_debug(
                 export_loader_spans.as_deref(),
             )?;
         }
+        DebugCommand::SoftRun { .. } => {
+            bail!("debug soft-run needs a Linux arm64 host (the soft AArch64 CPU's block runner)");
+        }
         DebugCommand::El1Census {
             inputs,
             limit,

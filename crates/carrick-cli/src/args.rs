@@ -1095,6 +1095,32 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         export_loader_spans: Option<PathBuf>,
     },
+    /// Run one AArch64 Linux process from a rootfs directory on the soft
+    /// AArch64 CPU, through the production EL1 image and kernel dispatcher
+    /// (diagnostics; the soft-a64 provider of `debug discover`). The command
+    /// is searched in the guest `PATH` inside the rootfs; the exit status is
+    /// the guest's. `CARRICK_EL1_CENSUS=<directory>` publishes its census.
+    /// Needs a Linux arm64 host.
+    SoftRun {
+        /// The guest's root: an extracted, immutable rootfs directory.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// The linked production EL1 ELF (default `CARRICK_A64_ELF`).
+        #[arg(long)]
+        el1_elf: Option<PathBuf>,
+        /// A guest environment entry, `KEY=VALUE` (repeat the flag).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Syscalls the run may dispatch before it is a carrier error.
+        #[arg(long, default_value_t = 10_000_000)]
+        max_syscalls: usize,
+        /// Also write the run's summary as JSON here.
+        #[arg(long)]
+        summary_out: Option<PathBuf>,
+        /// The guest command and its arguments.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
     /// syscall class, host services and their thread CPU, continuation
