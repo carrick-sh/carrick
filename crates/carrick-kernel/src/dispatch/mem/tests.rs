@@ -1678,7 +1678,10 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
         .overlay
         .set_file_contents(PATH, Vec::new())
         .expect("create shared overlay inode");
-    let install_snapshot = |fd| {
+    // The mapper's description is read-only: a writable shared mapping of a
+    // file with no live host view is fenced (#1338 C1), while a read-only
+    // one keeps the snapshot this test pins.
+    let install_snapshot = |fd, access| {
         dispatcher
             .captured_file_table()
             .write_open_files(None)
@@ -1686,7 +1689,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
                 fd,
                 OpenFile::from_open_description_with_status_flags(
                     std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                        base: OpenDescriptionBase::new(access),
                         path: PATH.into(),
                         metadata: RootFsMetadata {
                             path: PATH.into(),
@@ -1696,15 +1699,15 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
                         },
                         contents: FileContents::dense(Vec::new()),
                         offset: 0,
-                        writable: true,
+                        writable: access == crate::linux_abi::LINUX_O_RDWR,
                     })),
-                    crate::linux_abi::LINUX_O_RDWR,
+                    access,
                     0,
                 ),
             );
     };
-    install_snapshot(WRITER_FD);
-    install_snapshot(MAPPER_FD);
+    install_snapshot(WRITER_FD, crate::linux_abi::LINUX_O_RDWR);
+    install_snapshot(MAPPER_FD, crate::linux_abi::LINUX_O_RDONLY);
 
     let registry =
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1299));
@@ -1773,7 +1776,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
             SyscallArgs([
                 0,
                 FILE_LEN,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_PROT_READ,
                 LINUX_MAP_SHARED,
                 MAPPER_FD as u64,
                 0,
