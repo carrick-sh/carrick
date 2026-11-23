@@ -1806,12 +1806,21 @@ fn serve_delegated_anonymous_attempt<
             let _ = pending.cancel(model);
             forward(why)
         };
-    let (Some(grant), Some(owner)) = (
-        spaces.grant(index, mm_key),
-        frame
-            .slot()
-            .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
-    ) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
+        return refuse(pending, &mut model, Leave::NoGrant);
+    };
+    let Some(grant) = spaces.grant(index, mm_key) else {
+        // A raised gate is a host page-table pause of this live space: "not
+        // now", like the editor admission's `Gate` below. Park on the gate's
+        // release (the reprobe re-reads it through the editor admission);
+        // only a closed or re-keyed entry has no grant to wait for.
+        if spaces.table().installed_grant(index, mm_key).is_some() {
+            let _ = pending.cancel(&mut model);
+            return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
+        }
         return refuse(pending, &mut model, Leave::NoGrant);
     };
     let _editor_guard =
