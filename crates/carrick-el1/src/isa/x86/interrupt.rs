@@ -249,20 +249,9 @@ impl ShootdownReceipt {
 #[cold]
 #[inline(never)]
 pub fn fatal_unacknowledged_shootdown(cpu: u32, root: u64, generation: u64) -> ! {
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            "2: hlt",
-            "jmp 2b",
-            in("dx") super::context::native::FATAL_PORT,
-            in("rax") carrick_el1_abi::PANIC_SENTINEL,
-            in("rsi") (u64::from(cpu) << 32) | (generation & 0xffff_ffff),
-            in("rdi") root,
-            options(noreturn)
-        );
-    }
-    #[cfg(not(target_os = "none"))]
+    // A ring panic: the CPL0 panic handler publishes this message and its
+    // location, and the host adds the stopped CPU's ring return addresses
+    // (the operation that waited). A bare fatal-port exit carried neither.
     panic!("fatal: shootdown ack never arrived for cpu {cpu}, root {root:#x}, gen {generation}");
 }
 
