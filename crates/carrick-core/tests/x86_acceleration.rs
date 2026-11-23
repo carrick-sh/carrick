@@ -1424,6 +1424,116 @@ mod fork_cow {
             "the rerun publishes the child's tables"
         );
     }
+
+    /// Live words where, at the fork's first swap of `trigger_pa`, other CPUs'
+    /// walkers set bits on several words at once: a read of a leaf the fork
+    /// already armed (Accessed), and a write through the next leaf before its
+    /// swap (Accessed and Dirty).
+    struct WalkersRacedWords {
+        inner: TestMemory,
+        trigger_pa: u64,
+        marks: Vec<(u64, u64)>,
+        raced: AtomicBool,
+    }
+
+    impl LiveDescriptorWords for WalkersRacedWords {
+        fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+            self.inner.load(pa)
+        }
+
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, DescriptorRefusal> {
+            if pa == self.trigger_pa && !self.raced.swap(true, Ordering::SeqCst) {
+                for (marked, bits) in &self.marks {
+                    let word = self.inner.load(*marked)?;
+                    self.inner.store(*marked, word | bits);
+                }
+            }
+            self.inner.compare_exchange(pa, before, after)
+        }
+
+        fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+            self.inner.store_unlinked(pa, value)
+        }
+
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {}
+    }
+
+    /// #2919 review P0-2: the rollback of a refused publish must undo a leaf it
+    /// already armed even after the walker set Accessed on it (the armed leaf
+    /// stays present and user-readable). A rollback that demands the exact word
+    /// it stored fails as `Core`: the service quarantines (EIO) and the CPU's
+    /// fork loan is stranded. Two leaves, so the rollback has an applied edit.
+    #[test]
+    fn x86_fork_publish_rollback_undoes_an_armed_leaf_the_walker_marked_accessed() {
+        let request = sample_request(5);
+        let first_leaf = 0x10_3000;
+        let second_leaf = 0x10_3008;
+        let words = WalkersRacedWords {
+            inner: TestMemory::new(),
+            trigger_pa: second_leaf,
+            marks: vec![(first_leaf, ACCESSED), (second_leaf, ACCESSED | DIRTY)],
+            raced: AtomicBool::new(false),
+        };
+        let root_pa = 0x10_0000;
+        let leaf0 = 0x10_4000 | PRESENT | WRITE | USER;
+        let leaf1 = 0x10_5000 | PRESENT | WRITE | USER;
+        words
+            .inner
+            .store(root_pa, 0x10_1000 | PRESENT | WRITE | USER);
+        words
+            .inner
+            .store(0x10_1000, 0x10_2000 | PRESENT | WRITE | USER);
+        words
+            .inner
+            .store(0x10_2000, 0x10_3000 | PRESENT | WRITE | USER);
+        words.inner.store(first_leaf, leaf0);
+        words.inner.store(second_leaf, leaf1);
+        let parent_root = TestParentRoot {
+            incarnation: 1,
+            generation: ReservationGeneration::new(5).unwrap(),
+            sequence: 1,
+            ready: true,
+            authorized: true,
+            finished: false,
+        };
+        let child_root = TestChildRoot {
+            incarnation: 1,
+            admitted: false,
+            authorized: true,
+            origin: None,
+            finished: false,
+            retired: Arc::new(AtomicBool::new(false)),
+        };
+
+        let fork = prepare_private_leaf_fork(&words.inner, request, root_pa);
+        let position = |pa| fork.scratch.edits.iter().position(|edit| edit.pa == pa);
+        let (Some(armed_first), Some(armed_second)) = (position(first_leaf), position(second_leaf))
+        else {
+            panic!("the fork arms both parent leaves for COW");
+        };
+        assert!(
+            armed_first < armed_second,
+            "the first leaf is armed before the second one's swap fails"
+        );
+        assert_eq!(
+            fork.publish(&words, parent_root, child_root, sample_child_handle(20))
+                .err(),
+            Some(ForkError::ParentChanged),
+            "a walker-marked armed leaf is still the fork's edit: contention, never Core"
+        );
+        assert_eq!(
+            words.load(first_leaf).unwrap(),
+            leaf0 | ACCESSED,
+            "the rollback restores the armed leaf and keeps the walker's Accessed"
+        );
+        assert_eq!(words.load(second_leaf).unwrap(), leaf1 | ACCESSED | DIRTY);
+    }
 }
 
 struct FailGrantStore<'a, W> {
