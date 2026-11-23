@@ -725,9 +725,25 @@ impl<
             use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
             let window = match prepared.select_backing_window(grant.ttbr0, window) {
                 Ok(window) => window,
-                // The page was published since this selection translated it.
+                // The page's own descriptor is in use: an inherited prepared
+                // output that is not valid yet, or a leaf this access cannot
+                // use. This editor excludes a racing publication, so it is
+                // not contention. The supplier resolves that page from its
+                // custody; ask for the page alone, with no neighbour.
                 Err(DescriptorRefusal::AlreadyValid | DescriptorRefusal::Occupied) => {
-                    return Err(pending.map_or(MmError::Busy, MmError::Wait));
+                    let page = window.fault_page;
+                    carrick_core_abi::PortalGrantWindow {
+                        range: ReservationRange::new(page, page + 4096).ok_or(MmError::Invalid)?,
+                        host_backing: match window.host_backing {
+                            Some(source) => Some(
+                                source
+                                    .advance(page - window.range.start())
+                                    .ok_or(MmError::Invalid)?,
+                            ),
+                            None => None,
+                        },
+                        ..window
+                    }
                 }
                 // This venue reads no live descriptors: its supplier checks.
                 Err(_) => window,
