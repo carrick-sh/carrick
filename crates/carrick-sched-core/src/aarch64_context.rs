@@ -116,19 +116,12 @@ impl Aarch64ParkedContext {
     /// Replace the architectural PC and its syscall-relative meaning together.
     pub fn replace_saved_pc(&mut self, pc: u64, position: SavedSyscallPc) {
         self.native.pc = pc;
-        self.saved_syscall_pc = match position {
-            SavedSyscallPc::AfterSyscall => 0,
-            SavedSyscallPc::AtSyscall => 1,
-        };
+        self.saved_syscall_pc = position.word();
     }
 
     /// Interpret the position stored with this exact saved context.
     pub fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
-        match self.saved_syscall_pc {
-            0 => Some(SavedSyscallPc::AfterSyscall),
-            1 => Some(SavedSyscallPc::AtSyscall),
-            _ => None,
-        }
+        SavedSyscallPc::from_word(self.saved_syscall_pc)
     }
 
     /// Lower retained owner custody to the same native entry instruction.

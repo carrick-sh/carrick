@@ -75,10 +75,13 @@ pub fn from_syscall(
 
 /// Recover a syscall frame from its exact retained address owner.
 /// The independent user GPR slots retain IRQ RCX/R11 even when they differ
-/// from the return PC/flags.
+/// from the return PC/flags. `position` is where the context's RIP sits:
+/// the frame carries it, so a rerun of the frame never re-derives it
+/// (#2900).
 pub fn syscall_frame_from_native(
     context: &scheduler::NativeContext,
     expected: AddressContext<RootGpa>,
+    position: carrick_sched_core::SavedSyscallPc,
 ) -> Result<native::NativeFrame, ArchError> {
     if context.address != expected || !context.frame.valid_user_return() {
         return Err(ArchError::InvalidContext);
@@ -104,6 +107,7 @@ pub fn syscall_frame_from_native(
         rsp: context.frame.rsp,
         user_rcx: gpr(Gpr::Rcx),
         user_r11: gpr(Gpr::R11),
+        syscall_position: carrick_guest_arch::SavedSyscallPcWord::new(position),
     })
 }
 
@@ -143,6 +147,7 @@ mod tests {
             rsp: 0x8000,
             user_rcx: 0x1234,
             user_r11: 0x302,
+            syscall_position: Default::default(),
         };
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
@@ -171,7 +176,17 @@ mod tests {
         assert_eq!((words.fs_base, words.gs_base), (0x4000, 0x5000));
         assert_eq!(words.xsave, xsave.0);
         let restored = into_native(words, address).unwrap();
-        let returned = syscall_frame_from_native(&restored, address).unwrap();
+        let returned = syscall_frame_from_native(
+            &restored,
+            address,
+            carrick_sched_core::SavedSyscallPc::AtSyscall,
+        )
+        .unwrap();
+        assert_eq!(
+            returned.syscall_position.get(),
+            Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+            "the frame carries the restored context's position"
+        );
         assert_eq!(
             [
                 returned.r15,
@@ -233,14 +248,20 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                syscall_frame_from_native(&context, expected),
+                syscall_frame_from_native(
+                    &context,
+                    expected,
+                    carrick_sched_core::SavedSyscallPc::AfterSyscall
+                ),
                 Err(ArchError::InvalidContext)
             ));
         }
         let mut irq = context.clone();
         irq.frame.gpr[6] = 0x56789;
         irq.frame.gpr[11] = 0x12345;
-        let returned = syscall_frame_from_native(&irq, address).unwrap();
+        let returned =
+            syscall_frame_from_native(&irq, address, carrick_sched_core::SavedSyscallPc::AtSyscall)
+                .unwrap();
         assert_eq!(returned.user_rcx, 0x12345);
         assert_eq!(returned.user_r11, 0x56789);
         assert_eq!(
@@ -264,7 +285,11 @@ mod tests {
                 ..context.clone()
             };
             assert!(matches!(
-                syscall_frame_from_native(&invalid, address),
+                syscall_frame_from_native(
+                    &invalid,
+                    address,
+                    carrick_sched_core::SavedSyscallPc::AfterSyscall
+                ),
                 Err(ArchError::InvalidContext)
             ));
         }
@@ -276,6 +301,70 @@ mod tests {
         effects: OwnedObjectWakeEffects<'_, ParkedContextWords>,
     ) {
         let _ = effects.deliver_handbacks(&mut |_| {});
+    }
+
+    /// #2900: the syscall position travels with the frame through every
+    /// conversion the return checkpoint and the resume path make, for each
+    /// entry kind. A context built from a frame takes the frame's position,
+    /// and a frame built from a context takes the context's, so a rerun of
+    /// either rewinds only a PC that is after its `SYSCALL`, and only once.
+    #[test]
+    fn syscall_position_travels_with_the_frame_for_each_entry_kind() {
+        use carrick_guest_arch::{ProcessContext, SyscallReturnFrame};
+        use carrick_sched_core::SavedSyscallPc::{AfterSyscall, AtSyscall};
+        let (trapped, address, xsave) = syscall_fixture();
+        let save = |frame: &native::NativeFrame| {
+            from_native(
+                &from_syscall(frame, address, 0, 0, &xsave).unwrap(),
+                frame.syscall_position().unwrap(),
+            )
+        };
+        let restore = |words: ParkedContextWords| {
+            syscall_frame_from_native(
+                &into_native(words, address).unwrap(),
+                address,
+                words.saved_syscall_pc().unwrap(),
+            )
+            .unwrap()
+        };
+        // A fresh trap: the entry assembly's zero word, after its SYSCALL.
+        assert_eq!(trapped.syscall_position(), Some(AfterSyscall));
+        let words = save(&trapped);
+        assert_eq!(
+            (words.user_rip(), words.saved_syscall_pc()),
+            (0x1234, Some(AfterSyscall))
+        );
+        // Parked at the boundary: a frame rewound in place is saved at its
+        // SYSCALL, and its resumed frame stays there however often it reruns.
+        let mut rewound = trapped;
+        assert_eq!(rewound.rewind_to_syscall(), Some(0x1232));
+        let mut words = save(&rewound);
+        assert_eq!(
+            (words.user_rip(), words.saved_syscall_pc()),
+            (0x1232, Some(AtSyscall))
+        );
+        words.restart_syscall();
+        let mut resumed = restore(words);
+        assert_eq!(
+            (resumed.rcx, resumed.syscall_position()),
+            (0x1232, Some(AtSyscall))
+        );
+        assert_eq!(resumed.rewind_to_syscall(), Some(0x1232));
+        assert_eq!(
+            (resumed.rax, resumed.rdi, resumed.rsi),
+            (trapped.rax, trapped.rdi, trapped.rsi)
+        );
+        // A handler entry and a sigreturn-restored RIP are resume points,
+        // which the signal codec writes with their position.
+        for pc in [0x5000, 0x1232, 0x1234] {
+            let mut entered = trapped;
+            entered.replace_return_pc(pc, AtSyscall);
+            let mut words = save(&entered);
+            assert_eq!(words.saved_syscall_pc(), Some(AtSyscall));
+            words.restart_syscall();
+            assert_eq!(words.user_rip(), pc, "a resume point is never rewound");
+            assert_eq!(restore(words).syscall_pc(), Some(pc));
+        }
     }
 
     #[test]

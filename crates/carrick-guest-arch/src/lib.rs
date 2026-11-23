@@ -893,34 +893,134 @@ impl SavedSyscallPc {
             Self::AtSyscall => Some(pc),
         }
     }
+
+    /// The word a saved context or native frame stores for this position.
+    /// Zero, which entry assembly pushes for a fresh trap, is `AfterSyscall`.
+    pub const fn word(self) -> u64 {
+        match self {
+            Self::AfterSyscall => 0,
+            Self::AtSyscall => 1,
+        }
+    }
+
+    /// Interpret a stored position word; `None` is a corrupt record.
+    pub const fn from_word(word: u64) -> Option<Self> {
+        match word {
+            0 => Some(Self::AfterSyscall),
+            1 => Some(Self::AtSyscall),
+            _ => None,
+        }
+    }
 }
 
-/// The ISA mechanics of a trapped syscall's return frame that rerunning
-/// the call needs. Where the PC sits is the context's to say, never the
-/// frame's: see [`rerun_interrupted_syscall`].
-pub trait SyscallReturnFrame {
+/// A [`SavedSyscallPc`] stored in a machine frame beside its PC (#2900).
+/// Any bit pattern is a valid value, so entry assembly and host readers may
+/// copy the word; only [`Self::get`] interprets it.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SavedSyscallPcWord(u64);
+
+impl SavedSyscallPcWord {
+    pub const fn new(position: SavedSyscallPc) -> Self {
+        Self(position.word())
+    }
+
+    /// The stored position; `None` is a corrupt word.
+    pub const fn get(self) -> Option<SavedSyscallPc> {
+        SavedSyscallPc::from_word(self.0)
+    }
+}
+
+/// The ISA register mechanics of a trapped syscall's return frame that
+/// rerunning the call needs. Where the PC sits is never these registers' to
+/// say: see [`SyscallReturnFrame`].
+pub trait SyscallReturnRegisters {
     /// Bytes from the syscall instruction to the return PC its trap saves.
     const SYSCALL_LEN: u64;
     fn return_pc(&self) -> u64;
-    /// Resume at `pc` with `entry_word` back in the register that carries
-    /// both the call's entry value and its result.
-    fn resume_at(&mut self, pc: u64, entry_word: u64);
+    fn set_return_pc(&mut self, pc: u64);
+    /// Put `entry_word` back in the register that carries both the call's
+    /// entry value and its result.
+    fn set_entry_word(&mut self, entry_word: u64);
 }
 
-/// Point `frame`, whose PC sits where `original` records, back at
-/// `original`'s syscall instruction with its entry word restored. A PC
-/// already at the instruction is never rewound again (#2872). Returns the
-/// frame's new position, or `None` (frame untouched) for a corrupt position
-/// or an underflowing PC.
+/// A return frame together with where its PC sits relative to its syscall
+/// instruction. The position travels with the frame and is set wherever the
+/// PC is: a fresh trap is after its instruction, a rewind, a sigreturn, a
+/// handler entry or a context resumed at its instruction is at its resume
+/// point (#2900). Every rewind reads it here and never infers it.
+pub trait SyscallReturnFrame: SyscallReturnRegisters {
+    /// Where the return PC sits; `None` is a corrupt frame.
+    fn syscall_position(&self) -> Option<SavedSyscallPc>;
+    fn set_syscall_position(&mut self, position: SavedSyscallPc);
+
+    /// Replace the return PC and its position together.
+    fn replace_return_pc(&mut self, pc: u64, position: SavedSyscallPc) {
+        self.set_return_pc(pc);
+        self.set_syscall_position(position);
+    }
+
+    /// The PC of this frame's syscall instruction, from the frame's own
+    /// position. `None` is a corrupt position or an underflowing PC.
+    fn syscall_pc(&self) -> Option<u64> {
+        self.syscall_position()?
+            .syscall_instruction(self.return_pc(), Self::SYSCALL_LEN)
+    }
+
+    /// Put the PC on its syscall instruction. A frame already there keeps
+    /// it: a call may be rerun more than once before it executes (#2851).
+    /// Returns the instruction's PC, or `None` (frame untouched).
+    fn rewind_to_syscall(&mut self) -> Option<u64> {
+        let pc = self.syscall_pc()?;
+        self.replace_return_pc(pc, SavedSyscallPc::AtSyscall);
+        Some(pc)
+    }
+}
+
+/// A frame whose machine layout has no position word yet, with the
+/// position its owner tracked beside it, so it reruns through the same
+/// [`SyscallReturnFrame`] code as a frame that carries one.
+pub struct PositionedFrame<'a, F> {
+    pub frame: &'a mut F,
+    pub position: SavedSyscallPc,
+}
+
+impl<F: SyscallReturnRegisters> SyscallReturnRegisters for PositionedFrame<'_, F> {
+    const SYSCALL_LEN: u64 = F::SYSCALL_LEN;
+    fn return_pc(&self) -> u64 {
+        self.frame.return_pc()
+    }
+    fn set_return_pc(&mut self, pc: u64) {
+        self.frame.set_return_pc(pc);
+    }
+    fn set_entry_word(&mut self, entry_word: u64) {
+        self.frame.set_entry_word(entry_word);
+    }
+}
+
+impl<F: SyscallReturnRegisters> SyscallReturnFrame for PositionedFrame<'_, F> {
+    fn syscall_position(&self) -> Option<SavedSyscallPc> {
+        Some(self.position)
+    }
+    fn set_syscall_position(&mut self, position: SavedSyscallPc) {
+        self.position = position;
+    }
+}
+
+/// Point `frame` back at its interrupted syscall instruction with
+/// `original`'s entry word restored. Where the PC sits is the frame's own
+/// position, never the original context's: a frame already at the
+/// instruction is never rewound again (#2872, #2900). `false` (frame
+/// untouched) is a corrupt position or an underflowing PC.
 pub fn rerun_interrupted_syscall<F: SyscallReturnFrame, C: ProcessContext>(
     frame: &mut F,
     original: &C,
-) -> Option<SavedSyscallPc> {
-    let pc = original
-        .saved_syscall_pc()?
-        .syscall_instruction(frame.return_pc(), F::SYSCALL_LEN)?;
-    frame.resume_at(pc, original.syscall_return());
-    Some(SavedSyscallPc::AtSyscall)
+) -> bool {
+    if frame.rewind_to_syscall().is_none() {
+        return false;
+    }
+    frame.set_entry_word(original.syscall_return());
+    true
 }
 
 /// ISA-selected scheduler context operations needed by process birth.
