@@ -3172,6 +3172,18 @@ fn mounted_static_x86_netlink_sockets_match_native() {
     compare_socket_fixture_with_native("x86_local_sockets.c");
 }
 
+/// A mixed readiness wait (#1051), the shape of apt's `http` method: a fork
+/// child's `pselect6` over its stdin pipe (in-zone) and a connected TCP
+/// socket (host) together, while the run root makes the pipe, the socket,
+/// both or neither ready, and once with a `pselect6` mask that holds off a
+/// signal the root sends during the wait. Every line matches the native
+/// run and no caller's `pselect6` is refused. Before the mixed set had an
+/// owner, every such call was a counted ENOSYS for a native process.
+#[test]
+fn mounted_static_x86_mixed_select_matches_native() {
+    compare_socket_fixture_with_native("x86_mixed_select.c");
+}
+
 /// Run a static socket fixture natively and as the mounted x86 root: the
 /// two outputs match, and the census holds no refusal of the socket family
 /// by any caller.
@@ -3204,8 +3216,19 @@ fn compare_socket_fixture_with_native(fixture: &str) {
         &empty_image_archive(),
         Some(&census_dir),
     );
+    // A run that hangs past its deadline writes no census: say what it
+    // printed, against the oracle, rather than only that the census is
+    // missing.
     let census_files: Vec<_> = std::fs::read_dir(&census_dir)
-        .expect("census directory")
+        .unwrap_or_else(|error| {
+            panic!(
+                "census directory: {error}; guest status {:?}\nguest stdout:\n{}\nnative stdout:\n{}\nguest stderr:\n{}",
+                guest.status.code(),
+                String::from_utf8_lossy(&guest.stdout),
+                String::from_utf8_lossy(&native.stdout),
+                String::from_utf8_lossy(&guest.stderr)
+            )
+        })
         .map(|entry| entry.unwrap().path())
         .collect();
     assert_eq!(census_files.len(), 1, "{census_files:?}");
