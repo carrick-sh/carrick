@@ -2060,7 +2060,6 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
                 .resume_context_mut()
                 .replace_saved_pc(saved_pc, position);
             entry.retain_interrupted_syscall().unwrap();
-            use carrick_guest_arch::ProcessContext;
             entry
                 .resume_context_mut()
                 .set_syscall_return(carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64);
