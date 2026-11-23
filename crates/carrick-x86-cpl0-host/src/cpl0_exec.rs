@@ -690,6 +690,39 @@ fn stage_build<F: X86ExecFrames>(
     }
 }
 
+/// The failed steps of returning exec preparations. Every step runs even
+/// after one fails, since a skipped step leaks what it would have returned;
+/// the result is the first failure, naming how many came after it.
+#[derive(Default)]
+struct ReleaseFailures {
+    first: Option<TrapError>,
+    more: usize,
+}
+
+impl ReleaseFailures {
+    fn note(&mut self, step: Result<(), TrapError>) -> bool {
+        let Err(error) = step else {
+            return true;
+        };
+        if self.first.is_none() {
+            self.first = Some(error);
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+        false
+    }
+
+    fn finish<T>(self, value: T) -> Result<T, TrapError> {
+        match (self.first, self.more) {
+            (None, _) => Ok(value),
+            (Some(first), 0) => Err(first),
+            (Some(first), more) => Err(fail(format!(
+                "{first}; and {more} more exec release step(s) failed"
+            ))),
+        }
+    }
+}
+
 /// Return a retained preparation no build has used: its tables to the
 /// stock, its frames to the carrier, and its rows out of the closed root.
 pub fn release_x86_exec<T, C, F>(
@@ -703,34 +736,19 @@ where
     T: ChildAddressTags,
     F: X86ExecFrames,
 {
-    let X86ExecPreparation {
-        request,
-        tables,
-        data,
-        build,
-        ..
-    } = preparation;
-    stock.return_successor_tables(tables);
-    frames.release(data)?;
-    frames.release(build)?;
-    SuccessorRoot {
-        roots,
-        zone,
-        successor: request.successor,
-    }
-    .abort()
-    .map_err(root_fault)?;
-    Ok(request)
+    let mut failures = ReleaseFailures::default();
+    let request = release_x86_exec_steps(preparation, stock, frames, roots, zone, &mut failures);
+    failures.finish(request)
 }
 
-/// Cancel a sealed preparation whose build may have run: zero and return
-/// its tables, and return its data frames and build extent. The successor's
-/// root is the ring's: its exec slot retires it after this crossing.
-pub fn cancel_x86_exec<T, C, F>(
+fn release_x86_exec_steps<T, C, F>(
     preparation: X86ExecPreparation<F::Data>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
-) -> Result<X86ExecRequest, TrapError>
+    roots: &X86Cpl0Reservations,
+    zone: &X86Cpl0Zone,
+    failures: &mut ReleaseFailures,
+) -> X86ExecRequest
 where
     T: ChildAddressTags,
     F: X86ExecFrames,
@@ -742,20 +760,71 @@ where
         build,
         ..
     } = preparation;
-    frames.clear_tables(tables.pages())?;
     stock.return_successor_tables(tables);
-    frames.release(data)?;
-    frames.release(build)?;
-    Ok(request)
+    failures.note(frames.release(data));
+    failures.note(frames.release(build));
+    failures.note(
+        SuccessorRoot {
+            roots,
+            zone,
+            successor: request.successor,
+        }
+        .abort()
+        .map_err(root_fault),
+    );
+    request
+}
+
+/// Cancel a sealed preparation whose build may have run: zero and return
+/// its tables, and return its data frames and build extent. Tables that fail
+/// to clear stay out of the stock, whose pages are zero. The successor's
+/// root is the ring's: its exec slot retires it after this crossing.
+pub fn cancel_x86_exec<T, C, F>(
+    preparation: X86ExecPreparation<F::Data>,
+    stock: &mut ForkStock<T, C>,
+    frames: &mut F,
+) -> Result<X86ExecRequest, TrapError>
+where
+    T: ChildAddressTags,
+    F: X86ExecFrames,
+{
+    let mut failures = ReleaseFailures::default();
+    let request = cancel_x86_exec_steps(preparation, stock, frames, &mut failures);
+    failures.finish(request)
+}
+
+fn cancel_x86_exec_steps<T, C, F>(
+    preparation: X86ExecPreparation<F::Data>,
+    stock: &mut ForkStock<T, C>,
+    frames: &mut F,
+    failures: &mut ReleaseFailures,
+) -> X86ExecRequest
+where
+    T: ChildAddressTags,
+    F: X86ExecFrames,
+{
+    let X86ExecPreparation {
+        request,
+        tables,
+        data,
+        build,
+        ..
+    } = preparation;
+    if failures.note(frames.clear_tables(tables.pages())) {
+        stock.return_successor_tables(tables);
+    }
+    failures.note(frames.release(data));
+    failures.note(frames.release(build));
+    request
 }
 
 /// Apply the exec owner's carrier-exit verdict (#2799) to the rows it retired:
 /// a staged successor's tables, data frames and build extent go back exactly
 /// as a ring cancellation (a sealed row) or a refusal (an unsealed one)
 /// returns them. A claimed or parked row holds no carrier frames. No lane is
-/// left to run the drain again, so a row whose release fails does not keep
-/// the rows after it: every row is released, and the first failure is the
-/// result. Returns the rows retired.
+/// left to run the drain again, so a failed step keeps neither the steps nor
+/// the rows after it: every step of every row runs, and the result is the
+/// first failure with the count of those after it. Returns the rows retired.
 pub fn release_x86_execs_at_carrier_exit<T, C, F, P, A>(
     retired: Vec<ExecRetired<X86ExecPreparation<F::Data>, P, A>>,
     stock: &mut ForkStock<T, C>,
@@ -768,21 +837,18 @@ where
     F: X86ExecFrames,
 {
     let rows = retired.len();
-    let mut first = None;
+    let mut failures = ReleaseFailures::default();
     for row in retired {
         let ExecRetained::Staged(preparation) = row.held else {
             continue;
         };
-        let released = if row.retirement.sealed {
-            cancel_x86_exec(preparation, stock, frames)
+        if row.retirement.sealed {
+            cancel_x86_exec_steps(preparation, stock, frames, &mut failures);
         } else {
-            release_x86_exec(preparation, stock, frames, roots, zone)
-        };
-        if let Err(error) = released {
-            first.get_or_insert(error);
+            release_x86_exec_steps(preparation, stock, frames, roots, zone, &mut failures);
         }
     }
-    first.map_or(Ok(rows), Err)
+    failures.finish(rows)
 }
 
 /// A successor's data frames on the carrier: one private extent, its
