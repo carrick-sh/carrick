@@ -1,0 +1,56 @@
+# #1338 step 2 (design v3, confirmation 7102425065): ring-served MAP_SHARED
+# file mappings as windows onto the host page cache. Red first: on main the
+# x86 ring answers every writable MAP_SHARED mmap ENOSYS, and the ARM
+# dispatcher's snapshot arm loses a MAP_FIXED write. The VM-free bindings
+# cover the neutral window record only; the carrier installs and the
+# mmap, fault, munmap and size-change paths that use it come with PR A.
+schema_version = 1
+id = "kernel.mm.shared-file-window"
+title = "A shared file mapping is a live view of the file in every process"
+guest_surfaces = [
+  "syscall:mmap",
+  "syscall:munmap",
+  "syscall:msync",
+  "syscall:ftruncate",
+  "syscall:truncate",
+  "syscall:fallocate",
+  "syscall:fork",
+]
+semantic_authority = [
+  "man 2 mmap: MAP_SHARED updates are visible to other processes mapping the same region and are carried through to the underlying file; access past the end of the file is SIGBUS",
+  "man 2 msync: MS_SYNC requests an update and waits for it to complete",
+  "man 2 truncate: if the file shrinks, the extra data is lost",
+  "man 2 fork: the child inherits MAP_SHARED mappings, shared with the parent",
+]
+fixture = "embed:carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = """
+Linux: every MAP_SHARED mapping of a file, in any process, reaches the same
+page-cache pages, so a write through one is at once in the file and in every
+other mapping, with or without msync. Carrick serves these mappings as
+windows: a carrier's view of the host file's page cache in fixed 2 MiB
+chunks, with no copy and no write-back state. One neutral record
+(carrick_core::mm::window) decides who reaches a window and which offsets
+may be published: an edge per MM, counted per mapping, so a chunk mapped
+twice keeps its edge until both go; a fault at or past the file's end is
+SIGBUS; a shrink is a state in which faults past the new size park and a
+second size change is Busy until the host result returns the file to Live
+at the new size, or the old one if the host refused. The KVM fixture runs
+the Go linker's sequence, two live processes sharing one writable file
+mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED with msync and a read by path,
+a chunk mapped twice, and a /dev/zero mapping shared with a child, as the
+root and as a forked child, and compares every row with native Linux.
+"""
+
+[bindings]
+vm_free = [
+  "carrick-core::mm::window::tests; the neutral record: per-mapping edges (C3), SIGBUS past EOF, Shrinking parks faults past the new size including from a mapping made mid-shrink, a second size change is Busy, a failed shrink keeps the old size, stale epochs are refused",
+]
+embed = [
+  "carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native (red on main: every writable MAP_SHARED mmap is ENOSYS)",
+]
+
+[bindings.unresolved]
+docker = "Native Linux is the oracle: the KVM test compares each row with a native run of the same fixture."
+embed_timing = "No ratio is claimed until PR B (the ratio row's tuning)."
