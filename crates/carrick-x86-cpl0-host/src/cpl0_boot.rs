@@ -1311,8 +1311,8 @@ pub mod retained_slots;
 )]
 pub enum ForwardBindingRefusal {
     ContextMismatch,
-    /// The registered binding's execution generation is not the one the
-    /// stopped CPU's lifecycle record names.
+    /// The stopped task is the root's leader, and the registered binding's
+    /// execution generation is not the one its lifecycle record names.
     GenerationMismatch {
         stopped: u64,
         registered: u64,
@@ -1322,8 +1322,8 @@ pub enum ForwardBindingRefusal {
 /// Who the stopped execution is in the process whose root it runs on.
 ///
 /// The carrier registers one binding per root, issued to the process leader.
-/// A `CLONE_VM` member shares that root and generation; it is the same
-/// process and never the leader. Serving it is a decision for the forward's
+/// A `CLONE_VM` member shares that root and has its own execution
+/// generation; it is the same process and never the leader. Serving it is a decision for the forward's
 /// caller, made on this type: a member holds none of the leader's host task
 /// authority (#2780).
 #[derive(
@@ -1353,9 +1353,13 @@ struct ForwardExecution {
 
 impl ForwardExecution {
     /// Authenticate the CR3-registered carrier binding against the execution
-    /// the stopped CPU's own lifecycle record names: the address context and
-    /// the execution generation must match. Whether the stopped task is the
-    /// binding's leader is [`Self::subject`], not a refusal: a `CLONE_VM`
+    /// the stopped CPU's own lifecycle record names. The address context
+    /// must match for every subject. The registered execution generation is
+    /// the leader's own (an `execve` advances it), so it authenticates only
+    /// a stopped [`ForwardSubject::Leader`]. A `CLONE_VM` member carries the
+    /// generation of its own birth, which says nothing about the leader's
+    /// (#2832); the address context is what ties it to this image, because
+    /// an `execve` leaves the process on a new MM with one thread. A
     /// member's own control slot issues no authority on the root, so it is
     /// never served as the leader.
     fn authenticate_typed(
@@ -1365,7 +1369,9 @@ impl ForwardExecution {
         if binding.context() != self.context {
             return Err(ForwardBindingRefusal::ContextMismatch);
         }
-        if binding.task().execution.raw().get() != self.binding.generation.raw() {
+        if self.subject() == ForwardSubject::Leader
+            && binding.task().execution.raw().get() != self.binding.generation.raw()
+        {
             return Err(ForwardBindingRefusal::GenerationMismatch {
                 stopped: self.binding.generation.raw(),
                 registered: binding.task().execution.raw().get(),
