@@ -4,16 +4,29 @@
 //! [`run_single_process`](crate::run_single_process) loads one ELF; a parity
 //! row names a command (`pip --version`, `go version`). [`resolve_command`]
 //! finds it the way `execve(2)` and a shell's `PATH` search do, inside the
-//! rootfs: every symlink resolves against the rootfs root (never the host's),
-//! and one `#!` interpreter line is honoured (`#!interpreter [one argument]`,
-//! as `execve(2)` documents). `carrick debug soft-run` and the soft-CPU row
-//! witnesses share it.
+//! rootfs: every path walks through [`walk_rootfs`], with the rootfs as the
+//! process root (symlinks resolve against it, never the host's root, and `..`
+//! stops at it), the execute bit is checked on the command and on its
+//! interpreter (`EACCES`), and one `#!` interpreter line is honoured
+//! (`#!interpreter [one argument]`, as `execve(2)` documents). A failure
+//! carries the status a shell exits with for it
+//! ([`CommandError::exit_status`]). `carrick debug soft-run` and the soft-CPU
+//! row witnesses (and their syscall fixture's path walk) share it.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    fmt, io,
+    path::{Component, Path, PathBuf},
+};
+
+use carrick_abi::{
+    LINUX_EACCES, LINUX_ELOOP, LINUX_ENOENT, LINUX_ENOEXEC, LINUX_ENOTDIR, LinuxErrno,
+};
 
 /// A shell's `PATH` when the environment names none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-/// Symlinks one lookup may follow before it is a loop (Linux's `ELOOP` bound).
+/// Symlinks one walk may follow before it is a loop (Linux's `ELOOP` bound).
 const MAX_SYMLINK_HOPS: usize = 40;
 
 /// The program `execve` would load for an argv, inside a rootfs.
@@ -32,60 +45,142 @@ impl ResolvedCommand {
     }
 }
 
-/// Resolve `guest` (absolute, or relative to `/`) inside `root`, following
-/// every symlink against `root`. Returns the resolved guest path.
-pub fn resolve_guest_path(root: &Path, guest: &str) -> Result<String, String> {
-    let mut pending: Vec<String> = guest.split('/').rev().map(str::to_owned).collect();
-    let mut resolved: Vec<String> = Vec::new();
-    let mut hops = 0usize;
-    while let Some(part) = pending.pop() {
-        match part.as_str() {
-            "" | "." => continue,
-            ".." => {
-                resolved.pop();
-                continue;
-            }
-            _ => {}
-        }
-        let mut host = root.to_path_buf();
-        host.extend(&resolved);
-        host.push(&part);
-        let metadata = std::fs::symlink_metadata(&host).map_err(|error| {
-            format!(
-                "{guest}: /{} not in the rootfs: {error}",
-                resolved_join(&resolved, &part)
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            hops += 1;
-            if hops > MAX_SYMLINK_HOPS {
-                return Err(format!(
-                    "{guest}: more than {MAX_SYMLINK_HOPS} symlinks (ELOOP)"
-                ));
-            }
-            let target = std::fs::read_link(&host)
-                .map_err(|error| format!("read symlink {}: {error}", host.display()))?;
-            let target = target
-                .to_str()
-                .ok_or_else(|| format!("{}: symlink target is not UTF-8", host.display()))?;
-            if target.starts_with('/') {
-                resolved.clear();
-            }
-            pending.extend(target.split('/').rev().map(str::to_owned));
-        } else {
-            resolved.push(part);
-        }
-    }
-    Ok(format!("/{}", resolved.join("/")))
+/// Why a command cannot run inside the rootfs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandErrorKind {
+    /// No such command, or no such file on its path (`ENOENT`).
+    NotFound,
+    /// The command was found, but `execve` would fail with this errno:
+    /// `EACCES` (no execute bit, or not a regular file), `ENOEXEC` (neither
+    /// an ELF nor a `#!` script), `ENOTDIR` or `ELOOP` on its path, or any
+    /// error on its interpreter.
+    CannotExecute(LinuxErrno),
+    /// Linux would run it, but this lookup does not: a `#!` interpreter that
+    /// is itself a script, or a path that is not UTF-8.
+    Unsupported,
 }
 
-fn resolved_join(resolved: &[String], part: &str) -> String {
-    let mut path = resolved.join("/");
-    if !path.is_empty() {
-        path.push('/');
+/// A command lookup that failed, with what a shell reports for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandError {
+    pub kind: CommandErrorKind,
+    pub message: String,
+}
+
+impl CommandError {
+    /// The status a shell exits with: 127 when the command is not found, 126
+    /// when it is found but cannot be executed, and 125 (a tool error, as
+    /// `carrick run` uses it) when this lookup cannot run it.
+    pub fn exit_status(&self) -> i32 {
+        match self.kind {
+            CommandErrorKind::NotFound => 127,
+            CommandErrorKind::CannotExecute(_) => 126,
+            CommandErrorKind::Unsupported => 125,
+        }
     }
-    path.push_str(part);
-    path
+
+    fn new(kind: CommandErrorKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
+    /// `subject` failed with a host I/O error (a Linux host's errno is the
+    /// Linux errno; soft runs need a Linux host).
+    fn io(subject: &str, error: &io::Error) -> Self {
+        let kind = match error.raw_os_error() {
+            Some(errno) if errno == LINUX_ENOENT.get() => CommandErrorKind::NotFound,
+            Some(errno) if (1..=4095).contains(&errno) => {
+                CommandErrorKind::CannotExecute(LinuxErrno::new(errno))
+            }
+            _ => CommandErrorKind::Unsupported,
+        };
+        Self::new(kind, format!("{subject}: {error}"))
+    }
+
+    /// The same failure on a file the command needs once it was found (its
+    /// interpreter): a missing one is a command that cannot be executed.
+    fn after_found(self) -> Self {
+        match self.kind {
+            CommandErrorKind::NotFound => Self {
+                kind: CommandErrorKind::CannotExecute(LINUX_ENOENT),
+                ..self
+            },
+            _ => self,
+        }
+    }
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+fn errno_error(errno: LinuxErrno) -> io::Error {
+    io::Error::from_raw_os_error(errno.get())
+}
+
+/// Walk `path` inside the rootfs at `root`, from `base` (an already resolved
+/// path relative to `root`; empty for `/`), the way Linux path resolution
+/// does with `root` as the process root: a symlink resolves inside `root` (an
+/// absolute target restarts at `root`), `..` never climbs above `root`, and a
+/// non-directory before the last component is `ENOTDIR`. A symlink in the
+/// last component is followed only when `follow` is set (`O_NOFOLLOW` and
+/// `AT_SYMLINK_NOFOLLOW` clear it). Returns the resolved path relative to
+/// `root`. Errors carry a Linux errno as their `raw_os_error`: `ELOOP` past
+/// 40 symlinks, `ENOTDIR`, or the host's (a Linux host's errnos are Linux's).
+pub fn walk_rootfs(root: &Path, base: &Path, path: &Path, follow: bool) -> io::Result<PathBuf> {
+    let mut pending: VecDeque<OsString> = path
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut resolved = base.to_owned();
+    let mut links = 0usize;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => resolved.clear(),
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            Some(Component::CurDir) | None => {}
+            Some(Component::Normal(_)) => {
+                resolved.push(&part);
+                let candidate = root.join(&resolved);
+                let meta = std::fs::symlink_metadata(&candidate)?;
+                if meta.is_symlink() && (follow || !pending.is_empty()) {
+                    links += 1;
+                    if links > MAX_SYMLINK_HOPS {
+                        return Err(errno_error(LINUX_ELOOP));
+                    }
+                    let target = std::fs::read_link(&candidate)?;
+                    resolved.pop();
+                    for component in target.components().rev() {
+                        pending.push_front(component.as_os_str().to_owned());
+                    }
+                } else if !pending.is_empty() && !meta.is_dir() {
+                    return Err(errno_error(LINUX_ENOTDIR));
+                }
+            }
+            Some(Component::Prefix(_)) => unreachable!("Unix paths have no prefix"),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve `guest` (absolute, or relative to `/`, the guest's working
+/// directory) inside `root`, following every symlink ([`walk_rootfs`]).
+/// Returns the resolved guest path.
+pub fn resolve_guest_path(root: &Path, guest: &str) -> Result<String, CommandError> {
+    let resolved = walk_rootfs(root, Path::new(""), Path::new(guest), true)
+        .map_err(|error| CommandError::io(guest, &error))?;
+    let resolved = resolved.to_str().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorKind::Unsupported,
+            format!("{guest}: resolves to a path that is not UTF-8"),
+        )
+    })?;
+    Ok(format!("/{resolved}"))
 }
 
 /// The host path of a resolved guest path.
@@ -93,12 +188,39 @@ fn host_path(root: &Path, resolved: &str) -> PathBuf {
     root.join(resolved.trim_start_matches('/'))
 }
 
+/// `execve(2)`'s permission check on a resolved file: a regular file with an
+/// execute bit, else `EACCES` (Linux grants execute, even to root, only when
+/// some execute bit is set).
+fn check_executable(root: &Path, subject: &str, resolved: &str) -> Result<(), CommandError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::metadata(host_path(root, resolved))
+        .map_err(|error| CommandError::io(subject, &error))?;
+    let why = if meta.is_dir() {
+        "is a directory"
+    } else if !meta.is_file() {
+        "is not a regular file"
+    } else if meta.permissions().mode() & 0o111 == 0 {
+        "has no execute bit"
+    } else {
+        return Ok(());
+    };
+    Err(CommandError::new(
+        CommandErrorKind::CannotExecute(LINUX_EACCES),
+        format!("{subject} ({resolved}) {why}: permission denied (EACCES)"),
+    ))
+}
+
 /// Find `argv[0]` the way a shell does: a name with a `/` is a path (relative
-/// to `/`, the guest's working directory); a bare name is searched in `path`.
-/// Returns the guest path as found, before symlinks resolve.
-pub fn find_command(root: &Path, name: &str, path: &str) -> Result<String, String> {
+/// to `/`, the guest's working directory); a bare name is searched in `path`,
+/// for the first executable regular file. A name found only without the
+/// execute bit is `EACCES`, as a shell reports it. Returns the guest path as
+/// found, before symlinks resolve.
+pub fn find_command(root: &Path, name: &str, path: &str) -> Result<String, CommandError> {
     if name.is_empty() {
-        return Err("empty command".to_owned());
+        return Err(CommandError::new(
+            CommandErrorKind::NotFound,
+            "empty command".to_owned(),
+        ));
     }
     if name.contains('/') {
         return Ok(if name.starts_with('/') {
@@ -107,56 +229,83 @@ pub fn find_command(root: &Path, name: &str, path: &str) -> Result<String, Strin
             format!("/{name}")
         });
     }
+    let mut denied = None;
     for dir in path.split(':').filter(|dir| dir.starts_with('/')) {
         let candidate = format!("{}/{name}", dir.trim_end_matches('/'));
         let Ok(resolved) = resolve_guest_path(root, &candidate) else {
             continue;
         };
-        if is_executable_file(&host_path(root, &resolved)) {
-            return Ok(candidate);
+        if host_path(root, &resolved).is_dir() {
+            continue;
+        }
+        match check_executable(root, &candidate, &resolved) {
+            Ok(()) => return Ok(candidate),
+            Err(error) => {
+                denied.get_or_insert(error);
+            }
         }
     }
-    Err(format!("{name}: not found in the rootfs PATH {path}"))
-}
-
-fn is_executable_file(host: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(host)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    Err(denied.unwrap_or_else(|| {
+        CommandError::new(
+            CommandErrorKind::NotFound,
+            format!("{name}: not found in the rootfs PATH {path}"),
+        )
+    }))
 }
 
 /// Resolve the command for `argv` inside `root`: the PATH search, symlinks,
-/// and one `#!` line (`#!interpreter [one argument]`, as Linux reads it).
+/// the execute bit, and one `#!` line (`#!interpreter [one argument]`, as
+/// Linux reads it).
 pub fn resolve_command(
     root: &Path,
     argv: &[String],
     path: &str,
-) -> Result<ResolvedCommand, String> {
-    let name = argv
-        .first()
-        .ok_or_else(|| "an empty argv names no command".to_owned())?;
+) -> Result<ResolvedCommand, CommandError> {
+    let name = argv.first().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorKind::NotFound,
+            "an empty argv names no command".to_owned(),
+        )
+    })?;
     let found = find_command(root, name, path)?;
     let executable = resolve_guest_path(root, &found)?;
-    let head = read_head(&host_path(root, &executable))?;
+    check_executable(root, &found, &executable)?;
+    let head = read_head(root, &found, &executable)?;
     if let Some(line) = head.strip_prefix(b"#!") {
         let line = line.split(|byte| *byte == b'\n').next().unwrap_or_default();
         let line = std::str::from_utf8(line)
-            .map_err(|_| format!("{found}: #! line is not UTF-8"))?
+            .map_err(|_| {
+                CommandError::new(
+                    CommandErrorKind::Unsupported,
+                    format!("{found}: #! line is not UTF-8"),
+                )
+            })?
             .trim();
         let (interpreter, argument) = match line.split_once([' ', '\t']) {
             Some((interpreter, argument)) => (interpreter, Some(argument.trim())),
             None => (line, None),
         };
-        if !interpreter.starts_with('/') {
-            return Err(format!(
-                "{found}: #! interpreter {interpreter:?} is not an absolute path"
+        if interpreter.is_empty() {
+            return Err(CommandError::new(
+                CommandErrorKind::CannotExecute(LINUX_ENOEXEC),
+                format!("{found}: #! names no interpreter (ENOEXEC)"),
             ));
         }
-        let interpreter_path = resolve_guest_path(root, interpreter)?;
-        let interpreter_head = read_head(&host_path(root, &interpreter_path))?;
+        let interpreter_path =
+            resolve_guest_path(root, interpreter).map_err(CommandError::after_found)?;
+        check_executable(root, interpreter, &interpreter_path)
+            .map_err(CommandError::after_found)?;
+        let interpreter_head = read_head(root, interpreter, &interpreter_path)?;
+        if interpreter_head.starts_with(b"#!") {
+            return Err(CommandError::new(
+                CommandErrorKind::Unsupported,
+                format!("{found}: #! interpreter {interpreter} is a script (one #! level only)"),
+            ));
+        }
         if !interpreter_head.starts_with(b"\x7fELF") {
-            return Err(format!(
-                "{found}: #! interpreter {interpreter} is not an ELF (one #! level only)"
+            return Err(CommandError::new(
+                CommandErrorKind::CannotExecute(LINUX_ENOEXEC),
+                format!("{found}: #! interpreter {interpreter} is not an ELF (ENOEXEC)"),
             ));
         }
         let mut script_argv = vec![interpreter.to_owned()];
@@ -169,8 +318,9 @@ pub fn resolve_command(
         });
     }
     if !head.starts_with(b"\x7fELF") {
-        return Err(format!(
-            "{found} ({executable}) is neither an ELF nor a #! script"
+        return Err(CommandError::new(
+            CommandErrorKind::CannotExecute(LINUX_ENOEXEC),
+            format!("{found} ({executable}) is neither an ELF nor a #! script (ENOEXEC)"),
         ));
     }
     Ok(ResolvedCommand {
@@ -179,14 +329,12 @@ pub fn resolve_command(
     })
 }
 
-fn read_head(host: &Path) -> Result<Vec<u8>, String> {
+fn read_head(root: &Path, subject: &str, resolved: &str) -> Result<Vec<u8>, CommandError> {
     use std::io::Read as _;
     let mut head = Vec::with_capacity(256);
-    std::fs::File::open(host)
-        .map_err(|error| format!("open {}: {error}", host.display()))?
-        .take(256)
-        .read_to_end(&mut head)
-        .map_err(|error| format!("read {}: {error}", host.display()))?;
+    std::fs::File::open(host_path(root, resolved))
+        .and_then(|file| file.take(256).read_to_end(&mut head))
+        .map_err(|error| CommandError::io(subject, &error).after_found())?;
     Ok(head)
 }
 
@@ -231,16 +379,79 @@ mod tests {
         let badinterp = root.path().join("usr/bin/badinterp");
         std::fs::write(&badinterp, b"#!/usr/bin/noexec\n").unwrap();
         std::fs::set_permissions(&badinterp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // An executable that is neither an ELF nor a script, and a script
+        // whose interpreter is itself a script.
+        for (path, body) in [
+            ("usr/bin/text", b"plain text\n".as_slice()),
+            ("usr/bin/nested", b"#!/usr/bin/hello\n"),
+        ] {
+            let host = root.path().join(path);
+            std::fs::write(&host, body).unwrap();
+            std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A non-executable `go` ahead of the real one on a PATH.
+        std::fs::write(root.path().join("etc/go"), b"\x7fELF\x02\x01\x01").unwrap();
         root
+    }
+
+    fn lookup_error(root: &Path, words: &[&str], path: &str) -> CommandError {
+        resolve_command(root, &argv(words), path).unwrap_err()
     }
 
     #[test]
     fn a_path_or_an_interpreter_without_the_execute_bit_is_refused() {
         let root = rootfs();
-        assert!(resolve_command(root.path(), &argv(&["/usr/bin/noexec"]), DEFAULT_PATH).is_err());
-        assert!(resolve_command(root.path(), &argv(&["usr/bin/noexec"]), DEFAULT_PATH).is_err());
-        assert!(resolve_command(root.path(), &argv(&["badinterp"]), "/usr/bin").is_err());
-        assert!(resolve_command(root.path(), &argv(&["/usr/bin"]), DEFAULT_PATH).is_err());
+        let denied = CommandErrorKind::CannotExecute(LINUX_EACCES);
+        for words in [["/usr/bin/noexec"], ["usr/bin/noexec"], ["/usr/bin"]] {
+            let error = lookup_error(root.path(), &words, DEFAULT_PATH);
+            assert_eq!(error.kind, denied, "{words:?}: {error}");
+        }
+        let error = lookup_error(root.path(), &["badinterp"], "/usr/bin");
+        assert_eq!(error.kind, denied, "{error}");
+        assert!(error.message.contains("/usr/bin/noexec"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_lookup_exits_like_a_shell() {
+        let root = rootfs();
+        let status = |words: &[&str], path: &str| lookup_error(root.path(), words, path);
+        // Not found: 127.
+        for (words, path) in [
+            (&["nope"][..], DEFAULT_PATH),
+            (&["/usr/bin/missing"][..], DEFAULT_PATH),
+            (&[""][..], DEFAULT_PATH),
+        ] {
+            let error = status(words, path);
+            assert_eq!(error.kind, CommandErrorKind::NotFound, "{error}");
+            assert_eq!(error.exit_status(), 127, "{error}");
+        }
+        // Found but not executable: 126, with execve's errno.
+        for (words, path, errno) in [
+            (&["/usr/bin/noexec"][..], DEFAULT_PATH, LINUX_EACCES),
+            (&["readme"][..], "/etc", LINUX_EACCES),
+            (&["/usr/bin/text"][..], DEFAULT_PATH, LINUX_ENOEXEC),
+            (&["/etc/readme/x"][..], DEFAULT_PATH, LINUX_ENOTDIR),
+            (&["/etc/loop-a"][..], DEFAULT_PATH, LINUX_ELOOP),
+        ] {
+            let error = status(words, path);
+            assert_eq!(
+                error.kind,
+                CommandErrorKind::CannotExecute(errno),
+                "{error}"
+            );
+            assert_eq!(error.exit_status(), 126, "{error}");
+        }
+        // A nested #! Linux would run but this lookup does not: a tool error.
+        let error = status(&["nested"], "/usr/bin");
+        assert_eq!(error.kind, CommandErrorKind::Unsupported, "{error}");
+        assert_eq!(error.exit_status(), 125, "{error}");
+        // A non-executable match is skipped when a later PATH entry has one.
+        assert_eq!(
+            resolve_command(root.path(), &argv(&["go"]), "/etc:/usr/local/go/bin")
+                .unwrap()
+                .executable,
+            "/usr/local/go/bin/go"
+        );
     }
 
     #[test]
@@ -294,7 +505,11 @@ mod tests {
             "/usr/bin/dash"
         );
         let error = resolve_guest_path(root.path(), "/etc/loop-a").unwrap_err();
-        assert!(error.contains("ELOOP"), "{error}");
+        assert_eq!(
+            error.kind,
+            CommandErrorKind::CannotExecute(LINUX_ELOOP),
+            "{error}"
+        );
         assert!(resolve_guest_path(root.path(), "/usr/bin/missing").is_err());
     }
 
@@ -337,8 +552,7 @@ mod tests {
             }
         );
         // A path that is neither an ELF nor a script is refused.
-        let error =
-            resolve_command(root.path(), &argv(&["/etc/readme"]), DEFAULT_PATH).unwrap_err();
-        assert!(error.contains("neither an ELF"), "{error}");
+        let error = lookup_error(root.path(), &["/usr/bin/text"], DEFAULT_PATH);
+        assert!(error.message.contains("neither an ELF"), "{error}");
     }
 }
