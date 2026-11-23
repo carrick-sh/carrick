@@ -62,18 +62,117 @@ pub fn eligible_syscall(number: CanonicalNr) -> bool {
     [nr::BRK, nr::MUNMAP, nr::MMAP, nr::MPROTECT, nr::MADVISE].contains(&number)
 }
 
-struct Ledger {
+struct Tickets {
     next_ticket: u64,
     /// `(ticket, mm)` for every owed invalidation not yet completed.
     outstanding: Vec<(u64, u64)>,
 }
 
-static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
-    next_ticket: 1,
-    outstanding: Vec::new(),
-});
-/// `LEDGER.outstanding.len()`, readable without the lock.
-static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+/// The owed invalidations one frame-reuse domain must wait for.
+///
+/// The carrier has one, [`InvalidationLedger::global`]: every owed
+/// invalidation and every pre-mapped frame pool of the process share it, so
+/// a frame released while any MM owes waits for it. A test builds its own
+/// ([`InvalidationLedger::new`]), so what it owes is invisible to every other
+/// test running in the same process (#2884).
+pub struct InvalidationLedger {
+    tickets: Mutex<Tickets>,
+    /// `tickets.outstanding.len()`, readable without the lock.
+    outstanding: AtomicUsize,
+}
+
+static GLOBAL: InvalidationLedger = InvalidationLedger::new();
+
+impl InvalidationLedger {
+    /// An empty ledger, for a domain of its own.
+    pub const fn new() -> Self {
+        Self {
+            tickets: Mutex::new(Tickets {
+                next_ticket: 1,
+                outstanding: Vec::new(),
+            }),
+            outstanding: AtomicUsize::new(0),
+        }
+    }
+
+    /// The carrier's ledger, which the engine owes on.
+    pub fn global() -> &'static Self {
+        &GLOBAL
+    }
+
+    /// Owe one invalidation of `asid` for `mm` (the MM generation) on this
+    /// ledger.
+    pub fn owe(&'static self, mm: u64, asid: u16) -> ResumeInvalidation {
+        let mut tickets = self.tickets.lock();
+        let ticket = tickets.next_ticket;
+        tickets.next_ticket += 1;
+        tickets.outstanding.push((ticket, mm));
+        self.outstanding
+            .store(tickets.outstanding.len(), Ordering::Release);
+        OWED.fetch_add(1, Ordering::Relaxed);
+        ResumeInvalidation {
+            ledger: self,
+            ticket,
+            mm,
+            asid,
+        }
+    }
+
+    fn complete(&self, ticket: u64) {
+        let mut tickets = self.tickets.lock();
+        tickets.outstanding.retain(|&(owed, _)| owed != ticket);
+        self.outstanding
+            .store(tickets.outstanding.len(), Ordering::Release);
+    }
+
+    /// Whether `mm` owes an invalidation some vCPU has not completed yet.
+    pub fn outstanding_for_mm(&self, mm: u64) -> bool {
+        self.outstanding.load(Ordering::Acquire) != 0
+            && self
+                .tickets
+                .lock()
+                .outstanding
+                .iter()
+                .any(|&(_, owing)| owing == mm)
+    }
+
+    /// The tag for a frame released now: `None` when nothing is owed (the
+    /// frame may be reused at once), else the newest ticket issued, which
+    /// [`Self::completed_through`] must report complete before the frame is
+    /// reused.
+    pub fn release_tag(&self) -> Option<u64> {
+        if self.outstanding.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let tickets = self.tickets.lock();
+        (!tickets.outstanding.is_empty()).then(|| tickets.next_ticket - 1)
+    }
+
+    /// Whether every invalidation owed up to `tag` has completed.
+    pub fn completed_through(&self, tag: u64) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
+            || self
+                .tickets
+                .lock()
+                .outstanding
+                .iter()
+                .all(|&(ticket, _)| ticket > tag)
+    }
+}
+
+impl Default for InvalidationLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for InvalidationLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvalidationLedger")
+            .field("outstanding", &self.outstanding.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 static OWED: AtomicU64 = AtomicU64::new(0);
 static ISSUED_ON_RETURN: AtomicU64 = AtomicU64::new(0);
@@ -111,21 +210,17 @@ pub fn note_issued_by_host() {
 #[derive(Debug)]
 #[must_use = "an owed invalidation must be issued and completed"]
 pub struct ResumeInvalidation {
+    ledger: &'static InvalidationLedger,
     ticket: u64,
     mm: u64,
     asid: u16,
 }
 
 impl ResumeInvalidation {
-    /// Owe one invalidation of `asid` for `mm` (the MM generation).
+    /// Owe one invalidation of `asid` for `mm` (the MM generation) on the
+    /// carrier's ledger.
     pub fn owe(mm: u64, asid: u16) -> Self {
-        let mut ledger = LEDGER.lock();
-        let ticket = ledger.next_ticket;
-        ledger.next_ticket += 1;
-        ledger.outstanding.push((ticket, mm));
-        OUTSTANDING.store(ledger.outstanding.len(), Ordering::Release);
-        OWED.fetch_add(1, Ordering::Relaxed);
-        Self { ticket, mm, asid }
+        InvalidationLedger::global().owe(mm, asid)
     }
 
     pub fn mm(&self) -> u64 {
@@ -152,11 +247,7 @@ impl ResumeInvalidation {
     /// The invalidation ran to completion on some vCPU (broadcast, `DSB
     /// ISH`): no PE holds a translation it removed.
     pub fn complete(self) {
-        let mut ledger = LEDGER.lock();
-        ledger
-            .outstanding
-            .retain(|&(ticket, _)| ticket != self.ticket);
-        OUTSTANDING.store(ledger.outstanding.len(), Ordering::Release);
+        self.ledger.complete(self.ticket);
         std::mem::forget(self);
     }
 }
@@ -172,61 +263,66 @@ impl Drop for ResumeInvalidation {
     }
 }
 
-/// Whether `mm` owes an invalidation some vCPU has not completed yet.
+/// Whether `mm` owes an invalidation on the carrier's ledger.
 pub fn outstanding_for_mm(mm: u64) -> bool {
-    OUTSTANDING.load(Ordering::Acquire) != 0
-        && LEDGER
-            .lock()
-            .outstanding
-            .iter()
-            .any(|&(_, owing)| owing == mm)
+    InvalidationLedger::global().outstanding_for_mm(mm)
 }
 
-/// The tag for a frame released now: `None` when no invalidation is owed
-/// (the frame may be reused at once), else the newest ticket issued, which
-/// [`completed_through`] must report complete before the frame is reused.
+/// [`InvalidationLedger::release_tag`] on the carrier's ledger.
 pub fn release_tag() -> Option<u64> {
-    if OUTSTANDING.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    let ledger = LEDGER.lock();
-    (!ledger.outstanding.is_empty()).then(|| ledger.next_ticket - 1)
+    InvalidationLedger::global().release_tag()
 }
 
-/// Whether every invalidation owed up to `tag` has completed.
+/// [`InvalidationLedger::completed_through`] on the carrier's ledger.
 pub fn completed_through(tag: u64) -> bool {
-    OUTSTANDING.load(Ordering::Acquire) == 0
-        || LEDGER
-            .lock()
-            .outstanding
-            .iter()
-            .all(|&(ticket, _)| ticket > tag)
+    InvalidationLedger::global().completed_through(tag)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The ledger is process-wide; one test owns every assertion on it.
+    fn own_ledger() -> &'static InvalidationLedger {
+        Box::leak(Box::new(InvalidationLedger::new()))
+    }
+
     #[test]
     fn released_frames_wait_for_every_invalidation_owed_at_release() {
-        assert!(!outstanding_for_mm(7));
-        let first = ResumeInvalidation::owe(7, 7);
-        let tag = release_tag().expect("a frame released while owing is tagged");
-        assert!(!completed_through(tag));
-        assert!(outstanding_for_mm(7));
-        assert!(!outstanding_for_mm(8));
-        let later = ResumeInvalidation::owe(8, 8);
-        let later_tag = release_tag().expect("tag");
+        let ledger = own_ledger();
+        assert!(!ledger.outstanding_for_mm(7));
+        let first = ledger.owe(7, 7);
+        let tag = ledger
+            .release_tag()
+            .expect("a frame released while owing is tagged");
+        assert!(!ledger.completed_through(tag));
+        assert!(ledger.outstanding_for_mm(7));
+        assert!(!ledger.outstanding_for_mm(8));
+        let later = ledger.owe(8, 8);
+        let later_tag = ledger.release_tag().expect("tag");
         assert!(later_tag > tag);
         first.complete();
         // The frame released before `later` was owed waits only for `first`.
-        assert!(completed_through(tag));
-        assert!(!completed_through(later_tag));
-        assert!(!outstanding_for_mm(7));
+        assert!(ledger.completed_through(tag));
+        assert!(!ledger.completed_through(later_tag));
+        assert!(!ledger.outstanding_for_mm(7));
         later.complete();
-        assert!(completed_through(later_tag));
-        assert_eq!(release_tag(), None);
+        assert!(ledger.completed_through(later_tag));
+        assert_eq!(ledger.release_tag(), None);
+    }
+
+    /// Two ledgers are two domains: what one owes never tags a frame
+    /// released under the other (#2884: parallel tests shared one).
+    #[test]
+    fn a_ledger_never_sees_another_ledgers_tickets() {
+        let owing = own_ledger();
+        let other = own_ledger();
+        let owed = owing.owe(9, 9);
+        assert!(owing.release_tag().is_some());
+        assert_eq!(other.release_tag(), None);
+        assert!(!other.outstanding_for_mm(9));
+        assert!(other.completed_through(1));
+        owed.complete();
+        assert_eq!(owing.release_tag(), None);
     }
 
     #[test]
