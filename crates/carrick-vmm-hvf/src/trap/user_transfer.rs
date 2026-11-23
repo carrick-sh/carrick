@@ -109,7 +109,7 @@ pub struct RetainedUserData {
     custody: Arc<CarrierVmCustody>,
     _mapping: Option<Arc<GlobalFrameSharedMapping>>,
     _metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
-    _write: Option<Arc<code_content::PendingContentWrite<OwnedCodeContent>>>,
+    _write: Option<Arc<carrick_aarch64::code_content::PendingContentWrite<OwnedCodeContent>>>,
     carrier: NonZeroU64,
     identity: PortalRetainedData,
     selected: PortalSelectedData,
@@ -878,7 +878,10 @@ pub(super) mod tests {
                 )
             });
         });
-        assert_eq!(rejected, Err(code_content::ContentError::Changed));
+        assert_eq!(
+            rejected,
+            Err(carrick_aarch64::code_content::ContentError::Changed)
+        );
         assert!(copied);
         assert!(service.complete(4, 0));
         assert_eq!(ticket.take_completion().unwrap().completed, 4);

@@ -143,7 +143,7 @@ impl Registry {
 }
 
 #[derive(Debug)]
-pub(crate) struct CodeContent {
+pub struct CodeContent {
     len: usize,
     writers: AtomicUsize,
     observed: AtomicBool,
@@ -159,8 +159,8 @@ pub(crate) struct CodeContent {
     // Serializes only a bounded physical I2 invalidation, never content
     // revocation, metadata, I/O, or a retained writer lifetime.
     icache_publication: Mutex<()>,
-    #[cfg(test)]
-    pub(super) icache_publications: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub icache_publications: AtomicUsize,
 }
 
 /// Bits `[first, last]` of the 64-bit word `index` (page numbers).
@@ -171,7 +171,7 @@ fn page_word_mask(index: usize, first: usize, last: usize) -> u64 {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ContentError {
+pub enum ContentError {
     OutOfBounds,
     WriteInProgress,
     Changed,
@@ -179,7 +179,7 @@ pub(crate) enum ContentError {
 }
 
 impl CodeContent {
-    pub(crate) fn new(len: usize) -> Self {
+    pub fn new(len: usize) -> Self {
         let pages = len.div_ceil(1 << PAGE_SHIFT);
         Self {
             len,
@@ -187,7 +187,7 @@ impl CodeContent {
             observed: AtomicBool::new(false),
             registry: OnceLock::new(),
             icache_publication: Mutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             icache_publications: AtomicUsize::new(0),
             icache_dirty: (0..pages.div_ceil(64))
                 .map(|_| AtomicU64::new(u64::MAX))
@@ -197,7 +197,7 @@ impl CodeContent {
 
     /// Record that `[offset, offset + len)` may no longer match the
     /// instruction cache (a host write admission).
-    pub(crate) fn mark_icache_dirty(&self, offset: usize, len: usize) {
+    pub fn mark_icache_dirty(&self, offset: usize, len: usize) {
         let Ok(range) = self.pages(offset, len) else {
             return;
         };
@@ -230,7 +230,7 @@ impl CodeContent {
     /// claimed. A byte-range publication covers whole 4 KiB dirty pages,
     /// clamped at the backing's end. Each lock hold covers at most 16 KiB,
     /// including rounding; peers cannot mistake claimed work for completed I2.
-    pub(crate) fn publish_icache(
+    pub fn publish_icache(
         &self,
         offset: usize,
         len: usize,
@@ -250,7 +250,7 @@ impl CodeContent {
             if self.take_icache_dirty(cursor, size) {
                 invalidate(cursor, size);
                 invalidations += 1;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.icache_publications.fetch_add(1, Ordering::Relaxed);
             }
             cursor += size;
@@ -266,17 +266,13 @@ impl CodeContent {
         Ok((offset >> PAGE_SHIFT)..=((end - 1) >> PAGE_SHIFT))
     }
 
-    #[cfg(test)]
-    pub(crate) fn writer_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writer_count(&self) -> usize {
         self.writers.load(Ordering::SeqCst)
     }
 
     // Translation publication is deliberately not exposed by this witness.
-    pub(crate) fn observe(
-        &self,
-        offset: usize,
-        len: usize,
-    ) -> Result<ContentObservation, ContentError> {
+    pub fn observe(&self, offset: usize, len: usize) -> Result<ContentObservation, ContentError> {
         let range = self.pages(offset, len)?;
         let registry = self.registry.get_or_init(|| Arc::new(Registry::default()));
         let mut pages = registry.pages.lock();
@@ -312,7 +308,7 @@ impl CodeContent {
         Ok(observation)
     }
 
-    pub(crate) fn begin_write(
+    pub fn begin_write(
         &self,
         offset: usize,
         len: usize,
@@ -330,7 +326,7 @@ impl Drop for CodeContent {
 }
 
 #[derive(Debug)]
-pub(crate) struct ContentObservation {
+pub struct ContentObservation {
     registry: Arc<Registry>,
     dependencies: Vec<(usize, Arc<ContentPage>)>,
     executing: usize,
@@ -340,10 +336,10 @@ impl ContentObservation {
     /// Participating host writers cannot finish admission until this scope
     /// ends. This covers content only: it does not authorize executable entry
     /// or prove absence of guest hardware stores and writable aliases.
-    pub(crate) fn begin_execution(&mut self) -> Result<(), ContentError> {
+    pub fn begin_execution(&mut self) -> Result<(), ContentError> {
         self.begin_execution_with_hook(|| {})
     }
-    pub(crate) fn begin_execution_with_hook(
+    pub fn begin_execution_with_hook(
         &mut self,
         mut after_increment: impl FnMut(),
     ) -> Result<(), ContentError> {
@@ -368,7 +364,7 @@ impl ContentObservation {
         }
         Ok(())
     }
-    pub(crate) fn finish_execution(&mut self) {
+    pub fn finish_execution(&mut self) {
         let count = std::mem::take(&mut self.executing);
         let mut completions = Vec::new();
         for (_, page) in &self.dependencies[..count] {
@@ -383,7 +379,7 @@ impl ContentObservation {
         }
     }
 
-    pub(crate) fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         self.dependencies
             .iter()
             .all(|(_, valid)| valid.valid.load(Ordering::Acquire))
@@ -411,12 +407,12 @@ impl Drop for ContentObservation {
 /// the exact affected dependencies remain retained until copy or cancellation.
 /// No executor waits for executing readers inside this constructor.
 #[derive(Debug)]
-pub(crate) struct PendingContentWrite<O: Deref<Target = CodeContent>> {
+pub struct PendingContentWrite<O: Deref<Target = CodeContent>> {
     write: ContentWrite<O>,
     dependencies: Vec<(usize, Arc<ContentPage>, AtomicBool)>,
 }
 impl<O: Deref<Target = CodeContent>> PendingContentWrite<O> {
-    pub(crate) fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
+    pub fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
         let range = content.pages(offset, len)?;
         content.mark_icache_dirty(offset, len);
         content
@@ -447,13 +443,13 @@ impl<O: Deref<Target = CodeContent>> PendingContentWrite<O> {
         Ok(Self {
             write: ContentWrite {
                 content,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 visited_pages: dependencies.len(),
             },
             dependencies,
         })
     }
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.dependencies.iter().all(|(_, dependency, drained)| {
             if !drained.load(Ordering::Acquire) && dependency.running.load(Ordering::SeqCst) == 0 {
                 drained.store(true, Ordering::Release);
@@ -461,7 +457,7 @@ impl<O: Deref<Target = CodeContent>> PendingContentWrite<O> {
             drained.load(Ordering::Acquire)
         })
     }
-    pub(crate) fn enroll(
+    pub fn enroll(
         &self,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> (Vec<carrick_thread::completion::CompletionEnrollment>, bool) {
@@ -513,13 +509,13 @@ impl<O: Deref<Target = CodeContent>> Drop for PendingContentWrite<O> {
 /// The owner is either a lexical borrow or retained physical backing. Both
 /// close writer admission on drop without allocating another writer object.
 #[derive(Debug)]
-pub(crate) struct ContentWrite<O: Deref<Target = CodeContent>> {
+pub struct ContentWrite<O: Deref<Target = CodeContent>> {
     content: O,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     visited_pages: usize,
 }
 impl<O: Deref<Target = CodeContent>> ContentWrite<O> {
-    pub(crate) fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
+    pub fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
         let range = content.pages(offset, len)?;
         // A host write changes bytes the instruction cache may hold.
         content.mark_icache_dirty(offset, len);
@@ -531,7 +527,7 @@ impl<O: Deref<Target = CodeContent>> ContentWrite<O> {
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("hvf::code_content", "content writer count exhausted")
             });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut visited_pages = 0;
         if content.observed.load(Ordering::SeqCst) {
             let registry = content.registry.get().unwrap_or_else(|| {
@@ -541,21 +537,21 @@ impl<O: Deref<Target = CodeContent>> ContentWrite<O> {
                 )
             });
             let visits = registry.revoke(range);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 visited_pages = visits;
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             let _ = visits;
         }
         Ok(ContentWrite {
             content,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             visited_pages,
         })
     }
-    #[cfg(test)]
-    pub(crate) fn visited_pages(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visited_pages(&self) -> usize {
         self.visited_pages
     }
 }

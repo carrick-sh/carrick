@@ -160,6 +160,8 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
+# `CodeContent::writer_count` for the directory physical-resume tests.
+carrick-aarch64 = { path = "../carrick-aarch64", features = ["test-support"] }
 wait-timeout = "0.2.1"
 loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }

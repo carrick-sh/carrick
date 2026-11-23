@@ -11,6 +11,11 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Test-only accessors on `code_content` (publication and visit counts,
+# writer counts) for dependent crates' tests; never a product feature.
+test-support = []
+
 [dependencies]
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-core = { path = "../carrick-core" }
@@ -29,6 +34,8 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+# Completion callbacks a drained code-content page publishes to writers.
+carrick-thread = { path = "../carrick-thread" }
 # The shared sigframe glue trades in `carrick_abi::LinuxSiginfo`; the run-elf
 # service loop + fault delivery reference `libc` signal/errno numbers.
 carrick-abi = { path = "../carrick-abi" }
@@ -45,4 +52,5 @@ tracing.workspace = true
 [dev-dependencies]
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-test-support = { path = "../carrick-test-support" }
+serde_json.workspace = true
 sha2.workspace = true

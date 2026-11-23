@@ -8,8 +8,8 @@
 //! (`DeferredActivePins`) instead of recycling it under the access. Writes
 //! additionally admit content (executable-receipt revocation). These
 //! admissions track bytes, not executable entry.
-use super::code_content::{CodeContent, ContentWrite};
 use super::*;
+use carrick_aarch64::code_content::{CodeContent, ContentWrite};
 use carrick_guest_mem::{HostRead, HostReadRetention, HostWriteRange};
 use std::{ops::Deref, sync::Arc};
 

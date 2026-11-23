@@ -14,7 +14,7 @@ rationale = "A participating host writer must revoke future content use and wait
 [bindings]
 vm_free = [
   "carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract (feature conformance-metrics)",
-  "carrick-vmm-hvf::trap::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions",
+  "carrick-aarch64::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions",
 ]
 
 [bindings.unresolved]

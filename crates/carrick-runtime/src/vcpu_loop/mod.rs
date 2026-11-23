@@ -2879,11 +2879,6 @@ mod cow_refault_watch_tests {
 mod ipc_lock_park_tests;
 
 #[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../../carrick-vmm-hvf/src/trap/code_content.rs"]
-mod code_content_test;
-
-#[cfg(test)]
 pub(crate) mod tests {
     use super::binding::*;
     use super::signal::lower_el0_fault;

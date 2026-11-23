@@ -325,8 +325,10 @@ dependencies = [
  "carrick-observability",
  "carrick-sched-core",
  "carrick-test-support",
+ "carrick-thread",
  "libc",
  "parking_lot",
+ "serde_json",
  "sha2",
  "tracing",
 ]

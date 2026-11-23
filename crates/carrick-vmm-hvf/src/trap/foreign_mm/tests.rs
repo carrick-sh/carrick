@@ -11605,7 +11605,7 @@ fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
     assert!(unrelated.is_current());
     assert!(matches!(
         owner.mapping.code_content.observe(0, 4),
-        Err(super::super::code_content::ContentError::WriteInProgress)
+        Err(carrick_aarch64::code_content::ContentError::WriteInProgress)
     ));
     data.finish_native_access();
     let fresh = owner.mapping.code_content.observe(0, 4).unwrap();
@@ -11622,7 +11622,7 @@ fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
     assert!(!fresh.is_current());
     assert!(matches!(
         owner.mapping.code_content.observe(0, 4),
-        Err(super::super::code_content::ContentError::WriteInProgress)
+        Err(carrick_aarch64::code_content::ContentError::WriteInProgress)
     ));
     drop(data);
     assert!(
