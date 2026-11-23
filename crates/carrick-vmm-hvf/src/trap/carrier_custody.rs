@@ -3372,6 +3372,107 @@ mod carrier_vm_custody_tests {
         assert!(!super::alias_backing_is_live(host_addr));
     }
 
+    /// #2826: the carrier-exit arm that finds the VM already gone (a retry
+    /// after a failed terminal cleanup) runs only the terminal cleanup. A
+    /// sealed exec preparation still alive there must be drained by it, and
+    /// dropping it after the destroy must release its frame backing, IPA
+    /// lease and executable without a backend call.
+    #[test]
+    fn carrier_exit_after_vm_destroy_drains_a_sealed_exec_preparation() {
+        use carrick_core_abi::service::{ServiceBirth, ServiceIdentity};
+        use carrick_sched_core::{
+            RecordId, RecordRef,
+            process::{TaskId, TaskKey, TaskSerial},
+        };
+        use core::num::{NonZeroI32, NonZeroU64};
+
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa_baseline = crate::trap::exec_ipa_lease_count_for_tests();
+        let frame_baseline = custody.native_frame_backings.lock().len();
+        #[derive(Debug)]
+        struct Executable;
+        impl carrick_hal::fork_stock::ExecutableIdentity for Executable {
+            fn display_path(&self) -> String {
+                "/sealed-at-carrier-exit".into()
+            }
+        }
+        let executable: std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity> =
+            std::sync::Arc::new(Executable);
+        let live_executable = std::sync::Arc::downgrade(&executable);
+        let prepared = crate::trap::PreparedNativeExecSuccessor::installed_cancel_fixture(
+            &custody, executable,
+        )
+        .expect("sealed successor fixture");
+        let identity = ServiceIdentity {
+            birth: ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Initial,
+                process: TaskKey {
+                    id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+                    serial: TaskSerial::from_registry_allocation(NonZeroU64::MIN),
+                },
+                thread: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+                record: RecordRef {
+                    id: RecordId::from_raw(1).unwrap(),
+                    incarnation: 1,
+                },
+                // SAFETY: the fixture names this exact carrier/MM incarnation.
+                mm: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        custody.transfer_carrier,
+                        carrick_el1_abi::ReservationMm::new(5).unwrap(),
+                        NonZeroU64::new(77).unwrap(),
+                    )
+                },
+            },
+            execution: carrick_core_abi::SnapshotGeneration::from_raw(11),
+            sequence: NonZeroU64::MIN,
+        };
+        let receipt = custody
+            .claim_native_exec(
+                identity,
+                carrick_el1_abi::ReservationMm::new(6).unwrap(),
+                NonZeroU64::new(78).unwrap(),
+            )
+            .expect("claim exec receipt");
+        custody
+            .seal_native_exec_preparation(receipt, prepared)
+            .expect("seal the prepared successor");
+        assert_eq!(custody.native_exec_preparations.lock().len(), 1);
+        assert_eq!(
+            custody.native_frame_backings.lock().len(),
+            frame_baseline + 1
+        );
+
+        // The VM is destroyed first; the exit then finds it gone.
+        destroy_vm_with_custody_using(
+            &custody,
+            "carrier-exit test",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("raw carrier-exit destroy succeeds");
+        assert_eq!(custody.live_generation(), None);
+        super::finalize_carrier_exit_global_frame_owners_in_using(&custody, &mut |_, _| Ok(()))
+            .expect("terminal cleanup after the VM is gone");
+
+        assert_eq!(custody.native_exec_preparations.lock().len(), 0);
+        let census = custody.exec_owner_census();
+        assert_eq!(
+            (census.reserved, census.sealed, census.carrier_exit),
+            (1, 1, 1),
+            "{census}"
+        );
+        assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
+        assert_eq!(live_executable.strong_count(), 0);
+        assert_eq!(crate::trap::exec_ipa_lease_count_for_tests(), ipa_baseline);
+
+        // A retry of the cleanup finds nothing left to drain.
+        super::finalize_carrier_exit_global_frame_owners_in_using(&custody, &mut |_, _| Ok(()))
+            .expect("terminal cleanup retry");
+        assert_eq!(custody.exec_owner_census().carrier_exit, 1);
+    }
+
     #[test]
     fn carrier_exit_propagates_terminal_owner_cleanup_failure_after_destroy_success() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
