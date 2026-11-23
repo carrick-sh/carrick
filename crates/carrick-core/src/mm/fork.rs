@@ -420,13 +420,17 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                             }
                         }
                     }
-                    Ok(false) => Err(ForkError::Stale),
+                    // Another CPU edited this parent word after the read
+                    // check (on x86, the walker setting Accessed/Dirty on a
+                    // sibling's write): contention, the fork rolls back and
+                    // reruns from a fresh snapshot (#2890).
+                    Ok(false) => Err(ForkError::ParentChanged),
                     Err(_) => Err(ForkError::Core),
                 }
             } else {
                 match words.compare_exchange(edit.pa, edit.before, edit.after) {
                     Ok(true) => Ok(()),
-                    Ok(false) => Err(ForkError::Stale),
+                    Ok(false) => Err(ForkError::ParentChanged),
                     Err(_) => Err(ForkError::Core),
                 }
             };
