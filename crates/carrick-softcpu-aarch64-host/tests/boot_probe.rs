@@ -2344,6 +2344,82 @@ fn soft_cpu_runs_dynamic_cpython_through_production_dispatch() {
     );
 }
 
+/// Row witness (#1906): the pip parity row's commands, found the way
+/// `carrick debug soft-run` finds them (`rootfs_command`: the row's `PATH`,
+/// symlinks resolved inside the pinned `CARRICK_A64_PYTHON_ROOT`, and a `#!`
+/// line), with the row's interpreter run on the soft CPU through the
+/// production EL1 image and the production kernel dispatch.
+///
+/// `pip --version` must resolve to the image's CPython running pip's script;
+/// running it whole is out of this job's budget at the soft CPU's current
+/// rate, so the run is the row's `python` command, `python --version`
+/// (`/usr/local/bin/python` -> `python3` -> `python3.12`).
+#[test]
+#[ignore = "requires CARRICK_A64_PYTHON_ROOT and CARRICK_A64_ELF"]
+fn soft_run_resolves_the_pip_row_and_runs_its_python_through_production_dispatch() {
+    use carrick_softcpu_aarch64_host::rootfs_command::{env_path, resolve_command};
+
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1_elf = std::fs::read(std::env::var_os("CARRICK_A64_ELF").expect("set CARRICK_A64_ELF"))
+        .expect("read the production EL1 ELF");
+    let root_dir = std::path::PathBuf::from(
+        std::env::var_os("CARRICK_A64_PYTHON_ROOT").expect("set CARRICK_A64_PYTHON_ROOT"),
+    );
+    read_pinned_cpython(&FixtureRoot::new(root_dir.clone()));
+    // The python image's PATH (its config's `Env`), as the row runs it.
+    let env = [
+        "PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+        "HOME=/root".to_owned(),
+    ];
+    let words = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+
+    let pip = resolve_command(&root_dir, &words(&["pip", "--version"]), env_path(&env))
+        .expect("pip --version resolves inside the python rootfs");
+    assert!(
+        pip.executable.starts_with("/usr/local/bin/python3"),
+        "pip's #! names the image's CPython: {pip:?}"
+    );
+    assert_eq!(
+        pip.argv[pip.argv.len() - 2..],
+        words(&["/usr/local/bin/pip", "--version"]),
+        "the script and its arguments follow the interpreter: {pip:?}"
+    );
+
+    let python = resolve_command(&root_dir, &words(&["python", "--version"]), env_path(&env))
+        .expect("python --version resolves inside the python rootfs");
+    assert_eq!(python.executable, "/usr/local/bin/python3.12", "{python:?}");
+    assert_eq!(python.argv, words(&["python", "--version"]));
+    let elf_bytes =
+        std::fs::read(python.host_executable(&root_dir)).expect("read the resolved CPython");
+    let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {
+        elf_bytes: &elf_bytes,
+        executable_path: &python.executable,
+        argv: python.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        envp: env.iter().map(|e| e.as_bytes().to_vec()).collect(),
+        rootfs_dir: Some(&root_dir),
+        el1_elf_override: Some(&el1_elf),
+        max_syscalls: 4096,
+    };
+    let run = carrick_softcpu_aarch64_host::run_single_process(&config)
+        .expect("python --version must complete through production kernel dispatch");
+    println!(
+        "soft-run pip row: python --version exit={} syscalls_dispatched={} census={:?} \
+         counted_enosys={:?} stdout={:?} stderr={:?}",
+        run.exit_code,
+        run.syscalls_dispatched,
+        run.reply_census,
+        run.counted_enosys,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert_eq!(run.terminating_fault, None);
+    assert_eq!(
+        (run.exit_code, run.stdout.as_slice(), run.stderr.as_slice()),
+        (0, b"Python 3.12.16\n".as_slice(), b"".as_slice())
+    );
+    assert_production_replies(&run.reply_census, run.syscalls_dispatched, 10);
+}
+
 /// Counted `ENOSYS` the production-dispatch CPython startup still owes, each
 /// with the issue that retires it (decrease-only; see `assert_counted_enosys`).
 const CPYTHON_COUNTED_ENOSYS: &[(u64, u64)] = &[
