@@ -9,19 +9,20 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
+use carrick_aarch64::vmm::VcpuDestroyError;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PendingCarrierVmCreation {
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) generation: CarrierVmGeneration,
     pub(crate) probe_code: i32,
-    pub(crate) vcpu_id: Option<applevisor_sys::hv_vcpu_t>,
+    pub(crate) vcpu_id: Option<CarrierVcpuId>,
     pub(crate) armed: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PendingCarrierVmCreation {
-    pub(crate) fn record_vcpu(&mut self, vcpu_id: applevisor_sys::hv_vcpu_t) {
+    pub(crate) fn record_vcpu(&mut self, vcpu_id: CarrierVcpuId) {
         self.vcpu_id = Some(vcpu_id);
     }
 
@@ -95,7 +96,7 @@ impl PendingCarrierVmCreation {
 pub(crate) fn drive_pending_carrier_vm_cleanup(
     custody: &std::sync::Arc<CarrierVmCustody>,
     generation: CarrierVmGeneration,
-    vcpu_id: &mut Option<applevisor_sys::hv_vcpu_t>,
+    vcpu_id: &mut Option<CarrierVcpuId>,
     raw_vm_destroyed: &mut bool,
     context: &str,
 ) -> Result<(), TrapError> {
@@ -107,7 +108,14 @@ pub(crate) fn drive_pending_carrier_vm_cleanup(
             raw_vm_destroyed,
             context,
         },
-        |id| destroy_raw_vcpu(id, VcpuDestroySite::CreationRollback),
+        |id| {
+            let rc = destroy_raw_vcpu(id.raw(), VcpuDestroySite::CreationRollback);
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(VcpuDestroyError::from_raw(rc as u32))
+            }
+        },
         |custody, generation, context| {
             destroy_vm_with_custody_target(
                 custody,
@@ -121,7 +129,7 @@ pub(crate) fn drive_pending_carrier_vm_cleanup(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PendingCarrierVmCleanupState<'a> {
-    pub vcpu_id: &'a mut Option<applevisor_sys::hv_vcpu_t>,
+    pub vcpu_id: &'a mut Option<CarrierVcpuId>,
     pub raw_vm_destroyed: &'a mut bool,
     pub context: &'a str,
 }
@@ -131,7 +139,7 @@ pub(crate) fn drive_pending_carrier_vm_cleanup_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     generation: CarrierVmGeneration,
     state: PendingCarrierVmCleanupState<'_>,
-    mut destroy_vcpu: impl FnMut(applevisor_sys::hv_vcpu_t) -> applevisor_sys::hv_return_t,
+    mut destroy_vcpu: impl FnMut(CarrierVcpuId) -> Result<(), VcpuDestroyError>,
     mut destroy_vm: impl FnMut(
         &std::sync::Arc<CarrierVmCustody>,
         CarrierVmGeneration,
@@ -146,8 +154,7 @@ pub(crate) fn drive_pending_carrier_vm_cleanup_using(
     } = state;
     if let Some(id) = *vcpu_id {
         // `destroy_vcpu` reports a successful destroy itself (`destroy_raw_vcpu`).
-        let rc = destroy_vcpu(id);
-        if rc != 0 {
+        if let Err(rc) = destroy_vcpu(id) {
             return Err(TrapError::Hypervisor(format!(
                 "{context}: hv_vcpu_destroy rc={rc:#x}; exact vCPU cleanup retained"
             )));
@@ -213,17 +220,6 @@ pub(crate) fn prepare_initial_carrier_before_admission<T, U>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::Eq, ::core::cmp::PartialEq)]
-pub(crate) enum SetupVcpuCleanup {
-    /// The pending VM-creation transaction destroys the recorded vCPU with its
-    /// VM on rollback.
-    PendingRaw,
-    /// The vCPU's own setup failed before it ran: destroy it through
-    /// `destroy_raw_vcpu` (`VcpuDestroySite::CreationError`).
-    DestroyOnError,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct SetupVmGuard {
     vm: std::mem::ManuallyDrop<SharedVm>,
     pending_raw_cleanup: bool,
@@ -266,53 +262,6 @@ impl Drop for SetupVmGuard {
         // SAFETY: a reused carrier VM has no Pending raw cleanup owner. Drop
         // only this clone through its ordinary applevisor RAII path.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.vm) };
-        self.armed = false;
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) struct SetupVcpuGuard {
-    vcpu: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
-    cleanup: SetupVcpuCleanup,
-    armed: bool,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl SetupVcpuGuard {
-    pub(crate) fn new(vcpu: applevisor::vcpu::Vcpu, cleanup: SetupVcpuCleanup) -> Self {
-        Self {
-            vcpu: std::mem::ManuallyDrop::new(vcpu),
-            cleanup,
-            armed: true,
-        }
-    }
-
-    pub(crate) fn into_inner(mut self) -> applevisor::vcpu::Vcpu {
-        self.armed = false;
-        // SAFETY: `armed` prevents Drop from touching the value after this
-        // single ownership transfer.
-        unsafe { std::mem::ManuallyDrop::take(&mut self.vcpu) }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl std::ops::Deref for SetupVcpuGuard {
-    type Target = applevisor::vcpu::Vcpu;
-
-    fn deref(&self) -> &Self::Target {
-        &self.vcpu
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for SetupVcpuGuard {
-    fn drop(&mut self) {
-        if !self.armed || self.cleanup == SetupVcpuCleanup::PendingRaw {
-            return;
-        }
-        // The wrapper stays in `ManuallyDrop`: applevisor's destructor never
-        // runs, and the one raw destroy funnel reports the destroy.
-        let _ = destroy_raw_vcpu(self.vcpu.id(), VcpuDestroySite::CreationError);
         self.armed = false;
     }
 }
@@ -3715,7 +3664,8 @@ mod carrier_vm_custody_tests {
         let identity = custody
             .register_stage2_record(stage2_spec(generation, 92))
             .expect("register setup record");
-        let mut vcpu_id = Some(41);
+        let id = super::CarrierVcpuId::from_raw(41);
+        let mut vcpu_id = Some(id);
         let mut raw_vm_destroyed = false;
         let vm_destroy_calls = std::cell::Cell::new(0_u32);
         let finalize_calls = std::cell::Cell::new(0_u32);
@@ -3728,7 +3678,7 @@ mod carrier_vm_custody_tests {
                 raw_vm_destroyed: &mut raw_vm_destroyed,
                 context: "injected cleanup",
             },
-            |_| 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+            |_| Err(super::VcpuDestroyError::from_raw(0xfae9_4001)),
             |_, _, _| {
                 vm_destroy_calls.set(vm_destroy_calls.get() + 1);
                 Ok(())
@@ -3738,8 +3688,12 @@ mod carrier_vm_custody_tests {
                 Ok(())
             },
         );
-        assert!(first.is_err());
-        assert_eq!(vcpu_id, Some(41));
+        assert!(matches!(
+            first,
+            Err(super::TrapError::Hypervisor(message))
+                if message == "injected cleanup: hv_vcpu_destroy rc=0xfae94001; exact vCPU cleanup retained"
+        ));
+        assert_eq!(vcpu_id, Some(id));
         assert!(!raw_vm_destroyed);
         assert_eq!(vm_destroy_calls.get(), 0);
 
@@ -3751,7 +3705,7 @@ mod carrier_vm_custody_tests {
                 raw_vm_destroyed: &mut raw_vm_destroyed,
                 context: "injected cleanup retry",
             },
-            |_| 0,
+            |_| Ok(()),
             |custody, generation, _| {
                 vm_destroy_calls.set(vm_destroy_calls.get() + 1);
                 custody

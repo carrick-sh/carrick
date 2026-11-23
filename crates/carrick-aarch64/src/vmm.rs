@@ -28,6 +28,40 @@ use carrick_hal::{
 use carrick_mem::memory::AddressSpace;
 use carrick_mmu_core::aarch64::PageTableManager;
 
+/// A backend's vCPU handle as recorded by carrier custody.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CarrierVcpuId(u64);
+
+impl CarrierVcpuId {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// A backend's refusal code for a vCPU destroy.
+#[derive(Debug)]
+pub struct VcpuDestroyError(u32);
+
+impl VcpuDestroyError {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl core::fmt::LowerHex for VcpuDestroyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
 /// Stage-1 ownership installed by a completed exec image replacement.
 pub enum ExecStage1Replacement {
     /// The backend owns the new MM authority and retains the old MM until

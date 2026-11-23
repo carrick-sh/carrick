@@ -2033,7 +2033,7 @@ impl HvfVmState {
             let creation = pending_creation.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("exec creation transaction disappeared".to_owned())
             })?;
-            creation.record_vcpu(new_vcpu.id());
+            creation.record_vcpu(CarrierVcpuId::from_raw(new_vcpu.id()));
             enable_el0_counter_access(new_vcpu.id());
             pending_exec_vcpu = Some(new_vcpu);
             pending_exec_vm = Some(new_vm);
