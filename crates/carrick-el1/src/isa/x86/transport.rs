@@ -74,16 +74,39 @@ pub fn witness(op: u64) -> u64 {
     }
 }
 
-/// Terminal refusal of a broken carrier invariant: publish it through the
-/// fatal port and halt this CPU.
+/// Terminal refusal of a broken carrier invariant: publish its caller's
+/// source site through the fatal port and halt this CPU (#2853).
 #[cold]
 #[inline(never)]
+#[track_caller]
 pub fn fatal_boot() -> ! {
-    // SAFETY: the carrier owns this fatal control doorbell; HLT prevents a
-    // refused boot from spinning inside KVM_RUN if the host resumes it.
+    publish_fatal_report(
+        carrick_el1_abi::PanicReportKind::FatalSite,
+        &carrick_el1_abi::PanicReport::at_caller("fatal_boot"),
+    )
+}
+
+/// Publish a ring panic or carrier fatal record through the fatal port, then
+/// halt. The words ride in `carrick_x86::PANIC_REPORT_REGS` order.
+#[cold]
+#[inline(never)]
+pub fn publish_fatal_report(
+    kind: carrick_el1_abi::PanicReportKind,
+    report: &carrick_el1_abi::PanicReport,
+) -> ! {
+    let words = report.words();
+    // SAFETY: terminal CPL0 fatal crossing. The host reads the stopped
+    // registers and never resumes this CPU; HLT keeps it from spinning in
+    // KVM_RUN if it does.
     unsafe {
         core::arch::asm!("out dx, al", "2: cli", "hlt", "jmp 2b",
-            in("dx") FATAL_PORT, in("al") 0_u8, options(noreturn));
+            in("dx") FATAL_PORT,
+            in("rax") kind.sentinel(),
+            in("rdi") words[0], in("rsi") words[1], in("rcx") words[2],
+            in("r8") words[3], in("r9") words[4], in("r10") words[5],
+            in("r11") words[6], in("r12") words[7], in("r13") words[8],
+            in("r14") words[9],
+            options(noreturn));
     }
 }
 

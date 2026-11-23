@@ -15,7 +15,35 @@ pub const PANIC_MESSAGE_BYTES: usize = 48;
 /// Words in the register image of one [`PanicReport`].
 pub const PANIC_REPORT_WORDS: usize = 1 + PANIC_FILE_TAIL_BYTES / 8 + PANIC_MESSAGE_BYTES / 8;
 
-/// One ring panic: where it was raised and how its message starts.
+/// What raised a [`PanicReport`]: the first word of its fatal crossing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanicReportKind {
+    /// A Rust panic in the ring, at its panic location.
+    Panic,
+    /// A carrier refusing a broken invariant (`fatal_boot`), at its raising site.
+    FatalSite,
+}
+
+impl PanicReportKind {
+    /// The crossing's first word for this kind.
+    pub const fn sentinel(self) -> u64 {
+        match self {
+            Self::Panic => PanicReport::SENTINEL,
+            Self::FatalSite => PanicReport::FATAL_SITE_SENTINEL,
+        }
+    }
+
+    /// The kind a crossing's first word names, if it carries a record.
+    pub const fn from_sentinel(word: u64) -> Option<Self> {
+        match word {
+            PanicReport::SENTINEL => Some(Self::Panic),
+            PanicReport::FATAL_SITE_SENTINEL => Some(Self::FatalSite),
+            _ => None,
+        }
+    }
+}
+
+/// One ring panic or carrier fatal: where it was raised and how its message starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PanicReport {
     line: u32,
@@ -29,6 +57,19 @@ impl PanicReport {
     /// distinct from [`crate::PANIC_SENTINEL`], whose other fatal crossings
     /// carry no record.
     pub const SENTINEL: u64 = 0xDEAD_CAFE_9A41_C0DE;
+    /// First word of the fatal crossing that carries a carrier fatal's
+    /// raising site ([`PanicReportKind::FatalSite`]).
+    pub const FATAL_SITE_SENTINEL: u64 = 0xDEAD_CAFE_9A41_F5E5;
+
+    /// A record for the caller's source site, with `what` as its message.
+    #[track_caller]
+    pub fn at_caller(what: &str) -> Self {
+        use fmt::Write;
+        let location = core::panic::Location::caller();
+        let mut report = Self::new(location.file(), location.line(), location.column());
+        let _ = report.message_writer().write_str(what);
+        report
+    }
 
     /// A record for a panic raised at `file:line:column`, with an empty message.
     pub fn new(file: &str, line: u32, column: u32) -> Self {
@@ -154,6 +195,23 @@ mod tests {
             decoded.to_string(),
             "carrick-el1/src/alloc.rs:41:9: memory allocation of 115343360 bytes failed"
         );
+    }
+
+    #[test]
+    fn a_fatal_site_record_names_its_caller_and_kind() {
+        let line = line!() + 1;
+        let report = PanicReport::at_caller("fatal_boot");
+        assert_eq!(report.line(), line);
+        assert!(
+            report
+                .to_string()
+                .ends_with(&std::format!("src/panic_report.rs:{line}:22: fatal_boot")),
+            "{report}"
+        );
+        for kind in [PanicReportKind::Panic, PanicReportKind::FatalSite] {
+            assert_eq!(PanicReportKind::from_sentinel(kind.sentinel()), Some(kind));
+        }
+        assert_eq!(PanicReportKind::from_sentinel(crate::PANIC_SENTINEL), None);
     }
 
     #[test]
