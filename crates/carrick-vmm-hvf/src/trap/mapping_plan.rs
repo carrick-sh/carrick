@@ -610,13 +610,12 @@ impl HvfVmState {
                             key.0, key.1
                         ))
                     })?;
-                    let mut region = prepare_exec_region_raw_in(
-                        &state.carrier_foreign_mm_transport.custody,
-                        mapping,
-                    )?;
+                    let custody = &state.carrier_foreign_mm_transport.custody;
+                    let mut region = prepare_exec_region_raw_in(custody, mapping)?;
                     let install = exec_stage2_install(mapping, &region, false);
                     let rc = unsafe {
                         inventory_stage2_map(
+                            custody.stage2_backend(),
                             install.host.cast(),
                             install.ipa,
                             install.size,
@@ -629,13 +628,8 @@ impl HvfVmState {
                             install.ipa, install.size
                         )));
                     }
-                    lease.mark_mapped();
-                    publish_exec_region_host_owner_in(
-                        &state.carrier_foreign_mm_transport.custody,
-                        &mut region,
-                        lease,
-                        None,
-                    )?;
+                    lease.mark_mapped(custody.stage2_backend_handle());
+                    publish_exec_region_host_owner_in(custody, &mut region, lease, None)?;
                     if let Some(owner) = region.structural_owner.as_ref() {
                         state
                             .task

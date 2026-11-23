@@ -404,6 +404,29 @@ impl CarrierVmCustodyState {
 pub(crate) type NativeExecOwner =
     carrick_hal::exec_owner::ExecPreparations<crate::trap::PreparedNativeExecSuccessor>;
 
+/// Backend handle retained by extents that retire outside carrier custody.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::clone::Clone)]
+pub(crate) struct CarrierStage2Backend(
+    std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
+);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for CarrierStage2Backend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CarrierStage2Backend")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierStage2Backend {
+    pub(crate) fn as_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
+        self.0.as_ref()
+    }
+}
+
 /// Carrier-owned VM lifecycle authority.
 ///
 /// The state is intentionally neither static nor process-global. A failed
@@ -414,6 +437,7 @@ pub(crate) type NativeExecOwner =
 #[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
+    stage2_backend: CarrierStage2Backend,
     pub(crate) transfer_carrier: core::num::NonZeroU64,
     pub(crate) el1_frame_grants: std::sync::Arc<El1FrameGrantLedger>,
     /// Host COW accounting for every MM admitted to this carrier.
@@ -801,6 +825,14 @@ impl Default for CarrierVmCustody {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 impl CarrierVmCustody {
+    pub(crate) fn stage2_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
+        self.stage2_backend.as_backend()
+    }
+
+    pub(crate) fn stage2_backend_handle(&self) -> CarrierStage2Backend {
+        self.stage2_backend.clone()
+    }
+
     pub fn new() -> Self {
         static NEXT_CARRIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_CARRIER
@@ -817,6 +849,9 @@ impl CarrierVmCustody {
         });
         let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
+            stage2_backend: CarrierStage2Backend(std::sync::Arc::new(
+                super::stage2_backend::HvfStage2,
+            )),
             transfer_carrier,
             el1_frame_grants: std::sync::Arc::new(El1FrameGrantLedger::default()),
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
@@ -1132,7 +1167,7 @@ impl CarrierVmCustody {
             CarrierFramePoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
             CarrierFramePoolState::Failed => None,
             CarrierFramePoolState::Uninitialized => {
-                match crate::frame_pool::PreMappedFramePool::try_new() {
+                match crate::frame_pool::PreMappedFramePool::try_new(self) {
                     Ok(pool) => {
                         let pool = std::sync::Arc::new(pool);
                         *guard = CarrierFramePoolState::Active(std::sync::Arc::clone(&pool));
@@ -1168,7 +1203,7 @@ impl CarrierVmCustody {
             CarrierRootSlotPoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
             CarrierRootSlotPoolState::Failed => None,
             CarrierRootSlotPoolState::Uninitialized => {
-                match crate::frame_pool::PreMappedRootSlotPool::try_new() {
+                match crate::frame_pool::PreMappedRootSlotPool::try_new(self) {
                     Ok(pool) => {
                         let pool = std::sync::Arc::new(pool);
                         *guard = CarrierRootSlotPoolState::Active(std::sync::Arc::clone(&pool));
@@ -1820,7 +1855,7 @@ pub(crate) fn destroy_vm_with_custody_target(
         }
     };
 
-    let rc = unsafe { inventory_stage2_destroy() };
+    let rc = unsafe { inventory_stage2_destroy(custody.stage2_backend()) };
     if rc != 0 {
         if matches!(target, CarrierVmDestroyTarget::Live) {
             custody
@@ -2130,7 +2165,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate pinned global owner backing");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2259,7 +2294,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate global owner retirement lock-order fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2384,7 +2419,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate exclusive retirement fixture");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2438,7 +2473,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate foreign-MM release safe-point fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2507,7 +2542,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate foreign-MM transient retry fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2567,7 +2602,7 @@ mod carrier_vm_custody_tests {
             )
             .expect("allocate removable FIFO fixture");
             let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-            lease.mark_mapped();
+            lease.mark_mapped(custody.stage2_backend_handle());
             let generation = super::register_global_frame_host_owner_in(
                 &custody,
                 lease,
@@ -2649,7 +2684,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate concurrent idle-turn fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2717,7 +2752,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate disappearing retirement slot fixture");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2790,7 +2825,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate colliding global owner backing");
         let candidate_host = candidate_mapping.as_ptr() as usize;
         let mut candidate_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        candidate_lease.mark_mapped();
+        candidate_lease.mark_mapped(custody.stage2_backend_handle());
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         let mut rollback_calls = 0_u32;
 
@@ -2871,7 +2906,7 @@ mod carrier_vm_custody_tests {
             )
             .expect("allocate fair-retry directory backing");
             let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-            lease.mark_mapped();
+            lease.mark_mapped(custody.stage2_backend_handle());
             let generation = super::register_global_frame_host_owner_in(
                 &custody,
                 lease,
@@ -2915,7 +2950,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate fair-retry detached candidate");
         let mut candidate_lease =
             super::GlobalFrameStage2Lease::fixed(collision_key.0, collision_key.1);
-        candidate_lease.mark_mapped();
+        candidate_lease.mark_mapped(custody.stage2_backend_handle());
         assert!(
             super::register_global_frame_host_owner_in_using(
                 &custody,
@@ -3346,7 +3381,7 @@ mod carrier_vm_custody_tests {
         let mut lease = super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
             .expect("reserve pending rebuild owner IPA");
         let key = lease.key();
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -3967,7 +4002,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate concurrent-retirement owner");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -4200,6 +4235,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             unsafe {
                 super::inventory_stage2_map(
+                    custody.stage2_backend(),
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
@@ -4210,7 +4246,7 @@ mod carrier_vm_custody_tests {
             "a second child must map the returned root slot while stale MM-access metadata still exists",
         );
         assert_eq!(
-            unsafe { super::inventory_stage2_unmap(ipa, len as usize) },
+            unsafe { super::inventory_stage2_unmap(custody.stage2_backend(), ipa, len as usize,) },
             0
         );
         drop(replacement);
@@ -4293,6 +4329,7 @@ mod carrier_vm_custody_tests {
         assert_ne!(
             unsafe {
                 super::inventory_stage2_map(
+                    custody.stage2_backend(),
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
@@ -4310,7 +4347,9 @@ mod carrier_vm_custody_tests {
         super::retry_structural_backing_identities_in_using(
             &custody,
             &[identity],
-            &mut super::unmap_global_frame_stage2_record,
+            &mut |ipa, len| {
+                super::unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+            },
             &mut super::release_retired_stage2_ipa,
         )
         .expect("clean up deferred pinned structural fixture");

@@ -64,7 +64,13 @@ fn shared_mm_task_projection_preserves_structural_owner() {
     retry_structural_backing_identities_in_using(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                ipa,
+                len,
+            )
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire shared-MM projection fixture");
@@ -1006,6 +1012,7 @@ fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap(
     mapping.physical_ipa = start;
     mapping.physical_size = usize::try_from(crate::memory::LINUX_EL0_TRAMPOLINE_SIZE).unwrap();
     let authority = PersistentCarrierMappings {
+        stage2_backend: custody.stage2_backend_handle(),
         mappings: TaskMappingIndex::from_region(mapping),
         custody: std::sync::Arc::clone(&custody),
         vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1122,6 +1129,7 @@ fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
     // Host-only fixture: this lease has never been mapped into a real VM.
     mapping.stage2_lease = Some(GlobalFrameStage2Lease::fixed(start, size as u64));
     let carrier = std::sync::Arc::new(PersistentCarrierMappings {
+        stage2_backend: custody.stage2_backend_handle(),
         mappings: TaskMappingIndex::from_region(mapping),
         custody: std::sync::Arc::clone(&custody),
         vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1198,6 +1206,7 @@ fn cow_settlement_observes_two_exact_carrier_pools() {
         mapping.host_mapping = Some(host.into());
         mapping.stage2_lease = Some(GlobalFrameStage2Lease::fixed(start, size as u64));
         let carrier = std::sync::Arc::new(PersistentCarrierMappings {
+            stage2_backend: custody.stage2_backend_handle(),
             mappings: TaskMappingIndex::from_region(mapping),
             custody: std::sync::Arc::clone(&custody),
             vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),

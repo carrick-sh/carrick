@@ -297,7 +297,13 @@ impl Stage2State {
                 "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
             ));
         }
-        let rc = unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
+        let rc = unsafe {
+            inventory_stage2_unmap(
+                self.custody().stage2_backend(),
+                mapping.physical_ipa,
+                mapping.physical_size,
+            )
+        };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"

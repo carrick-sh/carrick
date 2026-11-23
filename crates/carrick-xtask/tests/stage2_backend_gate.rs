@@ -147,24 +147,37 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         stale.is_empty(),
         "the HVF-named stage-2 wrappers are gone; use `inventory_stage2_*`: {stale:?}"
     );
-    // Each wrapper reaches the backend once, through the trait.
-    let backend_calls = count(&sources, "HvfStage2.map(")
-        + count(&sources, "HvfStage2.unmap(")
-        + count(&sources, "HvfStage2.destroy()");
-    assert_eq!(
-        backend_calls, 3,
-        "only the three inventory wrappers may call the HVF backend"
-    );
+    let (_, backend) = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("trap/stage2_backend.rs"))
+        .expect("trap/stage2_backend.rs");
+    for (wrapper, call) in [
+        ("inventory_stage2_map", "backend.map("),
+        ("inventory_stage2_map_replay", "inventory_stage2_map("),
+        ("inventory_stage2_unmap", "backend.unmap("),
+        ("inventory_stage2_destroy", "backend.destroy()"),
+    ] {
+        let header = format!("fn {wrapper}(");
+        let (_, wrapper_body) = backend.split_once(&header).expect("wrapper definition");
+        let (wrapper_body, _) = wrapper_body.split_once("\n}").expect("wrapper end");
+        assert_eq!(
+            wrapper_body.matches(call).count(),
+            1,
+            "{wrapper} calls {call}"
+        );
+    }
     // Both lazy replay paths keep the exact serialized replay.
+    for backend in ["custody", "self.stage2.custody()"] {
+        let call = format!("inventory_stage2_map_replay({backend}.stage2_backend(), b)");
+        assert_eq!(
+            count(&sources, &call),
+            1,
+            "missing lazy replay through {backend}"
+        );
+    }
+    // VM destruction stays a custody transaction.
     assert_eq!(
-        count(&sources, concat!("inventory_stage2_map_replay", "(b)")),
-        2,
-        "both lazy replay paths must use exact serialized replay"
-    );
-    // VM destruction stays a custody transaction: the wrapper's definition
-    // and the custody transaction's one call.
-    assert_eq!(
-        count(&sources, concat!("inventory_stage2_", "destroy()")),
+        count(&sources, concat!("inventory_stage2_", "destroy(")),
         2,
         "inventory_stage2_destroy must appear only in its definition and the custody wrapper"
     );

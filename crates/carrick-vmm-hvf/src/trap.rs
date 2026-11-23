@@ -4288,7 +4288,7 @@ fn abort_prepared_task_and_carrier(
     if let Some(custody) = custody.as_ref()
         && let Err(error) = retry_structural_backing_retirements_in_using(
             custody,
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
             &mut release_retired_stage2_ipa,
         )
     {
@@ -6663,6 +6663,7 @@ impl HvfVmState {
             {
                 let rc = unsafe {
                     inventory_stage2_map(
+                        plan.carrier_foreign_mm_transport.custody.stage2_backend(),
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
@@ -6704,7 +6705,11 @@ impl HvfVmState {
                     return Err(error);
                 }
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped();
+                    lease.mark_mapped(
+                        plan.carrier_foreign_mm_transport
+                            .custody
+                            .stage2_backend_handle(),
+                    );
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
@@ -7137,6 +7142,7 @@ impl HvfVmState {
             {
                 let rc = unsafe {
                     inventory_stage2_map(
+                        plan.carrier_foreign_mm_transport.custody.stage2_backend(),
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
@@ -7181,7 +7187,11 @@ impl HvfVmState {
                     return Err(error);
                 }
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped();
+                    lease.mark_mapped(
+                        plan.carrier_foreign_mm_transport
+                            .custody
+                            .stage2_backend_handle(),
+                    );
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =
@@ -8023,7 +8033,7 @@ impl HvfInner {
                 {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
                     // by add_alias. Only rc=0 proves replay installation.
-                    let rc = unsafe { inventory_stage2_map_replay(b) };
+                    let rc = unsafe { inventory_stage2_map_replay(custody.stage2_backend(), b) };
                     crate::probes::hv_vm_map_alias(
                         exit.exception.virtual_address,
                         b.physical_ipa,

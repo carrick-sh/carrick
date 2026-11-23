@@ -117,10 +117,18 @@ fn inventoried_cow_source_fixture(
     let host_addr = host.as_ptr() as usize;
     unsafe { host.as_ptr().write_bytes(0xa5, OWNER_LEN) };
     assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
+        unsafe {
+            inventory_stage2_map(
+                custody.stage2_backend(),
+                host.as_ptr().cast(),
+                key.0,
+                OWNER_LEN,
+                3,
+            )
+        },
         0,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(custody.stage2_backend_handle());
     let generation = register_global_frame_host_owner_in(&custody, lease, host, 3)
         .expect("register COW source owner");
 
@@ -3894,7 +3902,9 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
     );
     let turn = retry_pending_global_frame_retirements_at_idle_in_using(
         &transport.custody,
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
     );
     assert!(turn.inspected_directory <= 16);
     for _ in 0..2 {
@@ -3907,7 +3917,9 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         }
         let _ = retry_pending_global_frame_retirements_at_idle_in_using(
             &transport.custody,
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| {
+                unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+            },
         );
     }
     assert!(
@@ -4185,7 +4197,13 @@ fn structural_backing_owner_lifecycle_and_retained_backing() {
     retry_structural_backing_identities_in_using(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                ipa,
+                len,
+            )
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("explicitly retire structural lifecycle fixture");
@@ -4243,7 +4261,13 @@ fn serial_host_structural_backing_owner_invalid_arguments_and_exact_drop_order()
     retry_structural_backing_identities_in_using(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                ipa,
+                len,
+            )
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("explicitly retire structural drop-order fixture");
@@ -4264,10 +4288,18 @@ fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_r
     let host_addr = mapping.as_ptr() as usize;
     let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
     assert_eq!(
-        unsafe { inventory_stage2_map(mapping.as_ptr().cast(), ipa, size, 7) },
+        unsafe {
+            inventory_stage2_map(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                mapping.as_ptr().cast(),
+                ipa,
+                size,
+                7,
+            )
+        },
         0
     );
-    lease.mark_mapped();
+    lease.mark_mapped(legacy_test_carrier_vm_custody().stage2_backend_handle());
     let generation = register_global_frame_host_owner(lease, mapping, 7)
         .expect("register global frame host owner");
     let owner = global_frame_host_owners()
@@ -5264,7 +5296,9 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire initial fixed mapping fixture");
@@ -5523,7 +5557,9 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire structural vvar fork fixture");
@@ -6491,7 +6527,9 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[vvar_identity, overlay_identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire production vvar fixture");
@@ -6555,7 +6593,9 @@ fn current_generation_structural_owner_needs_no_replay_rebind() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire current-generation reconciliation fixture");
@@ -6656,7 +6696,9 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[g2_identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire G2 structural replay fixture");
@@ -6769,7 +6811,9 @@ fn structural_alias_rejects_forged_semantic_host_projection() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire forged semantic projection fixture");
@@ -6920,7 +6964,9 @@ fn initial_fixed_mapping_composes_through_first_fork_preparation() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire first-fork composition fixture");
@@ -7123,7 +7169,9 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire private overlay structural fixture");
@@ -7499,7 +7547,9 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire copied-child structural fixture");
@@ -7652,9 +7702,17 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rx_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rx global-frame IPA");
     let parent_rx_ipa = parent_rx_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_rx_addr.cast(), parent_rx_ipa, 0x4000, 5) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            custody.stage2_backend(),
+            parent_rx_addr.cast(),
+            parent_rx_ipa,
+            0x4000,
+            5,
+        )
+    };
     assert_eq!(rc, 0);
-    parent_rx_lease.mark_mapped();
+    parent_rx_lease.mark_mapped(custody.stage2_backend_handle());
     let parent_rx_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_rx_lease,
@@ -7676,9 +7734,17 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rw_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rw global-frame IPA");
     let parent_rw_ipa = parent_rw_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_rw_addr.cast(), parent_rw_ipa, 0x4000, 3) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            custody.stage2_backend(),
+            parent_rw_addr.cast(),
+            parent_rw_ipa,
+            0x4000,
+            3,
+        )
+    };
     assert_eq!(rc, 0);
-    parent_rw_lease.mark_mapped();
+    parent_rw_lease.mark_mapped(custody.stage2_backend_handle());
     let parent_rw_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_rw_lease,
@@ -7700,9 +7766,17 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_cow_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent COW global-frame IPA");
     let parent_cow_ipa = parent_cow_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_cow_addr.cast(), parent_cow_ipa, 0x4000, 3) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            custody.stage2_backend(),
+            parent_cow_addr.cast(),
+            parent_cow_ipa,
+            0x4000,
+            3,
+        )
+    };
     assert_eq!(rc, 0);
-    parent_cow_lease.mark_mapped();
+    parent_cow_lease.mark_mapped(custody.stage2_backend_handle());
     let parent_cow_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_cow_lease,
@@ -8676,9 +8750,17 @@ fn serial_host_releasable_stage2_lease_lifecycle_and_deterministic_allocator_reu
         std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.as_ptr(), payload.len());
     }
 
-    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), allocated_ipa, size, 7) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            legacy_test_carrier_vm_custody().stage2_backend(),
+            mapping.as_ptr().cast(),
+            allocated_ipa,
+            size,
+            7,
+        )
+    };
     assert_eq!(rc, 0);
-    lease.mark_mapped();
+    lease.mark_mapped(legacy_test_carrier_vm_custody().stage2_backend_handle());
     assert!(
         ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
         "stage-2 mapping must be recorded in backend audit state"
@@ -8913,9 +8995,17 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     )
     .expect("allocate backing");
     let host_addr = mapping.as_ptr() as usize;
-    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), extent_base, size, 7) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            legacy_test_carrier_vm_custody().stage2_backend(),
+            mapping.as_ptr().cast(),
+            extent_base,
+            size,
+            7,
+        )
+    };
     assert_eq!(rc, 0);
-    lease.mark_mapped();
+    lease.mark_mapped(legacy_test_carrier_vm_custody().stage2_backend_handle());
     let generation = register_global_frame_host_owner(lease, mapping, 7)
         .expect("register global frame host owner");
 
@@ -9171,10 +9261,18 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
     .expect("allocate host backing b");
     let host_addr_b = host_b.as_ptr() as usize;
     assert_eq!(
-        unsafe { inventory_stage2_map(host_b.as_ptr().cast(), key_b.0, OWNER_LEN, 3) },
+        unsafe {
+            inventory_stage2_map(
+                custody.stage2_backend(),
+                host_b.as_ptr().cast(),
+                key_b.0,
+                OWNER_LEN,
+                3,
+            )
+        },
         0,
     );
-    lease_b.mark_mapped();
+    lease_b.mark_mapped(custody.stage2_backend_handle());
     let gen_b = register_global_frame_host_owner_in(&custody, lease_b, host_b, 3)
         .expect("register owner b");
 
@@ -9570,10 +9668,18 @@ fn register_replacement_compound_owner(
     .expect("allocate replacement compound backing");
     let host_addr = host.as_ptr() as usize;
     assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
+        unsafe {
+            inventory_stage2_map(
+                custody.stage2_backend(),
+                host.as_ptr().cast(),
+                key.0,
+                OWNER_LEN,
+                3,
+            )
+        },
         0,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(custody.stage2_backend_handle());
     let generation = register_global_frame_host_owner_in(custody, lease, host, 3)
         .expect("register replacement compound owner");
     (key, host_addr, generation)
@@ -10307,10 +10413,18 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
     let parent_ipa = parent_lease.base;
     assert!(is_reusable_global_frame_extent(parent_ipa, parent_len));
     assert_eq!(
-        unsafe { inventory_stage2_map(parent_addr.cast(), parent_ipa, parent_len as usize, 3) },
+        unsafe {
+            inventory_stage2_map(
+                custody.stage2_backend(),
+                parent_addr.cast(),
+                parent_ipa,
+                parent_len as usize,
+                3,
+            )
+        },
         0
     );
-    parent_lease.mark_mapped();
+    parent_lease.mark_mapped(custody.stage2_backend_handle());
     let parent_gen = register_global_frame_host_owner_in(&custody, parent_lease, parent_host, 3)
         .expect("register parent heap owner");
     assert_ne!(parent_gen, 0);
@@ -10616,6 +10730,7 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
     assert_eq!(
         unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
@@ -10625,7 +10740,10 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
         0,
         "the same numeric root slot must be reusable after exact rollback",
     );
-    assert_eq!(unsafe { inventory_stage2_unmap(root_ipa, 0x20_0000) }, 0);
+    assert_eq!(
+        unsafe { inventory_stage2_unmap(custody.stage2_backend(), root_ipa, 0x20_0000) },
+        0
+    );
 }
 
 #[test]
@@ -10672,6 +10790,7 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     assert_ne!(
         unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
@@ -10685,7 +10804,7 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     retry_structural_backing_identities_in_using(
         &custody,
         &new_records,
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
         &mut release_retired_stage2_ipa,
     )
     .expect("test cleanup exact failed rollback record");
@@ -10709,6 +10828,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
     assert_eq!(
         unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 sentinel_host.as_ptr().cast(),
                 sentinel_ipa,
                 sentinel_size,
@@ -10718,7 +10838,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
         0,
     );
     let mut sentinel_lease = GlobalFrameStage2Lease::fixed(sentinel_ipa, sentinel_size as u64);
-    sentinel_lease.mark_mapped();
+    sentinel_lease.mark_mapped(custody.stage2_backend_handle());
     let sentinel_owner = StructuralBackingOwner::new_in(
         &custody,
         sentinel_host,
@@ -10736,7 +10856,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
         retry_structural_backing_identities_in_using(
             &custody,
             &[sentinel_identity],
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
             &mut release_retired_stage2_ipa,
         )
         .is_err(),
@@ -10763,7 +10883,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
     retry_structural_backing_identities_in_using(
         &custody,
         &[sentinel_identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
         &mut release_retired_stage2_ipa,
     )
     .expect("cleanup unrelated retry-pending sentinel");
@@ -10874,6 +10994,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     assert_eq!(
         unsafe {
             inventory_stage2_map(
+                legacy_test_carrier_vm_custody().stage2_backend(),
                 sentinel_host.as_ptr().cast(),
                 sentinel_ipa,
                 sentinel_len as usize,
@@ -11075,7 +11196,13 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
         "alias registry must be empty"
     );
     assert_eq!(
-        unsafe { inventory_stage2_unmap(sentinel_ipa, sentinel_len as usize) },
+        unsafe {
+            inventory_stage2_unmap(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                sentinel_ipa,
+                sentinel_len as usize,
+            )
+        },
         0,
         "remove authoritative rollback sentinel mapping"
     );
@@ -11269,10 +11396,17 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     )
     .expect("allocate host mapping for retirement failure test");
     let host_addr_retire = mapping_retire.as_ptr() as usize;
-    let rc =
-        unsafe { inventory_stage2_map(mapping_retire.as_ptr().cast(), ipa_retire, size_retire, 7) };
+    let rc = unsafe {
+        inventory_stage2_map(
+            legacy_test_carrier_vm_custody().stage2_backend(),
+            mapping_retire.as_ptr().cast(),
+            ipa_retire,
+            size_retire,
+            7,
+        )
+    };
     assert_eq!(rc, 0);
-    lease_retire.mark_mapped();
+    lease_retire.mark_mapped(legacy_test_carrier_vm_custody().stage2_backend_handle());
     let observed_live_retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
     lease_retire.drop_backing_audit = Some((host_addr_retire, Arc::clone(&observed_live_retire)));
 
@@ -11862,7 +11996,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let original_host = root_mapping.as_mut_ptr();
     let root_epoch = next_structural_epoch().expect("root structural epoch");
     let mut root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    root_lease.mark_mapped();
+    root_lease.mark_mapped(transport.custody.stage2_backend_handle());
     let root_owner = StructuralBackingOwner::new_pooled_root_in(
         &transport.custody,
         root_mapping,
@@ -12134,7 +12268,9 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
     retry_structural_backing_identities_in_using(
         &transport.custody,
         &[owner.record_identity()],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| {
+            unmap_global_frame_stage2_record(transport.custody.stage2_backend(), ipa, len)
+        },
         &mut release_retired_stage2_ipa,
     )
     .expect("retire extension backing");

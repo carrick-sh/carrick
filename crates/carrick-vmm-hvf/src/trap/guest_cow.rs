@@ -321,6 +321,7 @@ pub(crate) fn allocate_grant_extent(
         // owner registration below transfers into carrier custody.
         let rc = unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 host_ptr.cast(),
                 physical_ipa,
                 length as usize,
@@ -332,7 +333,7 @@ pub(crate) fn allocate_grant_extent(
                 "map guest COW grant IPA 0x{physical_ipa:x}: 0x{rc:x}"
             )));
         }
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
     }
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     lease.mark_test_mapped_without_backend();

@@ -2426,6 +2426,7 @@ impl HvfTaskState {
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_result = unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
@@ -2437,7 +2438,7 @@ impl HvfTaskState {
                 "map retained reuse IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
             )));
         }
-        new_lease.mark_mapped();
+        new_lease.mark_mapped(custody.stage2_backend_handle());
         let owner_generation = register_global_frame_host_owner_in(
             custody,
             new_lease,
@@ -3886,6 +3887,7 @@ impl HvfTaskState {
                 let new_physical_ipa = new_lease.base;
                 let map_result = unsafe {
                     inventory_stage2_map(
+                        custody.stage2_backend(),
                         new_host_ptr.cast(),
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE as usize,
@@ -3897,7 +3899,7 @@ impl HvfTaskState {
                         "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
                     )));
                 }
-                new_lease.mark_mapped();
+                new_lease.mark_mapped(custody.stage2_backend_handle());
                 let owner_generation = register_global_frame_host_owner_in(
                     custody,
                     new_lease,
@@ -5475,7 +5477,13 @@ impl Stage2State {
     ) -> Result<(), TrapError> {
         let perms_raw: u64 = carrick_aarch64::stage2::stage2_perms_bits(perms);
         let r = unsafe {
-            inventory_stage2_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
+            inventory_stage2_map(
+                self.custody().stage2_backend(),
+                host as *mut std::ffi::c_void,
+                ipa,
+                len as usize,
+                perms_raw,
+            )
         };
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -5511,7 +5519,7 @@ impl HvfVmState {
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
         // `add_alias`. Replay succeeds only when HVF confirms the installation;
         // an arbitrary nonzero result is never evidence that a racing mapper won.
-        let rc = unsafe { inventory_stage2_map_replay(b) };
+        let rc = unsafe { inventory_stage2_map_replay(self.stage2.custody().stage2_backend(), b) };
         crate::probes::hv_vm_map_alias(
             va,
             b.physical_ipa,
@@ -5747,8 +5755,10 @@ impl HvfVmState {
             None
         };
         let ipa = global_lease.as_ref().map_or(ipa, |lease| lease.base);
+        let custody = &self.carrier_foreign_mm_transport.custody;
         let r = unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 host.cast(),
                 ipa,
                 physical_size,
@@ -5768,12 +5778,11 @@ impl HvfVmState {
             )));
         }
         if let Some(lease) = global_lease.as_mut() {
-            lease.mark_mapped();
+            lease.mark_mapped(custody.stage2_backend_handle());
         }
         let (host_mapping, owner_generation) = if self.task.stage2.persistent_vm_lifecycle {
-            let custody = self.carrier_vm_custody();
             let owner_generation = register_global_frame_host_owner_in(
-                &custody,
+                custody,
                 global_lease.take().ok_or_else(|| {
                     TrapError::Hypervisor("HVPatch alias lost its global IPA lease".to_owned())
                 })?,

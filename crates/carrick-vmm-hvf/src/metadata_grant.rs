@@ -565,14 +565,12 @@ impl CarrierMetadataAccess {
     ) -> Result<RetainedMetadataMapping, MetadataResolutionError> {
         let extent = metadata_aperture(&self.carrier.custody)
             .lock()
-            .install_retained_using(
-                &self.carrier.custody,
-                self.generation,
-                backing,
-                map_metadata_backing,
-            )?;
+            .install_retained_using(&self.carrier.custody, self.generation, backing, |spec| {
+                map_metadata_backing(self.carrier.custody.stage2_backend(), spec)
+            })?;
         Ok(RetainedMetadataMapping {
             access: self.clone(),
+            backend: self.carrier.custody.stage2_backend_handle(),
             extent,
         })
     }
@@ -614,6 +612,7 @@ impl CarrierMetadataAccess {
 /// destruction. Consumers pin the extent while any EL1 reference can reach it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct RetainedMetadataMapping {
+    backend: crate::trap::CarrierStage2Backend,
     access: CarrierMetadataAccess,
     extent: MetadataExtent,
 }
@@ -636,7 +635,13 @@ impl RetainedMetadataMapping {
                             &self.access.carrier.custody,
                             record.identity,
                             |ipa, len| {
-                                let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, len) };
+                                let rc = unsafe {
+                                    crate::trap::inventory_stage2_unmap(
+                                        self.backend.as_backend(),
+                                        ipa,
+                                        len,
+                                    )
+                                };
                                 if rc == 0 {
                                     Ok(())
                                 } else {
@@ -1061,26 +1066,22 @@ pub(crate) fn install_fork_lifecycle(
     metadata_aperture(custody)
         .lock()
         .install_fork_lifecycle_using(generation.0, |host, ipa, len, token| {
-            publish_backing_using(
-                custody,
-                generation,
-                host,
-                ipa,
-                len,
-                token,
-                map_metadata_backing,
-            )
+            publish_backing_using(custody, generation, host, ipa, len, token, |spec| {
+                map_metadata_backing(custody.stage2_backend(), spec)
+            })
         })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn map_metadata_backing(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
     spec: crate::trap::CarrierStage2RecordSpec,
 ) -> carrick_aarch64::stage2::Stage2Status {
     // SAFETY: the aperture owner retains the validated backing and reservation
     // through the inventory's rollback-capable stage-2 publication.
     unsafe {
         crate::trap::inventory_stage2_map(
+            backend,
             spec.host_addr as *mut std::ffi::c_void,
             spec.ipa,
             spec.len,
@@ -1272,6 +1273,7 @@ pub(crate) fn service_metadata_operation(
         let mut state = aperture.lock();
         let publication = publish_metadata_mapping_using(custody, spec, |_| unsafe {
             crate::trap::inventory_stage2_map(
+                custody.stage2_backend(),
                 backing.as_ptr().cast(),
                 ipa,
                 extent_size,
@@ -1326,7 +1328,9 @@ pub(crate) fn service_metadata_operation(
                 .lock()
                 .return_extent_using(slot_idx, size, token, generation, |record| {
                     retire_metadata_record_using(custody, record.identity, |ipa, size| {
-                        let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, size) };
+                        let rc = unsafe {
+                            crate::trap::inventory_stage2_unmap(custody.stage2_backend(), ipa, size)
+                        };
                         if rc == 0 {
                             Ok(())
                         } else {
