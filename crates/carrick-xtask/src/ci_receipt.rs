@@ -11,9 +11,10 @@ use crate::accept::AcceptReceipt;
 use crate::ci_scaler::{KERNEL_RUNTIME_WORKFLOW, REPOSITORY};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -598,13 +599,15 @@ fn check_target_paths(crate_dir: &Path, manifest: &toml::Value) -> Result<(), Re
 #[derive(Default)]
 struct TestSourceScan {
     tests: BTreeSet<String>,
+    name_mentioned: bool,
     unresolved: Option<&'static str>,
     item_generator: Option<&'static str>,
     /// Directory of the file being visited, used to resolve a literal
     /// `#[path = "…"]` module against the scanned files.
     file_dir: std::path::PathBuf,
-    /// Canonical paths of every `.rs` file the scan reads for this crate.
-    scanned: BTreeSet<std::path::PathBuf>,
+    /// Canonical paths from the initial scan, used to check `#[path]` modules.
+    scanned: Rc<BTreeSet<PathBuf>>,
+    crate_dir: PathBuf,
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
     /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
     inline_depth: usize,
@@ -676,7 +679,7 @@ impl TestSourceScan {
         self.scanned.contains(&target).then_some(target)
     }
 
-    /// The scanned file a plain `include!("x.rs")` / `std::include!` /
+    /// The in-crate source a plain `include!("x.rs")` / `std::include!` /
     /// `core::include!` names. A computed argument stays unresolved.
     fn resolve_include(&self, mac: &syn::Macro) -> Option<PathBuf> {
         let segments: Vec<String> = mac
@@ -696,7 +699,38 @@ impl TestSourceScan {
             return None;
         }
         let lit = mac.parse_body::<syn::LitStr>().ok()?;
-        self.scanned_rs_file(&lit.value())
+        let relative = lit.value();
+        let relative = Path::new(&relative);
+        if relative.extension().is_none_or(|ext| ext != "rs") {
+            return None;
+        }
+
+        // Walk the literal path before canonicalizing so even a link in an
+        // intermediate directory (including one followed by `..`) is refused.
+        use std::path::Component;
+        let mut candidate = self.file_dir.clone();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir if candidate != self.crate_dir => {
+                    candidate.pop();
+                }
+                Component::Normal(part) => {
+                    candidate.push(part);
+                    if std::fs::symlink_metadata(&candidate).ok()?.is_symlink() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !std::fs::symlink_metadata(&candidate).ok()?.is_file() {
+            return None;
+        }
+        let target = self.file_dir.join(relative).canonicalize().ok()?;
+        target
+            .starts_with(self.crate_dir.join("src"))
+            .then_some(target)
     }
 }
 
@@ -831,6 +865,93 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     }
 }
 
+const MAX_INCLUDE_DEPTH: usize = 8;
+
+fn scan_crate_sources(
+    crate_dir: &Path,
+    manifest: &toml::Value,
+    test_name: Option<&str>,
+) -> Result<BTreeMap<PathBuf, TestSourceScan>, ReceiptError> {
+    use syn::visit::Visit;
+    let crate_dir = crate_dir
+        .canonicalize()
+        .map_err(|e| source_io(crate_dir, e))?;
+    let mut files = Vec::new();
+    collect_rs_files(
+        &crate_dir,
+        &explicit_target_paths(manifest),
+        &crate_dir,
+        &mut files,
+    )?;
+    let scanned = Rc::new(files.iter().cloned().collect());
+    let mut pending: VecDeque<_> = files.into_iter().map(|file| (file, 0)).collect();
+    let mut scans = BTreeMap::new();
+    while let Some((file, depth)) = pending.pop_front() {
+        if scans.contains_key(&file) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+        let syntax = syn::parse_file(&source).map_err(|e| {
+            ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
+        })?;
+        let mut scan = TestSourceScan {
+            scanned: Rc::clone(&scanned),
+            crate_dir: crate_dir.clone(),
+            file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+            name_mentioned: test_name.is_some_and(|name| source.contains(name)),
+            ..Default::default()
+        };
+        scan.visit_file(&syntax);
+        if depth < MAX_INCLUDE_DEPTH {
+            pending.extend(
+                scan.includes
+                    .iter()
+                    .map(|include| (include.file.clone(), depth + 1)),
+            );
+        }
+        scans.insert(file, scan);
+    }
+    Ok(scans)
+}
+
+/// Visit tests spliced into the includer's module. Inline modules contribute
+/// their names, but out-of-line modules in an include remain unresolved.
+fn visit_included_tests(
+    scan: &TestSourceScan,
+    scans: &BTreeMap<PathBuf, TestSourceScan>,
+    prefix: &[String],
+    depth: usize,
+    visit: &mut impl FnMut(&[String], &str),
+) -> Result<(), &'static str> {
+    if depth == MAX_INCLUDE_DEPTH && !scan.includes.is_empty() {
+        return Err("include! depth limit");
+    }
+    let mut result = Ok(());
+    for include in &scan.includes {
+        let Some(included) = scans.get(&include.file) else {
+            result = result.and(Err("include! source"));
+            continue;
+        };
+        if !included.mod_decls.is_empty() {
+            result = result.and(Err("include! source declaring out-of-line modules"));
+            continue;
+        }
+        let mut module = prefix.to_vec();
+        module.extend(include.inline.iter().cloned());
+        for relative in &included.test_paths {
+            visit(&module, relative);
+        }
+        result = result.and(visit_included_tests(
+            included,
+            scans,
+            &module,
+            depth + 1,
+            visit,
+        ));
+    }
+    result
+}
+
 /// Look for an attributed test function by its final path segment in the
 /// owning crate. If the scan encounters an opaque item macro, fall back to
 /// checking for the literal name anywhere in the crate's scanned Rust source,
@@ -839,7 +960,6 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
 /// This fallback cannot infer a name synthesized during macro expansion.
 /// Unresolved source paths and parse errors still refuse retirement.
 pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
-    use syn::visit::Visit;
     let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
     let mut found = false;
     for crate_dir in candidate_crate_dirs(tree_root)? {
@@ -848,30 +968,24 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
             continue;
         }
         check_target_paths(&crate_dir, &manifest)?;
-        let mut files = Vec::new();
-        let explicit_targets = explicit_target_paths(&manifest);
-        collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
-        let mut scan = TestSourceScan {
-            scanned: files.iter().filter_map(|f| f.canonicalize().ok()).collect(),
-            ..Default::default()
-        };
+        let scans = scan_crate_sources(&crate_dir, &manifest, Some(fn_name))?;
         let mut name_mentioned = false;
-        for file in files {
-            let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
-            name_mentioned |= source.contains(fn_name);
-            let syntax = syn::parse_file(&source).map_err(|e| {
-                ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
-            })?;
-            scan.file_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-            scan.visit_file(&syntax);
-            if let Some(reason) = scan.unresolved {
+        let mut item_generator = false;
+        for (file, scan) in &scans {
+            let unresolved = scan
+                .unresolved
+                .or_else(|| visit_included_tests(scan, &scans, &[], 0, &mut |_, _| {}).err());
+            if let Some(reason) = unresolved {
                 return Err(ReceiptError::Retired(format!(
                     "cannot resolve {reason} in '{}'; retirement of {bin}::{test_path} refused",
                     file.display()
                 )));
             }
+            found |= scan.tests.contains(fn_name);
+            name_mentioned |= scan.name_mentioned;
+            item_generator |= scan.item_generator.is_some();
         }
-        found |= scan.tests.contains(fn_name) || (scan.item_generator.is_some() && name_mentioned);
+        found |= item_generator && name_mentioned;
     }
     Ok(found)
 }
@@ -1056,32 +1170,16 @@ fn attribute_module_file(
             .tests
             .insert((bin.to_string(), path.join("::")), lane.to_string());
     }
-    for include in &scan.includes {
-        let mut module = prefix.to_vec();
-        module.extend(include.inline.iter().cloned());
-        // The included file is spliced into this module: its tests join
-        // the module path. Its own `mod`s or includes would need their
-        // files located from the includer, so they stay unresolved.
-        match scans.get(&include.file) {
-            Some(included) if included.mod_decls.is_empty() && included.includes.is_empty() => {
-                for relative in &included.test_paths {
-                    let mut path = module.clone();
-                    path.push(relative.clone());
-                    inventory
-                        .tests
-                        .insert((bin.to_string(), path.join("::")), lane.to_string());
-                }
-            }
-            _ => {
-                inventory.unresolved.get_or_insert_with(|| {
-                    format!(
-                        "include! of {} in {} declares modules or was not scanned",
-                        include.file.display(),
-                        file.display()
-                    )
-                });
-            }
-        }
+    if let Err(reason) = visit_included_tests(scan, scans, prefix, 0, &mut |module, relative| {
+        let mut path = module.to_vec();
+        path.push(relative.to_owned());
+        inventory
+            .tests
+            .insert((bin.to_string(), path.join("::")), lane.to_string());
+    }) {
+        inventory
+            .unresolved
+            .get_or_insert_with(|| format!("{reason} in {}", file.display()));
     }
     let parent = canonical.parent().unwrap_or(Path::new(""));
     let child_dir = if mod_rs {
@@ -1140,7 +1238,6 @@ fn attribute_module_file(
 /// `binary_runs_in_receipt_lane`. A test is keyed by the cargo target whose
 /// `mod` tree contains it and its module path inside that target.
 pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, ReceiptError> {
-    use syn::visit::Visit;
     let mut out = Vec::new();
     for crate_dir in candidate_crate_dirs(tree_root)? {
         let manifest = crate_manifest(&crate_dir)?;
@@ -1160,33 +1257,15 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
             crate_name,
             ..Default::default()
         };
-        let mut files = Vec::new();
-        let explicit_targets = explicit_target_paths(&manifest);
-        collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
-        let scanned: BTreeSet<PathBuf> =
-            files.iter().filter_map(|f| f.canonicalize().ok()).collect();
-        let mut scans = BTreeMap::new();
-        for file in files {
-            let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
-            let syntax = syn::parse_file(&source).map_err(|e| {
-                ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
-            })?;
-            let mut scan = TestSourceScan {
-                scanned: scanned.clone(),
-                file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
-                ..Default::default()
-            };
-            scan.visit_file(&syntax);
+        let scans = scan_crate_sources(&crate_dir, &manifest, None)?;
+        for (file, scan) in &scans {
             // Keep scanning and report any source or generator that can
             // hide tests from the inventory.
-            if let Some(reason) = scan.unresolved.take().or(scan.item_generator) {
+            if let Some(reason) = scan.unresolved.or(scan.item_generator) {
                 inventory.unresolved.get_or_insert_with(|| {
-                    let relative = file.strip_prefix(tree_root).unwrap_or(&file);
+                    let relative = file.strip_prefix(tree_root).unwrap_or(file);
                     format!("{reason} in {}", relative.display())
                 });
-            }
-            if let Ok(canonical) = file.canonicalize() {
-                scans.insert(canonical, scan);
             }
         }
         for target in crate_targets(&crate_dir, &manifest, &package_bin)? {
