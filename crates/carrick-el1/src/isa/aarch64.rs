@@ -690,9 +690,9 @@ impl CrossingBackend for Aarch64Backend {
 /// Authenticated terminal crossing; the carrier owns run cleanup and exit 125.
 pub fn complete_native_run_failure(
     binding: carrick_el1_abi::ExecutionBinding,
-    reason: carrick_core_abi::NativeRunFailureReason,
+    cause: carrick_core_abi::NativeRunFailureCause,
 ) -> ! {
-    let record = carrick_core_abi::NativeRunFailure::new(binding, reason);
+    let record = carrick_core_abi::NativeRunFailure::new(binding, cause);
     // SAFETY: EL1 retains this initialized supervisor-stack record until the
     // stopped CPU's exact execution is authenticated and the carrier stops.
     unsafe {

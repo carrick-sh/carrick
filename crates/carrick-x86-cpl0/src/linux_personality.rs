@@ -423,11 +423,11 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
 
 pub fn complete_run_failure(
     task: &CurrentTask,
-    reason: carrick_core_abi::NativeRunFailureReason,
+    cause: carrick_core_abi::NativeRunFailureCause,
 ) -> ! {
     carrick_el1::isa::x86::complete_native_run_failure(
         carrick_el1_linux::common_entry::execution_binding(task),
-        reason,
+        cause,
     )
 }
 
@@ -506,7 +506,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
         complete_run_failure(
             task,
-            carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
+            carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody.at_caller(),
         )
     }
 

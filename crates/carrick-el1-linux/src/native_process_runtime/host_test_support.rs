@@ -12879,7 +12879,7 @@ fn owner_copyout_invariant_is_a_run_failure() {
     let outcome = entry.complete_copyout(UserVa::new(0x10000), vec![0; 8], SyscallResult::new(0));
     assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
     assert_eq!(
-        entry.take_run_failure(),
+        entry.take_run_failure().map(|cause| cause.reason),
         Some(carrick_core_abi::NativeRunFailureReason::NativeInvalid)
     );
     assert!(service.copies.is_empty());

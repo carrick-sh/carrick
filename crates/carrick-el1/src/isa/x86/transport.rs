@@ -113,9 +113,9 @@ pub fn publish_fatal_report(
 /// Retain a supervisor-stack failure record across the declared carrier port.
 pub fn complete_native_run_failure(
     binding: carrick_el1_abi::ExecutionBinding,
-    reason: carrick_core_abi::NativeRunFailureReason,
+    cause: carrick_core_abi::NativeRunFailureCause,
 ) -> ! {
-    let record = carrick_core_abi::NativeRunFailure::new(binding, reason);
+    let record = carrick_core_abi::NativeRunFailure::new(binding, cause);
     // SAFETY: CPL0 retains the initialized record and cannot restore a guest
     // frame after this authenticated terminal crossing, even on refusal.
     unsafe {

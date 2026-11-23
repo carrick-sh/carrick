@@ -1,5 +1,5 @@
 //! Terminal native failures retain the exact execution incarnation.
-use carrick_core_abi::{ExecutionBinding, NativeRunFailureReason};
+use carrick_core_abi::{ExecutionBinding, NativeRunFailureCause, NativeRunFailureReason};
 
 /// Recover the native-service error corresponding to a recorded run failure.
 pub(crate) const fn native_process_error_from_run_failure(
@@ -28,29 +28,35 @@ pub(crate) const fn native_process_error_from_run_failure(
 pub struct NativeRunFailurePanic {
     pub binding: ExecutionBinding,
     pub reason: NativeRunFailureReason,
+    /// The kernel site that raised the failure (#2853).
+    pub site: carrick_core_abi::SourceSite,
 }
 
 /// A failed native operation cannot become an errno, forwarded call or return.
-pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunFailureReason) -> ! {
+pub fn complete_native_run_failure(binding: ExecutionBinding, cause: NativeRunFailureCause) -> ! {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    carrick_el1::isa::aarch64::complete_native_run_failure(binding, reason);
+    carrick_el1::isa::aarch64::complete_native_run_failure(binding, cause);
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    carrick_el1::isa::x86::complete_native_run_failure(binding, reason);
+    carrick_el1::isa::x86::complete_native_run_failure(binding, cause);
     #[cfg(all(not(target_os = "none"), test))]
     {
-        test_terminal_failure(binding, reason)
+        test_terminal_failure(binding, cause)
     }
     #[cfg(all(not(target_os = "none"), not(test)))]
     {
         let _ = binding;
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::PhysicalCustody(
-            crate::dispatch::PhysicalCustodyInvariant::NativeRunFailure(reason),
+            crate::dispatch::PhysicalCustodyInvariant::NativeRunFailure(cause.reason),
         ))
     }
 }
 
 #[cfg(all(not(target_os = "none"), test))]
 #[allow(clippy::panic)]
-fn test_terminal_failure(binding: ExecutionBinding, reason: NativeRunFailureReason) -> ! {
-    std::panic::panic_any(NativeRunFailurePanic { binding, reason })
+fn test_terminal_failure(binding: ExecutionBinding, cause: NativeRunFailureCause) -> ! {
+    std::panic::panic_any(NativeRunFailurePanic {
+        binding,
+        reason: cause.reason,
+        site: cause.site,
+    })
 }

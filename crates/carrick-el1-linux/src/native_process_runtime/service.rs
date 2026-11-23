@@ -2886,10 +2886,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ))?? {
             NativeResume::NoPending => {}
             deferred @ NativeResume::Left(_) => {
-                if let Some(reason) = self.take_run_failure() {
+                if let Some(cause) = self.take_run_failure() {
                     self.handoff = None;
                     return Err(
-                        crate::native_run_failure::native_process_error_from_run_failure(reason),
+                        crate::native_run_failure::native_process_error_from_run_failure(
+                            cause.reason,
+                        ),
                     );
                 }
                 return Ok(deferred);
@@ -2901,9 +2903,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         let outcome = self.resume_pending_lifecycle();
-        if let Some(reason) = self.take_run_failure() {
+        if let Some(cause) = self.take_run_failure() {
             self.handoff = None;
-            return Err(crate::native_run_failure::native_process_error_from_run_failure(reason));
+            return Err(
+                crate::native_run_failure::native_process_error_from_run_failure(cause.reason),
+            );
         }
         let outcome = outcome.ok_or(NativeProcessError::ServiceQuarantined(
             NativeServiceQuarantine::RetainedLifecycleMissing,

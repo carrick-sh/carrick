@@ -58,29 +58,57 @@ impl NativeRunFailureReason {
     }
 }
 
+impl NativeRunFailureReason {
+    /// This reason, raised at the caller's source site.
+    #[track_caller]
+    pub fn at_caller(self) -> NativeRunFailureCause {
+        NativeRunFailureCause {
+            reason: self,
+            site: crate::SourceSite::caller(),
+        }
+    }
+}
+
+/// A terminal native run failure: its reason and the kernel site that raised
+/// it, so the host names the site without a per-site diagnostic build (#2853).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeRunFailureCause {
+    pub reason: NativeRunFailureReason,
+    pub site: crate::SourceSite,
+}
+
+impl core::fmt::Display for NativeRunFailureCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} at {}", self.reason.as_str(), self.site)
+    }
+}
+
 /// Retained supervisor-stack record; the carrier authenticates the exact lane.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct NativeRunFailure {
-    words: [u64; 8],
+    words: [u64; 16],
 }
 impl NativeRunFailure {
     const MAGIC: u64 = 0x4352_5255_4e46_4149;
-    pub fn new(binding: ExecutionBinding, reason: NativeRunFailureReason) -> Self {
-        Self {
-            words: [
-                Self::MAGIC,
-                binding.task.raw(),
-                binding.generation.raw(),
-                binding.mm.raw(),
-                binding.thread_generation.raw(),
-                reason as u64,
-                0,
-                0,
-            ],
-        }
+    /// First word of the raising site's wire image.
+    const SITE: usize = 6;
+    /// First reserved word; every reserved word is zero.
+    const RESERVED: usize = Self::SITE + crate::SOURCE_SITE_WORDS;
+    pub fn new(binding: ExecutionBinding, cause: NativeRunFailureCause) -> Self {
+        let mut words = [0; 16];
+        words[..Self::SITE].copy_from_slice(&[
+            Self::MAGIC,
+            binding.task.raw(),
+            binding.generation.raw(),
+            binding.mm.raw(),
+            binding.thread_generation.raw(),
+            cause.reason as u64,
+        ]);
+        words[Self::SITE..Self::RESERVED].copy_from_slice(&cause.site.words());
+        Self { words }
     }
-    pub fn reason_for(&self, expected: ExecutionBinding) -> Option<NativeRunFailureReason> {
+    pub fn cause_for(&self, expected: ExecutionBinding) -> Option<NativeRunFailureCause> {
         if !expected.issued()
             || self.words[..5]
                 != [
@@ -90,11 +118,17 @@ impl NativeRunFailure {
                     expected.mm.raw(),
                     expected.thread_generation.raw(),
                 ]
-            || self.words[6..] != [0, 0]
+            || self.words[Self::RESERVED..].iter().any(|&word| word != 0)
         {
             return None;
         }
-        NativeRunFailureReason::from_raw(self.words[5])
+        let reason = NativeRunFailureReason::from_raw(self.words[5])?;
+        let mut site = [0; crate::SOURCE_SITE_WORDS];
+        site.copy_from_slice(&self.words[Self::SITE..Self::RESERVED]);
+        Some(NativeRunFailureCause {
+            reason,
+            site: crate::SourceSite::from_words(site),
+        })
     }
 }
 /// Carrier-owned terminal crossing ledger. A successful admission is one-shot;
@@ -112,20 +146,20 @@ impl NativeRunFailureConsumer {
         &mut self,
         record: &NativeRunFailure,
         expected: ExecutionBinding,
-    ) -> Option<(NativeRunFailureReason, u64)> {
+    ) -> Option<(NativeRunFailureCause, u64)> {
         if self.consumed {
             return None;
         }
-        let reason = record.reason_for(expected)?;
+        let cause = record.cause_for(expected)?;
         let crossings = self.crossings.checked_add(1)?;
         self.crossings = crossings;
         self.consumed = true;
-        Some((reason, crossings))
+        Some((cause, crossings))
     }
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<NativeRunFailure>() == 64);
+    assert!(core::mem::size_of::<NativeRunFailure>() == 128);
     assert!(core::mem::align_of::<NativeRunFailure>() == 64);
 };
 

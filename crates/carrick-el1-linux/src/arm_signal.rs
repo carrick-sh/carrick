@@ -197,7 +197,7 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     >,
 ) -> Result<
     Option<super::native_process_runtime::NativeResume>,
-    carrick_core_abi::NativeRunFailureReason,
+    carrick_core_abi::NativeRunFailureCause,
 > {
     use zerocopy::IntoBytes;
     if !process.signal_checkpoint_needed() {
@@ -236,9 +236,9 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Ok(Some(
             super::native_process_runtime::NativeResume::Left(process.take_root_exit()),
         )),
-        Some(_) => {
-            Err(super::native_process_runtime::NativeFailure::Quarantined.run_failure_reason())
-        }
+        Some(_) => Err(super::native_process_runtime::NativeFailure::Quarantined
+            .run_failure_reason()
+            .at_caller()),
     }
 }
 

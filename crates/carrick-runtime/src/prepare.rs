@@ -957,8 +957,8 @@ fn run_prepared_kvm_pool_with_debug(
                 None,
             )
         }
-        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::RunFailed { reason, exits } => {
-            (125, None, exits, None, Some(reason))
+        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::RunFailed { cause, exits } => {
+            (125, None, exits, None, Some(cause))
         }
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
             (code, None, exits, None, None)
@@ -981,8 +981,9 @@ fn run_prepared_kvm_pool_with_debug(
             .map_err(|_| RuntimeError::Configuration("KVM dispatcher poisoned".into()))?;
         (dispatcher.stdout(), dispatcher.stderr())
     };
-    if let Some(reason) = run_failure {
-        stderr.extend_from_slice(format!("carrick: run failed: {}\n", reason.as_str()).as_bytes());
+    if let Some(cause) = run_failure {
+        // The cause names the kernel site that raised it (#2853).
+        stderr.extend_from_slice(format!("carrick: run failed: {cause}\n").as_bytes());
     }
     Ok(PreparedKvmPoolOutcome {
         run: RunResult {

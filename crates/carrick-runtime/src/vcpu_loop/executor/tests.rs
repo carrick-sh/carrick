@@ -9588,18 +9588,24 @@ fn native_exit_group_host_request_shuts_down_pool_cleanly() {
     let entry: NativeTerminalIdleEntry = Box::new(move || {
         let result = terminal_park_tests::run();
         status_tx
-            .send(result.as_ref().copied().map_err(|failure| failure.reason))
+            .send(
+                result
+                    .as_ref()
+                    .copied()
+                    .map_err(|failure| failure.cause.reason),
+            )
             .unwrap();
         result.map(|_| ()).map_err(|failure| {
             // The VM-free backend substitutes physical entry only. Exercise
             // the production wire codec and one-shot carrier consumer using
             // the execution binding retained by the actual failed native entry.
-            let record = carrick_core_abi::NativeRunFailure::new(failure.binding, failure.reason);
-            let (reason, crossings) = carrick_core_abi::NativeRunFailureConsumer::default()
+            let record = carrick_core_abi::NativeRunFailure::new(failure.binding, failure.cause);
+            let (cause, crossings) = carrick_core_abi::NativeRunFailureConsumer::default()
                 .consume(&record, failure.binding)
                 .unwrap();
             TrapError::NativeRunFailure {
-                reason: reason.as_str(),
+                reason: cause.reason.as_str(),
+                site: cause.site,
                 crossings,
             }
         })

@@ -1845,6 +1845,7 @@ mod tests {
         let items = syn::parse_file(&source).unwrap();
         for name in [
             "NativeRunFailureReason",
+            "NativeRunFailureCause",
             "NativeRunFailure",
             "NativeRunFailureConsumer",
         ] {

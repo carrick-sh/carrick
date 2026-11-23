@@ -8,7 +8,7 @@ use carrick_personality_linux::lifecycle::{LifecycleOutcome, LinuxWaitStatus, Pr
 #[derive(Debug)]
 pub struct NativeTerminalFailure {
     pub binding: ExecutionBinding,
-    pub reason: carrick_core_abi::NativeRunFailureReason,
+    pub cause: carrick_core_abi::NativeRunFailureCause,
 }
 
 /// Run two real native members through terminal park, handback and exit.
@@ -59,10 +59,10 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
         owner.exit_group(0),
         LifecycleOutcome::Transferred { .. }
     ));
-    if let Some(reason) = owner.take_run_failure() {
+    if let Some(cause) = owner.take_run_failure() {
         return Err(NativeTerminalFailure {
             binding: owner.binding,
-            reason,
+            cause,
         });
     }
     let owner_record_exists = fixture.zone.live(fixture.record).is_some();
@@ -103,10 +103,10 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
         member.exit_group(9),
         LifecycleOutcome::Transferred { .. }
     ));
-    if let Some(reason) = member.take_run_failure() {
+    if let Some(cause) = member.take_run_failure() {
         return Err(NativeTerminalFailure {
             binding: member.binding,
-            reason,
+            cause,
         });
     }
     assert!(member.take_handoff_receipt().is_some());
@@ -185,13 +185,12 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
             &mut service,
         )
         .unwrap();
-    let resumed =
-        owner
-            .resume_checkpoint(|_| Ok(None))
-            .map_err(|reason| NativeTerminalFailure {
-                binding: owner.binding,
-                reason,
-            })?;
+    let resumed = owner
+        .resume_checkpoint(|_| Ok(None))
+        .map_err(|cause| NativeTerminalFailure {
+            binding: owner.binding,
+            cause,
+        })?;
     assert_eq!(owner.take_run_failure(), None);
     let NativeResume::Left(Some(status)) = resumed else {
         panic!("terminal owner did not publish its status");
@@ -229,7 +228,7 @@ fn run_failed_never_mints_terminal_load_authority() {
         .unwrap();
     owner.run_failed(carrick_core_abi::NativeRunFailureReason::NativeQuarantined);
     assert_eq!(
-        owner.take_run_failure(),
+        owner.take_run_failure().map(|cause| cause.reason),
         Some(carrick_core_abi::NativeRunFailureReason::NativeQuarantined)
     );
     assert!(fixture.zone.live(fixture.record).is_none());

@@ -3340,8 +3340,8 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         fn is_root_process(&self) -> bool {
             true
         }
-        fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
-            Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
+        fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureCause> {
+            Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody.at_caller())
         }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
