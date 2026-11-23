@@ -351,7 +351,8 @@ fn guest_protect_refuses_host_map_leaf() {
                     writable: false,
                     executable: false,
                     user: true
-                }
+                },
+                exec: ExecAuthority::Leaf,
             },
             &[]
         ),
@@ -389,10 +390,92 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
         },
     ] {
         assert_eq!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &[]),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    exec: ExecAuthority::Leaf
+                },
+                &[]
+            ),
             DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
         );
         assert_eq!(*words.words.borrow(), before);
+    }
+}
+
+/// #2874: a private page granted read-write may become executable when the
+/// mapping's ceiling allows execute (V8's code range), and keeps `MAY_EXEC`
+/// for a later grant; write stays a leaf fact the ceiling cannot widen.
+#[test]
+fn guest_protect_grants_execute_within_the_mapping_ceiling() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let read_write = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    let read_only = Permissions {
+        writable: false,
+        ..read_write
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, read_only),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: read_write,
+                exec: ExecAuthority::Mapping,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    let read_exec = Permissions {
+        executable: true,
+        ..read_only
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: read_exec,
+                exec: ExecAuthority::Mapping,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (protected, _) =
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va)).unwrap();
+    assert_eq!(protected & (NX | WRITE), 0);
+    assert_ne!(protected & MAY_EXEC, 0);
+    for permissions in [read_only, read_exec] {
+        assert!(matches!(
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    exec: ExecAuthority::Leaf,
+                },
+                &[]
+            ),
+            DescriptorOutcome::Applied { .. }
+        ));
     }
 }
 
@@ -422,7 +505,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: readonly
+                permissions: readonly,
+                exec: ExecAuthority::Leaf,
             },
             &[]
         ),
@@ -437,7 +521,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: writable
+                permissions: writable,
+                exec: ExecAuthority::Leaf,
             },
             &[]
         ),
@@ -994,7 +1079,8 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     writable: true,
                     executable: false,
                     user: true
-                }
+                },
+                exec: ExecAuthority::Leaf,
             },
             &[]
         ),
@@ -1049,6 +1135,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 executable: true,
                 user: true,
             },
+            exec: ExecAuthority::Leaf,
         },
         &[],
     );
@@ -1233,7 +1320,15 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
             user: true,
         };
         assert!(matches!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &grants),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    exec: ExecAuthority::Leaf
+                },
+                &grants
+            ),
             DescriptorOutcome::Applied { .. }
         ));
         assert_eq!(
@@ -1258,6 +1353,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     writable: true,
                     ..permissions
                 },
+                exec: ExecAuthority::Leaf,
             },
             &[],
         );
@@ -1314,7 +1410,8 @@ fn failed_split_restores_all_512_children_and_parent() {
                         writable: false,
                         executable: false,
                         user: true
-                    }
+                    },
+                    exec: ExecAuthority::Leaf,
                 },
                 &[root(0x4000)]
             ),
@@ -1407,6 +1504,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 executable: false,
                 user: true,
             },
+            exec: ExecAuthority::Leaf,
         },
         &[],
     );

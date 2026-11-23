@@ -118,6 +118,7 @@ impl LiveTables {
                         executable: edit.executable,
                         user: true,
                     },
+                    ceiling: edit.cow_ceiling,
                 },
             );
         } else {

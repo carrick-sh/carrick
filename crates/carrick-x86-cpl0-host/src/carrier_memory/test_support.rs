@@ -1565,6 +1565,7 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
                 executable: false,
                 user: true,
             },
+            exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Leaf,
         },
     };
     let receipt = execute_descriptor_txn(

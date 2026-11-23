@@ -470,6 +470,17 @@ pub struct EditPermissions {
     pub user: bool,
 }
 
+/// The protection ceiling of the mapping a `Protect` edits (Linux's
+/// `VM_MAYWRITE`/`VM_MAYEXEC`, mprotect(2)), as the reservation owner reports
+/// it under its root guard. Each ISA decides which grants it may authorize
+/// beyond what its leaves already carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditCeiling {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
 /// Host-authenticated output backing, never inferred from a page-table word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditBacking {
@@ -517,6 +528,9 @@ pub enum EditOperation {
     },
     Protect {
         permissions: EditPermissions,
+        /// The edited mapping's ceiling; `None` when the caller has no
+        /// reservation owner (only the leaves' own tags authorize).
+        ceiling: Option<EditCeiling>,
     },
     ArmCow {
         kernel_only: bool,

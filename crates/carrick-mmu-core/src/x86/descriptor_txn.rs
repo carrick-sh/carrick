@@ -44,6 +44,18 @@ const fn leaf_level(size: LeafSize) -> usize {
         LeafSize::Block1G => 1,
     }
 }
+/// What authorizes a `Protect` to make a private leaf executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecAuthority {
+    /// Only a leaf already carrying `MAY_EXEC` may become executable.
+    Leaf,
+    /// The reservation owner reports that the mapping's ceiling allows
+    /// execute (`VM_MAYEXEC`, mprotect(2)), so every edited leaf gains
+    /// `MAY_EXEC`. x86 instruction fetch is coherent with stores: unlike
+    /// AArch64, granting execute owes no instruction-cache maintenance.
+    Mapping,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorOp {
     /// A complete owner grant: prepare neighbors and publish only the fault
@@ -71,6 +83,7 @@ pub enum DescriptorOp {
     Protect {
         span: PageSpan,
         permissions: Permissions,
+        exec: ExecAuthority,
     },
     ArmCow(PageSpan),
     CowRepoint {
@@ -187,9 +200,15 @@ impl<'a> DescriptorTxn<'a> {
             },
             EditOperation::Protect {
                 permissions: requested,
+                ceiling,
             } => DescriptorOp::Protect {
                 span,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                exec: if ceiling.is_some_and(|ceiling| ceiling.executable) {
+                    ExecAuthority::Mapping
+                } else {
+                    ExecAuthority::Leaf
+                },
             },
             EditOperation::ArmCow {
                 kernel_only: false,
@@ -681,7 +700,11 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 (entry | PRESENT) & !PREPARED
             }
-            DescriptorOp::Protect { permissions: p, .. } => {
+            DescriptorOp::Protect {
+                permissions: p,
+                exec,
+                ..
+            } => {
                 if entry & (PRESENT | PREPARED) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
@@ -691,10 +714,14 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if entry & COW != 0 {
                     return Err(DescriptorRefusal::CowArmed);
                 }
-                if p.writable && entry & MAY_WRITE == 0 || p.executable && entry & MAY_EXEC == 0 {
+                // Write stays a leaf fact: MAY_WRITE says the frame is this
+                // MM's own to write.
+                let may_exec = entry & MAY_EXEC != 0 || exec == ExecAuthority::Mapping;
+                if p.writable && entry & MAY_WRITE == 0 || p.executable && !may_exec {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
-                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
+                let granted = if p.executable { MAY_EXEC } else { 0 };
+                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX)) | granted
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
@@ -818,7 +845,16 @@ impl DescriptorTxn<'_> {
                 },
                 None,
             ),
-            DescriptorOp::Protect { permissions: p, .. } => (0, 0, permissions(p), None),
+            DescriptorOp::Protect {
+                permissions: p,
+                exec,
+                ..
+            } => (
+                0,
+                u64::from(exec == ExecAuthority::Mapping),
+                permissions(p),
+                None,
+            ),
             DescriptorOp::ArmCow(_) => (0, 0, 0, None),
             DescriptorOp::CowRepoint {
                 old, new, backing, ..
