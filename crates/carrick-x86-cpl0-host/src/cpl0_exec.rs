@@ -42,7 +42,7 @@ use carrick_el1::memory::reservations::{
 use carrick_guest_arch::{ExecutionGeneration, TaskIdentity, TaskSerial};
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
 use carrick_hal::exec_owner::{
-    ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecRetired, ExecSettleLane,
+    ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecSettleLane,
     ExecSettleRefusal, ExecSettlement, ParkedProbe, SettledExec, StockParked,
 };
 use carrick_hal::fork_stock::GrantExecution;
@@ -824,18 +824,21 @@ where
 /// returns them. A claimed or parked row holds no carrier frames. No lane is
 /// left to run the drain again, so a failed step keeps neither the steps nor
 /// the rows after it: every step of every row runs, and the result is the
-/// first failure with the count of those after it. Returns the rows retired.
+/// first failure with the count of those after it. The exec tables resolve
+/// before any row is retired: a carrier without them keeps its rows, and the
+/// owner's census still names them unretired. Returns the rows retired.
 pub fn release_x86_execs_at_carrier_exit<T, C, F, P, A>(
-    retired: Vec<ExecRetired<X86ExecPreparation<F::Data>, P, A>>,
+    tables: Result<(&X86Cpl0Reservations, &X86Cpl0Zone), TrapError>,
+    owner: &mut ExecPreparations<X86ExecPreparation<F::Data>, P, A>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
-    roots: &X86Cpl0Reservations,
-    zone: &X86Cpl0Zone,
 ) -> Result<usize, TrapError>
 where
     T: ChildAddressTags,
     F: X86ExecFrames,
 {
+    let (roots, zone) = tables?;
+    let retired = owner.retire_at_carrier_exit();
     let rows = retired.len();
     let mut failures = ReleaseFailures::default();
     for row in retired {
@@ -1084,17 +1087,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// each held; see [`release_x86_execs_at_carrier_exit`]. Call only once
     /// every CPU lane has stopped. Returns the rows retired.
     pub(crate) fn retire_native_execs_at_carrier_exit(&mut self) -> Result<usize, TrapError> {
-        // The tables first: a carrier without them keeps its rows.
         let ram = Arc::clone(&self.ram);
-        let (roots, zone) = Self::exec_tables(&ram)?;
-        let retired = self.exec_owner.retire_at_carrier_exit();
         let mut frames = CarrierExecFrames {
             vm: &mut self._vm,
             next: &mut self.anonymous_next_gpa,
             inventory: &self.frame_inventory,
             rollback_fault: &self.initial_rollback_fault,
         };
-        release_x86_execs_at_carrier_exit(retired, &mut self.fork_stock, &mut frames, roots, zone)
+        release_x86_execs_at_carrier_exit(
+            Self::exec_tables(&ram),
+            &mut self.exec_owner,
+            &mut self.fork_stock,
+            &mut frames,
+        )
     }
 }
 
