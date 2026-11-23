@@ -461,6 +461,48 @@ mod tests {
         assert_eq!(frame.rcx, 0x40_1005);
         assert_eq!((frame.rax, frame.rdi), (0x1234, 3));
     }
+    /// #2872: the x86 signal machine's `SA_RESTART` rerun reads where the
+    /// interrupted call's saved context puts its PC. A context parked at its
+    /// `SYSCALL` keeps RCX there; one after it rewinds exactly once. Red
+    /// before the fix: an `AtSyscall` context was rewound to `SYSCALL - 2`.
+    #[test]
+    fn sa_restart_rerun_keeps_an_at_syscall_rcx_on_its_syscall() {
+        sa_restart_reruns_interrupted_syscall_once(carrick_guest_arch::SavedSyscallPc::AtSyscall);
+    }
+    #[test]
+    fn sa_restart_rerun_rewinds_an_after_syscall_rcx_once() {
+        sa_restart_reruns_interrupted_syscall_once(
+            carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        );
+    }
+    fn sa_restart_reruns_interrupted_syscall_once(position: carrick_guest_arch::SavedSyscallPc) {
+        const SYSCALL: u64 = 0x42_8bb5;
+        const WAIT4: u64 = 61;
+        let saved_pc = match position {
+            carrick_guest_arch::SavedSyscallPc::AtSyscall => SYSCALL,
+            carrick_guest_arch::SavedSyscallPc::AfterSyscall => SYSCALL + 2,
+        };
+        let mut original = carrick_sched_core::ParkedContextWords::ZERO;
+        original.frame[10] = WAIT4; // saved RAX
+        original.replace_saved_pc(saved_pc, position);
+        // The interrupted wait answered EINTR in RAX; RCX is where the
+        // context says.
+        let mut frame = super::NativeFrame {
+            rcx: saved_pc,
+            rax: 4u64.wrapping_neg(), // -EINTR
+            rdi: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            carrick_guest_arch::rerun_interrupted_syscall(&mut frame, &original),
+            Some(carrick_guest_arch::SavedSyscallPc::AtSyscall)
+        );
+        assert_eq!(
+            frame.rcx, SYSCALL,
+            "the rerun enters the interrupted SYSCALL itself, exactly once ({position:?})"
+        );
+        assert_eq!((frame.rax, frame.rdi), (WAIT4, 7));
+    }
     #[test]
     fn scheduler_slot_conversion_rejects_unissued_high_bits() {
         use super::checked_scheduler_slot;

@@ -1928,3 +1928,174 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
     });
     assert!(mmap_cycles.load(Ordering::Acquire) > 0);
 }
+
+/// #2872: an `SA_RESTART` handler reruns an interrupted call from where its
+/// saved context says the PC sits. A context parked at its `SVC` (an object
+/// park, or a saved retry) keeps the PC; one after it rewinds exactly once.
+/// Driven through the production saved-context checkpoint,
+/// `checkpoint_saved_user_return`, with the production `ArmSignalMachine`.
+/// Red before the fix: the `AtSyscall` context was rewound a second time,
+/// to the instruction before its `SVC`.
+#[test]
+fn arm_sa_restart_keeps_an_at_syscall_pc_on_its_svc() {
+    arm_sa_restart_reruns_interrupted_svc_once(carrick_sched_core::SavedSyscallPc::AtSyscall);
+}
+
+#[test]
+fn arm_sa_restart_rewinds_an_after_syscall_pc_once() {
+    arm_sa_restart_reruns_interrupted_svc_once(carrick_sched_core::SavedSyscallPc::AfterSyscall);
+}
+
+fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::SavedSyscallPc) {
+    const SVC: u64 = 0x40_0000;
+    const ARG0: u64 = 0x99;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    registry()
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let owner_record = runtime
+        .task_binding(TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        })
+        .unwrap()
+        .record
+        .id;
+    fixture
+        .control
+        .bind_zone_record(fixture.zone.record_ref(owner_record));
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, owner_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        owner_record
+    );
+    run_as_leader(fixture);
+
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp_top = stack.va_at(stack.len());
+    let mut service = fixture.process_service();
+    let ttbr0 = fixture_ttbr0(fixture);
+    let task: &'static CurrentTask = &fixture.task;
+    let usr1 = Signal::from_number(10).unwrap();
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        with_process_entry(
+            source,
+            task,
+            &words.native,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        usr1,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x70_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                restart: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    let saved_pc = match position {
+        carrick_sched_core::SavedSyscallPc::AtSyscall => SVC,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall => SVC + 4,
+    };
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = ARG0;
+    native.x[8] = 61; // wait4: restartable under SA_RESTART
+    native.sp_el0 = sp_top.raw();
+    let resumed = with_process_entry(
+        source,
+        task,
+        &native,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |entry| {
+            // The interrupted call's own entry context, parked at `position`,
+            // is retained for the signal owner; the call then answers EINTR.
+            entry
+                .resume_context_mut()
+                .replace_saved_pc(saved_pc, position);
+            entry.retain_interrupted_syscall().unwrap();
+            use carrick_guest_arch::ProcessContext;
+            entry
+                .resume_context_mut()
+                .set_syscall_return(carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64);
+            let checkpoint = crate::arm_signal::checkpoint_saved_user_return(task, entry);
+            assert!(
+                matches!(checkpoint, Ok(None)),
+                "the handler is installed inline"
+            );
+            *entry.resume_context()
+        },
+    )
+    .unwrap();
+    assert_eq!(resumed.native.pc, 0x70_0000, "the SA_RESTART handler runs");
+
+    let written_sp = sp_top.raw()
+        - (core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>() as u64);
+    let written_sp = written_sp & !15;
+    let offset = (written_sp - stack.arg()) as usize;
+    let sigframe: carrick_personality_linux::signal::arm::SignalFrame =
+        zerocopy::FromBytes::read_from_bytes(
+            &stack.as_bytes()[offset
+                ..offset
+                    + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+        )
+        .unwrap();
+    let restart_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
+    let restart_x0 = { sigframe.rt.ucontext.uc_mcontext.regs[0] };
+    assert_eq!(
+        restart_pc, SVC,
+        "sigreturn reruns the interrupted SVC itself, exactly once ({position:?})"
+    );
+    assert_eq!(restart_x0, ARG0, "the rerun SVC keeps its original arg0");
+    assert_eq!(
+        resumed.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "a restarted context is at its SVC: nothing may rewind it again"
+    );
+}
