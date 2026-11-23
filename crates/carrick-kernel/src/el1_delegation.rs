@@ -2373,6 +2373,10 @@ fn handoff_open_reference(lease: crate::kernel::objects::FileDescriptionFdLease)
         return;
     };
     let region = get_el1_region_host_ptr();
+    std::eprintln!(
+        "PROBE_2852 handoff_open_reference thread={:?} region={region:#x} key={key:?}",
+        std::thread::current().name()
+    );
     assert_ne!(region, 0, "shared open lifetime retains its aperture");
     let record = open_file_object(region, key.handle);
     // Custody publication and host-group release share the slot gate. A ring
@@ -2398,6 +2402,11 @@ fn handoff_open_reference(lease: crate::kernel::objects::FileDescriptionFdLease)
 }
 
 fn settle_open_release(region: usize, handle: u32) {
+    std::eprintln!(
+        "PROBE_2852 settle thread={:?} settle_region={region:#x} global_region={:#x} handle={handle}",
+        std::thread::current().name(),
+        get_el1_region_host_ptr()
+    );
     let record = open_file_object(region, handle);
     let key = OpenReferenceKey {
         handle,

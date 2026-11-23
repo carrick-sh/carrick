@@ -758,6 +758,10 @@ mod serial_host {
         let region = Region::new();
         let other_region = carrick_test_support::TestEl1Region::zeroed();
         let service_region_ptr = region._buffer.as_ptr() as usize;
+        std::eprintln!(
+            "PROBE_2852 test service_region={service_region_ptr:#x} other_region={:#x}",
+            other_region.as_ptr() as usize
+        );
         let root = Root::new();
         let a = root.admit("/non_global", true, 3);
         let venue = Venue::default();

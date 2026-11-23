@@ -116,6 +116,13 @@ impl Driver {
             hook();
         }
         let region = get_el1_region_host_ptr();
+        std::eprintln!(
+            "PROBE_2852 drain thread={:?} drain_region={region:#x}",
+            std::thread::current().name()
+        );
+        if std::env::var_os("PROBE_2852_DELAY").is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         if region != 0 {
             // SAFETY: the aperture-drain gate excludes unmapping and reuse.
             for handle in unsafe { pending_at(region) }.take() {
@@ -203,7 +210,13 @@ impl RecallJob {
                 .generation
                 .load(Ordering::Acquire),
         )
-        .unwrap_or_else(|| carrick_fatal!("el1_delegation", "live inode has no generation"));
+        .unwrap_or_else(|| {
+            std::eprintln!(
+                "PROBE_2852 fatal thread={:?} global_region={region:#x} inode={inode} identity={identity:?} generation=0",
+                std::thread::current().name()
+            );
+            carrick_fatal!("el1_delegation", "live inode has no generation")
+        });
         let members = binding.live_members();
         let leases = members
             .iter()
