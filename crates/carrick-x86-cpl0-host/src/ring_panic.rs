@@ -66,14 +66,18 @@ pub fn fatal_port_panic_detail<M: CarrierMemoryIo, E>(
     memory: &CarrierMemory<M>,
     mut gpr: impl FnMut(X86Reg) -> Result<u64, E>,
 ) -> Result<Option<String>, E> {
-    let Some(report) = carrick_x86::fatal_port_panic_report(&mut gpr)? else {
+    let Some((kind, report)) = carrick_x86::fatal_port_panic_report(&mut gpr)? else {
         return Ok(None);
     };
     let frame = gpr(X86Reg::Rbp)?;
     let returns = RootGpa::page_aligned(FrameGpa::new(gpr(X86Reg::Cr3)? & !0xfff))
         .map(|root| walk_ring_frames(frame, |va| read_supervisor_word(memory, root, va)))
         .unwrap_or_default();
-    let mut detail = format!("CPL0 kernel panic at {report}; ring return addresses:");
+    let what = match kind {
+        carrick_el1_abi::PanicReportKind::Panic => "CPL0 kernel panic",
+        carrick_el1_abi::PanicReportKind::FatalSite => "CPL0 fatal exit",
+    };
+    let mut detail = format!("{what} at {report}; ring return addresses:");
     if returns.is_empty() {
         detail.push_str(" unavailable");
     }

@@ -450,7 +450,9 @@ unsafe extern "C" {
     fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !;
 }
 
-/// Refuse a broken carrier invariant through the shared kernel's fatal transport.
+/// Refuse a broken carrier invariant through the shared kernel's fatal
+/// transport, naming the caller's source site.
+#[track_caller]
 pub fn fatal_boot() -> ! {
     carrick_el1::isa::x86::transport::fatal_boot()
 }
