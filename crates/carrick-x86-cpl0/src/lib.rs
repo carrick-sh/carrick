@@ -213,6 +213,25 @@ mod test_support {
     /// copy-on-write can claim it (#2749). Polled, released and bounded
     /// through the settle hold's calls.
     pub const INJECT_HOLD_NEXT_COW_SUPPLY: u64 = 0xffff_ffff_ffff_fe47;
+    /// Switch-ins whose saved context claims its PC is after a `SYSCALL`
+    /// while the PC is that `SYSCALL` itself: RIP + 2 is the RCX the
+    /// instruction saved (#2900). A rerun rewinds such a context into the
+    /// instruction in front of its `SYSCALL`.
+    pub const INJECT_MISLABELLED_RESUME_CENSUS: u64 = 0xffff_ffff_ffff_fe48;
+    static MISLABELLED_RESUMES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Count a switched-in context labelled after its `SYSCALL` whose RIP
+    /// is the `SYSCALL` that saved its RCX.
+    pub fn observe_resumed_position(words: &carrick_sched_core::ParkedContextWords) {
+        use carrick_sched_core::X86ParkedGpr as Gpr;
+        if words.saved_syscall_pc() == Some(carrick_sched_core::SavedSyscallPc::AfterSyscall)
+            && words.user_rip().checked_add(carrick_guest_arch::X86_64_SYSCALL_LEN)
+                == Some(words.frame[Gpr::Rcx as usize])
+        {
+            MISLABELLED_RESUMES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     /// The calling member's next owner-selected grant finds its MM editor
     /// held when it serves the window the carrier already prepared and
     /// submitted: the loser of a two-CPU race in one grant window.
@@ -1281,6 +1300,7 @@ mod test_support {
                     | ((FORK_COW_EDITOR_PARKED_RELEASES.load(Ordering::Acquire) & 0xffff) << 16)
                     | (FORK_COW_SETTLED.load(Ordering::Acquire) & 0xffff),
             ),
+            INJECT_MISLABELLED_RESUME_CENSUS => Some(MISLABELLED_RESUMES.load(Ordering::Acquire)),
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)
                     | (OWNED_COPY_RERUNS.load(Ordering::Acquire) & u64::from(u32::MAX)),

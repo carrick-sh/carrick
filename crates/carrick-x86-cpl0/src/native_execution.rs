@@ -123,6 +123,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 fatal_boot!();
             }
             let mut words = state.words;
+            #[cfg(feature = "test-support")]
+            crate::test_support::observe_resumed_position(&words);
             let mut service = native_process::Service::new(current, slot);
             native_process::drain_external_ingress(source, &mut service)
                 .unwrap_or_else(|_| fatal_boot!());
