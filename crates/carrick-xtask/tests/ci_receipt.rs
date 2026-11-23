@@ -4339,3 +4339,123 @@ fn real_budget_artifact_population() {
         expected
     );
 }
+
+fn include_fixture(lib: &str, included: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_source(
+        dir.path(),
+        "crates/example/Cargo.toml",
+        "[package]\nname = 'example'\n",
+    );
+    write_source(dir.path(), "crates/example/src/lib.rs", lib);
+    write_source(dir.path(), "crates/example/src/tests.rs", included);
+    dir
+}
+
+#[test]
+fn retirement_follows_in_crate_include_of_a_sibling_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(&cand, "crates/example/tests/foo.rs", "");
+    write_source(
+        &cand,
+        "crates/example/src/lib.rs",
+        "#[cfg(test)] include!(\"tests.rs\");",
+    );
+    write_source(&cand, "crates/example/src/tests.rs", "#[test] fn kept() {}");
+    let diff = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        !format!("{diff:?}").contains("missing:foo::gone"),
+        "retirement not applied: {diff:?}"
+    );
+}
+
+#[test]
+fn retirement_refuses_when_the_included_file_still_has_the_test() {
+    let error = candidate_scan_error(
+        "crates/example/src/lib.rs",
+        "#[cfg(test)] include!(\"tests.rs\");",
+        None,
+    );
+    // Without the sibling file the include can't resolve: still refused.
+    assert!(error.contains("cannot resolve"), "{error}");
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(&cand, "crates/example/tests/foo.rs", "");
+    write_source(
+        &cand,
+        "crates/example/src/lib.rs",
+        "#[cfg(test)] include!(\"tests.rs\");",
+    );
+    write_source(&cand, "crates/example/src/tests.rs", "#[test] fn gone() {}");
+    let error = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .expect_err("retired test still exists in the included file")
+    .to_string();
+    assert!(error.contains("still exists in candidate source"), "{error}");
+}
+
+#[test]
+fn retirement_refuses_non_literal_or_non_rs_includes() {
+    for include in [
+        "include!(concat!(\"te\", \"sts.rs\"));",
+        "include!(\"data.txt\");",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let cand = dir.path().join("cand");
+        write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+        write_source(&cand, "crates/example/tests/foo.rs", "");
+        write_source(&cand, "crates/example/src/lib.rs", include);
+        write_source(&cand, "crates/example/src/tests.rs", "");
+        write_source(&cand, "crates/example/src/data.txt", "");
+        let error = diff_with_retired(
+            &cpl0_receipt(&["foo::gone"], &[]),
+            &cpl0_receipt(&[], &[]),
+            &[retirement("foo::gone", None)],
+            &base,
+            &cand,
+        )
+        .expect_err(include)
+        .to_string();
+        assert!(error.contains("cannot resolve"), "{include}: {error}");
+    }
+}
+
+#[test]
+fn test_inventory_files_an_included_test_under_the_includers_module() {
+    let dir = include_fixture(
+        "mod native { #[cfg(test)] include!(\"tests.rs\"); }",
+        "#[test] fn top() {} mod tests { #[test] fn nested() {} }",
+    );
+    let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
+    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    assert_eq!(krate.unresolved, None, "{krate:?}");
+    let names: Vec<&str> = krate.tests.keys().map(|(_, t)| t.as_str()).collect();
+    assert!(names.contains(&"native::top"), "{names:?}");
+    assert!(names.contains(&"native::tests::nested"), "{names:?}");
+}
+
+#[test]
+fn test_inventory_marks_an_included_file_with_modules_unresolved() {
+    let dir = include_fixture("include!(\"tests.rs\");", "mod more;");
+    let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
+    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    assert!(krate.unresolved.is_some(), "{krate:?}");
+}
