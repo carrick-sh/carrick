@@ -595,8 +595,6 @@ const DRAFT_JOBS: &[&str] = &[
     "loom",
     "x86-host-tests",
     "linux-doc",
-    "linux-unit-arm",
-    "linux-unit-x86",
     "kernel-linux-native",
     "cross-check-freebsd",
     "cross-check-netbsd",
@@ -606,6 +604,12 @@ const DRAFT_JOBS: &[&str] = &[
     "el1-native-tests",
     "el1-native-gate",
 ];
+
+/// The hosted Linux jobs that wait for ready-for-review (#2846). The unit lane
+/// is four jobs of 10 to 40 minutes; on a draft, whose `ci-ok` cannot land,
+/// they take hosted runners from the merge queue. A ready pull request and a
+/// merge group both run them, so nothing lands without the lane.
+const READY_ONLY_HOSTED_JOBS: &[&str] = &["linux-unit-arm", "linux-unit-x86"];
 
 const DRAFT_GATED_JOBS: &[&str] = &[
     "macos-clippy",
@@ -640,6 +644,24 @@ fn ci_workflow_runs_cheap_hosted_jobs_on_drafts_and_keeps_mac_jobs_off_them() {
             "{name} runs on a draft, so it must be a GitHub-hosted Linux job, not {runs_on}"
         );
     }
+    for name in READY_ONLY_HOSTED_JOBS {
+        let j = job(name);
+        let cond = j["if"].as_str().unwrap_or("");
+        assert!(
+            cond.contains(
+                "(github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
+            ),
+            "{name} must stay off draft PRs and run on ready PRs and merge groups: {cond}"
+        );
+        assert!(
+            !cond.contains("merge_group"),
+            "{name} must run on merge groups: {cond}"
+        );
+        assert!(
+            j["runs-on"].as_str().unwrap_or("").starts_with("ubuntu-"),
+            "{name} is pinned as a GitHub-hosted Linux job"
+        );
+    }
     for name in DRAFT_GATED_JOBS {
         let j = job(name);
         let cond = j["if"].as_str().unwrap_or("");
@@ -660,9 +682,12 @@ fn ci_workflow_runs_cheap_hosted_jobs_on_drafts_and_keeps_mac_jobs_off_them() {
     );
     // The rule, so a new job needs no edit here: a GitHub-hosted Linux job
     // never waits for ready-for-review, and a job that still names draft is a
-    // self-hosted Mac job.
+    // self-hosted Mac job. The named exception is the Linux unit lane.
     for (name, body) in jobs {
         let name = name.as_str().unwrap();
+        if READY_ONLY_HOSTED_JOBS.contains(&name) {
+            continue;
+        }
         let cond = body["if"].as_str().unwrap_or("");
         let runs_on = body["runs-on"].as_str().unwrap_or("");
         if runs_on.starts_with("ubuntu-") {
@@ -1598,14 +1623,14 @@ fn only_a_ready_upper_layer_makes_its_base_a_lower_layer() {
 
 /// The Linux unit lane (`linux-unit-arm`, `linux-unit-x86`: `just test`'s
 /// shards on hosted arm64 and x86_64 runners) is the only lane that runs the
-/// host unit set while the macOS jobs are off (owner, 2026-11-22, #231). Both
-/// are hosted Linux jobs, so they run on drafts.
+/// host unit set while the macOS jobs are off (owner, 2026-11-22, #231). It
+/// runs on ready pull requests and merge groups, and skips drafts (#2846).
 ///
 /// `ci-results` judges only the jobs `ci-ok` lists in `needs`. The lane is
 /// advisory until `ci-ok` lists it (#2809), so this drives `ci-results` with
 /// needs that already carry the two jobs: it must then reject a lane job that
-/// is not green on every event where the heavy Linux jobs run, drafts
-/// included, and accept the lane skipped where they are skipped.
+/// is not green on a ready pull request and on a merge group, require the
+/// lane skipped on a draft, and accept it skipped where the heavy jobs are.
 #[test]
 fn ci_results_rejects_a_needed_linux_unit_lane_job_that_is_not_green() {
     const LANE: [&str; 2] = ["linux-unit-arm", "linux-unit-x86"];
@@ -1693,26 +1718,31 @@ fn ci_results_rejects_a_needed_linux_unit_lane_job_that_is_not_green() {
         }
     }
 
-    // Draft: the lane runs (hosted Linux), so a green one reaches the draft
-    // notice, and a red or skipped one fails on the job itself.
-    let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), &needs.to_string(), &[]);
+    // Draft: the lane waits for ready-for-review (#2846), so both jobs are
+    // skipped and the run reaches the draft notice. A lane job that ran on a
+    // draft, whatever its result, is a broken gate and fails on the job.
+    let mut draft = needs.clone();
+    for job in LANE {
+        draft[job]["result"] = "skipped".into();
+    }
+    let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), &draft.to_string(), &[]);
     assert!(!ok, "a draft's ci-results never passes: {out}");
     assert!(
         out.contains("draft run: the jobs that ran passed"),
-        "a draft with a green unit lane fails only on the draft notice: {out}"
+        "a draft with the unit lane skipped fails only on the draft notice: {out}"
     );
     for job in LANE {
-        for result in NOT_GREEN {
+        for result in ["success", "failure", "cancelled"] {
             let (ok, out) = run_ci_results_with_env(
                 "pull_request",
                 Some("true"),
-                &with(&needs, job, result),
+                &with(&draft, job, result),
                 &[],
             );
             assert!(!ok, "a draft with {job} {result} must fail ci-results");
             assert!(
                 !out.contains("draft run:"),
-                "{job} {result} must fail on the job, not the draft notice: {out}"
+                "{job} {result} on a draft must fail on the job, not the draft notice: {out}"
             );
         }
     }
