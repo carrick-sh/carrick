@@ -2584,6 +2584,15 @@ impl KernelStackSnapshot {
     }
 }
 
+fn exec_owner_census_of<Mem: CarrierMemoryIo>(
+    custody: &std::sync::Mutex<Cpl0HostCustody<Mem>>,
+) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
+    let custody = custody
+        .lock()
+        .map_err(|_| fail("physical custody poisoned"))?;
+    Ok(custody.exec_owner_census())
+}
+
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     pub fn cpu_mut(&mut self) -> &mut CarrierCpu<M> {
         &mut self.cpu
@@ -2597,6 +2606,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     /// root's custody to the settled successor.
     pub fn take_root_exec_settlement(&mut self) -> Option<exec_service::RootExecSettled> {
         self.root_exec.take()
+    }
+
+    /// The exec owner's census observed from this CPU lease.
+    pub fn exec_owner_census(&self) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
+        exec_owner_census_of(&self._custody)
     }
 
     pub fn retarget_root_exec(
@@ -4305,11 +4319,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 
     /// The exec owner's census observed through the production carrier.
     pub fn exec_owner_census(&self) -> Result<carrick_hal::exec_owner::ExecOwnerCensus, TrapError> {
-        let custody = self
-            .custody
-            .lock()
-            .map_err(|_| fail("physical custody poisoned"))?;
-        Ok(custody.exec_owner_census())
+        exec_owner_census_of(&self.custody)
     }
 
     /// Settlement work observed through the production carrier.

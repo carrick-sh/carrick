@@ -155,10 +155,22 @@ impl KvmPhysicalDebug {
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-#[derive(Debug)]
 pub struct PreparedKvmPoolFailure {
     pub error: RuntimeError,
     pub authority_refusals: Vec<ForwardAuthorityRefusal>,
+    pub physical: Option<Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>>,
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl std::fmt::Debug for PreparedKvmPoolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedKvmPoolFailure")
+            .field("error", &self.error)
+            .field("authority_refusals", &self.authority_refusals)
+            .field("has_physical", &self.physical.is_some())
+            .finish()
+    }
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
@@ -174,6 +186,7 @@ impl From<RuntimeError> for PreparedKvmPoolFailure {
         Self {
             error,
             authority_refusals: Vec::new(),
+            physical: None,
         }
     }
 }
@@ -573,6 +586,9 @@ pub enum KvmInjectedExecutorDeath {
     IdlePeerFirstIdle,
     /// The worker that sent the guest's exit dies right after sending it.
     AfterGuestExit,
+    /// The executor dies right after sealing an exec row (before the guest
+    /// resumes to adopt it), leaving the sealed row live at carrier exit.
+    AfterExecSealed,
 }
 
 /// Test control for the production KVM pool, compiled only into test
@@ -843,11 +859,13 @@ fn run_prepared_kvm_pool_with_debug(
     census.map_err(|error| PreparedKvmPoolFailure {
         error: RuntimeError::Configuration(format!("publish terminal census: {error}")),
         authority_refusals: authority_refusals.clone(),
+        physical: Some(Arc::clone(&physical)),
     })?;
     let outcome = completion
         .map_err(|error| PreparedKvmPoolFailure {
             error: RuntimeError::Configuration(format!("KVM executor completion: {error}")),
             authority_refusals: authority_refusals.clone(),
+            physical: Some(Arc::clone(&physical)),
         })?
         .map_err(|error| {
             // A failed run never reaches the execution witness below, so its
@@ -861,6 +879,7 @@ fn run_prepared_kvm_pool_with_debug(
             PreparedKvmPoolFailure {
                 error: runtime_error,
                 authority_refusals: authority_refusals.clone(),
+                physical: Some(Arc::clone(&physical)),
             }
         })?;
     match (shutdown, scheduler.executor_death()) {
@@ -876,6 +895,7 @@ fn run_prepared_kvm_pool_with_debug(
             return Err(PreparedKvmPoolFailure {
                 error: RuntimeError::Configuration(error.to_string()),
                 authority_refusals,
+                physical: Some(Arc::clone(&physical)),
             });
         }
     }
