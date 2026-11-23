@@ -5593,6 +5593,52 @@ impl<
         Ok(Some(!close_effects.is_empty()))
     }
 
+    /// `CLOSE_RANGE_UNSHARE` (#2904). On a table no other thread shares,
+    /// the private copy Linux makes would be this same table, so the call
+    /// is a plain range (`None`: serve it). It stays unrouted
+    /// (`Some(Forward)`: a fork child's counted ENOSYS, the root's host
+    /// route) in two cases, before anything changes:
+    /// - another thread shares the table: the caller needs a successor
+    ///   table published for it alone, and the ring has no per-thread
+    ///   descriptor table yet (unshare(CLONE_FILES) is unrouted too, #2930);
+    /// - an open descriptor of the range owes host close effects: a
+    ///   `CommitOwed` replay would rerun the call with its UNSHARE flag on
+    ///   the host, which splits the host's table under the ring's.
+    fn close_range_unshare_route(
+        &self,
+        venue: &ipc::IpcVenue<'_>,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        first: u32,
+        last: u32,
+        cloexec: bool,
+    ) -> Option<FamilyCompletion> {
+        if self
+            .process
+            .as_deref()
+            .is_none_or(|process| process.shares_descriptor_namespace())
+        {
+            return Some(FamilyCompletion::Forward);
+        }
+        if cloexec {
+            return None;
+        }
+        let fds = venue.region.fd(NativeFdWait);
+        let mut cursor = first;
+        loop {
+            let fd = match fds.next_open(table, cursor, last) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => return None,
+                Err(err) => return Some(map_fd_error(err)),
+            };
+            match fds.close_effects(table, fd) {
+                Ok(effects) if !effects.is_empty() => return Some(FamilyCompletion::Forward),
+                Ok(_) | Err(carrick_el1_abi::ipc::fd::Error::BadFd) => {}
+                Err(err) => return Some(map_fd_error(err)),
+            }
+            cursor = (fd.0 as u32).checked_add(1).filter(|next| *next <= last)?;
+        }
+    }
+
     /// `close_range(first, last, flags)` (#2904): EINVAL for an inverted
     /// range or an unknown flag, then each open descriptor of the range, in
     /// order, through the one owned `close` (or, under
@@ -5615,6 +5661,11 @@ impl<
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
         }
         let cloexec = flags & carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC != 0;
+        if flags & carrick_abi::LINUX_CLOSE_RANGE_UNSHARE != 0
+            && let Some(done) = self.close_range_unshare_route(venue, table, first, last, cloexec)
+        {
+            return done;
+        }
         let mut owed = false;
         let mut cursor = first;
         loop {

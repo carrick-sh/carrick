@@ -344,6 +344,14 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn owns_descriptor_namespace(&self) -> bool {
         false
     }
+    /// Whether another thread may share the caller's descriptor table
+    /// (`CLONE_FILES`): every ring thread of a process shares its one table,
+    /// so this is "the process has another live thread". `true` when the
+    /// venue can't tell, so a caller that needs a private table declines
+    /// rather than mutating a table a sibling still uses.
+    fn shares_descriptor_namespace(&self) -> bool {
+        true
+    }
     /// Resume this exact thread's retained operation before a new syscall is
     /// dispatched. Readiness alone cannot authorize a user return.
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
