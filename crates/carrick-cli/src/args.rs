@@ -1353,6 +1353,12 @@ pub(crate) enum RootfsCommand {
         /// Rootful layer materialization target (used by image export).
         #[arg(long, hide = true)]
         destination: Option<PathBuf>,
+        /// Export the carrier's own view instead of the native oracle's: the
+        /// digest-keyed immutable extraction `carrick run` uses as its lower,
+        /// built unprivileged (ownership and unreadable modes are recorded in
+        /// Carrick's metadata xattrs, not applied). For `debug soft-run`.
+        #[arg(long, conflicts_with = "destination")]
+        carrier_view: bool,
     },
     Summary,
     Ls {
