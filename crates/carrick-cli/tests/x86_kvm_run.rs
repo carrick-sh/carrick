@@ -871,6 +871,44 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
+/// #2832 record B: the run root and its thread sleep. The sleep family
+/// declined for the run root, leaving the call to a host continuation the
+/// x86 crossing set does not carry, so every root `nanosleep` and
+/// `clock_nanosleep` answered ENOSYS (-38) at once (`sleep 1` as a
+/// container's entry point printed `cannot read realtime clock`).
+#[test]
+fn mounted_static_x86_root_and_its_thread_sleep_in_ring() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("root-threads-sleep");
+    compile_assembly_with_flags(
+        "x86_root_threads_sleep.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native root-threads-sleep oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"sleep=ok\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "root-threads-sleep", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "95 is a bad sleep (code 1..3 main, 11..13 thread, +100 early). Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
