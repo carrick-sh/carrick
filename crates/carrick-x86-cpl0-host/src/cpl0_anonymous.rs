@@ -2335,8 +2335,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let Some(identity) = window.host_backing else {
             return Ok(None);
         };
-        let source = self
-            .sources_mut(execution.context)?
+        let sources = self.sources_mut(execution.context)?;
+        // A shared file window's fault must reach the file's own pages; a
+        // private copy here would drop every store (#1338).
+        if sources.is_window(identity) {
+            return Err(fail("shared file window fault is not published yet"));
+        }
+        let source = sources
             .retain(identity, || None)
             .ok_or_else(|| fail("file fault source identity"))?;
         Ok(Some(FileSupplyRequest {
@@ -3246,7 +3251,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
                 .read_kernel_pod_bytes(self.execution.context, address, len, 1)?;
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
             .map_err(|_| fail("host file record encoding"))?;
-        if view.header().op != carrick_core_abi::host_file::HostFileOp::MapPrivate {
+        if !matches!(
+            view.header().op,
+            carrick_core_abi::host_file::HostFileOp::MapPrivate
+                | carrick_core_abi::host_file::HostFileOp::MapShared
+        ) {
             return Err(fail("unsupported synchronous host file operation"));
         }
         self.custody
@@ -3267,9 +3276,16 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         self.custody
             .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
         if let Some(source) = source {
-            self.custody
-                .sources_mut(self.execution.context)?
-                .inherit(source);
+            let window =
+                carrick_core_abi::host_file::request_parts(bytes).is_some_and(|(header, _, _)| {
+                    header.op == carrick_core_abi::host_file::HostFileOp::MapShared
+                });
+            let sources = self.custody.sources_mut(self.execution.context)?;
+            if window {
+                sources.inherit_window(source);
+            } else {
+                sources.inherit(source);
+            }
         }
         let physical =
             kernel_pod_physical(&self.custody.kernel_pod_storage, address, bytes.len(), 1)

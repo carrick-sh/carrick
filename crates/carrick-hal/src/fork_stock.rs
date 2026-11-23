@@ -100,6 +100,12 @@ pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
     /// Returns a bounded readable prefix; no bytes beyond a backing fault are supplied.
     fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
+    /// A duplicate of the retained host file's descriptor, for a carrier that
+    /// maps the file's own pages as a shared file window (#1338). `None` for
+    /// a source with no host file (a loaded image, an in-memory file).
+    fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
 }
 
 /// The personality's live executable object retained by a memory owner.
@@ -114,6 +120,10 @@ pub trait ExecutableIdentity: core::fmt::Debug + Send + Sync {
 pub struct ForkHostBackingCustody {
     executable: Option<std::sync::Arc<dyn ExecutableIdentity>>,
     sources: BTreeMap<(NonZeroU64, NonZeroU64), std::sync::Arc<dyn HostBackingRetention>>,
+    /// The sources retained for a shared file window
+    /// ([`carrick_core_abi::host_file::HostFileOp::MapShared`], #1338): a
+    /// fault maps the file's own pages for them and never copies bytes.
+    windows: std::collections::BTreeSet<(NonZeroU64, NonZeroU64)>,
 }
 impl ForkHostBackingCustody {
     pub fn bind_executable(&mut self, executable: std::sync::Arc<dyn ExecutableIdentity>) {
@@ -135,7 +145,10 @@ impl ForkHostBackingCustody {
             HostFileOp, HostFileRecordError, HostFileRequestView, MapSourceReply,
         };
         let view = HostFileRequestView::parse(record)?;
-        if view.header().op != HostFileOp::MapPrivate {
+        if !matches!(
+            view.header().op,
+            HostFileOp::MapPrivate | HostFileOp::MapShared
+        ) {
             return Ok(true);
         }
         let releases =
@@ -156,9 +169,25 @@ impl ForkHostBackingCustody {
             .insert((identity.handle(), identity.generation()), source);
     }
 
+    /// Retain a source for a shared file window: [`Self::inherit`], marked
+    /// so that [`Self::is_window`] answers for it.
+    pub fn inherit_window(&mut self, source: std::sync::Arc<dyn HostBackingRetention>) {
+        let identity = source.identity();
+        self.windows
+            .insert((identity.handle(), identity.generation()));
+        self.inherit(source);
+    }
+
+    /// Whether `identity` names a source retained for a shared file window.
+    pub fn is_window(&self, identity: carrick_el1_abi::HostBackingIdentity) -> bool {
+        self.windows
+            .contains(&(identity.handle(), identity.generation()))
+    }
+
     /// Drop one source the MM's reservation owner retired. Unknown
     /// identities are ignored: release is idempotent.
     pub fn release(&mut self, handle: NonZeroU64, generation: NonZeroU64) -> bool {
+        self.windows.remove(&(handle, generation));
         self.sources.remove(&(handle, generation)).is_some()
     }
 
