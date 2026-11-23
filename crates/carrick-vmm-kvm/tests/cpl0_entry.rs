@@ -2638,6 +2638,25 @@ fn shared_kernel_transport_yield_and_fatal() {
     );
 }
 
+/// A ring panic must end the run with the panic's source location and
+/// message, not leave its CPU halted for the host to wait on (#1156).
+#[test]
+fn ring_panic_reaches_the_host_with_its_location_and_message() {
+    let panic_prog = transport_program(2);
+    let peer_prog = transport_program(0);
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&panic_prog, &peer_prog])
+        .expect("real KVM + CPL0 image");
+    let error = carrier
+        .observe(0)
+        .expect_err("a ring panic must end the run")
+        .to_string();
+    assert!(
+        error.contains("CPL0 kernel panic at src/isa/x86/transport.rs:")
+            && error.contains(": transport witness panic 2"),
+        "expected the panic's location and message, got {error}"
+    );
+}
+
 fn context_program() -> Vec<u8> {
     const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
     let mut bytes = Vec::new();
