@@ -1341,7 +1341,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::alias",
-      "owner": "carrick_vmm_hvf::trap::cow_engine::HvfVmState::repoint_guest_alias",
+      "owner": "carrick_vmm_hvf::trap::cow_engine::Stage2State::repoint_guest_alias",
       "lane": "hvf",
       "ceiling": 4
     },
@@ -1425,7 +1425,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::cow_token",
-      "owner": "carrick_vmm_hvf::trap::HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "owner": "carrick_vmm_hvf::trap::stage2_state::Stage2State::publish_pending_fork_frame_receipts_with",
       "lane": "hvf",
       "ceiling": 3
     },
@@ -1467,7 +1467,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::deferred_materialization_binding",
-      "owner": "carrick_vmm_hvf::trap::HvfVmState::bind_deferred_anonymous_state",
+      "owner": "carrick_vmm_hvf::trap::stage2_state::Stage2State::bind_deferred_anonymous_state",
       "lane": "hvf",
       "ceiling": 2
     },
@@ -1663,7 +1663,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::fork_publication",
-      "owner": "carrick_vmm_hvf::trap::HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "owner": "carrick_vmm_hvf::trap::stage2_state::Stage2State::publish_pending_fork_frame_receipts_with",
       "lane": "hvf",
       "ceiling": 3
     },
@@ -1789,42 +1789,42 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::apply_inventory_lease_retirement",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::apply_inventory_lease_retirement",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::inventory_generation",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::inventory_generation",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_backing_identity",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_backing_identity",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_file_view_backing_identity",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_file_view_backing_identity",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::retire_task_state_process_mappings_inner",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::retire_task_state_process_mappings_inner",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::frame_inventory",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::shared_anon_backing_identity",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::shared_anon_backing_identity",
       "lane": "hvf",
       "ceiling": 1
     },
@@ -6675,21 +6675,21 @@
     {
       "family": "global_monotonic_allocator",
       "operation": "global:static",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_backing_identity::NEXT",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_backing_identity::NEXT",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "global_monotonic_allocator",
       "operation": "global:static",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_file_view_backing_identity::NEXT",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_file_view_backing_identity::NEXT",
       "lane": "hvf",
       "ceiling": 1
     },
     {
       "family": "global_monotonic_allocator",
       "operation": "global:static",
-      "owner": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::shared_anon_backing_identity::NEXT",
+      "owner": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::shared_anon_backing_identity::NEXT",
       "lane": "hvf",
       "ceiling": 1
     },

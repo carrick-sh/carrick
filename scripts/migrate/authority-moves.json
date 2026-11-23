@@ -185,6 +185,66 @@
       "from": "carrick_vmm_hvf::trap::code_content::PendingContentWrite<O>::new",
       "to": "carrick_aarch64::code_content::PendingContentWrite<O>::new",
       "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::HvfTaskState::publish_pending_fork_frame_receipts_with",
+      "to": "carrick_vmm_hvf::trap::stage2_state::Stage2State::publish_pending_fork_frame_receipts_with",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::HvfVmState::bind_deferred_anonymous_state",
+      "to": "carrick_vmm_hvf::trap::stage2_state::Stage2State::bind_deferred_anonymous_state",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::cow_engine::HvfVmState::repoint_guest_alias",
+      "to": "carrick_vmm_hvf::trap::cow_engine::Stage2State::repoint_guest_alias",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::apply_inventory_lease_retirement",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::apply_inventory_lease_retirement",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::inventory_generation",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::inventory_generation",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_backing_identity",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_backing_identity",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_backing_identity::NEXT",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_backing_identity::NEXT",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_file_view_backing_identity",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_file_view_backing_identity",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::private_file_view_backing_identity::NEXT",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::private_file_view_backing_identity::NEXT",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::retire_task_state_process_mappings_inner",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::retire_task_state_process_mappings_inner",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::shared_anon_backing_identity",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::shared_anon_backing_identity",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::frame_inventory::HvfVmState::shared_anon_backing_identity::NEXT",
+      "to": "carrick_vmm_hvf::trap::frame_inventory::Stage2State::shared_anon_backing_identity::NEXT",
+      "issue": 1236
     }
   ],
   "authority_debt_admissions": [
