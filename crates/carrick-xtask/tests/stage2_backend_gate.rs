@@ -75,6 +75,33 @@ fn raw_hvf_stage2_calls_live_only_in_the_backend_impl() {
     }
 }
 
+/// Custody speaks neutral permissions: `carrick_hal::MemPerms`, or the
+/// recorded word through `carrick_aarch64::stage2`. Only the HVF backend
+/// module converts them to applevisor's enum for the host call (#2814, S0b).
+#[test]
+fn applevisor_permissions_live_only_in_the_backend_module() {
+    let sources = hvf_sources();
+    let applevisor_perms = concat!("applevisor::memory::", "MemPerms");
+    let outside: Vec<_> = sources
+        .iter()
+        .filter(|(path, source)| {
+            !path.ends_with("trap/stage2_backend.rs") && source.contains(applevisor_perms)
+        })
+        .map(|(path, source)| {
+            format!(
+                "{} ({})",
+                path.display(),
+                source.matches(applevisor_perms).count()
+            )
+        })
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "custody must hold `carrick_hal::MemPerms` or the recorded stage-2 word, \
+         never `{applevisor_perms}`, outside trap/stage2_backend.rs: {outside:?}"
+    );
+}
+
 #[test]
 fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
     let sources = hvf_sources();
