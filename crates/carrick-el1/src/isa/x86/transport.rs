@@ -4,6 +4,19 @@ use super::X86Backend;
 use super::context::native::{FATAL_PORT, YIELD_PORT};
 use carrick_guest_arch::{CrossingBackend, FatalReport};
 
+/// Refuse a broken carrier invariant, naming this raising site.
+///
+/// A macro, not a `#[track_caller]` function: about a hundred carrier sites
+/// raise it, and a tracked caller costs each one a relocated 24-byte
+/// `Location` in the CPL0 image's writable data, which must fit the 2 MiB
+/// supervisor extent. The site rides as immediates instead.
+#[macro_export]
+macro_rules! x86_fatal_boot {
+    () => {
+        $crate::isa::x86::transport::fatal_boot_at(file!(), line!(), column!())
+    };
+}
+
 pub fn yield_host_effect() {
     // SAFETY: CPL0 exits to the KVM host through YIELD_PORT. The host
     // resumes this vCPU on the exact next instruction.
@@ -69,14 +82,14 @@ pub fn witness(op: u64) -> u64 {
         // A real Rust panic in the ring, through the image's panic handler.
         2 => panic!("transport witness panic {op}"),
         // A carrier invariant refusal, through the carriers' `fatal_boot!`.
-        3 => crate::x86_fatal_boot!(),
+        3 => x86_fatal_boot!(),
         _ => u64::MAX,
     }
 }
 
 /// Terminal refusal of a broken carrier invariant at `file:line:column`:
 /// publish that source site through the fatal port and halt this CPU (#2853).
-/// Raise it with [`crate::x86_fatal_boot!`].
+/// Raise it with `x86_fatal_boot!`.
 #[cold]
 #[inline(never)]
 pub fn fatal_boot_at(file: &'static str, line: u32, column: u32) -> ! {
@@ -84,19 +97,6 @@ pub fn fatal_boot_at(file: &'static str, line: u32, column: u32) -> ! {
         carrick_el1_abi::PanicReportKind::FatalSite,
         &carrick_el1_abi::PanicReport::at_site(file, line, column, "fatal_boot"),
     )
-}
-
-/// Refuse a broken carrier invariant, naming this raising site.
-///
-/// A macro, not a `#[track_caller]` function: about a hundred carrier sites
-/// raise it, and a tracked caller costs each one a relocated 24-byte
-/// `Location` in the CPL0 image's writable data, which must fit the 2 MiB
-/// supervisor extent. The site rides as immediates instead.
-#[macro_export]
-macro_rules! x86_fatal_boot {
-    () => {
-        $crate::isa::x86::transport::fatal_boot_at(file!(), line!(), column!())
-    };
 }
 
 /// Publish a ring panic or carrier fatal record through the fatal port, then
