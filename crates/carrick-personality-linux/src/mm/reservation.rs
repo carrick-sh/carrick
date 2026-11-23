@@ -95,6 +95,8 @@ pub(super) fn mmap<M: ReservationPolicyAccess>(
 /// byte-source node an inherited private file mapping carries). A read-only
 /// `MAP_SHARED` mapping takes the same custody, marked so that it is shown
 /// as shared and never becomes writable; a writable one is `Invalid` here.
+/// A shared file window ([`FileMapSharing::Shared`]) is `FILE` without
+/// `PRIVATE`: its pages are the file's, so it may be writable.
 pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
     root: &mut M,
     placement: Placement,
@@ -113,6 +115,7 @@ pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
             custody.union(ReservationNodeFlags::SHARED_READ_ONLY)
         }
         FileMapSharing::SharedReadOnly => return Err(Refusal::Invalid),
+        FileMapSharing::Shared => ReservationNodeFlags::FILE,
     };
     if root.has_pending_edit() || root.fork_pending() {
         return Err(Refusal::Busy);

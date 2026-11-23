@@ -251,8 +251,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         .to_vec();
                 let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
                     .map_err(|_| fail("invalid CPL0 host file record"))?;
-                if view.header().op == carrick_core_abi::host_file::HostFileOp::MapPrivate {
-                    return Err(fail("CPL0 MapPrivate uses HostFileCrossing"));
+                if matches!(
+                    view.header().op,
+                    carrick_core_abi::host_file::HostFileOp::MapPrivate
+                        | carrick_core_abi::host_file::HostFileOp::MapShared
+                ) {
+                    return Err(fail("CPL0 file mapping uses HostFileCrossing"));
                 }
                 return Ok(NativeNoticeStep::HostFile(Box::new(
                     PendingNativeHostFile {
