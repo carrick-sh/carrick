@@ -414,7 +414,7 @@ impl ForkStockHostCustody {
         &mut self,
         execution: GrantExecution,
         record: &carrick_core_abi::NativeRunFailure,
-    ) -> Result<(carrick_core_abi::NativeRunFailureCause, u64), ForkStockServiceError> {
+    ) -> Result<(carrick_core_abi::NativeRunFailureReport, u64), ForkStockServiceError> {
         self.run_failure
             .consume(record, execution.binding)
             .ok_or(ForkStockServiceError::StaleExecution)

@@ -621,3 +621,22 @@ impl TrapError {
         }
     }
 }
+
+#[cfg(test)]
+mod native_run_failure_display_tests {
+    /// A native run failure's message names the kernel site that raised it
+    /// (#2853), so a run's stderr locates the failure without a diagnostic build.
+    #[test]
+    fn native_run_failure_names_its_raising_site() {
+        let error = super::TrapError::NativeRunFailure {
+            reason: carrick_core_abi::NativeRunFailureReason::NativeStale.as_str(),
+            site: carrick_core_abi::SourceSite::new("crates/carrick-el1-linux/src/a.rs", 12, 7),
+            crossings: 1,
+        };
+        assert_eq!(
+            error.to_string(),
+            "native run failed: native process stale at rrick-el1-linux/src/a.rs:12:7; \
+             run_failure_crossings=1"
+        );
+    }
+}

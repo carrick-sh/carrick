@@ -7915,15 +7915,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// (#2306): the continuation stays retained and leaves through the owner
     /// checkpoint, whose next entry reruns it, as a retained IPC refusal
     /// does. Only a refusal with an answer stops the run.
+    /// A failure names the resume that met it (#2853).
+    #[track_caller]
     fn resume_not_now(
         &mut self,
         error: NativeProcessError,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
+        let site = core::panic::Location::caller();
         match error.failure() {
-            Ok(failure) => Err(failure.run_failure_reason().at_caller()),
+            Ok(failure) => Err(failure.run_failure_reason().at(site)),
             Err(_) => self
                 .yield_owner_checkpoint(OwnerEntry::Syscall)
-                .map_err(|failure| failure.run_failure_reason().at_caller()),
+                .map_err(|failure| failure.run_failure_reason().at(site)),
         }
     }
 
@@ -15005,7 +15008,7 @@ mod tests {
         );
         // The cause names the kernel site that raised it, not the terminal
         // crossing that carries it (#2853).
-        let site = std::string::ToString::to_string(&cause.unwrap().site);
+        let site = std::string::ToString::to_string(&cause.unwrap().site());
         assert!(
             site.starts_with("ative_process_runtime.rs:") && !site.ends_with(":0:0"),
             "{site}"

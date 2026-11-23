@@ -878,7 +878,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     pub fn service_run_failure<I: CarrierCpuIo>(
         &self,
         lease: &StoppedCpuLease<'_, I>,
-    ) -> Result<carrick_core_abi::NativeRunFailureCause, TrapError> {
+    ) -> Result<carrick_core_abi::NativeRunFailureReport, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the record consists of initialized u64s, valid for all bit patterns.
         let (_, record) = unsafe {

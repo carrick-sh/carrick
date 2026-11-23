@@ -304,7 +304,7 @@ mod process_exit_tests {
             _: carrick_core_abi::ExecutionBinding,
             cause: carrick_core_abi::NativeRunFailureCause,
         ) -> ! {
-            std::panic::panic_any(cause.reason)
+            std::panic::panic_any(cause)
         }
         let mut native = NativeLane {
             terminal_failure,
@@ -323,6 +323,25 @@ mod process_exit_tests {
         assert_eq!(native.frame.rax, 0xabcdef);
         assert!(native.xsave.0.iter().all(|byte| *byte == 0x5a));
         assert_eq!(task.mm.key.load(Ordering::Acquire), parent.mm);
+        // A lifecycle failure's cause names the `fail_lifecycle` caller,
+        // through the lane's terminal transport (#2853).
+        let line = line!() + 2;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            native.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::NativeQuarantined)
+        }))
+        .expect_err("fail_lifecycle is terminal");
+        let cause = failed
+            .downcast_ref::<carrick_core_abi::NativeRunFailureCause>()
+            .expect("the terminal transport receives the cause");
+        assert_eq!(
+            cause.reason,
+            carrick_core_abi::NativeRunFailureReason::NativeQuarantined
+        );
+        assert_eq!(cause.location.line(), line);
+        assert!(
+            cause.location.file().ends_with("cpl0_lifecycle.rs"),
+            "{cause}"
+        );
     }
 
     #[test]

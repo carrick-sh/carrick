@@ -690,7 +690,7 @@ pub enum InitialSyscallDisposition {
 )]
 pub enum PhysicalProcessExit {
     Exited(carrick_sched_core::process::TerminationStatus),
-    RunFailed(carrick_core_abi::NativeRunFailureCause),
+    RunFailed(carrick_core_abi::NativeRunFailureReport),
 }
 
 #[derive(

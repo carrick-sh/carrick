@@ -15,7 +15,10 @@ fn arm_terminal_native_failure_authenticates_once_and_counts_exactly() {
     };
     assert_eq!(consumer.consume(&record, foreign), None);
     assert_eq!(consumer.crossings(), 0);
-    assert_eq!(consumer.consume(&record, binding), Some((reason, 1)));
+    assert_eq!(
+        consumer.consume(&record, binding),
+        Some((reason.report(), 1))
+    );
     assert_eq!(consumer.consume(&record, binding), None);
     assert_eq!(consumer.crossings(), 1);
     let mut exhausted = super::NativeRunFailureConsumer {
@@ -37,7 +40,7 @@ fn native_run_failure_is_bound_to_the_exact_thread_incarnation() {
     let line = line!() + 1;
     let cause = super::NativeRunFailureReason::X86GroupExitCustody.at_caller();
     let mut record = super::NativeRunFailure::new(binding, cause);
-    assert_eq!(record.cause_for(binding), Some(cause));
+    assert_eq!(record.cause_for(binding), Some(cause.report()));
     // The host names the raising site from the record alone (#2853).
     extern crate std;
     use std::string::ToString;
