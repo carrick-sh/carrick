@@ -5,9 +5,10 @@
 //! script's first program (past `cd` and the other builtins, with its leading
 //! `NAME=value` words as environment) and runs that. Diagnostics only.
 //!
-//! The rootfs comes from `carrick rootfs export --platform linux/arm64`
-//! (cached by digest; its first extraction needs `sudo -n`). The soft CPU
-//! executes natively, so the runs need a Linux arm64 host.
+//! The rootfs comes from `carrick rootfs export --carrier-view --platform
+//! linux/arm64`: the carrier's own digest-keyed extraction, built
+//! unprivileged. The soft CPU executes natively, so the runs need a Linux
+//! arm64 host.
 
 use super::*;
 
@@ -172,9 +173,18 @@ struct ExportedRootfs {
     env: Option<Vec<String>>,
 }
 
-fn export_rootfs(carrick: &Path, image: &str) -> Result<ExportedRootfs> {
-    let output = std::process::Command::new(carrick)
-        .args(["rootfs", "export", "--platform", "linux/arm64"])
+/// Export `image` with this binary (`--carrier-view` is the harness's, not
+/// necessarily the carrier's under test).
+fn export_rootfs(image: &str) -> Result<ExportedRootfs> {
+    let carrick = std::env::current_exe().context("locate this carrick for rootfs export")?;
+    let output = std::process::Command::new(&carrick)
+        .args([
+            "rootfs",
+            "export",
+            "--carrier-view",
+            "--platform",
+            "linux/arm64",
+        ])
         .arg(image)
         .stdin(std::process::Stdio::null())
         .output()
@@ -229,7 +239,7 @@ pub(super) fn discover(
                 }
             };
             if !exports.contains_key(image) {
-                match export_rootfs(carrick, image) {
+                match export_rootfs(image) {
                     Ok(export) => {
                         exports.insert(image.clone(), export);
                     }
