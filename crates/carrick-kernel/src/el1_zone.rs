@@ -247,28 +247,9 @@ fn complete_carrier_object_wake(
 /// readiness completion is retained on its owner's queue, exactly like
 /// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
 fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
-    let zone = carrier.zone();
-    // Refused: the record retired between publication and handback, or
-    // another owner (its exit, a signal) settled it. Nothing is left to
-    // deliver.
-    let Some(handback) = zone.place_host_handback(record) else {
-        return;
-    };
-    let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement else {
-        return;
-    };
-    if placement.resched {
-        carrier.resched(placement.slot);
-    }
-    if !zone.slot(placement.slot).is_live() && handback.homeless {
-        for index in 0..carrick_sched_core::ZONE_SLOTS {
-            let slot = SlotId::new(index as u8);
-            if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
-                zone.owe_resched(slot);
-                carrier.resched(slot);
-            }
-        }
-    }
+    carrier
+        .zone()
+        .hand_back_to_owner(record, &mut |slot| carrier.resched(slot));
 }
 
 /// Sample a native member's host-readiness queue

@@ -5799,6 +5799,37 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
+    /// A record a carrier's host wake handed back (no guest slot could take
+    /// it: every eligible CPU was stopped, e.g. the one serving the exit
+    /// whose release woke it). A native thread has no host continuation, so
+    /// it is retained on its owner's queue ([`Self::place_host_handback`]),
+    /// and `resched` reaches the slots that must see it: the placed slot,
+    /// and, for a homeless record placed on a slot that is not live, every
+    /// live slot it may run on. A record that retired, or that another
+    /// owner (its exit, a signal) settled meanwhile, needs nothing. Every
+    /// host venue of a carrier zone delivers its handbacks here (#2031,
+    /// #2783); none completes or drops one.
+    pub fn hand_back_to_owner(&self, record: RecordRef, resched: &mut impl FnMut(SlotId)) {
+        let Some(handback) = self.place_host_handback(record) else {
+            return;
+        };
+        let NativePlacement::Placed(placement) = handback.placement else {
+            return;
+        };
+        if placement.resched {
+            resched(placement.slot);
+        }
+        if !self.slot(placement.slot).is_live() && handback.homeless {
+            for index in 0..ZONE_SLOTS {
+                let slot = SlotId::new(index as u8);
+                if self.slot(slot).is_live() && self.record_allows_slot(record.id, slot) {
+                    self.owe_resched(slot);
+                    resched(slot);
+                }
+            }
+        }
+    }
+
     fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
