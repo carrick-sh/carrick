@@ -273,7 +273,7 @@ pub fn decide_reservation_syscall<
     frame: &(impl AnonymousCallView + ?Sized),
     current: &CurrentTask,
     model: &mut ReservationModel<'_, G, C>,
-    file: Option<carrick_el1_abi::HostBackingIdentity>,
+    file: Option<NativeFileSource>,
 ) -> ReservationDisposition {
     decide_reservation_syscall_for_origin(frame, current, model, file, ServiceOrigin::Initial)
 }
@@ -286,7 +286,7 @@ pub fn decide_reservation_syscall_for_origin<
     frame: &(impl AnonymousCallView + ?Sized),
     current: &CurrentTask,
     model: &mut ReservationModel<'_, G, C>,
-    file: Option<carrick_el1_abi::HostBackingIdentity>,
+    file: Option<NativeFileSource>,
     service_origin: ServiceOrigin,
 ) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
@@ -304,15 +304,21 @@ pub fn decide_reservation_syscall_for_origin<
             let flags = frame.arguments()[3];
             let file = file.and_then(|source| {
                 use carrick_el1_abi::FileMapSharing;
-                let sharing = match flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) {
-                    MAP_PRIVATE => FileMapSharing::Private,
-                    // The venue retains a source for a shared mapping only
+                let sharing = match (source, flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED)) {
+                    (NativeFileSource::Copied(_), MAP_PRIVATE) => FileMapSharing::Private,
+                    // The venue copies a source for a shared mapping only
                     // when it asks for no write on a read-only description.
-                    MAP_SHARED if frame.arguments()[2] & PROT_WRITE == 0 => {
+                    (NativeFileSource::Copied(_), MAP_SHARED)
+                        if frame.arguments()[2] & PROT_WRITE == 0 =>
+                    {
                         FileMapSharing::SharedReadOnly
                     }
+                    // A window maps the file's own pages, so the mapping may
+                    // store now or after an `mprotect` (#1338).
+                    (NativeFileSource::Window(_), MAP_SHARED) => FileMapSharing::Shared,
                     _ => return None,
                 };
+                let source = source.identity();
                 (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED) == 0).then_some((source, sharing))
             });
             if file.is_none() && !private_anonymous_mmap(flags) {
@@ -1476,10 +1482,29 @@ pub fn drive_return_settlement<
     }
 }
 
+/// A file source a venue retained for one `mmap`, by the pages it gives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFileSource {
+    /// Bytes copied into the mapping on first touch: `MAP_PRIVATE`, or a
+    /// `MAP_SHARED` mapping that can never write the file.
+    Copied(carrick_el1_abi::HostBackingIdentity),
+    /// A shared file window: the carrier maps the host file's own pages, so
+    /// a store reaches the file and every other mapping of it (#1338).
+    Window(carrick_el1_abi::HostBackingIdentity),
+}
+
+impl NativeFileSource {
+    pub const fn identity(self) -> carrick_el1_abi::HostBackingIdentity {
+        match self {
+            Self::Copied(identity) | Self::Window(identity) => identity,
+        }
+    }
+}
+
 /// Mapping inputs carried by the native adapter across one in-ring attempt.
 #[derive(Clone, Copy)]
 pub struct NativeMapping {
-    pub file: Option<carrick_el1_abi::HostBackingIdentity>,
+    pub file: Option<NativeFileSource>,
     pub origin: ServiceOrigin,
 }
 
@@ -1515,7 +1540,7 @@ pub fn serve_delegated_mapping<
     // A retained source this call did not consume (an errno, a refusal or a
     // forward) is retired now; one a committed node holds is unchanged.
     if let Some(file) = mapping.file {
-        retire_native_sources(current, spaces, table, slot, &[file]);
+        retire_native_sources(current, spaces, table, slot, &[file.identity()]);
     }
     served
 }
@@ -1613,7 +1638,7 @@ pub fn serve_delegated_anonymous<
         table,
         editor,
         NativeMapping {
-            file,
+            file: file.map(NativeFileSource::Copied),
             origin: ServiceOrigin::Initial,
         },
     )
@@ -2877,7 +2902,7 @@ mod tests {
                 table,
                 editor,
                 NativeMapping {
-                    file,
+                    file: file.map(NativeFileSource::Copied),
                     origin: ServiceOrigin::Initial,
                 },
             );

@@ -4544,7 +4544,10 @@ impl<
             access,
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
-            memory::NativeMapping { file, origin },
+            memory::NativeMapping {
+                file: file.map(memory::NativeFileSource::Copied),
+                origin,
+            },
         ) {
             memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,

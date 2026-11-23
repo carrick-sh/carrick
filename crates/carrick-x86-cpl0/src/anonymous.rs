@@ -150,7 +150,7 @@ impl X86AnonymousVenue<'_> {
     fn source(
         &self,
         zone: &X86Cpl0Zone,
-    ) -> Result<Option<carrick_el1_abi::HostBackingIdentity>, SyscallResult> {
+    ) -> Result<Option<carrick_el1::memory::NativeFileSource>, SyscallResult> {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
         };
@@ -185,16 +185,33 @@ impl X86AnonymousVenue<'_> {
             }
             count
         };
-        let staged = carrick_el1_linux::dispatch::stage_native_host_file(
-            HostFileCall::MapPrivate(key),
-            self.task,
-            &carrick_el1_linux::file::HardwareValidator,
-            &mut NativeNamespace {
-                table,
-                resolve: &mut resolve,
-                releases: &mut releases,
-            },
-        );
+        let mut stage = |call| {
+            carrick_el1_linux::dispatch::stage_native_host_file(
+                call,
+                self.task,
+                &carrick_el1_linux::file::HardwareValidator,
+                &mut NativeNamespace {
+                    table,
+                    resolve: &mut resolve,
+                    releases: &mut releases,
+                },
+            )
+        };
+        // A shared mapping of a description open for writing has no byte
+        // source: this carrier serves it as a shared file window instead,
+        // mapping the host file's own pages (#1338).
+        let (staged, pages) = match stage(HostFileCall::MapPrivate(key)) {
+            None => (
+                stage(HostFileCall::MapShared(key)),
+                carrick_el1::memory::NativeFileSource::Window
+                    as fn(_) -> carrick_el1::memory::NativeFileSource,
+            ),
+            staged => (
+                staged,
+                carrick_el1::memory::NativeFileSource::Copied
+                    as fn(_) -> carrick_el1::memory::NativeFileSource,
+            ),
+        };
         match staged {
             Some(HostFileStage::Request {
                 record,
@@ -210,17 +227,16 @@ impl X86AnonymousVenue<'_> {
                 };
                 carrick_x86_carrier::entry::forward_to_host(&frame);
                 native_host_file::map_source(&record).map(|reply| {
-                    Some(carrick_el1_abi::HostBackingIdentity::new(
+                    Some(pages(carrick_el1_abi::HostBackingIdentity::new(
                         reply.handle,
                         reply.generation,
                         0,
-                    ))
+                    )))
                 })
             }
             Some(HostFileStage::Returned(result)) => Err(result),
-            // The venue does not serve this mapping (a shared mapping of a
-            // writable description): no source, so the owner leaves it
-            // unrouted.
+            // The venue does not serve this mapping: no source, so the owner
+            // leaves it unrouted.
             None => Ok(None),
             _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
         }
