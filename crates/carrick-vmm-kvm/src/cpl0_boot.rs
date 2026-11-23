@@ -2243,10 +2243,11 @@ impl Cpl0Carrier {
                 return Err(fail(detail));
             }
             if port == FATAL_PORT {
-                if let Some(report) =
-                    carrick_x86::fatal_port_panic_report(|reg| self.cpus[index].get_gpr(reg))?
-                {
-                    return Err(fail(format!("CPL0 kernel panic at {report}")));
+                if let Some(detail) = carrick_x86_cpl0_host::ring_panic::fatal_port_panic_detail(
+                    self.custody.memory(),
+                    |reg| self.cpus[index].get_gpr(reg),
+                )? {
+                    return Err(fail(detail));
                 }
                 let payload = self.cpus[index].get_gpr(X86Reg::Rax)?;
                 let fault = self.user_fault_state(index)?;
