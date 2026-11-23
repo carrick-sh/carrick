@@ -3215,6 +3215,17 @@ fn mounted_static_x86_netlink_sockets_match_native() {
     compare_socket_fixture_with_native("x86_local_sockets.c");
 }
 
+/// Blocking waits between the run root and a fork child, with no select
+/// (#1051's gap 2): the child's socket write reaches the root's timed
+/// receive; the root's blocking read of its accepted socket wakes on the
+/// child's later write; and the root's pipe write wakes the child parked
+/// in its pipe read. Each wait is bounded by an interval timer, so a lost
+/// wake prints `-4` (EINTR) against the oracle instead of hanging.
+#[test]
+fn mounted_static_x86_child_socket_wake_matches_native() {
+    compare_socket_fixture_with_native("x86_child_socket_wake.c");
+}
+
 /// Run a static socket fixture natively and as the mounted x86 root: the
 /// two outputs match, and the census holds no refusal of the socket family
 /// by any caller.
