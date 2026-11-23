@@ -1393,7 +1393,7 @@ impl CarrierVmCustody {
     pub(crate) fn publish_stage2_record_using(
         &self,
         spec: CarrierStage2RecordSpec,
-        map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
+        map: impl FnOnce(CarrierStage2RecordIdentity) -> carrick_aarch64::stage2::Stage2Status,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
         let mut state = self.state.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
@@ -1749,7 +1749,7 @@ pub(crate) fn create_vm_with_custody_using<T>(
 pub(crate) fn destroy_vm_with_custody_using(
     custody: &CarrierVmCustody,
     context: &str,
-    destroy: impl FnOnce() -> applevisor_sys::hv_return_t,
+    destroy: impl FnOnce() -> carrick_aarch64::stage2::Stage2Status,
     record_released: impl FnOnce(),
 ) -> Result<(), TrapError> {
     let generation = custody.live_generation().ok_or_else(|| {
@@ -3038,8 +3038,13 @@ mod carrier_vm_custody_tests {
             .pin()
             .expect("pin reconcile-deferred owner");
 
-        destroy_vm_with_custody_using(&custody, "deferred G1 destroy", || 0, || {})
-            .expect("destroy deferred G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "deferred G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy deferred G1");
         let g2 = custody.begin_create().expect("begin deferred G2");
         custody.commit_create(g2).expect("publish deferred G2");
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
@@ -3179,7 +3184,13 @@ mod carrier_vm_custody_tests {
             .owner()
             .record_identity;
 
-        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
         let terminal = custody
             .stage2_record_snapshot(old_identity.record_id)
             .expect("terminal G1 record");
@@ -3365,7 +3376,7 @@ mod carrier_vm_custody_tests {
             destroy_vm_with_custody_using(
                 &custody,
                 "failed G1 destroy",
-                || 0xfae9_4002_u32 as i32,
+                || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4002),
                 || {},
             )
             .is_err()
@@ -3377,8 +3388,13 @@ mod carrier_vm_custody_tests {
             "failed raw destroy must preserve exact G1 record"
         );
 
-        destroy_vm_with_custody_using(&custody, "successful G1 destroy", || 0, || {})
-            .expect("persistent pre-destroy unmap failure must not block raw destroy");
+        destroy_vm_with_custody_using(
+            &custody,
+            "successful G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("persistent pre-destroy unmap failure must not block raw destroy");
         assert!(
             custody
                 .stage2_record_snapshot(identity.record_id)
@@ -3432,8 +3448,13 @@ mod carrier_vm_custody_tests {
             .owner()
             .record_identity;
 
-        destroy_vm_with_custody_using(&custody, "carrier-exit test", || 0, || {})
-            .expect("raw carrier-exit destroy succeeds");
+        destroy_vm_with_custody_using(
+            &custody,
+            "carrier-exit test",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("raw carrier-exit destroy succeeds");
         let injected = "injected terminal owner release failure";
         let error =
             super::finalize_carrier_exit_global_frame_owners_in_using(&custody, &mut |_, _| {
@@ -3606,8 +3627,13 @@ mod carrier_vm_custody_tests {
             super::register_carrier_stage2_leases(&custody, &mut vec![g1_lease], &owners)
                 .expect("register G1 carrier-MM record")[0];
         assert_eq!(old_identity.vm_generation, g1);
-        destroy_vm_with_custody_using(&custody, "carrier G1 destroy", || 0, || {})
-            .expect("destroy G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "carrier G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
@@ -3647,7 +3673,13 @@ mod carrier_vm_custody_tests {
         let identity = custody
             .register_stage2_record(stage2_spec(custody.live_generation().expect("G1 live"), 91))
             .expect("register G1 record");
-        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
         let _g2 = custody.begin_create().expect("begin G2 replay");
         assert!(
             custody
@@ -3868,7 +3900,13 @@ mod carrier_vm_custody_tests {
             .insert(key, old_identity);
         let mut authority = super::carrier_stage2_logical_leases(&custody, &[old_identity]);
 
-        destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
         super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
@@ -4301,8 +4339,13 @@ mod carrier_vm_custody_tests {
         let old_identity = *owner.retained.record_identity.lock();
         assert_eq!(old_identity.vm_generation, g1);
 
-        destroy_vm_with_custody_using(&custody, "structural G1 destroy", || 0, || {})
-            .expect("destroy structural G1");
+        destroy_vm_with_custody_using(
+            &custody,
+            "structural G1 destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy structural G1");
         let g2 = custody.begin_create().expect("begin structural G2");
         custody.commit_create(g2).expect("publish structural G2");
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
@@ -4473,7 +4516,7 @@ mod carrier_vm_custody_tests {
         let result = destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+            || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
             || released.store(true, std::sync::atomic::Ordering::SeqCst),
         );
 
@@ -4500,7 +4543,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || 0,
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || released_after_terminal.set(custody.live_generation().is_none()),
         )
         .expect("destroy transaction succeeds");
@@ -4877,8 +4920,13 @@ mod carrier_vm_custody_tests {
         let (custody, _) = live_custody();
         let identity = settle_child_with_retained_frame(&custody, 0xa091_1000_0000);
         assert_eq!(custody.fork_stock.lock().owner.live_children(), 1);
-        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
-            .expect("destroy VM with live committed child");
+        destroy_vm_with_custody_using(
+            &custody,
+            "test destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy VM with live committed child");
         assert_eq!(
             custody.fork_stock.lock().owner.live_children(),
             0,
@@ -4914,8 +4962,13 @@ mod carrier_vm_custody_tests {
             })
             .expect("register second record");
 
-        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
-            .expect("destroy exact generation");
+        destroy_vm_with_custody_using(
+            &custody,
+            "test destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy exact generation");
         let post_destroy_unmaps = std::cell::Cell::new(0_u32);
         for identity in [first, second] {
             assert_eq!(
@@ -4944,7 +4997,7 @@ mod carrier_vm_custody_tests {
             destroy_vm_with_custody_using(
                 &custody,
                 "test destroy",
-                || 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
+                || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
                 || {},
             )
             .is_err()
@@ -4968,8 +5021,13 @@ mod carrier_vm_custody_tests {
         let first = custody
             .register_stage2_record(stage2_spec(first_generation, 51))
             .expect("register predecessor record");
-        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
-            .expect("destroy predecessor VM");
+        destroy_vm_with_custody_using(
+            &custody,
+            "test destroy",
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy predecessor VM");
         let second_generation = custody.begin_create().expect("begin successor create");
         custody
             .commit_create(second_generation)
