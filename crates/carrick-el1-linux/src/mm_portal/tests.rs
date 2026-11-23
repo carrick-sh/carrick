@@ -920,6 +920,93 @@ fn untouched_transfer_supply_excludes_published_neighbours() {
     }
 }
 
+/// #2843: a syscall copy whose own page holds an in-use (occupied, not
+/// valid) descriptor asks its owner for the mapping's whole window, as it
+/// did before the narrowing: the supplier resolves that page from its
+/// custody. A one-page window there killed the aarch64 soft-CPU dynamic
+/// glibc and CPython witnesses (`HVC #2` current-EL fault in the `mprotect`,
+/// `read` and `fstat` copies of dynamic startup).
+#[test]
+fn in_use_transfer_page_keeps_the_owner_window() {
+    use carrick_el1::fault::PreparedPageResolver;
+    use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+    use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
+
+    /// The production aarch64 resolver's selection and lane capability.
+    struct LiveSelection<'a>(&'a dyn LiveDescriptorWords);
+    impl PreparedPageResolver for LiveSelection<'_> {
+        fn select_backing_window(
+            &mut self,
+            root: u64,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<
+            carrick_el1_abi::PortalGrantWindow,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+        > {
+            carrick_core::mm::frames::select_backing_window::<
+                carrick_mmu_core::owner_mmu::Aarch64Mmu,
+                _,
+            >(self.0, root, window)
+        }
+        fn commit_prepared(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            panic!("this fixture holds no prepared residency")
+        }
+        fn inherited_prepared_supply(&self) -> bool {
+            true
+        }
+    }
+
+    const PAGE: u64 = 4096;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 16, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    // Page 3 holds an occupied descriptor that is not valid.
+    tables.words[1536 + 3].store((IPA + 3 * PAGE) | (RW & !1), Ordering::Release);
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    for intent in [TransferIntent::UserWrite, TransferIntent::UserRead] {
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(VA + 3 * PAGE + 7),
+                4,
+                intent,
+                0,
+            )
+            .unwrap();
+        let step = portal
+            .select(
+                &transfer,
+                &words,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut LiveSelection(&words),
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0,
+                },
+            )
+            .unwrap();
+        let TransferStep::Supply(window) = step else {
+            panic!("{intent:?}: an in-use page asks its owner for backing: {step:?}")
+        };
+        assert_eq!(window.fault_page, VA + 3 * PAGE);
+        assert_eq!(
+            (window.range.start(), window.range.end()),
+            (VA, VA + 16 * PAGE),
+            "{intent:?}: an in-use page keeps the owner's whole window"
+        );
+    }
+}
+
 #[test]
 fn internal_read_selects_identity_control_from_exact_live_mm() {
     // Frozen host-buffer failure: identity shim-enabled word, not image header.
