@@ -2738,8 +2738,9 @@ mod include_inventory_tests {
     fn kernel_inventory_resolves_literal_includes() -> Result<(), ReceiptError> {
         let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../carrick-kernel");
         let bin = "carrick_kernel";
-        let test =
-            "dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child";
+        // A test the dispatch module reaches only through its
+        // `include!("tests.rs")`, so the receipt gate can resolve it.
+        let test = "dispatch::overlay_dispatch_tests::mutation_classifier_exactly_matches_the_typed_handler_tables";
 
         // The retirement scan refuses unresolved source paths even when the
         // inventory can still list attributed tests alongside opaque macros.
