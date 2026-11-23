@@ -263,16 +263,17 @@ fn missing_affinity_targets_precede_buffer_failures() {
 }
 
 #[test]
-fn arm_affinity_routes_in_ring_and_x86_stays_unported() {
+fn affinity_routes_in_ring_on_both_isas() {
     for nr in [122, 123] {
+        let family = Family::Sched(if nr == 122 {
+            SchedCall::SetAffinity
+        } else {
+            SchedCall::GetAffinity
+        });
         assert_eq!(
             carrick_personality_linux::dispatch::route_aarch64(nr, 0),
-            Family::Sched(if nr == 122 {
-                SchedCall::SetAffinity
-            } else {
-                SchedCall::GetAffinity
-            })
+            family
         );
-        assert_eq!(route_x86(nr, 0), Family::Unported);
+        assert_eq!(route_x86(nr, 0), family);
     }
 }

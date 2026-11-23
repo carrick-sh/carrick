@@ -517,6 +517,9 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
         if let Ok(freq) = backend.frequency() {
             zone.publish_counter_frequency(freq);
         }
+        // The carrier's CPU topology, before any guest instruction: the
+        // affinity venue and the root's initial mask read it.
+        zone.publish_carrier_cpu_count(carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT);
         if let Ok(now) = backend.counter() {
             let slot = carrick_sched_core::SlotId::new(0);
             zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
