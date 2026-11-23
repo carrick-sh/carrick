@@ -4277,6 +4277,8 @@ fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_r
         .owner()
         .clone();
     assert!(alias_backing_is_live(host_addr));
+    let region_before = diag_region_containing(host_addr);
+    let mapping_weak = Arc::downgrade(&owner.mapping);
     drop(owner);
     assert!(
         ScopedStage2MapTestStub::is_mapped(ipa, size),
@@ -4291,7 +4293,60 @@ fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_r
         GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
     ));
     assert!(!ScopedStage2MapTestStub::is_mapped(ipa, size));
-    assert!(!alias_backing_is_live(host_addr));
+    // DIAGNOSTICS ONLY (#2882 flake): tell a recycled host VA from a
+    // retained backing.
+    let live_after = alias_backing_is_live(host_addr);
+    let mapping_strong_after = mapping_weak
+        .upgrade()
+        .map(|arc| Arc::strong_count(&arc) - 1);
+    let region_after = diag_region_containing(host_addr);
+    println!(
+        "C6DIAG host_addr={host_addr:#x} live_after={live_after} \
+         mapping_strong_after={mapping_strong_after:?} \
+         region_before={region_before:x?} region_after={region_after:x?}"
+    );
+    assert!(
+        !live_after,
+        "C6DIAG backing still live: mapping_strong_after={mapping_strong_after:?} \
+         region_before={region_before:x?} region_after={region_after:x?}"
+    );
+}
+
+/// DIAGNOSTICS ONLY: the `[start, end)` and protection of the host region
+/// containing `host_addr`, or `None`.
+fn diag_region_containing(host_addr: usize) -> Option<(usize, usize, i32)> {
+    unsafe extern "C" {
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: i32,
+            info: *mut i32,
+            info_count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let mut addr = host_addr as libc::mach_vm_address_t;
+    let mut size: libc::mach_vm_size_t = 0;
+    let mut info = [0i32; 16];
+    let mut count = 9u32;
+    let mut obj: libc::mach_port_t = 0;
+    // SAFETY: queries this task's VM map only.
+    #[allow(deprecated)]
+    let kr = unsafe {
+        mach_vm_region(
+            libc::mach_task_self_,
+            &mut addr,
+            &mut size,
+            9,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut obj,
+        )
+    };
+    let start = addr as usize;
+    let end = start.saturating_add(size as usize);
+    (kr == 0 && start <= host_addr && host_addr < end).then_some((start, end, info[0]))
 }
 
 #[test]
