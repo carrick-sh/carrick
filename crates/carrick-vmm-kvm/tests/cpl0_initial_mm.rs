@@ -9042,3 +9042,36 @@ fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
         "mmap/mprotect/munmap refusals; anonymous leaves {leaves:?}"
     );
 }
+
+/// #2900: a context standing on its `SYSCALL` (a sigreturn to a parked
+/// boundary, as a Go `Syscall6` site) is persisted by a signal checkpoint
+/// whose frame copy is contended, resumed, and persisted again, `ROUNDS`
+/// times. It must re-enter that `SYSCALL` exactly once with every argument
+/// register intact, and each switch-in must find it labelled at its
+/// `SYSCALL`, so no rerun can rewind it into the argument shuffle in front of
+/// the instruction. Red before the fix: the return checkpoint labelled every
+/// captured frame "after `SYSCALL`", and the census counted the boundary
+/// context resumed under that label (exit 14).
+fn syscall_boundary_rerun(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_syscall_boundary_rerun.S", flags);
+    assert_eq!(native_oracle_status(&elf), Some(0), "native Linux oracle");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("syscall boundary rerun");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_syscall_boundary_rerun.S): {:?}",
+        outcome.run
+    );
+}
+
+#[test]
+fn production_syscall_boundary_reenters_once_after_contended_signal_copies() {
+    syscall_boundary_rerun(&[]);
+}
+
+#[test]
+fn production_syscall_boundary_reenters_once_after_owner_waited_signal_copies() {
+    syscall_boundary_rerun(&["-DEDITOR_BUSY"]);
+}
