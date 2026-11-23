@@ -549,25 +549,39 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 result,
                 work: false,
             },
+            // The copy is tried once here, as the signal family's setup
+            // outputs are (`copy_setup_output`): a written page is done and a
+            // bad address is EFAULT. Only a page the venue can't write yet
+            // goes to the memory owner, which waits for it and finishes the
+            // record without running the call again.
             SysinfoOutcome::Output {
                 address,
                 bytes,
                 result,
-            } => match pending.time_native() {
-                Some(owner) => owner.finish_time_output([Some((address, bytes)), None], result),
-                // No memory owner on this venue: its own copy is final.
-                None => crate::lifecycle::LifecycleOutcome::Returned {
-                    result: if pending
-                        .sysinfo_native()
-                        .is_some_and(|native| native.copy_out(address, &bytes).is_done())
-                    {
-                        result
-                    } else {
-                        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
-                    },
+            } => {
+                use carrick_core::user_copy::CopyOutcome;
+                let attempt = pending
+                    .sysinfo_native()
+                    .map(|native| native.copy_out(address, &bytes));
+                let efault = crate::lifecycle::LifecycleOutcome::Returned {
+                    result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
                     work: false,
-                },
-            },
+                };
+                match attempt {
+                    Some(CopyOutcome::Done) => crate::lifecycle::LifecycleOutcome::Returned {
+                        result,
+                        work: false,
+                    },
+                    Some(CopyOutcome::NotYet(_)) => match pending.time_native() {
+                        Some(owner) => {
+                            owner.finish_time_output([Some((address, bytes)), None], result)
+                        }
+                        // No memory owner on this venue: its own copy is final.
+                        None => efault,
+                    },
+                    Some(CopyOutcome::Fault) | None => efault,
+                }
+            }
             SysinfoOutcome::Input(request) => match pending.time_native() {
                 Some(owner) => owner.wait_guest_copy(request),
                 None => crate::lifecycle::LifecycleOutcome::Returned {
