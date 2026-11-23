@@ -51,6 +51,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod soft;
+
+/// Where `discover` runs the rows: carrick carriers on this host's ISA, or
+/// each row's first single process on the soft AArch64 CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum Provider {
+    /// `carrick run` on this host's hypervisor.
+    #[default]
+    Hardware,
+    /// `carrick debug soft-run` from the row's arm64 image (Linux arm64 hosts).
+    SoftA64,
+}
+
 /// The ISA a row runs on: the host's, since a carrier runs its own ISA.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -1321,6 +1334,8 @@ pub(crate) struct DiscoverOptions<'a> {
     pub(crate) oracle_only: bool,
     /// Native-oracle syscall profiles, `<row>=<file>` (`--venue-profile`).
     pub(crate) venue_profiles: &'a [String],
+    /// Where the rows run (`--provider`).
+    pub(crate) provider: Provider,
 }
 
 fn instance_name(explicit: Option<&str>) -> String {
@@ -1496,6 +1511,29 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
         );
     }
     ensure!(is_label(options.label), "--label is [A-Za-z0-9_.-]+");
+    if options.provider == Provider::SoftA64 {
+        ensure!(
+            options.oracle.is_none() && !options.oracle_only,
+            "--provider soft-a64 takes no --oracle phase"
+        );
+        let carrick = match options.carrick {
+            Some(path) => path.to_path_buf(),
+            None => std::env::current_exe().context("locate this carrick binary")?,
+        };
+        std::fs::create_dir_all(options.out)
+            .with_context(|| format!("create {}", options.out.display()))?;
+        let selected: Vec<&RowSpec> = rows
+            .rows
+            .iter()
+            .filter(|row| options.only.is_empty() || options.only.contains(&row.name))
+            .collect();
+        return soft::discover(
+            &options,
+            &selected,
+            &carrick,
+            &instance_name(options.instance),
+        );
+    }
     let isa = RowIsa::host()?;
     let carrick = match options.carrick {
         Some(path) => path.to_path_buf(),
@@ -2066,6 +2104,7 @@ mod tests {
             oracle: Some(&docker),
             oracle_only: false,
             venue_profiles: &[],
+            provider: Provider::Hardware,
         })
         .unwrap();
         assert_eq!(
@@ -2108,6 +2147,7 @@ mod tests {
             oracle,
             oracle_only,
             venue_profiles: &[],
+            provider: Provider::Hardware,
         };
         discover(options(Some(&docker), true)).unwrap();
         assert_eq!(
@@ -2344,6 +2384,7 @@ mod tests {
             oracle: None,
             oracle_only: false,
             venue_profiles: &[],
+            provider: Provider::Hardware,
         })
         .unwrap();
         let records = read_records(&out).unwrap();
@@ -2424,6 +2465,7 @@ mod tests {
             oracle: None,
             oracle_only: false,
             venue_profiles: &[],
+            provider: Provider::Hardware,
         })
         .unwrap();
         let records = read_records(&out).unwrap();
@@ -2610,6 +2652,7 @@ VENUEPROFILE1|complete|root=7
                 oracle: None,
                 oracle_only: false,
                 venue_profiles: specs,
+                provider: Provider::Hardware,
             })
         };
         run(&[format!("go={}", profile.display())], &out).unwrap();

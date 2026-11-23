@@ -1162,6 +1162,13 @@ pub(crate) enum DebugCommand {
         /// Re-rank a finished `--out` directory without running anything.
         #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle", "oracle_only"])]
         report: bool,
+        /// Where the rows run: `hardware` (`carrick run` on this host) or
+        /// `soft-a64` (each row's first single process on the soft AArch64
+        /// CPU via `carrick debug soft-run`, from the row's arm64 image;
+        /// needs a Linux arm64 host and the production EL1 ELF in
+        /// `CARRICK_A64_ELF`).
+        #[arg(long, value_enum, default_value_t = crate::debug_discover::Provider::Hardware)]
+        provider: crate::debug_discover::Provider,
     },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
