@@ -400,7 +400,15 @@ fn compact_native_portal_prepares_and_publishes_initial_private_ranges() {
     use carrick_el1_linux::mm_portal::NativeForkPortal;
     let words = Words([&parent, &child, &supply]);
     let scratch = portal.census_fork(request, &words, 0).unwrap();
-    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(
+            request,
+            scratch,
+            &words,
+            &carrick_el1_abi::CowGrantPool::new(),
+            0,
+        )
+        .unwrap();
     assert_eq!(plan.custody().len(), 2);
     assert!(plan.custody().iter().all(|row| matches!(
         row,

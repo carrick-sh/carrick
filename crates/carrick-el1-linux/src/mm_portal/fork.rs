@@ -52,6 +52,33 @@ pub(super) fn fork_table_window(
     })
 }
 
+/// The carrier's COW grant pool as this image sees it: the authority a
+/// fork consults for its parent's unsettled completions
+/// ([`NativeForkPortal::prepare_fork`]). A host build with no installed EL1
+/// region has no guest COW lane, so it sees an empty pool.
+pub fn carrier_cow_pool() -> Result<&'static carrick_el1_abi::CowGrantPool, MmError> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        Ok(carrick_el1_abi::cow_grant_pool_guest())
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let venues =
+            carrick_el1_abi::KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
+                .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
+                .ok_or(MmError::Stale)?;
+        // SAFETY: boot retains the physical replacement pool at the kernel
+        // layout's COW venue for the image's lifetime.
+        Ok(unsafe { &*(venues.cow_pool.raw() as *const carrick_el1_abi::CowGrantPool) })
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        static NO_GUEST_COW_LANE: carrick_el1_abi::CowGrantPool =
+            carrick_el1_abi::CowGrantPool::new();
+        Ok(carrick_el1_abi::cow_grant_pool_host().unwrap_or(&NO_GUEST_COW_LANE))
+    }
+}
+
 pub use carrick_core::mm::fork::ForkScratch;
 pub type PreparedOwnerFork<B = NativeForkMmu> = carrick_core::mm::fork::PreparedOwnerFork<B>;
 
@@ -158,11 +185,14 @@ pub trait NativeForkPortal<P: PinnedMetadataExtent, B: OwnerForkMmu = NativeFork
         words: &W,
         worker: u32,
     ) -> Result<ForkScratch, MmError>;
+    /// `cow` is the carrier's COW grant pool: the parent's unsettled
+    /// completions are contention for the fork (see the implementation).
     fn prepare_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         request: PortalForkRequest,
         scratch: ForkScratch,
         words: &W,
+        cow: &carrick_el1_abi::CowGrantPool,
         worker: u32,
     ) -> Result<PreparedOwnerFork<B>, MmError>;
     fn publish_fork<W: LiveDescriptorWords + ?Sized>(
@@ -271,6 +301,7 @@ impl<
         request: PortalForkRequest,
         mut scratch: ForkScratch,
         words: &W,
+        cow: &carrick_el1_abi::CowGrantPool,
         worker: u32,
     ) -> Result<PreparedOwnerFork<B>, MmError> {
         if !request.valid() || request.operation.carrier != self.carrier {
@@ -315,6 +346,7 @@ impl<
         if !root.fork_ready() {
             return Err(MmError::Busy);
         }
+        let _ = cow;
         let child = self.child_root(request.child_mm, worker)?;
         if child.is_admitted() {
             return Err(MmError::Stale);
@@ -674,7 +706,13 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         frame.x[1] = 4; // Reachable graph census.
         let scratch = portal.census_fork(request, &words, frame.slot as u32)?;
         frame.x[1] = 5; // Owner fork preparation.
-        let plan = portal.prepare_fork(request, scratch, &words, frame.slot as u32)?;
+        let plan = portal.prepare_fork(
+            request,
+            scratch,
+            &words,
+            carrier_cow_pool()?,
+            frame.slot as u32,
+        )?;
         frame.x[1] = 6; // Exact physical custody.
         for (index, custody) in plan.custody().iter().copied().enumerate() {
             if !service.retain(index as u64, custody, super::production::yield_host_effect) {
