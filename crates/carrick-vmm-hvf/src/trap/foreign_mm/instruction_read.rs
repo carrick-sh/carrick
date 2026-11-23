@@ -1,7 +1,7 @@
 //! Authenticated instruction reads retain physical content dependencies.
 //! The dependencies cover participating host writers, not executable admission.
-use super::super::code_content::ContentObservation;
 use super::*;
+use carrick_aarch64::code_content::ContentObservation;
 use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
 use carrick_hal::{ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot};
 

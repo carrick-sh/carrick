@@ -185,3 +185,231 @@ test = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_
 reason = "#2867: the carrier venue now serves a held root socket's calls for a native member instead of refusing them, so the refusal witness became a service witness (getsockname names the bound address, accept4 takes the queued connection; an inherited regular file is still ENOTSOCK)."
 replaced_by = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child"
 pr = 2880
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::executable_publication_rounding_respects_backing_and_lock_budget"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_rounding_respects_backing_and_lock_budget, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_rounding_respects_backing_and_lock_budget"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::executable_publication_waits_for_claimed_invalidation_completion"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_waits_for_claimed_invalidation_completion, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_waits_for_claimed_invalidation_completion"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::fresh_backing_pages_are_claimed_dirty_exactly_once"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::fresh_backing_pages_are_claimed_dirty_exactly_once, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::fresh_backing_pages_are_claimed_dirty_exactly_once"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::a_host_write_dirties_only_its_pages"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::a_host_write_dirties_only_its_pages, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::a_host_write_dirties_only_its_pages"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::overlapping_writes_prevent_observation_until_both_finish"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::overlapping_writes_prevent_observation_until_both_finish, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::overlapping_writes_prevent_observation_until_both_finish"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::simultaneous_final_observers_leave_no_history"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::simultaneous_final_observers_leave_no_history, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::simultaneous_final_observers_leave_no_history"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::partial_page_crossings_and_invalid_ranges"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::partial_page_crossings_and_invalid_ranges, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::partial_page_crossings_and_invalid_ranges"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::tests::native_code_content_invalidation_contract"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::tests::native_code_content_invalidation_contract, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::native_code_content_invalidation_contract"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count"
+pr = 2916
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
+reason = "#1236 M1: `code_content` moved unchanged from carrick-vmm-hvf (macOS only, signed-hvf lane); the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::owned_content_drain_enroll_then_probe_covers_both_leave_orders"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_covers_disjoint_lines_on_one_dirty_page"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::executable_publication_rounding_respects_backing_and_lock_budget"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_rounding_respects_backing_and_lock_budget, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_rounding_respects_backing_and_lock_budget"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::executable_publication_waits_for_claimed_invalidation_completion"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::executable_publication_waits_for_claimed_invalidation_completion, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::executable_publication_waits_for_claimed_invalidation_completion"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::fresh_backing_pages_are_claimed_dirty_exactly_once"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::fresh_backing_pages_are_claimed_dirty_exactly_once, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::fresh_backing_pages_are_claimed_dirty_exactly_once"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::a_host_write_dirties_only_its_pages"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::a_host_write_dirties_only_its_pages, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::a_host_write_dirties_only_its_pages"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::overlapping_writes_prevent_observation_until_both_finish"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::overlapping_writes_prevent_observation_until_both_finish, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::overlapping_writes_prevent_observation_until_both_finish"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::simultaneous_final_observers_leave_no_history"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::simultaneous_final_observers_leave_no_history, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::simultaneous_final_observers_leave_no_history"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::racing_first_observation_cannot_survive_an_admitted_write"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::partial_page_crossings_and_invalid_ranges"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::partial_page_crossings_and_invalid_ranges, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::partial_page_crossings_and_invalid_ranges"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::tests::native_code_content_invalidation_contract"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::tests::native_code_content_invalidation_contract, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::tests::native_code_content_invalidation_contract"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_code_drain_last_active_observer_releases_registry_entry"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count"
+pr = 2916
+
+[[retired]]
+test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
+reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference, where it runs on the Linux host unit lanes."
+replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
+pr = 2916

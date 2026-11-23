@@ -9169,7 +9169,7 @@ mod tests {
     /// Real dispatch, scheduler, retained directory operation and content writer.
     /// Only the engine and the enrollment interleaving are test-controlled.
     fn exercise_directory_physical_resume(scenario: DirectoryPhysicalScenario) {
-        use super::super::code_content_test::{CodeContent, ContentError, PendingContentWrite};
+        use carrick_aarch64::code_content::{CodeContent, ContentError, PendingContentWrite};
         use carrick_guest_mem::{GuestVa, OwnedMemoryWait, PhysicalMemoryWait};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -9790,7 +9790,7 @@ mod tests {
     /// Real pipe2 dispatch, scheduler and content writer.
     /// Only the engine and the enrollment interleaving are test-controlled.
     fn exercise_owner_physical_resume(scenario: OwnerPhysicalScenario) {
-        use super::super::code_content_test::{CodeContent, ContentError, PendingContentWrite};
+        use carrick_aarch64::code_content::{CodeContent, ContentError, PendingContentWrite};
         use carrick_guest_mem::{GuestVa, OwnedMemoryWait, PhysicalMemoryWait};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -10272,7 +10272,7 @@ mod tests {
     }
 
     fn futex_zone_owner_wait(cancelled: bool) {
-        use super::super::code_content_test::{CodeContent, PendingContentWrite};
+        use carrick_aarch64::code_content::{CodeContent, PendingContentWrite};
         use carrick_guest_mem::{MemoryError, OwnedMemoryWait};
         use carrick_kernel::kernel::container::ClockDomain;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

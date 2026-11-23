@@ -100,7 +100,7 @@ fn native_code_content_host_write_guard_retains_and_revokes_all_fragments() {
     assert_eq!(owner.mapping.pin_count(), original_pins + 1);
     assert!(matches!(
         content.observe(0, 4),
-        Err(crate::trap::code_content::ContentError::WriteInProgress)
+        Err(carrick_aarch64::code_content::ContentError::WriteInProgress)
     ));
     // SAFETY: exact two-byte destination, both physical fragments retained by guard.
     unsafe {

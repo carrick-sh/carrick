@@ -187,8 +187,6 @@ use sysreg::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod carrier_custody;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod code_content;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod global_frame;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod host_writes;

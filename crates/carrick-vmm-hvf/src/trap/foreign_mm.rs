@@ -3741,7 +3741,8 @@ impl std::fmt::Debug for CarrierPinnedCowRange {
 /// Only native grants retain carrier revalidation state. Ordinary prepared
 /// copies keep the original pin/receipt path without additional Arc operations.
 struct CarrierNativeDataSpan {
-    content_write: Option<super::code_content::ContentWrite<super::global_frame::OwnedCodeContent>>,
+    content_write:
+        Option<carrick_aarch64::code_content::ContentWrite<super::global_frame::OwnedCodeContent>>,
     range: CarrierPinnedCowRange,
     custody: std::sync::Arc<CarrierVmCustody>,
     state: std::sync::Arc<MmAccessState>,

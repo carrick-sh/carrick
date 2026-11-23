@@ -79,6 +79,9 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 cc = "1"
 
 [dev-dependencies]
+# Test accessors of the moved code-content witness (`icache_publications`,
+# `visited_pages`).
+carrick-aarch64 = { path = "../carrick-aarch64", features = ["test-support"] }
 carrick-test-support = { path = "../carrick-test-support" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # The real EL1 guest-COW resolver drives the host settlement model tests.

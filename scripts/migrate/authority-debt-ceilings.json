@@ -1271,36 +1271,36 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvf::code_content",
-      "owner": "carrick_vmm_hvf::trap::code_content::ContentObservation::begin_execution_with_hook",
-      "lane": "hvf",
+      "owner": "carrick_aarch64::code_content::ContentObservation::begin_execution_with_hook",
+      "lane": "shared",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvf::code_content",
-      "owner": "carrick_vmm_hvf::trap::code_content::ContentPage::leave",
-      "lane": "hvf",
+      "owner": "carrick_aarch64::code_content::ContentPage::leave",
+      "lane": "shared",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvf::code_content",
-      "owner": "carrick_vmm_hvf::trap::code_content::ContentPage::publish_completion",
-      "lane": "hvf",
+      "owner": "carrick_aarch64::code_content::ContentPage::publish_completion",
+      "lane": "shared",
       "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvf::code_content",
-      "owner": "carrick_vmm_hvf::trap::code_content::ContentWrite<O>::new",
-      "lane": "hvf",
+      "owner": "carrick_aarch64::code_content::ContentWrite<O>::new",
+      "lane": "shared",
       "ceiling": 2
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvf::code_content",
-      "owner": "carrick_vmm_hvf::trap::code_content::PendingContentWrite<O>::new",
-      "lane": "hvf",
+      "owner": "carrick_aarch64::code_content::PendingContentWrite<O>::new",
+      "lane": "shared",
       "ceiling": 2
     },
     {

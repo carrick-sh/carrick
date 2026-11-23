@@ -1,7 +1,7 @@
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
-# carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract
+# carrick-aarch64::code_content::tests::native_code_content_invalidation_contract
 # #2826: the carrier-exit terminal global-frame cleanup now drains the exec
 # owner's unadopted rows first, so the exit arm that finds the VM already
 # gone cannot skip the drain. Witness bound under kernel.vcpu.vm-lifetime:
@@ -18,7 +18,7 @@ rationale = "A host write must invalidate every translation dependency on its ph
 
 [bindings]
 vm_free = [
-  "carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract",
+  "carrick-aarch64::code_content::tests::native_code_content_invalidation_contract",
   "carrick-vmm-hvf::trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies",
   "carrick-vmm-hvf::trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation",
 ]
