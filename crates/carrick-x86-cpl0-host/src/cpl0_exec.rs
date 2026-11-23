@@ -693,7 +693,7 @@ fn stage_build<F: X86ExecFrames>(
 /// The failed steps of returning exec preparations. Every step runs even
 /// after one fails, since a skipped step leaks what it would have returned;
 /// the result is the first failure, naming how many came after it.
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct ReleaseFailures {
     first: Option<TrapError>,
     more: usize,
