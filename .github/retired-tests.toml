@@ -179,3 +179,9 @@ test = "carrick_vmm_hvf::trap::stage2_backend::raw_vm_destroy_is_custody_transac
 reason = "#2814 S0: the destroy and replay counts moved with the stage-2 gate to carrick-xtask, over the renamed `inventory_stage2_*` wrappers."
 replaced_by = "stage2_backend_gate::custody_reaches_stage2_only_through_the_inventory_wrappers"
 pr = 2882
+
+[[retired]]
+test = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_never_enotsock_in_a_native_child"
+reason = "#2867: the carrier venue now serves a held root socket's calls for a native member instead of refusing them, so the refusal witness became a service witness (getsockname names the bound address, accept4 takes the queued connection; an inherited regular file is still ENOTSOCK)."
+replaced_by = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child"
+pr = 2880
