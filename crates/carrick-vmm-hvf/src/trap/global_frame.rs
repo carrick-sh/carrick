@@ -3194,6 +3194,13 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
+    // #2826: the terminal cleanup owns the exec owner's carrier-exit drain,
+    // so no exit path reaches it with an unadopted row left. The live-VM
+    // arm drains before its destroy, leaving none here; the arm that finds
+    // the VM already gone (a retry after a failed cleanup) drains here. A
+    // dropped preparation's backings retire records the destroy already
+    // terminalized, so no backend call runs on the gone VM.
+    custody.retire_native_exec_preparations_at_carrier_exit();
     let report = reconcile_global_frame_owners_after_replay_in_using(
         custody,
         &[],
