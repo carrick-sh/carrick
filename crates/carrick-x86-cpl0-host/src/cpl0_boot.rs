@@ -1786,6 +1786,45 @@ mod forward_execution_tests {
         );
     }
 
+    /// #2832: an `execve` gives the process leader a new execution
+    /// generation, and the root's registered binding carries it. A thread
+    /// born after the exec has its own generation. The registered generation
+    /// authenticates the leader only; a stale leader is still refused.
+    #[test]
+    fn a_member_keeps_its_own_generation_after_the_leader_execs() {
+        let (leader, context) = execution();
+        let cpu = carrick_guest_arch::CpuId::new(1);
+        let member = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(43),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            ..leader
+        };
+        let exec_successor = carrier_binding(context, leader.generation.raw() + 1);
+        let stopped_member =
+            admit_forward_execution(cpu, cpu, member, context, context.root, context.generation)
+                .expect("an issued member is admitted")
+                .with_leader_task(leader.task);
+        assert_eq!(
+            stopped_member.subject(),
+            ForwardSubject::Member {
+                leader: leader.task,
+                stopped: member.task,
+            }
+        );
+        assert_eq!(stopped_member.authenticate_typed(exec_successor), Ok(()));
+
+        let stale_leader =
+            admit_forward_execution(cpu, cpu, leader, context, context.root, context.generation)
+                .expect("the leader is admitted");
+        assert_eq!(
+            stale_leader.authenticate_typed(exec_successor),
+            Err(ForwardBindingRefusal::GenerationMismatch {
+                stopped: leader.generation.raw(),
+                registered: leader.generation.raw() + 1,
+            })
+        );
+    }
+
     #[test]
     fn forward_venue_admits_child_exec_successor_only_with_carried_key() {
         let mut fx = ForwardVenueFixture::new();
