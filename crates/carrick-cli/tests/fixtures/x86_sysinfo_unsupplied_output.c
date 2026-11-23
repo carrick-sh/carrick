@@ -68,6 +68,14 @@ static void rows(const char *who, char *touched, char *cow) {
     ret = sc(PRLIMIT64, 0, 7, 0, (long)limit, 0, 0);
     row(who, "prlimit64_old_untouched", ret, ret == 0 && limit[1] != 0);
 
+    // Not the guest's to write: an unmapped address and a PROT_NONE page
+    // are EFAULT, never a wait.
+    ret = sc(PRLIMIT64, 0, 3, 0, 0x10, 0, 0);
+    row(who, "prlimit64_old_unmapped", ret, ret == -14);
+    char *none = (char *)sc(9, 0, PG, 0, 0x22, -1, 0);
+    ret = sc(UNAME, (long)none, 0, 0, 0, 0, 0);
+    row(who, "uname_prot_none", ret, ret == -14);
+
     char *usage = fresh(1);
     ret = sc(GETRUSAGE, 0, (long)usage, 0, 0, 0, 0);
     row(who, "getrusage_untouched", ret, ret == 0);
