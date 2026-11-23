@@ -1248,6 +1248,8 @@ surfaces = [
   { path = "crates/carrick-softcpu-aarch64-host/src/lib.rs", contract = "softcpu.code-residency" },
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/src/memory.rs", contract = "arm.softcpu.stage1-tlb" },
+  # Host-side command lookup for the soft single-process runner (moved from carrick-cli's debug soft-run, #1906); launcher tooling, no guest-visible behaviour.
+  { path = "crates/carrick-softcpu-aarch64-host/src/rootfs_command.rs", contracts = [] },
   { path = "crates/carrick-softcpu-aarch64-host/src/runner.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.cache-hot-set" },
   { path = "crates/carrick-softcpu-aarch64-host/tests/boot_probe.rs", contract = "arm.softcpu.hvc2-kernel-dispatch" },
