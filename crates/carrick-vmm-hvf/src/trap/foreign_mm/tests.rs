@@ -6585,8 +6585,13 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
     let host_addr = owner.ptr() as usize;
     let perms = carrick_aarch64::stage2::stage2_perms_bits(region.perms);
 
-    destroy_vm_with_custody_using(&transport.custody, "structural G1 destroy", || 0, || {})
-        .expect("destroy G1 structural fixture");
+    destroy_vm_with_custody_using(
+        &transport.custody,
+        "structural G1 destroy",
+        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        || {},
+    )
+    .expect("destroy G1 structural fixture");
     let g2 = transport.custody.begin_create().expect("begin G2");
     let empty_error = reconcile_global_frame_owners_after_replay_in(&transport.custody, &[], false)
         .expect_err("an old-generation structural owner requires exact replay");

@@ -2257,7 +2257,7 @@ mod intake_tests {
                 "root grant proof failure",
                 || {
                     destroys.set(destroys.get() + 1);
-                    0
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS
                 },
                 || releases.set(releases.get() + 1),
             );

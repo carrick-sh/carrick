@@ -96,7 +96,7 @@ fn native_fork_reserve_retains_a_source_the_parent_acquired_after_birth() {
                     perms: 3,
                     logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
                 },
-                |_| 0,
+                |_| carrick_aarch64::stage2::Stage2Status::SUCCESS,
             )
             .unwrap();
     }

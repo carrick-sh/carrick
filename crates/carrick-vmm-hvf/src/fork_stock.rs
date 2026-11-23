@@ -802,7 +802,7 @@ mod tests {
                         perms: 3,
                         logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
                     },
-                    |_| 0,
+                    |_| carrick_aarch64::stage2::Stage2Status::SUCCESS,
                 )
                 .unwrap();
         }
@@ -997,7 +997,7 @@ mod tests {
                         perms: 3,
                         logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
                     },
-                    |_| 0,
+                    |_| carrick_aarch64::stage2::Stage2Status::SUCCESS,
                 )
                 .unwrap();
         }

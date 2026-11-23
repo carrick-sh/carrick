@@ -1475,7 +1475,7 @@ impl std::fmt::Debug for IpcWindowInstallation {
 pub(crate) fn install_ipc_window_using(
     custody: &CarrierVmCustody,
     backing: std::sync::Arc<dyn IpcWindowBacking>,
-    mut map: impl FnMut(*mut u8, u64, usize, u64) -> i32,
+    mut map: impl FnMut(*mut u8, u64, usize, u64) -> carrick_aarch64::stage2::Stage2Status,
     mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> Result<IpcWindowInstallation, TrapError> {
     let (directory_len, pool_len) = ipc_window_geometry(backing.as_ref())?;
@@ -1579,9 +1579,7 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         backing,
         // SAFETY: the backing is validated host memory retained by the
         // installation for as long as the VM maps it.
-        |host, ipa, len, perms| {
-            unsafe { inventory_stage2_map(host.cast(), ipa, len, perms) }.raw() as i32
-        },
+        |host, ipa, len, perms| unsafe { inventory_stage2_map(host.cast(), ipa, len, perms) },
         |ipa, len| {
             // SAFETY: unmapping exactly the extent this installation mapped.
             let rc = unsafe { inventory_stage2_unmap(ipa, len) };
@@ -1672,7 +1670,7 @@ mod ipc_window_tests {
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
             |host, ipa, len, perms| {
                 calls.push((host as usize, ipa, len, perms));
-                0
+                carrick_aarch64::stage2::Stage2Status::SUCCESS
             },
             |_, _| Ok(()),
         )
@@ -1691,8 +1689,12 @@ mod ipc_window_tests {
     fn el1_ipc_window_refuses_bad_geometry_and_rolls_back_a_failed_map() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = CarrierVmCustody::new_live_fixture();
-        let wrong_pool =
-            install_ipc_window_using(&custody, backing(0x10_0000), |_, _, _, _| 0, |_, _| Ok(()));
+        let wrong_pool = install_ipc_window_using(
+            &custody,
+            backing(0x10_0000),
+            |_, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            |_, _| Ok(()),
+        );
         assert!(wrong_pool.is_err(), "a pool of another length fails closed");
         let mut unmapped = Vec::new();
         let mut maps = 0;
@@ -1701,7 +1703,11 @@ mod ipc_window_tests {
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
             |_, _, _, _| {
                 maps += 1;
-                if maps == 2 { 1 } else { 0 }
+                if maps == 2 {
+                    carrick_aarch64::stage2::Stage2Status::from_raw(1)
+                } else {
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS
+                }
             },
             |ipa, len| {
                 unmapped.push((ipa, len));
@@ -1720,7 +1726,7 @@ mod ipc_window_tests {
             install_ipc_window_using(
                 &no_vm,
                 backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-                |_, _, _, _| 0,
+                |_, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
                 |_, _| Ok(())
             )
             .is_err()

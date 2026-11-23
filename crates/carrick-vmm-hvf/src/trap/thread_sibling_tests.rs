@@ -1011,8 +1011,13 @@ fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap(
         fd_ceiling_publisher: parking_lot::Mutex::new(None),
     };
 
-    destroy_vm_with_custody_using(&custody, "terminal carrier mapping fixture", || 0, || {})
-        .expect("exact custody destroy commits");
+    destroy_vm_with_custody_using(
+        &custody,
+        "terminal carrier mapping fixture",
+        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        || {},
+    )
+    .expect("exact custody destroy commits");
     authority
         .mark_vm_destroyed_after_custody_commit()
         .expect("only the exact terminal custody may disarm live unmap");

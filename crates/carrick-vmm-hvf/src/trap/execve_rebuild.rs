@@ -687,7 +687,10 @@ impl PreparedExecBacking {
     /// backing/root/record owner for transfer to carrier cleanup.
     fn install_using(
         self,
-        mut map: impl FnMut(ExecStage2Install, CarrierStage2RecordIdentity) -> i32,
+        mut map: impl FnMut(
+            ExecStage2Install,
+            CarrierStage2RecordIdentity,
+        ) -> carrick_aarch64::stage2::Stage2Status,
         mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> Result<InstalledExecBacking, ExecBackingInstallError> {
         let Self {
@@ -862,10 +865,10 @@ fn install_prepared_exec_backing(
     let installed = prepared.install_using(
         |extent, _record| {
             if extent.pre_mapped {
-                return 0;
+                return carrick_aarch64::stage2::Stage2Status::SUCCESS;
             }
             if fail_after.is_some_and(|limit| maps_completed >= limit) {
-                return -1;
+                return carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX);
             }
             crate::probes::hvpatch_exec_stage2(
                 carrick_observability::probes::HvpatchExecStage2::new(
@@ -902,7 +905,7 @@ fn install_prepared_exec_backing(
             if rc == 0 {
                 maps_completed += 1;
             }
-            rc.raw() as i32
+            rc
         },
         |ipa, len| {
             let rc = unsafe { inventory_stage2_unmap(ipa, len) };
@@ -2663,7 +2666,7 @@ mod backing_preparation_tests {
             .install_using(
                 |_install, identity| {
                     map_saw_record = identity.record_id.0 != 0;
-                    0
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS
                 },
                 |_ipa, _len| Ok(()),
             )
@@ -2692,7 +2695,11 @@ mod backing_preparation_tests {
         let failure = match transaction.install_using(
             |_install, _identity| {
                 maps += 1;
-                if maps == 2 { -1 } else { 0 }
+                if maps == 2 {
+                    carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX)
+                } else {
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS
+                }
             },
             |ipa, len| {
                 unmaps.push((ipa, len));
