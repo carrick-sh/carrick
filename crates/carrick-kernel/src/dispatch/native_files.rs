@@ -3965,55 +3965,65 @@ mod tests {
         }
     }
 
-    /// #2414 review P0-2: a socket the run root created and a native child
-    /// inherited across fork is published in the child's ring namespace as
-    /// a physical hold of the root's own description, not as a native
-    /// network socket. The child's `fstat` answers S_IFSOCK; its
-    /// `getsockname` and `accept4` must never answer ENOTSOCK on that same
-    /// descriptor. No native venue serves a root-owned socket's call yet, so
-    /// each is refused (the ring's counted ENOSYS); an inherited regular
-    /// file is still a proven non-socket (ENOTSOCK). Red before the fix:
-    /// every descriptor that was not a native network socket answered
-    /// ENOTSOCK.
+    /// #2867 (and #2414 review P0-2): a socket the run root's host table
+    /// created and a native member's ring namespace names (a child that
+    /// inherited it across fork, or the root itself once its table is the
+    /// ring's) is a physical hold of the root's own description, not a
+    /// native network socket. The member's `fstat` answers S_IFSOCK, and its
+    /// socket calls are the host socket's own: `getsockname` names the
+    /// bound address, and `accept4` takes the connection the root queued.
+    /// An inherited regular file is still a proven non-socket (ENOTSOCK).
+    /// Red before the fix: each call on the held socket was refused (the
+    /// ring's counted ENOSYS), so an x86 root that forked could never
+    /// accept on its listener.
     #[test]
-    fn an_inherited_root_socket_is_never_enotsock_in_a_native_child() {
+    fn an_inherited_root_socket_is_served_in_a_native_child() {
         let mut fixture = writable_fixture(Upper::Memory);
         let file = root_openat(&mut fixture.dispatcher, b"/tmp/not-a-socket\0", CREATE);
         assert!(file >= 0, "a regular file: {file}");
-        let root_call = |dispatcher: &mut SyscallDispatcher, nr: u64, args: [u64; 6]| {
-            const BASE: u64 = 0x4_0000;
-            let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x1000]);
-            memory.bytes[..2].copy_from_slice(&2u16.to_le_bytes());
-            memory.bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
-            let context = dispatcher.capture_one_task_context().unwrap();
-            let args = args.map(|arg| if arg == u64::MAX { BASE } else { arg });
-            match dispatcher
-                .dispatch(
-                    &context,
-                    super::super::SyscallRequest::new(nr, crate::compat::SyscallArgs(args)),
-                    &mut memory,
-                    &crate::compat::CompatReporter::default(),
-                )
-                .unwrap()
-            {
-                DispatchOutcome::Returned { value } => value,
-                DispatchOutcome::Errno { errno } => errno.guest_retval(),
-                other => panic!("unexpected outcome {other:?}"),
-            }
-        };
+        // `u64::MAX` names a `sockaddr_in` of 127.0.0.1 and `port`.
+        let root_call =
+            |dispatcher: &mut SyscallDispatcher, nr: u64, args: [u64; 6], port: [u8; 2]| {
+                const BASE: u64 = 0x4_0000;
+                let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x1000]);
+                memory.bytes[..2].copy_from_slice(&2u16.to_le_bytes());
+                memory.bytes[2..4].copy_from_slice(&port);
+                memory.bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
+                let context = dispatcher.capture_one_task_context().unwrap();
+                let args = args.map(|arg| if arg == u64::MAX { BASE } else { arg });
+                match dispatcher
+                    .dispatch(
+                        &context,
+                        super::super::SyscallRequest::new(nr, crate::compat::SyscallArgs(args)),
+                        &mut memory,
+                        &crate::compat::CompatReporter::default(),
+                    )
+                    .unwrap()
+                {
+                    DispatchOutcome::Returned { value } => value,
+                    DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            };
         let socket = carrick_abi::syscall::nr::SOCKET.raw() as u64;
         let bind = carrick_abi::syscall::nr::BIND.raw() as u64;
         let listen = carrick_abi::syscall::nr::LISTEN.raw() as u64;
-        let fd = root_call(&mut fixture.dispatcher, socket, [2, 1, 0, 0, 0, 0]);
+        let fd = root_call(&mut fixture.dispatcher, socket, [2, 1, 0, 0, 0, 0], [0; 2]);
         assert!(fd >= 0, "the root's AF_INET stream socket: {fd}");
         let bound = root_call(
             &mut fixture.dispatcher,
             bind,
             [fd as u64, u64::MAX, 16, 0, 0, 0],
+            [0; 2],
         );
         assert_eq!(bound, 0, "bind 127.0.0.1:0");
         assert_eq!(
-            root_call(&mut fixture.dispatcher, listen, [fd as u64, 4, 0, 0, 0, 0]),
+            root_call(
+                &mut fixture.dispatcher,
+                listen,
+                [fd as u64, 4, 0, 0, 0, 0],
+                [0; 2]
+            ),
             0
         );
         let region = fixture.owner.region();
@@ -4107,15 +4117,45 @@ mod tests {
             )
             .unwrap(),
         );
-        for (name, mut call) in [("getsockname", getsockname(fd as i32)), ("accept4", accept)] {
-            let served = fixture.serve(None, &mut call);
-            let answer = served.map(|()| host_file::reply(&call).unwrap().result);
-            assert_eq!(
-                answer,
-                Err(NativeHostFileRefusal),
-                "{name} of an inherited root socket is refused, never ENOTSOCK"
-            );
-        }
+        let named = getsockname(fd as i32);
+        let segments: Vec<_> = host_file::NetCall::decode(
+            host_file::NetCaller::split(host_file::request_parts(&named).unwrap().1)
+                .unwrap()
+                .1,
+        )
+        .unwrap()
+        .segments()
+        .to_vec();
+        let (result, output) = fixture.result(None, named);
+        assert_eq!(result, 0, "getsockname of the held listener");
+        let (_, written) = host_file::NetCall::decode_written(&segments, &output).unwrap();
+        let address = written
+            .iter()
+            .find(|(address, _)| *address == 0x20_0000)
+            .map(|(_, bytes)| bytes.to_vec())
+            .unwrap();
+        assert_eq!(&address[4..8], &[127, 0, 0, 1], "the bound address");
+        let port = [address[2], address[3]];
+        assert_ne!(port, [0, 0], "a bound port");
+        // The root queues a connection on its listener; the child takes it.
+        let peer = root_call(&mut fixture.dispatcher, socket, [2, 1, 0, 0, 0, 0], [0; 2]);
+        assert!(peer >= 0, "the root's connecting socket: {peer}");
+        let connect = carrick_abi::syscall::nr::CONNECT.raw() as u64;
+        assert_eq!(
+            root_call(
+                &mut fixture.dispatcher,
+                connect,
+                [peer as u64, u64::MAX, 16, 0, 0, 0],
+                port,
+            ),
+            0,
+            "the root connects to its listener"
+        );
+        let (accepted, _) = fixture.result(None, accept);
+        assert!(
+            accepted >= 0 && accepted != fd,
+            "accept4 on the held listener takes the queued connection: {accepted}"
+        );
         assert_eq!(
             fixture.result(None, getsockname(file as i32)).0,
             carrick_abi::LINUX_ENOTSOCK.guest_retval(),
