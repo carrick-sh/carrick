@@ -66,6 +66,8 @@ pub fn witness(op: u64) -> u64 {
                 detail: carrick_guest_arch::FatalCode::new(1),
             });
         }
+        // A real Rust panic in the ring, through the image's panic handler.
+        2 => panic!("transport witness panic {op}"),
         _ => u64::MAX,
     }
 }
