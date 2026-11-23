@@ -4408,7 +4408,10 @@ fn retirement_refuses_when_the_included_file_still_has_the_test() {
     )
     .expect_err("retired test still exists in the included file")
     .to_string();
-    assert!(error.contains("still exists in candidate source"), "{error}");
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4445,7 +4448,10 @@ fn test_inventory_files_an_included_test_under_the_includers_module() {
         "#[test] fn top() {} mod tests { #[test] fn nested() {} }",
     );
     let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
-    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    let krate = inventory
+        .iter()
+        .find(|c| c.crate_name == "example")
+        .unwrap();
     assert_eq!(krate.unresolved, None, "{krate:?}");
     let names: Vec<&str> = krate.tests.keys().map(|(_, t)| t.as_str()).collect();
     assert!(names.contains(&"native::top"), "{names:?}");
@@ -4456,6 +4462,120 @@ fn test_inventory_files_an_included_test_under_the_includers_module() {
 fn test_inventory_marks_an_included_file_with_modules_unresolved() {
     let dir = include_fixture("include!(\"tests.rs\");", "mod more;");
     let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
-    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    let krate = inventory
+        .iter()
+        .find(|c| c.crate_name == "example")
+        .unwrap();
     assert!(krate.unresolved.is_some(), "{krate:?}");
+}
+
+fn include_only_retirement(included: &str, chain: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    let lib = "mod nested { include!(\"sub/x_tests.rs\"); }";
+    for root in [&base, &cand] {
+        write_source(
+            root,
+            "crates/example/Cargo.toml",
+            "[package]\nname = 'example'\n",
+        );
+        write_source(root, "crates/example/src/lib.rs", lib);
+    }
+    write_source(
+        &base,
+        "crates/example/src/sub/x_tests.rs",
+        "#[test] fn gone() {}",
+    );
+    let leaf = if chain {
+        write_source(
+            &cand,
+            "crates/example/src/sub/x_tests.rs",
+            "core::include!(\"leaf/tests.rs\");",
+        );
+        "crates/example/src/sub/leaf/tests.rs"
+    } else {
+        "crates/example/src/sub/x_tests.rs"
+    };
+    write_source(&cand, leaf, &format!("#[test] fn {included}() {{}}"));
+    let result = diff_with_retired(
+        &cpl0_receipt(&["example::nested::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("example::nested::gone", None)],
+        &base,
+        &cand,
+    );
+    if included == "gone" {
+        let error = result
+            .expect_err("included test is still present")
+            .to_string();
+        assert!(
+            error.contains("still exists in candidate source"),
+            "{error}"
+        );
+    } else {
+        let diff = result.unwrap();
+        assert!(diff.new.is_empty(), "{diff:?}");
+    }
+
+    let inventory = carrick_xtask::ci_receipt::tree_test_inventory(&cand).unwrap();
+    let krate = &inventory[0];
+    assert_eq!(krate.unresolved, None);
+    assert!(
+        krate
+            .tests
+            .contains_key(&("example".into(), format!("nested::{included}")))
+    );
+}
+
+#[test]
+fn retirement_accepts_removal_from_include_only_subdirectory() {
+    for chain in [false, true] {
+        include_only_retirement("kept", chain);
+    }
+}
+
+#[test]
+fn retirement_refuses_test_in_include_only_subdirectory() {
+    for chain in [false, true] {
+        include_only_retirement("gone", chain);
+    }
+}
+
+#[test]
+fn retirement_refuses_real_include_target_outside_crate() {
+    let dir = include_fixture("std::include!(\"../../outside.rs\");", "");
+    write_source(dir.path(), "crates/outside.rs", "#[test] fn gone() {}");
+    let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+    assert!(
+        error.to_string().contains("cannot resolve include! source"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_refuses_symlink_include_target() {
+    for link_dir in [false, true] {
+        let include = if link_dir {
+            "include!(\"sub/tests.rs\");"
+        } else {
+            "include!(\"alias.rs\");"
+        };
+        let dir = include_fixture(include, "");
+        let src = dir.path().join("crates/example/src");
+        let (target, alias) = if link_dir {
+            std::fs::create_dir(src.join("real")).unwrap();
+            write_source(&src, "real/tests.rs", "");
+            (src.join("real"), src.join("sub"))
+        } else {
+            (src.join("tests.rs"), src.join("alias.rs"))
+        };
+        std::os::unix::fs::symlink(target, alias).unwrap();
+        let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot resolve include! source"),
+            "{error}"
+        );
+    }
 }
