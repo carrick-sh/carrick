@@ -3092,20 +3092,21 @@ pub fn restarts_after_interrupt(record: &[u8]) -> bool {
     carrick_signal_core::is_native_restartable_syscall(canonical)
 }
 
-/// Stamp a staged `Poll` record with its call's ring serial (#2414 review
-/// P0-2): the carrier keys the call's deadline on it, so a record the ring
-/// publishes again for the same call keeps the call's deadline and a new
-/// call starts its own. Any other record is left as staged. `false` for a
-/// malformed record.
-pub fn stamp_poll_call(record: &mut [u8], serial: host_file::HostCallSerial) -> bool {
+/// Stamp a staged record whose call may wait with a deadline (a `Poll`,
+/// #2414 review P0-2, or a socket call, #2878) with its call's ring serial
+/// ([`host_file::call_serial_arg`]): the carrier keys the call's deadline on
+/// it, so a record the ring publishes again for the same call keeps the
+/// call's deadline and a new call starts its own. Any other record is left
+/// as staged. `false` for a malformed record.
+pub fn stamp_call_serial(record: &mut [u8], serial: host_file::HostCallSerial) -> bool {
     let Ok(mut view) = host_file::HostFileRequestView::parse(record) else {
         return false;
     };
-    if view.header().op != HostFileOp::Poll {
+    let Some(index) = host_file::call_serial_arg(view.header().op) else {
         return true;
-    }
+    };
     let mut args = view.header().args;
-    args[host_file::POLL_CALL_SERIAL_ARG] = serial.raw();
+    args[index] = serial.raw();
     view.set_args(args);
     true
 }
