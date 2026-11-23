@@ -4026,6 +4026,72 @@ mod tests {
             assert_eq!(owed_returns(&model).len(), 1);
         }
 
+        /// #2783 / #2832 record B2: a host page-table pause (a raised gate)
+        /// is "not now". The call parks on the gate's release with the root
+        /// and the descriptors unchanged, and the rerun after the host lowers
+        /// it is served: Busy once, then success, never a Forward.
+        #[test]
+        fn delegated_raised_gate_parks_then_the_rerun_is_served() {
+            use carrick_el1_abi::AnonymousLeave;
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                mmap_fixed(ARENA, 0x2000),
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            editor.calls.clear();
+            let index = spaces.find(task.key).unwrap();
+            let generation = root(&spaces, &table, &task).generation();
+            for (nr, args) in [
+                (SYS_MUNMAP, [ARENA, 0x1000, 0, 0, 0, 0]),
+                (SYS_MPROTECT, [ARENA + 0x1000, 0x1000, PROT_READ, 0, 0, 0]),
+                (SYS_MMAP, mmap_fixed(ARENA + 0x4000, 0x1000)),
+            ] {
+                spaces.raise(index);
+                let (route, _) = syscall(&task, &spaces, &table, &counters, &mut editor, nr, args);
+                assert_eq!(
+                    route,
+                    DelegatedAnonymous::Contended(SpaceWaitCause::Gate),
+                    "syscall {nr} under a raised gate"
+                );
+                assert_eq!(
+                    root(&spaces, &table, &task).generation(),
+                    generation,
+                    "syscall {nr}: a parked call proposes nothing"
+                );
+                assert!(editor.calls.is_empty(), "syscall {nr}: no descriptor step");
+                spaces.lower(index);
+            }
+            assert_eq!(
+                counters.anonymous_leaves[AnonymousLeave::NoGrant as usize].load(Ordering::Relaxed),
+                0
+            );
+            for (nr, args) in [
+                (SYS_MUNMAP, [ARENA, 0x1000, 0, 0, 0, 0]),
+                (SYS_MPROTECT, [ARENA + 0x1000, 0x1000, PROT_READ, 0, 0, 0]),
+                (SYS_MMAP, mmap_fixed(ARENA + 0x4000, 0x1000)),
+            ] {
+                let (route, result) =
+                    syscall(&task, &spaces, &table, &counters, &mut editor, nr, args);
+                assert_eq!(route, DelegatedAnonymous::Served, "syscall {nr} rerun");
+                assert!(result >= 0, "syscall {nr} rerun: {result}");
+            }
+            let mut model = root(&spaces, &table, &task);
+            assert_eq!(model.mapping(ARENA), None);
+            assert!(model.mapping(ARENA + 0x1000).is_some());
+            assert!(model.mapping(ARENA + 0x4000).is_some());
+            for nr in [SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP] {
+                assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+            }
+        }
+
         #[test]
         fn delegated_busy_root_replays_and_unservable_steps_leave_the_root_unchanged() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
