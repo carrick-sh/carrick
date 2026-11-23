@@ -749,6 +749,89 @@ fn assemble_kvm_root_pool(
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn settle_kvm_pool_completion(
+    census: Result<(), std::io::Error>,
+    completion: Result<
+        Result<carrick_vmm_kvm::cpl0_boot::InitialProcessExit, String>,
+        std::sync::mpsc::RecvError,
+    >,
+    shutdown: Result<(), String>,
+    executor_death: Option<carrick_kernel::kernel::ExecutorDeath>,
+    exec_drain: Result<usize, carrick_hal::TrapError>,
+    authority_refusals: Vec<ForwardAuthorityRefusal>,
+    stats: &crate::vcpu_loop::executor::cpl0::Cpl0ForwardStats,
+    physical: Option<Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>>,
+) -> Result<carrick_vmm_kvm::cpl0_boot::InitialProcessExit, PreparedKvmPoolFailure> {
+    let failure_with_drain =
+        |error: RuntimeError, authority_refusals: Vec<ForwardAuthorityRefusal>| {
+            let error = match &exec_drain {
+                Ok(_) => error,
+                Err(drain_error) => {
+                    tracing::error!(
+                        %drain_error,
+                        "carrier-exit exec drain failed after KVM pool run failure"
+                    );
+                    RuntimeError::Configuration(format!(
+                        "{error}; carrier-exit exec drain: {drain_error}"
+                    ))
+                }
+            };
+            PreparedKvmPoolFailure {
+                error,
+                authority_refusals,
+                physical: physical.clone(),
+            }
+        };
+    census.map_err(|error| {
+        failure_with_drain(
+            RuntimeError::Configuration(format!("publish terminal census: {error}")),
+            authority_refusals.clone(),
+        )
+    })?;
+    let outcome = completion
+        .map_err(|error| {
+            failure_with_drain(
+                RuntimeError::Configuration(format!("KVM executor completion: {error}")),
+                authority_refusals.clone(),
+            )
+        })?
+        .map_err(|error| {
+            // A failed run never reaches the execution witness below, so its
+            // forward refusals ride on the failure itself.
+            let runtime_error = match stats.snapshot() {
+                Ok((_, refusals)) if !refusals.is_empty() => {
+                    RuntimeError::Configuration(format!("{error}; forward refusals {refusals:?}"))
+                }
+                _ => RuntimeError::Configuration(error),
+            };
+            failure_with_drain(runtime_error, authority_refusals.clone())
+        })?;
+    match (shutdown, executor_death) {
+        (Ok(()), _) => {}
+        // The run's first completion was its guest exit. A worker that died
+        // after it, while the run ended or at teardown, fails its own join
+        // but does not unsay the exit: the death would have been the run's
+        // result only by reaching the completion first (#2420).
+        (Err(error), Some(death)) => {
+            tracing::error!(%death, %error, "executor died after the guest exit was the run's result");
+        }
+        (Err(error), None) => {
+            return Err(failure_with_drain(
+                RuntimeError::Configuration(error),
+                authority_refusals,
+            ));
+        }
+    }
+    exec_drain.map_err(|error| PreparedKvmPoolFailure {
+        error: RuntimeError::from(error),
+        authority_refusals: Vec::new(),
+        physical,
+    })?;
+    Ok(outcome)
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn run_prepared_kvm_pool_with_debug(
     machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
     root_context: carrick_kernel::kernel::KernelContext,
@@ -854,56 +937,25 @@ fn run_prepared_kvm_pool_with_debug(
     } else {
         Ok(())
     };
-    let shutdown = pool.shutdown();
+    let shutdown = pool
+        .shutdown()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    // #2799 / #2826: `pool.shutdown()` joined every worker on every outcome,
+    // so no lane can adopt or cancel an exec again. Drain unadopted rows once
+    // before any `?` so `Err` exits never leave sealed rows live.
+    let exec_drain = physical.retire_exec_preparations_at_carrier_exit();
     let authority_refusals = stats.authority_refusals().unwrap_or_default();
-    census.map_err(|error| PreparedKvmPoolFailure {
-        error: RuntimeError::Configuration(format!("publish terminal census: {error}")),
-        authority_refusals: authority_refusals.clone(),
-        physical: Some(Arc::clone(&physical)),
-    })?;
-    let outcome = completion
-        .map_err(|error| PreparedKvmPoolFailure {
-            error: RuntimeError::Configuration(format!("KVM executor completion: {error}")),
-            authority_refusals: authority_refusals.clone(),
-            physical: Some(Arc::clone(&physical)),
-        })?
-        .map_err(|error| {
-            // A failed run never reaches the execution witness below, so its
-            // forward refusals ride on the failure itself.
-            let runtime_error = match stats.snapshot() {
-                Ok((_, refusals)) if !refusals.is_empty() => {
-                    RuntimeError::Configuration(format!("{error}; forward refusals {refusals:?}"))
-                }
-                _ => RuntimeError::Configuration(error),
-            };
-            PreparedKvmPoolFailure {
-                error: runtime_error,
-                authority_refusals: authority_refusals.clone(),
-                physical: Some(Arc::clone(&physical)),
-            }
-        })?;
-    match (shutdown, scheduler.executor_death()) {
-        (Ok(_), _) => {}
-        // The run's first completion was its guest exit. A worker that died
-        // after it, while the run ended or at teardown, fails its own join
-        // but does not unsay the exit: the death would have been the run's
-        // result only by reaching the completion first (#2420).
-        (Err(error), Some(death)) => {
-            tracing::error!(%death, %error, "executor died after the guest exit was the run's result");
-        }
-        (Err(error), None) => {
-            return Err(PreparedKvmPoolFailure {
-                error: RuntimeError::Configuration(error.to_string()),
-                authority_refusals,
-                physical: Some(Arc::clone(&physical)),
-            });
-        }
-    }
-    // #2799: the pool is shut down, so no lane can adopt or cancel an exec
-    // again. A process that died with the run between its exec's seal and
-    // its adoption left a row holding its successor's frames; the exec owner
-    // retires it here rather than leave it live at teardown.
-    physical.retire_exec_preparations_at_carrier_exit()?;
+    let outcome = settle_kvm_pool_completion(
+        census,
+        completion,
+        shutdown,
+        scheduler.executor_death(),
+        exec_drain,
+        authority_refusals,
+        &stats,
+        Some(Arc::clone(&physical)),
+    )?;
     let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
     let physical_crossing_families: Vec<_> = physical
         .physical_crossing_counts()?
@@ -2670,5 +2722,106 @@ mod tests {
         }
         crate::carrier::shutdown().expect("carrier shutdown without a VM is a no-op");
         assert!(crate::vm_lifecycle::process_snapshot().terminal.is_none());
+    }
+
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    #[test]
+    fn settle_kvm_pool_completion_preserves_original_error_and_reports_drain_error_on_success() {
+        use carrick_hal::TrapError;
+        use carrick_vmm_kvm::cpl0_boot::InitialProcessExit;
+
+        let stats = crate::vcpu_loop::executor::cpl0::Cpl0ForwardStats::default();
+        let exited = || Ok(Ok(InitialProcessExit::Exited { code: 0, exits: 1 }));
+
+        // Success path reports drain failure as before.
+        let err = super::settle_kvm_pool_completion(
+            Ok(()),
+            exited(),
+            Ok(()),
+            None,
+            Err(TrapError::Hypervisor("drain boom".into())),
+            Vec::new(),
+            &stats,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.error.to_string().contains("drain boom"), "{err:?}");
+
+        // Each of the 4 Err exits keeps its original error even when drain fails too.
+        let census_err = super::settle_kvm_pool_completion(
+            Err(std::io::Error::other("census broken")),
+            exited(),
+            Ok(()),
+            None,
+            Err(TrapError::Hypervisor("drain boom".into())),
+            Vec::new(),
+            &stats,
+            None,
+        )
+        .unwrap_err();
+        let census_msg = census_err.error.to_string();
+        assert!(
+            census_msg.contains("publish terminal census: census broken")
+                && census_msg.contains("carrier-exit exec drain:")
+                && census_msg.contains("drain boom"),
+            "{census_msg}"
+        );
+
+        let recv_err = super::settle_kvm_pool_completion(
+            Ok(()),
+            Err(std::sync::mpsc::RecvError),
+            Ok(()),
+            None,
+            Err(TrapError::Hypervisor("drain boom".into())),
+            Vec::new(),
+            &stats,
+            None,
+        )
+        .unwrap_err();
+        let recv_msg = recv_err.error.to_string();
+        assert!(
+            recv_msg.contains("KVM executor completion:")
+                && recv_msg.contains("carrier-exit exec drain:")
+                && recv_msg.contains("drain boom"),
+            "{recv_msg}"
+        );
+
+        let run_err = super::settle_kvm_pool_completion(
+            Ok(()),
+            Ok(Err("worker died".into())),
+            Ok(()),
+            None,
+            Err(TrapError::Hypervisor("drain boom".into())),
+            Vec::new(),
+            &stats,
+            None,
+        )
+        .unwrap_err();
+        let run_msg = run_err.error.to_string();
+        assert!(
+            run_msg.contains("worker died")
+                && run_msg.contains("carrier-exit exec drain:")
+                && run_msg.contains("drain boom"),
+            "{run_msg}"
+        );
+
+        let shutdown_err = super::settle_kvm_pool_completion(
+            Ok(()),
+            exited(),
+            Err("join failed".into()),
+            None,
+            Err(TrapError::Hypervisor("drain boom".into())),
+            Vec::new(),
+            &stats,
+            None,
+        )
+        .unwrap_err();
+        let shutdown_msg = shutdown_err.error.to_string();
+        assert!(
+            shutdown_msg.contains("join failed")
+                && shutdown_msg.contains("carrier-exit exec drain:")
+                && shutdown_msg.contains("drain boom"),
+            "{shutdown_msg}"
+        );
     }
 }
