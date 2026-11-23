@@ -2356,6 +2356,18 @@ struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
 }
 
+/// What [`NativeProcessRegistry::task_group_tids`] found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskGroupLookup {
+    /// The caller's own group is not a registered native group: the ring
+    /// does not own its process view.
+    Unowned,
+    /// No thread group has that id in the caller's PID namespace.
+    Absent,
+    /// The group's leader id and its live thread ids, in no order.
+    Live { tgid: NonZeroU32, tids: Vec<u32> },
+}
+
 /// The admitted owner kind of a thread's group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeThreadGroupOwner {
@@ -3274,6 +3286,57 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 root_generation: address.generation,
             },
         )
+    }
+
+    /// The live thread ids of a thread group, for a caller whose own group
+    /// is `(page, visible_pid)` (#2776): its own group (`tgid` `None`), or
+    /// the group `tgid` leads in the caller's process graph, which is its
+    /// PID namespace. Membership is the signal owner's: the leader and every
+    /// authenticated member a `tgkill` could still name.
+    pub fn task_group_tids(
+        &self,
+        zone: &ZoneTables<C>,
+        page: &ThreadLifecyclePage,
+        visible_pid: u32,
+        tgid: Option<NonZeroU32>,
+    ) -> TaskGroupLookup {
+        let carrier = core::ptr::from_ref(zone).addr();
+        let page = core::ptr::from_ref(page).addr();
+        let owner = self
+            .state
+            .lock()
+            .groups
+            .range((carrier, 0, 0, 0, 0)..=(carrier, u64::MAX, u64::MAX, usize::MAX, u32::MAX))
+            .find_map(|(&(_, _, _, group_page, pid), (runtime, process))| {
+                (group_page == page && pid == visible_pid).then(|| (runtime.clone(), *process))
+            });
+        let Some((runtime, process)) = owner else {
+            return TaskGroupLookup::Unowned;
+        };
+        let graph = runtime.graph.lock();
+        let row = match tgid {
+            None => graph.owner.task(process).ok(),
+            Some(tgid) => graph
+                .owner
+                .tasks()
+                .values()
+                .find(|row| row.metadata().namespace_pid == tgid.get()),
+        };
+        let Some((row, leader)) =
+            row.and_then(|row| Some((row, NonZeroU32::new(row.metadata().namespace_pid)?)))
+        else {
+            return TaskGroupLookup::Absent;
+        };
+        let resources = row.native().resources();
+        let mut tids = Vec::new();
+        resources.for_each_live_signal_member(row.key(), runtime.zone, |_, control| {
+            if core::ptr::eq(control, resources.control) {
+                tids.push(leader.get());
+            } else if let Some(tid) = control.visible_tid() {
+                tids.push(tid);
+            }
+        });
+        TaskGroupLookup::Live { tgid: leader, tids }
     }
 
     /// Classify the admitted thread group at whatever address incarnation.

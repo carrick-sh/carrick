@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::String;
 use carrick_core_abi::host_file::HostFileRequestView;
 
 /// User memory at a fixed base; anything outside it faults.
@@ -90,6 +91,7 @@ fn run_releasing(
         taken
     };
     let mut namespace = NativeNamespace {
+        directories: None,
         table: TABLE,
         resolve: &mut resolve,
         releases: &mut releases,
@@ -338,6 +340,7 @@ fn mutation_pair_staging_has_a_fixed_two_path_copy_and_record_budget() {
             };
             let mut resolve = caller;
             let mut namespace = NativeNamespace {
+                directories: None,
                 table: TABLE,
                 resolve: &mut resolve,
                 releases: &mut |_| 0,
@@ -506,6 +509,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
         Some(HostFileStage::InRingReply {
             output,
             bytes: stat(&carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields()),
+            result: SyscallResult::new(0),
         })
     );
     let Some(HostFileStage::InRingReply { bytes, .. }) = pipe else {
@@ -529,6 +533,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
         Some(HostFileStage::InRingReply {
             output,
             bytes: stat(&carrick_syscall_abi::LinuxStatFields::CARRICK_EVENTFD),
+            result: SyscallResult::new(0),
         })
     );
     // statx(fd, "", AT_EMPTY_PATH) on a pipe: the statx encoding of the
@@ -551,6 +556,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
                 &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields()
             ))
             .into(),
+            result: SyscallResult::new(0),
         })
     );
     // An unwritable buffer still asks for write supply first.
@@ -992,6 +998,7 @@ fn unserved_epoll_reads_do_not_prepare_output() {
     let mut resolve = |_| Some(NativeDescriptor::InZone(InZoneKind::Epoll));
     let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
     let mut namespace = NativeNamespace {
+        directories: None,
         table: TABLE,
         resolve: &mut resolve,
         releases: &mut releases,
@@ -1326,6 +1333,7 @@ fn ppoll_sets_the_carrier_cannot_answer_whole_keep_their_route() {
     let mut resolve = |_| None;
     let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
     let mut namespace = NativeNamespace {
+        directories: None,
         table: TABLE,
         resolve: &mut resolve,
         releases: &mut releases,
@@ -1923,6 +1931,7 @@ fn chmod_and_chown_answer_linux_errors_in_ring() {
         stage(
             call,
             &mut NativeNamespace {
+                directories: None,
                 table: TABLE,
                 resolve: &mut resolve,
                 releases: &mut releases,
@@ -2842,4 +2851,289 @@ fn a_message_send_that_fails_epipe_owes_sigpipe_unless_msg_nosignal() {
             "{canonical:?} with flags {flags:#x}"
         );
     }
+}
+
+/// The ring directory owner as staging sees it: descriptor 7 is the task
+/// directory of a group whose live threads are `tids`.
+struct TaskDirectory {
+    tids: Vec<u32>,
+    cursor: u64,
+    opened: Vec<(RingDirectoryPath, bool)>,
+}
+impl RingDirectories for TaskDirectory {
+    fn open(&mut self, path: RingDirectoryPath, cloexec: bool) -> Option<SyscallResult> {
+        self.opened.push((path, cloexec));
+        Some(match path {
+            RingDirectoryPath::TaskGroup(tgid) if tgid.get() == 99 => {
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOENT)
+            }
+            _ => SyscallResult::new(7),
+        })
+    }
+    fn listing(&mut self, fd: i32) -> Option<Result<RingDirectoryListing, LinuxErrno>> {
+        (fd == 7).then(|| {
+            Ok(RingDirectoryListing {
+                cursor: self.cursor,
+                tids: self.tids.clone(),
+            })
+        })
+    }
+    fn seek(&mut self, fd: i32, cursor: u64) -> Option<u64> {
+        (fd == 7).then(|| core::mem::replace(&mut self.cursor, cursor))
+    }
+}
+
+fn run_with_directory(
+    directory: &mut TaskDirectory,
+    call: HostFileCall,
+    user: &mut Memory,
+) -> Option<HostFileStage> {
+    let mut resolve = |fd| {
+        if fd == 7 {
+            Some(NativeDescriptor::InZone(InZoneKind::Directory))
+        } else {
+            caller(fd)
+        }
+    };
+    let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+    let mut namespace = NativeNamespace {
+        directories: Some(directory),
+        table: TABLE,
+        resolve: &mut resolve,
+        releases: &mut releases,
+    };
+    stage(call, &mut namespace, user)
+}
+
+/// The names a `getdents64` reply holds, with each record's `d_off`.
+fn dirent_names(bytes: &[u8]) -> Vec<(String, i64)> {
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let reclen = u16::from_ne_bytes(bytes[at + 16..at + 18].try_into().unwrap()) as usize;
+        assert_eq!(reclen % 8, 0);
+        assert_eq!(bytes[at + 18], 4, "DT_DIR");
+        let name = &bytes[at + 19..at + reclen];
+        let name = &name[..name.iter().position(|byte| *byte == 0).unwrap()];
+        names.push((
+            String::from_utf8(name.to_vec()).unwrap(),
+            i64::from_ne_bytes(bytes[at + 8..at + 16].try_into().unwrap()),
+        ));
+        at += reclen;
+    }
+    names
+}
+
+#[test]
+fn ring_directory_paths_parse_exactly() {
+    let tgid = |n| RingDirectoryPath::TaskGroup(core::num::NonZeroU32::new(n).unwrap());
+    assert_eq!(
+        RingDirectoryPath::parse(b"/proc/self/task"),
+        Some(RingDirectoryPath::OwnTaskGroup)
+    );
+    assert_eq!(
+        RingDirectoryPath::parse(b"/proc/self/task//"),
+        Some(RingDirectoryPath::OwnTaskGroup)
+    );
+    assert_eq!(RingDirectoryPath::parse(b"/proc/41/task"), Some(tgid(41)));
+    assert_eq!(
+        RingDirectoryPath::parse(b"/proc/4294967295/task"),
+        Some(tgid(u32::MAX))
+    );
+    for other in [
+        &b"/proc/self/task/41"[..],
+        b"/proc/self/tasks",
+        b"/proc/0/task",
+        b"/proc/041/task",
+        b"/proc/4294967296/task",
+        b"/proc/-1/task",
+        b"/proc//task",
+        b"proc/self/task",
+        b"/proc/self/fd",
+    ] {
+        assert_eq!(
+            RingDirectoryPath::parse(other),
+            None,
+            "{}",
+            String::from_utf8_lossy(other)
+        );
+    }
+}
+
+/// #2776: `openat` of a task directory is answered by the ring owner and
+/// never builds a host request; open(2)'s directory rules hold before it.
+#[test]
+fn task_directory_open_is_served_in_ring_with_open2_errors() {
+    let open = |path: &[u8], flags: u64, directory: &mut TaskDirectory| {
+        let mut user = memory(path);
+        run_with_directory(
+            directory,
+            HostFileCall::Openat {
+                dirfd: LINUX_AT_FDCWD,
+                path: BASE,
+                flags,
+                mode: 0,
+            },
+            &mut user,
+        )
+    };
+    let mut directory = TaskDirectory {
+        tids: vec![41],
+        cursor: 0,
+        opened: Vec::new(),
+    };
+    let rdonly_dir = carrick_syscall_abi::LINUX_O_CLOEXEC | 0o200000;
+    assert_eq!(
+        open(b"/proc/self/task\0", rdonly_dir, &mut directory),
+        Some(HostFileStage::Returned(SyscallResult::new(7)))
+    );
+    assert_eq!(
+        open(b"/proc/99/task\0", 0, &mut directory),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+    assert_eq!(
+        directory.opened,
+        [
+            (RingDirectoryPath::OwnTaskGroup, true),
+            (
+                RingDirectoryPath::TaskGroup(core::num::NonZeroU32::new(99).unwrap()),
+                false
+            )
+        ]
+    );
+    assert_eq!(
+        open(b"/proc/self/task\0", 1, &mut directory),
+        returned(carrick_syscall_abi::LINUX_EISDIR)
+    );
+    assert_eq!(
+        open(b"/proc/self/task\0", 0o100 | 0o200, &mut directory),
+        returned(carrick_syscall_abi::LINUX_EEXIST)
+    );
+    assert_eq!(directory.opened.len(), 2, "a refused open reaches no owner");
+    // Any other /proc path, and a venue with no ring directories, keep the
+    // host request.
+    assert!(matches!(
+        open(b"/proc/self/status\0", 0, &mut directory),
+        Some(HostFileStage::Request { .. })
+    ));
+    let mut user = memory(b"/proc/self/task\0");
+    assert!(matches!(
+        run(
+            HostFileCall::Openat {
+                dirfd: LINUX_AT_FDCWD,
+                path: BASE,
+                flags: 0,
+                mode: 0
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Request { .. })
+    ));
+}
+
+/// #2776: `getdents64` lists `.`, `..` and the live tids in ascending
+/// order across short buffers; a thread that exits between two calls is
+/// not listed and does not hide another; a buffer the ring must supply
+/// first does not advance the position; `lseek(0)` rewinds.
+#[test]
+fn task_directory_reads_follow_the_live_group_across_calls() {
+    let mut directory = TaskDirectory {
+        tids: vec![57, 41, 43],
+        cursor: 0,
+        opened: Vec::new(),
+    };
+    let read =
+        |directory: &mut TaskDirectory, count: u64, user: &mut Memory| match run_with_directory(
+            directory,
+            HostFileCall::Getdents64 {
+                fd: 7,
+                dirp: BASE,
+                count,
+            },
+            user,
+        ) {
+            Some(HostFileStage::InRingReply {
+                output,
+                bytes,
+                result,
+            }) => {
+                assert_eq!(output, HostFileOutput::bytes(BASE, bytes.len()));
+                assert_eq!(result, SyscallResult::new(bytes.len() as i64));
+                Ok(dirent_names(&bytes))
+            }
+            other => Err(other),
+        };
+    let mut user = memory(&[]);
+    // 24-byte records: three fit in 72 bytes.
+    assert_eq!(
+        read(&mut directory, 72, &mut user),
+        Ok(vec![(".".into(), 1), ("..".into(), 2), ("41".into(), 43)])
+    );
+    // Thread 43 exits and 50 is born before the next call.
+    directory.tids = vec![57, 41, 50];
+    // An unwritable buffer asks for supply and keeps the position.
+    let mut unsupplied = memory(&[]);
+    unsupplied.writable = false;
+    assert_eq!(
+        read(&mut directory, 4096, &mut unsupplied),
+        Err(Some(HostFileStage::Fault {
+            address: BASE,
+            access: Access::Write
+        }))
+    );
+    assert_eq!(directory.cursor, 43);
+    assert_eq!(
+        read(&mut directory, 4096, &mut user),
+        Ok(vec![("50".into(), 52), ("57".into(), 59)])
+    );
+    assert_eq!(
+        read(&mut directory, 4096, &mut user),
+        Err(Some(HostFileStage::Returned(SyscallResult::new(0))))
+    );
+    // Rewind; a buffer too small for one record is EINVAL.
+    assert_eq!(
+        run_with_directory(
+            &mut directory,
+            HostFileCall::Lseek {
+                fd: 7,
+                offset: 0,
+                whence: 0
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Returned(SyscallResult::new(0)))
+    );
+    assert_eq!(
+        read(&mut directory, 8, &mut user),
+        Err(returned(carrick_syscall_abi::LINUX_EINVAL))
+    );
+    assert_eq!(
+        read(&mut directory, 4096, &mut user).map(|names| names.len()),
+        Ok(5)
+    );
+    // read(2) on a directory, and getdents64 on a non-directory object.
+    assert_eq!(
+        run_with_directory(
+            &mut directory,
+            HostFileCall::Read {
+                fd: 7,
+                buf: BASE,
+                count: 16
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_EISDIR)
+    );
+    assert_eq!(
+        run_with_directory(
+            &mut directory,
+            HostFileCall::Getdents64 {
+                fd: 4,
+                dirp: BASE,
+                count: 4096
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENOTDIR)
+    );
 }

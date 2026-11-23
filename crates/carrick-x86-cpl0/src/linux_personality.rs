@@ -1911,7 +1911,11 @@ impl Personality for LinuxPersonality {
                         }
                     }
                     Some(HostFileStage::Returned(result)) => Some(result.raw()),
-                    Some(HostFileStage::InRingReply { output, bytes }) => {
+                    Some(HostFileStage::InRingReply {
+                        output,
+                        bytes,
+                        result,
+                    }) => {
                         let mut copy = carrick_el1_linux::file::ValidatedCopy {
                             task,
                             validator: &carrick_el1_linux::file::HardwareValidator,
@@ -1922,7 +1926,7 @@ impl Personality for LinuxPersonality {
                                 output.address,
                                 &bytes,
                             ) {
-                                0
+                                result.raw()
                             } else {
                                 carrick_syscall_abi::LINUX_EFAULT.guest_retval()
                             },

@@ -173,7 +173,7 @@ impl EpollMember {
                 object,
                 end: StreamEnd::Second,
             } => Some((object, Self::StreamSecond)),
-            IpcBacking::Host(_) | IpcBacking::Epoll { .. } => None,
+            IpcBacking::Host(_) | IpcBacking::Epoll { .. } | IpcBacking::Directory { .. } => None,
         }
     }
 }

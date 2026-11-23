@@ -215,6 +215,40 @@ fn el1_io(
     step.result.map(|n| (n, wake)).map_err(IoError::Obj)
 }
 
+/// #2776: a ring directory keeps its view and read position in its object
+/// record, under the object lock, and its description's release frees the
+/// object: a stale handle then resolves nothing.
+#[test]
+fn el1_ipc_directory_keeps_view_and_cursor_and_frees_with_its_description() {
+    let w = fixture(1 << 20);
+    let tgid = core::num::NonZeroU32::new(41).unwrap();
+    let view = DirectoryView::TaskGroup { tgid };
+    let object = w.region.create_directory(view, &Spin).unwrap();
+    {
+        let mut guard = w.region.lock(object, &Spin).unwrap();
+        assert_eq!(guard.kind(), Some(IpcObjectKind::Directory));
+        assert!(guard.eventfd().is_err(), "a directory is no eventfd");
+        let directory = guard.directory().unwrap();
+        assert_eq!((directory.view(), directory.cursor()), (Some(view), 0));
+        directory.set_cursor(43);
+    }
+    assert_eq!(
+        w.region
+            .lock(object, &Spin)
+            .unwrap()
+            .directory()
+            .unwrap()
+            .cursor(),
+        43
+    );
+    let released = w
+        .region
+        .release_backing(IpcBacking::Directory { object }.encode(), &Spin)
+        .unwrap();
+    assert!(matches!(released, IpcReleased::Object { freed: true, .. }));
+    assert!(w.region.lock(object, &Spin).is_err(), "the handle is stale");
+}
+
 #[test]
 fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
     let object = IpcObjectHandle::from_raw(RawIpcObject {
@@ -240,6 +274,7 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
             object,
             end: StreamEnd::Second,
         },
+        IpcBacking::Directory { object },
         IpcBacking::Host(HostResourceToken::new(HostResourceToken::MAX).unwrap()),
         IpcBacking::Host(HostResourceToken::new(1).unwrap()),
     ] {
@@ -247,7 +282,7 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
     }
     for bad in [
         0,
-        6 << 61,
+        (6 << 61) | (1 << 60),
         7 << 61,
         (3 << 61) | (1 << 60),
         (4 << 61) | (1 << 60),

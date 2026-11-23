@@ -933,6 +933,7 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
                 &task,
                 &carrick_el1_linux::file::HardwareValidator,
                 &mut NativeNamespace {
+                    directories: None,
                     table: [1, 2, 3],
                     resolve: &mut |fd| {
                         resolved.push(fd);
@@ -999,6 +1000,7 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
             &task,
             &carrick_el1_linux::file::HardwareValidator,
             &mut NativeNamespace {
+                directories: None,
                 table: [1, 2, 3],
                 resolve: &mut |_| panic!("path form must not resolve dirfd"),
                 releases: &mut |_| 0,
@@ -1632,6 +1634,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                     self.task,
                     &carrick_el1_linux::file::HardwareValidator,
                     &mut NativeNamespace {
+                        directories: None,
                         table,
                         resolve: &mut resolve,
                         releases: &mut releases,

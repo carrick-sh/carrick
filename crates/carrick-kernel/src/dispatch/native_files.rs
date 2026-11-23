@@ -2584,6 +2584,7 @@ mod tests {
             let staged = carrick_personality_linux::native_host_file::stage(
                 HostFileCall::Socket(socket),
                 &mut NativeNamespace {
+                    directories: None,
                     table: fixture.table,
                     resolve: &mut |_| {
                         Some(NativeDescriptor::HostBacked {
@@ -2756,6 +2757,7 @@ mod tests {
             match carrick_personality_linux::native_host_file::stage(
                 HostFileCall::Socket(socket),
                 &mut NativeNamespace {
+                    directories: None,
                     table: self.table,
                     resolve: &mut |_| {
                         Some(NativeDescriptor::HostBacked {
@@ -3168,6 +3170,7 @@ mod tests {
                 &carrick_el1_abi::CurrentTask::new(),
                 &*memory,
                 &mut NativeNamespace {
+                    directories: None,
                     table: self.table,
                     resolve: &mut resolve,
                     releases: &mut releases,

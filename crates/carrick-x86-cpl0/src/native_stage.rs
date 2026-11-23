@@ -19,6 +19,7 @@ pub(crate) fn stage_call<V, R>(
     origin: ServiceOrigin,
     delegated: impl FnOnce(i32) -> bool,
     namespace: impl FnOnce() -> Option<([u64; 3], R)>,
+    directories: Option<&mut dyn carrick_personality_linux::native_host_file::RingDirectories>,
 ) -> Option<HostFileStage>
 where
     V: MemoryValidator,
@@ -64,6 +65,11 @@ where
             table,
             resolve: &mut resolve,
             releases: &mut releases,
+            // Shorten the owner's lifetime to this call's namespace.
+            directories: match directories {
+                Some(directories) => Some(directories),
+                None => None,
+            },
         },
     );
     if absent && host_route {
@@ -112,6 +118,7 @@ mod tests {
             origin,
             |_| false,
             || Some(([3, 4, 5], |_| fd)),
+            None,
         )
     }
 
@@ -147,6 +154,7 @@ mod tests {
             origin,
             |_| delegated,
             || Some(([3, 4, 5], |_| host())),
+            None,
         )
     }
 
@@ -303,6 +311,7 @@ mod tests {
                     origin,
                     |_| false,
                     || None::<([u64; 3], fn(i32) -> Option<NativeDescriptor>)>,
+                    None,
                 );
                 assert_eq!(staged, None, "{origin:?} nr {nr}");
             }
@@ -342,6 +351,7 @@ mod tests {
             INITIAL,
             |_| false,
             || Some(([3, 4, 5], |_| None)),
+            None,
         )
     }
 
@@ -434,6 +444,7 @@ mod tests {
             CHILD,
             |_| false,
             || Some(([3, 4, 5], |_| None)),
+            None,
         );
         let Some(HostFileStage::Request {
             record,
@@ -651,6 +662,7 @@ mod tests {
                 CHILD,
                 |_| false,
                 || Some(([3, 4, 5], |_| host())),
+                None,
             )
             .expect("a fork child's message call is staged")
         };

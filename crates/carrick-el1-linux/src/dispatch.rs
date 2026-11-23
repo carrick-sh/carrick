@@ -1291,9 +1291,27 @@ fn native_host_file_fault(
 /// Route a native SVC through the host-file venue. `None` keeps the call on
 /// its existing route; the descriptor is resolved in the caller's own ring
 /// namespace by `descriptor`.
+#[cfg(test)]
+pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
+    frame: &TrapFrame,
+    task: &CurrentTask,
+    validator: &V,
+    table: [u64; 3],
+    origin: carrick_core_abi::service::ServiceOrigin,
+    descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
+    releases: &mut dyn FnMut(&mut [carrick_core_abi::host_file::MapSourceReply]) -> usize,
+) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
+    native_host_file_stage_in(
+        frame, task, validator, table, origin, descriptor, releases, None,
+    )
+}
+
+/// [`native_host_file_stage`] with the venue's ring directories (`None`
+/// for a venue that publishes none).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
-pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn native_host_file_stage_in<V: file::MemoryValidator>(
     frame: &TrapFrame,
     task: &CurrentTask,
     validator: &V,
@@ -1301,6 +1319,7 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     origin: carrick_core_abi::service::ServiceOrigin,
     mut descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
     releases: &mut dyn FnMut(&mut [carrick_core_abi::host_file::MapSourceReply]) -> usize,
+    directories: Option<&mut dyn carrick_personality_linux::native_host_file::RingDirectories>,
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
     use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace};
     if (frame.esr >> 26) & 0x3f != 0x15 {
@@ -1342,6 +1361,11 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
         table,
         resolve: &mut descriptor,
         releases,
+        // Shorten the owner's lifetime to this call's namespace.
+        directories: match directories {
+            Some(directories) => Some(directories),
+            None => None,
+        },
     };
     stage_native_host_file(call, task, validator, &mut namespace)
 }
@@ -1594,6 +1618,7 @@ pub(super) fn native_service_decision(
             Some(carrick_personality_linux::native_host_file::HostFileStage::InRingReply {
                 output,
                 bytes,
+                result,
             }) => {
                 // Staging proved the destination writable; the ring
                 // copies its own answer.
@@ -1603,7 +1628,7 @@ pub(super) fn native_service_decision(
                 };
                 NativeServiceStage::Return(
                     if file::UserCopy::copy_out(&mut copy, output.address, &bytes) {
-                        0
+                        result.raw()
                     } else {
                         carrick_syscall_abi::LINUX_EFAULT.guest_retval()
                     },
@@ -1931,7 +1956,17 @@ fn arm_native_service_exit(
             let table = ipc::native_table(&venue, task)?;
             let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
             let lock_slot = frame.slot as u32;
-            native_host_file_stage(
+            let mut directories = RingDirectoryVenue {
+                region: &venue.region,
+                table,
+                task_group: |tgid| match task.visible_pid() {
+                    Some(pid) => {
+                        super::aarch64_process::registry().task_group_tids(zone, page, pid, tgid)
+                    }
+                    None => super::native_process_runtime::TaskGroupLookup::Unowned,
+                },
+            };
+            native_host_file_stage_in(
                 frame,
                 task,
                 &file::HardwareValidator,
@@ -1943,6 +1978,7 @@ fn arm_native_service_exit(
                 },
                 |fd| ipc::native_descriptor(&venue, table, fd),
                 &mut |out| native_source_releases(task, access, lock_slot, out),
+                Some(&mut directories),
             )
         },
     ) {
@@ -4812,7 +4848,10 @@ fn serve_ring_epoll_ctl<Z: carrick_el1_abi::EntryContext>(
         let epoll = match IpcBacking::decode(edesc.backing) {
             Some(IpcBacking::Epoll { object }) => object,
             Some(
-                IpcBacking::Pipe { .. } | IpcBacking::EventFd { .. } | IpcBacking::Stream { .. },
+                IpcBacking::Pipe { .. }
+                | IpcBacking::EventFd { .. }
+                | IpcBacking::Stream { .. }
+                | IpcBacking::Directory { .. },
             ) => {
                 return match authority.get(table, call.member_fd) {
                     Err(error) => map_fd_error(error),
@@ -5258,6 +5297,160 @@ fn serve_ring_stream_socket<'ipc, Z: carrick_el1_abi::EntryContext>(
         SyscallResult::new(0),
         (call.counters, call.canonical_ordinal, call.args, call.pc),
     )
+}
+
+/// Open a ring-owned directory on `view` in `table`: the object, its one
+/// read-only description and the lowest free descriptor.
+#[inline(never)]
+fn open_ring_directory(
+    region: &carrick_el1_abi::ipc::IpcRegion<'_>,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    view: carrick_el1_abi::ipc::DirectoryView,
+    cloexec: bool,
+) -> FamilyCompletion {
+    use carrick_el1_abi::ipc::{
+        IpcBacking,
+        fd::{AccessMode, Fd},
+    };
+    let object = loop {
+        let seen = region.object_count();
+        match region.create_directory(view, &NativeFdWait) {
+            Ok(object) => break object,
+            Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
+                if let Err(error) = region.grow_objects(seen) {
+                    return map_ipc_error(error);
+                }
+            }
+            Err(error) => return map_ipc_error(error),
+        }
+    };
+    let backing = IpcBacking::Directory { object }.encode();
+    let description = carrick_el1_abi::ipc::fd::Description::new(
+        backing,
+        AccessMode::ReadOnly,
+        carrick_el1_abi::ipc::fd::StatusFlags::default(),
+    );
+    let result = run_with_table_growth(region, table, |auth| {
+        auth.open(table, Fd(0), description, cloexec)
+    });
+    match result {
+        Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
+        Err(error) => {
+            if let Err(release) = region.release_backing(backing, &NativeFdWait) {
+                return map_ipc_error(release);
+            }
+            error
+        }
+    }
+}
+
+/// The ring's own directories for one staged call (#2776): the caller's
+/// descriptor table in the shared IPC region, and the process owner's
+/// thread-group membership. Both ISAs build it at their staging venue.
+pub struct RingDirectoryVenue<'r, 'a, F> {
+    pub region: &'r carrick_el1_abi::ipc::IpcRegion<'a>,
+    pub table: [u64; 3],
+    /// [`super::native_process_runtime::NativeProcessRegistry::task_group_tids`]
+    /// for the caller: its own group for `None`.
+    pub task_group: F,
+}
+
+impl<F> RingDirectoryVenue<'_, '_, F> {
+    /// The directory object `fd` names. `None`: not a ring directory, or
+    /// the table is contended.
+    fn object(&self, fd: i32) -> Option<carrick_el1_abi::ipc::IpcObjectHandle> {
+        let table = carrick_el1_abi::ipc::fd::TableId::from_raw(carrick_el1_abi::ipc::RawTableId {
+            authority: self.table[0],
+            index: self.table[1],
+            generation: self.table[2],
+        });
+        let description = self
+            .region
+            .fd(NativeFdWait)
+            .get(table, carrick_el1_abi::ipc::fd::Fd(fd))
+            .ok()?;
+        match carrick_el1_abi::ipc::IpcBacking::decode(description.backing)? {
+            carrick_el1_abi::ipc::IpcBacking::Directory { object } => Some(object),
+            _ => None,
+        }
+    }
+}
+
+impl<F> carrick_personality_linux::native_host_file::RingDirectories
+    for RingDirectoryVenue<'_, '_, F>
+where
+    F: FnMut(Option<core::num::NonZeroU32>) -> super::native_process_runtime::TaskGroupLookup,
+{
+    fn open(
+        &mut self,
+        path: carrick_personality_linux::native_host_file::RingDirectoryPath,
+        cloexec: bool,
+    ) -> Option<SyscallResult> {
+        use super::native_process_runtime::TaskGroupLookup;
+        use carrick_personality_linux::native_host_file::RingDirectoryPath;
+        let named = match path {
+            RingDirectoryPath::OwnTaskGroup => None,
+            RingDirectoryPath::TaskGroup(tgid) => Some(tgid),
+        };
+        let tgid = match (self.task_group)(named) {
+            TaskGroupLookup::Unowned => return None,
+            TaskGroupLookup::Absent => {
+                return Some(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOENT));
+            }
+            TaskGroupLookup::Live { tgid, .. } => tgid,
+        };
+        let table = carrick_el1_abi::ipc::fd::TableId::from_raw(carrick_el1_abi::ipc::RawTableId {
+            authority: self.table[0],
+            index: self.table[1],
+            generation: self.table[2],
+        });
+        match open_ring_directory(
+            self.region,
+            table,
+            carrick_el1_abi::ipc::DirectoryView::TaskGroup { tgid },
+            cloexec,
+        ) {
+            FamilyCompletion::Complete(result) => Some(SyscallResult::new(result)),
+            _ => None,
+        }
+    }
+
+    fn listing(
+        &mut self,
+        fd: i32,
+    ) -> Option<
+        Result<
+            carrick_personality_linux::native_host_file::RingDirectoryListing,
+            carrick_syscall_abi::LinuxErrno,
+        >,
+    > {
+        use super::native_process_runtime::TaskGroupLookup;
+        let object = self.object(fd)?;
+        let (view, cursor) = {
+            let mut guard = self.region.lock(object, &NativeFdWait).ok()?;
+            let directory = guard.directory().ok()?;
+            (directory.view()?, directory.cursor())
+        };
+        let carrick_el1_abi::ipc::DirectoryView::TaskGroup { tgid } = view;
+        Some(match (self.task_group)(Some(tgid)) {
+            TaskGroupLookup::Unowned => return None,
+            // The group was reaped while its directory stayed open: Linux
+            // reports the directory itself gone.
+            TaskGroupLookup::Absent => Err(carrick_syscall_abi::LINUX_ENOENT),
+            TaskGroupLookup::Live { tids, .. } => Ok(
+                carrick_personality_linux::native_host_file::RingDirectoryListing { cursor, tids },
+            ),
+        })
+    }
+
+    fn seek(&mut self, fd: i32, cursor: u64) -> Option<u64> {
+        let object = self.object(fd)?;
+        let mut guard = self.region.lock(object, &NativeFdWait).ok()?;
+        let directory = guard.directory().ok()?;
+        let old = directory.cursor();
+        directory.set_cursor(cursor);
+        Some(old)
+    }
 }
 
 #[inline(never)]

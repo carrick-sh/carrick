@@ -310,6 +310,59 @@ pub enum IpcBacking {
         object: IpcObjectHandle,
         end: StreamEnd,
     },
+    /// A ring-owned directory ([`IpcObjectKind::Directory`]): its listing is
+    /// rendered by the ring from the view the object names
+    /// ([`DirectoryView`]), never from a host directory.
+    Directory {
+        object: IpcObjectHandle,
+    },
+}
+
+/// What a ring-owned directory lists. One object kind serves every such
+/// directory; the view selects the ring owner that supplies its names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryView {
+    /// `/proc/<tgid>/task`: the live threads of the thread group whose
+    /// leader has this id in the opener's PID namespace. `/proc/self` is
+    /// resolved when the directory is opened, as Linux resolves the link.
+    TaskGroup { tgid: core::num::NonZeroU32 },
+}
+
+const DIRECTORY_VIEW_TASK_GROUP: u32 = 1;
+
+/// A ring directory's state: its view and the read position its one open
+/// file description holds (`getdents64` advances it, `lseek` resets it).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryState {
+    view: u32,
+    subject: u32,
+    cursor: u64,
+}
+impl DirectoryState {
+    const fn new(view: DirectoryView) -> Self {
+        match view {
+            DirectoryView::TaskGroup { tgid } => Self {
+                view: DIRECTORY_VIEW_TASK_GROUP,
+                subject: tgid.get(),
+                cursor: 0,
+            },
+        }
+    }
+    /// `None` for a record this ABI never writes (fails closed).
+    pub const fn view(&self) -> Option<DirectoryView> {
+        match (self.view, core::num::NonZeroU32::new(self.subject)) {
+            (DIRECTORY_VIEW_TASK_GROUP, Some(tgid)) => Some(DirectoryView::TaskGroup { tgid }),
+            _ => None,
+        }
+    }
+    /// The directory's read position, in its view's own units.
+    pub const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+    pub fn set_cursor(&mut self, cursor: u64) {
+        self.cursor = cursor;
+    }
 }
 
 /// One end of a ring stream socket pair. Each end writes one byte lane of
@@ -337,12 +390,14 @@ const TAG_PIPE: u64 = 2;
 const TAG_EVENTFD: u64 = 3;
 const TAG_EPOLL: u64 = 4;
 const TAG_STREAM: u64 = 5;
+const TAG_DIRECTORY: u64 = 6;
 const END_WRITER: u64 = 1 << 60;
 const INDEX_SHIFT: u32 = 32;
 const INDEX_BITS: u64 = (1 << 28) - 1;
 
 impl IpcBacking {
-    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd, 4 epoll, 5 stream);
+    /// Bits 63..61 tag (1 host, 2 pipe, 3 eventfd, 4 epoll, 5 stream,
+    /// 6 directory);
     /// host: bits 60..0 token;
     /// object: bit 60 pipe writer end or stream second end, bits 59..32
     /// index, 31..0 generation.
@@ -365,6 +420,7 @@ impl IpcBacking {
                 };
                 (TAG_STREAM << TAG_SHIFT) | end | object_bits(object)
             }
+            Self::Directory { object } => (TAG_DIRECTORY << TAG_SHIFT) | object_bits(object),
         })
     }
     /// `None` for any token this ABI never encodes (fails closed).
@@ -389,6 +445,7 @@ impl IpcBacking {
             }),
             TAG_EVENTFD if raw & END_WRITER == 0 => Some(Self::EventFd { object }),
             TAG_EPOLL if raw & END_WRITER == 0 => Some(Self::Epoll { object }),
+            TAG_DIRECTORY if raw & END_WRITER == 0 => Some(Self::Directory { object }),
             TAG_STREAM => Some(Self::Stream {
                 object,
                 end: if raw & END_WRITER != 0 {
@@ -420,6 +477,9 @@ pub enum IpcObjectKind {
     /// The zone's advisory file locks ([`IpcRegion::file_locks`]): its lock
     /// serializes the [`LockTable`], its `Readable` lane parks lock waiters.
     FileLocks,
+    /// A ring-owned directory ([`DirectoryState`]); its lock serializes the
+    /// read position.
+    Directory,
 }
 const KIND_FREE: u32 = 0;
 const KIND_PIPE: u32 = 1;
@@ -439,6 +499,7 @@ const KIND_STREAM_SECOND_CLOSED: u32 = 6;
 /// blocks are not part of its contract.)
 pub const IPC_STREAM_LANE_BYTES: usize = IPC_STOCK_RING_BYTES as usize / 2;
 const KIND_FILE_LOCKS: u32 = 7;
+const KIND_DIRECTORY: u32 = 8;
 
 /// A pipe's pool storage: `ring_bytes` of ring (guest-page multiple) followed
 /// by `pages` [`Page`] metadata entries, starting at pool `offset`
@@ -489,6 +550,8 @@ union IpcKindState {
     counters: IpcCounterState,
     /// A stream pair's [`StreamEnd::Second`] lane.
     stream_second: PipeRecord,
+    /// A ring directory's view and read position.
+    directory: DirectoryState,
 }
 
 #[repr(C)]
@@ -719,6 +782,9 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::size_of::<IpcObjectState>() as u64,
     core::mem::size_of::<PipeRecord>() as u64,
     core::mem::size_of::<EventFd>() as u64,
+    core::mem::size_of::<DirectoryState>() as u64,
+    TAG_DIRECTORY,
+    KIND_DIRECTORY as u64,
     core::mem::size_of::<Page>() as u64,
     core::mem::size_of::<IpcPipeStorage>() as u64,
     core::mem::size_of::<IpcOperation>() as u64,
@@ -1927,6 +1993,7 @@ impl<'a> IpcRegion<'a> {
                 KIND_STREAM_FIRST_CLOSED => "stream(first closed)",
                 KIND_STREAM_SECOND_CLOSED => "stream(second closed)",
                 KIND_FILE_LOCKS => "file-locks",
+                KIND_DIRECTORY => "directory",
                 KIND_FREE => "free",
                 _ => "?",
             },
@@ -2006,6 +2073,10 @@ impl<'a> IpcRegion<'a> {
             Some(IpcObjectKind::FileLocks) => {
                 writeln!(out, " locks={}", self.lock_table_unchecked().len())
             }
+            Some(IpcObjectKind::Directory) => match guard.directory() {
+                Ok(d) => writeln!(out, " view={:?} cursor={}", d.view(), d.cursor()),
+                Err(e) => writeln!(out, " directory={e:?}"),
+            },
             None => writeln!(out),
         }
     }
@@ -2154,6 +2225,19 @@ impl<'a> IpcRegion<'a> {
         Ok(guard.publish_kind(KIND_EVENTFD))
     }
 
+    /// Create a ring-owned directory on `view`, positioned at its start.
+    pub fn create_directory<W: LockWait>(
+        &self,
+        view: DirectoryView,
+        wait: &W,
+    ) -> Result<IpcObjectHandle, IpcError> {
+        let (index, record) = self.pop_object()?;
+        let guard = self.lock_fresh(index, record, wait)?;
+        // SAFETY: the object lock is held and the record is unpublished.
+        unsafe { (*record.state.get()).kind_state.directory = DirectoryState::new(view) };
+        Ok(guard.publish_kind(KIND_DIRECTORY))
+    }
+
     /// Create a connected stream socket pair: two lanes of
     /// [`IPC_STREAM_LANE_BYTES`], each with its writer end and its reader
     /// (the other end) referenced once. As for a pipe, either venue creates
@@ -2262,6 +2346,15 @@ impl<'a> IpcRegion<'a> {
             IpcBacking::Epoll { object } => {
                 self.epoll_destroy(object, wait)?;
                 Ok(IpcReleased::Epoll)
+            }
+            IpcBacking::Directory { object } => {
+                // Its description was its only holder, and nothing waits on
+                // a directory or enrols it in an epoll.
+                let mut guard = self.lock(object, wait)?;
+                guard.directory()?;
+                let wake = guard.publish(WakeSet::default());
+                guard.free();
+                Ok(IpcReleased::Object { wake, freed: true })
             }
             IpcBacking::Stream { object, end } => {
                 let mut guard = self.lock(object, wait)?;
@@ -2796,6 +2889,7 @@ impl<'a> IpcObjectGuard<'a> {
                 Some(IpcObjectKind::Stream)
             }
             KIND_FILE_LOCKS => Some(IpcObjectKind::FileLocks),
+            KIND_DIRECTORY => Some(IpcObjectKind::Directory),
             _ => None,
         }
     }
@@ -3172,6 +3266,15 @@ impl<'a> IpcObjectGuard<'a> {
         *replacement = old;
         Ok(())
     }
+    /// The ring directory's view and read position, in place.
+    pub fn directory(&mut self) -> Result<&mut DirectoryState, IpcError> {
+        if self.kind() != Some(IpcObjectKind::Directory) {
+            return Err(IpcError::WrongKind);
+        }
+        // SAFETY: the lock is held and the kind selects this member.
+        Ok(unsafe { &mut (*self.record.state.get()).kind_state.directory })
+    }
+
     /// The eventfd counter, in place.
     pub fn eventfd(&mut self) -> Result<&mut EventFd, IpcError> {
         if self.kind() != Some(IpcObjectKind::EventFd) {

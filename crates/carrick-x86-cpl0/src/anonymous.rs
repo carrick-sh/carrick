@@ -190,6 +190,7 @@ impl X86AnonymousVenue<'_> {
             self.task,
             &carrick_el1_linux::file::HardwareValidator,
             &mut NativeNamespace {
+                directories: None,
                 table,
                 resolve: &mut resolve,
                 releases: &mut releases,

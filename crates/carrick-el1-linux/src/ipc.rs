@@ -504,6 +504,7 @@ pub fn native_descriptor(
             )),
             IpcBacking::EventFd { .. } => NativeDescriptor::InZone(InZoneKind::EventFd),
             IpcBacking::Epoll { .. } => NativeDescriptor::InZone(InZoneKind::Epoll),
+            IpcBacking::Directory { .. } => NativeDescriptor::InZone(InZoneKind::Directory),
             IpcBacking::Stream { object, end } => {
                 NativeDescriptor::InZone(InZoneKind::Stream(carrick_abi::LinuxSocketIdentity::new(
                     object.index(),
@@ -1695,7 +1696,7 @@ fn op_kind(
         IpcBacking::EventFd { object } if reading => Some((IpcOpKind::EventFdRead, object)),
         IpcBacking::EventFd { object } => Some((IpcOpKind::EventFdWrite, object)),
         IpcBacking::Stream { object, end } => Some((IpcOpKind::stream(end, reading), object)),
-        IpcBacking::Host(_) | IpcBacking::Epoll { .. } => None,
+        IpcBacking::Host(_) | IpcBacking::Epoll { .. } | IpcBacking::Directory { .. } => None,
     }
 }
 

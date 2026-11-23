@@ -73,6 +73,8 @@ pub enum InZoneKind {
     Epoll,
     /// One end of a ring `AF_UNIX` stream pair.
     Stream(LinuxSocketIdentity),
+    /// A ring-owned directory ([`RingDirectories`]).
+    Directory,
 }
 
 /// What the caller's descriptor names, resolved in its own ring table.
@@ -96,6 +98,125 @@ pub struct NativeNamespace<'a> {
     /// the slice and returns how many; called only when a private-mapping
     /// request is built, which carries them to the carrier for release.
     pub releases: &'a mut dyn FnMut(&mut [host_file::MapSourceReply]) -> usize,
+    /// The ring's own directories. `None`: this venue publishes none, and a
+    /// path that names one keeps its route.
+    pub directories: Option<&'a mut dyn RingDirectories>,
+}
+
+/// A directory the ring owns, as a path names it (#2776).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RingDirectoryPath {
+    /// `/proc/self/task`: the caller's own thread group.
+    OwnTaskGroup,
+    /// `/proc/<tgid>/task`: a thread group in the caller's PID namespace.
+    TaskGroup(core::num::NonZeroU32),
+}
+
+impl RingDirectoryPath {
+    /// The ring directory an absolute `path` names exactly (trailing
+    /// slashes allowed). Any other spelling keeps its route.
+    pub fn parse(path: &[u8]) -> Option<Self> {
+        let mut path = path.strip_prefix(b"/proc/")?;
+        while let Some(rest) = path.strip_suffix(b"/") {
+            path = rest;
+        }
+        let subject = path.strip_suffix(b"/task")?;
+        if subject == b"self" {
+            return Some(Self::OwnTaskGroup);
+        }
+        // proc(5) names a process by its decimal id, without leading zeros.
+        if subject.first().is_none_or(|digit| *digit == b'0') || subject.len() > 10 {
+            return None;
+        }
+        let mut tgid = 0u32;
+        for digit in subject {
+            if !digit.is_ascii_digit() {
+                return None;
+            }
+            tgid = tgid.checked_mul(10)?.checked_add(u32::from(digit - b'0'))?;
+        }
+        core::num::NonZeroU32::new(tgid).map(Self::TaskGroup)
+    }
+}
+
+/// What a ring directory lists now, and where its description reads next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RingDirectoryListing {
+    /// The read position ([`task_directory_entries`] defines its units).
+    pub cursor: u64,
+    /// The live thread ids of the directory's thread group.
+    pub tids: Vec<u32>,
+}
+
+/// The ring's own directories, as staging uses them. Every `None` means
+/// the owner cannot answer now (contention, or a caller it does not own):
+/// the call keeps its route.
+pub trait RingDirectories {
+    /// Open `path` read-only in the caller's table: the new descriptor, or
+    /// the errno Linux reports (ENOENT for no such thread group).
+    fn open(&mut self, path: RingDirectoryPath, cloexec: bool) -> Option<SyscallResult>;
+    /// What ring directory `fd` lists now.
+    fn listing(&mut self, fd: i32) -> Option<Result<RingDirectoryListing, LinuxErrno>>;
+    /// Store ring directory `fd`'s read position; returns the old one.
+    fn seek(&mut self, fd: i32, cursor: u64) -> Option<u64>;
+}
+
+/// Render `/proc/<tgid>/task` from `listing` as `linux_dirent64` records,
+/// at most `capacity` bytes, and return them with the next read position.
+/// Position 0 is `.`, 1 is `..`, and `tid + 2` is "after thread `tid`":
+/// threads are listed in ascending id order, so a position stays valid
+/// while threads are born and exit between calls (a thread already passed
+/// is neither repeated nor does its exit skip another). Each record's
+/// `d_off` is the position after it, as `lseek` accepts it.
+pub fn task_directory_entries(listing: &RingDirectoryListing, capacity: usize) -> (Vec<u8>, u64) {
+    const HEADER: usize = 19;
+    let mut tids = listing.tids.clone();
+    tids.sort_unstable();
+    tids.dedup();
+    let mut bytes = Vec::new();
+    let mut cursor = listing.cursor;
+    let mut digits = [0u8; 10];
+    let dots = [(&b"."[..], 1u64), (&b".."[..], 2u64)];
+    let names = dots
+        .into_iter()
+        .map(|(name, after)| (None, name, after))
+        .chain(
+            tids.iter()
+                .map(|tid| (Some(*tid), &b""[..], u64::from(*tid) + 2)),
+        );
+    for (tid, name, after) in names {
+        if after <= cursor {
+            continue;
+        }
+        let name = match tid {
+            Some(mut tid) => {
+                let mut at = digits.len();
+                loop {
+                    at -= 1;
+                    digits[at] = b'0' + (tid % 10) as u8;
+                    tid /= 10;
+                    if tid == 0 {
+                        break;
+                    }
+                }
+                &digits[at..]
+            }
+            None => name,
+        };
+        let reclen = (HEADER + name.len() + 1).next_multiple_of(8);
+        if bytes.len() + reclen > capacity {
+            break;
+        }
+        let start = bytes.len();
+        bytes.extend_from_slice(&carrick_syscall_abi::linux_synthetic_inode(name).to_ne_bytes());
+        bytes.extend_from_slice(&(after as i64).to_ne_bytes());
+        bytes.extend_from_slice(&(reclen as u16).to_ne_bytes());
+        bytes.push(carrick_syscall_abi::LINUX_DT_DIR);
+        bytes.extend_from_slice(name);
+        bytes.resize(start + reclen, 0);
+        cursor = after;
+    }
+    (bytes, cursor)
 }
 
 /// Signed Linux readlink buffer size, decoded from the syscall int argument.
@@ -924,11 +1045,14 @@ pub enum HostFileStage {
     /// Answered in ring without crossing.
     Returned(SyscallResult),
     /// Answered in ring with user output: the ring copies `bytes` to
-    /// `output` itself and returns 0. Staging has already proved the
+    /// `output` itself and returns `result`. Staging has already proved the
     /// destination writable.
     InRingReply {
         output: HostFileOutput,
         bytes: Box<[u8]>,
+        /// What the call returns once the bytes are copied: 0 for a stat,
+        /// the byte count for a directory read.
+        result: SyscallResult,
     },
     /// A user page must be supplied before staging can continue; the ring
     /// retries the exact call afterwards.
@@ -1012,6 +1136,11 @@ fn in_zone_stat(op: HostFileOp, kind: InZoneKind, output: HostFileOutput) -> Hos
         InZoneKind::Stream(identity) => identity.stat_fields(),
         InZoneKind::EventFd => carrick_syscall_abi::LinuxStatFields::CARRICK_EVENTFD,
         InZoneKind::Epoll => carrick_syscall_abi::LinuxStatFields::CARRICK_EPOLL,
+        // proc(5): a task directory is `dr-xr-xr-x`, owned by root here.
+        InZoneKind::Directory => carrick_syscall_abi::LinuxStatFields {
+            nlink: 2,
+            ..carrick_syscall_abi::LinuxStatFields::synthetic(b"proc:[task]", 0o040555)
+        },
     };
     let bytes: Box<[u8]> = match op {
         HostFileOp::Statx => {
@@ -1025,7 +1154,11 @@ fn in_zone_stat(op: HostFileOp, kind: InZoneKind, output: HostFileOutput) -> Hos
         _ => zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(&fields))
             .into(),
     };
-    HostFileStage::InRingReply { output, bytes }
+    HostFileStage::InRingReply {
+        output,
+        bytes,
+        result: SyscallResult::new(0),
+    }
 }
 
 fn errno(errno: LinuxErrno) -> HostFileStage {
@@ -1185,6 +1318,100 @@ impl Staging<'_, '_> {
         (self.namespace.resolve)(fd)
     }
 
+    /// `openat` of a path that names a ring directory, answered in ring.
+    /// `None`: the path names none, the venue publishes none, or the open
+    /// asks for what the ring does not serve (`O_PATH`, `O_TMPFILE`), and
+    /// the call keeps its route.
+    fn open_ring_directory(&mut self, path: &[u8], flags: u64) -> Option<HostFileStage> {
+        if path.first() != Some(&b'/') {
+            return None;
+        }
+        let directory = RingDirectoryPath::parse(path)?;
+        let directories = self.namespace.directories.as_deref_mut()?;
+        if flags & (carrick_syscall_abi::LINUX_O_PATH | carrick_syscall_abi::LINUX_O_TMPFILE) != 0 {
+            return None;
+        }
+        // open(2): O_CREAT|O_EXCL on an existing name is EEXIST; write
+        // access to, or creation of, a directory is EISDIR.
+        if flags & carrick_syscall_abi::LINUX_O_CREAT != 0
+            && flags & carrick_syscall_abi::LINUX_O_EXCL != 0
+        {
+            return Some(errno(carrick_syscall_abi::LINUX_EEXIST));
+        }
+        if flags & carrick_syscall_abi::LINUX_O_ACCMODE != carrick_syscall_abi::LINUX_O_RDONLY
+            || flags & carrick_syscall_abi::LINUX_O_CREAT != 0
+        {
+            return Some(errno(carrick_syscall_abi::LINUX_EISDIR));
+        }
+        directories
+            .open(directory, flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0)
+            .map(HostFileStage::Returned)
+    }
+
+    /// `getdents64` on a ring directory. The read position advances only
+    /// with the records the caller's buffer can take now: a buffer page
+    /// the ring must supply first retries the exact call.
+    fn read_ring_directory(
+        &mut self,
+        fd: i32,
+        dirp: u64,
+        count: u64,
+        user: &mut dyn HostFileUser,
+    ) -> Option<HostFileStage> {
+        let directories = self.namespace.directories.as_deref_mut()?;
+        let listing = match directories.listing(fd)? {
+            Ok(listing) => listing,
+            Err(error) => return Some(errno(error)),
+        };
+        let (bytes, cursor) = task_directory_entries(&listing, chunk(count));
+        if bytes.is_empty() {
+            // getdents(2): 0 at the end of the directory; EINVAL when the
+            // buffer is too small for the next record.
+            let (rest, _) = task_directory_entries(&listing, usize::MAX);
+            return Some(if rest.is_empty() {
+                HostFileStage::Returned(SyscallResult::new(0))
+            } else {
+                errno(carrick_syscall_abi::LINUX_EINVAL)
+            });
+        }
+        let writable = user.writable(dirp, bytes.len());
+        if writable < bytes.len() {
+            return Some(HostFileStage::Fault {
+                address: dirp.saturating_add(writable as u64),
+                access: Access::Write,
+            });
+        }
+        directories.seek(fd, cursor)?;
+        Some(HostFileStage::InRingReply {
+            output: HostFileOutput::bytes(dirp, bytes.len()),
+            result: SyscallResult::new(bytes.len() as i64),
+            bytes: bytes.into(),
+        })
+    }
+
+    /// `lseek` on a ring directory: `SEEK_SET` stores a position a record's
+    /// `d_off` named (0 rewinds), `SEEK_CUR` with 0 reports it.
+    fn seek_ring_directory(&mut self, fd: i32, offset: u64, whence: u64) -> Option<HostFileStage> {
+        // lseek(2) whence values.
+        const SEEK_SET: u64 = 0;
+        const SEEK_CUR: u64 = 1;
+        let directories = self.namespace.directories.as_deref_mut()?;
+        Some(match whence {
+            SEEK_SET if offset as i64 >= 0 => {
+                directories.seek(fd, offset)?;
+                HostFileStage::Returned(SyscallResult::new(offset as i64))
+            }
+            SEEK_CUR if offset == 0 => {
+                let position = directories.listing(fd)?.map(|listing| listing.cursor);
+                match position {
+                    Ok(position) => HostFileStage::Returned(SyscallResult::new(position as i64)),
+                    Err(error) => errno(error),
+                }
+            }
+            _ => errno(carrick_syscall_abi::LINUX_EINVAL),
+        })
+    }
+
     /// Keep a relative path's directory operand in the record. The
     /// carrier pins that directory in the caller's ring table at service
     /// time. Absolute paths must ignore even an invalid descriptor.
@@ -1193,6 +1420,9 @@ impl Staging<'_, '_> {
             return Some(Ok(LINUX_AT_FDCWD));
         }
         Some(match self.descriptor(dirfd)? {
+            // A name below a ring directory has no ring owner yet: the
+            // call keeps its route.
+            NativeDescriptor::InZone(InZoneKind::Directory) => return None,
             NativeDescriptor::InZone(_) => Err(errno(carrick_syscall_abi::LINUX_ENOTDIR)),
             NativeDescriptor::Absent => Err(errno(carrick_syscall_abi::LINUX_EBADF)),
             NativeDescriptor::HostBacked { .. } => Ok(dirfd),
@@ -2186,6 +2416,9 @@ fn stage_call(
             if path.is_empty() {
                 return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
             }
+            if let Some(answer) = staging.open_ring_directory(&path, flags) {
+                return Some(answer);
+            }
             let dirfd = match staging.path_base(dirfd, &path)? {
                 Ok(base) => base,
                 Err(answer) => return Some(answer),
@@ -2321,6 +2554,10 @@ fn stage_call(
                 }
             }
             NativeDescriptor::InZone(InZoneKind::Epoll) => HostFileStage::InRing,
+            // read(2): the descriptor refers to a directory.
+            NativeDescriptor::InZone(InZoneKind::Directory) => {
+                errno(carrick_syscall_abi::LINUX_EISDIR)
+            }
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { access } if !access.readable() => {
                 errno(carrick_syscall_abi::LINUX_EBADF)
@@ -2364,6 +2601,9 @@ fn stage_call(
             NativeDescriptor::InZone(InZoneKind::Pipe(_) | InZoneKind::Stream(_)) => {
                 errno(carrick_syscall_abi::LINUX_ESPIPE)
             }
+            NativeDescriptor::InZone(InZoneKind::Directory) => {
+                return staging.seek_ring_directory(fd, offset, whence);
+            }
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { .. } => {
@@ -2371,6 +2611,9 @@ fn stage_call(
             }
         },
         HostFileCall::Getdents64 { fd, dirp, count } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(InZoneKind::Directory) => {
+                return staging.read_ring_directory(fd, dirp, count, user);
+            }
             NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { .. } => staging.request(

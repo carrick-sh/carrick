@@ -64,6 +64,7 @@ pub const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
 pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
+pub const LINUX_EISDIR: LinuxErrno = LinuxErrno::new(21);
 pub const LINUX_ENODEV: LinuxErrno = LinuxErrno::new(19);
 pub const LINUX_ENOTDIR: LinuxErrno = LinuxErrno::new(20);
 pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);

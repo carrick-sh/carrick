@@ -1644,6 +1644,7 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
     };
     let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
     let mut namespace = NativeNamespace {
+        directories: None,
         table: [1, 2, 3],
         resolve: &mut resolve,
         releases: &mut releases,

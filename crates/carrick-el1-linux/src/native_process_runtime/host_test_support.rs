@@ -5835,6 +5835,7 @@ fn native_child_fchdir_completion_moves_only_the_childs_cwd() {
             fixture.task,
             &ResidentUser,
             &mut NativeNamespace {
+                directories: None,
                 table: [1, 1, 1],
                 resolve: &mut resolve,
                 releases: &mut releases,
@@ -6104,6 +6105,7 @@ fn native_child_socket_call_runs_under_the_childs_own_identity() {
         fixture.task,
         &ResidentUser,
         &mut NativeNamespace {
+            directories: None,
             table: [1, 1, 1],
             resolve: &mut resolve,
             releases: &mut releases,
@@ -6430,6 +6432,7 @@ impl<C: ProcessContext + 'static> HostReadyWaitFixture<C> {
             fixture.task,
             &ResidentUser,
             &mut NativeNamespace {
+                directories: None,
                 table: [1, 1, 1],
                 resolve: &mut resolve,
                 releases: &mut releases,

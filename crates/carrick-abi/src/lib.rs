@@ -179,7 +179,6 @@ pub const LINUX_SCHED_OTHER_SLICE: LinuxTimespec = LinuxTimespec::new(0, 2_000_0
 
 pub const LINUX_DT_FIFO: u8 = 1;
 pub const LINUX_DT_CHR: u8 = 2;
-pub const LINUX_DT_DIR: u8 = 4;
 pub const LINUX_DT_REG: u8 = 8;
 pub const LINUX_DT_LNK: u8 = 10;
 pub const LINUX_DT_SOCK: u8 = 12;
@@ -2605,7 +2604,6 @@ pub const LINUX_FALLOC_FL_SUPPORTED: u64 = LINUX_FALLOC_FL_KEEP_SIZE
     | LINUX_FALLOC_FL_INSERT_RANGE
     | LINUX_FALLOC_FL_UNSHARE_RANGE;
 pub const LINUX_ENOTDIR: LinuxErrno = LinuxErrno::new(20);
-pub const LINUX_EISDIR: LinuxErrno = LinuxErrno::new(21);
 pub const LINUX_ENOTTY: LinuxErrno = LinuxErrno::new(25);
 pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
 pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
@@ -2982,14 +2980,10 @@ pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
 pub const LINUX_SEEK_DATA: u64 = 3;
 pub const LINUX_SEEK_HOLE: u64 = 4;
-pub const LINUX_O_ACCMODE: u64 = 0b11;
-pub const LINUX_O_RDONLY: u64 = 0;
 pub const LINUX_O_WRONLY: u64 = 1;
 pub const LINUX_O_RDWR: u64 = 2;
 pub const LINUX_O_NONBLOCK: u64 = 0o4000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
-pub const LINUX_O_CREAT: u64 = 0o100;
-pub const LINUX_O_EXCL: u64 = 0o200;
 pub const LINUX_O_TRUNC: u64 = 0o1000;
 pub const LINUX_O_APPEND: u64 = 0o2000;
 /// `O_ASYNC` / `FASYNC` (asm-generic `020000`): enables signal-driven I/O. When
@@ -3004,14 +2998,6 @@ pub const LINUX_O_ASYNC: u64 = 0o20000;
 // it. Verified against a real aarch64-musl binary.
 pub const LINUX_O_DIRECTORY: u64 = 0o40000;
 pub const LINUX_O_NOFOLLOW: u64 = 0o100000;
-/// `__O_TMPFILE` — the distinguishing bit of `O_TMPFILE` (which is
-/// `__O_TMPFILE | O_DIRECTORY`). The `pathname` names the parent directory and
-/// the kernel returns an unnamed regular file in it.
-pub const LINUX_O_TMPFILE: u64 = 0o20000000;
-/// `O_PATH` (asm-generic `010000000`): obtain a descriptor that names a location
-/// in the filesystem tree without opening the file. read/write/fchmod/fchown/
-/// ioctl/fgetxattr on such a descriptor all fail with EBADF (LTP open13).
-pub const LINUX_O_PATH: u64 = 0o10000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;

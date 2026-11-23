@@ -97,10 +97,10 @@ pub use capability::{
 };
 pub use errno::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT,
-    LINUX_EFBIG, LINUX_EIDRM, LINUX_EINTR, LINUX_EINVAL, LINUX_EIO, LINUX_EMFILE, LINUX_EMSGSIZE,
-    LINUX_ENAMETOOLONG, LINUX_ENODEV, LINUX_ENOENT, LINUX_ENOMEM, LINUX_ENOMSG, LINUX_ENOSPC,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTTY, LINUX_EOPNOTSUPP, LINUX_EPERM, LINUX_EPIPE,
-    LINUX_ERANGE, LINUX_ESPIPE, LINUX_ESRCH, LINUX_ETIMEDOUT, LinuxErrno,
+    LINUX_EFBIG, LINUX_EIDRM, LINUX_EINTR, LINUX_EINVAL, LINUX_EIO, LINUX_EISDIR, LINUX_EMFILE,
+    LINUX_EMSGSIZE, LINUX_ENAMETOOLONG, LINUX_ENODEV, LINUX_ENOENT, LINUX_ENOMEM, LINUX_ENOMSG,
+    LINUX_ENOSPC, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTTY, LINUX_EOPNOTSUPP, LINUX_EPERM,
+    LINUX_EPIPE, LINUX_ERANGE, LINUX_ESPIPE, LINUX_ESRCH, LINUX_ETIMEDOUT, LinuxErrno,
 };
 
 #[repr(C, packed)]
@@ -474,6 +474,19 @@ pub const LINUX_POLLWRNORM: i16 = 0x0100;
 pub const LINUX_POLLWRBAND: i16 = 0x0200;
 pub const LINUX_POLLRDHUP: i16 = 0x2000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
+pub const LINUX_O_ACCMODE: u64 = 0b11;
+pub const LINUX_O_RDONLY: u64 = 0;
+pub const LINUX_O_CREAT: u64 = 0o100;
+pub const LINUX_O_EXCL: u64 = 0o200;
+/// `O_PATH` (asm-generic `010000000`): obtain a descriptor that names a location
+/// in the filesystem tree without opening the file. read/write/fchmod/fchown/
+/// ioctl/fgetxattr on such a descriptor all fail with EBADF (LTP open13).
+pub const LINUX_O_PATH: u64 = 0o10000000;
+/// `__O_TMPFILE` — the distinguishing bit of `O_TMPFILE` (which is
+/// `__O_TMPFILE | O_DIRECTORY`). The `pathname` names the parent directory and
+/// the kernel returns an unnamed regular file in it.
+pub const LINUX_O_TMPFILE: u64 = 0o20000000;
+pub const LINUX_DT_DIR: u8 = 4;
 
 /// Linux poll interest/result bits after decoding the wire `i16` field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
