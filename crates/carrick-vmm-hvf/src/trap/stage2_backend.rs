@@ -293,12 +293,9 @@ const HV_BAD_ARGUMENT: u32 = 0xfae9_4003;
 
 /// HVF's stage-2 backend, and the only place `carrick-vmm-hvf` calls
 /// Hypervisor.framework's raw stage-2 functions. HVF has one VM per process,
-/// so the backend holds no state.
-pub(crate) struct HvfStage2;
-
-/// The process's HVF stage-2 backend. The `inventory_stage2_*` wrappers are its
+/// so the backend holds no state. The `inventory_stage2_*` wrappers are its
 /// only callers; custody reaches stage-2 through them.
-pub(crate) static HVF_STAGE2: HvfStage2 = HvfStage2;
+pub(crate) struct HvfStage2;
 
 /// `hv_return_t` is the backend's 32-bit status word, kept bit for bit.
 fn hvf_stage2_status(rc: applevisor_sys::hv_return_t) -> Stage2Status {
@@ -378,7 +375,7 @@ pub(crate) unsafe fn inventory_stage2_map(
         return Stage2Status::SUCCESS;
     }
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HVF_STAGE2.map(host, ipa, size, perms) };
+    let result = unsafe { HvfStage2.map(host, ipa, size, perms) };
     if result.is_success() {
         emit_global_frame_stage2(
             carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Mapped,
@@ -473,7 +470,7 @@ pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Stat
         return Stage2Status::SUCCESS;
     }
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HVF_STAGE2.unmap(ipa, size) };
+    let result = unsafe { HvfStage2.unmap(ipa, size) };
     if result.is_success() {
         forget_replay_extent(ipa, size);
         emit_global_frame_stage2(
@@ -490,7 +487,7 @@ pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Stat
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn inventory_stage2_destroy() -> Stage2Status {
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HVF_STAGE2.destroy() };
+    let result = unsafe { HvfStage2.destroy() };
     if result.is_success() {
         clear_replay_mappings();
     }

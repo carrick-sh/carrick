@@ -89,9 +89,9 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         "the HVF-named stage-2 wrappers are gone; use `inventory_stage2_*`: {stale:?}"
     );
     // Each wrapper reaches the backend once, through the trait.
-    let backend_calls = count(&sources, "HVF_STAGE2.map(")
-        + count(&sources, "HVF_STAGE2.unmap(")
-        + count(&sources, "HVF_STAGE2.destroy()");
+    let backend_calls = count(&sources, "HvfStage2.map(")
+        + count(&sources, "HvfStage2.unmap(")
+        + count(&sources, "HvfStage2.destroy()");
     assert_eq!(
         backend_calls, 3,
         "only the three inventory wrappers may call the HVF backend"
