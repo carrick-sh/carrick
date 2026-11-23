@@ -298,6 +298,31 @@ mod anonymous_restart_tests {
         assert_eq!(words.frame[15], 0x401000);
         assert_eq!(words.syscall_return(), 11);
     }
+
+    /// #2851: a saved syscall rerun twice (its first rerun interrupted before
+    /// `SYSCALL` executed, and the record parked again) must still name
+    /// `SYSCALL`, not the two bytes before it.
+    #[test]
+    fn a_saved_syscall_rerun_twice_stays_at_its_instruction() {
+        use carrick_guest_arch::SavedSyscallPc;
+        let mut words = super::ParkedContextWords::ZERO;
+        words.frame[15] = 0x428bb7; // RCX after `syscall` at 0x428bb5.
+        words.frame[10] = 0x1c; // madvise in saved RAX.
+        assert_eq!(
+            ProcessContext::saved_syscall_pc(&words),
+            Some(SavedSyscallPc::AfterSyscall)
+        );
+        words.restart_syscall();
+        assert_eq!(words.frame[15], 0x428bb5);
+        assert_eq!(
+            ProcessContext::saved_syscall_pc(&words),
+            Some(SavedSyscallPc::AtSyscall)
+        );
+        // The rerun is interrupted at `SYSCALL` and resumed again.
+        words.restart_syscall();
+        assert_eq!(words.frame[15], 0x428bb5);
+        assert_eq!(words.syscall_return(), 0x1c);
+    }
 }
 
 #[cfg(test)]
