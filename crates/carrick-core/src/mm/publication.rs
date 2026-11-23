@@ -157,6 +157,18 @@ impl ExtentCustody {
             next_edge: 0,
         }
     }
+    /// Custody with no owner MM: the extent lives only while edges hold it
+    /// (a shared file window, `crate::mm::window`). Its owner generation is
+    /// the window's own.
+    pub fn edge_only(owner_generation: OwnerGeneration) -> Self {
+        Self {
+            owner: None,
+            owner_generation,
+            edges: BTreeMap::new(),
+            cow_edges: 0,
+            next_edge: 0,
+        }
+    }
     pub const fn owner(&self) -> Option<MmIncarnationKey> {
         self.owner
     }
