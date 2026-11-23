@@ -212,6 +212,17 @@ fn serial_host_native_root_exec_successor_out_of_arena_hint_is_exact() {
     assert_root_hint_exact(&outcome, "root exec successor");
 }
 
+/// The same hint from a forked child while its parent waits live: the
+/// descendant's ring placement honours a free outside-layout hint exactly
+/// too, rather than relocating it into the arena.
+#[test]
+fn serial_host_native_forked_child_out_of_arena_hint_is_exact() {
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &["-DFORKED_CHILD"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_LOADED)
+        .expect("native forked child out-of-arena hint");
+    assert_root_hint_exact(&outcome, "forked child");
+}
+
 fn assert_root_hint_exact(outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome, who: &str) {
     let counters = outcome
         .physical
