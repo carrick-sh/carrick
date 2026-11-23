@@ -1,22 +1,24 @@
 // Blocking waits across a run root and its fork child, with no select, on
 // x86_64 (#1051's gap 2). The root holds a loopback listener and a pipe's
 // write end; the child holds a connected TCP socket and the pipe's read
-// end. Four rows, each wait bounded by an interval timer (EINTR on expiry):
+// end. Four rows, with no interval timer (x86 setitimer is a gap of its
+// own, #2876):
 //   accept: the root blocks in accept4 before the child connects;
 //   b: the child writes the socket, then the root receives with a
 //      receive timeout (is the child's write delivered at all);
 //   a: the root blocks reading its accepted socket, then the child writes
 //      (does the root's blocking socket read wake);
-//   c: the child blocks reading the pipe, then the root writes it (does a
-//      zone pipe write wake a parked descendant's read).
+//   c: the child blocks in poll on the pipe (bounded by poll's timeout),
+//      then the root writes it (does a zone pipe write wake a parked
+//      descendant), and reads the byte.
 // Every line is `who.name result`, where a failure prints as `-errno`; the
 // native run is the oracle. The root prints after the child exits, so the
 // processes' lines never interleave.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <netinet/in.h>
-#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -46,18 +48,6 @@ static void record(const char *name, long ret) {
     }
 }
 
-static void on_alarm(int signal) { (void)signal; }
-
-// Arms (ms > 0) or disarms (0) ITIMER_REAL; its handler has no SA_RESTART,
-// so an expired wait returns EINTR instead of hanging the run.
-static long bound(long ms) {
-    struct itimerval timer;
-    memset(&timer, 0, sizeof timer);
-    timer.it_value.tv_sec = ms / 1000;
-    timer.it_value.tv_usec = (ms % 1000) * 1000;
-    return syscall(SYS_setitimer, ITIMER_REAL, &timer, NULL);
-}
-
 static void pause_ms(long ms) {
     struct timespec delay = {ms / 1000, (ms % 1000) * 1000000L};
     (void)syscall(SYS_nanosleep, &delay, NULL);
@@ -66,11 +56,6 @@ static void pause_ms(long ms) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     who = "root";
-    struct sigaction action;
-    memset(&action, 0, sizeof action);
-    action.sa_handler = on_alarm;
-    value("sigaction", sigaction(SIGALRM, &action, NULL));
-
     int listener = (int)call(syscall(SYS_socket, AF_INET, SOCK_STREAM, 0));
     struct sockaddr_in address;
     memset(&address, 0, sizeof address);
@@ -99,10 +84,11 @@ int main(void) {
         pause_ms(200);
         byte = 'a';
         value("a.write", syscall(SYS_write, sock, &byte, 1));
-        // Row c: parked in the pipe read before the root writes it.
-        value("c.bound", bound(3000));
+        // Row c: parked in poll on the pipe before the root writes it.
+        struct pollfd ready = {pipe_fds[0], POLLIN, 0};
+        value("c.poll", syscall(SYS_poll, &ready, 1, 3000));
+        value("c.revents", ready.revents);
         value("c.read", syscall(SYS_read, pipe_fds[0], &byte, 1));
-        value("c.unbound", bound(0));
         printf("child.c.byte %c\n", byte);
         _exit(0);
     }
@@ -127,11 +113,11 @@ int main(void) {
     record("b.byte", byte);
     record("b.clear", syscall(SYS_setsockopt, peer, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none));
 
-    // Row a: a plain blocking read the child's later write must wake.
+    // Row a: a plain blocking read the child's later write must wake. It is
+    // unbounded: a receive timeout's wait is a venue gap of its own (#2878),
+    // and the test's own timeout ends a lost wake.
     byte = 0;
-    record("a.bound", bound(3000));
     record("a.read", syscall(SYS_read, peer, &byte, 1));
-    record("a.unbound", bound(0));
     record("a.byte", byte);
 
     // Row c: the child is parked in its pipe read by now.
