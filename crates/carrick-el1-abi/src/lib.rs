@@ -1474,6 +1474,17 @@ impl carrick_personality_linux::dispatch::SyscallFrame for TrapFrame {
     }
 }
 
+impl carrick_guest_arch::SyscallReturnFrame for TrapFrame {
+    const SYSCALL_LEN: u64 = carrick_guest_arch::AARCH64_SVC_LEN;
+    fn return_pc(&self) -> u64 {
+        self.elr
+    }
+    fn resume_at(&mut self, pc: u64, entry_word: u64) {
+        self.x[0] = entry_word;
+        self.elr = pc;
+    }
+}
+
 impl carrick_guest_arch::Aarch64Registers for TrapFrame {
     fn read(&self, register: carrick_guest_arch::Aarch64Register) -> u64 {
         use carrick_guest_arch::Aarch64Register::*;

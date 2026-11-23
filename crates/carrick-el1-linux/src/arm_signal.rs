@@ -32,13 +32,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         frame: &mut TrapFrame,
         original: &carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
-        frame.x[0] = original.syscall_return();
-        if let Some(pc) = frame.elr.checked_sub(4) {
-            frame.elr = pc;
-            true
-        } else {
-            false
-        }
+        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
     }
 
     fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {

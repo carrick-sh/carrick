@@ -296,6 +296,17 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeFrame, user_r11) == 136);
 };
 
+impl carrick_guest_arch::SyscallReturnFrame for NativeFrame {
+    const SYSCALL_LEN: u64 = carrick_guest_arch::X86_64_SYSCALL_LEN;
+    fn return_pc(&self) -> u64 {
+        self.rcx
+    }
+    fn resume_at(&mut self, pc: u64, entry_word: u64) {
+        self.rax = entry_word;
+        self.rcx = pc;
+    }
+}
+
 impl NativeFrame {
     pub fn snapshot(&self) -> NativeEntrySnapshot<'_, Self> {
         NativeEntrySnapshot {

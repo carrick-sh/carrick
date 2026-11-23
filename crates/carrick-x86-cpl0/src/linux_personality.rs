@@ -472,13 +472,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
         frame: &mut NativeFrame,
         original: &carrick_sched_core::ParkedContextWords,
     ) -> bool {
-        frame.rax = original.syscall_return();
-        if let Some(pc) = frame.rcx.checked_sub(2) {
-            frame.rcx = pc;
-            true
-        } else {
-            false
-        }
+        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
     }
 
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
