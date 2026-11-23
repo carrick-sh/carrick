@@ -863,6 +863,30 @@ pub enum SavedSyscallPc {
     AtSyscall,
 }
 
+/// The ISA mechanics of a trapped syscall's return frame that rerunning
+/// the call needs. Where the PC sits is the context's to say, never the
+/// frame's.
+pub trait SyscallReturnFrame {
+    /// Bytes from the syscall instruction to the return PC its trap saves.
+    const SYSCALL_LEN: u64;
+    fn return_pc(&self) -> u64;
+    /// Resume at `pc` with `entry_word` back in the register that carries
+    /// both the call's entry value and its result.
+    fn resume_at(&mut self, pc: u64, entry_word: u64);
+}
+
+/// Point `frame` back at `original`'s syscall instruction with its entry
+/// word restored. Returns the frame's new position, or `None` (frame
+/// untouched) for an underflowing PC.
+pub fn rerun_interrupted_syscall<F: SyscallReturnFrame, C: ProcessContext>(
+    frame: &mut F,
+    original: &C,
+) -> Option<SavedSyscallPc> {
+    let pc = frame.return_pc().checked_sub(F::SYSCALL_LEN)?;
+    frame.resume_at(pc, original.syscall_return());
+    Some(SavedSyscallPc::AtSyscall)
+}
+
 /// ISA-selected scheduler context operations needed by process birth.
 /// Implementations preserve native register/TLS/vector state and replace only
 /// the child's return value and exact address-space binding. The owner never
