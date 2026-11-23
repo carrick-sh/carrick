@@ -919,6 +919,45 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
+/// #2876 R1 step 0: a thread's timed park whose vCPU leaves the guest. In a
+/// fork child and then in the root, one thread sleeps 200 ms while a
+/// sibling keeps crossing to the host (`openat` and `close` of "/"), so
+/// the executor departs and the slot's foreign deadline moves to the
+/// carrier's deadline server (`take_foreign`).
+#[test]
+fn mounted_static_x86_timed_park_survives_executor_departure() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("departing-timed-park");
+    compile_assembly_with_flags(
+        "x86_departing_timed_park.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native departing-timed-park oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"c ok\nr ok\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "departing-timed-park", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "a line is `<who> <slept ms> <crossings>` when the sleep ended early or late, \
+         `timeout` (98) when it never ended. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2832 record B: the run root and its thread sleep. The sleep family
 /// declined for the run root, leaving the call to a host continuation the
 /// x86 crossing set does not carry, so every root `nanosleep` and
