@@ -9,15 +9,18 @@
 //! inside the rootfs (`carrick_softcpu_aarch64_host::rootfs_command`, shared
 //! with the soft-CPU row witnesses). The guest's stdout and stderr are this
 //! command's; the exit status is the guest's, or 128 plus the signal that
-//! killed it. With `CARRICK_EL1_CENSUS=<directory>` the run publishes the same
-//! terminal census a hardware carrier does, cut from the EL1 image's counters.
+//! killed it. A command the lookup cannot run exits as a shell's would: 127
+//! when it is not found, 126 when it is found but cannot be executed (no
+//! execute bit, not an ELF or a script), 125 when the lookup can't run it.
+//! With `CARRICK_EL1_CENSUS=<directory>` the run publishes the same terminal
+//! census a hardware carrier does, cut from the EL1 image's counters.
 //!
 //! The soft CPU executes translated blocks natively, so a run needs a Linux
 //! arm64 host; anywhere else the runner refuses it (`UnsupportedHost`).
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use carrick_softcpu_aarch64_host::rootfs_command::{env_path, resolve_command};
 
 /// The exit status of a run the carrier could not finish (as `carrick run`).
@@ -88,8 +91,14 @@ fn run_to_status(options: &SoftRunOptions<'_>) -> Result<i32> {
         "{} is not an ELF (soft-run loads the linked EL1 ELF, not the flat image)",
         el1_path.display()
     );
-    let command = resolve_command(options.rootfs, options.argv, env_path(options.env))
-        .map_err(|e| anyhow!(e))?;
+    let command = match resolve_command(options.rootfs, options.argv, env_path(options.env)) {
+        Ok(command) => command,
+        Err(error) => {
+            // As a shell reports it: 127 not found, 126 not executable.
+            eprintln!("carrick: soft-run: {error}");
+            return Ok(error.exit_status());
+        }
+    };
     let elf_bytes = std::fs::read(command.host_executable(options.rootfs))
         .with_context(|| format!("read {}", command.executable))?;
     let config = carrick_softcpu_aarch64_host::SoftSingleProcessConfig {

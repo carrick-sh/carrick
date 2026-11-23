@@ -13,7 +13,7 @@ use carrick_mem::{
 use carrick_softcpu_aarch64::state::VirtualAddress;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, Metadata},
     io::{self, Read, Seek, SeekFrom},
@@ -21,7 +21,7 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         fs::{FileExt, MetadataExt},
     },
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,42 +42,10 @@ impl FixtureRoot {
         Self(root.canonicalize().expect("canonical fixture root"))
     }
 
+    /// The production rootfs walk (`rootfs_command::walk_rootfs`, shared with
+    /// `carrick debug soft-run`'s command lookup).
     fn resolve(&self, base: &Path, path: &Path, follow: bool) -> io::Result<PathBuf> {
-        let mut pending: VecDeque<OsString> = path
-            .components()
-            .map(|c| c.as_os_str().to_owned())
-            .collect();
-        let mut resolved = base.to_owned();
-        let mut links = 0;
-        while let Some(part) = pending.pop_front() {
-            match Path::new(&part).components().next().unwrap() {
-                Component::RootDir => resolved.clear(),
-                Component::ParentDir => {
-                    resolved.pop();
-                }
-                Component::CurDir => {}
-                Component::Normal(_) => {
-                    resolved.push(part);
-                    let candidate = self.0.join(&resolved);
-                    let meta = fs::symlink_metadata(&candidate)?;
-                    if meta.is_symlink() && (follow || !pending.is_empty()) {
-                        links += 1;
-                        if links > 40 {
-                            return Err(io::Error::from_raw_os_error(LINUX_ELOOP.get()));
-                        }
-                        let target = fs::read_link(candidate)?;
-                        resolved.pop();
-                        for component in target.components().rev() {
-                            pending.push_front(component.as_os_str().to_owned());
-                        }
-                    } else if !pending.is_empty() && !meta.is_dir() {
-                        return Err(io::Error::from_raw_os_error(LINUX_ENOTDIR.get()));
-                    }
-                }
-                Component::Prefix(_) => unreachable!("Unix paths"),
-            }
-        }
-        Ok(resolved)
+        carrick_softcpu_aarch64_host::rootfs_command::walk_rootfs(&self.0, base, path, follow)
     }
 
     pub(super) fn read(&self, path: &str) -> io::Result<Vec<u8>> {
