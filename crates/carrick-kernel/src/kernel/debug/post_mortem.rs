@@ -411,6 +411,12 @@ pub struct PhysicalCapture {
     /// Linux kernel thread stacks where procfs permits reading them.
     pub host_threads: Vec<String>,
     pub unavailable: Vec<String>,
+    /// The carrier's syscall census so far, as the JSON its terminal
+    /// publication would write, when the run opted in (`CARRICK_EL1_CENSUS`).
+    /// A killed carrier publishes nothing, so a capture is the only reader
+    /// of a hung run's refusals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub el1_census: Option<String>,
 }
 
 /// Carrier-owned state reader used only while serving an explicit capture.

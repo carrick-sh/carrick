@@ -26,24 +26,53 @@ pub(crate) enum ZoneSource<'a> {
     Region(&'a Path),
 }
 
-pub(crate) fn run_zonedump(source: ZoneSource<'_>) -> Result<()> {
-    let text = match source {
+pub(crate) fn run_zonedump(source: ZoneSource<'_>, census_out: Option<&Path>) -> Result<()> {
+    let (text, census) = match source {
         ZoneSource::Live(run_id) => {
             let capture = carrick_kernel::kernel::debug::capture(run_id)
                 .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("capture live run {run_id}"))?;
-            render_capture(&capture)?
+            (render_capture(&capture)?, Some(capture_census(&capture)))
         }
         ZoneSource::PostMortem(path) => {
             let bytes = read_input(path)?;
             let capture: carrick_kernel::kernel::debug::PostMortem = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse post-mortem {}", path.display()))?;
-            render_capture(&capture)?
+            (render_capture(&capture)?, Some(capture_census(&capture)))
         }
-        ZoneSource::Region(path) => render_region(path)?,
+        ZoneSource::Region(path) => (render_region(path)?, None),
     };
+    // The zone first: a capture without a census is still a zonedump.
     print!("{text}");
+    if let Some(path) = census_out {
+        let census = census.context("a region image carries no syscall census")??;
+        let body = serde_json::to_vec_pretty(&census).context("encode the census")?;
+        std::fs::write(path, body).with_context(|| format!("write census {}", path.display()))?;
+    }
     Ok(())
+}
+
+/// The syscall census a capture carries (`PhysicalCapture::el1_census`),
+/// named with the capture's run, as the carrier's own publication names it.
+fn capture_census(
+    capture: &carrick_kernel::kernel::debug::PostMortem,
+) -> Result<carrick_runtime::el1_census::Census> {
+    let physical = capture.physical.as_ref();
+    let json = physical
+        .and_then(|physical| physical.el1_census.as_deref())
+        .with_context(|| {
+            format!(
+                "the capture carries no syscall census: the run was not started with CARRICK_EL1_CENSUS, or its counters could not be read ({})",
+                physical.map_or_else(
+                    || "no physical capture".to_owned(),
+                    |physical| physical.unavailable.join("; ")
+                )
+            )
+        })?;
+    let mut census: carrick_runtime::el1_census::Census =
+        serde_json::from_str(json).context("parse the capture's syscall census")?;
+    census.run_id.clone_from(&capture.run_id);
+    Ok(census)
 }
 
 /// The one host file read of this diagnostic: a capture or region image the
