@@ -1500,7 +1500,7 @@ impl HvfVmState {
             return Ok(());
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
+        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
@@ -1537,7 +1537,7 @@ impl HvfVmState {
             )));
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
+        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"

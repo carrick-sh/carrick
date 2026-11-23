@@ -2995,7 +2995,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     )
     .expect("allocate successor root backing");
     let replacement_map = unsafe {
-        inventory_hv_vm_map(
+        inventory_stage2_map(
             replacement.as_ptr().cast(),
             root_slot.0,
             root_len as usize,
@@ -3019,7 +3019,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
         .expect("clean leaked RED root fixture");
     } else if replacement_map == 0 {
         assert_eq!(
-            unsafe { inventory_hv_vm_unmap(root_slot.0, root_len as usize) },
+            unsafe { inventory_stage2_unmap(root_slot.0, root_len as usize) },
             0,
         );
     }
@@ -4456,7 +4456,7 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
     .expect("allocate kernel state host mapping");
     let host_addr = host.as_ptr() as usize;
 
-    let rc = unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
+    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
     assert_eq!(rc, 0);
     lease.mark_mapped();
 
@@ -4608,7 +4608,7 @@ fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_ho
     .expect("allocate kernel state host mapping");
     let host_addr = host.as_ptr() as usize;
 
-    let rc = unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
+    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
     assert_eq!(rc, 0);
     lease.mark_mapped();
 
@@ -4686,7 +4686,7 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
     )
     .expect("allocate kernel state host mapping");
 
-    let rc = unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
+    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
     assert_eq!(rc, 0);
     lease.mark_mapped();
 
@@ -5024,7 +5024,7 @@ fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_withou
     let mut lease = GlobalFrameStage2Lease::fixed(key.0, key.1);
     assert_eq!(
         unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 mapping.as_ptr().cast(),
                 key.0,
                 key.1 as usize,

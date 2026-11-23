@@ -2676,7 +2676,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
         let map_result = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
@@ -3207,7 +3207,7 @@ fn perform_foreign_guest_cow(
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
         let map_result = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,

@@ -636,11 +636,11 @@ impl RetainedMetadataMapping {
                             &self.access.carrier.custody,
                             record.identity,
                             |ipa, len| {
-                                let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, len) };
+                                let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, len) };
                                 if rc == 0 {
                                     Ok(())
                                 } else {
-                                    Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
+                                    Err(crate::trap::CarrierStage2BackendError::HvReturn(rc.raw()))
                                 }
                             },
                         )
@@ -1078,13 +1078,14 @@ fn map_metadata_backing(spec: crate::trap::CarrierStage2RecordSpec) -> i32 {
     // SAFETY: the aperture owner retains the validated backing and reservation
     // through the inventory's rollback-capable stage-2 publication.
     unsafe {
-        crate::trap::inventory_hv_vm_map(
+        crate::trap::inventory_stage2_map(
             spec.host_addr as *mut std::ffi::c_void,
             spec.ipa,
             spec.len,
             spec.perms,
         )
     }
+    .raw() as i32
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1269,7 +1270,13 @@ pub(crate) fn service_metadata_operation(
         };
         let mut state = aperture.lock();
         let publication = publish_metadata_mapping_using(custody, spec, |_| unsafe {
-            crate::trap::inventory_hv_vm_map(backing.as_ptr().cast(), ipa, extent_size, permissions)
+            crate::trap::inventory_stage2_map(
+                backing.as_ptr().cast(),
+                ipa,
+                extent_size,
+                permissions,
+            )
+            .raw() as i32
         });
         let identity = match publication {
             Ok(identity) => identity,
@@ -1319,11 +1326,11 @@ pub(crate) fn service_metadata_operation(
                 .lock()
                 .return_extent_using(slot_idx, size, token, generation, |record| {
                     retire_metadata_record_using(custody, record.identity, |ipa, size| {
-                        let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, size) };
+                        let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, size) };
                         if rc == 0 {
                             Ok(())
                         } else {
-                            Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
+                            Err(crate::trap::CarrierStage2BackendError::HvReturn(rc.raw()))
                         }
                     })
                 });

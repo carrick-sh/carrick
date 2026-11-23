@@ -638,7 +638,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     .unwrap();
     let host_addr = host.as_ptr() as usize;
     assert_eq!(
-        unsafe { inventory_hv_vm_map(host.as_ptr().cast(), gpa, length as usize, 7) },
+        unsafe { inventory_stage2_map(host.as_ptr().cast(), gpa, length as usize, 7) },
         0
     );
     lease.mark_mapped();

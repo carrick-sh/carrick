@@ -606,7 +606,7 @@ impl Drop for PersistentCarrierMappings {
                 }
             } else if !vm_destroyed {
                 let rc =
-                    unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+                    unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
                 if rc != 0 {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
@@ -1322,10 +1322,10 @@ mod tests {
         );
         assert_eq!(
             crate_sources
-                .matches(concat!("inventory_hv_vm_", "destroy()"))
+                .matches(concat!("inventory_stage2_", "destroy()"))
                 .count(),
             1,
-            "inventory_hv_vm_destroy appears only in the custody wrapper"
+            "inventory_stage2_destroy appears only in the custody wrapper"
         );
     }
 }

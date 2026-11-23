@@ -877,7 +877,7 @@ fn install_prepared_exec_backing(
                 ),
             );
             let rc = unsafe {
-                inventory_hv_vm_map(extent.host.cast(), extent.ipa, extent.size, extent.perms)
+                inventory_stage2_map(extent.host.cast(), extent.ipa, extent.size, extent.perms)
             };
             if rc == 0
                 && let Some(replay_key) = extent.replay_key()
@@ -896,20 +896,20 @@ fn install_prepared_exec_backing(
                     extent.ipa,
                     extent.size as u64,
                     u64::MAX,
-                    rc as i32,
+                    rc.raw() as i32,
                 ),
             );
             if rc == 0 {
                 maps_completed += 1;
             }
-            rc as i32
+            rc.raw() as i32
         },
         |ipa, len| {
-            let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
             if rc == 0 {
                 Ok(())
             } else {
-                Err(CarrierStage2BackendError::HvReturn(rc as u32))
+                Err(CarrierStage2BackendError::HvReturn(rc.raw()))
             }
         },
     );

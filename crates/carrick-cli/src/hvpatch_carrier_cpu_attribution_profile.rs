@@ -519,7 +519,7 @@ pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
     {
         return Some(CpuCategory::FaultService(FaultClass::Cow));
     }
-    if frame.contains("inventory_hv_vm_map_replay")
+    if frame.contains("inventory_stage2_map")
         || frame.contains("map_host_alias")
         || frame.contains("lookup_shared_alias")
         || frame.contains("global_frame_stage2")
@@ -1398,7 +1398,7 @@ mod tests {
             "              3",
             "",
             // Fault: stage-2: 2 samples
-            "              carrick`carrick_vmm_hvf::trap::inventory_hv_vm_map_replay+0x30",
+            "              carrick`carrick_vmm_hvf::trap::inventory_stage2_map_replay+0x30",
             "              carrick`carrick_vmm_hvf::trap::run_to_exit+0x100",
             "              2",
             "",

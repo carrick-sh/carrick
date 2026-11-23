@@ -3965,7 +3965,7 @@ mod task_only_materializer_tests {
             .and_then(|tail| tail.split("fn global_frame_exec_plan").next())
             .expect("compatibility process preparation");
         for shared_stage in [
-            "inventory_hv_vm_map",
+            "inventory_stage2_map",
             "lease.mark_mapped()",
             "rebind_inherited_alias_to_process",
             "Self::stage_mapping",

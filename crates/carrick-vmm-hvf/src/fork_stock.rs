@@ -277,7 +277,7 @@ impl ForkStockHostCustody {
                     .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
                     // SAFETY: exclusively reserved physical slot and retained aligned mapping.
                     let result = unsafe {
-                        crate::trap::inventory_hv_vm_map(mapping.as_ptr().cast(), base, len, perms)
+                        crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms)
                     };
                     if result != 0 {
                         return Err(fail(&format!("native fork arena map: {result:#x}")));
@@ -341,7 +341,7 @@ impl ForkStockHostCustody {
         let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
         // SAFETY: the fresh IPA lease and mapping are retained by the owner.
         let result =
-            unsafe { crate::trap::inventory_hv_vm_map(mapping.as_ptr().cast(), base, len, perms) };
+            unsafe { crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms) };
         if result != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "native fork control map: {result:#x}"

@@ -95,7 +95,7 @@ impl PreMappedFramePool {
 
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
-            crate::trap::inventory_hv_vm_map(
+            crate::trap::inventory_stage2_map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
@@ -387,7 +387,7 @@ impl PreMappedRootSlotPool {
 
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
-            crate::trap::inventory_hv_vm_map(
+            crate::trap::inventory_stage2_map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
