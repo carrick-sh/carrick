@@ -1536,6 +1536,7 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
             | nr::IOCTL
             | nr::LSEEK
             | nr::CLOSE
+            | nr::CLOSE_RANGE
             | nr::EPOLL_CREATE1
             | nr::EPOLL_CTL
             | nr::PIPE2
