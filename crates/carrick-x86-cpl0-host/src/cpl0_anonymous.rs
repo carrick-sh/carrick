@@ -3276,10 +3276,7 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         self.custody
             .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
         if let Some(source) = source {
-            let window =
-                carrick_core_abi::host_file::request_parts(bytes).is_some_and(|(header, _, _)| {
-                    header.op == carrick_core_abi::host_file::HostFileOp::MapShared
-                });
+            let window = replied_map_source_is_window(bytes)?;
             let sources = self.custody.sources_mut(self.execution.context)?;
             if window {
                 sources.inherit_window(source);
@@ -3294,6 +3291,20 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             ._vm
             .write(physical, bytes)
             .map_err(|error| fail(error.to_string()))
+    }
+}
+
+/// Whether the source a map-source record retained is a shared file window
+/// ([`carrick_core_abi::host_file::HostFileOp::MapShared`], #1338). The host
+/// service has written its reply by now, so the record must read as replied.
+/// Any other record is a broken invariant: retaining a window's source as a
+/// byte copy would drop every store the guest makes through the mapping.
+fn replied_map_source_is_window(bytes: &[u8]) -> Result<bool, TrapError> {
+    use carrick_core_abi::host_file::{HostFileOp, replied_parts};
+    match replied_parts(bytes) {
+        Some((header, _, _)) if header.op == HostFileOp::MapShared => Ok(true),
+        Some((header, _, _)) if header.op == HostFileOp::MapPrivate => Ok(false),
+        _ => Err(fail("retained map source without a replied map record")),
     }
 }
 
@@ -3382,6 +3393,63 @@ mod custody_tests {
     use carrick_el1_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
+
+    /// One map-source record as `complete_host_file` sees it: the host
+    /// service has replied.
+    fn replied_map_record(op: carrick_core_abi::host_file::HostFileOp) -> Vec<u8> {
+        map_record(op, true)
+    }
+
+    fn map_record(op: carrick_core_abi::host_file::HostFileOp, replied: bool) -> Vec<u8> {
+        use carrick_core_abi::host_file::{
+            HostFileHeader, HostFileRequestView, MapSourceReply, encode, record_len,
+        };
+        let mut bytes = vec![0; record_len(0, MapSourceReply::BYTES).unwrap()];
+        encode(
+            &mut bytes,
+            HostFileHeader {
+                op,
+                table: [1, 2, 3],
+                fd: 3,
+                flags: 0,
+                args: [0, 0x2000, 0, 0],
+            },
+            &[],
+            MapSourceReply::BYTES,
+        )
+        .unwrap();
+        let reply = MapSourceReply {
+            handle: NonZeroU64::new(9).unwrap(),
+            generation: NonZeroU64::MIN,
+        }
+        .encode();
+        if replied {
+            HostFileRequestView::parse(&mut bytes)
+                .unwrap()
+                .reply(0, &reply)
+                .unwrap();
+        }
+        bytes
+    }
+
+    /// #1338: a source the host retained for a `MapShared` record is a
+    /// shared file window once its reply is written, so its faults never
+    /// copy bytes. Reading the replied record as a pending request answered
+    /// "not a window" and retained it as a private copy: every store through
+    /// the mapping was lost (KVM witness rows `linker_read_back`,
+    /// `shared_child_write_in_pread`).
+    #[test]
+    fn replied_map_shared_record_retains_a_window_source() {
+        use carrick_core_abi::host_file::HostFileOp;
+        assert!(replied_map_source_is_window(&replied_map_record(HostFileOp::MapShared)).unwrap());
+        assert!(
+            !replied_map_source_is_window(&replied_map_record(HostFileOp::MapPrivate)).unwrap()
+        );
+        // A record with no reply, or of another operation, retains nothing.
+        assert!(replied_map_source_is_window(&map_record(HostFileOp::MapShared, false)).is_err());
+        assert!(replied_map_source_is_window(&replied_map_record(HostFileOp::Ftruncate)).is_err());
+    }
+
     #[test]
     fn x86_prepare_candidates_continue_after_twelve_root_table_loans() {
         use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
