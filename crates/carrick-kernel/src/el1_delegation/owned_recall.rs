@@ -229,6 +229,10 @@ impl RecallJob {
         });
         let index = inode as usize - 1;
         driver().state.lock().routes[index] = Arc::downgrade(&job);
+        #[cfg(test)]
+        {
+            *LIVE_JOBS.lock() += 1;
+        }
         job
     }
     fn schedule(self: &Arc<Self>) {
@@ -391,6 +395,20 @@ impl RecallJob {
     }
 }
 
+/// A job's worker, queue entry or requester may hold it past its owner's
+/// `Host` verdict, and with it the descriptions it counts against their inode
+/// numbers. Tests observe its end only after those descriptions are gone.
+#[cfg(test)]
+impl Drop for RecallJob {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.members));
+        drop(std::mem::take(self.leases.get_mut()));
+        *self.phase.get_mut() = Phase::Done;
+        *LIVE_JOBS.lock() -= 1;
+        LIVE_JOBS_CHANGED.notify_all();
+    }
+}
+
 /// This is result interest only. The inode retains the job after cancellation.
 pub struct OwnedRecallRequest {
     job: Option<Arc<RecallJob>>,
@@ -534,6 +552,25 @@ pub(super) fn wait_for_cleanup_bounded(identity: InodeIdentity) -> bool {
 }
 
 #[cfg(test)]
+static LIVE_JOBS: Mutex<usize> = Mutex::new(0);
+#[cfg(test)]
+static LIVE_JOBS_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// Wait until every recall job, and every description it retained, is dropped.
+#[cfg(test)]
+pub(super) fn wait_for_recall_jobs_dropped() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut live = LIVE_JOBS.lock();
+    while *live != 0 {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return false;
+        };
+        LIVE_JOBS_CHANGED.wait_for(&mut live, remaining);
+    }
+    true
+}
+
+#[cfg(test)]
 pub(super) fn wait_for_cleanup(identity: InodeIdentity) {
     let owners = OWNERS.lock();
     let job = owners
@@ -572,6 +609,33 @@ pub(super) fn wait_for_open_retirement(handle: u32) -> bool {
 #[cfg(test)]
 pub(super) fn test_drain_external() {
     driver().drain_external();
+}
+/// The process-global aperture pointed at another region under the drain
+/// gate. A host drain reads the global and settles under it in one gate hold,
+/// so it cannot read one region and admit recall against another. Dropping
+/// restores the previous region before releasing the gate.
+#[cfg(test)]
+pub(super) struct ApertureRedirect {
+    previous: usize,
+    _drain: parking_lot::MutexGuard<'static, ()>,
+}
+#[cfg(test)]
+impl ApertureRedirect {
+    pub(super) fn to(region: usize) -> Self {
+        let drain = APERTURE_DRAIN.lock();
+        let previous = get_el1_region_host_ptr();
+        carrick_el1_abi::record_el1_region_host_ptr(region);
+        Self {
+            previous,
+            _drain: drain,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for ApertureRedirect {
+    fn drop(&mut self) {
+        carrick_el1_abi::record_el1_region_host_ptr(self.previous);
+    }
 }
 #[cfg(test)]
 pub(super) fn test_drain_external_at(region: usize) {
