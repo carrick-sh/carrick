@@ -202,6 +202,7 @@ surfaces = [
   { path = "crates/carrick-el1-abi/src/loom_models.rs", contract = "kernel.el1.inotify" },
   { path = "crates/carrick-el1-abi/src/open_lifetime.rs", contract = "core.personality.files" },
   { path = "crates/carrick-el1-abi/src/open_lifetime.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-el1-abi/src/panic_report.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-el1-abi/src/refusal_census_tests.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-el1-abi/src/signal_ingress.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-abi/src/stack_overflow.rs", contract = "kernel.el1.fault-entry" },
