@@ -7886,6 +7886,13 @@
     {
       "family": "host_backing",
       "operation": "std::fs::File::open",
+      "owner": "carrick_softcpu_aarch64_host::rootfs_command::read_head",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::File::open",
       "owner": "carrick_vfs::rootfs::extract_layer_paths_with_metadata",
       "lane": "linux_runtime",
       "ceiling": 1
@@ -14879,6 +14886,13 @@
     {
       "family": "host_backing",
       "operation": "std::fs::read_link",
+      "owner": "carrick_softcpu_aarch64_host::rootfs_command::walk_rootfs",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_link",
       "owner": "carrick_vfs::vfs::bind::<BindVfs as Vfs>::readlink",
       "lane": "linux_runtime",
       "ceiling": 1
@@ -20045,6 +20059,13 @@
     {
       "family": "host_backing",
       "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_softcpu_aarch64_host::rootfs_command::walk_rootfs",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
       "owner": "carrick_vfs::vfs::bind::BindVfs::new",
       "lane": "linux_runtime",
       "ceiling": 1
@@ -20711,6 +20732,13 @@
       "family": "host_backing",
       "operation": "std::fs::write",
       "owner": "carrick_vfs::vfs::bind::write_symlink_owner_sidecar",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::write",
+      "owner": "carrick_cli::debug_soft_run::run_to_status",
       "lane": "linux_cli",
       "ceiling": 1
     },
@@ -22542,6 +22570,13 @@
       "ceiling": 1
     },
     {
+      "family": "host_backing",
+      "operation": "std::fs::metadata",
+      "owner": "carrick_softcpu_aarch64_host::rootfs_command::check_executable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
       "family": "host_forbidden_semantic",
       "operation": "std::fs::metadata",
       "owner": "carrick_host::host_proc::imp::pid_info",
@@ -22568,6 +22603,13 @@
       "owner": "carrick_vfs::vfs::etc_services::synthesize_etc_services",
       "lane": "linux_cli",
       "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read",
+      "owner": "carrick_cli::debug_soft_run::run_to_status",
+      "lane": "linux_cli",
+      "ceiling": 2
     },
     {
       "family": "host_forbidden_semantic",
