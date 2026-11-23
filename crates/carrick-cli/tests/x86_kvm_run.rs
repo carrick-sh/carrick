@@ -793,8 +793,9 @@ fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {
 
 /// `getcwd`, `uname`, `getrlimit`, `prlimit64`, `getrusage` and `sysinfo`
 /// into a mapped page the guest never touched succeed on Linux: the copy
-/// fills the page in. The root and a forked child (with a copy-on-write
-/// page too) must report the native rows, never EFAULT.
+/// fills the page in. So do `clock_gettime`, `rt_sigprocmask`, `pipe2` and
+/// `epoll_wait`. The root and a forked child (with a copy-on-write page
+/// too) must report the native rows, never EFAULT and never a hang.
 #[test]
 fn mounted_static_x86_sysinfo_output_to_an_untouched_page_matches_native() {
     if skip_without_kvm() {
@@ -822,7 +823,7 @@ fn mounted_static_x86_sysinfo_output_to_an_untouched_page_matches_native() {
         "native oracle: {native_rows}"
     );
     assert!(
-        native_rows.lines().count() == 20 && !native_rows.contains("MISSING"),
+        native_rows.lines().count() == 28 && !native_rows.contains("MISSING"),
         "native Linux fills every buffer: {native_rows}"
     );
 

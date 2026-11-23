@@ -1,6 +1,9 @@
 // System-information calls whose output buffer is a page the guest has
 // mapped but never touched (git's first `getcwd` into a fresh allocation).
 //
+// The clock, signal-mask, pipe and epoll rows put the same page state through
+// the other output owners, which hung instead of failing.
+//
 // Linux fills such a page in during the copy and the call succeeds. Each row
 // prints the raw result and whether the bytes arrived; the test compares the
 // rows with a native run. The root runs every row, then a forked child runs
@@ -18,6 +21,7 @@ static long sc(long n, long a, long b, long c, long d, long e, long f) {
 }
 #define PG 4096L
 enum { GETCWD = 79, UNAME = 63, GETRLIMIT = 97, GETRUSAGE = 98, SYSINFO = 99, PRLIMIT64 = 302 };
+enum { RT_SIGPROCMASK = 14, CLOCK_GETTIME = 228, EPOLL_WAIT = 232, EPOLL_CTL = 233, EVENTFD2 = 290, EPOLL_CREATE1 = 291, PIPE2 = 293 };
 static char *fresh(long pages) {
     long p = sc(9, 0, pages * PG, 3, 0x22, -1, 0);
     if (p < 0 && p > -4096) sc(231, 90, 0, 0, 0, 0, 0);
@@ -70,6 +74,28 @@ static void rows(const char *who, char *touched, char *cow) {
     unsigned long *info = (unsigned long *)fresh(1);
     ret = sc(SYSINFO, (long)info, 0, 0, 0, 0, 0);
     row(who, "sysinfo_untouched", ret, ret == 0 && info[4] != 0);
+
+    // The same page state through the other output owners: a clock, a
+    // signal mask, a descriptor pair and a ready epoll report.
+    unsigned long *now = (unsigned long *)fresh(1);
+    ret = sc(CLOCK_GETTIME, 1, (long)now, 0, 0, 0, 0);
+    row(who, "clock_gettime_untouched", ret, ret == 0 && (now[0] | now[1]) != 0);
+    char *mask = fresh(1);
+    ret = sc(RT_SIGPROCMASK, 0, 0, (long)mask, 8, 0, 0);
+    row(who, "rt_sigprocmask_old_untouched", ret, ret == 0);
+    int *ends = (int *)fresh(1);
+    ret = sc(PIPE2, (long)ends, 0, 0, 0, 0, 0);
+    row(who, "pipe2_untouched", ret, ret == 0 && ends[0] > 2 && ends[1] > ends[0]);
+    struct {
+        unsigned events;
+        unsigned long data;
+    } __attribute__((packed)) interest = {1, 0x1234};
+    long epoll = sc(EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+    long ready = sc(EVENTFD2, 1, 0, 0, 0, 0, 0);
+    sc(EPOLL_CTL, epoll, 1, ready, (long)&interest, 0, 0);
+    char *reports = fresh(1);
+    ret = sc(EPOLL_WAIT, epoll, (long)reports, 4, 0, 0, 0);
+    row(who, "epoll_wait_untouched", ret, ret == 1 && reports[0] == 1 && reports[4] == 0x34);
 }
 void start_c(void) {
     // A cwd that is not the root directory; the image may not have it yet.
