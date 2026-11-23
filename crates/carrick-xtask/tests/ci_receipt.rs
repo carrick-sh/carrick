@@ -4408,7 +4408,10 @@ fn retirement_refuses_when_the_included_file_still_has_the_test() {
     )
     .expect_err("retired test still exists in the included file")
     .to_string();
-    assert!(error.contains("still exists in candidate source"), "{error}");
+    assert!(
+        error.contains("still exists in candidate source"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4445,7 +4448,10 @@ fn test_inventory_files_an_included_test_under_the_includers_module() {
         "#[test] fn top() {} mod tests { #[test] fn nested() {} }",
     );
     let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
-    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    let krate = inventory
+        .iter()
+        .find(|c| c.crate_name == "example")
+        .unwrap();
     assert_eq!(krate.unresolved, None, "{krate:?}");
     let names: Vec<&str> = krate.tests.keys().map(|(_, t)| t.as_str()).collect();
     assert!(names.contains(&"native::top"), "{names:?}");
@@ -4456,6 +4462,9 @@ fn test_inventory_files_an_included_test_under_the_includers_module() {
 fn test_inventory_marks_an_included_file_with_modules_unresolved() {
     let dir = include_fixture("include!(\"tests.rs\");", "mod more;");
     let inventory = carrick_xtask::ci_receipt::tree_test_inventory(dir.path()).unwrap();
-    let krate = inventory.iter().find(|c| c.crate_name == "example").unwrap();
+    let krate = inventory
+        .iter()
+        .find(|c| c.crate_name == "example")
+        .unwrap();
     assert!(krate.unresolved.is_some(), "{krate:?}");
 }
