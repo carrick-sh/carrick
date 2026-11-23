@@ -338,6 +338,9 @@ mod tests {
     /// carrier whose generation went stale between loads is.
     struct FakeMapper {
         region: std::ptr::NonNull<carrick_test_support::TestEl1Region>,
+        // Owns the mapping `region` points into; it unmaps when the mapper
+        // drops.
+        _backing: carrick_test_support::ZeroedBox<carrick_test_support::TestEl1Region>,
         stale: bool,
         refuse: Arc<std::sync::atomic::AtomicBool>,
         maps: Arc<std::sync::atomic::AtomicUsize>,
@@ -350,10 +353,10 @@ mod tests {
 
     impl FakeMapper {
         fn new(stale: bool) -> Self {
+            let mut backing = carrick_test_support::TestEl1Region::zeroed();
             Self {
-                region: std::ptr::NonNull::from(carrick_test_support::ZeroedBox::leak(
-                    carrick_test_support::TestEl1Region::zeroed(),
-                )),
+                region: std::ptr::NonNull::from(&mut *backing),
+                _backing: backing,
                 stale,
                 refuse: Arc::default(),
                 maps: Arc::default(),
@@ -371,13 +374,6 @@ mod tests {
                     .cast::<CurrentTask>()
                     .add(slot)
             }
-        }
-    }
-
-    impl Drop for FakeMapper {
-        fn drop(&mut self) {
-            // SAFETY: leaked from a Box in `new`, released exactly once here.
-            drop(unsafe { Box::from_raw(self.region.as_ptr()) });
         }
     }
 
