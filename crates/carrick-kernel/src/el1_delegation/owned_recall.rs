@@ -160,7 +160,13 @@ impl Driver {
             let job = state.ready.pop_front();
             drop(state);
             if let Some(job) = job {
+                let identity = job.identity;
                 job.run();
+                std::eprintln!(
+                    "PROBE_SHARED job_run_returned identity={identity:?} thread={:?} t={:?}",
+                    std::thread::current().name(),
+                    std::time::SystemTime::now()
+                );
             }
         }
     }

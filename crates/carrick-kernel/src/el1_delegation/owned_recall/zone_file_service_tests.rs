@@ -48,6 +48,11 @@ mod serial_host {
     }
     impl Drop for Region {
         fn drop(&mut self) {
+            std::eprintln!(
+                "PROBE_SHARED region_drop thread={:?} t={:?}",
+                std::thread::current().name(),
+                std::time::SystemTime::now()
+            );
             recall_all_delegated();
             clear_el1_region_host_ptr();
         }
@@ -152,6 +157,16 @@ mod serial_host {
         fn admit(&self, path: &str, create: bool, fd: i32) -> Admitted {
             if create {
                 self.fs.rootfs_vfs.create_file(path).unwrap();
+            }
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(self.scratch.path().join(&path[1..])).unwrap();
+                std::eprintln!(
+                    "PROBE_SHARED admit path={path} dev={} ino={} t={:?}",
+                    meta.dev(),
+                    meta.ino(),
+                    std::time::SystemTime::now()
+                );
             }
             let carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
                 host_fd,

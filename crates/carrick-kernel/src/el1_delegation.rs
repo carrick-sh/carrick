@@ -1563,6 +1563,16 @@ fn delegate_transaction(
             .and_then(|map| map.get(&identity))
             .is_none_or(|owner| owner.open_count != 1);
         if shared {
+            let owners = OWNERS.lock();
+            let owner = owners.as_ref().and_then(|map| map.get(&identity));
+            std::eprintln!(
+                "PROBE_SHARED refuse identity={identity:?} open_count={:?} host={:?} thread={:?}",
+                owner.map(|o| o.open_count),
+                owner.map(|o| o.state.is_host()),
+                std::thread::current().name()
+            );
+        }
+        if shared {
             return Err(NotEligible::Shared);
         }
     }
