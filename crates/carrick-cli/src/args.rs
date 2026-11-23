@@ -1099,7 +1099,8 @@ pub(crate) enum DebugCommand {
     /// AArch64 CPU, through the production EL1 image and kernel dispatcher
     /// (diagnostics; the soft-a64 provider of `debug discover`). The command
     /// is searched in the guest `PATH` inside the rootfs; the exit status is
-    /// the guest's. `CARRICK_EL1_CENSUS=<directory>` publishes its census.
+    /// the guest's, or a shell's for a failed lookup (127 not found, 126 not
+    /// executable). `CARRICK_EL1_CENSUS=<directory>` publishes its census.
     /// Needs a Linux arm64 host.
     SoftRun {
         /// The guest's root: an extracted, immutable rootfs directory.
