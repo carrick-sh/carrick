@@ -527,25 +527,65 @@ fn serve_family<'a, C: EntryContext + 'a>(
             );
     }
     if let Family::Sysinfo(call) = family {
+        use crate::sysinfo::SysinfoOutcome;
         let original = pending.original_argument0();
-        return pending
+        let Some(outcome) = pending
             .sysinfo_native()
             .and_then(|native| crate::sysinfo::invoke(call, native))
-            .map_or(
-                FamilyRun {
-                    return_venue: ReturnVenue::Native,
-                    completion: FamilyCompletion::Forward,
-                    returned: None,
-                    // An absent/unported owner must still enter crossing policy.
-                    forward_reason: ForwardReason::Unported,
+        else {
+            return FamilyRun {
+                return_venue: ReturnVenue::Native,
+                completion: FamilyCompletion::Forward,
+                returned: None,
+                // An absent/unported owner must still enter crossing policy.
+                forward_reason: ForwardReason::Unported,
+            };
+        };
+        // Guest memory belongs to the process's memory owner. It finishes
+        // an output after the call's effects, or prepares an input and
+        // reruns the call; a page it has not supplied yet is never EFAULT.
+        let outcome = match outcome {
+            SysinfoOutcome::Returned(result) => crate::lifecycle::LifecycleOutcome::Returned {
+                result,
+                work: false,
+            },
+            SysinfoOutcome::Output {
+                address,
+                bytes,
+                result,
+            } => match pending.time_native() {
+                Some(owner) => owner.finish_time_output([Some((address, bytes)), None], result),
+                // No memory owner on this venue: its own copy is final.
+                None => crate::lifecycle::LifecycleOutcome::Returned {
+                    result: if pending
+                        .sysinfo_native()
+                        .is_some_and(|native| native.copy_out(address, &bytes).is_done())
+                    {
+                        result
+                    } else {
+                        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
+                    },
+                    work: false,
                 },
-                |result| FamilyRun {
-                    return_venue: ReturnVenue::Native,
-                    completion: FamilyCompletion::Complete(result.raw()),
-                    returned: Some((result, original)),
-                    forward_reason: ForwardReason::FamilyFallback,
+            },
+            SysinfoOutcome::Input(request) => match pending.time_native() {
+                Some(owner) => owner.wait_guest_copy(request),
+                None => crate::lifecycle::LifecycleOutcome::Returned {
+                    result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    work: false,
                 },
-            );
+            },
+        };
+        let returned = match outcome {
+            crate::lifecycle::LifecycleOutcome::Returned { result, .. } => Some((result, original)),
+            _ => None,
+        };
+        return FamilyRun {
+            return_venue: ReturnVenue::Native,
+            completion: crate::lifecycle::lifecycle_effect(&outcome),
+            returned,
+            forward_reason: ForwardReason::FamilyFallback,
+        };
     }
     if let Family::Ipc(call) = family {
         let original = pending.original_argument0();
