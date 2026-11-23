@@ -358,11 +358,13 @@ impl<
         }
     }
 
+    #[track_caller]
     fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
+        let cause = reason.at_caller();
         let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
-        super::native_run_failure::complete_native_run_failure(binding, reason)
+        super::native_run_failure::complete_native_run_failure(binding, cause)
     }
     fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
         let admission = self

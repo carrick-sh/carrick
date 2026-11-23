@@ -453,9 +453,11 @@ pub enum TrapError {
     ExecutionAdmissionPoisoned,
 
     /// Authenticated native dependency failure ends the run before guest return.
-    #[error("native run failed: {reason}; run_failure_crossings={crossings}")]
+    #[error("native run failed: {reason} at {site}; run_failure_crossings={crossings}")]
     NativeRunFailure {
         reason: &'static str,
+        /// The kernel site that raised the failure (#2853).
+        site: carrick_core_abi::SourceSite,
         crossings: u64,
     },
     #[error("syscall trapping is not available on this platform")]

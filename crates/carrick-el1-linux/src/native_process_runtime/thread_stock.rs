@@ -898,10 +898,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub(super) fn resume_thread_stock_wait(
         &mut self,
-    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
         self.take_thread_stock_wait()
             .map(|resumed| resumed.unwrap_or(NativeResume::NoPending))
-            .map_err(NativeFailure::run_failure_reason)
+            .map_err(|failure| failure.run_failure_reason().at_caller())
     }
     fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeFailure> {
         let key = {

@@ -141,20 +141,20 @@ pub fn schedule(slot: SlotId) -> ! {
                         use carrick_el1_linux::native_process_runtime::{
                             NativeFailure, NativeResume,
                         };
-                        let position = entry
-                            .resume_context()
-                            .saved_syscall_pc()
-                            .ok_or_else(|| NativeFailure::Quarantined.run_failure_reason())?;
+                        let position =
+                            entry.resume_context().saved_syscall_pc().ok_or_else(|| {
+                                NativeFailure::Quarantined.run_failure_reason().at_caller()
+                            })?;
                         let native = context::context_words::into_native(
                             *entry.resume_context(),
                             state.address,
                         )
-                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?;
+                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
                         let mut frame = context::context_words::syscall_frame_from_native(
                             &native,
                             state.address,
                         )
-                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?;
+                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
                         let mut machine =
                             crate::linux_personality::X86SignalMachine::new(state.address);
                         match deliver_signal_on_syscall_return(
@@ -173,7 +173,9 @@ pub fn schedule(slot: SlotId) -> ! {
                                         native.gs_base,
                                         &native.xsave,
                                     )
-                                    .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?,
+                                    .map_err(|_| {
+                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
+                                    })?,
                                     machine.frame_position(position),
                                 );
                                 Ok(None)
@@ -181,7 +183,9 @@ pub fn schedule(slot: SlotId) -> ! {
                             Some(
                                 carrick_personality_linux::dispatch::CompletionRoute::Suspended,
                             ) => Ok(Some(NativeResume::Left(entry.take_root_exit()))),
-                            Some(_) => Err(NativeFailure::Quarantined.run_failure_reason()),
+                            Some(_) => {
+                                Err(NativeFailure::Quarantined.run_failure_reason().at_caller())
+                            }
                         }
                     })
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))

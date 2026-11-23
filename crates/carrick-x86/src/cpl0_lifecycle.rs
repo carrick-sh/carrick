@@ -302,9 +302,9 @@ mod process_exit_tests {
         #[allow(clippy::panic)]
         fn terminal_failure(
             _: carrick_core_abi::ExecutionBinding,
-            reason: carrick_core_abi::NativeRunFailureReason,
+            cause: carrick_core_abi::NativeRunFailureCause,
         ) -> ! {
-            std::panic::panic_any(reason)
+            std::panic::panic_any(cause.reason)
         }
         let mut native = NativeLane {
             terminal_failure,
@@ -403,9 +403,9 @@ mod process_exit_tests {
         #[allow(clippy::panic)]
         fn terminal_failure(
             _: carrick_core_abi::ExecutionBinding,
-            reason: carrick_core_abi::NativeRunFailureReason,
+            cause: carrick_core_abi::NativeRunFailureCause,
         ) -> ! {
-            std::panic::panic_any(reason)
+            std::panic::panic_any(cause.reason)
         }
         let mut native = NativeLane {
             terminal_failure,
@@ -533,9 +533,9 @@ mod process_exit_tests {
             #[allow(clippy::panic)]
             fn terminal_failure(
                 _: carrick_core_abi::ExecutionBinding,
-                reason: carrick_core_abi::NativeRunFailureReason,
+                cause: carrick_core_abi::NativeRunFailureCause,
             ) -> ! {
-                std::panic::panic_any(reason)
+                std::panic::panic_any(cause.reason)
             }
             let mut native = NativeLane {
                 terminal_failure,
@@ -772,7 +772,7 @@ pub struct LifecycleLane {
 
 /// The image owner supplies the terminal transport with its retained custody.
 pub type TerminalFailure =
-    fn(carrick_core_abi::ExecutionBinding, carrick_core_abi::NativeRunFailureReason) -> !;
+    fn(carrick_core_abi::ExecutionBinding, carrick_core_abi::NativeRunFailureCause) -> !;
 
 pub struct NativeLane<'a> {
     terminal_failure: TerminalFailure,
@@ -1096,10 +1096,12 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         carrick_guest_arch::GuestIsa::X86_64
     }
 
+    #[track_caller]
     fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
+        let cause = reason.at_caller();
         (self.terminal_failure)(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
-            reason,
+            cause,
         )
     }
 

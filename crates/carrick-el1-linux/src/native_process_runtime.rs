@@ -5324,7 +5324,7 @@ pub struct NativeProcessEntry<
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
-    run_failure: Option<carrick_core_abi::NativeRunFailureReason>,
+    run_failure: Option<carrick_core_abi::NativeRunFailureCause>,
     #[cfg(test)]
     pub(crate) publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
     #[cfg(test)]
@@ -5580,12 +5580,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn set_slot_for_test(&mut self, slot: &'a ThreadControlSlot) {
         self.slot = Some(slot);
     }
-    pub fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
+    pub fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureCause> {
         self.run_failure.take()
     }
+    /// Record a terminal run failure raised at the caller's site.
+    #[track_caller]
     fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
         self.discard_rerun_answers();
-        self.run_failure = Some(reason);
+        self.run_failure = Some(reason.at_caller());
         if let Some(record) = self
             .source
             .zone
@@ -5699,7 +5701,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // wait (`UserReturn`) wakes with `-EINTR` on deliverable signal arrival.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
         if let Err(error) = self.interrupt_member_record(record) {
-            self.run_failure = Some(error.run_failure_reason());
+            self.run_failure = Some(error.run_failure_reason().at_caller());
         }
     }
 
@@ -7814,11 +7816,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         checkpoint: impl FnOnce(
             &mut Self,
-        ) -> Result<
-            Option<NativeResume>,
-            carrick_core_abi::NativeRunFailureReason,
-        >,
-    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        )
+            -> Result<Option<NativeResume>, carrick_core_abi::NativeRunFailureCause>,
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
         let previous_venue = core::mem::replace(
             &mut self.exit_venue,
             service::EntryExitVenue::SchedulerResume,
@@ -7841,11 +7841,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         host_owned: bool,
         checkpoint: impl FnOnce(
             &mut Self,
-        ) -> Result<
-            Option<NativeResume>,
-            carrick_core_abi::NativeRunFailureReason,
-        >,
-    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        )
+            -> Result<Option<NativeResume>, carrick_core_abi::NativeRunFailureCause>,
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
         let record = self.source.zone.record(self.record.id);
         // A borrowed ring continuation must return its completed context to
         // the host executor. Returning it directly to EL0 would leave the next
@@ -7905,7 +7903,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             );
             if self.take_handoff_receipt().is_none() {
-                return Err(NativeFailure::Quarantined.run_failure_reason());
+                return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
             }
             self.current.linux.mark_pending_host_work();
             return Ok(NativeResume::Left(None));
@@ -7920,23 +7918,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn resume_not_now(
         &mut self,
         error: NativeProcessError,
-    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
         match error.failure() {
-            Ok(failure) => Err(failure.run_failure_reason()),
+            Ok(failure) => Err(failure.run_failure_reason().at_caller()),
             Err(_) => self
                 .yield_owner_checkpoint(OwnerEntry::Syscall)
-                .map_err(NativeFailure::run_failure_reason),
+                .map_err(|failure| failure.run_failure_reason().at_caller()),
         }
     }
 
     #[inline(never)]
     fn resume_owned_checkpoint(
         &mut self,
-    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureCause> {
         let syscall_retry = match self.words.saved_syscall_pc() {
             Some(carrick_sched_core::SavedSyscallPc::AtSyscall) => NativeResume::RetrySavedSyscall,
             Some(carrick_sched_core::SavedSyscallPc::AfterSyscall) => NativeResume::RetrySyscall,
-            None => return Err(NativeFailure::Quarantined.run_failure_reason()),
+            None => return Err(NativeFailure::Quarantined.run_failure_reason().at_caller()),
         };
         if let Some(result) = self.resume_exec_closing() {
             return result.or_else(|error| self.resume_not_now(error));
@@ -7966,7 +7964,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let resources = graph
                 .owner
                 .task(self.key)
-                .map_err(|_| NativeFailure::Stale.run_failure_reason())?
+                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
                 .native()
                 .resources();
             resources
@@ -7984,7 +7982,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(NativeProcessError::failure)
             {
                 Ok(()) | Err(Ok(NativeFailure::Fault | NativeFailure::Stale)) => {}
-                Err(Ok(failure)) => return Err(failure.run_failure_reason()),
+                Err(Ok(failure)) => return Err(failure.run_failure_reason().at_caller()),
                 Err(Err(contention)) => {
                     return self.resume_not_now(contention.into());
                 }
@@ -7994,7 +7992,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .lock()
                 .owner
                 .task_mut(self.key)
-                .map_err(|_| NativeFailure::Stale.run_failure_reason())?
+                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
                 .native_mut()
                 .resources_mut()
                 .pending_child_tid = None;
@@ -8043,7 +8041,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     },
                 );
                 if self.take_handoff_receipt().is_none() {
-                    return Err(NativeFailure::Quarantined.run_failure_reason());
+                    return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
                 }
                 self.current.linux.mark_pending_host_work();
                 Ok(NativeResume::Left(None))
@@ -9890,7 +9888,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .then(|| self.resume_pending_lifecycle())
             .flatten()
     }
-    fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
+    fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureCause> {
         self.run_failure.take()
     }
     fn take_relative_futex_wait(
@@ -10199,7 +10197,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             return false;
         }
         if let Err(error) = self.service.vacate_terminal_space(self.source) {
-            self.run_failure = Some(error.run_failure_reason());
+            self.run_failure = Some(error.run_failure_reason().at_caller());
             return false;
         }
         self.handoff = retirement
@@ -10421,7 +10419,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         ) {
             // Born is already committed: report an invariant failure without
             // inviting the clone caller to roll back a published record.
-            self.run_failure = Some(error.run_failure_reason());
+            self.run_failure = Some(error.run_failure_reason().at_caller());
         }
         Ok(())
     }
@@ -10493,7 +10491,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             return false;
         };
         if identity.binding() != self.binding || identity.entry() != self.control.entry() {
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            self.run_failure =
+                Some(carrick_core_abi::NativeRunFailureReason::NativeStale.at_caller());
             return false;
         }
         self.control.request_host_exit();
@@ -10543,7 +10542,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if let Err(error) = published {
             // The sole pending-exit wake cannot be retried or discarded. The
             // active clone lane reports typed run failure before guest return.
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            self.run_failure =
+                Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement.at_caller());
             return Err(error.errno());
         }
         thread_stock::admission_settled(self.runtime, self.key);
@@ -10736,18 +10736,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             notification,
         } = verdict
         else {
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            self.run_failure =
+                Some(carrick_core_abi::NativeRunFailureReason::NativeStale.at_caller());
             return;
         };
         if identity.binding() != self.binding
             || identity.entry() != self.control.entry()
             || !requires_slot_absence
         {
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            self.run_failure =
+                Some(carrick_core_abi::NativeRunFailureReason::NativeStale.at_caller());
             return;
         }
         let Some(tid) = self.control.visible_tid() else {
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            self.run_failure =
+                Some(carrick_core_abi::NativeRunFailureReason::NativeStale.at_caller());
             return;
         };
         if let Some(notification) = notification {
@@ -10832,7 +10835,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 thread_stock::StockGrowth::Within,
             )
         {
-            self.run_failure = Some(error.run_failure_reason());
+            self.run_failure = Some(error.run_failure_reason().at_caller());
         }
     }
 
@@ -14994,10 +14997,18 @@ mod tests {
             entry.exit_group(9),
             LifecycleOutcome::Transferred { .. }
         ));
+        let cause = entry.take_run_failure();
         assert_eq!(
-            entry.take_run_failure(),
+            cause.map(|cause| cause.reason),
             Some(carrick_core_abi::NativeRunFailureReason::NativeStale),
             "stale caller retains its true cause"
+        );
+        // The cause names the kernel site that raised it, not the terminal
+        // crossing that carries it (#2853).
+        let site = std::string::ToString::to_string(&cause.unwrap().site);
+        assert!(
+            site.starts_with("ative_process_runtime.rs:") && !site.ends_with(":0:0"),
+            "{site}"
         );
     }
     // A fixture actor holds the enrollment bucket until main's committed
@@ -15303,7 +15314,7 @@ mod tests {
             ));
             if resume_stale {
                 assert_eq!(
-                    entry.take_run_failure(),
+                    entry.take_run_failure().map(|cause| cause.reason),
                     Some(carrick_core_abi::NativeRunFailureReason::NativeStale)
                 );
                 assert!(entry.take_root_exit().is_none());

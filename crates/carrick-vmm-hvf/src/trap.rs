@@ -8542,7 +8542,7 @@ impl HvfInner {
                         })?;
                     // SAFETY: complete aligned wire record retained by the stopped CPU.
                     let record = unsafe { &*pointer };
-                    let (reason, crossings) = custody
+                    let (cause, crossings) = custody
                         .fork_stock
                         .lock()
                         .service_run_failure(execution, record)
@@ -8554,7 +8554,8 @@ impl HvfInner {
                     // Runtime propagates this named error through carrier cleanup;
                     // the CLI's existing run-failure convention is exit 125.
                     return Err(TrapError::NativeRunFailure {
-                        reason: reason.as_str(),
+                        reason: cause.reason.as_str(),
+                        site: cause.site,
                         crossings,
                     });
                 }

@@ -4,7 +4,7 @@ use crate::abi::thread::{
     AltStack, BlockedMask, BornRecord, EntryRef, EntryState, GateState, Lifecycle,
     LifecycleDecline, ThreadControlSlot, ThreadLifecyclePage, TransitionError,
 };
-use carrick_personality_api::NativeRunFailureReason;
+use carrick_personality_api::{NativeRunFailureCause, NativeRunFailureReason};
 use carrick_sched_core::process::{TerminationKind, TerminationStatus};
 pub use carrick_syscall_abi::LinuxWaitOptions;
 
@@ -356,7 +356,7 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     }
     fn store_handoff_receipt(&mut self, _receipt: carrick_core_abi::EntryHandoffReceipt<C>) {}
     fn prepare_object_park(&mut self) {}
-    fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
+    fn take_run_failure(&mut self) -> Option<NativeRunFailureCause> {
         None
     }
     fn take_relative_futex_wait(&mut self) -> Option<crate::sched::RelativeFutexWait> {
@@ -688,6 +688,8 @@ pub trait LifecycleNative<'a>: UserCopy {
     }
 
     /// Terminal custody loss must never become a guest errno or leave exit parked.
+    /// The run failure names the caller's site (#2853).
+    #[track_caller]
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
     fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
         ThreadBirthAdmission::Unmanaged

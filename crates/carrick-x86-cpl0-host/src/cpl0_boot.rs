@@ -690,7 +690,7 @@ pub enum InitialSyscallDisposition {
 )]
 pub enum PhysicalProcessExit {
     Exited(carrick_sched_core::process::TerminationStatus),
-    RunFailed(carrick_core_abi::NativeRunFailureReason),
+    RunFailed(carrick_core_abi::NativeRunFailureCause),
 }
 
 #[derive(
@@ -2976,12 +2976,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
                 carrick_core_abi::NATIVE_RUN_FAILURE_PORT => {
-                    let reason = custody.service_run_failure(&lease)?;
+                    let cause = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody
                         .run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
+                    Ok((Some(PhysicalProcessExit::RunFailed(cause)), None, None))
                 }
                 carrick_core_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
@@ -3429,11 +3429,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
                 Some(ProductionPort::RunFailure) => {
-                    let reason = custody.service_run_failure(&lease)?;
+                    let cause = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
+                    Ok((Some(PhysicalProcessExit::RunFailed(cause)), None, None))
                 }
                 Some(ProductionPort::RootExit) => {
                     custody.root_exit_crossings = custody

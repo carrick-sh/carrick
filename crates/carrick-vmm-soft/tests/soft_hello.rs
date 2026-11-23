@@ -368,8 +368,8 @@ fn drive(
                         run.stdout = dispatcher.stdout();
                         return Ok(());
                     }
-                    Some(PhysicalProcessExit::RunFailed(reason)) => {
-                        return Err(format!("run failed {}", reason.as_str()));
+                    Some(PhysicalProcessExit::RunFailed(cause)) => {
+                        return Err(format!("run failed {cause}"));
                     }
                 }
             }

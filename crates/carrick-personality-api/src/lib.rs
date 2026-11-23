@@ -27,7 +27,8 @@ pub use carrick_core::{TaskKey, TaskRusage, TaskSerial, TerminationStatus};
 
 // 5. Neutral lifecycle authority and entry tokens from carrick-core-abi
 pub use carrick_core_abi::{
-    EntryRef, EntryState, GateState, NativeRunFailureReason, Served, ThreadLedgerActivity,
+    EntryRef, EntryState, GateState, NativeRunFailureCause, NativeRunFailureReason, Served,
+    ThreadLedgerActivity,
 };
 
 // 6. Capability-based neutral file service

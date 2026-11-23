@@ -9,11 +9,11 @@
 use core::fmt;
 
 /// Bytes of the panic location's file path kept (its tail: the crate-relative end).
-pub const PANIC_FILE_TAIL_BYTES: usize = 24;
+pub const PANIC_FILE_TAIL_BYTES: usize = carrick_core_abi::SOURCE_SITE_FILE_TAIL_BYTES;
 /// Bytes of the formatted panic message kept (its head).
 pub const PANIC_MESSAGE_BYTES: usize = 48;
 /// Words in the register image of one [`PanicReport`].
-pub const PANIC_REPORT_WORDS: usize = 1 + PANIC_FILE_TAIL_BYTES / 8 + PANIC_MESSAGE_BYTES / 8;
+pub const PANIC_REPORT_WORDS: usize = carrick_core_abi::SOURCE_SITE_WORDS + PANIC_MESSAGE_BYTES / 8;
 
 /// What raised a [`PanicReport`]: the first word of its fatal crossing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,9 +46,7 @@ impl PanicReportKind {
 /// One ring panic or carrier fatal: where it was raised and how its message starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PanicReport {
-    line: u32,
-    column: u32,
-    file_tail: [u8; PANIC_FILE_TAIL_BYTES],
+    site: carrick_core_abi::SourceSite,
     message: [u8; PANIC_MESSAGE_BYTES],
 }
 
@@ -65,22 +63,18 @@ impl PanicReport {
     #[track_caller]
     pub fn at_caller(what: &str) -> Self {
         use fmt::Write;
-        let location = core::panic::Location::caller();
-        let mut report = Self::new(location.file(), location.line(), location.column());
+        let mut report = Self {
+            site: carrick_core_abi::SourceSite::caller(),
+            message: [0; PANIC_MESSAGE_BYTES],
+        };
         let _ = report.message_writer().write_str(what);
         report
     }
 
     /// A record for a panic raised at `file:line:column`, with an empty message.
     pub fn new(file: &str, line: u32, column: u32) -> Self {
-        let bytes = file.as_bytes();
-        let tail = &bytes[bytes.len().saturating_sub(PANIC_FILE_TAIL_BYTES)..];
-        let mut file_tail = [0; PANIC_FILE_TAIL_BYTES];
-        file_tail[..tail.len()].copy_from_slice(tail);
         Self {
-            line,
-            column,
-            file_tail,
+            site: carrick_core_abi::SourceSite::new(file, line, column),
             message: [0; PANIC_MESSAGE_BYTES],
         }
     }
@@ -94,22 +88,20 @@ impl PanicReport {
     }
 
     pub const fn line(&self) -> u32 {
-        self.line
+        self.site.line()
     }
 
     pub const fn column(&self) -> u32 {
-        self.column
+        self.site.column()
     }
 
-    /// The register image: line and column, then the file tail, then the message.
+    /// The register image: the site's words (line and column, then the file
+    /// tail), then the message.
     pub fn words(&self) -> [u64; PANIC_REPORT_WORDS] {
+        const SITE: usize = carrick_core_abi::SOURCE_SITE_WORDS;
         let mut words = [0; PANIC_REPORT_WORDS];
-        words[0] = (u64::from(self.line) << 32) | u64::from(self.column);
-        let text = self
-            .file_tail
-            .chunks_exact(8)
-            .chain(self.message.chunks_exact(8));
-        for (word, chunk) in words[1..].iter_mut().zip(text) {
+        words[..SITE].copy_from_slice(&self.site.words());
+        for (word, chunk) in words[SITE..].iter_mut().zip(self.message.chunks_exact(8)) {
             let mut bytes = [0; 8];
             bytes.copy_from_slice(chunk);
             *word = u64::from_le_bytes(bytes);
@@ -119,40 +111,24 @@ impl PanicReport {
 
     /// Decode a register image. Every image decodes; the text is shown lossily.
     pub fn from_words(words: [u64; PANIC_REPORT_WORDS]) -> Self {
+        const SITE: usize = carrick_core_abi::SOURCE_SITE_WORDS;
+        let mut site = [0; SITE];
+        site.copy_from_slice(&words[..SITE]);
         let mut report = Self {
-            line: (words[0] >> 32) as u32,
-            column: words[0] as u32,
-            file_tail: [0; PANIC_FILE_TAIL_BYTES],
+            site: carrick_core_abi::SourceSite::from_words(site),
             message: [0; PANIC_MESSAGE_BYTES],
         };
-        let text = report
-            .file_tail
-            .chunks_exact_mut(8)
-            .chain(report.message.chunks_exact_mut(8));
-        for (chunk, word) in text.zip(&words[1..]) {
+        for (chunk, word) in report.message.chunks_exact_mut(8).zip(&words[SITE..]) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         report
     }
 }
 
-fn write_text(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    use fmt::Write;
-    for &byte in bytes.iter().take_while(|&&byte| byte != 0) {
-        f.write_char(if byte == b' ' || byte.is_ascii_graphic() {
-            char::from(byte)
-        } else {
-            '?'
-        })?;
-    }
-    Ok(())
-}
-
 impl fmt::Display for PanicReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_text(f, &self.file_tail)?;
-        write!(f, ":{}:{}: ", self.line, self.column)?;
-        write_text(f, &self.message)
+        write!(f, "{}: ", self.site)?;
+        carrick_core_abi::write_wire_text(f, &self.message)
     }
 }
 
