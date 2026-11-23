@@ -823,7 +823,7 @@ fn mounted_static_x86_sysinfo_output_to_an_untouched_page_matches_native() {
         "native oracle: {native_rows}"
     );
     assert!(
-        native_rows.lines().count() == 28 && !native_rows.contains("MISSING"),
+        native_rows.lines().count() == 32 && !native_rows.contains("MISSING"),
         "native Linux fills every buffer: {native_rows}"
     );
 
