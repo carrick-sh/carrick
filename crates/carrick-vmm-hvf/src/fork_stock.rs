@@ -278,12 +278,18 @@ impl ForkStockHostCustody {
                     .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
                     // SAFETY: exclusively reserved physical slot and retained aligned mapping.
                     let result = unsafe {
-                        crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms)
+                        crate::trap::inventory_stage2_map(
+                            custody.stage2_backend(),
+                            mapping.as_ptr().cast(),
+                            base,
+                            len,
+                            perms,
+                        )
                     };
                     if result != 0 {
                         return Err(fail(&format!("native fork arena map: {result:#x}")));
                     }
-                    lease.mark_mapped();
+                    lease.mark_mapped(custody.stage2_backend_handle());
                     crate::trap::StructuralBackingOwner::new_in(
                         custody, mapping, lease, perms, epoch, base, len,
                     )?
@@ -342,14 +348,21 @@ impl ForkStockHostCustody {
         let perms =
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
         // SAFETY: the fresh IPA lease and mapping are retained by the owner.
-        let result =
-            unsafe { crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms) };
+        let result = unsafe {
+            crate::trap::inventory_stage2_map(
+                custody.stage2_backend(),
+                mapping.as_ptr().cast(),
+                base,
+                len,
+                perms,
+            )
+        };
         if result != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "native fork control map: {result:#x}"
             )));
         }
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let epoch = crate::trap::next_structural_epoch()?;
         let owner = crate::trap::StructuralBackingOwner::new_in(
             custody, mapping, lease, perms, epoch, base, len,

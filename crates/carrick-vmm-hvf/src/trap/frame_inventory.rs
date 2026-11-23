@@ -1463,7 +1463,9 @@ impl Stage2State {
             let retirement = retry_structural_backing_identities_in_using(
                 custody,
                 &[identity],
-                &mut unmap_global_frame_stage2_record,
+                &mut |ipa, len| {
+                    unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+                },
                 &mut release_retired_stage2_ipa,
             );
             if let Err(error) = retirement {
@@ -1500,7 +1502,7 @@ impl Stage2State {
             return Ok(());
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
+        let rc = unsafe { inventory_stage2_unmap(custody.stage2_backend(), ipa, size) };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
@@ -1537,7 +1539,7 @@ impl Stage2State {
             )));
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
+        let rc = unsafe { inventory_stage2_unmap(custody.stage2_backend(), ipa, size) };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"

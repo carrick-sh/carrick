@@ -381,7 +381,7 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     retry_structural_backing_identities_in_using(
         custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
         &mut release_retired_stage2_ipa,
     )
     .unwrap();

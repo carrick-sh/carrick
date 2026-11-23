@@ -3,7 +3,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
-use carrick_aarch64::stage2::{Stage2Backend as _, Stage2Status, stage2_perms_from_bits};
+use carrick_aarch64::stage2::{Stage2Status, stage2_perms_from_bits};
 use carrick_fatal::carrick_fatal;
 
 impl HvfMappedRegion {
@@ -293,8 +293,8 @@ const HV_BAD_ARGUMENT: u32 = 0xfae9_4003;
 
 /// HVF's stage-2 backend, and the only place `carrick-vmm-hvf` calls
 /// Hypervisor.framework's raw stage-2 functions. HVF has one VM per process,
-/// so the backend holds no state. The `inventory_stage2_*` wrappers are its
-/// only callers; custody reaches stage-2 through them.
+/// so the backend holds no state. Carrier custody holds it and supplies it
+/// to the inventory wrappers.
 pub(crate) struct HvfStage2;
 
 /// `hv_return_t` is the backend's 32-bit status word, kept bit for bit.
@@ -333,6 +333,7 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfStage2 {
 /// ([`carrick_aarch64::stage2::STAGE2_PERM_READ`] and its siblings).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn inventory_stage2_map(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
     host: *mut std::ffi::c_void,
     ipa: u64,
     size: usize,
@@ -375,7 +376,7 @@ pub(crate) unsafe fn inventory_stage2_map(
         return Stage2Status::SUCCESS;
     }
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HvfStage2.map(host, ipa, size, perms) };
+    let result = unsafe { backend.map(host, ipa, size, perms) };
     if result.is_success() {
         emit_global_frame_stage2(
             carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Mapped,
@@ -416,7 +417,10 @@ pub(crate) fn emit_global_frame_stage2(
 /// exact already-installed extent as success without accepting arbitrary HVF
 /// errors. The marker is cleared on unmap and every VM destruction.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_map_replay(backing: AliasBacking) -> Stage2Status {
+pub(crate) unsafe fn inventory_stage2_map_replay(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
+    backing: AliasBacking,
+) -> Stage2Status {
     let key = replay_mapping_key(backing);
     mutate_external_alias_state(|registry| {
         if registry.contains_replay(&key) {
@@ -424,6 +428,7 @@ pub(crate) unsafe fn inventory_stage2_map_replay(backing: AliasBacking) -> Stage
         }
         let result = unsafe {
             inventory_stage2_map(
+                backend,
                 backing.physical_host_addr as *mut std::ffi::c_void,
                 backing.physical_ipa,
                 backing.physical_size,
@@ -443,7 +448,11 @@ pub(crate) unsafe fn inventory_stage2_map_replay(backing: AliasBacking) -> Stage
 
 /// Sole stage-2 unmap boundary.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Status {
+pub(crate) unsafe fn inventory_stage2_unmap(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
+    ipa: u64,
+    size: usize,
+) -> Stage2Status {
     #[cfg(test)]
     if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
         let should_fail = STAGE2_AUDIT_STATE.with(|s| {
@@ -470,7 +479,7 @@ pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Stat
         return Stage2Status::SUCCESS;
     }
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HvfStage2.unmap(ipa, size) };
+    let result = unsafe { backend.unmap(ipa, size) };
     if result.is_success() {
         forget_replay_extent(ipa, size);
         emit_global_frame_stage2(
@@ -485,9 +494,11 @@ pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Stat
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_destroy() -> Stage2Status {
+pub(crate) unsafe fn inventory_stage2_destroy(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
+) -> Stage2Status {
     // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HvfStage2.destroy() };
+    let result = unsafe { backend.destroy() };
     if result.is_success() {
         clear_replay_mappings();
     }
@@ -785,6 +796,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
     }
     let r = unsafe {
         inventory_stage2_map(
+            custody.stage2_backend(),
             host.cast::<std::ffi::c_void>(),
             mapping.ipa_start,
             size,
@@ -855,7 +867,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         })?;
         let mut lease =
             GlobalFrameStage2Lease::fixed(region.physical_ipa, region.physical_size as u64);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let owner = StructuralBackingOwner::new_in(
             custody,
             host_mapping,
@@ -1081,7 +1093,7 @@ pub(crate) fn hvf_error(error: applevisor::error::HypervisorError) -> TrapError 
 }
 
 /// Convert a neutral [`carrick_hal::MemPerms`] to applevisor's stage-2
-/// `MemPerms` for the host call in [`HvfStage2`]'s `map`, the one place
+/// `MemPerms` for the backend's host map call, the one place
 /// custody's neutral permissions become HVF's. A DIRECT conversion (no RWX
 /// escalation): that escalation is the `hvf_perms(SegmentPerms)` boot/alias
 /// policy; every other caller passes the perms it wants verbatim.
@@ -1380,7 +1392,15 @@ fn stage2_map_refuses_the_gic_window() {
         LINUX_GIC_WINDOW_BASE - 0x2000,
     ] {
         // SAFETY: the test stub records the call; nothing reaches HVF.
-        let rc = unsafe { inventory_stage2_map(page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
+        let rc = unsafe {
+            inventory_stage2_map(
+                legacy_test_carrier_vm_custody().stage2_backend(),
+                page.as_mut_ptr().cast(),
+                ipa,
+                0x4000,
+                0b111,
+            )
+        };
         assert_eq!(
             rc,
             Stage2Status::from_raw(HV_BAD_ARGUMENT),
@@ -1390,6 +1410,7 @@ fn stage2_map_refuses_the_gic_window() {
     // SAFETY: as above.
     let rc = unsafe {
         inventory_stage2_map(
+            legacy_test_carrier_vm_custody().stage2_backend(),
             page.as_mut_ptr().cast(),
             LINUX_GIC_WINDOW_BASE - 0x4000,
             0x4000,
@@ -1579,10 +1600,12 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         backing,
         // SAFETY: the backing is validated host memory retained by the
         // installation for as long as the VM maps it.
-        |host, ipa, len, perms| unsafe { inventory_stage2_map(host.cast(), ipa, len, perms) },
+        |host, ipa, len, perms| unsafe {
+            inventory_stage2_map(custody.stage2_backend(), host.cast(), ipa, len, perms)
+        },
         |ipa, len| {
             // SAFETY: unmapping exactly the extent this installation mapped.
-            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
+            let rc = unsafe { inventory_stage2_unmap(custody.stage2_backend(), ipa, len) };
             if rc == 0 {
                 Ok(())
             } else {

@@ -84,7 +84,9 @@ impl std::fmt::Debug for PreMappedFramePool {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreMappedFramePool {
     /// Attempt to create and stage-2 map a new pre-mapped frame pool.
-    pub(crate) fn try_new() -> Result<Self, crate::trap::TrapError> {
+    pub(crate) fn try_new(
+        custody: &crate::trap::CarrierVmCustody,
+    ) -> Result<Self, crate::trap::TrapError> {
         let pool_size = frame_pool_size();
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut lease = crate::trap::GlobalFrameStage2Lease::reserve(pool_size as u64, TWO_MIB)?;
@@ -100,6 +102,7 @@ impl PreMappedFramePool {
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
             crate::trap::inventory_stage2_map(
+                custody.stage2_backend(),
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
@@ -111,7 +114,7 @@ impl PreMappedFramePool {
                 "map frame pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{map_rc:x}"
             )));
         }
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
 
         let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
         let num_compounds = pool_size / compound_size;
@@ -389,7 +392,9 @@ unsafe impl Sync for PreMappedRootSlotPool {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreMappedRootSlotPool {
-    pub(crate) fn try_new() -> Result<Self, crate::trap::TrapError> {
+    pub(crate) fn try_new(
+        custody: &crate::trap::CarrierVmCustody,
+    ) -> Result<Self, crate::trap::TrapError> {
         let pool_size = root_slot_pool_size();
         let base_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
         let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base_ipa, pool_size as u64);
@@ -404,6 +409,7 @@ impl PreMappedRootSlotPool {
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
             crate::trap::inventory_stage2_map(
+                custody.stage2_backend(),
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
@@ -415,7 +421,7 @@ impl PreMappedRootSlotPool {
                 "map root slot pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{map_rc:x}"
             )));
         }
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
 
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let num_slots = pool_size / TWO_MIB;

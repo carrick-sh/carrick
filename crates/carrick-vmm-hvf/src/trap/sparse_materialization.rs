@@ -235,6 +235,7 @@ pub(super) fn prepare(
             .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
         let map_result = unsafe {
             inventory_stage2_map(
+                custody.stage2_backend(),
                 physical_host.cast(),
                 physical_ipa,
                 physical_size,
@@ -246,7 +247,7 @@ pub(super) fn prepare(
                 "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
             )));
         }
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let owner_generation = register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -884,6 +885,7 @@ impl MmAccessState {
 
                     let rc = unsafe {
                         inventory_stage2_map(
+                            custody.stage2_backend(),
                             host_mapping.as_ptr().cast(),
                             base,
                             TWO_MIB,
@@ -900,7 +902,7 @@ impl MmAccessState {
                     }
 
                     let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
-                    lease.mark_mapped();
+                    lease.mark_mapped(custody.stage2_backend_handle());
                     let host_addr = host_mapping.as_ptr();
                     (host_addr, Some(host_mapping), lease, None)
                 }
@@ -1607,7 +1609,13 @@ pub(super) fn publish_replacing(
                                     &context.custody,
                                     popped,
                                     &journal,
-                                    &mut unmap_global_frame_stage2_record,
+                                    &mut |ipa, len| {
+                                        unmap_global_frame_stage2_record(
+                                            context.custody.stage2_backend(),
+                                            ipa,
+                                            len,
+                                        )
+                                    },
                                     &mut release_retired_stage2_ipa,
                                 )?;
                                 Ok::<(), TrapError>(())
@@ -2341,7 +2349,7 @@ mod arena_pin_tests {
         .unwrap();
         let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
         // Exercise the injected backend callback as a live stage-2 record.
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let owner = StructuralBackingOwner::new_in(
             &custody,
             host,

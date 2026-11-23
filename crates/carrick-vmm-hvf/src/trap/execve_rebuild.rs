@@ -285,7 +285,7 @@ impl PendingExecStage2Cleanup {
         retry_structural_backing_identities_in_using(
             custody,
             &structural_retirements,
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
             &mut release_retired_stage2_ipa,
         )?;
         self.armed = false;
@@ -718,7 +718,7 @@ impl PreparedExecBacking {
                 // The record presented to publication names the map that the
                 // callback is about to install. Ownership transfers only
                 // after that callback succeeds.
-                lease.mark_mapped();
+                lease.mark_mapped(installed.custody.stage2_backend_handle());
             }
             let install = ExecStage2Install {
                 ipa: lease.base,
@@ -860,6 +860,7 @@ fn install_prepared_exec_backing(
     prepared: PreparedExecBacking,
     successor_root_slot: (u64, u64),
 ) -> Result<PublishedExecBacking, ExecBackingTransactionError> {
+    let custody = std::sync::Arc::clone(&prepared.custody);
     let fail_after = exec_stage2_fail_after_maps();
     let mut maps_completed = 0usize;
     let installed = prepared.install_using(
@@ -880,7 +881,13 @@ fn install_prepared_exec_backing(
                 ),
             );
             let rc = unsafe {
-                inventory_stage2_map(extent.host.cast(), extent.ipa, extent.size, extent.perms)
+                inventory_stage2_map(
+                    custody.stage2_backend(),
+                    extent.host.cast(),
+                    extent.ipa,
+                    extent.size,
+                    extent.perms,
+                )
             };
             if rc == 0
                 && let Some(replay_key) = extent.replay_key()
@@ -908,7 +915,7 @@ fn install_prepared_exec_backing(
             rc
         },
         |ipa, len| {
-            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
+            let rc = unsafe { inventory_stage2_unmap(custody.stage2_backend(), ipa, len) };
             if rc == 0 {
                 Ok(())
             } else {

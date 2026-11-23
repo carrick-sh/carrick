@@ -1299,12 +1299,9 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        self.retire_mm_root_stage2_in_using(
-            custody,
-            expected_root_slot,
-            true,
-            &mut unmap_global_frame_stage2_record,
-        )
+        self.retire_mm_root_stage2_in_using(custody, expected_root_slot, true, &mut |ipa, len| {
+            unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+        })
     }
 
     /// Retire an exec predecessor's physical root while preserving its
@@ -1314,12 +1311,9 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        self.retire_mm_root_stage2_in_using(
-            custody,
-            expected_root_slot,
-            false,
-            &mut unmap_global_frame_stage2_record,
-        )
+        self.retire_mm_root_stage2_in_using(custody, expected_root_slot, false, &mut |ipa, len| {
+            unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+        })
     }
 
     fn retire_mm_root_stage2_in_using(
@@ -2677,6 +2671,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     {
         let map_result = unsafe {
             inventory_stage2_map(
+                lease.custody.stage2_backend(),
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
@@ -2686,7 +2681,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         if map_result != 0 {
             return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
-        new_lease.mark_mapped();
+        new_lease.mark_mapped(lease.custody.stage2_backend_handle());
     }
     #[cfg(test)]
     new_lease.mark_test_mapped_without_backend();
@@ -3208,6 +3203,7 @@ fn perform_foreign_guest_cow(
     {
         let map_result = unsafe {
             inventory_stage2_map(
+                lease.custody.stage2_backend(),
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
@@ -3217,7 +3213,7 @@ fn perform_foreign_guest_cow(
         if map_result != 0 {
             return Err(Error::MutationFailed);
         }
-        new_lease.mark_mapped();
+        new_lease.mark_mapped(lease.custody.stage2_backend_handle());
     }
     #[cfg(test)]
     new_lease.mark_test_mapped_without_backend();

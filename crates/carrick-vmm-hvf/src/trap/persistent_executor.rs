@@ -330,6 +330,7 @@ pub(crate) fn persistent_executor_carrier_mappings<'a>(
 /// drops only after every worker vCPU has been joined and destroyed.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PersistentCarrierMappings {
+    pub(super) stage2_backend: CarrierStage2Backend,
     pub(crate) mappings: TaskMappingIndex,
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool,
@@ -355,6 +356,7 @@ impl PersistentCarrierMappings {
         *task_mappings = task;
         let authority = Self {
             mappings: carrier,
+            stage2_backend: custody.stage2_backend_handle(),
             custody,
             vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
             fd_ceiling_publisher: parking_lot::Mutex::new(None),
@@ -595,8 +597,13 @@ impl Drop for PersistentCarrierMappings {
                     });
                 }
             } else if !vm_destroyed {
-                let rc =
-                    unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
+                let rc = unsafe {
+                    inventory_stage2_unmap(
+                        self.stage2_backend.as_backend(),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                    )
+                };
                 if rc != 0 {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
@@ -1064,7 +1071,13 @@ impl HvfVmState {
         // clean persistent worker; the next executor-idle boundary retries.
         let _remaining = retry_pending_global_frame_retirements_at_idle_in_using(
             &self.carrier_foreign_mm_transport.custody,
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| {
+                unmap_global_frame_stage2_record(
+                    self.carrier_foreign_mm_transport.custody.stage2_backend(),
+                    ipa,
+                    len,
+                )
+            },
         );
         Ok(())
     }
@@ -1319,7 +1332,7 @@ mod tests {
         );
         assert_eq!(
             crate_sources
-                .matches(concat!("inventory_stage2_", "destroy()"))
+                .matches(concat!("inventory_stage2_", "destroy("))
                 .count(),
             1,
             "inventory_stage2_destroy appears only in the custody wrapper"

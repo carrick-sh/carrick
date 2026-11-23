@@ -198,7 +198,7 @@ mod allocator_stats_tests {
             for mm_key in 1..=scale {
                 let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
                 let (base, length) = lease.key();
-                lease.mark_mapped();
+                lease.mark_mapped(a.stage2_backend_handle());
                 let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                     length as usize,
                     crate::host_mapping::HostMappingKind::FrameCow,
@@ -264,7 +264,7 @@ mod allocator_stats_tests {
         let mut lease = GlobalFrameStage2Lease::reserve(length, length).unwrap();
         let (base, length) = lease.key();
         // The callback supplied by the test is the entire stage-2 backend.
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             length as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
@@ -483,7 +483,7 @@ mod allocator_stats_tests {
         // Reusing the IPA creates a new immutable owner. Old-MM destruction
         // cannot retire that successor through the retained predecessor token.
         let mut lease = GlobalFrameStage2Lease::fixed(base, length);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             length as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
@@ -569,7 +569,7 @@ mod allocator_stats_tests {
             PhysicalGrantRelease::Released
         );
         let mut lease = GlobalFrameStage2Lease::fixed(base, length);
-        lease.mark_mapped();
+        lease.mark_mapped(custody.stage2_backend_handle());
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             length as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
@@ -719,7 +719,7 @@ mod allocator_stats_tests {
             // the allocator's best-fit choice among unrelated free extents.
             let reused_base = base;
             let mut lease = GlobalFrameStage2Lease::fixed(reused_base, length);
-            lease.mark_mapped();
+            lease.mark_mapped(custody.stage2_backend_handle());
             let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 length as usize,
                 crate::host_mapping::HostMappingKind::FrameCow,
@@ -1134,7 +1134,7 @@ pub(crate) struct GlobalFrameStage2Lease {
     pub(crate) release_ipa: bool,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
-    pub(crate) backend_map_installed: bool,
+    backend: Option<CarrierStage2Backend>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1149,7 +1149,7 @@ impl GlobalFrameStage2Lease {
             release_ipa: true,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            backend_map_installed: false,
+            backend: None,
         })
     }
 
@@ -1171,18 +1171,18 @@ impl GlobalFrameStage2Lease {
             release_ipa: false,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            backend_map_installed: false,
+            backend: None,
         }
     }
 
-    pub(crate) fn mark_mapped(&mut self) {
+    pub(crate) fn mark_mapped(&mut self, backend: CarrierStage2Backend) {
         self.mapped = true;
-        self.backend_map_installed = true;
+        self.backend = Some(backend);
     }
 
     pub(crate) fn mark_pre_mapped(&mut self) {
         self.mapped = true;
-        self.backend_map_installed = false;
+        self.backend = None;
     }
 
     /// Transfer this reservation into an exact carrier stage-2 record that
@@ -1196,14 +1196,14 @@ impl GlobalFrameStage2Lease {
             || record.ipa != self.base
             || record.len as u64 != self.length
             || !record.mapped
-            || record.backend_map_installed != self.backend_map_installed
+            || record.backend_map_installed != self.backend.is_some()
             || record.release_ipa != self.release_ipa;
         // Once the record exists it is the sole retirement authority even if
         // its snapshot exposes an internal mismatch. Disarm before reporting
         // that invariant failure so unwinding cannot unmap/release twice.
         self.active = false;
         self.mapped = false;
-        self.backend_map_installed = false;
+        self.backend = None;
         self.release_ipa = false;
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         {
@@ -1237,7 +1237,7 @@ impl GlobalFrameStage2Lease {
     /// release, which `Drop` then does.
     pub(crate) fn forget_backend_mapping(&mut self) {
         self.mapped = false;
-        self.backend_map_installed = false;
+        self.backend = None;
     }
 
     #[allow(dead_code)]
@@ -1252,12 +1252,11 @@ impl GlobalFrameStage2Lease {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
-        let unmap_backend = self.backend_map_installed;
-        if unmap_backend {
+        if let Some(backend) = &self.backend {
             let size = usize::try_from(self.length).map_err(|_| {
                 TrapError::Hypervisor("global frame stage-2 lease is too large".to_owned())
             })?;
-            let rc = unsafe { inventory_stage2_unmap(self.base, size) };
+            let rc = unsafe { inventory_stage2_unmap(backend.as_backend(), self.base, size) };
             if rc != 0 {
                 return Err(TrapError::Hypervisor(format!(
                     "guest-memory unmap(guest=0x{:x}, size={}) failed: 0x{:x}",
@@ -1265,7 +1264,7 @@ impl GlobalFrameStage2Lease {
                 )));
             }
             self.mapped = false;
-            self.backend_map_installed = false;
+            self.backend = None;
         }
         if self.release_ipa {
             release_global_frame_ipa(self.base, self.length)?;
@@ -1650,9 +1649,9 @@ impl GlobalFrameHostOwner {
         let custody = self.custody.upgrade().ok_or_else(|| {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
-        match custody
-            .retire_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
-        {
+        match custody.retire_stage2_record_using(self.record_identity, |ipa, len| {
+            unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+        }) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 finalize_global_frame_owner_record(&custody, self)
@@ -2044,7 +2043,7 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point(
     retire_carrier_stage2_record_at_safe_point_using(
         custody,
         identity,
-        unmap_global_frame_stage2_record,
+        |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
         release_retired_stage2_ipa,
     )
 }
@@ -2107,7 +2106,7 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
                 ))
             })?,
         };
-        let backend_map_installed = lease.backend_map_installed;
+        let backend_map_installed = lease.backend.is_some();
         custody
             .register_stage2_record(CarrierStage2RecordSpec {
                 vm_generation,
@@ -2142,9 +2141,9 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     lease.active = false;
     lease.mapped = false;
     lease.release_ipa = false;
+    lease.backend = None;
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     {
-        lease.backend_map_installed = false;
         lease.drop_backing_audit = None;
     }
     Ok(identity)
@@ -2152,10 +2151,11 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn unmap_global_frame_stage2_record(
+    backend: &dyn carrick_aarch64::stage2::Stage2Backend,
     ipa: u64,
     len: usize,
 ) -> Result<(), CarrierStage2BackendError> {
-    let rc = unsafe { inventory_stage2_unmap(ipa, len) };
+    let rc = unsafe { inventory_stage2_unmap(backend, ipa, len) };
     if rc == 0 {
         Ok(())
     } else {
@@ -2170,13 +2170,9 @@ pub(crate) fn register_global_frame_host_owner_in(
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
 ) -> Result<u64, TrapError> {
-    register_global_frame_host_owner_in_using(
-        custody,
-        lease,
-        mapping,
-        perms,
-        &mut unmap_global_frame_stage2_record,
-    )
+    register_global_frame_host_owner_in_using(custody, lease, mapping, perms, &mut |ipa, len| {
+        unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2297,8 +2293,9 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let outcome =
-            custody.retire_stage2_record_using(record_identity, unmap_global_frame_stage2_record);
+        let outcome = custody.retire_stage2_record_using(record_identity, |ipa, len| {
+            unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+        });
         match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -2392,7 +2389,7 @@ pub(crate) fn publish_pooled_exec_root_owner_in(
     handle: crate::frame_pool::PooledRootSlotHandle,
 ) -> Result<u64, TrapError> {
     let key = lease.key();
-    if !lease.mapped || lease.backend_map_installed {
+    if !lease.mapped || lease.backend.is_some() {
         return Err(TrapError::Hypervisor(format!(
             "pooled exec root lease ({:#x}, {:#x}) is not pre-mapped",
             key.0, key.1
@@ -3062,7 +3059,7 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
         if let Err(error) = retry_structural_backing_identities_in_using(
             custody,
             &[identity],
-            &mut unmap_global_frame_stage2_record,
+            &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
             &mut release_retired_stage2_ipa,
         ) {
             rollback_error.get_or_insert(error);
@@ -3627,7 +3624,7 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in(
         ipa,
         length,
         expected_generation,
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
     )
 }
 
@@ -3643,7 +3640,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in(
         ipa,
         length,
         expected_generation,
-        &mut unmap_global_frame_stage2_record,
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
     )
 }
 
@@ -3911,7 +3908,9 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
 pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
     custody: &CarrierVmCustody,
 ) -> Result<(), TrapError> {
-    drain_all_global_frame_retirements_in_using(custody, &mut unmap_global_frame_stage2_record)
+    drain_all_global_frame_retirements_in_using(custody, &mut |ipa, len| {
+        unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len)
+    })
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
