@@ -7595,6 +7595,22 @@ reservation_shape_witness!(
     "A 4 GiB reserve, 1 MiB committed RW 3 GiB into it."
 );
 reservation_shape_witness!(
+    production_mprotect_makes_written_anonymous_memory_executable,
+    11,
+    "#2874: the root maps 1.875 MiB anonymous RW, writes it, mprotects it PROT_READ|PROT_EXEC \
+     and runs it (V8's code range; ENOSYS before the fix)."
+);
+reservation_shape_witness!(
+    production_mprotect_makes_a_committed_reserve_executable,
+    12,
+    "#2874: as the anonymous RW case, committed RW inside a 16 MiB PROT_NONE reserve."
+);
+reservation_shape_witness!(
+    production_mprotect_makes_a_forked_childs_anonymous_memory_executable,
+    13,
+    "#2874: as the anonymous RW case, in a forked child while its parent waits."
+);
+reservation_shape_witness!(
     production_fork_child_runs_beside_a_parent_holding_a_4gib_reservation,
     9,
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \

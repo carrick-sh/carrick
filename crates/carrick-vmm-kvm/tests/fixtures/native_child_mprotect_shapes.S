@@ -12,6 +12,11 @@
  *     three, overwrites the reserved page (COW), reserves 1 GiB more and
  *     commits a page of it. The parent, alive throughout, still reads its
  *     own page.
+ *   11 (#2874) the root maps 1.875 MiB anonymous RW, writes a `ret` into
+ *     every page, mprotects it PROT_READ|PROT_EXEC and calls its first and
+ *     last pages
+ *   12 as 11, the range committed RW inside a 16 MiB PROT_NONE reserve
+ *   13 as 11, in a forked child
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -52,11 +57,13 @@
 #define RESERVE 0x40000000
 #define COMMIT_AT 0x100000
 #endif
+/* #2874: V8's code-range length */
+#define CODE_LEN 0x1e0000
 
 .global _start
 .text
 _start:
-#if CASE == 8
+#if CASE == 8 || CASE == 11 || CASE == 12
     jmp child               /* the run root itself, no fork */
 #endif
 #if CASE == 9
@@ -117,6 +124,26 @@ child:
     MPROTECT %r15, $0x1000, $3
     movb $1, (%r15)
     cmpb $0x3c, (%r14)
+    jne bad
+#elif CASE >= 11
+#if CASE == 12
+    MMAP $0x1000000, $0, $0x4022
+    add $0x200000, %r15
+    MPROTECT %r15, $CODE_LEN, $3
+#else
+    MMAP $CODE_LEN, $3, $0x22
+#endif
+    mov %r15, %rbx
+    lea CODE_LEN(%r15), %r13
+1:  movb $0xc3, (%rbx)      /* ret */
+    add $4096, %rbx
+    cmp %r13, %rbx
+    jb 1b
+    MPROTECT %r15, $CODE_LEN, $5
+    call *%r15              /* the first page now executes */
+    lea -4096(%r13), %rax
+    call *%rax              /* and the last */
+    cmpb $0xc3, -4096(%r13)
     jne bad
 #else
     MMAP $RESERVE, $0, $0x4022
