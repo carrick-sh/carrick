@@ -1,7 +1,7 @@
 // Blocking waits across a run root and its fork child, with no select, on
 // x86_64 (#1051's gap 2). The root holds a loopback listener and a pipe's
 // write end; the child holds a connected TCP socket and the pipe's read
-// end. Six rows, with no interval timer (x86 setitimer is a gap of its
+// end. Seven rows, with no interval timer (x86 setitimer is a gap of its
 // own, #2876); each wait is bounded by a receive timeout, a poll timeout
 // or a later write of the other process:
 //   accept: the root blocks in accept4 before the child connects;
@@ -19,7 +19,10 @@
 //      flag belongs to the open description, which the fork shares;
 //   e: socket timeouts that must wait (#2878): the child's receive under a
 //      short SO_RCVTIMEO answers EAGAIN when nothing arrives, and the
-//      root's receive under a longer one is woken by the child's write.
+//      root's receive under a longer one is woken by the child's write;
+//   f: a send that must wait (#2878): the child fills the root's inherited
+//      connection without blocking, then its send under a short
+//      SO_SNDTIMEO answers EAGAIN, as nobody reads the other end.
 // Every line is `who.name result`, where a failure prints as `-errno`; the
 // native run is the oracle. The root prints after the child exits, so the
 // processes' lines never interleave.
@@ -128,6 +131,21 @@ int main(void) {
         pause_ms(800);
         byte = 'z';
         value("d.write", syscall(SYS_write, shared_peer, &byte, 1));
+        // Row f: a send under SO_SNDTIMEO into a full buffer answers EAGAIN
+        // when the timeout passes (the root never reads `shared` again).
+        static char chunk[4096];
+        long filled = 0;
+        for (int i = 0; i < 100000; i++) {
+            long sent = syscall(SYS_sendto, shared_peer, chunk, sizeof chunk, MSG_DONTWAIT, NULL, 0);
+            if (sent < 0) {
+                filled = call(sent);
+                break;
+            }
+        }
+        value("f.filled", filled);
+        struct timeval send_bound = {0, 300000};
+        value("f.sndtimeo", syscall(SYS_setsockopt, shared_peer, SOL_SOCKET, SO_SNDTIMEO, &send_bound, sizeof send_bound));
+        value("f.send", syscall(SYS_sendto, shared_peer, chunk, 1, 0, NULL, 0));
         // Row e: nothing arrives within the receive timeout.
         struct timeval brief = {0, 300000};
         value("e.rcvtimeo", syscall(SYS_setsockopt, sock, SOL_SOCKET, SO_RCVTIMEO, &brief, sizeof brief));
