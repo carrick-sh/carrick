@@ -1,6 +1,7 @@
 //! System-information and resource-limit syscall family.
 use crate::abi::entry::SyscallResult;
 use crate::lifecycle::UserCopy;
+use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
 use carrick_guest_arch::UserVa;
 
 pub const EPERM: i64 = -1;
@@ -245,6 +246,53 @@ pub enum SysinfoCall {
     Getcwd,
 }
 
+/// What a system-information call leaves for the entry owner.
+///
+/// The family never writes guest memory itself. A page the guest has mapped
+/// but not touched, or holds copy-on-write, is not a bad address: only the
+/// memory owner can tell the two apart, and only it can wait for the page.
+#[derive(Debug)]
+pub enum SysinfoOutcome {
+    /// The call is complete with this result.
+    Returned(SyscallResult),
+    /// Every effect is done. The memory owner publishes `bytes` at `address`,
+    /// waiting for the page if it must, then returns `result`; an address
+    /// that is not the guest's to write is EFAULT.
+    Output {
+        address: UserVa,
+        bytes: alloc::vec::Vec<u8>,
+        result: SyscallResult,
+    },
+    /// An argument record is not available yet and nothing has happened:
+    /// the memory owner prepares it and the call runs again.
+    Input(GuestCopyRequest),
+}
+
+fn returned(result: i64) -> Option<SysinfoOutcome> {
+    Some(SysinfoOutcome::Returned(SyscallResult::new(result)))
+}
+
+fn output(address: UserVa, bytes: &[u8], result: i64) -> Option<SysinfoOutcome> {
+    Some(SysinfoOutcome::Output {
+        address,
+        bytes: bytes.to_vec(),
+        result: SyscallResult::new(result),
+    })
+}
+
+/// Read an argument record before any effect.
+fn input<'a>(
+    native: &mut dyn SysinfoNative<'a>,
+    dst: &mut [u8],
+    src: UserVa,
+) -> Result<(), SysinfoOutcome> {
+    match native.copy_in(dst, src) {
+        CopyOutcome::Done => Ok(()),
+        CopyOutcome::Fault => Err(SysinfoOutcome::Returned(SyscallResult::new(EFAULT))),
+        CopyOutcome::NotYet(request) => Err(SysinfoOutcome::Input(request)),
+    }
+}
+
 pub trait ProcessSysinfoVenue {
     fn get_uts(&self) -> LinuxUtsname;
     fn can_set_hostname(&self) -> Result<(), i64>;
@@ -282,7 +330,7 @@ fn set_uts_string<'a>(
     len: usize,
     native: &mut dyn SysinfoNative<'a>,
     is_domain: bool,
-) -> Option<SyscallResult> {
+) -> Option<SysinfoOutcome> {
     let venue = native.process_sysinfo()?;
     let perm = if is_domain {
         venue.can_set_domainname()
@@ -290,14 +338,19 @@ fn set_uts_string<'a>(
         venue.can_set_hostname()
     };
     if let Err(e) = perm {
-        return Some(SyscallResult::new(e));
+        return returned(e);
     }
     if len > 64 {
-        return Some(SyscallResult::new(EINVAL));
+        return returned(EINVAL);
     }
     let mut buf = [0u8; 64];
-    if len > 0 && (ptr.raw() == 0 || !native.copy_in(&mut buf[..len], ptr).is_done()) {
-        return Some(SyscallResult::new(EFAULT));
+    if len > 0 {
+        if ptr.raw() == 0 {
+            return returned(EFAULT);
+        }
+        if let Err(outcome) = input(native, &mut buf[..len], ptr) {
+            return Some(outcome);
+        }
     }
     let venue = native.process_sysinfo()?;
     let res = if is_domain {
@@ -305,26 +358,23 @@ fn set_uts_string<'a>(
     } else {
         venue.set_hostname(&buf[..len])
     };
-    Some(SyscallResult::new(res.err().unwrap_or(0)))
+    returned(res.err().unwrap_or(0))
 }
 
 #[inline(never)]
-pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Option<SyscallResult> {
+pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Option<SysinfoOutcome> {
     let args = native.arguments();
     match call {
         SysinfoCall::Uname => {
             let ptr = UserVa::new(args[0]);
             if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
+                return returned(EFAULT);
             }
             let uts = {
                 let venue = native.process_sysinfo()?;
                 venue.get_uts()
             };
-            if !native.copy_out(ptr, &uts.to_bytes()).is_done() {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            Some(SyscallResult::new(0))
+            output(ptr, &uts.to_bytes(), 0)
         }
         SysinfoCall::SetHostname => {
             set_uts_string(UserVa::new(args[0]), args[1] as usize, native, false)
@@ -336,45 +386,42 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             let resource = args[0] as usize;
             let ptr = UserVa::new(args[1]);
             if resource >= 16 {
-                return Some(SyscallResult::new(EINVAL));
+                return returned(EINVAL);
             }
             if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
+                return returned(EFAULT);
             }
             let lim = {
                 let venue = native.process_sysinfo()?;
                 match venue.get_rlimit(resource) {
                     Ok(l) => l,
-                    Err(e) => return Some(SyscallResult::new(e)),
+                    Err(e) => return returned(e),
                 }
             };
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&lim.rlim_cur.to_ne_bytes());
             bytes[8..16].copy_from_slice(&lim.rlim_max.to_ne_bytes());
-            if !native.copy_out(ptr, &bytes).is_done() {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            Some(SyscallResult::new(0))
+            output(ptr, &bytes, 0)
         }
         SysinfoCall::SetRlimit => {
             let resource = args[0] as usize;
             let ptr = UserVa::new(args[1]);
             if resource >= 16 {
-                return Some(SyscallResult::new(EINVAL));
+                return returned(EINVAL);
             }
             if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
+                return returned(EFAULT);
             }
             let mut bytes = [0u8; 16];
-            if !native.copy_in(&mut bytes, ptr).is_done() {
-                return Some(SyscallResult::new(EFAULT));
+            if let Err(outcome) = input(native, &mut bytes, ptr) {
+                return Some(outcome);
             }
             let cur = u64::from_ne_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
             let max = u64::from_ne_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
             let venue = native.process_sysinfo()?;
             match venue.set_rlimit(resource, LinuxRlimit::new(cur, max)) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(()) => returned(0),
+                Err(e) => returned(e),
             }
         }
         SysinfoCall::Prlimit64 => {
@@ -383,12 +430,12 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             let new_limit_ptr = UserVa::new(args[2]);
             let old_limit_ptr = UserVa::new(args[3]);
             if resource >= 16 {
-                return Some(SyscallResult::new(EINVAL));
+                return returned(EINVAL);
             }
             let new_limit = if new_limit_ptr.raw() != 0 {
                 let mut bytes = [0u8; 16];
-                if !native.copy_in(&mut bytes, new_limit_ptr).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = input(native, &mut bytes, new_limit_ptr) {
+                    return Some(outcome);
                 }
                 let cur = u64::from_ne_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
                 let max = u64::from_ne_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
@@ -400,74 +447,65 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let venue = native.process_sysinfo()?;
                 match venue.prlimit64(pid, resource, new_limit) {
                     Ok(l) => l,
-                    Err(e) => return Some(SyscallResult::new(e)),
+                    Err(e) => return returned(e),
                 }
             };
             if old_limit_ptr.raw() != 0 {
                 let mut bytes = [0u8; 16];
                 bytes[0..8].copy_from_slice(&old.rlim_cur.to_ne_bytes());
                 bytes[8..16].copy_from_slice(&old.rlim_max.to_ne_bytes());
-                if !native.copy_out(old_limit_ptr, &bytes).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
-                }
+                // The new limit, if any, is already set: the owner finishes
+                // this record without running the call again.
+                return output(old_limit_ptr, &bytes, 0);
             }
-            Some(SyscallResult::new(0))
+            returned(0)
         }
         SysinfoCall::Umask => {
             let mask = args[0] as u32;
             let venue = native.process_sysinfo()?;
             let old = venue.umask(mask);
-            Some(SyscallResult::new(i64::from(old)))
+            returned(i64::from(old))
         }
         SysinfoCall::GetRusage => {
             let who = args[0] as i32;
             let ptr = UserVa::new(args[1]);
             if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
+                return returned(EFAULT);
             }
             let rusage = {
                 let venue = native.process_sysinfo()?;
                 match venue.getrusage(who) {
                     Ok(r) => r,
-                    Err(e) => return Some(SyscallResult::new(e)),
+                    Err(e) => return returned(e),
                 }
             };
-            if !native.copy_out(ptr, &rusage.to_bytes()).is_done() {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            Some(SyscallResult::new(0))
+            output(ptr, &rusage.to_bytes(), 0)
         }
         SysinfoCall::Getcwd => {
             let ptr = UserVa::new(args[0]);
             let size = args[1];
             let mut visible = match native.process_sysinfo()?.getcwd()? {
                 Ok(visible) => visible,
-                Err(errno) => return Some(SyscallResult::new(errno)),
+                Err(errno) => return returned(errno),
             };
             visible.push(0);
             // Linux returns the length filled, NUL included; ERANGE before
             // any copy when the buffer is too small.
             if visible.len() as u64 > size {
-                return Some(SyscallResult::new(ERANGE));
+                return returned(ERANGE);
             }
-            if !native.copy_out(ptr, &visible).is_done() {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            Some(SyscallResult::new(visible.len() as i64))
+            output(ptr, &visible, visible.len() as i64)
         }
         SysinfoCall::Sysinfo => {
             let ptr = UserVa::new(args[0]);
             if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
+                return returned(EFAULT);
             }
             let info = {
                 let venue = native.process_sysinfo()?;
                 venue.sysinfo()
             };
-            if !native.copy_out(ptr, &info.to_bytes()).is_done() {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            Some(SyscallResult::new(0))
+            output(ptr, &info.to_bytes(), 0)
         }
     }
 }
@@ -481,6 +519,8 @@ mod tests {
         args: [u64; 6],
         memory: BTreeMap<u64, u8>,
         venue: MockVenue,
+        /// Absent input bytes are an owner wait instead of a fault.
+        not_yet: bool,
     }
 
     impl MockNative {
@@ -489,7 +529,25 @@ mod tests {
                 args: [0; 6],
                 memory: BTreeMap::new(),
                 venue: MockVenue::default(),
+                not_yet: false,
             }
+        }
+    }
+
+    /// Run a call as the entry owner does on a venue whose pages are all
+    /// present: publish the output, then return the result.
+    fn run(call: SysinfoCall, mock: &mut MockNative) -> SyscallResult {
+        match invoke(call, mock).unwrap() {
+            SysinfoOutcome::Returned(result) => result,
+            SysinfoOutcome::Output {
+                address,
+                bytes,
+                result,
+            } => {
+                assert!(mock.copy_out(address, &bytes).is_done());
+                result
+            }
+            SysinfoOutcome::Input(request) => panic!("unexpected input wait: {request:?}"),
         }
     }
 
@@ -499,6 +557,12 @@ mod tests {
             for (i, byte) in dst.iter_mut().enumerate() {
                 if let Some(&b) = self.memory.get(&(addr + i as u64)) {
                     *byte = b;
+                } else if self.not_yet {
+                    return carrick_core::user_copy::CopyOutcome::NotYet(GuestCopyRequest {
+                        address: src,
+                        len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                        access: carrick_guest_arch::Access::Read,
+                    });
                 } else {
                     return carrick_core::user_copy::CopyOutcome::Fault;
                 }
@@ -620,7 +684,7 @@ mod tests {
         mock.venue.can_set_host_error = Some(EPERM);
         mock.args[0] = 0xdead_beef; // unmapped memory
         mock.args[1] = 5;
-        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetHostname, &mut mock);
         assert_eq!(res.raw(), EPERM);
     }
 
@@ -629,7 +693,7 @@ mod tests {
         let mut mock = MockNative::new();
         mock.args[0] = 0; // NULL pointer
         mock.args[1] = 0; // len == 0
-        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetHostname, &mut mock);
         assert_eq!(res.raw(), 0);
         assert_eq!(mock.venue.hostname, b"");
     }
@@ -639,7 +703,7 @@ mod tests {
         let mut mock = MockNative::new();
         mock.args[0] = 0; // NULL pointer
         mock.args[1] = 0; // len == 0
-        let res = invoke(SysinfoCall::SetDomainname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetDomainname, &mut mock);
         assert_eq!(res.raw(), 0);
         assert_eq!(mock.venue.domainname, b"");
     }
@@ -649,7 +713,7 @@ mod tests {
         let mut mock = MockNative::new();
         mock.args[0] = 0x1000;
         mock.args[1] = 65;
-        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetHostname, &mut mock);
         assert_eq!(res.raw(), EINVAL);
     }
 
@@ -659,7 +723,7 @@ mod tests {
         mock.venue.can_set_host_error = Some(EPERM);
         mock.args[0] = 0x1000;
         mock.args[1] = 65; // len > 64
-        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetHostname, &mut mock);
         assert_eq!(res.raw(), EPERM);
     }
 
@@ -669,7 +733,7 @@ mod tests {
         mock.venue.can_set_domain_error = Some(EPERM);
         mock.args[0] = 0x1000;
         mock.args[1] = 65; // len > 64
-        let res = invoke(SysinfoCall::SetDomainname, &mut mock).unwrap();
+        let res = run(SysinfoCall::SetDomainname, &mut mock);
         assert_eq!(res.raw(), EPERM);
     }
 
@@ -677,10 +741,62 @@ mod tests {
     fn uname_copies_uts_record() {
         let mut mock = MockNative::new();
         mock.args[0] = 0x1000;
-        let res = invoke(SysinfoCall::Uname, &mut mock).unwrap();
+        let res = run(SysinfoCall::Uname, &mut mock);
         assert_eq!(res.raw(), 0);
         // Verify sysname starts with "Linux\0"
         let sysname: alloc::vec::Vec<u8> = (0..6).map(|i| mock.memory[&(0x1000 + i)]).collect();
         assert_eq!(&sysname, b"Linux\0");
+    }
+
+    /// The family hands every output to the memory owner and never decides
+    /// EFAULT from its own copy: a mapped page the guest has not touched is
+    /// not a bad address (git's first `getcwd`, #2223's class).
+    #[test]
+    fn outputs_are_left_to_the_memory_owner() {
+        for (call, args, len, result) in [
+            (SysinfoCall::Uname, [0x7000, 0, 0, 0, 0, 0], 390, 0),
+            (SysinfoCall::GetRlimit, [7, 0x7000, 0, 0, 0, 0], 16, 0),
+            (SysinfoCall::Prlimit64, [0, 7, 0, 0x7000, 0, 0], 16, 0),
+            (SysinfoCall::Sysinfo, [0x7000, 0, 0, 0, 0, 0], 112, 0),
+        ] {
+            let mut mock = MockNative::new();
+            mock.args = args;
+            match invoke(call, &mut mock).unwrap() {
+                SysinfoOutcome::Output {
+                    address,
+                    bytes,
+                    result: reported,
+                } => {
+                    assert_eq!(address, UserVa::new(0x7000), "{call:?}");
+                    assert_eq!(bytes.len(), len, "{call:?}");
+                    assert_eq!(reported, SyscallResult::new(result), "{call:?}");
+                }
+                other => panic!("{call:?}: {other:?}"),
+            }
+            assert!(mock.memory.is_empty(), "{call:?} wrote guest memory itself");
+        }
+    }
+
+    /// An argument record on a page that is not available yet is an owner
+    /// wait with no effect, not EFAULT; a bad address stays EFAULT.
+    #[test]
+    fn an_unavailable_input_waits_before_any_effect() {
+        let mut mock = MockNative::new();
+        mock.args = [0x1000, 4, 0, 0, 0, 0];
+        mock.not_yet = true;
+        match invoke(SysinfoCall::SetHostname, &mut mock).unwrap() {
+            SysinfoOutcome::Input(request) => {
+                assert_eq!(request.address, UserVa::new(0x1000));
+                assert_eq!(request.len, carrick_guest_arch::GuestLen::new(4));
+                assert_eq!(request.access, carrick_guest_arch::Access::Read);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(mock.venue.hostname.is_empty(), "no effect before the input");
+        mock.not_yet = false;
+        assert_eq!(
+            run(SysinfoCall::SetHostname, &mut mock),
+            SyscallResult::new(EFAULT)
+        );
     }
 }
