@@ -308,6 +308,10 @@
     {
       "owner": "carrick_cli::debug_soft_run::run_to_status",
       "issue": 1236
+    },
+    {
+      "owner": "carrick_core::mm::window::SizeAdmission",
+      "issue": 1338
     }
   ],
   "terminal_custody": []
