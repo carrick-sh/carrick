@@ -2729,3 +2729,40 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
         }
     }
 }
+
+#[cfg(test)]
+mod include_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_inventory_resolves_literal_includes() -> Result<(), ReceiptError> {
+        let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../carrick-kernel");
+        let bin = "carrick_kernel";
+        let test =
+            "dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child";
+
+        // The retirement scan refuses unresolved source paths even when the
+        // inventory can still list attributed tests alongside opaque macros.
+        assert!(tree_has_test(&kernel, bin, test)?);
+        let inventory = tree_test_inventory(&kernel)?;
+        let included =
+            "kernel::scheduler::tests::serial_host::exit_drain_abandons_object_wait_exactly_once";
+        for test in [test, included] {
+            assert!(
+                inventory
+                    .iter()
+                    .any(|krate| krate.tests.contains_key(&(bin.into(), test.into()))),
+                "missing {bin}::{test}"
+            );
+        }
+        // The real crate defines item macros. Its inventory can flag their
+        // expansions as unknown even though the include source scan succeeds.
+        assert!(inventory.iter().all(|krate| {
+            krate
+                .unresolved
+                .as_ref()
+                .is_none_or(|reason| reason.contains("generator"))
+        }));
+        Ok(())
+    }
+}
