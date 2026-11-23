@@ -12541,7 +12541,7 @@ mod tests {
         ] {
             // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+                carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = ThreadLifecyclePage::new();
             let control = ThreadControlSlot::new();
@@ -12801,7 +12801,7 @@ mod tests {
     fn two_roots_fork_gate_contract(peer_gate: Option<carrick_el1_abi::GateState>) {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let registry = Box::leak(Box::new(NativeProcessRegistry::<
             AddressContext<RootGpa>,
@@ -13212,7 +13212,7 @@ mod tests {
                 .is_none()
         );
         let foreign_zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         assert!(
             registry
@@ -14097,7 +14097,7 @@ mod tests {
     fn nonleader_thread_forks_through_its_authenticated_process_owner() {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let registry = Box::leak(Box::new(NativeProcessRegistry::<
             AddressContext<RootGpa>,
@@ -14302,7 +14302,7 @@ mod tests {
         ] {
             // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                carrick_test_support::ZeroedBox::<
+                carrick_zeroed_pages::ZeroedBox::<
                     ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
                 >::new_zeroed()
             };
@@ -14391,7 +14391,7 @@ mod tests {
     fn signal_wait_contract(default_stop: bool, suspend_only: bool) {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -14749,7 +14749,7 @@ mod tests {
     fn actual_compact_root_can_exit_before_its_first_park() {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -14867,7 +14867,7 @@ mod tests {
     fn exit_failure_preserves_stale_cause() {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -15014,7 +15014,7 @@ mod tests {
         ] {
             // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+                carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
@@ -15294,7 +15294,7 @@ mod tests {
     fn clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue() {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -15538,7 +15538,7 @@ mod tests {
         let _ = host_test_support::take_signal_copies();
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         zone.publish_carrier_cpu_count(1);
         let page = Box::new(ThreadLifecyclePage::new());
@@ -16169,7 +16169,7 @@ mod tests {
     fn reparented_exit_notification_contract(parent_caught: bool, adopter_caught: bool) {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -16610,7 +16610,7 @@ mod tests {
     fn child_exit_group_waits_for_parent_bucket_and_delivers_status() {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -16804,7 +16804,7 @@ mod tests {
         for (exec_first, host_loaded) in [(false, false), (true, false), (false, true)] {
             // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+                carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
@@ -17046,7 +17046,7 @@ mod tests {
         for depth_count in [2, 3] {
             // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
             let zone = unsafe {
-                carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+                carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
             };
             zone.publish_carrier_cpu_count(1);
             let page = Box::new(ThreadLifecyclePage::new());
@@ -17292,7 +17292,7 @@ mod tests {
     #[test]
     fn two_threads_keep_credentials_comm_and_affinity_independent() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         zone.publish_carrier_cpu_count(2);
         let page = Box::new(ThreadLifecyclePage::new());
@@ -17574,7 +17574,7 @@ mod tests {
     #[test]
     fn thread_exit_removes_thread_state_and_stays_bounded() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -17683,7 +17683,7 @@ mod tests {
     #[test]
     fn non_leader_credential_changes_and_calling_thread_authority() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -17826,7 +17826,7 @@ mod tests {
     #[test]
     fn capset_restricted_to_pid_zero_and_caller_own_tid() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -17931,7 +17931,7 @@ mod tests {
     #[test]
     fn getppid_returns_zero_when_parent_outside_pid_namespace() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18090,7 +18090,7 @@ mod tests {
     #[test]
     fn get_robust_list_foreign_nonleader_dispatch_checks() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18543,7 +18543,7 @@ mod tests {
     #[test]
     fn prlimit64_resolves_non_leader_tid_of_own_process() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -18701,7 +18701,7 @@ mod tests {
     fn blocked_ipc_signal_contract(operation: u8, contended: bool, external: bool) {
         // SAFETY: the lazily committed mapping owns the complete zero-valid compact zone.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -19240,7 +19240,7 @@ mod tests {
     #[test]
     fn fork_failure_injection_after_prepare_loaned_cleans_up_and_subsequent_fork_succeeds() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
@@ -19455,7 +19455,7 @@ mod tests {
     #[test]
     fn fork_commits_child_execution_snapshot_independently_of_durable_task_serial() {
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<ParkedContextWords>>::new_zeroed()
         };
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());

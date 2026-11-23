@@ -336,7 +336,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             MAP.get_or_init(|| {
                 // SAFETY: a zeroed mapping is a valid empty IpcTableMap,
                 // retained for the life of the isolated test process.
-                carrick_test_support::ZeroedBox::leak(unsafe { carrick_test_support::ZeroedBox::<carrick_el1_abi::ipc_tables::IpcTableMap>::new_zeroed() })
+                carrick_zeroed_pages::ZeroedBox::leak(unsafe { carrick_zeroed_pages::ZeroedBox::<carrick_el1_abi::ipc_tables::IpcTableMap>::new_zeroed() })
             })
         });
         Some((self.native_ipc?, map))
@@ -784,8 +784,8 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
     ) -> Self {
         // SAFETY: one lazily committed mapping owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
-        let zone = carrick_test_support::ZeroedBox::leak(unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<C>>::new_zeroed()
+        let zone = carrick_zeroed_pages::ZeroedBox::leak(unsafe {
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<C>>::new_zeroed()
         });
         let (binding, process, process_birth, file_table) = identity(zone);
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));

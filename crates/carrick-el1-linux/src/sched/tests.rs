@@ -44,9 +44,9 @@ impl LockWait<Aarch64ParkedContext> for HostWait {
     }
 }
 
-fn zone() -> carrick_test_support::ZeroedBox<ZoneTables> {
+fn zone() -> carrick_zeroed_pages::ZeroedBox<ZoneTables> {
     // SAFETY: all-zero is the valid empty zone.
-    unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() }
+    unsafe { carrick_zeroed_pages::ZeroedBox::<ZoneTables>::new_zeroed() }
 }
 
 fn identity(tid: u64) -> ThreadIdentity {
@@ -1863,7 +1863,7 @@ fn idle_round_trip_then_switch_in(
     seal: bool,
 ) -> (
     std::thread::Result<carrick_el1_abi::Action>,
-    carrick_test_support::ZeroedBox<ZoneTables>,
+    carrick_zeroed_pages::ZeroedBox<ZoneTables>,
     FakeCpu,
     u64,
 ) {
@@ -1878,7 +1878,7 @@ fn round_trip_then_switch_in(
     before: impl FnOnce(&ZoneTables),
 ) -> (
     std::thread::Result<carrick_el1_abi::Action>,
-    carrick_test_support::ZeroedBox<ZoneTables>,
+    carrick_zeroed_pages::ZeroedBox<ZoneTables>,
     FakeCpu,
     u64,
 ) {

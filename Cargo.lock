@@ -578,6 +578,7 @@ dependencies = [
  "carrick-syscall-abi",
  "carrick-test-support",
  "carrick-vfs",
+ "carrick-zeroed-pages",
  "libc",
  "wait-timeout",
  "zerocopy",
@@ -1160,6 +1161,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-zeroed-pages",
  "flate2",
  "libc",
  "tar",
@@ -1470,6 +1472,13 @@ dependencies = [
  "thiserror",
  "toml",
  "yaml-rust2",
+]
+
+[[package]]
+name = "carrick-zeroed-pages"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

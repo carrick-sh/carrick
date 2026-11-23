@@ -39,9 +39,8 @@ mod el1_region;
 pub mod executable;
 pub use el1_region::TestEl1Region;
 pub mod guest_user;
+pub use carrick_zeroed_pages::{ZeroedBox, ZeroedPages};
 pub use guest_user::{GuestUserBuffer, GuestUserValue, assert_guest_args, user_arg};
-mod zeroed_pages;
-pub use zeroed_pages::{ZeroedBox, ZeroedPages};
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
     gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))

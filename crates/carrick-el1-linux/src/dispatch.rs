@@ -8810,7 +8810,7 @@ mod tests {
                         // SAFETY: ZoneTables permits zero initialization; the
                         // box owns its lazily committed mapping.
                         let zone =
-                            unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() };
+                            unsafe { carrick_zeroed_pages::ZeroedBox::<ZoneTables>::new_zeroed() };
                         let slot = SlotId::new(0);
                         zone.drive(slot, 3);
                         zone.publish_slot(slot, 7, None, 0);
@@ -9144,7 +9144,7 @@ mod tests {
     fn el1_sched_venue_carrier_topology_and_missing_authority() {
         use carrick_personality_linux::sched::SchedVenue;
 
-        let zone = unsafe { carrick_test_support::ZeroedBox::<ZoneTables>::new_zeroed() };
+        let zone = unsafe { carrick_zeroed_pages::ZeroedBox::<ZoneTables>::new_zeroed() };
         zone.publish_carrier_cpu_count(4);
         // Executor occupancy is not the installed carrier topology.
         for cpu in 0..4 {
