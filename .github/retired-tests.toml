@@ -167,3 +167,9 @@ test = "sched_policy::arm_affinity_routes_in_ring_and_x86_stays_unported"
 reason = "#1092: the affinity route is shared by both ISAs."
 replaced_by = "sched_policy::affinity_routes_in_ring_on_both_isas"
 pr = 2855
+
+[[retired]]
+test = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_never_enotsock_in_a_native_child"
+reason = "#2867: the carrier venue now serves a held root socket's calls for a native member instead of refusing them, so the refusal witness became a service witness (getsockname names the bound address, accept4 takes the queued connection; an inherited regular file is still ENOTSOCK)."
+replaced_by = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child"
+pr = 2880
