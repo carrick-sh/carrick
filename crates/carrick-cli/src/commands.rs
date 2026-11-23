@@ -987,6 +987,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 run_id,
                 post_mortem,
                 region,
+                census_out,
             } => crate::debug_zonedump::run_zonedump(
                 match (run_id.as_deref(), post_mortem.as_deref(), region.as_deref()) {
                     (Some(run_id), _, _) => crate::debug_zonedump::ZoneSource::Live(run_id),
@@ -996,6 +997,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         bail!("zonedump needs --run-id, --post-mortem or --region")
                     }
                 },
+                census_out.as_deref(),
             )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },

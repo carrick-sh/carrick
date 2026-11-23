@@ -196,14 +196,34 @@ impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug
                 unavailable: vec![
                     "kvm physical carrier still preparing before worker handoff".to_owned(),
                 ],
+                el1_census: None,
             };
         };
         let capture = physical.capture_physical_state();
+        let mut unavailable = capture.unavailable;
+        crate::el1_census::init_from_env();
+        let el1_census = if crate::el1_census::enabled() {
+            // Never wait on the custody a hung carrier may hold.
+            match physical.try_syscall_counters() {
+                Some(counters) => crate::el1_census::live_capture_json(
+                    Some(&counters),
+                    carrick_spec::syscall_census::CensusIsa::X86_64,
+                ),
+                None => {
+                    unavailable
+                        .push("physical custody busy; syscall census unavailable".to_owned());
+                    None
+                }
+            }
+        } else {
+            None
+        };
         carrick_kernel::kernel::debug::PhysicalCapture {
             zone_census: capture.zone_census,
             vcpus: capture.vcpus,
             host_threads: Vec::new(),
-            unavailable: capture.unavailable,
+            unavailable,
+            el1_census,
         }
     }
 }

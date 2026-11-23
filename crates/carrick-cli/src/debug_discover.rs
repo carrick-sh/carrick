@@ -20,8 +20,10 @@
 //! - a timeout, a nonzero exit, or a missing success marker;
 //! - for a run past its timeout, what the hung carrier was doing: its live
 //!   `carrick debug zonedump` (parked records' saved syscalls, vCPUs and
-//!   tasks holding unserved host work), read before the kill, since a killed
-//!   carrier writes no census;
+//!   tasks holding unserved host work) and its syscall census so far
+//!   (`zonedump --census-out`), both read before the kill, since a killed
+//!   carrier publishes no census: a hung stage keeps its refusals and their
+//!   arguments;
 //! - with `--oracle`, each stage that passes at 5x the native Docker
 //!   oracle's time or more (`pathological_time`);
 //! - with `--venue-profile <row>=<file>`, each call shape the row makes on
@@ -29,7 +31,9 @@
 //!   ISA (`venue_gap`, from `crate::venue_gaps`): the stops past the ones the
 //!   runs reached. Each gap is joined with the runs' counted refusals: it is
 //!   `reached` when a run of its row on its ISA refused that call for that
-//!   caller, and `not yet reached` when the row stopped before making it.
+//!   caller, `not yet reached` when every run of the row wrote a census
+//!   and none refused it, and `no evidence` when a run of the row wrote no
+//!   census, so nothing says whether it made the call.
 //!
 //! The output is one ranked table (instance, ISA, row, stage, kind, site,
 //! count, runs, real values) in `<out>/table.md` and `<out>/table.json`, and
@@ -1006,8 +1010,10 @@ pub(crate) fn venue_gap_rows(
 /// The gap's runs column becomes the runs of its row, on its ISA, that
 /// refused the call for the same caller, out of the runs of that row, so
 /// reached gaps rank first. Its values say which: `reached` with the refusal
-/// count and stages, `not yet reached` when the row ran and never refused
-/// it, `not run` when no run of the row was on that ISA. A counted refusal
+/// count and stages, `not yet reached` when every run of the row wrote a
+/// census and none refused it, `no evidence` when none refused it but a run
+/// wrote no census (it may have made the call), `not run` when no run of
+/// the row was on that ISA. A counted refusal
 /// carries no argument shape, so a shaped gap (a socket family, say) also
 /// takes the refused calls' recorded arguments.
 pub(crate) fn mark_reached(venue: &mut [TableRow], records: &[RunRecord]) {
@@ -1023,6 +1029,7 @@ pub(crate) fn mark_reached(venue: &mut [TableRow], records: &[RunRecord]) {
         let mut refused = 0u64;
         let mut stages = BTreeSet::new();
         let mut recorded = Vec::new();
+        let mut blind = 0usize;
         gap.runs = 0;
         gap.of_runs = 0;
         for record in records {
@@ -1032,6 +1039,7 @@ pub(crate) fn mark_reached(venue: &mut [TableRow], records: &[RunRecord]) {
             gap.of_runs += 1;
             let mut hit = false;
             for finding in &record.findings {
+                blind += usize::from(finding.kind == FindingKind::NoCensus);
                 if finding.kind == FindingKind::Refused
                     && site_call(&finding.site) == Some((name.as_str(), caller.as_str()))
                 {
@@ -1050,6 +1058,11 @@ pub(crate) fn mark_reached(venue: &mut [TableRow], records: &[RunRecord]) {
         let isa = gap.isa.name();
         gap.values.push(if gap.of_runs == 0 {
             format!("not run: no run of this row on {isa}")
+        } else if gap.runs == 0 && blind != 0 {
+            format!(
+                "no evidence: {blind} of {} {isa} stage runs of this row wrote no census",
+                gap.of_runs
+            )
         } else if gap.runs == 0 {
             format!("not yet reached: no {isa} run of this row refused it")
         } else {
@@ -1267,9 +1280,11 @@ const ZONEDUMP_SECS: u64 = 60;
 
 /// Read a live carrier's scheduler zone (`<carrick> debug zonedump
 /// --run-id <run_id>`, through the run's debug endpoint, without stopping
-/// it) into `path`. Best effort: a dump that fails leaves its error there,
-/// and `hang_findings` reports a dump that read no zone.
-fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path) {
+/// it) into `path`, and the same capture's syscall census so far into
+/// `census`. Best effort: a dump that fails leaves its error there, and
+/// `hang_findings` reports a dump that read no zone; a capture without a
+/// census leaves no census file, and the run reads `no_census`.
+fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path, census: &Path) {
     let Ok(file) = std::fs::File::create(path) else {
         return;
     };
@@ -1277,7 +1292,8 @@ fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path) {
         return;
     };
     let Ok(child) = std::process::Command::new(carrick)
-        .args(["debug", "zonedump", "--run-id", run_id])
+        .args(["debug", "zonedump", "--run-id", run_id, "--census-out"])
+        .arg(census)
         .stdin(std::process::Stdio::null())
         .stdout(file)
         .stderr(err)
@@ -1564,7 +1580,12 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
                 let timeout = Duration::from_secs(stage.timeout_secs.unwrap_or(row.timeout_secs));
                 let zonedump_path = base.with_extension("zonedump");
                 let _ = std::fs::remove_file(&zonedump_path);
-                let mut dump_zone = || capture_zonedump(&carrick, &run_id, &zonedump_path);
+                // Beside the census directory, never in it: a carrier that
+                // exits by itself during the capture publishes its own.
+                let kill_census_path = base.with_extension("census-at-kill.json");
+                let _ = std::fs::remove_file(&kill_census_path);
+                let mut dump_zone =
+                    || capture_zonedump(&carrick, &run_id, &zonedump_path, &kill_census_path);
                 let ending = wait_bounded(child, timeout, &mut dump_zone)?;
                 let secs = started.elapsed().as_secs_f64();
                 if let Some(reap) = options.reap {
@@ -1580,8 +1601,26 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
                 }
                 let stdout = String::from_utf8_lossy(&std::fs::read(&stdout_path)?).into_owned();
                 let stderr = String::from_utf8_lossy(&std::fs::read(&stderr_path)?).into_owned();
-                let censuses = load_censuses(&census)?;
+                let mut censuses = load_censuses(&census)?;
+                let mut census_at_kill = false;
+                if ending.timed_out
+                    && censuses.is_empty()
+                    && let Ok(at_kill) = crate::debug_el1_census::load(&kill_census_path)
+                {
+                    censuses.push(at_kill);
+                    census_at_kill = true;
+                }
                 let (passed, mut findings) = judge(stage, ending, &stdout, &stderr, &censuses);
+                if census_at_kill
+                    && let Some(timeout) = findings
+                        .iter_mut()
+                        .find(|finding| finding.kind == FindingKind::Timeout)
+                {
+                    push_value(
+                        &mut timeout.values,
+                        "census read at the kill (refusals up to the deadline)".to_owned(),
+                    );
+                }
                 if ending.timed_out {
                     let zonedump = std::fs::read(&zonedump_path).unwrap_or_default();
                     findings.extend(hang_findings(isa, &String::from_utf8_lossy(&zonedump)));
@@ -2244,6 +2283,112 @@ mod tests {
     }
 
     #[test]
+    fn a_stage_killed_at_its_timeout_keeps_the_refusals_of_its_census_at_the_kill() {
+        use carrick_runtime::el1_census::RefusedCallRecord;
+        use carrick_spec::syscall_census::RefusalRow;
+        let dir = tempfile::tempdir().unwrap();
+        // What the live capture of the hung carrier would hand back.
+        let mut census = census_with(CensusIsa::X86_64, |_| {});
+        census.refusal_evidence.rows = vec![RefusalRow {
+            nr: 41,
+            caller: CallerClass::NativeChild,
+            refused: 2,
+            venue_refused: 0,
+            allowlisted: false,
+        }];
+        census.refused_calls = vec![RefusedCallRecord {
+            nr: 41,
+            name: Some("socket".to_owned()),
+            caller: CallerClass::NativeChild,
+            venue: "ring".to_owned(),
+            arguments: Some([1, 0x80001, 0, 0, 0, 0]),
+        }];
+        let at_kill = dir.path().join("at-kill.json");
+        std::fs::write(&at_kill, serde_json::to_vec(&census).unwrap()).unwrap();
+        // A stand-in carrier (cfg(test) only): `run` hangs and publishes no
+        // census; `debug zonedump --run-id <id> --census-out <file>` answers
+        // with a zone line and that census. `nocensus` stages get no file.
+        let fake = dir.path().join("carrick");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = run ]; then exec sleep 30; fi\n\
+                 echo 'zone slot 0: state=IdleWfi'\n\
+                 case \"$4\" in *nocensus*) exit 1;; esac\n\
+                 cp {} \"$6\"\n",
+                at_kill.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let rows = dir.path().join("rows.json");
+        std::fs::write(
+            &rows,
+            r#"{"rows":[{"name":"shell","image":{"x86_64":"u","arm64":"u"},"timeout_secs":1,
+                "stages":[{"name":"hang","command":["x"]},{"name":"nocensus","command":["x"]}]}]}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("out");
+        discover(DiscoverOptions {
+            rows: &rows,
+            only: &[],
+            runs: 1,
+            out: &out,
+            carrick: Some(&fake),
+            instance: Some("unit"),
+            label: "t",
+            reap: None,
+            limit: 50,
+            oracle: None,
+            oracle_only: false,
+            venue_profiles: &[],
+        })
+        .unwrap();
+        let records = read_records(&out).unwrap();
+        assert_eq!(records.len(), 2);
+        let kinds = |record: &RunRecord| {
+            record
+                .findings
+                .iter()
+                .map(|finding| finding.kind)
+                .collect::<Vec<_>>()
+        };
+        // The killed stage's refusal survives with its arguments.
+        let hang = &records[0];
+        assert!(hang.timed_out && hang.signal == Some(libc::SIGKILL));
+        assert!(!kinds(hang).contains(&FindingKind::NoCensus), "{hang:?}");
+        let refused = hang
+            .findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::Refused)
+            .expect("the refusal read at the kill");
+        assert_eq!(refused.count, 2);
+        assert!(refused.site.starts_with("socket(nr=41)"), "{refused:?}");
+        assert!(
+            refused.values.iter().any(|value| value.contains("0x80001")),
+            "{refused:?}"
+        );
+        let timeout = hang
+            .findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::Timeout)
+            .unwrap();
+        assert_eq!(
+            timeout.values,
+            ["census read at the kill (refusals up to the deadline)"]
+        );
+        // The capture's file sits beside the census directory, never in it.
+        assert!(out.join("shell-hang-1.census-at-kill.json").is_file());
+        // A capture that carried no census leaves the run saying so.
+        let blind = &records[1];
+        assert!(blind.timed_out);
+        assert!(kinds(blind).contains(&FindingKind::NoCensus), "{blind:?}");
+        assert!(!kinds(blind).contains(&FindingKind::Refused), "{blind:?}");
+    }
+
+    #[test]
     fn discover_runs_each_stage_and_report_rerenders_the_table() {
         let dir = tempfile::tempdir().unwrap();
         // A stand-in carrier (cfg(test) only): it writes the census
@@ -2406,6 +2551,26 @@ VENUEPROFILE1|complete|root=7
                 "not yet reached: no x86_64 run of this row refused it"
             );
         }
+        // A run that wrote no census (a killed stage) may have made the
+        // call: an unreached gap of its row is unknown, a reached one stays
+        // reached.
+        let mut blind = records.to_vec();
+        blind[1]
+            .findings
+            .push(Finding::new(FindingKind::NoCensus, "no census file", 1));
+        let mut again = venue.clone();
+        for gap in &mut again {
+            gap.values.truncate(1);
+        }
+        mark_reached(&mut again, &blind);
+        assert!(again[0].values[1].starts_with("reached: "), "{again:?}");
+        for unknown in &again[1..3] {
+            assert_eq!(
+                unknown.values[1],
+                "no evidence: 1 of 2 x86_64 stage runs of this row wrote no census"
+            );
+        }
+        assert_eq!(again[3].values[1], "not run: no run of this row on arm64");
         assert_eq!((venue[3].runs, venue[3].of_runs), (0, 0));
         assert_eq!(venue[3].values[1], "not run: no run of this row on arm64");
         // A reached gap ranks before an unreached one.

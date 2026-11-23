@@ -220,6 +220,7 @@ pub(crate) fn run_debug(
             run_id,
             post_mortem,
             region,
+            census_out,
         } => crate::debug_zonedump::run_zonedump(
             match (run_id.as_deref(), post_mortem.as_deref(), region.as_deref()) {
                 (Some(run_id), _, _) => crate::debug_zonedump::ZoneSource::Live(run_id),
@@ -227,6 +228,7 @@ pub(crate) fn run_debug(
                 (None, None, Some(path)) => crate::debug_zonedump::ZoneSource::Region(path),
                 (None, None, None) => bail!("zonedump needs --run-id, --post-mortem or --region"),
             },
+            census_out.as_deref(),
         )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();

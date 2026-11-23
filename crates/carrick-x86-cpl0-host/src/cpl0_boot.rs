@@ -4004,6 +4004,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(counters.copy_snapshot())
     }
 
+    /// The same snapshot for a debug capture: never waits on the custody,
+    /// which a hung carrier may hold. `None` when it is held or poisoned.
+    pub fn try_syscall_counters(&self) -> Option<Counters> {
+        let custody = self.custody.try_lock().ok()?;
+        let counters: &Counters = custody.metadata(COUNTERS_OFFSET);
+        Some(counters.copy_snapshot())
+    }
+
     pub fn refusal_count(&self, nr: carrick_abi::NativeNr) -> Result<u64, TrapError> {
         let custody = self
             .custody

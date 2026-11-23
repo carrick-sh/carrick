@@ -142,6 +142,7 @@ mod tests {
                 vcpus: Vec::new(),
                 host_threads: Vec::new(),
                 unavailable: Vec::new(),
+                el1_census: None,
             }
         }
     }

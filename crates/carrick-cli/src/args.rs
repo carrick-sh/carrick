@@ -1225,6 +1225,12 @@ pub(crate) enum DebugCommand {
         /// bytes), decoded through the `carrick-el1-abi` layout.
         #[arg(long)]
         region: Option<PathBuf>,
+        /// Also write the capture's syscall census so far to this file, as
+        /// the census JSON the carrier would publish at its exit. For a run
+        /// started with `CARRICK_EL1_CENSUS` that will be killed: a killed
+        /// carrier publishes none.
+        #[arg(long, conflicts_with = "region")]
+        census_out: Option<PathBuf>,
     },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
