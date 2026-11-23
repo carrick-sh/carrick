@@ -828,6 +828,49 @@ fn mounted_static_x86_exec_child_member_reads_a_host_file() {
     );
 }
 
+/// #2851: seven threads of an exec'd fork child map, protect, advise and
+/// unmap memory at once. A call that waited for another's edit reruns its
+/// saved `SYSCALL`; a preemption before that instruction parked the rewound
+/// context again, and the next resume rewound it once more. The thread then
+/// ran the two bytes before `SYSCALL` and took a user page fault at the
+/// syscall number (`kernel fault policy refused: reason 0x9`). Other
+/// defects of the same workload end most runs first (#2832's records: a
+/// refused mapping edit, an unregistered crossing CR3, a stopped forward
+/// mismatch); run it with `--ignored` until they land.
+#[test]
+#[ignore = "#2832 records B, D, E and G end the run before #2851's rerun is checked"]
+fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exec-child-edits");
+    compile_assembly_with_flags(
+        "x86_exec_child_threads_edit_mappings.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native exec-child-edits oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"ok=4\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "exec-child-threads-edit-mappings", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "93 is exec failure, 95 a child that did not exit 0. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
