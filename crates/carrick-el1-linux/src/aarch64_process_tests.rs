@@ -10823,20 +10823,14 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
     }
 
     fn restart(
-        &self,
+        &mut self,
         frame: &mut carrick_el1_abi::TrapFrame,
         original: &Aarch64ParkedContext,
     ) -> bool {
-        frame.x[0] = original.syscall_return();
-        if let Some(pc) = frame.elr.checked_sub(4) {
-            frame.elr = pc;
-            true
-        } else {
-            false
-        }
+        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
     }
 
-    fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
+    fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
 

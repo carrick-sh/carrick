@@ -11,6 +11,9 @@ use carrick_personality_linux::signal::arm::RtSigframe;
 struct ArmSignalMachine {
     backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
+    /// The syscall position a restart left the frame at; `None` keeps the
+    /// parked context's own.
+    restarted: Option<carrick_sched_core::SavedSyscallPc>,
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -28,15 +31,23 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     }
 
     fn restart(
-        &self,
+        &mut self,
         frame: &mut TrapFrame,
         original: &carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
-        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
+        let Some(position) = carrick_guest_arch::rerun_interrupted_syscall(frame, original) else {
+            return false;
+        };
+        self.restarted = Some(position);
+        true
     }
 
-    fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
-        restart_forwarded_frame(frame)
+    fn restart_forwarded(&mut self, frame: &mut TrapFrame) -> Option<bool> {
+        let restarted = restart_forwarded_frame(frame);
+        if restarted == Some(true) {
+            self.restarted = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
+        }
+        restarted
     }
 
     fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
@@ -49,7 +60,10 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         ctx: &mut carrick_sched_core::Aarch64ParkedContext,
     ) {
         ctx.native.x = frame.x;
-        ctx.native.pc = frame.elr;
+        match self.restarted {
+            Some(position) => ctx.replace_saved_pc(frame.elr, position),
+            None => ctx.native.pc = frame.elr,
+        }
         ctx.native.pstate = frame.spsr;
         ctx.native.sp_el0 = self.user_sp.raw();
     }
@@ -163,6 +177,7 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
         &mut ArmSignalMachine {
             backend: LinuxAarch64Backend,
             user_sp: sp,
+            restarted: None,
         },
     )
 }
@@ -201,6 +216,7 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     let mut machine = ArmSignalMachine {
         backend: LinuxAarch64Backend,
         user_sp: carrick_guest_arch::UserVa::new(saved.native.sp_el0),
+        restarted: None,
     };
     let control = process.resume_signal_control();
     let route = deliver_on_user_return_with(
@@ -213,11 +229,8 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     );
     match route {
         None => {
-            let saved = process.resume_context_mut();
-            saved.native.x = frame.x;
-            saved.native.pc = frame.elr;
-            saved.native.pstate = frame.spsr;
-            saved.native.sp_el0 = machine.user_sp.raw();
+            use super::signal_delivery::SignalMachine;
+            machine.sync_parked_context(&frame, process.resume_context_mut());
             Ok(None)
         }
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Ok(Some(

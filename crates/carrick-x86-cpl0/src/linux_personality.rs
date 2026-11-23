@@ -449,9 +449,33 @@ pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     halt();
 }
 
-struct X86SignalMachine {
+pub(crate) struct X86SignalMachine {
     backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
     address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    /// The syscall position a restart left the frame at; `None` keeps the
+    /// parked context's own.
+    restarted: Option<carrick_sched_core::SavedSyscallPc>,
+}
+
+impl X86SignalMachine {
+    pub(crate) fn new(
+        address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    ) -> Self {
+        Self {
+            backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
+            address,
+            restarted: None,
+        }
+    }
+
+    /// Where the returned frame's PC sits relative to its syscall, given the
+    /// position of the context it was built from (#2872).
+    pub(crate) fn frame_position(
+        &self,
+        parked: carrick_sched_core::SavedSyscallPc,
+    ) -> carrick_sched_core::SavedSyscallPc {
+        self.restarted.unwrap_or(parked)
+    }
 }
 
 impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::ParkedContextWords>
@@ -468,11 +492,15 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
     }
 
     fn restart(
-        &self,
+        &mut self,
         frame: &mut NativeFrame,
         original: &carrick_sched_core::ParkedContextWords,
     ) -> bool {
-        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
+        let Some(position) = carrick_guest_arch::rerun_interrupted_syscall(frame, original) else {
+            return false;
+        };
+        self.restarted = Some(position);
+        true
     }
 
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
@@ -498,7 +526,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
             &native.xsave,
         )
         .unwrap_or_else(|_| fatal_boot());
-        let position = ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot());
+        let position = self.frame_position(ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot()));
         *ctx = context::context_words::from_native(&updated, position);
     }
 }
@@ -512,23 +540,15 @@ pub(crate) fn deliver_signal_on_syscall_return(
         carrick_sched_core::ParkedContextWords,
         native_process::Service,
     >,
-    address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
+    machine: &mut X86SignalMachine,
 ) -> Option<CompletionRoute> {
     let (_, control) = task.lifecycle_refs()?;
     #[cfg(feature = "test-support")]
     crate::test_support::block_sigusr1_at_checkpoint(control);
     carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(
-        task,
-        control,
-        process,
-        frame,
-        &fpstate.0,
-        &mut X86SignalMachine {
-            backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
-            address,
-        },
+        task, control, process, frame, &fpstate.0, machine,
     )
 }
 
@@ -586,9 +606,13 @@ pub fn signal_user_return(
                 thread.slot.pending(),
             );
         }
-        if let Some(route) =
-            deliver_signal_on_syscall_return(task, &mut process, address, frame, xsave)
-        {
+        if let Some(route) = deliver_signal_on_syscall_return(
+            task,
+            &mut process,
+            frame,
+            xsave,
+            &mut X86SignalMachine::new(address),
+        ) {
             if route != CompletionRoute::Suspended {
                 fatal_boot();
             }
@@ -667,9 +691,9 @@ pub fn signal_irq_return(
         if let Some(route) = deliver_signal_on_syscall_return(
             task,
             &mut process,
-            runtime_address,
             &mut returned,
             xsave,
+            &mut X86SignalMachine::new(runtime_address),
         ) {
             if route != CompletionRoute::Suspended {
                 fatal_boot();
@@ -2021,9 +2045,9 @@ impl Personality for LinuxPersonality {
                 && let Some(r) = deliver_signal_on_syscall_return(
                     task,
                     &mut process,
-                    address,
                     frame,
                     early_xstate,
+                    &mut X86SignalMachine::new(address),
                 )
             {
                 route = r;

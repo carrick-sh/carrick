@@ -276,11 +276,10 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     /// Only a RIP after `SYSCALL` moves: a context already at its `SYSCALL`
     /// (rewound once, or interrupted before the instruction ran) keeps it.
     fn restart_syscall(&mut self) {
-        if self.saved_syscall_pc() == Some(SavedSyscallPc::AfterSyscall) {
-            self.replace_saved_pc(
-                self.frame[15].wrapping_sub(carrick_guest_arch::X86_64_SYSCALL_LEN),
-                SavedSyscallPc::AtSyscall,
-            );
+        if let Some(pc) = self.saved_syscall_pc().and_then(|position| {
+            position.syscall_instruction(self.frame[15], carrick_guest_arch::X86_64_SYSCALL_LEN)
+        }) {
+            self.replace_saved_pc(pc, SavedSyscallPc::AtSyscall);
         }
     }
     fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {

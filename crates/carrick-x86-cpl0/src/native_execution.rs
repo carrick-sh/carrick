@@ -155,12 +155,14 @@ pub fn schedule(slot: SlotId) -> ! {
                             state.address,
                         )
                         .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?;
+                        let mut machine =
+                            crate::linux_personality::X86SignalMachine::new(state.address);
                         match deliver_signal_on_syscall_return(
                             current,
                             entry,
-                            state.address,
                             &mut frame,
                             &native.xsave,
+                            &mut machine,
                         ) {
                             None => {
                                 *entry.resume_context_mut() = context::context_words::from_native(
@@ -172,7 +174,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                         &native.xsave,
                                     )
                                     .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?,
-                                    position,
+                                    machine.frame_position(position),
                                 );
                                 Ok(None)
                             }
@@ -255,12 +257,14 @@ pub fn schedule(slot: SlotId) -> ! {
                     let mut frame =
                         context::context_words::syscall_frame_from_native(&native, state.address)
                             .unwrap_or_else(|_| fatal_boot());
+                    let mut machine =
+                        crate::linux_personality::X86SignalMachine::new(state.address);
                     if let Some(route) = deliver_signal_on_syscall_return(
                         current,
                         &mut entry,
-                        state.address,
                         &mut frame,
                         &native.xsave,
+                        &mut machine,
                     ) {
                         match route {
                             carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
@@ -278,7 +282,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             &native.xsave,
                         )
                         .unwrap_or_else(|_| fatal_boot()),
-                        position,
+                        machine.frame_position(position),
                     );
                 }
                 if let Some(status) = entry.take_root_exit() {

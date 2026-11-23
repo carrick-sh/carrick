@@ -863,9 +863,21 @@ pub enum SavedSyscallPc {
     AtSyscall,
 }
 
+impl SavedSyscallPc {
+    /// The syscall instruction's address for a `pc` at this position: a PC
+    /// after the instruction moves back `syscall_len` bytes, a PC already at
+    /// it stays (#2851, #2872). `None` is a PC below one instruction.
+    pub const fn syscall_instruction(self, pc: u64, syscall_len: u64) -> Option<u64> {
+        match self {
+            Self::AfterSyscall => pc.checked_sub(syscall_len),
+            Self::AtSyscall => Some(pc),
+        }
+    }
+}
+
 /// The ISA mechanics of a trapped syscall's return frame that rerunning
 /// the call needs. Where the PC sits is the context's to say, never the
-/// frame's.
+/// frame's: see [`rerun_interrupted_syscall`].
 pub trait SyscallReturnFrame {
     /// Bytes from the syscall instruction to the return PC its trap saves.
     const SYSCALL_LEN: u64;
@@ -875,14 +887,18 @@ pub trait SyscallReturnFrame {
     fn resume_at(&mut self, pc: u64, entry_word: u64);
 }
 
-/// Point `frame` back at `original`'s syscall instruction with its entry
-/// word restored. Returns the frame's new position, or `None` (frame
-/// untouched) for an underflowing PC.
+/// Point `frame`, whose PC sits where `original` records, back at
+/// `original`'s syscall instruction with its entry word restored. A PC
+/// already at the instruction is never rewound again (#2872). Returns the
+/// frame's new position, or `None` (frame untouched) for a corrupt position
+/// or an underflowing PC.
 pub fn rerun_interrupted_syscall<F: SyscallReturnFrame, C: ProcessContext>(
     frame: &mut F,
     original: &C,
 ) -> Option<SavedSyscallPc> {
-    let pc = frame.return_pc().checked_sub(F::SYSCALL_LEN)?;
+    let pc = original
+        .saved_syscall_pc()?
+        .syscall_instruction(frame.return_pc(), F::SYSCALL_LEN)?;
     frame.resume_at(pc, original.syscall_return());
     Some(SavedSyscallPc::AtSyscall)
 }
