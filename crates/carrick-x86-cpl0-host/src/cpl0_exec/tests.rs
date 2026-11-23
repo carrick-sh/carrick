@@ -724,16 +724,7 @@ fn the_carrier_exit_drain_releases_every_row_and_reports_the_first_failure() {
 
     // The sealed row's second release, its build extent, reports a failure.
     fixture.frames.fail_release = vec![1];
-    let retired = fixture.preparations.retire_at_carrier_exit();
-    assert_eq!(retired.len(), 2);
-    let error = release_x86_execs_at_carrier_exit(
-        retired,
-        &mut fixture.stock,
-        &mut fixture.frames,
-        fixture.region.roots(),
-        fixture.region.zone(),
-    )
-    .unwrap_err();
+    let error = drain_at_carrier_exit(&mut fixture).unwrap_err();
     assert!(
         format!("{error:?}").contains("injected release failure"),
         "the drain reports the first failure: {error:?}"
@@ -769,14 +760,49 @@ fn one_row_at_carrier_exit(fixture: &mut Fixture, sealed: bool) {
 }
 
 fn drain_at_carrier_exit(fixture: &mut Fixture) -> Result<usize, TrapError> {
-    let retired = fixture.preparations.retire_at_carrier_exit();
     release_x86_execs_at_carrier_exit(
-        retired,
+        Ok((fixture.region.roots(), fixture.region.zone())),
+        &mut fixture.preparations,
         &mut fixture.stock,
         &mut fixture.frames,
-        fixture.region.roots(),
-        fixture.region.zone(),
     )
+}
+
+/// #2826 (review of #2868): the exec tables resolve before the drain retires
+/// a row. A carrier whose tables are missing reports that, and keeps its
+/// rows: none is retired, so the owner's census still names it, and what it
+/// holds stays out of the stock. A later drain with the tables returns it.
+#[test]
+fn a_drain_without_exec_tables_keeps_its_rows_unretired() {
+    for sealed in [true, false] {
+        let mut fixture = Fixture::new(32);
+        one_row_at_carrier_exit(&mut fixture, sealed);
+        let error = release_x86_execs_at_carrier_exit(
+            Err(fail("exec reservation table")),
+            &mut fixture.preparations,
+            &mut fixture.stock,
+            &mut fixture.frames,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("exec reservation table"),
+            "sealed={sealed}: the drain reports the missing tables: {error:?}"
+        );
+        let census = fixture.preparations.census();
+        assert_eq!(census.carrier_exit, 0, "sealed={sealed}: nothing retired");
+        assert_eq!(census.unretired(), 1, "sealed={sealed}: the row is kept");
+        assert_eq!(fixture.frames.release_calls, 0, "sealed={sealed}");
+        assert_eq!(
+            fixture.stock.table_stock().len(),
+            32 - 10,
+            "sealed={sealed}"
+        );
+
+        assert_eq!(drain_at_carrier_exit(&mut fixture).unwrap(), 1);
+        assert_eq!(fixture.preparations.census().unretired(), 0);
+        assert_eq!(fixture.frames.mapped(), 0, "sealed={sealed}");
+        assert_eq!(fixture.stock.table_stock().len(), 32, "sealed={sealed}");
+    }
 }
 
 /// #2826 (review of #2868): a step that fails inside one row must not keep
