@@ -2848,20 +2848,50 @@ mod serial_host {
                         .is_some_and(|text| text.contains("last_stopped_gprs="))))
         );
         assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
-        let named_wait = capture["degraded_kernel"]["tasks"]
+        // The empty poll parks in the ring's own object wait (#2909), not a
+        // host wait, so the host kernel's thread row still reads Running:
+        // the zone census names the wait. It must name a parked record of a
+        // captured thread (its tid and serial), and that record's object
+        // wait with its waiter enrolled.
+        let threads: Vec<(u64, u64)> = capture["degraded_kernel"]["tasks"]
             .as_array()
             .into_iter()
             .flatten()
             .flat_map(|task| task["threads"].as_array().into_iter().flatten())
-            .any(|thread| {
-                thread["key"]["tid"].as_u64().is_some()
-                    && thread["execution"].as_str().is_some_and(|state| {
-                        state.contains("Blocked") && state.contains("HostWait")
+            .filter_map(|thread| {
+                Some((
+                    thread["key"]["tid"].as_u64()?,
+                    thread["key"]["serial"].as_u64()?,
+                ))
+            })
+            .collect();
+        let named_wait = zone_census.lines().any(|line| {
+            let Some(rest) = line.strip_prefix("zone record ") else {
+                return false;
+            };
+            let Some((record, state)) = rest.split_once(": claim=Parked ") else {
+                return false;
+            };
+            let parked_thread = threads
+                .iter()
+                .any(|(tid, serial)| state.contains(&format!(" tid={tid} serial={serial} ")));
+            let object_wait = zone_census
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix(&format!("zone record {record} object wait: queue="))
+                })
+                .filter_map(|queue| queue.split_whitespace().next())
+                .any(|queue| {
+                    zone_census.lines().any(|line| {
+                        line.strip_prefix(&format!("zone object queue {queue}: "))
+                            .is_some_and(|q| q.contains(" waiters=1 "))
                     })
-            });
+                });
+            parked_thread && object_wait
+        });
         assert!(
             named_wait,
-            "deadline capture did not name the parked task and wait: {}",
+            "deadline capture did not name the parked task and wait: {}\n{zone_census}",
             capture_path.display()
         );
     }
