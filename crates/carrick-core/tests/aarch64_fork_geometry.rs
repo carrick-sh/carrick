@@ -672,7 +672,7 @@ fn test_arm_fork_break_before_make_on_block_split() {
     }
 
     // Rollback test
-    rollback(&mem, &scratch.edits).unwrap();
+    rollback::<Aarch64Mmu, _>(&mem, &scratch.edits).unwrap();
     let post_rollback_memory = mem.snapshot();
     for (addr, original_word) in &pre_fork_memory {
         let current_word = post_rollback_memory.get(addr).copied().unwrap_or(0);

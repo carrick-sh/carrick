@@ -1099,3 +1099,100 @@ pub fn bind_service_root(
         Ok(spaces.grant(index, mm.raw()).ok_or(MmError::Busy)?.ttbr0)
     }
 }
+
+/// A forking child's closed space index with its reservation root
+/// published, before the fork publishes the child. A refused fork releases
+/// both together: it retires the root, then frees the index. Freeing the
+/// index alone left the root's key behind, so the next MM to claim that
+/// index (the same child MM, when the fork reruns after contention) was
+/// refused `Collision` and answered EFAULT (#2919 review P0-1). Once the
+/// fork has published its child, [`Self::keep`] hands the root to the
+/// published child, whose abort retires it.
+#[must_use = "dropping releases the child's root and space index"]
+pub struct ClosedChildSpace<
+    'p,
+    'a,
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> {
+    portal: &'p MmPortal<'a, P, Policy, Geometry, Venue, B, Context>,
+    index: carrick_sched_core::SpaceIndex,
+    mm: ReservationMm,
+    worker: u32,
+    armed: bool,
+}
+
+impl<
+    'p,
+    'a,
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> ClosedChildSpace<'p, 'a, P, Policy, Geometry, Venue, B, Context>
+{
+    /// Publish `mm`'s root at the closed space `index` the caller just
+    /// published for it. A refused root frees the index: nothing was
+    /// published at it.
+    pub fn publish(
+        portal: &'p MmPortal<'a, P, Policy, Geometry, Venue, B, Context>,
+        index: carrick_sched_core::SpaceIndex,
+        mm: ReservationMm,
+        layout: impl Into<crate::mm::reservation::Layout>,
+        worker: u32,
+    ) -> Result<Self, crate::mm::reservation::Refusal> {
+        if let Err(refusal) = portal.roots.publish(index.index(), mm, layout) {
+            portal.spaces.free(index);
+            return Err(refusal);
+        }
+        Ok(Self {
+            portal,
+            index,
+            mm,
+            worker,
+            armed: true,
+        })
+    }
+
+    pub fn index(&self) -> carrick_sched_core::SpaceIndex {
+        self.index
+    }
+
+    /// The fork refused before publishing its child: retire the root, then
+    /// free the index (also what dropping does).
+    pub fn release(self) {}
+
+    /// The fork published its child, which now owns the root.
+    pub fn keep(mut self) -> carrick_sched_core::SpaceIndex {
+        self.armed = false;
+        self.index
+    }
+}
+
+impl<
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> Drop for ClosedChildSpace<'_, '_, P, Policy, Geometry, Venue, B, Context>
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The root was published here and never admitted: nothing else
+        // holds it, so its retirement settles nothing and cannot owe.
+        if let Ok(root) = self.portal.root_any(self.mm, self.worker) {
+            let _ = root.retire();
+        }
+        self.portal.spaces.free(self.index);
+    }
+}

@@ -6,7 +6,7 @@ use super::anonymous;
 use crate::exec_successor::{X86ExecMachine, X86ExecSuccessor};
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
-use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
+use carrick_core::mm::transaction::{ClosedChildSpace, MmPortal, OwnerVenue};
 use carrick_el1::isa::x86::context::scheduler::WakeCpu;
 use carrick_el1::memory::reservations::{
     X86Cpl0ReservationGeometry, X86Cpl0Zone, shared_x86_cpl0_guest,
@@ -474,35 +474,42 @@ impl Service {
             .spaces
             .publish_closed(child_mm.raw().get(), loan.request.child_tables.base, 0)
             .ok_or_else(|| abandon(NativeProcessError::Exhausted))?;
-        let free = |error| {
-            owner.spaces.free(index);
+        // Every refusal before the child is published releases the root and
+        // the index together (#2919 review P0-1).
+        let child_space =
+            ClosedChildSpace::publish(owner, index, loan.request.child_mm, layout, self.worker())
+                .map_err(|e| abandon(refused(NativeForkStage::PublishRoot, e)))?;
+        let free = |child_space, error| {
+            ClosedChildSpace::release(child_space);
             abandon(error)
         };
-        owner
-            .roots
-            .publish(index.index(), loan.request.child_mm, layout)
-            .map_err(|e| free(refused(NativeForkStage::PublishRoot, e)))?;
-        let scratch = ForkScratch::bounded(
+        let scratch = match ForkScratch::bounded(
             loan.request,
             mapping_count,
             count.child,
             count.parent,
             count.live,
             count.custody,
-        )
-        .map_err(|e| free(refused(NativeForkStage::Scratch, e)))?;
-        let plan = owner
-            .prepare_fork(loan.request, scratch, live, self.worker())
-            .map_err(|e| free(refused(NativeForkStage::Prepare, e)))?;
+        ) {
+            Ok(scratch) => scratch,
+            Err(e) => return Err(free(child_space, refused(NativeForkStage::Scratch, e))),
+        };
+        let plan = match owner.prepare_fork(loan.request, scratch, live, self.worker()) {
+            Ok(plan) => plan,
+            Err(e) => return Err(free(child_space, refused(NativeForkStage::Prepare, e))),
+        };
         let mut custody = Vec::new();
-        custody
-            .try_reserve_exact(plan.custody().len())
-            .map_err(|_| free(NativeProcessError::Exhausted))?;
+        if custody.try_reserve_exact(plan.custody().len()).is_err() {
+            return Err(free(child_space, NativeProcessError::Exhausted));
+        }
         custody.extend(plan.custody().iter().copied().map(PortalForkCustody::words));
         let mut child = match owner.publish_fork(plan, live, self.worker()) {
-            Ok(child) => child,
+            Ok(child) => {
+                let _ = child_space.keep();
+                child
+            }
             Err(e) => {
-                owner.spaces.free(index);
+                child_space.release();
                 // A refused publish may have stored into the loaned tables;
                 // it rolled its parent edits back, so they are unlinked and
                 // are scrubbed before the abort. `Core` means that rollback

@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
-use carrick_core::mm::transaction::OwnerVenue;
+use carrick_core::mm::transaction::{ClosedChildSpace, OwnerVenue};
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
 use carrick_el1_abi::{
@@ -2332,19 +2332,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 ));
             }
         };
-        if let Err(e) = owner
-            .roots
-            .publish(index.index(), loan.request.child_mm, layout)
-        {
-            owner.spaces.free(index);
-            return Err(abandon_loan(
-                &self.crossing,
-                self.worker(),
-                &loan,
-                None,
-                refused(NativeForkStage::PublishRoot, e),
-            ));
-        }
+        // Every refusal before the child is published releases the root and
+        // the index together (#2919 review P0-1).
+        let child_space = match ClosedChildSpace::publish(
+            &owner,
+            index,
+            loan.request.child_mm,
+            layout,
+            self.worker(),
+        ) {
+            Ok(child_space) => child_space,
+            Err(e) => {
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    refused(NativeForkStage::PublishRoot, e),
+                ));
+            }
+        };
         let scratch = match ForkScratch::bounded(
             loan.request,
             mappings.len(),
@@ -2355,7 +2362,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         ) {
             Ok(scratch) => scratch,
             Err(e) => {
-                owner.spaces.free(index);
+                child_space.release();
                 return Err(abandon_loan(
                     &self.crossing,
                     self.worker(),
@@ -2397,7 +2404,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 };
                 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
                 let alias = None;
-                owner.spaces.free(index);
+                child_space.release();
                 return Err(abandon_loan(
                     &self.crossing,
                     self.worker(),
@@ -2409,7 +2416,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         };
         let mut custody = Vec::new();
         if custody.try_reserve_exact(plan.custody().len()).is_err() {
-            owner.spaces.free(index);
+            child_space.release();
             return Err(abandon_loan(
                 &self.crossing,
                 self.worker(),
@@ -2420,9 +2427,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         custody.extend_from_slice(plan.custody());
         let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
-            Ok(child) => child,
+            Ok(child) => {
+                let _ = child_space.keep();
+                child
+            }
             Err(e) => {
-                owner.spaces.free(index);
+                child_space.release();
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
                     return Err(NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::ForkPublishCore,

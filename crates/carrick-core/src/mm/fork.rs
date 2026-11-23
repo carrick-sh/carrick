@@ -435,30 +435,30 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                 }
             };
             if let Err(error) = changed {
-                rollback(words, &self.scratch.edits[..applied])?;
+                rollback::<B, _>(words, &self.scratch.edits[..applied])?;
                 return Err(error);
             }
         }
         if let Err(error) = child.set_fork_origin(self.request) {
-            rollback(words, &self.scratch.edits)?;
+            rollback::<B, _>(words, &self.scratch.edits)?;
             return Err(error);
         }
         if let Err(error) = parent.clone_into(&mut child) {
             child.clear_fork_origin();
-            rollback(words, &self.scratch.edits)?;
+            rollback::<B, _>(words, &self.scratch.edits)?;
             return Err(error);
         }
         let parent_generation = match parent.publish_fork_parent(self.request) {
             Ok(generation) => generation,
             Err(error) => {
                 child.clear_fork_origin();
-                rollback(words, &self.scratch.edits)?;
+                rollback::<B, _>(words, &self.scratch.edits)?;
                 return Err(error);
             }
         };
         if let Err(error) = child.publish_fork_child(self.request) {
             child.clear_fork_origin();
-            rollback(words, &self.scratch.edits)?;
+            rollback::<B, _>(words, &self.scratch.edits)?;
             return Err(error);
         }
         words.publish_barrier();
@@ -533,7 +533,7 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
         {
             return Err(ForkError::Stale);
         }
-        rollback(words, &self.scratch.edits)?;
+        rollback::<B, _>(words, &self.scratch.edits)?;
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         parent.finish_fork_publication(request.operation)?;
@@ -639,16 +639,17 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
     }
 }
 
-pub fn rollback<W: LiveDescriptorWords + ?Sized>(
+/// Undo `edits`, newest first. A word another CPU's walker has marked
+/// since the edit (x86 Accessed, [`OwnerForkMmu::WALKER_SET_BITS`]) still
+/// holds the edit: it is restored with those bits kept, never refused as a
+/// broken rollback (#2919 review P0-2). Any other difference is.
+pub fn rollback<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
     edits: &[JournalEntry],
 ) -> Result<(), ForkError> {
     for edit in edits.iter().rev() {
         if edit.bbm_len != 0 {
-            if !words
-                .compare_exchange(edit.pa, edit.after, 0)
-                .map_err(|_| ForkError::Core)?
-            {
+            if !undo_word::<B, W>(words, edit.pa, edit.after, 0, false)? {
                 return Err(ForkError::Core);
             }
             words.publish_barrier();
@@ -659,16 +660,42 @@ pub fn rollback<W: LiveDescriptorWords + ?Sized>(
             {
                 return Err(ForkError::Core);
             }
-        } else if !words
-            .compare_exchange(edit.pa, edit.after, edit.before)
-            .map_err(|_| ForkError::Core)?
-        {
+        } else if !undo_word::<B, W>(words, edit.pa, edit.after, edit.before, true)? {
             return Err(ForkError::Core);
         }
     }
     words.publish_barrier();
     words.invalidate_range(0, 1 << 48);
     Ok(())
+}
+
+/// Swap `pa` from `stored` to `restore` (with any walker-set bits it gained
+/// when `keep`; a break-before-make break stores exactly `restore`). Each
+/// failed exchange means the walker set another of those bits, which it
+/// never clears, so this ends within their count.
+fn undo_word<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    pa: u64,
+    stored: u64,
+    restore: u64,
+    keep: bool,
+) -> Result<bool, ForkError> {
+    let kept = if keep { B::WALKER_SET_BITS } else { 0 };
+    let mut expected = stored;
+    for _ in 0..=B::WALKER_SET_BITS.count_ones() {
+        if words
+            .compare_exchange(pa, expected, restore | (expected & kept))
+            .map_err(|_| ForkError::Core)?
+        {
+            return Ok(true);
+        }
+        let current = words.load(pa).map_err(|_| ForkError::Core)?;
+        if current & !B::WALKER_SET_BITS != stored & !B::WALKER_SET_BITS {
+            return Ok(false);
+        }
+        expected = current;
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
