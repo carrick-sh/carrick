@@ -751,13 +751,10 @@ pub struct GuestLeafPublication {
 }
 
 /// Mapping protection ceiling (`VM_MAY*`) authorizing a COW-armed private leaf
-/// permission edit when `SW_EL1_MAY_WRITE` carries current write intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestPermissionCeiling {
-    pub readable: bool,
-    pub writable: bool,
-    pub executable: bool,
-}
+/// permission edit when `SW_EL1_MAY_WRITE` carries current write intent. On
+/// AArch64 an execute grant still needs `SW_EL1_MAY_EXEC`: the frame must
+/// have crossed the instruction-cache authority, which the ring lacks.
+pub use carrick_guest_arch::EditCeiling as GuestPermissionCeiling;
 
 /// One resident private-anonymous permission transition owned by guest EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,6 +764,8 @@ pub struct GuestPermissionEdit {
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
+    /// The edited mapping's ceiling, from its reservation owner: it
+    /// authorizes a COW-armed AArch64 leaf's edit, and an x86 execute grant.
     pub cow_ceiling: Option<GuestPermissionCeiling>,
 }
 

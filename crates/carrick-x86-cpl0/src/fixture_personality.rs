@@ -708,6 +708,7 @@ impl Personality for FixturePersonality {
                             executable: false,
                             user: true,
                         },
+                        ceiling: None,
                     },
                 );
                 frame.rax = match receipt {
