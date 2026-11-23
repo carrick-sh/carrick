@@ -2133,3 +2133,882 @@ fn arm_handler_entry_is_a_resume_point() {
         Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
     );
 }
+
+struct LivePositionFixture {
+    fixture: &'static Fixture,
+    runtime: std::sync::Arc<NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>>,
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    owner_record: carrick_el1_abi::RecordId,
+    member: carrick_sched_core::RecordRef,
+    service: Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    ttbr0: u64,
+}
+
+fn new_live_position_fixture() -> LivePositionFixture {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    registry()
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let owner_record = runtime
+        .task_binding(TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        })
+        .unwrap()
+        .record
+        .id;
+    let member = fixture.zone.record_ref(owner_record);
+    fixture.control.bind_zone_record(member);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, owner_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        owner_record
+    );
+    run_as_leader(fixture);
+    let crossing = Box::leak(Box::new(TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ])));
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let ttbr0 = fixture_ttbr0(fixture);
+    LivePositionFixture {
+        fixture,
+        runtime,
+        source,
+        owner_record,
+        member,
+        service,
+        ttbr0,
+    }
+}
+
+fn wake_and_resume_deferred_signal_copy(
+    env: &mut LivePositionFixture,
+    cpu: &mut crate::sched::FakeCpu,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) {
+    let notice = env
+        .fixture
+        .task
+        .service_notice
+        .take()
+        .expect("service_notice cell")
+        .expect("CarrierWork service notice published");
+    let queue = env
+        .fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(env.member).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &env.fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            env.fixture.zone.record(env.owner_record).identity(),
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(env.fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut resume_cpu = ResumeCpu {
+        inner: core::mem::take(cpu),
+        runtime: &env.runtime,
+        registry: registry(),
+        source: env.source,
+        task: &env.fixture.task,
+        service: &mut env.service,
+    };
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: env.fixture.zone,
+            slot: env.fixture.slot,
+            task: &env.fixture.task,
+            cpu: &mut resume_cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(frame, 0),
+        Served::Returned { switched: true }
+    );
+    *cpu = resume_cpu.inner;
+}
+
+fn read_delivered_sigframe(
+    stack: &carrick_test_support::GuestUserBuffer,
+    sp_top: UserVa,
+) -> carrick_personality_linux::signal::arm::SignalFrame {
+    let written_sp = (sp_top.raw()
+        - core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>() as u64)
+        & !15;
+    let offset = (written_sp - stack.arg()) as usize;
+    zerocopy::FromBytes::read_from_bytes(
+        &stack.as_bytes()[offset
+            ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+    )
+    .unwrap()
+}
+
+/// #2900 on ARM (live P0): an in-place dispatch rewind (`wait_guest_copy` ->
+/// `LifecycleOutcome::Redispatch` -> `restart_syscall`) moves the live frame's
+/// ELR back onto the `SVC` instruction before the EL0 return checkpoint. When
+/// signal-frame copyout then defers (`Busy` once), the parked context must be
+/// labelled `AtSyscall` so neither `ProcessContext::restart_syscall`,
+/// `host_resume`, nor scheduler/signal resume rewinds ELR a second time.
+#[test]
+fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
+    const SVC: u64 = 0x40_0000;
+    let mut env = new_live_position_fixture();
+    let usr1 = Signal::from_number(10).unwrap();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp_top = stack.va_at(stack.len());
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, env.fixture.address);
+        with_process_entry(
+            env.source,
+            &env.fixture.task,
+            &words.native,
+            env.ttbr0,
+            env.fixture.page,
+            env.fixture.control,
+            &mut env.service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        usr1,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x70_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                restart: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    let refusals_left = std::rc::Rc::new(core::cell::Cell::new(1usize));
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        let refusals_left = refusals_left.clone();
+        *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+            if bytes.is_some() && refusals_left.get() > 0 {
+                refusals_left.set(refusals_left.get() - 1);
+                return Some(Err(NativeProcessError::Busy));
+            }
+            None
+        }));
+    });
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        }
+    }
+    let _clear = ClearHook;
+
+    let mask = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
+    let old_mask = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (env.ttbr0, env.ttbr0),
+        ..Default::default()
+    };
+    cpu.regs.sp_el0 = sp_top.raw();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x5600_0000,
+        elr: SVC + 4,
+        slot: u64::from(env.fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[..4].copy_from_slice(&[0, mask.arg(), old_mask.arg(), 8]);
+    frame.x[8] = 135; // SYS_rt_sigprocmask
+
+    let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&env.fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: env.fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(env.fixture),
+        env.fixture.page,
+        env.fixture.control,
+        &saved.native,
+        env.ttbr0,
+        &mut env.service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    let action = crate::dispatch::resolve_arm_process_route(
+        route,
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&env.fixture.task),
+        || false,
+    );
+    assert_eq!(action, carrick_el1_abi::Action::Served);
+    assert_eq!(
+        frame.elr, SVC,
+        "in-place input preparation must rewind ELR onto the SVC once"
+    );
+
+    let checkpoint_action = crate::dispatch::final_user_return(&mut frame, action, |frame| {
+        crate::dispatch::arm_signal_user_return_with_cpu(
+            frame,
+            &env.fixture.task,
+            env.fixture.page,
+            env.fixture.control,
+            env.fixture.zone,
+            &mut cpu,
+            env.ttbr0,
+            true,
+            &mut env.service,
+        )
+    });
+    assert_eq!(
+        checkpoint_action,
+        carrick_el1_abi::Action::Idle,
+        "Busy once on signal frame copy must park the rewound frame"
+    );
+    assert!(env.fixture.zone.slot(env.fixture.slot).current().is_none());
+
+    // SAFETY: the parked record is not OnCpu on any slot while we inspect it.
+    let parked = unsafe { *env.fixture.zone.record(env.owner_record).ctx_mut() };
+    assert_eq!(parked.native.pc, SVC);
+    assert_eq!(
+        parked.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "a frame already rewound in place must park as AtSyscall, never AfterSyscall"
+    );
+    let mut retried = parked;
+    carrick_guest_arch::ProcessContext::restart_syscall(&mut retried);
+    assert_eq!(
+        retried.native.pc, SVC,
+        "restarting the parked context must not rewind a second time to SVC - 4"
+    );
+    assert_eq!(
+        parked
+            .host_resume(
+                carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(
+                    carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                )
+            )
+            .unwrap()
+            .pc,
+        SVC,
+        "host syscall continuation resume must not rewind a second time to SVC - 4"
+    );
+
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    assert_eq!(frame.elr, SVC);
+    let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
+        &mut frame,
+        &env.fixture.task,
+        env.fixture.page,
+        env.fixture.control,
+        env.fixture.zone,
+        &mut cpu,
+        env.ttbr0,
+        true,
+        &mut env.service,
+    );
+    assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0x70_0000);
+    let sigframe = read_delivered_sigframe(&stack, sp_top);
+    let delivered_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
+    assert_eq!(
+        delivered_pc, SVC,
+        "sigreturn from the handler must resume at the SVC once, never SVC - 4"
+    );
+    // SAFETY: single-lane test owns the switched-in record.
+    let after_handler = unsafe { *env.fixture.zone.record(env.owner_record).ctx_mut() };
+    assert_eq!(
+        after_handler.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
+    );
+}
+
+/// #2900 on ARM (live P0 `ArmSignalMachine::restart`): if a live frame has
+/// already been rewound to `AtSyscall` while a retained interrupted context
+/// still records `AfterSyscall`, `SA_RESTART` across a deferred signal-frame
+/// copy must not combine the retained `AfterSyscall` label with the already-
+/// rewound `ELR` and subtract 4 a second time.
+#[test]
+fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
+    const SVC: u64 = 0x40_0000;
+    const ARG0: u64 = 0x99;
+    let mut env = new_live_position_fixture();
+    let usr1 = Signal::from_number(10).unwrap();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp_top = stack.va_at(stack.len());
+    {
+        let mut native = ThreadCtx::ZERO;
+        native.x[0] = ARG0;
+        native.x[8] = 260; // SYS_wait4
+        native.pc = SVC + 4;
+        native.sp_el0 = sp_top.raw();
+        with_process_entry(
+            env.source,
+            &env.fixture.task,
+            &native,
+            env.ttbr0,
+            env.fixture.page,
+            env.fixture.control,
+            &mut env.service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        usr1,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x70_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                restart: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+                entry
+                    .resume_context_mut()
+                    .replace_saved_pc(SVC + 4, carrick_sched_core::SavedSyscallPc::AfterSyscall);
+                entry.retain_interrupted_syscall().unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    let refusals_left = std::rc::Rc::new(core::cell::Cell::new(1usize));
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        let refusals_left = refusals_left.clone();
+        *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+            if bytes.is_some() && refusals_left.get() > 0 {
+                refusals_left.set(refusals_left.get() - 1);
+                return Some(Err(NativeProcessError::Busy));
+            }
+            None
+        }));
+    });
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _clear = ClearHook;
+
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (env.ttbr0, env.ttbr0),
+        ..Default::default()
+    };
+    cpu.regs.sp_el0 = sp_top.raw();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x5600_0000,
+        elr: SVC + 4,
+        slot: u64::from(env.fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[8] = 260;
+    // Dispatch rewinds the live frame onto the SVC before the return checkpoint;
+    // the interrupted call answers EINTR for SA_RESTART inspection.
+    crate::dispatch::GuestDispatchFrame::restart_syscall(&mut frame);
+    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    assert_eq!(frame.elr, SVC);
+
+    let first =
+        crate::dispatch::final_user_return(&mut frame, carrick_el1_abi::Action::Served, |frame| {
+            crate::dispatch::arm_signal_user_return_with_cpu(
+                frame,
+                &env.fixture.task,
+                env.fixture.page,
+                env.fixture.control,
+                env.fixture.zone,
+                &mut cpu,
+                env.ttbr0,
+                true,
+                &mut env.service,
+            )
+        });
+    assert_eq!(first, carrick_el1_abi::Action::Idle);
+    // SAFETY: parked record is off-CPU.
+    let parked = unsafe { *env.fixture.zone.record(env.owner_record).ctx_mut() };
+    assert_eq!(
+        parked.native.pc, SVC,
+        "SA_RESTART on an already-rewound frame must not rewind to SVC - 4 before parking"
+    );
+    assert_eq!(
+        parked.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
+    );
+
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    let second = crate::dispatch::arm_signal_user_return_with_cpu(
+        &mut frame,
+        &env.fixture.task,
+        env.fixture.page,
+        env.fixture.control,
+        env.fixture.zone,
+        &mut cpu,
+        env.ttbr0,
+        true,
+        &mut env.service,
+    );
+    assert_eq!(second, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0x70_0000);
+    let sigframe = read_delivered_sigframe(&stack, sp_top);
+    let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
+    let saved_x0 = { sigframe.rt.ucontext.uc_mcontext.regs[0] };
+    assert_eq!(saved_pc, SVC, "SA_RESTART must rewind saved PC once");
+    assert_eq!(saved_x0, ARG0, "SA_RESTART must restore original arg0");
+}
+
+/// #2900 on ARM (live P0 IRQ resume PC): a deferred signal-frame copy on an EL0
+/// interrupt return (`esr == 0`) must park the interrupted instruction's PC as
+/// `AtSyscall` so nothing treats it as `AfterSyscall`.
+#[test]
+fn arm_irq_deferred_signal_copy_keeps_resume_label() {
+    const IRQ_PC: u64 = 0x40_1234;
+    let mut env = new_live_position_fixture();
+    let usr1 = Signal::from_number(10).unwrap();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp_top = stack.va_at(stack.len());
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, env.fixture.address);
+        with_process_entry(
+            env.source,
+            &env.fixture.task,
+            &words.native,
+            env.ttbr0,
+            env.fixture.page,
+            env.fixture.control,
+            &mut env.service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        usr1,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x70_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                restart: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    let refusals_left = std::rc::Rc::new(core::cell::Cell::new(1usize));
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        let refusals_left = refusals_left.clone();
+        *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+            if bytes.is_some() && refusals_left.get() > 0 {
+                refusals_left.set(refusals_left.get() - 1);
+                return Some(Err(NativeProcessError::Busy));
+            }
+            None
+        }));
+    });
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _clear = ClearHook;
+
+    let counters = carrick_el1_abi::Counters::new();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (env.ttbr0, env.ttbr0),
+        ..Default::default()
+    };
+    cpu.regs.sp_el0 = sp_top.raw();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0,
+        elr: IRQ_PC,
+        slot: u64::from(env.fixture.slot.raw()),
+        ..Default::default()
+    };
+    let task_slice = core::slice::from_ref(&env.fixture.task);
+    let irq_action = crate::dispatch::dispatch_irq_with_regions(
+        &mut frame,
+        &counters,
+        task_slice,
+        crate::dispatch::Zone {
+            tables: env.fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        },
+    );
+    assert_eq!(irq_action, carrick_el1_abi::Action::Served);
+    let checkpoint_action = crate::dispatch::final_user_return(&mut frame, irq_action, |frame| {
+        crate::dispatch::arm_signal_user_return_with_cpu(
+            frame,
+            &env.fixture.task,
+            env.fixture.page,
+            env.fixture.control,
+            env.fixture.zone,
+            &mut cpu,
+            env.ttbr0,
+            true,
+            &mut env.service,
+        )
+    });
+    assert_eq!(checkpoint_action, carrick_el1_abi::Action::Idle);
+
+    // SAFETY: parked record is off-CPU.
+    let parked = unsafe { *env.fixture.zone.record(env.owner_record).ctx_mut() };
+    assert_eq!(parked.native.pc, IRQ_PC);
+    assert_eq!(
+        parked.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "an EL0 IRQ resume PC must park as AtSyscall, never AfterSyscall"
+    );
+    let mut retried = parked;
+    carrick_guest_arch::ProcessContext::restart_syscall(&mut retried);
+    assert_eq!(retried.native.pc, IRQ_PC);
+
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
+        &mut frame,
+        &env.fixture.task,
+        env.fixture.page,
+        env.fixture.control,
+        env.fixture.zone,
+        &mut cpu,
+        env.ttbr0,
+        true,
+        &mut env.service,
+    );
+    assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0x70_0000);
+    let sigframe = read_delivered_sigframe(&stack, sp_top);
+    let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
+    assert_eq!(saved_pc, IRQ_PC);
+}
+
+/// #2900 on ARM (live P0 sigreturn-restored ELR): `rt_sigreturn` restores an
+/// interrupted resume PC into `frame.elr` while `frame.esr` still names `SVC`.
+/// When unblocking a second pending signal (`SIGUSR2`) defers on signal-frame
+/// copyout (`Busy` once), the parked context must keep `AtSyscall`.
+#[test]
+fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
+    const RESTORED_PC: u64 = 0x40_5678;
+    let mut env = new_live_position_fixture();
+    let usr1 = Signal::from_number(10).unwrap();
+    let usr2 = Signal::from_number(12).unwrap();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp_top = stack.va_at(stack.len());
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, env.fixture.address);
+        with_process_entry(
+            env.source,
+            &env.fixture.task,
+            &words.native,
+            env.ttbr0,
+            env.fixture.page,
+            env.fixture.control,
+            &mut env.service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        usr1,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x70_0000)),
+                            mask: carrick_signal_core::SignalSet::EMPTY.with(usr2),
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .rt_sigaction(
+                        usr2,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x74_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                restart: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x71_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    let task_slice = core::slice::from_ref(&env.fixture.task);
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (env.ttbr0, env.ttbr0),
+        ..Default::default()
+    };
+    cpu.regs.sp_el0 = sp_top.raw();
+
+    // Deliver SIGUSR1 first on an interrupted EL0 PC (`RESTORED_PC`), writing a
+    // real Linux AArch64 signal frame onto `stack` and masking SIGUSR2.
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0,
+        elr: RESTORED_PC,
+        slot: u64::from(env.fixture.slot.raw()),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::dispatch::arm_signal_user_return_with_cpu(
+            &mut frame,
+            &env.fixture.task,
+            env.fixture.page,
+            env.fixture.control,
+            env.fixture.zone,
+            &mut cpu,
+            env.ttbr0,
+            true,
+            &mut env.service,
+        ),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(frame.elr, 0x70_0000);
+    assert_ne!(cpu.regs.sp_el0, sp_top.raw());
+
+    // Queue SIGUSR2 while masked inside SIGUSR1's handler.
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, env.fixture.address);
+        with_process_entry(
+            env.source,
+            &env.fixture.task,
+            &words.native,
+            env.ttbr0,
+            env.fixture.page,
+            env.fixture.control,
+            &mut env.service,
+            |entry| {
+                entry
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(12).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    // Arm Busy once for SIGUSR2's signal-frame copyout when rt_sigreturn
+    // unmasks it at the live EL0 return checkpoint.
+    let refusals_left = std::rc::Rc::new(core::cell::Cell::new(1usize));
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        let refusals_left = refusals_left.clone();
+        *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+            if bytes.is_some() && refusals_left.get() > 0 {
+                refusals_left.set(refusals_left.get() - 1);
+                return Some(Err(NativeProcessError::Busy));
+            }
+            None
+        }));
+    });
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _clear = ClearHook;
+
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    frame.esr = 0x5600_0000;
+    frame.elr = 0x71_0004;
+    frame.x[8] = 139; // SYS_rt_sigreturn
+
+    let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
+    let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        task_slice,
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: env.fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(env.fixture),
+        env.fixture.page,
+        env.fixture.control,
+        &saved.native,
+        env.ttbr0,
+        &mut env.service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    let sigreturn_action = crate::dispatch::resolve_arm_process_route(
+        route,
+        &mut frame,
+        &counters,
+        task_slice,
+        || false,
+    );
+    assert_eq!(sigreturn_action, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, RESTORED_PC);
+    assert_eq!(cpu.regs.sp_el0, sp_top.raw());
+
+    let checkpoint_action =
+        crate::dispatch::final_user_return(&mut frame, sigreturn_action, |frame| {
+            crate::dispatch::arm_signal_user_return_with_cpu(
+                frame,
+                &env.fixture.task,
+                env.fixture.page,
+                env.fixture.control,
+                env.fixture.zone,
+                &mut cpu,
+                env.ttbr0,
+                true,
+                &mut env.service,
+            )
+        });
+    assert_eq!(checkpoint_action, carrick_el1_abi::Action::Idle);
+
+    // SAFETY: parked record is off-CPU.
+    let parked = unsafe { *env.fixture.zone.record(env.owner_record).ctx_mut() };
+    assert_eq!(parked.native.pc, RESTORED_PC);
+    assert_eq!(
+        parked.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "a sigreturn-restored ELR must park as AtSyscall, never AfterSyscall"
+    );
+    let mut retried = parked;
+    carrick_guest_arch::ProcessContext::restart_syscall(&mut retried);
+    assert_eq!(retried.native.pc, RESTORED_PC);
+
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
+        &mut frame,
+        &env.fixture.task,
+        env.fixture.page,
+        env.fixture.control,
+        env.fixture.zone,
+        &mut cpu,
+        env.ttbr0,
+        true,
+        &mut env.service,
+    );
+    assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0x74_0000);
+    let sigframe = read_delivered_sigframe(&stack, sp_top);
+    let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
+    assert_eq!(saved_pc, RESTORED_PC);
+}
