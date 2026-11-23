@@ -154,16 +154,16 @@ pr = 2785
 test = "x86_kvm_run::mounted_static_x86_sched_unported_refusal_returns_enosys"
 reason = "#1092: x86 CPL0 now serves sched_setaffinity and sched_getaffinity in ring through the shared route, so the counted-ENOSYS witness of the unported call (and its fixture x86_sched_refusal.S) no longer describes the kernel."
 replaced_by = "x86_kvm_run::mounted_static_x86_affinity_matches_native"
-pr = 0
+pr = 2855
 
 [[retired]]
 test = "carrick_personality_linux::dispatch::ring_first_tests::affinity_routes_are_arm_only_even_after_x86_canonicalization"
 reason = "#1092: the affinity route is shared by both ISAs, so the test that pinned the ARM-only split now asserts identical routing."
 replaced_by = "carrick_personality_linux::dispatch::ring_first_tests::affinity_routes_are_shared_by_both_isas"
-pr = 0
+pr = 2855
 
 [[retired]]
 test = "sched_policy::arm_affinity_routes_in_ring_and_x86_stays_unported"
 reason = "#1092: the affinity route is shared by both ISAs."
 replaced_by = "sched_policy::affinity_routes_in_ring_on_both_isas"
-pr = 0
+pr = 2855
