@@ -284,6 +284,11 @@ pub enum FileMapSharing {
     /// `MAP_SHARED` of a description that cannot write the file: the
     /// mapping may never hold a store ([`ReservationNodeFlags::SHARED_READ_ONLY`]).
     SharedReadOnly,
+    /// `MAP_SHARED` served as a shared file window: the carrier maps the
+    /// file's own pages, so the node is [`ReservationNodeFlags::FILE`]
+    /// without [`ReservationNodeFlags::PRIVATE`], and its faults publish the
+    /// window's pages rather than copying bytes (#1338).
+    Shared,
 }
 
 /// Attributes of one reservation node, fixed when the node is inserted (host

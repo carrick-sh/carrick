@@ -1381,6 +1381,25 @@ fn shared_read_only_file_mapping_renders_as_shared_in_proc_maps() {
         ),
         Err(Refusal::Invalid)
     );
+    // A shared file window (#1338) is the file's own pages: a writable node
+    // that is FILE without PRIVATE, never SHARED_READ_ONLY.
+    let window = {
+        let mut root = root.lock();
+        let decision = root
+            .mmap_private_file(
+                Placement::Anywhere,
+                PAGE,
+                ReservationProtection::READ_WRITE,
+                source,
+                FileMapSharing::Shared,
+            )
+            .unwrap();
+        commit(&mut root, decision)
+    };
+    let flags = root.lock().mapping(window).unwrap().flags;
+    assert!(flags.contains(ReservationNodeFlags::FILE));
+    assert!(!flags.contains(ReservationNodeFlags::PRIVATE));
+    assert!(!flags.contains(ReservationNodeFlags::SHARED_READ_ONLY));
 }
 
 /// The proc-executable description must use the same owner source custody as
