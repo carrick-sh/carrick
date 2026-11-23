@@ -11,9 +11,12 @@ use carrick_personality_linux::signal::arm::RtSigframe;
 struct ArmSignalMachine {
     backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
-    /// The syscall position a restart left the frame at; `None` keeps the
-    /// parked context's own.
-    restarted: Option<carrick_sched_core::SavedSyscallPc>,
+    /// Where the frame's PC sits relative to its `SVC` (#2900). The
+    /// vector-encoded `TrapFrame` has no word for it, so the machine carries
+    /// it beside the frame: exact for a frame built from a saved context,
+    /// and after a rerun or a handler entry. `None` is the live vector
+    /// frame, whose rerun still takes the interrupted context's position.
+    position: Option<carrick_sched_core::SavedSyscallPc>,
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -35,23 +38,29 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         frame: &mut TrapFrame,
         original: &carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
-        let Some(position) = carrick_guest_arch::rerun_interrupted_syscall(frame, original) else {
+        let Some(position) = self.position.or_else(|| original.saved_syscall_pc()) else {
             return false;
         };
-        self.restarted = Some(position);
+        let mut frame = carrick_guest_arch::PositionedFrame { frame, position };
+        if !carrick_guest_arch::rerun_interrupted_syscall(&mut frame, original) {
+            return false;
+        }
+        self.position = Some(frame.position);
         true
     }
 
     fn restart_forwarded(&mut self, frame: &mut TrapFrame) -> Option<bool> {
         let restarted = restart_forwarded_frame(frame);
         if restarted == Some(true) {
-            self.restarted = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
+            self.position = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
         }
         restarted
     }
 
+    /// The frame now enters the handler, which is where it resumes.
     fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
         self.user_sp = sp;
+        self.position = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
     }
 
     fn sync_parked_context(
@@ -60,7 +69,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         ctx: &mut carrick_sched_core::Aarch64ParkedContext,
     ) {
         ctx.native.x = frame.x;
-        match self.restarted {
+        match self.position {
             Some(position) => ctx.replace_saved_pc(frame.elr, position),
             None => ctx.native.pc = frame.elr,
         }
@@ -95,13 +104,19 @@ pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
 }
 
 /// Rewind an interrupted restart-class forwarded SVC for `SA_RESTART` or when
-/// no handler runs at the checkpoint (`WaitDecision::Continue`).
+/// no handler runs at the checkpoint (`WaitDecision::Continue`). The host's
+/// checkpoint frame is the `SVC`'s own return, after the instruction.
 fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
-    let Some(pc) = frame.elr.checked_sub(4) else {
-        return Some(false);
+    use carrick_guest_arch::SyscallReturnFrame;
+    let arg0 = frame.far;
+    let mut frame = carrick_guest_arch::PositionedFrame {
+        frame,
+        position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
     };
-    frame.x[0] = frame.far;
-    frame.elr = pc;
+    if frame.rewind_to_syscall().is_none() {
+        return Some(false);
+    }
+    frame.frame.x[0] = arg0;
     Some(true)
 }
 
@@ -177,7 +192,7 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
         &mut ArmSignalMachine {
             backend: LinuxAarch64Backend,
             user_sp: sp,
-            restarted: None,
+            position: None,
         },
     )
 }
@@ -204,6 +219,11 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
         return Ok(None);
     }
     let saved = process.resume_context();
+    let Some(position) = saved.saved_syscall_pc() else {
+        return Err(super::native_process_runtime::NativeFailure::Quarantined
+            .run_failure_reason()
+            .at_caller());
+    };
     let mut frame = alloc::boxed::Box::new(TrapFrame::default());
     frame.x = saved.native.x;
     frame.elr = saved.native.pc;
@@ -216,7 +236,8 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     let mut machine = ArmSignalMachine {
         backend: LinuxAarch64Backend,
         user_sp: carrick_guest_arch::UserVa::new(saved.native.sp_el0),
-        restarted: None,
+        // The frame is the saved context's: its PC sits where it says.
+        position: Some(position),
     };
     let control = process.resume_signal_control();
     let route = deliver_on_user_return_with(

@@ -155,6 +155,7 @@ pub fn schedule(slot: SlotId) -> ! {
                         let mut frame = context::context_words::syscall_frame_from_native(
                             &native,
                             state.address,
+                            position,
                         )
                         .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
                         let mut machine =
@@ -178,7 +179,12 @@ pub fn schedule(slot: SlotId) -> ! {
                                     .map_err(|_| {
                                         NativeFailure::Quarantined.run_failure_reason().at_caller()
                                     })?,
-                                    machine.frame_position(position),
+                                    carrick_guest_arch::SyscallReturnFrame::syscall_position(
+                                        &frame,
+                                    )
+                                    .ok_or_else(|| {
+                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
+                                    })?,
                                 );
                                 Ok(None)
                             }
@@ -260,9 +266,12 @@ pub fn schedule(slot: SlotId) -> ! {
                     let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot!());
                     let native = context::context_words::into_native(words, state.address)
                         .unwrap_or_else(|_| fatal_boot!());
-                    let mut frame =
-                        context::context_words::syscall_frame_from_native(&native, state.address)
-                            .unwrap_or_else(|_| fatal_boot!());
+                    let mut frame = context::context_words::syscall_frame_from_native(
+                        &native,
+                        state.address,
+                        position,
+                    )
+                    .unwrap_or_else(|_| fatal_boot!());
                     let mut machine =
                         crate::linux_personality::X86SignalMachine::new(state.address);
                     if let Some(route) = deliver_signal_on_syscall_return(
@@ -288,7 +297,8 @@ pub fn schedule(slot: SlotId) -> ! {
                             &native.xsave,
                         )
                         .unwrap_or_else(|_| fatal_boot!()),
-                        machine.frame_position(position),
+                        carrick_guest_arch::SyscallReturnFrame::syscall_position(&frame)
+                            .unwrap_or_else(|| fatal_boot!()),
                     );
                 }
                 if let Some(status) = entry.take_root_exit() {

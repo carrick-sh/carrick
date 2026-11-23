@@ -740,6 +740,9 @@ impl NativeBirthContext {
             rsp: 0,
             user_rcx: 0,
             user_r11: 0,
+            syscall_position: carrick_guest_arch::SavedSyscallPcWord::new(
+                carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+            ),
         },
         fs_base: 0,
         gs_base: 0,

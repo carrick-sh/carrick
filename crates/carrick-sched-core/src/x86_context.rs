@@ -140,33 +140,22 @@ impl ParkedContextWords {
             generation: address.generation.raw().get(),
             fs_base,
             gs_base,
-            saved_syscall_pc: Self::encode_saved_syscall_pc(SavedSyscallPc::AfterSyscall),
+            saved_syscall_pc: SavedSyscallPc::AfterSyscall.word(),
             _xsave_align: [0; 48],
             xsave,
-        }
-    }
-
-    const fn encode_saved_syscall_pc(position: SavedSyscallPc) -> u64 {
-        match position {
-            SavedSyscallPc::AfterSyscall => 0,
-            SavedSyscallPc::AtSyscall => 1,
         }
     }
 
     /// Replace the saved RIP and its syscall-relative meaning together.
     pub fn replace_saved_pc(&mut self, rip: u64, position: SavedSyscallPc) {
         self.frame[15] = rip;
-        self.saved_syscall_pc = Self::encode_saved_syscall_pc(position);
+        self.saved_syscall_pc = position.word();
     }
 
     /// Interpret the position stored with this exact saved context; `None`
     /// is a corrupt record.
     pub fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
-        match self.saved_syscall_pc {
-            0 => Some(SavedSyscallPc::AfterSyscall),
-            1 => Some(SavedSyscallPc::AtSyscall),
-            _ => None,
-        }
+        SavedSyscallPc::from_word(self.saved_syscall_pc)
     }
 
     /// The first user entry of a fresh image: `rip`/`rsp` under the
