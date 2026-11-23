@@ -919,11 +919,16 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
-/// `close_range` in the run root and in a fork child (#1906's table: a
-/// counted ENOSYS for a native child). `x86_close_range.c` opens two pipes
-/// and prints each call's return value with `F_GETFD` of its four fds after it:
-/// the EINVAL shapes, `CLOSE_RANGE_CLOEXEC`, a range past the table,
-/// `CLOSE_RANGE_UNSHARE` and an empty range.
+/// `close_range` in the run root and in a fork child (#2904: a counted
+/// ENOSYS for both). `x86_close_range.c` opens two pipes and prints each
+/// call's return value with `F_GETFD` of its four fds after it: the EINVAL
+/// shapes, `CLOSE_RANGE_CLOEXEC`, a range past the table,
+/// `CLOSE_RANGE_UNSHARE`, an empty range, and a range holding a host file
+/// between ring pipe ends. The root then runs a thread sharing its table
+/// (`CLONE_FILES`): its plain `close_range` closes for both threads, and its
+/// `CLOSE_RANGE_UNSHARE` must never close the root's descriptor. The ring
+/// has no per-thread table yet, so that one call stays unrouted (-38,
+/// nothing closed) until #2930; every other line must match Linux.
 #[test]
 fn mounted_static_x86_close_range_matches_native() {
     if skip_without_kvm() {
@@ -947,11 +952,22 @@ fn mounted_static_x86_close_range_matches_native() {
     assert_eq!(native.status.code(), Some(7), "native oracle");
 
     let guest = run_mounted_binary(&elf, "close-range", false);
-    assert_eq!(
-        String::from_utf8_lossy(&guest.stdout),
-        String::from_utf8_lossy(&native.stdout),
-        "c is the fork child, r the root; each line is a call's return value, then \
-         F_GETFD of the four pipe fds (-9 EBADF, 1 FD_CLOEXEC). Stderr: {}",
+    let native_out = String::from_utf8_lossy(&native.stdout);
+    let shared_native = "t shared=0 unshare=0 own=-9 root=0 -9\n";
+    assert!(
+        native_out.ends_with(shared_native),
+        "native oracle: {native_out}"
+    );
+    // The thread's UNSHARE needs a table published for it alone (#2930):
+    // unrouted, it must leave the shared table as it was.
+    let shared_unrouted = "t shared=0 unshare=-38 own=0 root=0 -9\n";
+    let expected_unrouted = native_out.replace(shared_native, shared_unrouted);
+    let guest_out = String::from_utf8_lossy(&guest.stdout);
+    assert!(
+        guest_out == native_out || guest_out == expected_unrouted,
+        "c is the fork child, r the root, t the root's CLONE_FILES thread; each \
+         c/r line is a call's return value, then F_GETFD of the four fds (-9 \
+         EBADF, 1 FD_CLOEXEC).\n  left: {guest_out:?}\n right: {native_out:?}\nStderr: {}",
         String::from_utf8_lossy(&guest.stderr)
     );
     assert_eq!(guest.status.code(), native.status.code());
