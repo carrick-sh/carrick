@@ -241,6 +241,10 @@ impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for HvfPhysicalDebug
             vcpus: capture.vcpus,
             host_threads: Vec::new(),
             unavailable: capture.unavailable,
+            el1_census: crate::el1_census::live_capture_json(
+                crate::read_el1_counters().as_ref(),
+                carrick_spec::syscall_census::CensusIsa::Aarch64,
+            ),
         }
     }
 }
