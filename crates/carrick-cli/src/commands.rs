@@ -943,6 +943,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 oracle_only,
                 venue_profiles,
                 report,
+                provider,
             } => {
                 if report {
                     crate::debug_discover::report(&out, limit)?;
@@ -962,6 +963,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         oracle: oracle.as_deref(),
                         oracle_only,
                         venue_profiles: &venue_profiles,
+                        provider,
                     })?;
                 }
             }
