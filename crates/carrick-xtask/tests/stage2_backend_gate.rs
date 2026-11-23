@@ -102,10 +102,43 @@ fn applevisor_permissions_live_only_in_the_backend_module() {
     );
 }
 
+#[test]
+fn custody_names_no_hvf_vcpu_types() {
+    let sources = hvf_sources();
+    let mut raw = Vec::new();
+    for (path, source) in &sources {
+        let custody =
+            if path.ends_with("trap/carrier_custody.rs") || path.ends_with("trap/cow_engine.rs") {
+                source.as_str()
+            } else if path.ends_with("trap.rs") {
+                source
+                    .split_once("enum PersistentCarrierCellEntry {")
+                    .and_then(|(_, body)| body.split_once("\n}"))
+                    .map(|(body, _)| body)
+                    .and_then(|body| body.split_once("CreateCleanup {"))
+                    .and_then(|(_, variant)| variant.split_once("\n    }"))
+                    .map(|(variant, _)| variant)
+                    .expect("PersistentCarrierCellEntry::CreateCleanup")
+            } else {
+                continue;
+            };
+        for name in [
+            "applevisor_sys::hv_vcpu_t",
+            "applevisor_sys::hv_return_t",
+            "applevisor::vcpu::Vcpu",
+        ] {
+            let occurrences = custody.matches(name).count();
+            if occurrences != 0 {
+                raw.push(format!("{}: {name} ({occurrences})", path.display()));
+            }
+        }
+    }
+    assert!(raw.is_empty(), "HVF vCPU types in custody: {raw:?}");
+}
+
 /// A stage-2 map or destroy that custody takes as a closure returns
 /// `carrick_aarch64::stage2::Stage2Status`, the backend's status, never a
-/// bare integer or applevisor's `hv_return_t` (#2814, S0b). vCPU operations
-/// (closures over `hv_vcpu_t`) move behind their own type in the next layer.
+/// bare integer or applevisor's `hv_return_t` (#2814, S0b).
 #[test]
 fn custody_stage2_closures_return_the_neutral_status() {
     let sources = hvf_sources();
@@ -113,15 +146,12 @@ fn custody_stage2_closures_return_the_neutral_status() {
     let mut raw = Vec::new();
     for (path, source) in &sources {
         for (index, line) in source.lines().enumerate() {
-            let Some((params, ret)) = line
+            let Some((_, ret)) = line
                 .split_once("impl Fn")
                 .and_then(|(_, tail)| tail.rsplit_once("->"))
             else {
                 continue;
             };
-            if params.contains("hv_vcpu_t") {
-                continue;
-            }
             let ret = ret.trim().trim_end_matches(',').trim();
             if raw_returns.contains(&ret) {
                 raw.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
