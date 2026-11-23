@@ -164,6 +164,11 @@ impl HostReadyWaits {
         );
     }
 
+    /// Drop `record`'s wait (its call was answered). `true` when it had one.
+    fn cancel(&mut self, record: carrick_el1_abi::RecordRef) -> bool {
+        self.waits.remove(&HostReadyKey::of(record)).is_some()
+    }
+
     /// Drop every wait on `source` (its last guest descriptor closed).
     /// `true` when one was dropped.
     fn forget(&mut self, source: HostReadinessSource) -> bool {
@@ -388,6 +393,17 @@ impl HostReadinessReactor {
         }
     }
 
+    /// `record`'s call was answered without a wait: drop the wait its
+    /// earlier attempt enrolled, with its descriptors and in-zone
+    /// enrolments, so a later readiness of the same socket neither wakes the
+    /// member for a call it no longer makes nor keeps the descriptors in
+    /// the reactor's poll set.
+    pub(crate) fn cancel(&self, record: carrick_el1_abi::RecordRef) {
+        if let Some(service) = self.service() {
+            service.change_host_ready_waits(&mut |waits| waits.cancel(record));
+        }
+    }
+
     /// Drop every host-readiness wait on `source`.
     pub(crate) fn forget(&self, source: HostReadinessSource) {
         if let Some(service) = self.service() {
@@ -543,6 +559,28 @@ mod tests {
         assert_eq!(reactor.enrolled(), 1);
         reactor.forget(source);
         assert_eq!(reactor.enrolled(), 0);
+    }
+
+    /// An answered call drops its member's wait, and only that member's:
+    /// the descriptors leave the reactor's poll set.
+    #[test]
+    fn an_answered_call_drops_only_its_own_wait() {
+        let (reactor, _service) = reactor(15_904);
+        let (read, _write) = pipe_pair();
+        let token = HostReadinessToken::new();
+        let interest = HostReadinessInterest {
+            source: token.source(),
+            fd: std::os::fd::AsFd::as_fd(&read),
+            events: libc::POLLIN,
+        };
+        assert!(reactor.watch(record(5), std::slice::from_ref(&interest), None, None));
+        assert!(reactor.watch(record(6), &[interest], None, None));
+        assert_eq!(reactor.enrolled(), 2);
+        reactor.cancel(record(5));
+        assert_eq!(reactor.enrolled(), 1);
+        // A member with no wait: nothing changes.
+        reactor.cancel(record(5));
+        assert_eq!(reactor.enrolled(), 1);
     }
 
     #[test]
