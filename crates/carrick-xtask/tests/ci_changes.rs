@@ -600,7 +600,6 @@ const DRAFT_JOBS: &[&str] = &[
     "cross-check-netbsd",
     "cross-check-macos",
     "cross-check-linux",
-    "x86-test-list",
     "el1-native-tests",
     "el1-native-gate",
 ];
@@ -703,6 +702,26 @@ fn ci_workflow_runs_cheap_hosted_jobs_on_drafts_and_keeps_mac_jobs_off_them() {
             );
         }
     }
+}
+
+/// `x86-test-list` compiled the whole x86 `just test` selection (25 to 36
+/// minutes, the largest pull-request job) only to upload a list artifact
+/// nothing reads: `ci-ok` doesn't need it, and the director's enqueue tooling
+/// doesn't read `test-list-x86-host-<sha>` (#1236, CI budget cut 1). The job
+/// is gone, not gated, and must not come back as dead weight.
+#[test]
+fn ci_workflow_has_no_unread_x86_test_list_job() {
+    let text = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let jobs = docs[0]["jobs"].as_hash().unwrap();
+    assert!(
+        !jobs.keys().any(|k| k.as_str() == Some("x86-test-list")),
+        "ci.yml must not carry the unread x86-test-list job"
+    );
+    assert!(
+        !text.contains("test-list-x86-host"),
+        "ci.yml must not upload the unread test-list-x86-host artifact"
+    );
 }
 
 #[cfg(unix)]
