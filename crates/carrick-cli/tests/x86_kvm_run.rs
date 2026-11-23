@@ -871,6 +871,69 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
+/// #2890: the Go runtime's `fork/exec` once it runs more than one P. A
+/// thread forks with `clone(CLONE_VM | CLONE_VFORK)` on its own stack and
+/// execs this image sixteen times (`x86_threads_vfork_exec.c`). `go build`
+/// and `go vet` die with `fork/exec ...: bad address` or a carrier error
+/// (`guest MMU publication live descriptor mismatch`, an unexpected physical
+/// production port `0xcc`) on main, and on #2855's parent with
+/// `GOMAXPROCS=2`. `flags` pick the shape: `-DWORKERS=0` drops the four
+/// memory-editing siblings, `-DFROM_MAIN` forks from the root's own thread.
+fn threads_vfork_exec_matches_native(flags: &[&str], run_id: &str) {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join(run_id);
+    let mut all = vec![
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-O1",
+    ];
+    all.extend_from_slice(flags);
+    compile_assembly_with_flags("x86_threads_vfork_exec.c", &elf, &all);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native threads-vfork-exec oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"ok=16\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, run_id, false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "94 is a failed vfork clone (its errno is the printed status), 95 a failed \
+         round (the exec errno is the status's exit code), 98 threads past five \
+         seconds, 99 a memory edit that did not answer as Linux does. \
+         Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// The control: the root's only thread vforks and execs.
+#[test]
+fn mounted_static_x86_root_vfork_exec_matches_native() {
+    threads_vfork_exec_matches_native(&["-DWORKERS=0", "-DFROM_MAIN"], "root-vfork-exec");
+}
+
+/// A second thread vforks while the root's thread sleeps. On main the
+/// clone answers -EFAULT (status `0x000e`) in round 0 or 1: Go's
+/// `fork/exec ...: bad address`.
+#[test]
+fn mounted_static_x86_thread_vfork_exec_matches_native() {
+    threads_vfork_exec_matches_native(&["-DWORKERS=0"], "thread-vfork-exec");
+}
+
+/// A fifth thread vforks while four siblings map, touch and unmap memory.
+/// On main a sibling's memory edit answers wrongly (99), or the carrier
+/// dies (an unregistered forward CR3).
+#[test]
+fn mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings() {
+    threads_vfork_exec_matches_native(&[], "threads-vfork-exec-siblings");
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
