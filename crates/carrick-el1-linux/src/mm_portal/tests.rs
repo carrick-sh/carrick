@@ -825,6 +825,101 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
     assert_eq!(selected(select(&portal, &transfer, &tables)).ipa, IPA);
 }
 
+/// #2686, on the aarch64 owner's descriptors: a syscall copy into an
+/// untouched page asks only for the unused span around it. The mapping's
+/// whole window holds pages an earlier supply published, and a supplier
+/// refuses a window that holds a published page.
+#[test]
+fn untouched_transfer_supply_excludes_published_neighbours() {
+    use carrick_el1::fault::PreparedPageResolver;
+    use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+    use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
+
+    /// The production aarch64 resolver's selection: the shared grant owner's
+    /// walk over this MM's live descriptors.
+    struct LiveSelection<'a>(&'a dyn LiveDescriptorWords);
+    impl PreparedPageResolver for LiveSelection<'_> {
+        fn select_backing_window(
+            &mut self,
+            root: u64,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<
+            carrick_el1_abi::PortalGrantWindow,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+        > {
+            carrick_core::mm::frames::select_backing_window::<
+                carrick_mmu_core::owner_mmu::Aarch64Mmu,
+                _,
+            >(self.0, root, window)
+        }
+        fn commit_prepared(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            panic!("this fixture holds no prepared leaf")
+        }
+    }
+
+    const PAGE: u64 = 4096;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 16, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    // Earlier supplies backed pages 2 and 5 of the 16-page mapping.
+    for page in [2u64, 5] {
+        tables.words[1536 + page as usize].store((IPA + page * PAGE) | RW, Ordering::Release);
+    }
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    for (intent, page) in [
+        (TransferIntent::UserWrite, 3u64),
+        (TransferIntent::UserRead, 4),
+        (TransferIntent::UserWrite, 0),
+        (TransferIntent::UserWrite, 9),
+    ] {
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(VA + page * PAGE + 7),
+                4,
+                intent,
+                0,
+            )
+            .unwrap();
+        let step = portal
+            .select(
+                &transfer,
+                &words,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut LiveSelection(&words),
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0,
+                },
+            )
+            .unwrap();
+        let TransferStep::Supply(window) = step else {
+            panic!("an untouched page asks its owner for backing: {step:?}")
+        };
+        let (start, end) = match page {
+            0 => (0, 2),
+            3 | 4 => (3, 5),
+            _ => (6, 16),
+        };
+        assert_eq!(window.fault_page, VA + page * PAGE);
+        assert_eq!(
+            (window.range.start(), window.range.end()),
+            (VA + start * PAGE, VA + end * PAGE),
+            "page {page}: the supply window stops at the published neighbours"
+        );
+    }
+}
+
 #[test]
 fn internal_read_selects_identity_control_from_exact_live_mm() {
     // Frozen host-buffer failure: identity shim-enabled word, not image header.
