@@ -1820,7 +1820,7 @@ pub(crate) fn destroy_vm_with_custody_target(
         }
     };
 
-    let rc = unsafe { inventory_hv_vm_destroy() };
+    let rc = unsafe { inventory_stage2_destroy() };
     if rc != 0 {
         if matches!(target, CarrierVmDestroyTarget::Live) {
             custody
@@ -4148,7 +4148,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate replacement root-slot backing");
         assert_eq!(
             unsafe {
-                super::inventory_hv_vm_map(
+                super::inventory_stage2_map(
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
@@ -4159,7 +4159,7 @@ mod carrier_vm_custody_tests {
             "a second child must map the returned root slot while stale MM-access metadata still exists",
         );
         assert_eq!(
-            unsafe { super::inventory_hv_vm_unmap(ipa, len as usize) },
+            unsafe { super::inventory_stage2_unmap(ipa, len as usize) },
             0
         );
         drop(replacement);
@@ -4241,7 +4241,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate refused replacement root-slot backing");
         assert_ne!(
             unsafe {
-                super::inventory_hv_vm_map(
+                super::inventory_stage2_map(
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
@@ -4369,7 +4369,7 @@ mod carrier_vm_custody_tests {
             .and_then(|tail| tail.split("\n}\n").next())
             .expect("global-frame lease Drop body");
         assert!(!lease_drop.contains("try_retire"));
-        assert!(!lease_drop.contains("inventory_hv_vm_unmap"));
+        assert!(!lease_drop.contains("inventory_stage2_unmap"));
         assert!(!lease_drop.contains("process::abort"));
         let structural_drop = source
             .split(concat!("impl Drop for StructuralBacking", "Owner {"))
@@ -4377,7 +4377,7 @@ mod carrier_vm_custody_tests {
             .and_then(|tail| tail.split("\n}\n").next())
             .expect("structural owner Drop body");
         assert!(structural_drop.contains("request_stage2_record_retirement"));
-        assert!(!structural_drop.contains("inventory_hv_vm_unmap"));
+        assert!(!structural_drop.contains("inventory_stage2_unmap"));
         assert!(!prepared.contains("Arc<GlobalFrameHostOwner>"));
     }
 

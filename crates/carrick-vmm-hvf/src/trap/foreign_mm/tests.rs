@@ -117,7 +117,7 @@ fn inventoried_cow_source_fixture(
     let host_addr = host.as_ptr() as usize;
     unsafe { host.as_ptr().write_bytes(0xa5, OWNER_LEN) };
     assert_eq!(
-        unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
+        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
         0,
     );
     lease.mark_mapped();
@@ -4264,7 +4264,7 @@ fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_r
     let host_addr = mapping.as_ptr() as usize;
     let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
     assert_eq!(
-        unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), ipa, size, 7) },
+        unsafe { inventory_stage2_map(mapping.as_ptr().cast(), ipa, size, 7) },
         0
     );
     lease.mark_mapped();
@@ -7638,7 +7638,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rx_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rx global-frame IPA");
     let parent_rx_ipa = parent_rx_lease.base;
-    let rc = unsafe { inventory_hv_vm_map(parent_rx_addr.cast(), parent_rx_ipa, 0x4000, 5) };
+    let rc = unsafe { inventory_stage2_map(parent_rx_addr.cast(), parent_rx_ipa, 0x4000, 5) };
     assert_eq!(rc, 0);
     parent_rx_lease.mark_mapped();
     let parent_rx_gen = register_global_frame_host_owner_in(
@@ -7662,7 +7662,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rw_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rw global-frame IPA");
     let parent_rw_ipa = parent_rw_lease.base;
-    let rc = unsafe { inventory_hv_vm_map(parent_rw_addr.cast(), parent_rw_ipa, 0x4000, 3) };
+    let rc = unsafe { inventory_stage2_map(parent_rw_addr.cast(), parent_rw_ipa, 0x4000, 3) };
     assert_eq!(rc, 0);
     parent_rw_lease.mark_mapped();
     let parent_rw_gen = register_global_frame_host_owner_in(
@@ -7686,7 +7686,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_cow_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent COW global-frame IPA");
     let parent_cow_ipa = parent_cow_lease.base;
-    let rc = unsafe { inventory_hv_vm_map(parent_cow_addr.cast(), parent_cow_ipa, 0x4000, 3) };
+    let rc = unsafe { inventory_stage2_map(parent_cow_addr.cast(), parent_cow_ipa, 0x4000, 3) };
     assert_eq!(rc, 0);
     parent_cow_lease.mark_mapped();
     let parent_cow_gen = register_global_frame_host_owner_in(
@@ -8660,7 +8660,7 @@ fn serial_host_releasable_stage2_lease_lifecycle_and_deterministic_allocator_reu
         std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.as_ptr(), payload.len());
     }
 
-    let rc = unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), allocated_ipa, size, 7) };
+    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), allocated_ipa, size, 7) };
     assert_eq!(rc, 0);
     lease.mark_mapped();
     assert!(
@@ -8896,7 +8896,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     )
     .expect("allocate backing");
     let host_addr = mapping.as_ptr() as usize;
-    let rc = unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), extent_base, size, 7) };
+    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), extent_base, size, 7) };
     assert_eq!(rc, 0);
     lease.mark_mapped();
     let generation = register_global_frame_host_owner(lease, mapping, 7)
@@ -9146,7 +9146,7 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
     .expect("allocate host backing b");
     let host_addr_b = host_b.as_ptr() as usize;
     assert_eq!(
-        unsafe { inventory_hv_vm_map(host_b.as_ptr().cast(), key_b.0, OWNER_LEN, 3) },
+        unsafe { inventory_stage2_map(host_b.as_ptr().cast(), key_b.0, OWNER_LEN, 3) },
         0,
     );
     lease_b.mark_mapped();
@@ -9524,7 +9524,7 @@ fn register_replacement_compound_owner(
     .expect("allocate replacement compound backing");
     let host_addr = host.as_ptr() as usize;
     assert_eq!(
-        unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
+        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
         0,
     );
     lease.mark_mapped();
@@ -10257,7 +10257,7 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
     let parent_ipa = parent_lease.base;
     assert!(is_reusable_global_frame_extent(parent_ipa, parent_len));
     assert_eq!(
-        unsafe { inventory_hv_vm_map(parent_addr.cast(), parent_ipa, parent_len as usize, 3) },
+        unsafe { inventory_stage2_map(parent_addr.cast(), parent_ipa, parent_len as usize, 3) },
         0
     );
     parent_lease.mark_mapped();
@@ -10565,7 +10565,7 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
     .expect("allocate replacement root backing");
     assert_eq!(
         unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
@@ -10575,7 +10575,7 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
         0,
         "the same numeric root slot must be reusable after exact rollback",
     );
-    assert_eq!(unsafe { inventory_hv_vm_unmap(root_ipa, 0x20_0000) }, 0);
+    assert_eq!(unsafe { inventory_stage2_unmap(root_ipa, 0x20_0000) }, 0);
 }
 
 #[test]
@@ -10621,7 +10621,7 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     .expect("allocate prohibited replacement backing");
     assert_ne!(
         unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
@@ -10658,7 +10658,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
     .expect("allocate unrelated structural sentinel");
     assert_eq!(
         unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 sentinel_host.as_ptr().cast(),
                 sentinel_ipa,
                 sentinel_size,
@@ -10823,7 +10823,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     .expect("allocate authoritative rollback sentinel backing");
     assert_eq!(
         unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 sentinel_host.as_ptr().cast(),
                 sentinel_ipa,
                 sentinel_len as usize,
@@ -11025,7 +11025,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
         "alias registry must be empty"
     );
     assert_eq!(
-        unsafe { inventory_hv_vm_unmap(sentinel_ipa, sentinel_len as usize) },
+        unsafe { inventory_stage2_unmap(sentinel_ipa, sentinel_len as usize) },
         0,
         "remove authoritative rollback sentinel mapping"
     );
@@ -11220,7 +11220,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     .expect("allocate host mapping for retirement failure test");
     let host_addr_retire = mapping_retire.as_ptr() as usize;
     let rc =
-        unsafe { inventory_hv_vm_map(mapping_retire.as_ptr().cast(), ipa_retire, size_retire, 7) };
+        unsafe { inventory_stage2_map(mapping_retire.as_ptr().cast(), ipa_retire, size_retire, 7) };
     assert_eq!(rc, 0);
     lease_retire.mark_mapped();
     let observed_live_retire = Arc::new(std::sync::atomic::AtomicBool::new(false));

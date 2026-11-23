@@ -623,7 +623,7 @@ impl HvfVmState {
                     )?;
                     let install = exec_stage2_install(mapping, &region, false);
                     let rc = unsafe {
-                        inventory_hv_vm_map(
+                        inventory_stage2_map(
                             install.host.cast(),
                             install.ipa,
                             install.size,

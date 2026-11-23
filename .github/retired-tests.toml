@@ -167,3 +167,15 @@ test = "sched_policy::arm_affinity_routes_in_ring_and_x86_stays_unported"
 reason = "#1092: the affinity route is shared by both ISAs."
 replaced_by = "sched_policy::affinity_routes_in_ring_on_both_isas"
 pr = 2855
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::stage2_backend::raw_hvf_stage2_calls_are_inventory_gated"
+reason = "#2814 S0: the HVF stage-2 calls go through `carrick_aarch64::stage2::Stage2Backend`; the macOS-only source gate moved to carrick-xtask so it runs on every Linux lane, and now also requires the raw calls to sit inside the backend impl."
+replaced_by = "stage2_backend_gate::raw_hvf_stage2_calls_live_only_in_the_backend_impl"
+pr = 0
+
+[[retired]]
+test = "carrick_vmm_hvf::trap::stage2_backend::raw_vm_destroy_is_custody_transaction_gated"
+reason = "#2814 S0: the destroy and replay counts moved with the stage-2 gate to carrick-xtask, over the renamed `inventory_stage2_*` wrappers."
+replaced_by = "stage2_backend_gate::custody_reaches_stage2_only_through_the_inventory_wrappers"
+pr = 0

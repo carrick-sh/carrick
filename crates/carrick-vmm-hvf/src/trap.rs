@@ -2139,7 +2139,7 @@ impl HvfTaskState {
     /// eager identity mapping unchanged.
     ///
     /// **Once per carrier VM, not once per container.** The unmap below is
-    /// `inventory_hv_vm_unmap` over the WHOLE arena extent, which is VM-wide
+    /// `inventory_stage2_unmap` over the WHOLE arena extent, which is VM-wide
     /// state, while this runs during each container's root bring-up. With one
     /// VM per container that distinction did not exist. With a carrier VM
     /// shared by several containers it is the difference between retiring an
@@ -2180,7 +2180,7 @@ impl HvfTaskState {
                 "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
             ));
         }
-        let rc = unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+        let rc = unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
@@ -7019,7 +7019,7 @@ impl HvfVmState {
                 )
             {
                 let rc = unsafe {
-                    inventory_hv_vm_map(
+                    inventory_stage2_map(
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
@@ -7035,13 +7035,13 @@ impl HvfVmState {
                         mapping.physical_ipa,
                         mapping.physical_size,
                         u64::from(mapping.perms),
-                        rc as u32,
+                        rc.raw(),
                     );
                     let error = TrapError::ChildMapFailed {
                         host_addr: mapping.physical_host_addr as u64,
                         guest_start: mapping.physical_ipa,
                         size: mapping.physical_size,
-                        code: rc as u32,
+                        code: rc.raw(),
                     };
                     drop(mm_root_stage2.take());
                     if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
@@ -7493,7 +7493,7 @@ impl HvfVmState {
                 )
             {
                 let rc = unsafe {
-                    inventory_hv_vm_map(
+                    inventory_stage2_map(
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
@@ -7507,13 +7507,13 @@ impl HvfVmState {
                         mapping.physical_ipa,
                         mapping.physical_size,
                         u64::from(mapping.perms),
-                        rc as u32,
+                        rc.raw(),
                     );
                     let error = TrapError::ChildMapFailed {
                         host_addr: mapping.physical_host_addr as u64,
                         guest_start: mapping.physical_ipa,
                         size: mapping.physical_size,
-                        code: rc as u32,
+                        code: rc.raw(),
                     };
                     drop(mapping.stage2_lease.take());
                     let mut prior_stage2_leases = mapped
@@ -8371,12 +8371,12 @@ impl HvfInner {
                 {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
                     // by add_alias. Only rc=0 proves replay installation.
-                    let rc = unsafe { inventory_hv_vm_map_replay(b) };
+                    let rc = unsafe { inventory_stage2_map_replay(b) };
                     crate::probes::hv_vm_map_alias(
                         exit.exception.virtual_address,
                         b.physical_ipa,
                         b.physical_size as u64,
-                        rc as i32,
+                        rc.raw() as i32,
                         0,
                     );
                     if rc != 0 {

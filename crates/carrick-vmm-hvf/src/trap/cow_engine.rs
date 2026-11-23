@@ -2363,7 +2363,7 @@ impl HvfTaskState {
             .ok_or_else(|| TrapError::Hypervisor("retained reuse IPA overflow".to_owned()))?;
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_result = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
@@ -3809,7 +3809,7 @@ impl HvfTaskState {
                 )?;
                 let new_physical_ipa = new_lease.base;
                 let map_result = unsafe {
-                    inventory_hv_vm_map(
+                    inventory_stage2_map(
                         new_host_ptr.cast(),
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE as usize,
@@ -5380,7 +5380,7 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let perms_raw: u64 = u64::from(hvf_mem_perms(perms));
         let r = unsafe {
-            inventory_hv_vm_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
+            inventory_stage2_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
         };
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -5409,12 +5409,12 @@ impl HvfVmState {
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
         // `add_alias`. Replay succeeds only when HVF confirms the installation;
         // an arbitrary nonzero result is never evidence that a racing mapper won.
-        let rc = unsafe { inventory_hv_vm_map_replay(b) };
+        let rc = unsafe { inventory_stage2_map_replay(b) };
         crate::probes::hv_vm_map_alias(
             va,
             b.physical_ipa,
             b.physical_size as u64,
-            rc as i32,
+            rc.raw() as i32,
             self.forked_no_exec as i32,
         );
         rc == 0
@@ -5645,12 +5645,12 @@ impl HvfVmState {
             None
         };
         let ipa = global_lease.as_ref().map_or(ipa, |lease| lease.base);
-        let r = unsafe { inventory_hv_vm_map(host.cast(), ipa, physical_size, u64::from(perms)) };
+        let r = unsafe { inventory_stage2_map(host.cast(), ipa, physical_size, u64::from(perms)) };
         crate::probes::hv_vm_map_alias(
             va,
             ipa,
             physical_size as u64,
-            r as i32,
+            r.raw() as i32,
             self.forked_no_exec as i32,
         );
         if r != 0 {

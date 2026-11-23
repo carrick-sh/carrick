@@ -317,7 +317,7 @@ pub(crate) fn allocate_grant_extent(
         // SAFETY: the host mapping outlives its stage-2 record, which the
         // owner registration below transfers into carrier custody.
         let rc = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 host_ptr.cast(),
                 physical_ipa,
                 length as usize,

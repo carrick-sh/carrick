@@ -1257,7 +1257,7 @@ impl GlobalFrameStage2Lease {
             let size = usize::try_from(self.length).map_err(|_| {
                 TrapError::Hypervisor("global frame stage-2 lease is too large".to_owned())
             })?;
-            let rc = unsafe { inventory_hv_vm_unmap(self.base, size) };
+            let rc = unsafe { inventory_stage2_unmap(self.base, size) };
             if rc != 0 {
                 return Err(TrapError::Hypervisor(format!(
                     "guest-memory unmap(guest=0x{:x}, size={}) failed: 0x{:x}",
@@ -2151,11 +2151,11 @@ pub(crate) fn unmap_global_frame_stage2_record(
     ipa: u64,
     len: usize,
 ) -> Result<(), CarrierStage2BackendError> {
-    let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+    let rc = unsafe { inventory_stage2_unmap(ipa, len) };
     if rc == 0 {
         Ok(())
     } else {
-        Err(CarrierStage2BackendError::HvReturn(rc as u32))
+        Err(CarrierStage2BackendError::HvReturn(rc.raw()))
     }
 }
 

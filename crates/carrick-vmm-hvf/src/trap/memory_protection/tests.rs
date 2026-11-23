@@ -39,7 +39,7 @@ mod alias_remap_limiter_tests {
             .insert(key);
 
         // The exact installed marker returns before touching Hypervisor.framework.
-        let result = unsafe { inventory_hv_vm_map_replay(backing) };
+        let result = unsafe { inventory_stage2_map_replay(backing) };
         assert_eq!(result, 0);
         assert!(alias_registry().lock().contains_replay(&key));
 

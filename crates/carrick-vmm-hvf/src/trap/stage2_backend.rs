@@ -3,6 +3,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
+use carrick_aarch64::stage2::{Stage2Backend as _, Stage2Status, stage2_perms_from_bits};
 use carrick_fatal::carrick_fatal;
 
 impl HvfMappedRegion {
@@ -286,21 +287,68 @@ fn unsigned_executable_maps_hv_denied_to_entitlement() {
     }
 }
 
-/// Sole raw Hypervisor.framework stage-2 map boundary. Inventory-aware callers
-/// own logical publication; VM/vCPU replay calls this only to reinstall the
-/// same physical extent and must still treat every nonzero result as failure.
+/// `HV_BAD_ARGUMENT`: the status HVF itself returns for an extent or a
+/// permission word it can't install.
+const HV_BAD_ARGUMENT: u32 = 0xfae9_4003;
+
+/// HVF's stage-2 backend, and the only place `carrick-vmm-hvf` calls
+/// Hypervisor.framework's raw stage-2 functions. HVF has one VM per process,
+/// so the backend holds no state.
+pub(crate) struct HvfStage2;
+
+/// The process's HVF stage-2 backend. The `inventory_stage2_*` wrappers are its
+/// only callers; custody reaches stage-2 through them.
+pub(crate) static HVF_STAGE2: HvfStage2 = HvfStage2;
+
+/// `hv_return_t` is the backend's 32-bit status word, kept bit for bit.
+fn hvf_stage2_status(rc: applevisor_sys::hv_return_t) -> Stage2Status {
+    Stage2Status::from_raw(rc as u32)
+}
+
+impl carrick_aarch64::stage2::Stage2Backend for HvfStage2 {
+    unsafe fn map(
+        &self,
+        host: *mut std::ffi::c_void,
+        ipa: u64,
+        size: usize,
+        perms: carrick_hal::MemPerms,
+    ) -> Stage2Status {
+        let flags = u64::from(hvf_mem_perms(perms));
+        // SAFETY: the caller keeps the host range mapped while installed.
+        hvf_stage2_status(unsafe { applevisor_sys::hv_vm_map(host, ipa, size, flags) })
+    }
+
+    unsafe fn unmap(&self, ipa: u64, size: usize) -> Stage2Status {
+        // SAFETY: the caller owns the extent's custody record.
+        hvf_stage2_status(unsafe { applevisor_sys::hv_vm_unmap(ipa, size) })
+    }
+
+    unsafe fn destroy(&self) -> Stage2Status {
+        // SAFETY: the caller owns the VM's custody transaction.
+        hvf_stage2_status(unsafe { applevisor_sys::hv_vm_destroy() })
+    }
+}
+
+/// Sole stage-2 map boundary. Inventory-aware callers own logical
+/// publication; VM/vCPU replay calls this only to reinstall the same physical
+/// extent and must still treat every nonzero status as failure. `permissions`
+/// is the recorded stage-2 permission word
+/// ([`carrick_aarch64::stage2::STAGE2_PERM_READ`] and its siblings).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_hv_vm_map(
+pub(crate) unsafe fn inventory_stage2_map(
     host: *mut std::ffi::c_void,
     ipa: u64,
     size: usize,
     permissions: u64,
-) -> applevisor_sys::hv_return_t {
+) -> Stage2Status {
     // The in-kernel GIC owns this guest-physical window: a stage-2 mapping
     // there would shadow the distributor or a redistributor.
     if carrick_mem::memory::ipa_overlaps_gic_window(ipa, size as u64) {
-        return 0xfae9_4003_u32 as applevisor_sys::hv_return_t; // HV_BAD_ARGUMENT
+        return Stage2Status::from_raw(HV_BAD_ARGUMENT);
     }
+    let Some(perms) = stage2_perms_from_bits(permissions) else {
+        return Stage2Status::from_raw(HV_BAD_ARGUMENT);
+    };
     #[cfg(test)]
     if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
         let should_fail = STAGE2_AUDIT_STATE.with(|s| {
@@ -325,12 +373,13 @@ pub(crate) unsafe fn inventory_hv_vm_map(
             }
         });
         if should_fail {
-            return 0xfae9_4005u32 as applevisor_sys::hv_return_t;
+            return Stage2Status::from_raw(0xfae9_4005);
         }
-        return 0;
+        return Stage2Status::SUCCESS;
     }
-    let result = unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) };
-    if result == 0 {
+    // SAFETY: forwarded from this function's contract.
+    let result = unsafe { HVF_STAGE2.map(host, ipa, size, perms) };
+    if result.is_success() {
         emit_global_frame_stage2(
             carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Mapped,
             ipa,
@@ -370,23 +419,21 @@ pub(crate) fn emit_global_frame_stage2(
 /// exact already-installed extent as success without accepting arbitrary HVF
 /// errors. The marker is cleared on unmap and every VM destruction.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_hv_vm_map_replay(
-    backing: AliasBacking,
-) -> applevisor_sys::hv_return_t {
+pub(crate) unsafe fn inventory_stage2_map_replay(backing: AliasBacking) -> Stage2Status {
     let key = replay_mapping_key(backing);
     mutate_external_alias_state(|registry| {
         if registry.contains_replay(&key) {
-            return 0;
+            return Stage2Status::SUCCESS;
         }
         let result = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 backing.physical_host_addr as *mut std::ffi::c_void,
                 backing.physical_ipa,
                 backing.physical_size,
                 backing.perms,
             )
         };
-        if result == 0 {
+        if result.is_success() {
             let bucket = registry
                 .by_scope
                 .entry(backing.ownership_scope)
@@ -397,9 +444,9 @@ pub(crate) unsafe fn inventory_hv_vm_map_replay(
     })
 }
 
-/// Sole raw Hypervisor.framework stage-2 unmap boundary.
+/// Sole stage-2 unmap boundary.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_sys::hv_return_t {
+pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Status {
     #[cfg(test)]
     if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
         let should_fail = STAGE2_AUDIT_STATE.with(|s| {
@@ -415,7 +462,7 @@ pub(crate) unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_
             }
         });
         if should_fail {
-            return 0xfae9_4001u32 as applevisor_sys::hv_return_t;
+            return Stage2Status::from_raw(0xfae9_4001);
         }
         forget_replay_extent(ipa, size);
         STAGE2_AUDIT_STATE.with(|s| {
@@ -423,10 +470,11 @@ pub(crate) unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_
             state.mapped_extents.remove(&(ipa, size));
             state.events.push(Stage2BackendEvent::Unmap { ipa, size });
         });
-        return 0;
+        return Stage2Status::SUCCESS;
     }
-    let result = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
-    if result == 0 {
+    // SAFETY: forwarded from this function's contract.
+    let result = unsafe { HVF_STAGE2.unmap(ipa, size) };
+    if result.is_success() {
         forget_replay_extent(ipa, size);
         emit_global_frame_stage2(
             carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Unmapped,
@@ -440,69 +488,13 @@ pub(crate) unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_hv_vm_destroy() -> applevisor_sys::hv_return_t {
-    let result = unsafe { applevisor_sys::hv_vm_destroy() };
-    if result == 0 {
+pub(crate) unsafe fn inventory_stage2_destroy() -> Stage2Status {
+    // SAFETY: forwarded from this function's contract.
+    let result = unsafe { HVF_STAGE2.destroy() };
+    if result.is_success() {
         clear_replay_mappings();
     }
     result
-}
-
-#[cfg(test)]
-#[test]
-fn raw_hvf_stage2_calls_are_inventory_gated() {
-    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    let source = concat!(
-        include_str!("../trap.rs"),
-        include_str!("stage2_backend.rs"),
-        include_str!("cow_engine.rs")
-    );
-    assert_eq!(
-        source
-            .matches(concat!("applevisor_sys::hv_vm_", "map("))
-            .count(),
-        1,
-        "raw hv_vm_map must appear only in inventory_hv_vm_map"
-    );
-    assert_eq!(
-        source
-            .matches(concat!("applevisor_sys::hv_vm_", "unmap("))
-            .count(),
-        1,
-        "raw hv_vm_unmap must appear only in inventory_hv_vm_unmap"
-    );
-    assert_eq!(
-        source
-            .matches(concat!("inventory_hv_vm_map_replay", "(b)"))
-            .count(),
-        2,
-        "both lazy replay paths must use exact serialized replay"
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn raw_vm_destroy_is_custody_transaction_gated() {
-    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    let source = concat!(
-        include_str!("../trap.rs"),
-        include_str!("stage2_backend.rs"),
-        include_str!("carrier_custody.rs")
-    );
-    assert_eq!(
-        source
-            .matches(concat!("applevisor_sys::hv_vm_", "destroy()"))
-            .count(),
-        1,
-        "the inventory boundary must remain the sole raw hv_vm_destroy caller"
-    );
-    assert_eq!(
-        source
-            .matches(concat!("inventory_hv_vm_", "destroy()"))
-            .count(),
-        2,
-        "inventory_hv_vm_destroy must appear only in its definition and the custody wrapper"
-    );
 }
 
 #[cfg(test)]
@@ -795,7 +787,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         ));
     }
     let r = unsafe {
-        inventory_hv_vm_map(
+        inventory_stage2_map(
             host.cast::<std::ffi::c_void>(),
             mapping.ipa_start,
             size,
@@ -808,7 +800,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             mapping.ipa_start,
             size as u64,
             mapping.guest_start,
-            r as i32,
+            r.raw() as i32,
         ));
     }
     if r != 0 {
@@ -1381,8 +1373,6 @@ fn stage2_map_refuses_the_gic_window() {
         LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
         LINUX_GIC_WINDOW_SIZE,
     };
-    const HV_BAD_ARGUMENT: applevisor_sys::hv_return_t =
-        0xfae9_4003_u32 as applevisor_sys::hv_return_t;
     let _stub = ScopedStage2MapTestStub::enable();
     let mut page = vec![0u8; 0x4000];
     for ipa in [
@@ -1392,15 +1382,16 @@ fn stage2_map_refuses_the_gic_window() {
         LINUX_GIC_WINDOW_BASE - 0x2000,
     ] {
         // SAFETY: the test stub records the call; nothing reaches HVF.
-        let rc = unsafe { inventory_hv_vm_map(page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
+        let rc = unsafe { inventory_stage2_map(page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
         assert_eq!(
-            rc, HV_BAD_ARGUMENT,
+            rc,
+            Stage2Status::from_raw(HV_BAD_ARGUMENT),
             "stage-2 map at {ipa:#x} must be refused"
         );
     }
     // SAFETY: as above.
     let rc = unsafe {
-        inventory_hv_vm_map(
+        inventory_stage2_map(
             page.as_mut_ptr().cast(),
             LINUX_GIC_WINDOW_BASE - 0x4000,
             0x4000,
@@ -1590,14 +1581,16 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         backing,
         // SAFETY: the backing is validated host memory retained by the
         // installation for as long as the VM maps it.
-        |host, ipa, len, perms| unsafe { inventory_hv_vm_map(host.cast(), ipa, len, perms) },
+        |host, ipa, len, perms| {
+            unsafe { inventory_stage2_map(host.cast(), ipa, len, perms) }.raw() as i32
+        },
         |ipa, len| {
             // SAFETY: unmapping exactly the extent this installation mapped.
-            let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
             if rc == 0 {
                 Ok(())
             } else {
-                Err(CarrierStage2BackendError::HvReturn(rc as u32))
+                Err(CarrierStage2BackendError::HvReturn(rc.raw()))
             }
         },
     )?;

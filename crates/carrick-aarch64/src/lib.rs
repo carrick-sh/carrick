@@ -36,6 +36,7 @@ pub mod mailbox;
 pub mod owed_kick;
 pub mod resume_invalidation;
 pub mod stage1_authority;
+pub mod stage2;
 pub mod staged_cpu;
 pub mod stopped_abi;
 pub mod user_transfer;

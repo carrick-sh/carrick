@@ -231,7 +231,7 @@ pub(super) fn prepare(
             .checked_add(physical_offset)
             .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
         let map_result = unsafe {
-            inventory_hv_vm_map(
+            inventory_stage2_map(
                 physical_host.cast(),
                 physical_ipa,
                 physical_size,
@@ -880,7 +880,7 @@ impl MmAccessState {
                     })?;
 
                     let rc = unsafe {
-                        inventory_hv_vm_map(
+                        inventory_stage2_map(
                             host_mapping.as_ptr().cast(),
                             base,
                             TWO_MIB,
@@ -892,7 +892,7 @@ impl MmAccessState {
                             host_addr: host_mapping.as_ptr() as u64,
                             guest_start: base,
                             size: TWO_MIB,
-                            code: rc as u32,
+                            code: rc.raw(),
                         });
                     }
 
