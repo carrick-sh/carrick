@@ -2372,7 +2372,24 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 ));
             }
         };
-        let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
+        // A parent COW completion the carrier has not settled refuses as
+        // `Busy`. On this lane the carrier settles an MM's completions at
+        // its next exclusion of the MM's editor; the fork reruns after its
+        // editor is released (#2890).
+        let cow = match crate::mm_portal::carrier_cow_pool() {
+            Ok(cow) => cow,
+            Err(e) => {
+                owner.spaces.free(index);
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    refused(NativeForkStage::Prepare, e),
+                ));
+            }
+        };
+        let plan = match owner.prepare_fork(loan.request, scratch, &*live, cow, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
                 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
