@@ -147,8 +147,12 @@ impl GuestPreparedBacking {
             std::num::NonZeroU64::new(stage.length)
                 .ok_or_else(|| TrapError::Hypervisor("empty COW backing".to_owned()))?,
         );
-        let extent =
-            HvfVmState::stage_mapping_in(&custody, &mut inventory.lock(), &mut reservation, stage)?;
+        let extent = Stage2State::stage_mapping_in(
+            &custody,
+            &mut inventory.lock(),
+            &mut reservation,
+            stage,
+        )?;
         let commit = reservation.commit(());
         let challenge = commit.receipt_challenge();
         let (mut prepared_ids, mut unmapped_ids) = (Vec::new(), Vec::new());
@@ -199,7 +203,7 @@ impl GuestPreparedBacking {
         let (receipt, generation, foreign) = match applied {
             Ok(applied) => applied,
             Err(error) => {
-                HvfVmState::rollback_unpublished_mappings(
+                Stage2State::rollback_unpublished_mappings(
                     &mut inventory.lock(),
                     &[((stage.gpa, stage.length), extent)],
                 )
@@ -267,7 +271,7 @@ impl Drop for GuestPreparedBacking {
                 .unwrap_or_else(|error| {
                     carrick_fatal!("hvpatch::cow", "kernel COW grant rollback: {error}")
                 });
-            HvfVmState::rollback_unpublished_mappings(
+            Stage2State::rollback_unpublished_mappings(
                 &mut self.inventory.lock(),
                 &[(
                     (self.extent.stage2_base, self.extent.stage2_length),
@@ -374,14 +378,14 @@ impl HvfVmState {
     /// silently sharing the parent's frame. The alias registry supplies mappings
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        if let Some(identity) = self.cow_identity {
+        if let Some(identity) = self.task.stage2.cow_identity {
             super::guest_cow::require_guest_cow_settled(identity.mm, "fork of the parent");
         }
         // Retire the rows (and their registry aliases) that earlier COW splits
         // superseded, so the projection below scans this process's mappings,
         // never its fork history.
         let superseded = if fork_shadow_prune_enabled() {
-            self.mappings.drain_superseded_shadow_rows()
+            self.task.stage2.mappings.drain_superseded_shadow_rows()
         } else {
             Vec::new()
         };
@@ -392,7 +396,10 @@ impl HvfVmState {
                 .collect();
             let mut registry = alias_registry_write(AliasRegistryWriter::ForkShadowPrune);
             let stale: Vec<AliasBacking> = registry
-                .process_visible_ordered(self.mm_root_slot, self.container_root)
+                .process_visible_ordered(
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
+                )
                 .into_iter()
                 .filter(|alias| {
                     keys.contains(&(
@@ -406,15 +413,16 @@ impl HvfVmState {
                 .collect();
             registry.remove_exact_values_in_batch(&stale);
         }
-        let current_revision = alias_registry()
-            .lock()
-            .process_visible_revision(self.mm_root_slot, self.container_root);
+        let current_revision = alias_registry().lock().process_visible_revision(
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
+        );
         {
             let guard = self.cached_fork_alias_snapshot.lock();
             if let Some(cached) = guard.as_ref() {
                 if cached.revision == current_revision
-                    && cached.mm_root_slot == self.mm_root_slot
-                    && cached.container_root == self.container_root
+                    && cached.mm_root_slot == self.task.stage2.mm_root_slot
+                    && cached.container_root == self.task.stage2.container_root
                 {
                     self.last_fork_projection_rows_visited
                         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -422,23 +430,22 @@ impl HvfVmState {
                 }
             }
         }
-        let aliases = std::sync::Arc::new(
-            alias_registry()
-                .lock()
-                .process_visible_ordered(self.mm_root_slot, self.container_root),
-        );
+        let aliases = std::sync::Arc::new(alias_registry().lock().process_visible_ordered(
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
+        ));
         // A rebuild visits every mapping row and every visible alias row.
         // Contracts charge this as `fork_projection_rows_visited`.
         self.last_fork_projection_rows_visited.store(
-            (self.mappings.len() + aliases.len()) as u64,
+            (self.task.stage2.mappings.len() + aliases.len()) as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         let alias_index = std::sync::Arc::new(process_alias_index(
             &aliases,
-            self.mm_root_slot,
-            self.container_root,
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
         ));
-        let has_shadowed = self.mappings.shadowed_len() > 0;
+        let has_shadowed = self.task.stage2.mappings.shadowed_len() > 0;
         let mut seen_dynamic_aliases = if has_shadowed {
             Some(ProcessAliasSet::with_hasher(FastKeyBuildHasher::default()))
         } else {
@@ -469,6 +476,8 @@ impl HvfVmState {
                 .unwrap_or(false)
         };
         let mut ranges: Vec<_> = self
+            .task
+            .stage2
             .mappings
             .iter()
             .filter(|mapping| {
@@ -516,7 +525,9 @@ impl HvfVmState {
             let local_aliases: ProcessAliasSet = if let Some(seen) = seen_dynamic_aliases {
                 seen
             } else {
-                self.mappings
+                self.task
+                    .stage2
+                    .mappings
                     .iter()
                     .filter(|mapping| {
                         mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
@@ -528,8 +539,8 @@ impl HvfVmState {
                 missing_process_aliases(
                     &local_aliases,
                     &aliases,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                 )
                 .into_iter()
                 .filter(|mapping| {
@@ -559,13 +570,15 @@ impl HvfVmState {
         drop(inventory);
         let mut seen_for_source = if has_shadowed {
             Some(ProcessAliasSet::with_capacity_and_hasher(
-                self.mappings.len(),
+                self.task.stage2.mappings.len(),
                 FastKeyBuildHasher::default(),
             ))
         } else {
             None
         };
         let source_mappings: Vec<ThreadMappingDesc> = self
+            .task
+            .stage2
             .mappings
             .iter()
             .filter_map(|mapping| {
@@ -596,8 +609,8 @@ impl HvfVmState {
         ranges.dedup_by_key(|range| (range.va, range.len));
         *self.cached_fork_alias_snapshot.lock() = Some(ForkAliasSnapshot {
             revision: current_revision,
-            mm_root_slot: self.mm_root_slot,
-            container_root: self.container_root,
+            mm_root_slot: self.task.stage2.mm_root_slot,
+            container_root: self.task.stage2.container_root,
             cow_ranges: ranges.clone(),
             source_mappings,
             all_aliases_covered,
@@ -615,25 +628,30 @@ impl HvfVmState {
         {
             eprintln!(
                 "[ARMDBG parent pid={:?} mm={:?} slot={:x?}] arm covers watch: va={:#x} len={:#x}",
-                self.cow_identity.map(|identity| identity.linux_pid),
-                self.cow_identity.map(|identity| identity.mm),
-                self.mm_root_slot,
+                self.task
+                    .stage2
+                    .cow_identity
+                    .map(|identity| identity.linux_pid),
+                self.task.stage2.cow_identity.map(|identity| identity.mm),
+                self.task.stage2.mm_root_slot,
                 range.va,
                 range.len,
             );
         }
         self.cow_armed.lock().arm(ranges);
     }
+}
 
+impl Stage2State {
     pub(crate) fn frame_cow_arm_snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        self.cow_armed.lock().snapshot()
+        self.mm_access.cow_armed.lock().snapshot()
     }
 
     pub(crate) fn restore_frame_cow_arm_snapshot(
         &mut self,
         snapshot: Vec<carrick_aarch64::vmm::ForkCowRange>,
     ) {
-        self.cow_armed.lock().restore(snapshot);
+        self.mm_access.cow_armed.lock().restore(snapshot);
     }
 
     pub(crate) fn armed_frame_cow_ranges(
@@ -641,7 +659,7 @@ impl HvfVmState {
         va: u64,
         len: usize,
     ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        self.cow_armed.lock().overlapping(va, len)
+        self.mm_access.cow_armed.lock().overlapping(va, len)
     }
 
     pub(crate) fn repoint_guest_alias(
@@ -656,7 +674,7 @@ impl HvfVmState {
         use super::guest_alias::AliasPublishFailure;
         use carrick_mmu_core::aarch64::descriptor_txn::PageSpan;
         let error = |message: &str| TrapError::Hypervisor(message.to_owned());
-        let tables = self.page_tables_authority();
+        let tables = self.mm_access.page_tables_authority();
         let identity = self.cow_identity;
         let authority = self.cow_authority.clone();
         let Some(context) = self.guest_alias_context(&tables, identity, authority.as_deref())
@@ -741,7 +759,7 @@ impl HvfVmState {
     ) -> Option<super::guest_alias::GuestAliasContext<'a>> {
         Some(super::guest_alias::GuestAliasContext {
             custody: self.custody(),
-            ledger: &self.frame_inventory.ledger,
+            ledger: &self.mm_access.frame_inventory.ledger,
             authority: authority?,
             tables,
             mm: std::num::NonZeroU64::new(identity?.mm)?,
@@ -756,7 +774,7 @@ impl HvfVmState {
         len: usize,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
-        let tables = self.page_tables_authority();
+        let tables = self.mm_access.page_tables_authority();
         let identity = self.cow_identity;
         let authority = self.cow_authority.clone();
         self.guest_alias_context(&tables, identity, authority.as_deref())
@@ -776,7 +794,7 @@ impl HvfVmState {
         writable: bool,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), carrick_aarch64::vmm::GuestAliasRefusal> {
-        let tables = self.page_tables_authority();
+        let tables = self.mm_access.page_tables_authority();
         let identity = self.cow_identity;
         let authority = self.cow_authority.clone();
         self.guest_alias_context(&tables, identity, authority.as_deref())
@@ -853,6 +871,7 @@ impl HvfVmState {
                 TrapError::Hypervisor("private repoint semantic host overflow".to_owned())
             })?;
         let inventory_backing = self
+            .mm_access
             .frame_inventory
             .lock()
             .extents
@@ -875,7 +894,13 @@ impl HvfVmState {
             } else {
                 mapping_owner_generation
             };
-        require_published_repoint(&self.page_tables_authority(), va, overlay_ipa, len, access)?;
+        require_published_repoint(
+            &self.mm_access.page_tables_authority(),
+            va,
+            overlay_ipa,
+            len,
+            access,
+        )?;
         // The stage-1 repoint has replaced every promise about the previous
         // VA -> IPA output. Retire those promises before publishing the alias,
         // so the protection commit authenticates only the replacement state.
@@ -900,7 +925,9 @@ impl HvfVmState {
         });
         Ok(())
     }
+}
 
+impl HvfVmState {
     pub(crate) fn apply_exec_inventory(
         &mut self,
         replacement_mm: u64,
@@ -923,14 +950,16 @@ impl HvfVmState {
     pub(crate) fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
         // The predecessor's retirement is applied by now: owners whose last
         // frame the Kernel retired in it follow the frame.
-        Self::settle_task_state_declined_lease_remainders(&self.task)?;
+        Stage2State::settle_task_state_declined_lease_remainders(&self.task)?;
         let Some(ref mut reg) = self.registration else {
             return Ok(());
         };
         reg.activate()
     }
+}
 
-    pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
+impl Stage2State {
+    const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
 
     pub(crate) fn fault_window_bytes() -> u64 {
         static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -942,7 +971,9 @@ impl HvfVmState {
                 .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
         })
     }
+}
 
+impl HvfVmState {
     /// Materialize private zero backing for the exact accessible pieces of the
     /// sparse HVPatch mmap arena. One VMA hole becomes one host mapping, one
     /// stage-2 lease, and one inventory frame; there is no shared source frame
@@ -962,8 +993,8 @@ impl HvfVmState {
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let Some(started) = carrick_observability::probes::hvpatch_mapping_index_begin(
-            self.mappings.live_len() as u64,
-            self.mappings.shadowed_len() as u64,
+            self.task.stage2.mappings.live_len() as u64,
+            self.task.stage2.mappings.shadowed_len() as u64,
         ) else {
             return self.ensure_sparse_mmap_backing_censused(va, len, flush_stage1);
         };
@@ -979,8 +1010,8 @@ impl HvfVmState {
             carrick_observability::probes::HvpatchMappingIndexCensus::new(
                 carrick_observability::probes::HvpatchMappingIndexCensusArgs {
                     far: va,
-                    live_rows: self.mappings.live_len() as u64,
-                    shadowed_rows: self.mappings.shadowed_len() as u64,
+                    live_rows: self.task.stage2.mappings.live_len() as u64,
+                    shadowed_rows: self.task.stage2.mappings.shadowed_len() as u64,
                     rows_visited: hot_path_rows_scanned_live(HotPathScan::TaskMappings)
                         .wrapping_sub(mapping_rows_before),
                     alias_rows,
@@ -1001,7 +1032,7 @@ impl HvfVmState {
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
-        if !self.persistent_vm_lifecycle || len == 0 {
+        if !self.task.stage2.persistent_vm_lifecycle || len == 0 {
             return Ok(());
         }
         let arena_start = crate::memory::LINUX_MMAP_BASE;
@@ -1016,7 +1047,7 @@ impl HvfVmState {
         if !in_low_arena && !in_high_va {
             return Ok(());
         }
-        if let Some(state) = self.deferred_anonymous_state()
+        if let Some(state) = self.task.stage2.deferred_anonymous_state()
             && let Some(transition) =
                 state.begin_private_file_materialization(carrick_guest_mem::GuestVa::new(va))
         {
@@ -1054,27 +1085,33 @@ impl HvfVmState {
         const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         if len == PAGE_SIZE as usize && current < end {
-            let pristine = self.deferred_anonymous_state().and_then(|state| {
-                state
-                    .snapshot()
-                    .pristine
-                    .into_iter()
-                    .find(|r| r.start.raw() <= current && current < r.end.raw())
-                    .map(|r| (r.start.raw(), r.end.raw()))
-            });
+            let pristine = self
+                .task
+                .stage2
+                .deferred_anonymous_state()
+                .and_then(|state| {
+                    state
+                        .snapshot()
+                        .pristine
+                        .into_iter()
+                        .find(|r| r.start.raw() <= current && current < r.end.raw())
+                        .map(|r| (r.start.raw(), r.end.raw()))
+                });
             if let Some((p_start, p_end)) = pristine {
-                let w = Self::fault_window_bytes();
+                let w = Stage2State::fault_window_bytes();
                 if w < COMPOUND {
                     // Hatch CARRICK_FAULT_WINDOW_BYTES=4096: single-page fallback.
                     let has_local = self
+                        .task
+                        .stage2
                         .mappings
                         .iter()
                         .any(|m| m.start < end && m.end > current);
                     let has_alias = alias_registry().lock().has_live_process_alias_overlapping(
                         current,
                         end,
-                        self.mm_root_slot,
-                        self.container_root,
+                        self.task.stage2.mm_root_slot,
+                        self.task.stage2.container_root,
                     );
                     if !has_local && !has_alias {
                         self.materialize_sparse_mmap_extent(
@@ -1107,7 +1144,7 @@ impl HvfVmState {
                     // heap corruption, 2026-09-07); the invariant now holds at
                     // every publication site, and displaced rows are searched
                     // too.
-                    let next_local = self.mappings.first_start_between(
+                    let next_local = self.task.stage2.mappings.first_start_between(
                         GuestVa::new(current),
                         GuestVa::new(window_end),
                         |_| true,
@@ -1117,8 +1154,8 @@ impl HvfVmState {
                         .first_matching_process_alias_start_between(
                             current,
                             window_end,
-                            self.mm_root_slot,
-                            self.container_root,
+                            self.task.stage2.mm_root_slot,
+                            self.task.stage2.container_root,
                             |alias| alias_backing_is_live(alias.physical_host_addr),
                         );
                     window_end = next_local
@@ -1133,10 +1170,12 @@ impl HvfVmState {
                         && !alias_registry().lock().has_live_process_alias_overlapping(
                             compound_start,
                             current,
-                            self.mm_root_slot,
-                            self.container_root,
+                            self.task.stage2.mm_root_slot,
+                            self.task.stage2.container_root,
                         ) {
                         let lower_has_local = self
+                            .task
+                            .stage2
                             .mappings
                             .any_lower_row_reaches(GuestVa::new(current), compound_start);
                         if !lower_has_local {
@@ -1183,8 +1222,8 @@ impl HvfVmState {
                         mapping.start,
                         mapping.end,
                         mapping.ipa,
-                        self.translate_va(current),
-                        self.mm_root_slot,
+                        self.task.stage2.translate_va(current),
+                        self.task.stage2.mm_root_slot,
                     )));
                 }
                 current = next;
@@ -1193,16 +1232,18 @@ impl HvfVmState {
 
             // Preserve already-materialized neighbours. The topology lock in
             // the materializer rechecks this shape before publication.
-            let next_local =
-                self.mappings
-                    .first_start_between(GuestVa::new(current), GuestVa::new(end), |_| true);
+            let next_local = self.task.stage2.mappings.first_start_between(
+                GuestVa::new(current),
+                GuestVa::new(end),
+                |_| true,
+            );
             let next_alias = alias_registry()
                 .lock()
                 .first_matching_process_alias_start_between(
                     current,
                     end,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                     |alias| alias_backing_is_live(alias.physical_host_addr),
                 );
             let hole_end = next_local
@@ -1243,7 +1284,7 @@ impl HvfVmState {
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
-        if !self.persistent_vm_lifecycle || len == 0 {
+        if !self.task.stage2.persistent_vm_lifecycle || len == 0 {
             return Ok(false);
         }
         let arena_start = crate::memory::LINUX_MMAP_BASE;
@@ -1294,8 +1335,8 @@ impl HvfVmState {
         let overlapping_aliases = alias_registry().lock().overlapping_process_aliases(
             va,
             len,
-            self.mm_root_slot,
-            self.container_root,
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
         );
         let has_non_retirable_alias = overlapping_aliases.iter().any(|(_, alias)| {
             alias.sharing != GuestMappingSharing::Private
@@ -1305,10 +1346,10 @@ impl HvfVmState {
             return Ok(false);
         }
 
-        let has_non_retirable_mapping = self.mappings.iter().any(|m| {
+        let has_non_retirable_mapping = self.task.stage2.mappings.iter().any(|m| {
             m.start < end
                 && m.end > va
-                && global_frame_region_owner_matches_in(self.custody(), m)
+                && global_frame_region_owner_matches_in(self.task.stage2.custody(), m)
                 && (!m.is_dynamic_alias || m.sharing != GuestMappingSharing::Private)
         });
         if has_non_retirable_mapping {
@@ -1380,14 +1421,14 @@ impl HvfVmState {
             );
             Ok(None)
         };
-        let Some(identity) = self.cow_identity else {
+        let Some(identity) = self.task.stage2.cow_identity else {
             return decline("frame grant lacks exact identity");
         };
         if !sparse_materialization::frame_grant_request_is_valid(identity, request) {
             return decline("frame grant request is invalid");
         }
         let publication = sparse_materialization::PublicationContext::for_local(
-            std::sync::Arc::clone(&self.mm_access),
+            std::sync::Arc::clone(&self.task.stage2.mm_access),
             self.carrier_vm_custody(),
             identity,
         )?;
@@ -1400,13 +1441,13 @@ impl HvfVmState {
         let aliases = alias_registry().lock().overlapping_process_aliases(
             request.semantic_base,
             semantic_len,
-            self.mm_root_slot,
-            self.container_root,
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
         );
         let forbidden_alias = aliases.iter().any(|(_, alias)| {
             alias.sharing != GuestMappingSharing::Private
                 || !global_frame_host_owner_matches_in(
-                    self.custody(),
+                    self.task.stage2.custody(),
                     alias.physical_ipa,
                     alias.physical_size as u64,
                     alias.physical_host_addr,
@@ -1417,12 +1458,14 @@ impl HvfVmState {
         // physical owner alive. Global generation authenticates the frame,
         // not this MM's ownership: only its selected alias makes a predecessor.
         let overlapping_mappings: Vec<_> = self
+            .task
+            .stage2
             .mappings
             .iter()
             .filter(|mapping| {
                 mapping.start < end
                     && mapping.end > request.semantic_base
-                    && global_frame_region_owner_matches_in(self.custody(), mapping)
+                    && global_frame_region_owner_matches_in(self.task.stage2.custody(), mapping)
                     && sparse_materialization::frame_grant_local_lease_is_current(
                         (
                             mapping.physical_ipa,
@@ -1461,7 +1504,7 @@ impl HvfVmState {
         {
             return decline("frame grant overlaps a pending replacement");
         }
-        let Some(deferred_state) = self.deferred_anonymous_state() else {
+        let Some(deferred_state) = self.task.stage2.deferred_anonymous_state() else {
             return decline("frame grant lacks deferred provenance");
         };
         let transition = match deferred_state.begin_owner_grant_materialization(
@@ -1483,8 +1526,10 @@ impl HvfVmState {
         let planned = if replacement_leases.is_empty() {
             None
         } else {
-            let planned =
-                self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
+            let planned = self
+                .task
+                .stage2
+                .plan_process_alias_retirement(request.semantic_base, semantic_len)?;
             // A subrange replacement clips registry rows, not physical leases.
             // Authenticated fragments outside this span keep their old lease;
             // only leases with no survivor need an inventory retirement.
@@ -1597,7 +1642,7 @@ impl HvfVmState {
         // execute makes its fresh frame coherent here, through the same
         // authority as every host-stored executable leaf.
         if request.permissions & carrick_abi::LINUX_PROT_EXEC != 0 {
-            self.publish_user_executable(physical_grant.0, physical_grant.1)
+            self.task.stage2.publish_user_executable(physical_grant.0, physical_grant.1)
                 .unwrap_or_else(|error| {
                     carrick_fatal!(
                         "hvpatch::el1_frame_grant",
@@ -1607,9 +1652,9 @@ impl HvfVmState {
                     );
                 });
         }
-        self.mappings.insert(published.region);
+        self.task.stage2.mappings.insert(published.region);
         transition.commit();
-        mark_el1_frame_grant_in(self.custody(), physical_grant.0, physical_grant.1, request.mm_key, published.ready.owner_generation).unwrap_or_else(
+        mark_el1_frame_grant_in(self.task.stage2.custody(), physical_grant.0, physical_grant.1, request.mm_key, published.ready.owner_generation).unwrap_or_else(
             |error| {
             carrick_fatal!(
                 "hvpatch::el1_frame_grant",
@@ -1639,7 +1684,7 @@ impl HvfVmState {
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,
     ) -> Result<bool, TrapError> {
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant rollback has no mm identity".to_owned())
         })?;
         if identity.mm != grant.mm_key {
@@ -1669,7 +1714,7 @@ impl HvfVmState {
                 &registry,
             )?;
             drop(registry);
-            let deferred = self.deferred_anonymous_state().ok_or_else(|| {
+            let deferred = self.task.stage2.deferred_anonymous_state().ok_or_else(|| {
                 TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
             })?;
             deferred
@@ -1684,14 +1729,14 @@ impl HvfVmState {
         let aliases = alias_registry().lock().overlapping_process_aliases(
             grant.semantic_base,
             len,
-            self.mm_root_slot,
-            self.container_root,
+            self.task.stage2.mm_root_slot,
+            self.task.stage2.container_root,
         );
         if !is_exactly_el1_frame_grant(&aliases, grant) {
             return Ok(false);
         }
         self.unregister_process_alias(grant.semantic_base, len)?;
-        let deferred = self.deferred_anonymous_state().ok_or_else(|| {
+        let deferred = self.task.stage2.deferred_anonymous_state().ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
         })?;
         deferred
@@ -1715,7 +1760,7 @@ impl HvfVmState {
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,
     ) -> Result<(), TrapError> {
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant completion has no mm identity".to_owned())
         })?;
         if identity.mm != grant.mm_key {
@@ -1731,7 +1776,10 @@ impl HvfVmState {
             return Ok(()); // Fresh alias is already installed; receipt proves publication.
         }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
-        let retirement = self.prepare_process_alias_retirement(grant.semantic_base, len)?;
+        let retirement = self
+            .task
+            .stage2
+            .prepare_process_alias_retirement(grant.semantic_base, len)?;
         if retirement.planned_leases != pending.predecessor_leases {
             return Err(TrapError::Hypervisor(format!(
                 "EL1 frame-grant replacement at 0x{:x}: predecessor changed before completion: planned={:?} live={:?}",
@@ -1761,7 +1809,7 @@ impl HvfVmState {
         alias: AliasBacking,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
-        let authority = self.cow_authority.as_ref().ok_or_else(|| {
+        let authority = self.task.stage2.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor(
                 "EL1 frame-grant retirement has no inventory authority".to_owned(),
             )
@@ -1770,7 +1818,7 @@ impl HvfVmState {
         let leases = std::collections::BTreeSet::from([lease.lease()]);
         let inventory = {
             let inventory = self.frame_inventory.lock();
-            Self::inventory_lease_retirement_shape(
+            Stage2State::inventory_lease_retirement_shape(
                 &inventory,
                 &std::collections::BTreeSet::from([lease]),
                 &|frame| {
@@ -1787,15 +1835,18 @@ impl HvfVmState {
                 "EL1 frame-grant replacement at 0x{va:x} has no inventory row to retire"
             )));
         }
-        let prepared = self.reserve_process_alias_retirement(PreparedProcessAliasRetirement {
-            planned_leases: leases,
-            visible_revisions: None,
-            read_rows: Vec::new(),
-            diagnostic_before: Vec::new(),
-            disarm_spans: Vec::new(),
-            inventory: Some(inventory),
-            reservation: None,
-        })?;
+        let prepared =
+            self.task
+                .stage2
+                .reserve_process_alias_retirement(PreparedProcessAliasRetirement {
+                    planned_leases: leases,
+                    visible_revisions: None,
+                    read_rows: Vec::new(),
+                    diagnostic_before: Vec::new(),
+                    disarm_spans: Vec::new(),
+                    inventory: Some(inventory),
+                    reservation: None,
+                })?;
         self.commit_process_alias_retirement_inner(
             va,
             len,
@@ -1822,11 +1873,11 @@ impl HvfVmState {
                 "invalid sparse mmap materialization 0x{start:x}..0x{end:x}"
             )));
         }
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch sparse mmap has no bound mm identity".to_owned())
         })?;
         let publication = sparse_materialization::PublicationContext::for_local(
-            std::sync::Arc::clone(&self.mm_access),
+            std::sync::Arc::clone(&self.task.stage2.mm_access),
             self.carrier_vm_custody(),
             identity,
         )?;
@@ -1839,17 +1890,17 @@ impl HvfVmState {
             let aliases = alias_registry().lock().overlapping_process_aliases(
                 start,
                 len,
-                self.mm_root_slot,
-                self.container_root,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
             );
             let forbidden_alias = aliases.iter().any(|(_, alias)| {
                 alias.sharing != GuestMappingSharing::Private
                     || !alias_backing_is_live(alias.physical_host_addr)
             });
-            let forbidden_mapping = self.mappings.iter().any(|mapping| {
+            let forbidden_mapping = self.task.stage2.mappings.iter().any(|mapping| {
                 mapping.start < end
                     && mapping.end > start
-                    && global_frame_region_owner_matches_in(self.custody(), mapping)
+                    && global_frame_region_owner_matches_in(self.task.stage2.custody(), mapping)
                     && (!mapping.is_dynamic_alias
                         || mapping.sharing != GuestMappingSharing::Private)
             });
@@ -1886,15 +1937,15 @@ impl HvfVmState {
                 .lock()
                 .process_alias_containing_va_candidates(
                     start,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                     |_| true,
                 );
             let live_alias_end = live_alias_candidates
                 .into_iter()
                 .find(|alias| {
                     global_frame_host_owner_matches_in(
-                        self.custody(),
+                        self.task.stage2.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -1913,8 +1964,8 @@ impl HvfVmState {
             // whether the new extent overlaps a live mapping, so it must still see
             // every row -- including displaced ones -- that the exact live global
             // owner still backs.
-            let custody = self.custody();
-            let next_local = self.mappings.first_start_between(
+            let custody = self.task.stage2.custody();
+            let next_local = self.task.stage2.mappings.first_start_between(
                 GuestVa::new(start),
                 GuestVa::new(end),
                 |mapping| global_frame_region_owner_matches_in(custody, mapping),
@@ -1924,15 +1975,15 @@ impl HvfVmState {
                 .matching_process_alias_starts_between_candidates(
                     start,
                     end,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                     |_| true,
                 );
             let next_alias = next_alias_candidates
                 .into_iter()
                 .find(|alias| {
                     global_frame_host_owner_matches_in(
-                        self.custody(),
+                        self.task.stage2.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
@@ -1949,7 +2000,7 @@ impl HvfVmState {
 
         let semantic_len =
             usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
-        let deferred_state = self.deferred_anonymous_state();
+        let deferred_state = self.task.stage2.deferred_anonymous_state();
         let deferred_transition = deferred_state
             .as_ref()
             .map(|state| {
@@ -1961,7 +2012,11 @@ impl HvfVmState {
             })?;
 
         let mut retirement = if replacing {
-            Some(self.prepare_process_alias_retirement(start, semantic_len)?)
+            Some(
+                self.task
+                    .stage2
+                    .prepare_process_alias_retirement(start, semantic_len)?,
+            )
         } else {
             None
         };
@@ -1995,9 +2050,9 @@ impl HvfVmState {
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
         for ext in published.extension_regions {
-            self.mappings.insert(ext);
+            self.task.stage2.mappings.insert(ext);
         }
-        self.mappings.insert(published.region);
+        self.task.stage2.mappings.insert(published.region);
         if page_granular_arm {
             // Every page of the view starts clean: the first guest (or host
             // syscall) write to a page must move THAT page, and only that
@@ -2030,7 +2085,11 @@ impl HvfVmState {
             (start, semantic_len, semantic_ipa)
         };
         if receipt_len > 0 {
-            self.supersede_cow_receipts("sparse-mmap-extent", receipt_va, receipt_len as u64);
+            self.task.stage2.supersede_cow_receipts(
+                "sparse-mmap-extent",
+                receipt_va,
+                receipt_len as u64,
+            );
             self.cow_deferred_publications
                 .lock()
                 .push(PendingFrameCowPublication {
@@ -2047,7 +2106,7 @@ impl HvfVmState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl HvfTaskState {
+impl Stage2State {
     /// Whether the frame backing `ipa` is referenced by MORE than one extent in
     /// the shared backend registry — i.e., some other mm (a fork parent or
     /// child) still lives on it. The registry `Arc` is shared across every
@@ -2081,7 +2140,7 @@ impl HvfTaskState {
         if !is_reusable_global_frame_extent(ipa, 1) {
             return false;
         }
-        let inventory = self.frame_inventory.lock();
+        let inventory = self.mm_access.frame_inventory.lock();
         let extent = inventory.extent_containing(ipa).map(|(_, extent)| *extent);
         let Some(extent) = extent else {
             return true;
@@ -2136,7 +2195,7 @@ impl HvfTaskState {
         let Some(end) = va.checked_add(len) else {
             return;
         };
-        let mut receipts = self.cow_deferred_publications.lock();
+        let mut receipts = self.mm_access.cow_deferred_publications.lock();
         // Every munmap and repoint reaches here. When no receipt names the
         // range the rebuild below would reproduce the same vector in the same
         // order, so skip its allocation and moves.
@@ -2186,7 +2245,9 @@ impl HvfTaskState {
         }
         *receipts = remaining;
     }
+}
 
+impl HvfTaskState {
     /// Replace an invalid stage-1 output whose exact stage-2 lease was retired
     /// by `munmap` with a fresh zero frame before low-arena same-VA reuse.
     ///
@@ -2219,7 +2280,7 @@ impl HvfTaskState {
         const AP_USER_RO: u64 = 0b11 << 6;
         const NON_GLOBAL: u64 = 1 << 11;
 
-        if !self.persistent_vm_lifecycle {
+        if !self.stage2.persistent_vm_lifecycle {
             return Ok(None);
         }
         let page_va = align_down(va, PAGE_SIZE);
@@ -2231,7 +2292,9 @@ impl HvfTaskState {
             return Ok(None);
         };
         if self.physical_cow_source(page_va, retained_ipa).is_some()
-            && !self.retained_output_lacks_exclusive_claim(retained_ipa)
+            && !self
+                .stage2
+                .retained_output_lacks_exclusive_claim(retained_ipa)
         {
             return Ok(None);
         }
@@ -2245,10 +2308,10 @@ impl HvfTaskState {
             )));
         }
 
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch retained reuse has no bound mm identity".to_owned())
         })?;
-        let authority = self.cow_authority.clone().ok_or_else(|| {
+        let authority = self.stage2.cow_authority.clone().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch retained reuse has no inventory authority".to_owned())
         })?;
         let _quiesce = authority.quiesce().map_err(|error| {
@@ -2264,7 +2327,9 @@ impl HvfTaskState {
             return Ok(None);
         };
         if self.physical_cow_source(page_va, retained_ipa).is_some()
-            && !self.retained_output_lacks_exclusive_claim(retained_ipa)
+            && !self
+                .stage2
+                .retained_output_lacks_exclusive_claim(retained_ipa)
         {
             // A live PRIVATE source means a sibling repaired the leaf; nothing
             // to materialize. A live SHARED source is the case this exists
@@ -2309,7 +2374,7 @@ impl HvfTaskState {
                 .flatten();
             let needs_materialization = retained.is_some_and(|ipa| {
                 self.physical_cow_source(probe, ipa).is_none()
-                    || self.retained_output_lacks_exclusive_claim(ipa)
+                    || self.stage2.retained_output_lacks_exclusive_claim(ipa)
             }) && self
                 .protections
                 .legacy()
@@ -2331,6 +2396,7 @@ impl HvfTaskState {
             TrapError::Hypervisor("HVPatch retained reuse offset underflow".to_owned())
         })?;
         let page_table_host = self
+            .stage2
             .mapping_for_range_in(
                 custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -2344,7 +2410,7 @@ impl HvfTaskState {
         let mut reservation = authority.reserve(1, 1, 2).map_err(|error| {
             TrapError::Hypervisor(format!("reserve HVPatch retained reuse inventory: {error}"))
         })?;
-        let backing = HvfVmState::private_backing_identity();
+        let backing = Stage2State::private_backing_identity();
         let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             CowArmedRanges::COMPOUND_SIZE as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
@@ -2458,8 +2524,8 @@ impl HvfTaskState {
         } else {
             let inventory_mapping = {
                 let mut inventory = self.frame_inventory.lock();
-                HvfVmState::stage_mapping_in(
-                    self.custody(),
+                Stage2State::stage_mapping_in(
+                    self.stage2.custody(),
                     &mut inventory,
                     &mut reservation,
                     retained_stage(),
@@ -2490,7 +2556,7 @@ impl HvfTaskState {
                                     "begin undo HVPatch retained reuse leaves: {other:?}"
                                 )),
                             })?;
-                            HvfVmState::refresh_stage1_exclusivity(editor.manager);
+                            Stage2State::refresh_stage1_exclusivity(editor.manager);
                             editor
                                 .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
                                 .map_err(|error| {
@@ -2510,7 +2576,7 @@ impl HvfTaskState {
                                         "restrict HVPatch retained reuse leaves: {error:?}"
                                     ))
                                 })?;
-                            self.publish_stage1_extension_arenas(editor.manager)?;
+                            self.stage2.publish_stage1_extension_arenas(editor.manager)?;
                             let page_table_resolver =
                                 self.page_table_resolver(editor.base(), Some(page_table_host));
                             unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
@@ -2567,7 +2633,7 @@ impl HvfTaskState {
                         "retained reuse rollback TLBI failed: {flush_error}"
                     );
                 }
-                HvfVmState::rollback_unpublished_mappings(
+                Stage2State::rollback_unpublished_mappings(
                     &mut self.frame_inventory.lock(),
                     &[inventory_entry],
                 )?;
@@ -2644,13 +2710,17 @@ impl HvfTaskState {
             perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             guest_writable: true,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
+            ownership_scope: alias_ownership_scope(
+                sharing,
+                self.stage2.mm_root_slot,
+                self.stage2.container_root,
+            ),
             inventory_backing: backing,
             shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         });
-        self.mappings.insert(HvfMappedRegion {
+        self.stage2.mappings.insert(HvfMappedRegion {
             start: page_va,
             ipa: new_ipa,
             physical_ipa: new_physical_ipa,
@@ -2670,7 +2740,8 @@ impl HvfTaskState {
             shared_key_offset: 0,
             owner_generation,
         });
-        self.supersede_cow_receipts("retained-reuse", page_va, span_len as u64);
+        self.stage2
+            .supersede_cow_receipts("retained-reuse", page_va, span_len as u64);
         let mut pending = self.cow_deferred_publications.lock();
         let mut current = page_va;
         while current < span_end {
@@ -2692,8 +2763,8 @@ impl HvfTaskState {
         {
             eprintln!(
                 "[DISARMDBG retained-reuse pid={:?} mm={:?}] span=({page_va:#x},{span_len:#x})",
-                self.cow_identity.map(|identity| identity.linux_pid),
-                self.cow_identity.map(|identity| identity.mm),
+                self.stage2.cow_identity.map(|identity| identity.linux_pid),
+                self.stage2.cow_identity.map(|identity| identity.mm),
             );
         }
         self.cow_armed.lock().disarm(CowArmedSpan {
@@ -2722,7 +2793,7 @@ fn fork_shadow_prune_enabled() -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl HvfTaskState {
+impl Stage2State {
     pub(crate) fn publish_shared_repoint(
         &mut self,
         va: u64,
@@ -2858,13 +2929,14 @@ impl HvfTaskState {
                     })
             })
             .or_else(|| {
-                self.frame_inventory
+                self.mm_access
+                    .frame_inventory
                     .lock()
                     .extents
                     .get(&(physical_ipa, physical_size as u64))
                     .map(|extent| extent.backing)
             })
-            .or_else(|| (!self.persistent_vm_lifecycle).then(HvfVmState::private_backing_identity))
+            .or_else(|| (!self.persistent_vm_lifecycle).then(Stage2State::private_backing_identity))
             .ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
@@ -2885,7 +2957,13 @@ impl HvfTaskState {
 
         // The engine already published and invalidated this mapping. This
         // adapter commits ownership metadata, never a second descriptor edit.
-        require_published_repoint(&self.page_tables_authority(), va, target_ipa, len, access)?;
+        require_published_repoint(
+            &self.mm_access.page_tables_authority(),
+            va,
+            target_ipa,
+            len,
+            access,
+        )?;
 
         let (shared_key_base, shared_key_offset) =
             advance_shared_key(shared_key_base, shared_key_offset, semantic_offset);
@@ -2934,11 +3012,14 @@ impl HvfTaskState {
     /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
     /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
     pub(crate) fn translate_va(&self, va: u64) -> Option<u64> {
-        self.page_tables_authority()
+        self.mm_access
+            .page_tables_authority()
             .with_manager(|manager| manager.translate(va))
             .flatten()
     }
+}
 
+impl HvfTaskState {
     pub(crate) fn live_stage1_names_writable_private_mapping(
         &self,
         custody: &CarrierVmCustody,
@@ -2955,6 +3036,7 @@ impl HvfTaskState {
             })?)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch winner PTE IPA overflow".to_owned()))?;
         let page_table_host = self
+            .stage2
             .mapping_for_range_in(
                 custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -2986,7 +3068,9 @@ impl HvfTaskState {
                 TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
             })?
     }
+}
 
+impl Stage2State {
     /// Called only under the COW quiesce and topology guards. Use the complete
     /// physical alias bucket, not only live leaves: even a retained invalid
     /// projection or a foreign/stale alias conservatively prevents reuse.
@@ -3019,7 +3103,7 @@ impl HvfTaskState {
                 continue;
             }
             let extent = {
-                let inventory = self.frame_inventory.lock();
+                let inventory = self.mm_access.frame_inventory.lock();
                 let Some(extent) = inventory.extents.get(&key).copied() else {
                     continue;
                 };
@@ -3078,7 +3162,8 @@ impl HvfTaskState {
         const PAGE_SIZE: u64 = 4 * 1024;
         let span_start = span.va & !(PAGE_SIZE - 1);
         let span_end = span.va.saturating_add(span.len as u64);
-        self.page_tables_authority()
+        self.mm_access
+            .page_tables_authority()
             .with_manager(|manager| {
                 let mut page_va = span_start;
                 while page_va < span_end {
@@ -3095,7 +3180,9 @@ impl HvfTaskState {
             })
             .unwrap_or(false)
     }
+}
 
+impl HvfTaskState {
     /// Serve a write fault on a fork-armed compound whose frame this mm alone
     /// maps ([`CowWriteRoute::ReuseSoleOwner`]) by making its leaves writable
     /// where the guest may write, under the same undo journal, live-backing
@@ -3152,7 +3239,7 @@ impl HvfTaskState {
                         pre_edit_ap.insert(page_va, manager.debug_walk(page_va)[3] & AP_MASK);
                         page_va = page_va.saturating_add(PAGE_SIZE);
                     }
-                    HvfVmState::refresh_stage1_exclusivity(manager.manager);
+                    Stage2State::refresh_stage1_exclusivity(manager.manager);
                     let mut page_va = span_start;
                     while page_va < span_end {
                         if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
@@ -3167,7 +3254,7 @@ impl HvfTaskState {
                         }
                         page_va = page_va.saturating_add(PAGE_SIZE);
                     }
-                    self.publish_stage1_extension_arenas(manager.manager)?;
+                    self.stage2.publish_stage1_extension_arenas(manager.manager)?;
                     let page_table_resolver =
                         self.page_table_resolver(manager.base(), Some(page_table_host));
                     unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|error| {
@@ -3292,10 +3379,10 @@ impl HvfTaskState {
                 "guest COW requires its driving vCPU".to_owned(),
             ));
         }
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch frame COW has no bound mm identity".to_owned())
         })?;
-        let authority = self.cow_authority.clone().ok_or_else(|| {
+        let authority = self.stage2.cow_authority.clone().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch frame COW has no inventory authority".to_owned())
         })?;
         // Pause sibling walkers first before inspecting or mutating MM COW state.
@@ -3308,7 +3395,7 @@ impl HvfTaskState {
         // Owner MMs authenticate the arm from their live descriptors. Host
         // MMs select one candidate without cloning the whole arm population.
         let (span, armed_is_empty, armed_len) = if guest_lane {
-            (self.guest_private_cow_span(fault_va), true, 0)
+            (self.stage2.guest_private_cow_span(fault_va), true, 0)
         } else {
             let cow_armed = self.cow_armed.lock();
             let candidate = cow_armed.span_for(fault_va);
@@ -3316,13 +3403,13 @@ impl HvfTaskState {
             let len = cow_armed.ranges.len();
             drop(cow_armed);
             (
-                candidate.map(|candidate| self.live_cow_span(candidate, fault_va)),
+                candidate.map(|candidate| self.stage2.live_cow_span(candidate, fault_va)),
                 empty,
                 len,
             )
         };
         let Some(span) = span else {
-            let mapping = self.mapping_for_range_in(custody, fault_va, 1);
+            let mapping = self.stage2.mapping_for_range_in(custody, fault_va, 1);
             let write_denied = self
                 .protections
                 .legacy()
@@ -3394,6 +3481,7 @@ impl HvfTaskState {
         // the page-table publication below deliberately preserves the denied
         // descriptor until mmap's later `protect_range` commit.
         let source_guest_writable = self
+            .stage2
             .mapping_for_range_in(custody, fault_va, 1)
             .ok_or_else(|| {
                 TrapError::Hypervisor(format!(
@@ -3416,8 +3504,8 @@ impl HvfTaskState {
         // that the exact byte translated; backing maintenance may intentionally
         // start from an invalid munmap descriptor, so the mapping-metadata
         // fallback is authoritative for that pre-publication transaction.
-        let old_fault_ipa = self.translate_va_for_cow(fault_va).or_else(|| {
-            let mapping = self.mapping_for_range_in(custody, fault_va, 1)?;
+        let old_fault_ipa = self.stage2.translate_va_for_cow(fault_va).or_else(|| {
+            let mapping = self.stage2.mapping_for_range_in(custody, fault_va, 1)?;
             mapping
                 .ipa
                 .checked_add(fault_va.checked_sub(mapping.start)?)
@@ -3464,8 +3552,8 @@ impl HvfTaskState {
         })?;
         let retention_aliases = authenticated_cow_retention_aliases_in(
             custody,
-            self.mm_root_slot,
-            self.container_root,
+            self.stage2.mm_root_slot,
+            self.stage2.container_root,
             old_physical_ipa,
         );
         let retain_old_compound = {
@@ -3491,7 +3579,7 @@ impl HvfTaskState {
         };
         let shape = {
             let inventory = self.frame_inventory.lock();
-            let shape = HvfVmState::cow_inventory_split_shape(
+            let shape = Stage2State::cow_inventory_split_shape(
                 &inventory,
                 old_physical_ipa,
                 retain_old_compound,
@@ -3513,6 +3601,7 @@ impl HvfTaskState {
                 drop(inventory);
                 if !exact_coverage {
                     let page_table_host = self
+                        .stage2
                         .mapping_for_range_in(
                             custody,
                             crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -3595,7 +3684,7 @@ impl HvfTaskState {
         // all (a never-touched page inside the compound) is what the copy
         // path's repoint would create; keep copying for such a span.
         let route = if route == CowWriteRoute::ReuseSoleOwner
-            && self.span_names_old_frame_exactly(span, old_ipa)
+            && self.stage2.span_names_old_frame_exactly(span, old_ipa)
         {
             CowWriteRoute::ReuseSoleOwner
         } else {
@@ -3643,7 +3732,7 @@ impl HvfTaskState {
         ) && intent
             == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
         {
-            self.private_cow_lane_candidate(
+            self.stage2.private_cow_lane_candidate(
                 custody,
                 authority.as_ref(),
                 span,
@@ -3825,7 +3914,7 @@ impl HvfTaskState {
             .checked_add(old_offset)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
 
-        let backing = reused_extent.map_or_else(HvfVmState::private_backing_identity, |extent| {
+        let backing = reused_extent.map_or_else(Stage2State::private_backing_identity, |extent| {
             extent.backing
         });
         let mut guest_backing = if let Some(reservation) = guest_reservation {
@@ -3897,7 +3986,7 @@ impl HvfTaskState {
         } else {
             None
         };
-        let split = match HvfVmState::stage_cow_inventory_split(
+        let split = match Stage2State::stage_cow_inventory_split(
             &mut reservation,
             old_inventory_key,
             old_inventory_extent,
@@ -4106,7 +4195,7 @@ impl HvfTaskState {
                                 probe_va = probe_va.saturating_add(PAGE_SIZE);
                             }
                         }
-                        HvfVmState::refresh_stage1_exclusivity(manager.manager);
+                        Stage2State::refresh_stage1_exclusivity(manager.manager);
                         if span.kernel_only {
                             manager
                                 .map_kernel_aliased(span.va, new_ipa, span.len as u64)
@@ -4145,7 +4234,7 @@ impl HvfTaskState {
                                 page_va = page_va.saturating_add(PAGE_SIZE);
                             }
                         }
-                        self.publish_stage1_extension_arenas(manager.manager)?;
+                        self.stage2.publish_stage1_extension_arenas(manager.manager)?;
                         let page_table_resolver =
                             self.page_table_resolver(manager.base(), Some(page_table_host));
                         unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {
@@ -4285,8 +4374,8 @@ impl HvfTaskState {
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
         let retired_old_stage2 = {
             let mut inventory = inventory_ledger.lock();
-            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                self.retire_stage2_extent_for_cow(
+            Stage2State::commit_cow_inventory_split(&mut inventory, &split, || {
+                self.stage2.retire_stage2_extent_for_cow(
                     custody,
                     split.old.stage2_base,
                     split.old.stage2_length,
@@ -4307,8 +4396,8 @@ impl HvfTaskState {
         }
         let scope = CowInventoryLifecycleScope {
             custody,
-            identity: self.cow_identity,
-            mm_root_slot: self.mm_root_slot,
+            identity: self.stage2.cow_identity,
+            mm_root_slot: self.stage2.mm_root_slot,
             semantic_va: span.va,
             semantic_length: span.len as u64,
         };
@@ -4352,8 +4441,8 @@ impl HvfTaskState {
                 let retired = [RetiredStage2Projection::from(split.old)];
                 let cleanup = mutate_known_external_alias_state(
                     AliasWriterActor::Mm {
-                        mm_root_slot: self.mm_root_slot,
-                        container_root: self.container_root,
+                        mm_root_slot: self.stage2.mm_root_slot,
+                        container_root: self.stage2.container_root,
                     },
                     |registry| retired_projection_mutation_keys(registry, &retired, &[]),
                     |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
@@ -4363,8 +4452,8 @@ impl HvfTaskState {
                         CowDiagnosticLifecycleKind::AliasPreservedReused,
                         CowDiagnosticLifecycleSite::CowCommit,
                         Some(custody),
-                        self.cow_identity,
-                        self.mm_root_slot,
+                        self.stage2.cow_identity,
+                        self.stage2.mm_root_slot,
                         *alias,
                     );
                 }
@@ -4373,13 +4462,13 @@ impl HvfTaskState {
                         CowDiagnosticLifecycleKind::AliasRemoved,
                         CowDiagnosticLifecycleSite::CowCommit,
                         Some(custody),
-                        self.cow_identity,
-                        self.mm_root_slot,
+                        self.stage2.cow_identity,
+                        self.stage2.mm_root_slot,
                         *alias,
                     );
                 }
             }
-            self.mappings.remove_rows_matching_in_ranges(
+            self.stage2.mappings.remove_rows_matching_in_ranges(
                 &[MappingExtent::Ipa(
                     split.old.stage2_base,
                     split.old.stage2_length,
@@ -4421,7 +4510,8 @@ impl HvfTaskState {
         // `mmap`, whose leaves are deliberately invalid until the protection
         // commit — is now a false promise, and would fail the authentication
         // that completes this mapping.
-        self.supersede_cow_receipts_for_cow(span.va, span.len as u64);
+        self.stage2
+            .supersede_cow_receipts_for_cow(span.va, span.len as u64);
         if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_protection_receipt {
             crate::probes::pt_alias_receipt(va, leaf, expected_ipa, expected_ap, 3);
             if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
@@ -4449,8 +4539,8 @@ impl HvfTaskState {
             sharing: GuestMappingSharing::Private,
             ownership_scope: alias_ownership_scope(
                 GuestMappingSharing::Private,
-                self.mm_root_slot,
-                self.container_root,
+                self.stage2.mm_root_slot,
+                self.stage2.container_root,
             ),
             inventory_backing: backing,
             shared_key_base: None,
@@ -4462,18 +4552,18 @@ impl HvfTaskState {
             CowDiagnosticLifecycleKind::AliasPublished,
             CowDiagnosticLifecycleSite::CowCommit,
             Some(custody),
-            self.cow_identity,
-            self.mm_root_slot,
+            self.stage2.cow_identity,
+            self.stage2.mm_root_slot,
             alias,
         );
         record_alias_revision(
             CowDiagnosticAliasRevisionSite::CowPublication,
             custody,
-            self.cow_identity,
+            self.stage2.cow_identity,
             new_physical_ipa,
             alias_registry().lock().revision(),
         );
-        self.mappings.insert(HvfMappedRegion {
+        self.stage2.mappings.insert(HvfMappedRegion {
             start: span.va,
             ipa: new_ipa,
             physical_ipa: new_physical_ipa,
@@ -4512,8 +4602,8 @@ impl HvfTaskState {
         {
             eprintln!(
                 "[DISARMDBG split pid={:?} mm={:?}] span=({:#x},{:#x}) new_ipa={new_ipa:#x}",
-                self.cow_identity.map(|identity| identity.linux_pid),
-                self.cow_identity.map(|identity| identity.mm),
+                self.stage2.cow_identity.map(|identity| identity.linux_pid),
+                self.stage2.cow_identity.map(|identity| identity.mm),
                 span.va,
                 span.len,
             );
@@ -4521,14 +4611,17 @@ impl HvfTaskState {
         self.cow_armed.lock().disarm(span);
         let path = crate::hvf_aarch64_engine::HostCowPath::of_trigger(trigger.class);
         if guest_lane {
-            self.mm_access
+            self.stage2
+                .mm_access
                 .host_cow_stats
                 .record_guest_lane_host_cow(path);
         } else {
-            self.mm_access
+            self.stage2
+                .mm_access
                 .host_cow_stats
                 .record_host_cow_resolution(path);
-            self.mm_access
+            self.stage2
+                .mm_access
                 .sample_host_lane(carrick_aarch64::stage1_authority::GuestLaneSite::HostCow);
         }
         Ok(true)
@@ -4559,6 +4652,7 @@ impl HvfTaskState {
             ));
         }
         let mapping = self
+            .stage2
             .mapping_for_range_in(custody, generation_address, core::mem::size_of::<u64>())
             .ok_or_else(|| {
                 TrapError::Hypervisor(
@@ -4701,21 +4795,23 @@ impl HvfVmState {
     }
 
     pub(crate) fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
-        self.task.record_stage1_populated_prefix(base, prefix);
+        self.task
+            .stage2
+            .record_stage1_populated_prefix(base, prefix);
     }
 
     pub(crate) fn publish_stage1_extension_arenas(
         &mut self,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
-        self.task.publish_stage1_extension_arenas(manager)
+        self.task.stage2.publish_stage1_extension_arenas(manager)
     }
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
         manager: &mut carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
-        self.task.retire_stage1_extension_arenas(manager)
+        self.task.stage2.retire_stage1_extension_arenas(manager)
     }
 
     pub(crate) fn resolve_frame_cow_fault(
@@ -4730,9 +4826,9 @@ impl HvfVmState {
             let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
             // EL1 found no grant for a fault it could resolve itself: refill
             // the MM's pool and let EL1 take the retry, with no host COW.
-            if self.task.refill_guest_cow_pool(&custody, fault_va)? {
+            if self.task.stage2.refill_guest_cow_pool(&custody, fault_va)? {
                 return Ok(carrick_hal::CowFaultResolution::Resolved {
-                    translation: self.translate_va(fault_va),
+                    translation: self.task.stage2.translate_va(fault_va),
                     arm_generation: self.task.cow_armed.lock().generation(),
                 });
             }
@@ -4757,7 +4853,7 @@ impl HvfVmState {
             // rewrites the same stack slot), so (FAR, ESR) alone cannot prove
             // the resolver made no progress.
             return Ok(carrick_hal::CowFaultResolution::Resolved {
-                translation: self.translate_va(fault_va),
+                translation: self.task.stage2.translate_va(fault_va),
                 arm_generation: self.task.cow_armed.lock().generation(),
             });
         }
@@ -4784,7 +4880,7 @@ impl HvfVmState {
         }
         let before = crate::trap::cow_engine::MmMaintenanceVisits::read();
         let outcome = self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
-        self.emit_mm_maintenance_census(
+        self.task.stage2.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
             va,
             len,
@@ -4792,7 +4888,9 @@ impl HvfVmState {
         );
         outcome
     }
+}
 
+impl Stage2State {
     /// Report one census-armed maintenance operation: the rows its lookups
     /// visited beside the populations they were drawn from. Only called
     /// while `hvpatch-mm-maintenance-begin` is enabled.
@@ -4825,11 +4923,13 @@ impl HvfVmState {
                 extents_visited: after.extents.wrapping_sub(before.extents),
                 alias_rows_live,
                 task_rows_live: self.mappings.len() as u64,
-                extents_live: self.frame_inventory.lock().extents.len() as u64,
+                extents_live: self.mm_access.frame_inventory.lock().extents.len() as u64,
             },
         );
     }
+}
 
+impl HvfVmState {
     fn ensure_frame_cow_write_routed(
         &mut self,
         va: u64,
@@ -4861,13 +4961,13 @@ impl HvfVmState {
             // The live span, not the armed granule: a page past it names
             // another frame and is routed on its own next iteration.
             let armed_span_end = candidate.map(|candidate| {
-                let span = self.task.live_cow_span(candidate, current);
+                let span = self.task.stage2.live_cow_span(candidate, current);
                 span.va.saturating_add(span.len as u64)
             });
             let armed = armed_span_end.is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
                 if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
-                    && self.persistent_vm_lifecycle
+                    && self.task.stage2.persistent_vm_lifecycle
                 {
                     match self
                         .page_tables_authority()
@@ -4891,7 +4991,7 @@ impl HvfVmState {
                                 unmapped && self.physical_cow_source(current, ipa).is_none();
                             let shared = unmapped
                                 && !no_source
-                                && self.retained_output_lacks_exclusive_claim(ipa);
+                                && self.task.stage2.retained_output_lacks_exclusive_claim(ipa);
                             (no_source, shared)
                         }
                         None => (false, false),
@@ -4914,7 +5014,7 @@ impl HvfVmState {
                 // still name that frame? A Direct GuestVisible write into a
                 // frame another live mm reads is the fork-child stack-smash
                 // corruption shape.
-                let translation = self.translate_va(debug_va);
+                let translation = self.task.stage2.translate_va(debug_va);
                 let mapping = self.mapping_for_range(debug_va, 1).map(|mapping| {
                     (
                         mapping.start,
@@ -4938,8 +5038,8 @@ impl HvfVmState {
                                     && alias.ownership_scope
                                         != alias_ownership_scope(
                                             GuestMappingSharing::Private,
-                                            self.mm_root_slot,
-                                            self.container_root,
+                                            self.task.stage2.mm_root_slot,
+                                            self.task.stage2.container_root,
                                         )
                             })
                             .map(|alias| (alias.start, alias.physical_ipa, alias.ownership_scope))
@@ -4952,9 +5052,12 @@ impl HvfVmState {
                      no_source={retained_output_has_no_physical_source} \
                      shared={retained_output_source_is_shared} route={route:?} \
                      translation={translation:x?} mapping={mapping:x?} co_owners={co_owners:x?}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
-                    self.cow_identity.map(|identity| identity.mm),
-                    self.mm_root_slot,
+                    self.task
+                        .stage2
+                        .cow_identity
+                        .map(|identity| identity.linux_pid),
+                    self.task.stage2.cow_identity.map(|identity| identity.mm),
+                    self.task.stage2.mm_root_slot,
                     self.cow_armed.lock().ranges.len(),
                 );
             }
@@ -5248,37 +5351,40 @@ impl HvfVmState {
     ) -> Result<std::ptr::NonNull<carrick_aarch64::mailbox::Aarch64SyscallMailbox>, TrapError> {
         let address = slot.guest_address();
         let size = carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize;
-        let pointer = self
-            .translate_va(address)
-            .and_then(|ipa| {
-                Self::mailbox_mapping_for_range(&self.mappings, address, ipa, size).map(|mapping| {
-                    let offset =
-                        usize::try_from(address.saturating_sub(mapping.start)).unwrap_or_default();
-                    unsafe { mapping.host_addr.add(offset) }
+        let pointer =
+            self.task
+                .stage2
+                .translate_va(address)
+                .and_then(|ipa| {
+                    Self::mailbox_mapping_for_range(&self.task.stage2.mappings, address, ipa, size)
+                        .map(|mapping| {
+                            let offset = usize::try_from(address.saturating_sub(mapping.start))
+                                .unwrap_or_default();
+                            unsafe { mapping.host_addr.add(offset) }
+                        })
                 })
-            })
-            // A persistent-VM exec deliberately drops the software page-table
-            // manager until the first real edit. The mailbox lives in a static
-            // boot mapping whose guest-VA extent is unambiguous, so resolve that
-            // mapping directly instead of paying a 1.8 MiB table clone solely to
-            // recover the root-slot/global-frame IPA during publication.
-            .or_else(|| {
-                let mapping = self.mapping_for_range(address, size)?;
-                let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
-                Some(unsafe { mapping.host_addr.add(offset) })
-            })
-            .or_else(|| {
-                self.carrier_mappings
-                    .as_ref()?
-                    .host_pointer(address, size)
-                    .map(std::ptr::NonNull::as_ptr)
-            })
-            .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "AArch64 syscall mailbox slot {} at {address:#x} is not mapped",
-                    slot.raw()
-                ))
-            })?;
+                // A persistent-VM exec deliberately drops the software page-table
+                // manager until the first real edit. The mailbox lives in a static
+                // boot mapping whose guest-VA extent is unambiguous, so resolve that
+                // mapping directly instead of paying a 1.8 MiB table clone solely to
+                // recover the root-slot/global-frame IPA during publication.
+                .or_else(|| {
+                    let mapping = self.mapping_for_range(address, size)?;
+                    let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
+                    Some(unsafe { mapping.host_addr.add(offset) })
+                })
+                .or_else(|| {
+                    self.carrier_mappings
+                        .as_ref()?
+                        .host_pointer(address, size)
+                        .map(std::ptr::NonNull::as_ptr)
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "AArch64 syscall mailbox slot {} at {address:#x} is not mapped",
+                        slot.raw()
+                    ))
+                })?;
         std::ptr::NonNull::new(pointer.cast()).ok_or_else(|| {
             TrapError::Hypervisor(format!(
                 "AArch64 syscall mailbox slot {} resolved to a null host pointer",
@@ -5341,7 +5447,7 @@ impl HvfVmState {
         }
         let slot = binding.slot();
         let address = slot.guest_address();
-        let translated_ipa = self.translate_va(address);
+        let translated_ipa = self.task.stage2.translate_va(address);
         let live = self.mailbox_host_pointer(slot).ok();
         let live_diagnostics = live.map(|pointer| {
             // SAFETY: `mailbox_host_pointer` authenticated a complete live slot,
@@ -5355,7 +5461,9 @@ impl HvfVmState {
             live.map(|pointer| pointer.as_ptr() as usize),
         ))
     }
+}
 
+impl Stage2State {
     /// Host pointer backing `[gpa, gpa+len)`, or `None` if unmapped. The
     /// engine's `GuestMemory` copies through this; HVF resolves it via the same
     /// per-thread mapping walk (with the stage-1-IPA disambiguation) the
@@ -5380,7 +5488,9 @@ impl HvfVmState {
         }
         Ok(())
     }
+}
 
+impl HvfVmState {
     /// The HVF-only lazy high-VA alias re-map: a forked child rebuilt its VM
     /// from only the forking thread's mappings, dropping a global-shared alias a
     /// sibling thread mapped; re-`hv_vm_map` the registered host backing into
@@ -5392,7 +5502,12 @@ impl HvfVmState {
         let backing = if gpa != 0 {
             lookup_shared_alias(gpa)
         } else {
-            lookup_shared_alias_by_va(va, 1, self.mm_root_slot, self.container_root)
+            lookup_shared_alias_by_va(
+                va,
+                1,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
+            )
         };
         let Some(b) = backing else {
             return false;
@@ -5478,7 +5593,7 @@ impl HvfVmState {
             }
             HostAliasBacking::Anonymous {
                 sharing: HostAliasSharing::Shared,
-            } => Self::shared_anon_backing_identity(),
+            } => Stage2State::shared_anon_backing_identity(),
             // A private file mapping is a private frame: its host object is a
             // per-mapping COW view of the file, never shared with another alias.
             HostAliasBacking::File {
@@ -5487,7 +5602,7 @@ impl HvfVmState {
             }
             | HostAliasBacking::Anonymous {
                 sharing: HostAliasSharing::Private,
-            } => Self::private_backing_identity(),
+            } => Stage2State::private_backing_identity(),
         };
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
         // alias arena. An in-process hvpatch mm relocates non-global aliases into
@@ -5630,7 +5745,7 @@ impl HvfVmState {
         // `test_mmap` LargeMmapTests hung there). The sparse-arena sibling
         // reserves on `TWO_MIB` for exactly this reason.
         const TWO_MIB: u64 = 2 * 1024 * 1024;
-        let mut global_lease = if self.persistent_vm_lifecycle {
+        let mut global_lease = if self.task.stage2.persistent_vm_lifecycle {
             Some(GlobalFrameStage2Lease::reserve(hvf_len, TWO_MIB)?)
         } else {
             None
@@ -5659,7 +5774,7 @@ impl HvfVmState {
         if let Some(lease) = global_lease.as_mut() {
             lease.mark_mapped();
         }
-        let (host_mapping, owner_generation) = if self.persistent_vm_lifecycle {
+        let (host_mapping, owner_generation) = if self.task.stage2.persistent_vm_lifecycle {
             let custody = self.carrier_vm_custody();
             let owner_generation = register_global_frame_host_owner_in(
                 &custody,
@@ -5693,13 +5808,17 @@ impl HvfVmState {
             perms: carrick_aarch64::stage2::stage2_perms_bits(perms),
             guest_writable: alias_guest_writable,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
+            ownership_scope: alias_ownership_scope(
+                sharing,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
+            ),
             inventory_backing,
             shared_key_base,
             shared_key_offset,
             owner_generation,
         });
-        self.mappings.insert(HvfMappedRegion {
+        self.task.stage2.mappings.insert(HvfMappedRegion {
             start: va,
             ipa,
             physical_ipa: ipa,
@@ -5719,7 +5838,7 @@ impl HvfVmState {
             shared_key_offset,
             owner_generation,
         });
-        if self.persistent_vm_lifecycle {
+        if self.task.stage2.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
             let mut reservation = inventory.alias_reservation.take().unwrap_or_else(|| {
                 carrick_fatal!(
@@ -5727,8 +5846,8 @@ impl HvfVmState {
                     "HVPatch alias mapped without frame inventory reservation"
                 );
             });
-            match Self::stage_mapping_in(
-                self.custody(),
+            match Stage2State::stage_mapping_in(
+                self.task.stage2.custody(),
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -5845,15 +5964,20 @@ impl HvfVmState {
             .map_err(hvf_error)?;
         Ok(true)
     }
+}
 
+impl Stage2State {
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     pub(crate) fn range_no_access(&self, address: u64, length: usize) -> bool {
-        self.protections
+        self.mm_access
+            .protections
             .legacy()
             .is_none_or(|protections| protections.range_no_access(address, length))
     }
+}
 
+impl HvfVmState {
     /// Write the vDSO vvar data page: the counter frequency and the
     /// monotonic→realtime offset, so `__kernel_clock_gettime` can convert
     /// CNTVCT_EL0 to a timespec entirely in userspace. The guest reads the same
@@ -5941,12 +6065,14 @@ impl HvfVmState {
         }
         // seq stays 0 (even = stable); these aren't updated after boot.
     }
+}
 
+impl Stage2State {
     /// Mark `[address, address+len)` PROT_NONE (`no_access=true`) or clear it.
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
     pub(crate) fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        if let Some(protections) = self.protections.legacy() {
+        if let Some(protections) = self.mm_access.protections.legacy() {
             protections.set_no_access(address, len, no_access);
         }
     }
@@ -5979,7 +6105,9 @@ impl HvfVmState {
     pub(crate) fn split_local_rows_for_unmap(&mut self, va: u64, len: usize) {
         self.mappings.split_local_rows_for_unmap(va, len);
     }
+}
 
+impl HvfVmState {
     pub(crate) fn unregister_process_alias(
         &mut self,
         va: u64,
@@ -5995,15 +6123,20 @@ impl HvfVmState {
         // `ENOMEM`. Seen as `go-net` dying with "fatal error: runtime: cannot
         // allocate memory" on a 256 KiB arena mmap whose fifth page still held
         // a one-page receipt from a freed mapping.
-        if !self.persistent_vm_lifecycle {
-            self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
+        if !self.task.stage2.persistent_vm_lifecycle {
+            self.task
+                .stage2
+                .supersede_cow_receipts("process-alias-unmap", va, len as u64);
             if let Some(debug_va) = fork_debug_va()
                 && debug_va >= va
                 && debug_va < va.saturating_add(len as u64)
             {
                 eprintln!(
                     "[DISARMDBG alias-unmap-legacy pid={:?}] va={va:#x} len={len:#x}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
+                    self.task
+                        .stage2
+                        .cow_identity
+                        .map(|identity| identity.linux_pid),
                 );
             }
             self.cow_armed.lock().disarm(CowArmedSpan {
@@ -6012,17 +6145,22 @@ impl HvfVmState {
                 executable: false,
                 kernel_only: false,
             });
-            let _ = unregister_alias(va, len, self.mm_root_slot, self.container_root);
-            self.split_local_rows_for_unmap(va, len);
+            let _ = unregister_alias(
+                va,
+                len,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
+            );
+            self.task.stage2.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
         })?;
         // `GuestMemory::unmap_range` is reached only from the mmap-family
         // syscall set, whose runtime dispatch already owns the process-wide
         // MM exclusion across invalidate + TLBI + this backend retirement.
-        let prepared = self.prepare_process_alias_retirement(va, len)?;
+        let prepared = self.task.stage2.prepare_process_alias_retirement(va, len)?;
         if prepared.inventory.is_some() {
             let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
                 carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
@@ -6041,7 +6179,9 @@ impl HvfVmState {
             )
         }
     }
+}
 
+impl Stage2State {
     /// Prepare while the caller holds topology exclusion. Dropping this value
     /// leaves aliases, COW state, receipts and inventory unchanged.
     pub(crate) fn prepare_process_alias_retirement(
@@ -6129,7 +6269,7 @@ impl HvfVmState {
             None
         } else {
             let retirement = {
-                let inventory = self.frame_inventory.lock();
+                let inventory = self.mm_access.frame_inventory.lock();
                 // Each lease retires only the incarnation a retiring row was
                 // published under: a row that outlived its lease names a
                 // recycled IPA, and the address alone would retire its
@@ -6160,7 +6300,9 @@ impl HvfVmState {
             reservation: None,
         })
     }
+}
 
+impl HvfVmState {
     /// Consume a retirement under the same topology exclusion as preparation.
     /// `registry` is the caller's live frame-registry leaf hold: the commit
     /// publishes into the carrier-wide shared-frame registry, so it must run
@@ -6240,13 +6382,13 @@ impl HvfVmState {
                 return Ok(());
             };
             note_alias_retirement_restart();
-            prepared = self.prepare_process_alias_retirement(va, len)?;
+            prepared = self.task.stage2.prepare_process_alias_retirement(va, len)?;
             if prepared.read_rows.len() >= read {
                 carrick_fatal!(
                     "hvpatch::host_alias",
                     "HVPatch alias retirement restart read {} rows after {read}: a writer outside the mm guard added rows: va={va:#x} len={len:#x} mm={:?} writers={}",
                     prepared.read_rows.len(),
-                    self.mm_root_slot,
+                    self.task.stage2.mm_root_slot,
                     stale.writers,
                 );
             }
@@ -6269,10 +6411,10 @@ impl HvfVmState {
                 "alias retirement inventory publication lacks frame registry guard".to_owned(),
             ));
         }
-        let authority = self.cow_authority.as_ref().ok_or_else(|| {
+        let authority = self.task.stage2.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
-        let identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
         })?;
         let custody = self.carrier_vm_custody();
@@ -6287,7 +6429,9 @@ impl HvfVmState {
         } = prepared;
         let registered = rows == AliasRetirementRows::Registered;
         if registered {
-            self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
+            self.task
+                .stage2
+                .supersede_cow_receipts("process-alias-unmap", va, len as u64);
         }
         // A grant whose alias was never registered has no registry rows to
         // retire; its planned leases are exactly its own publication.
@@ -6297,8 +6441,8 @@ impl HvfVmState {
                 &mut aliases,
                 va,
                 len,
-                self.mm_root_slot,
-                self.container_root,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
                 AliasUnmapPlanAuthority {
                     planned_leases: &planned_leases,
                     visible_revisions,
@@ -6318,7 +6462,7 @@ impl HvfVmState {
                         carrick_fatal!(
                             "hvpatch::host_alias",
                             "HVPatch pre-applied alias retirement went stale: va={va:#x} len={len:#x} mm={:?} planned={planned_leases:x?} live={live_leases:x?} writers={writers}",
-                            self.mm_root_slot,
+                            self.task.stage2.mm_root_slot,
                         );
                     }
                     return Ok(Some(StaleAliasRetirement { writers }));
@@ -6335,8 +6479,8 @@ impl HvfVmState {
                     .collect();
                 let now_rows = aliases.visible_extent_rows(
                     differing.iter().copied(),
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                 );
                 let plan_rows: Vec<_> = read_rows
                     .iter()
@@ -6350,7 +6494,7 @@ impl HvfVmState {
                 carrick_fatal!(
                     "hvpatch::host_alias",
                     "HVPatch alias retirement disagrees with its authenticated plan: va={va:#x} len={len:#x} mm={:?} planned={} actual={} differing={differing:x?} writers={writers} plan_co_holders={plan_rows:?} now_rows={now_rows:?}",
-                    self.mm_root_slot,
+                    self.task.stage2.mm_root_slot,
                     planned_leases.len(),
                     actual.len(),
                 );
@@ -6361,8 +6505,8 @@ impl HvfVmState {
                 CowDiagnosticLifecycleSite::AliasUnmap,
                 &custody,
                 Some(identity),
-                self.mm_root_slot,
-                self.container_root,
+                self.task.stage2.mm_root_slot,
+                self.task.stage2.container_root,
                 &diagnostic_before,
             );
         }
@@ -6373,7 +6517,7 @@ impl HvfVmState {
                 ));
             }
             if registered {
-                self.split_local_rows_for_unmap(va, len);
+                self.task.stage2.split_local_rows_for_unmap(va, len);
             }
             // A surviving fragment of a compound still needs its COW arm.
             // The planner emits spans only for leases it actually retires.
@@ -6392,7 +6536,7 @@ impl HvfVmState {
                 })?;
                 // Kernel publication and backend decrement are one step under
                 // the frame registry; see `apply_inventory_lease_retirement`.
-                Self::apply_inventory_lease_retirement(
+                Stage2State::apply_inventory_lease_retirement(
                     &self.frame_inventory.ledger,
                     &retirement,
                     reservation,
@@ -6449,7 +6593,7 @@ impl HvfVmState {
         let scope = CowInventoryLifecycleScope {
             custody: &custody,
             identity: Some(identity),
-            mm_root_slot: self.mm_root_slot,
+            mm_root_slot: self.task.stage2.mm_root_slot,
             semantic_va: va,
             semantic_length: len as u64,
         };
@@ -6482,12 +6626,12 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            self.retire_stage2_extent(ipa, length)?;
+            self.task.stage2.retire_stage2_extent(ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {
-                    mm_root_slot: self.mm_root_slot,
-                    container_root: self.container_root,
+                    mm_root_slot: self.task.stage2.mm_root_slot,
+                    container_root: self.task.stage2.container_root,
                 },
                 |registry| retired_projection_mutation_keys(registry, &retired, &[]),
                 |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
@@ -6498,7 +6642,7 @@ impl HvfVmState {
                     CowDiagnosticLifecycleSite::AliasUnmap,
                     Some(&custody),
                     Some(identity),
-                    self.mm_root_slot,
+                    self.task.stage2.mm_root_slot,
                     alias,
                 );
             }
@@ -6508,17 +6652,19 @@ impl HvfVmState {
                     CowDiagnosticLifecycleSite::AliasUnmap,
                     Some(&custody),
                     Some(identity),
-                    self.mm_root_slot,
+                    self.task.stage2.mm_root_slot,
                     alias,
                 );
             }
-            self.mappings
+            self.task
+                .stage2
+                .mappings
                 .remove_rows_matching_in_ranges(&[MappingExtent::Ipa(ipa, length)], |mapping| {
                     mapped_region_matches_retired_inventory_extent(mapping, retired[0])
                 });
         }
         if registered {
-            self.split_local_rows_for_unmap(va, len);
+            self.task.stage2.split_local_rows_for_unmap(va, len);
         }
         {
             let mut armed = self.cow_armed.lock();
@@ -6528,9 +6674,11 @@ impl HvfVmState {
         }
         // This retirement's Kernel commit is applied. If its unmap was a
         // frame's last, the Kernel retired the frame in it; the owner follows.
-        if let (Some(registry), Some(authority)) = (registry, self.cow_authority.clone()) {
+        if let (Some(registry), Some(authority)) =
+            (registry, self.task.stage2.cow_authority.clone())
+        {
             let frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
-            Self::settle_declined_lease_remainders(
+            Stage2State::settle_declined_lease_remainders(
                 &custody,
                 &frames,
                 authority.as_ref(),
@@ -6556,7 +6704,9 @@ impl HvfVmState {
     /// resolve identically — no accessor mutates the region itself.
     pub(crate) fn mapping_for_range(&self, address: u64, length: usize) -> Option<MappingView> {
         let custody = self.carrier_vm_custody();
-        self.task.mapping_for_range_in(&custody, address, length)
+        self.task
+            .stage2
+            .mapping_for_range_in(&custody, address, length)
     }
 
     pub(crate) fn mapping_for_range_mut(
@@ -6566,7 +6716,9 @@ impl HvfVmState {
     ) -> Option<MappingView> {
         self.mapping_for_range(address, length)
     }
+}
 
+impl Stage2State {
     /// The address the per-chunk region lookup + offset should use for a syscall
     /// buffer at guest VA `chunk_va`. Identity for everything but a
     /// `repoint_private` overlay: a MAP_FIXED|MAP_PRIVATE carved over a
@@ -6632,7 +6784,9 @@ impl HvfVmState {
             .next()
             .map(HvfMappedRegion::view)
     }
+}
 
+impl HvfVmState {
     /// Resolve one mailbox route without losing its semantic VA identity.
     ///
     /// A raw IPA is not a sufficient key in the persistent VM: the reusable
@@ -6659,7 +6813,9 @@ impl HvfVmState {
             })
             .map(HvfMappedRegion::view)
     }
+}
 
+impl Stage2State {
     /// Resolve a raw IPA only through the exact currently-owned generation.
     /// A retired dynamic row can keep the same IPA and raw host pointer after
     /// the reusable allocator hands that IPA to another frame; mapped-address
@@ -6716,9 +6872,11 @@ impl HvfVmState {
             )
             .map(|alias| MappingView::from_alias(&alias))
     }
+}
 
+impl HvfVmState {
     pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        if self.range_no_access(address, length) {
+        if self.task.stage2.range_no_access(address, length) {
             carrick_observability::probes::guest_internal_write_fault(
                 address,
                 length as u64,
@@ -6748,7 +6906,7 @@ impl HvfTaskState {
         semantic_va: u64,
         ipa: u64,
     ) -> Option<PhysicalCowSource> {
-        self.physical_cow_source_in(self.custody(), semantic_va, ipa)
+        self.physical_cow_source_in(self.stage2.custody(), semantic_va, ipa)
     }
 
     pub(crate) fn report_physical_cow_source_refusal(
@@ -6771,10 +6929,11 @@ impl HvfTaskState {
             .unwrap_or_else(|| align_down(semantic_va, CowArmedRanges::COMPOUND_SIZE));
         let compound_end = compound_va.saturating_add(CowArmedRanges::COMPOUND_SIZE);
         let custody_identity = custody as *const CarrierVmCustody as usize;
-        let mm_access_identity = std::sync::Arc::as_ptr(&self.mm_access) as usize;
+        let mm_access_identity = std::sync::Arc::as_ptr(&self.stage2.mm_access) as usize;
         let page_tables_authority = self.page_tables_authority();
         let page_tables_identity = page_tables_authority.authority_id() as usize;
         let page_table_host = self
+            .stage2
             .mapping_for_range_in(
                 custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -6810,8 +6969,8 @@ impl HvfTaskState {
         eprintln!(
             "[COW-REFUSAL] input_va={semantic_va:#x} input_ipa={ipa:#x} compound_va={compound_va:#x} physical={physical_ipa:#x}+{:#x} custody={custody_identity:#x} mm_access={mm_access_identity:#x} page_tables={page_tables_identity:#x} root={page_table_root:#x?} mm_root_slot={:?} cow_identity={:?}",
             CowArmedRanges::COMPOUND_SIZE,
-            self.mm_root_slot,
-            self.cow_identity,
+            self.stage2.mm_root_slot,
+            self.stage2.cow_identity,
         );
         for (va, translated, retained, shadow, live) in stage1_rows {
             let live_leaf = live.map(|walk| walk[3]);
@@ -6915,6 +7074,7 @@ impl HvfTaskState {
             let mut total = 0usize;
             let mut rows = Vec::new();
             for mapping in self
+                .stage2
                 .mappings
                 .iter()
                 .rev()
@@ -6984,7 +7144,7 @@ impl HvfTaskState {
             let mut rows = Vec::new();
             for alias in alias_registry()
                 .lock()
-                .process_visible_ordered(self.mm_root_slot, self.container_root)
+                .process_visible_ordered(self.stage2.mm_root_slot, self.stage2.container_root)
                 .into_iter()
                 .rev()
                 .filter(|alias| {
@@ -7064,13 +7224,13 @@ impl HvfTaskState {
         let alias_candidates = alias_registry().lock().process_va_overlap_candidates(
             semantic_start,
             CowArmedRanges::COMPOUND_SIZE,
-            self.mm_root_slot,
-            self.container_root,
+            self.stage2.mm_root_slot,
+            self.stage2.container_root,
             |alias| {
                 alias_matches_process_scope(
                     alias.ownership_scope,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.stage2.mm_root_slot,
+                    self.stage2.container_root,
                 ) && alias.start < semantic_end
                     && alias
                         .start
@@ -7085,7 +7245,7 @@ impl HvfTaskState {
             },
         );
         if let Some(alias) = alias_candidates.into_iter().find(|alias| {
-            if self.persistent_vm_lifecycle
+            if self.stage2.persistent_vm_lifecycle
                 && is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
             {
                 global_frame_host_owner_matches_in(
@@ -7100,7 +7260,7 @@ impl HvfTaskState {
             }
         }) {
             let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
-            if self.persistent_vm_lifecycle
+            if self.stage2.persistent_vm_lifecycle
                 && is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
             {
                 if let Some(pin) = pin_exact_live_global_frame_owner_in(
@@ -7120,6 +7280,7 @@ impl HvfTaskState {
             }
         }
         let mapping = self
+            .stage2
             .mappings
             .candidates_for_range(GuestVa::new(semantic_start), CowArmedRanges::COMPOUND_SIZE)
             .find(|mapping| {
@@ -7131,7 +7292,7 @@ impl HvfTaskState {
                     && affine_translation_matches(mapping.start, mapping.ipa)
                     && physical_ipa >= mapping.physical_ipa
                     && physical_mapping_end.is_some_and(|limit| physical_end <= limit)
-                    && (!self.persistent_vm_lifecycle
+                    && (!self.stage2.persistent_vm_lifecycle
                         || !is_reusable_global_frame_extent(
                             mapping.physical_ipa,
                             mapping.physical_size as u64,
@@ -7142,7 +7303,7 @@ impl HvfTaskState {
             && let Some(physical_host_addr) = mapped_region_physical_host_addr(mapping)
             && let Ok(offset) = usize::try_from(physical_ipa - mapping.physical_ipa)
         {
-            if self.persistent_vm_lifecycle
+            if self.stage2.persistent_vm_lifecycle
                 && is_reusable_global_frame_extent(
                     mapping.physical_ipa,
                     mapping.physical_size as u64,
@@ -7169,7 +7330,7 @@ impl HvfTaskState {
         // the current COW overlay. Authenticate that physical fact directly:
         // the extent, host address, and owner generation must all match exactly,
         // and the returned source retains both mapping and stage-2 pins.
-        if self.persistent_vm_lifecycle
+        if self.stage2.persistent_vm_lifecycle
             && is_reusable_global_frame_extent(physical_ipa, CowArmedRanges::COMPOUND_SIZE)
         {
             let inventory_owner = {
@@ -7206,7 +7367,9 @@ impl HvfTaskState {
         self.report_physical_cow_source_refusal(custody, semantic_va, ipa);
         None
     }
+}
 
+impl Stage2State {
     /// The instruction-cache authority for one EL0-executable publication of
     /// `[output, output + len)` through this MM's tables (see
     /// `HostArenaResolver::publish_user_executable`), falling back to this
@@ -7234,7 +7397,7 @@ impl HvfTaskState {
     }
 
     pub(crate) fn host_ptr_for_ipa(&self, ipa: u64, len: usize) -> Option<*mut u8> {
-        let mapping = HvfVmState::mapping_for_ipa_range(&self.mappings, ipa, len.max(1))?;
+        let mapping = Stage2State::mapping_for_ipa_range(&self.mappings, ipa, len.max(1))?;
         let offset = usize::try_from(ipa.saturating_sub(mapping.ipa)).ok()?;
         Some(unsafe { mapping.host_addr.add(offset) })
     }
@@ -7254,7 +7417,9 @@ impl HvfTaskState {
             }
         }
     }
+}
 
+impl HvfTaskState {
     pub(crate) fn page_table_resolver<'a>(
         &'a self,
         manager_base: u64,
@@ -7266,7 +7431,9 @@ impl HvfTaskState {
             primary_host,
         }
     }
+}
 
+impl Stage2State {
     pub(crate) fn publish_stage1_extension_arenas(
         &mut self,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
@@ -7312,7 +7479,7 @@ impl HvfTaskState {
         let custody = self.custody_arc();
         let retired_bases = manager.retire_extension_arenas();
         for base in retired_bases {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
+            Stage2State::retire_stage2_extent_from_mappings_in(
                 &custody,
                 &mut self.mappings,
                 base,
@@ -7329,7 +7496,7 @@ impl HvfTaskState {
     /// page's frame in this MM's live stage-1 (see
     /// [`ArmedSpanCandidate::live`]). Call without holding `cow_armed`.
     pub(crate) fn live_cow_span(&self, candidate: ArmedSpanCandidate, va: u64) -> CowArmedSpan {
-        let page_tables = self.page_tables_authority();
+        let page_tables = self.mm_access.page_tables_authority();
         page_tables
             .with_manager(|manager| {
                 candidate.live(va, |page| manager.translate_retained_output(page))
@@ -7348,7 +7515,8 @@ impl HvfTaskState {
             terminal_descriptor_is_fork_cow,
         };
         const PAGE: u64 = CowArmedRanges::PAGE_SIZE;
-        self.page_tables_authority()
+        self.mm_access
+            .page_tables_authority()
             .with_manager(|manager| {
                 let output = |page| {
                     let leaf = terminal_descriptor(manager.debug_walk(page));
@@ -7394,7 +7562,8 @@ impl HvfTaskState {
     }
 
     pub(crate) fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
-        self.page_tables_authority()
+        self.mm_access
+            .page_tables_authority()
             .with_manager(|m| m.translate(va))
             .flatten()
     }
@@ -7567,6 +7736,7 @@ impl HvfTaskState {
             return Some(project(MappingSource::Region(mapping)));
         }
         if !self
+            .mm_access
             .protections
             .legacy()
             .is_none_or(|protections| protections.range_no_access(address, length))
@@ -7578,7 +7748,7 @@ impl HvfTaskState {
     }
 
     pub(crate) fn supersede_cow_receipts_for_cow(&self, va: u64, len: u64) {
-        supersede_cow_receipts_in(&self.cow_deferred_publications, va, len);
+        supersede_cow_receipts_in(&self.mm_access.cow_deferred_publications, va, len);
     }
 
     pub(crate) fn retire_stage2_extent_for_cow(
@@ -7587,7 +7757,7 @@ impl HvfTaskState {
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        HvfVmState::retire_stage2_extent_from_mappings_in(custody, &mut self.mappings, ipa, length)
+        Stage2State::retire_stage2_extent_from_mappings_in(custody, &mut self.mappings, ipa, length)
     }
 }
 

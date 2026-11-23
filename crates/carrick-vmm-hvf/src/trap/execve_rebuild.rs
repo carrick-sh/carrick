@@ -138,9 +138,9 @@ impl PendingExecStage2Cleanup {
                 continue;
             }
             let mut exact_owner_retired = false;
-            if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
+            if Stage2State::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
                 if owner_generation == 0 {
-                    HvfVmState::retire_stage2_extent_from_mappings_in(
+                    Stage2State::retire_stage2_extent_from_mappings_in(
                         custody,
                         &mut self.mappings,
                         ipa,
@@ -1659,9 +1659,9 @@ impl Drop for GlobalFrameOwnerRollback {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl HvfVmState {
+impl Stage2State {
     pub(crate) fn exec_authority_fingerprint(&self) -> ExecAuthorityFingerprint {
-        let inventory = self.frame_inventory.lock();
+        let inventory = self.mm_access.frame_inventory.lock();
         let backend_extents = inventory
             .extents
             .iter()
@@ -1769,7 +1769,9 @@ impl HvfVmState {
             replay_mappings,
         }
     }
+}
 
+impl HvfVmState {
     /// `execve(2)` image replacement. Ordinary VMM tears down and rebuilds the
     /// VM; hvpatch retains its one process-wide VM and replaces only stage-2
     /// mappings plus vCPU architectural state. Clears the alias registry and
@@ -1794,9 +1796,9 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         let custody = self.carrier_vm_custody();
-        let predecessor_mm_root_slot = self.mm_root_slot;
-        let replacement_mm_root_slot = if self.persistent_vm_lifecycle {
-            let successor = self.pending_exec_mm_root_slot.ok_or_else(|| {
+        let predecessor_mm_root_slot = self.task.stage2.mm_root_slot;
+        let replacement_mm_root_slot = if self.task.stage2.persistent_vm_lifecycle {
+            let successor = self.task.stage2.pending_exec_mm_root_slot.ok_or_else(|| {
                 TrapError::Hypervisor(
                     "HVPatch exec began without a fresh root-slot lease".to_owned(),
                 )
@@ -1808,16 +1810,16 @@ impl HvfVmState {
             }
             successor
         } else {
-            self.mm_root_slot.unwrap_or((0, 0))
+            self.task.stage2.mm_root_slot.unwrap_or((0, 0))
         };
-        let replacement_asid = if self.persistent_vm_lifecycle {
-            self.pending_exec_asid.ok_or_else(|| {
+        let replacement_asid = if self.task.stage2.persistent_vm_lifecycle {
+            self.task.stage2.pending_exec_asid.ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch exec began without a fresh ASID lease".to_owned())
             })?
         } else {
             0
         };
-        let mut inventory_reservations = if self.persistent_vm_lifecycle {
+        let mut inventory_reservations = if self.task.stage2.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
             // The replacement transaction is mandatory. The retirement one is
             // absent exactly when the old mm stays owned by a live sharer, so
@@ -1833,8 +1835,8 @@ impl HvfVmState {
         };
         let frame_plan_started = std::time::Instant::now();
         let mut global = Some(self.global_frame_exec_plan(plan)?);
-        self.pending_exec_mm_root_slot = None;
-        self.pending_exec_asid = None;
+        self.task.stage2.pending_exec_mm_root_slot = None;
+        self.task.stage2.pending_exec_asid = None;
         let frame_plan_elapsed_ns = frame_plan_started
             .elapsed()
             .as_nanos()
@@ -1873,7 +1875,7 @@ impl HvfVmState {
         // transaction marks leases mapped. Retain its carrier through transfer
         // into installed ownership; the nonpersistent path keeps unused leases
         // through the same scope as before this extraction.
-        let mut prepared_exec_backing = if self.persistent_vm_lifecycle {
+        let mut prepared_exec_backing = if self.task.stage2.persistent_vm_lifecycle {
             Some(PreparedExecBacking::prepare(
                 std::sync::Arc::clone(&custody),
                 global.take().ok_or_else(|| {
@@ -1923,24 +1925,30 @@ impl HvfVmState {
         // own JSON report to stdout (interleaved with the parent's), making the
         // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
-        let shared_projection = self.shared_process_mm;
+        let shared_projection = self.task.stage2.shared_process_mm;
         let address_space_teardown_started = std::time::Instant::now();
         let mut pending_exec_vcpu = None;
         let mut pending_exec_vm = None;
-        let retired_physical_extents = if self.persistent_vm_lifecycle {
+        let retired_physical_extents = if self.task.stage2.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
             // has already retired. Build the complete predecessor/replacement
             // edge sets before touching stage-2. The switch helper restores the
             // exact predecessor on every ordinary failure, so backend inventory,
             // owners and mapping rows remain unchanged until this succeeds.
-            let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "HVPatch exec retirement has no frame inventory authority".to_owned(),
-                )
-            })?;
+            let authority = self
+                .task
+                .stage2
+                .cow_authority
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec retirement has no frame inventory authority".to_owned(),
+                    )
+                })?;
             let extents =
                 final_exec_physical_extents(&self.frame_inventory.lock(), authority.as_ref())?;
-            let authority_before = self.exec_authority_fingerprint();
+            let authority_before = self.task.stage2.exec_authority_fingerprint();
             let prepared = prepared_exec_backing.take().ok_or_else(|| {
                 TrapError::Hypervisor(
                     "persistent exec lost its prepared physical backing".to_owned(),
@@ -1951,7 +1959,7 @@ impl HvfVmState {
                 Ok(published) => Ok(published),
                 Err(ExecBackingTransactionError::Terminal(failure)) => Err(failure),
                 Err(ExecBackingTransactionError::RolledBack(error)) => {
-                    let authority_after = self.exec_authority_fingerprint();
+                    let authority_after = self.task.stage2.exec_authority_fingerprint();
                     if let Err(rollback_error) =
                         verify_exec_authority_rollback(&authority_before, &authority_after)
                     {
@@ -1967,11 +1975,17 @@ impl HvfVmState {
             published_exec_plan = Some(published.plan);
             published_exec_regions = published.regions;
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
-                let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch exec retirement has no frame inventory authority".to_owned(),
-                    )
-                })?;
+                let authority = self
+                    .task
+                    .stage2
+                    .cow_authority
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "HVPatch exec retirement has no frame inventory authority".to_owned(),
+                        )
+                    })?;
                 let mut inventory = self.frame_inventory.lock();
                 let diagnostic_extents = if cow_refusal_diagnostics_enabled() {
                     inventory
@@ -1983,7 +1997,7 @@ impl HvfVmState {
                     Vec::new()
                 };
                 if let Err(error) =
-                    Self::stage_retirement(&mut inventory, retired, authority.as_ref())
+                    Stage2State::stage_retirement(&mut inventory, retired, authority.as_ref())
                 {
                     carrick_fatal!(
                         "hvpatch::frame_inventory",
@@ -1992,8 +2006,8 @@ impl HvfVmState {
                 }
                 let scope = CowInventoryLifecycleScope {
                     custody: &self.carrier_foreign_mm_transport.custody,
-                    identity: self.cow_identity,
-                    mm_root_slot: self.mm_root_slot,
+                    identity: self.task.stage2.cow_identity,
+                    mm_root_slot: self.task.stage2.mm_root_slot,
                     semantic_va: 0,
                     semantic_length: 0,
                 };
@@ -2057,7 +2071,7 @@ impl HvfVmState {
         // the whole VM; persistent HVPatch removes only physical extents whose
         // final logical references retired above.
         let alias_cleanup_started = std::time::Instant::now();
-        if !self.persistent_vm_lifecycle {
+        if !self.task.stage2.persistent_vm_lifecycle {
             clear_alias_registry();
         }
         emit_replace_stage(
@@ -2065,8 +2079,8 @@ impl HvfVmState {
             alias_cleanup_started,
         );
         let drop_backings_started = std::time::Instant::now();
-        if self.persistent_vm_lifecycle {
-            let predecessor_cow_identity = self.cow_identity.ok_or_else(|| {
+        if self.task.stage2.persistent_vm_lifecycle {
+            let predecessor_cow_identity = self.task.stage2.cow_identity.ok_or_else(|| {
                 TrapError::Hypervisor(
                     "HVPatch exec predecessor cleanup lacks exact COW identity".to_owned(),
                 )
@@ -2098,21 +2112,21 @@ impl HvfVmState {
                 })?;
             let predecessor_aliases = alias_registry()
                 .lock()
-                .process_visible_ordered(predecessor_mm_root_slot, self.container_root)
+                .process_visible_ordered(predecessor_mm_root_slot, self.task.stage2.container_root)
                 .into_iter()
                 .filter(|alias| {
                     alias_is_owned_by_process(
                         alias.ownership_scope,
                         predecessor_mm_root_slot,
-                        self.container_root,
+                        self.task.stage2.container_root,
                     )
                 })
                 .collect::<Vec<_>>();
-            let predecessor_mappings = std::mem::take(&mut self.mappings);
+            let predecessor_mappings = std::mem::take(&mut self.task.stage2.mappings);
             let predecessor_mm_access = if shared_projection {
                 None
             } else {
-                Some(std::sync::Arc::clone(&self.mm_access))
+                Some(std::sync::Arc::clone(&self.task.stage2.mm_access))
             };
             let predecessor_frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
             let predecessor_extents = retired_physical_extents
@@ -2143,6 +2157,8 @@ impl HvfVmState {
                     TrapError,
                 >>()?;
             if self
+                .task
+                .stage2
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
                     #[cfg(not(test))]
@@ -2170,7 +2186,7 @@ impl HvfVmState {
             // Preserve mature VMM's historical leak-until-process-exit discipline:
             // the old VM was raw-destroyed and sibling/alias projections may still
             // carry non-owning pointers into these backings.
-            std::mem::forget(std::mem::take(&mut self.mappings));
+            std::mem::forget(std::mem::take(&mut self.task.stage2.mappings));
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::DropBackings,
@@ -2181,9 +2197,9 @@ impl HvfVmState {
         self.last_fault_esr = 0;
         self.is_forked_child = was_forked_child;
         self.forked_no_exec = false; // execve gives a fresh VM: no longer a live forked-no-exec child
-        self.shared_process_mm = false;
-        self.pending_fork_frame_receipts.clear();
-        self.pending_process_aliases.clear();
+        self.task.stage2.shared_process_mm = false;
+        self.task.stage2.pending_fork_frame_receipts.clear();
+        self.task.stage2.pending_process_aliases.clear();
         // The shared AArch64 engine already builds this editor lazily from the
         // live page-table backing on its first real edit. Keeping an eager
         // manager here cloned the complete 1.8 MiB root-slot table on every exec,
@@ -2191,13 +2207,13 @@ impl HvfVmState {
         // Mailbox publication resolves its static boot mapping directly; an
         // in-process fork below explicitly materializes the manager on demand.
         // The =0 hatch restores the eager clone for schedule-identical ABBA.
-        if self.persistent_vm_lifecycle {
-            self.mm_root_slot = Some(replacement_mm_root_slot);
+        if self.task.stage2.persistent_vm_lifecycle {
+            self.task.stage2.mm_root_slot = Some(replacement_mm_root_slot);
         }
         let exec_page_tables = if lazy_exec_page_tables_enabled() {
             None
         } else {
-            self.mm_root_slot.and_then(|_| {
+            self.task.stage2.mm_root_slot.and_then(|_| {
                 let root = plan.stage1_page_tables_base?;
                 let table = plan
                     .mappings
@@ -2220,7 +2236,7 @@ impl HvfVmState {
         ));
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        self.mm_access = MmAccessState::new(
+        self.task.stage2.mm_access = MmAccessState::new(
             carrick_aarch64::Stage1Authority::new_with_manager(exec_page_tables),
             protections,
             self.frame_inventory.shared_ledger(),
@@ -2233,12 +2249,12 @@ impl HvfVmState {
         // born bound to its own resolver, before the engine adopts it, or a
         // retained resolver would still authenticate the predecessor root and
         // reject the replacement image's live backing.
-        self.seed_readonly_spans_from_plan(plan);
+        self.task.stage2.seed_readonly_spans_from_plan(plan);
         // Mature one-process VMM exec gets a fresh VM-local allocator. A
         // persistent HVPatch worker must retain its executor-local allocator
         // on the owner pthread; `allocate_mailbox_for_vcpu` below gives the
         // replacement task a fresh slot from that same bounded arena.
-        if !self.persistent_vm_lifecycle {
+        if !self.task.stage2.persistent_vm_lifecycle {
             self.mailbox_slots = std::sync::Arc::new(MailboxSlotAllocator::new());
         }
         self.last_syscall_nr = None;
@@ -2252,10 +2268,12 @@ impl HvfVmState {
         // bound their host owners before successor-MM publication. Transfer
         // those regions into the live MM index here. Mature VMM still maps
         // through the historical helper.
-        if self.persistent_vm_lifecycle {
+        if self.task.stage2.persistent_vm_lifecycle {
             for region in published_exec_regions.drain(..) {
                 if let Some(owner) = region.structural_owner.as_ref() {
-                    self.mm_access
+                    self.task
+                        .stage2
+                        .mm_access
                         .install_structural_mapping_authority(
                             Some(replacement_mm_root_slot),
                             std::sync::Arc::clone(owner),
@@ -2267,22 +2285,26 @@ impl HvfVmState {
                             )
                         });
                 }
-                self.mappings.insert(region);
+                self.task.stage2.mappings.insert(region);
             }
         } else {
             for mapping in &plan.mappings {
-                self.mappings
+                self.task
+                    .stage2
+                    .mappings
                     .insert(map_region_raw_in(&custody, mapping, false, false)?);
             }
-            let replayed =
-                replayed_global_frame_owners_for_regions_in(&custody, self.mappings.iter());
+            let replayed = replayed_global_frame_owners_for_regions_in(
+                &custody,
+                self.task.stage2.mappings.iter(),
+            );
             reconcile_global_frame_owners_after_replay_in(&custody, &replayed, false)?;
         }
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
             let staged_inventory_mappings = {
                 let mut inventory = self.frame_inventory.lock();
-                let mut staged_mappings = Vec::with_capacity(self.mappings.len());
-                for region in &self.mappings {
+                let mut staged_mappings = Vec::with_capacity(self.task.stage2.mappings.len());
+                for region in &self.task.stage2.mappings {
                     let stage2_owner = mapped_region_stage2_owner_identity(region)
                         .unwrap_or_else(|| {
                             carrick_fatal!(
@@ -2291,15 +2313,15 @@ impl HvfVmState {
                                 region.physical_ipa
                             )
                         });
-                    let staged = match Self::stage_mapping_in(
+                    let staged = match Stage2State::stage_mapping_in(
                         &custody,
                         &mut inventory,
                         &mut replacement,
                         InventoryMappingStage {
                             gpa: region.physical_ipa,
                             length: region.physical_size as u64,
-                            permissions: Self::region_permissions(region),
-                            backing: Self::private_backing_identity(),
+                            permissions: Stage2State::region_permissions(region),
+                            backing: Stage2State::private_backing_identity(),
                             inherited_frame: None,
                             stage2_lease: None,
                             stage2_owner,
@@ -2322,8 +2344,8 @@ impl HvfVmState {
             let retired_commit = retired.map(|retired| retired.commit(()));
             let fallback_replacement_commit = if self.registration.is_some() {
                 let replacement_challenge = replacement_commit.receipt_challenge();
-                let owner_hosts =
-                    collect_carrier_stage2_owner_hosts(self.mappings.iter().map(|mapping| {
+                let owner_hosts = collect_carrier_stage2_owner_hosts(
+                    self.task.stage2.mappings.iter().map(|mapping| {
                         let owner =
                             mapped_region_stage2_owner_identity(mapping).unwrap_or_else(|| {
                                 carrick_fatal!(
@@ -2335,15 +2357,16 @@ impl HvfVmState {
                             (mapping.physical_ipa, mapping.physical_size as u64),
                             owner.host_addr,
                         )
-                    }))
-                    .unwrap_or_else(|error| {
-                        carrick_fatal!(
-                            "hvpatch::frame_inventory",
-                            "collect exec carrier lease owners: {error}"
-                        )
-                    });
+                    }),
+                )
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "collect exec carrier lease owners: {error}"
+                    )
+                });
                 let mut stage2_leases = Vec::new();
-                for region in &mut self.mappings {
+                for region in &mut self.task.stage2.mappings {
                     if let Some(stage2_lease) = region.stage2_lease.take() {
                         stage2_leases.push(stage2_lease);
                     }
@@ -2360,6 +2383,8 @@ impl HvfVmState {
                             )
                         });
                 let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
+                    .task
+                    .stage2
                     .mappings
                     .iter()
                     .map(|mapping| HvpatchTaskMappingState {
@@ -2400,7 +2425,7 @@ impl HvfVmState {
                     )),
                     mm_root_slot: Some(replacement_mm_root_slot),
                     mm_root_stage2: parking_lot::Mutex::new(None),
-                    container_root: self.container_root,
+                    container_root: self.task.stage2.container_root,
                     inventory: parking_lot::Mutex::new(new_authority),
                     kernel_mm: parking_lot::Mutex::new(None),
                     cow_armed: Some(std::sync::Arc::clone(&self.cow_armed)),
@@ -2408,7 +2433,7 @@ impl HvfVmState {
                         &self.cow_deferred_publications,
                     )),
                     mm_access: parking_lot::Mutex::new(Some(std::sync::Arc::clone(
-                        &self.mm_access,
+                        &self.task.stage2.mm_access,
                     ))),
                     pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
                     pending_receipts: parking_lot::Mutex::new(Vec::new()),

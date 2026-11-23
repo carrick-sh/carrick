@@ -31,11 +31,11 @@ fn translation_after_hole(reusable: bool, retained: bool) {
     assert_eq!(is_reusable_global_frame_extent(ipa, 1), reusable);
     let mut row = mapped_region(VA, VA + LEN as u64, ipa);
     row.host_addr = backing.ptr;
-    task.mappings.insert(row);
+    task.stage2.mappings.insert(row);
     let q = 0x3000_0000;
     let mut row = mapped_region(VA + PAGE as u64, VA + 2 * PAGE as u64, q);
     row.host_addr = translated.ptr;
-    task.mappings.insert(row);
+    task.stage2.mappings.insert(row);
     let mut pt = tables();
     assert_eq!(pt.translate(VA), None);
     assert_eq!(pt.translate_retained_output(VA), None);
@@ -100,10 +100,10 @@ fn retained_interior_pages_republish_lifetime_edges() {
         2 * 1024 * 1024,
     );
     let mut task = HvfTaskState::neutral();
-    task.mm_root_slot = Some(root);
+    task.stage2.mm_root_slot = Some(root);
     let mut row = mapped_region(VA, VA + LEN as u64, ipa);
     row.host_addr = backing.ptr;
-    task.mappings.insert(row);
+    task.stage2.mappings.insert(row);
     let prefix = AliasBacking {
         start: VA,
         ipa,
@@ -204,14 +204,17 @@ impl HvfVmState {
         {
             eprintln!(
                 "[FORKDBG pid={:?}] zero_guest_backing va={address:#x} len={length:#x}\n{}",
-                self.cow_identity.map(|identity| identity.linux_pid),
+                self.task
+                    .stage2
+                    .cow_identity
+                    .map(|identity| identity.linux_pid),
                 std::backtrace::Backtrace::force_capture(),
             );
         }
         let mut cleared = 0usize;
         let mut active_run: Option<ScrubRun> = None;
         while cleared < length {
-            let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
+            let (chunk_va, chunk_len) = Stage2State::guest_copy_chunk(address, cleared, length)?;
             // munmap invalidates the leaf but intentionally preserves its PA.
             // Backing maintenance runs before the replacement VMA is made
             // guest-visible, so an ordinary hardware-valid translation cannot
@@ -234,8 +237,8 @@ impl HvfVmState {
                     chunk_va,
                     ipa,
                     chunk_len,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                 )
             });
             // WRITE TARGETS ARE STAGE-1-AUTHENTICATED, PERIOD. This used to
@@ -258,11 +261,13 @@ impl HvfVmState {
             // hand, `mapping_for_live_ipa_range` demands VA/IPA consistency
             // plus a live authenticated owner, so the write can only land in
             // this mm's own backing.
-            let live_ipa = self.translate_va(chunk_va);
+            let live_ipa = self.task.stage2.translate_va(chunk_va);
             let ipa = live_ipa.or(retained_ipa);
             let chunk_resolved = ipa
                 .and_then(|ipa| {
-                    self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
+                    self.task
+                        .stage2
+                        .mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
                         .and_then(|mapping| {
                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
                             let target = unsafe { mapping.host_addr.add(offset) };
@@ -317,7 +322,10 @@ impl HvfVmState {
                 eprintln!(
                     "[SCRUBDBG pid={:?}] chunk va={chunk_va:#x}+{chunk_len:#x} live_ipa={live_ipa:x?} \
                      retained_ipa={retained_ipa:x?} target={:?}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
+                    self.task
+                        .stage2
+                        .cow_identity
+                        .map(|identity| identity.linux_pid),
                     chunk_resolved.map(|(target, _)| target),
                 );
             }
@@ -376,10 +384,10 @@ fn enumerated_layouts_match_pre_batch_page_reference() {
         let mut task = HvfTaskState::neutral();
         let mut a = mapped_region(VA, VA + LEN as u64, 0x2000_0000);
         a.host_addr = first.ptr;
-        task.mappings.insert(a);
+        task.stage2.mappings.insert(a);
         let mut b = mapped_region(VA + PAGE as u64, VA + LEN as u64, 0x3000_0000 + PAGE as u64);
         b.host_addr = unsafe { second.ptr.add(PAGE) };
-        task.mappings.insert(b);
+        task.stage2.mappings.insert(b);
         let mut pt = tables();
         for page in 0..4 {
             let state = (layout >> (2 * page)) & 3;

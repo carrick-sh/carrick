@@ -429,7 +429,7 @@ impl GuestAliasContext<'_> {
             );
         }
         if let Err(rollback) =
-            HvfVmState::rollback_unpublished_mappings(&mut self.ledger.lock(), staged)
+            Stage2State::rollback_unpublished_mappings(&mut self.ledger.lock(), staged)
         {
             carrick_fatal!(
                 "hvpatch::alias",

@@ -394,17 +394,6 @@ impl GuestMappingPlan {
 }
 
 impl HvfVmState {
-    pub(crate) fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
-        for span in &plan.ro_spans {
-            let Ok(len) = usize::try_from(span.len) else {
-                continue;
-            };
-            if let Some(protections) = self.protections.legacy() {
-                protections.set_no_write(span.start, len, true);
-            }
-        }
-    }
-
     /// Boot a container root: create the carrier VM (first root) or reuse the
     /// live one (later roots), map the guest address space, and stage the
     /// root's first-instruction registers as data. No vCPU is created: every
@@ -550,27 +539,38 @@ impl HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm.into_inner()),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
-                #[cfg(not(test))]
-                custody,
-                mappings: TaskMappingIndex::new(),
-                mm_root_slot: None,
-                container_root: ContainerRootToken::next(),
-                pending_exec_mm_root_slot: None,
-                pending_exec_asid: None,
-                pending_exec_predecessor_identity: None,
-                pending_exec_stage2_cleanup: None,
-                shared_process_mm: false,
-                mm_access: MmAccessState::new(
-                    carrick_aarch64::Stage1Authority::new(),
-                    carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
-                        MemoryProtections::default(),
-                    )),
-                    std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
-                    std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
-                    std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    root_host_cow_stats,
-                    super::foreign_mm::LiveBacking::deferred(root_custody),
-                ),
+                stage2: Stage2State {
+                    #[cfg(not(test))]
+                    custody,
+                    mappings: TaskMappingIndex::new(),
+                    mm_root_slot: None,
+                    container_root: ContainerRootToken::next(),
+                    pending_exec_mm_root_slot: None,
+                    pending_exec_asid: None,
+                    pending_exec_predecessor_identity: None,
+                    pending_exec_stage2_cleanup: None,
+                    shared_process_mm: false,
+                    mm_access: MmAccessState::new(
+                        carrick_aarch64::Stage1Authority::new(),
+                        carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                            MemoryProtections::default(),
+                        )),
+                        std::sync::Arc::new(parking_lot::Mutex::new(
+                            HvpatchFrameInventory::default(),
+                        )),
+                        std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                        root_host_cow_stats,
+                        super::foreign_mm::LiveBacking::deferred(root_custody),
+                    ),
+                    persistent_vm_lifecycle: false,
+                    cow_authority: None,
+                    cow_identity: None,
+                    pending_fork_frame_receipts: Vec::new(),
+                    pending_process_aliases: Vec::new(),
+                    fail_next_begin_exec_inventory: false,
+                    cow_rollback_scratch: None,
+                },
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -578,13 +578,6 @@ impl HvfVmState {
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
                 live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
-                persistent_vm_lifecycle: false,
-                cow_authority: None,
-                cow_identity: None,
-                pending_fork_frame_receipts: Vec::new(),
-                pending_process_aliases: Vec::new(),
-                fail_next_begin_exec_inventory: false,
-                cow_rollback_scratch: None,
                 registration: None,
             },
             carrier_mappings,
@@ -595,7 +588,7 @@ impl HvfVmState {
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
-        state.seed_readonly_spans_from_plan(plan);
+        state.task.stage2.seed_readonly_spans_from_plan(plan);
 
         // Reuse lane: map the relocated image with owning stage-2 leases (the
         // exec placement); first-boot lane: the identity `map_region_raw`
@@ -644,12 +637,16 @@ impl HvfVmState {
                         None,
                     )?;
                     if let Some(owner) = region.structural_owner.as_ref() {
-                        state.mm_access.install_structural_mapping_authority(
-                            None,
-                            std::sync::Arc::clone(owner),
-                        )?;
+                        state
+                            .task
+                            .stage2
+                            .mm_access
+                            .install_structural_mapping_authority(
+                                None,
+                                std::sync::Arc::clone(owner),
+                            )?;
                     }
-                    state.mappings.insert(region);
+                    state.task.stage2.mappings.insert(region);
                 }
                 if !stage2_leases.is_empty() {
                     return Err(TrapError::Hypervisor(format!(
@@ -685,12 +682,16 @@ impl HvfVmState {
                     // exec. Publish that ownership to the MM before any guest
                     // fault needs the executor-independent table resolver.
                     if let Some(owner) = region.structural_owner.as_ref() {
-                        state.mm_access.install_structural_mapping_authority(
-                            None,
-                            std::sync::Arc::clone(owner),
-                        )?;
+                        state
+                            .task
+                            .stage2
+                            .mm_access
+                            .install_structural_mapping_authority(
+                                None,
+                                std::sync::Arc::clone(owner),
+                            )?;
                     }
-                    state.mappings.insert(region);
+                    state.task.stage2.mappings.insert(region);
                 }
                 plan
             }
@@ -698,7 +699,7 @@ impl HvfVmState {
         if carrier.is_none() {
             let replayed = replayed_global_frame_owners_for_regions_in(
                 &state.carrier_foreign_mm_transport.custody,
-                state.mappings.iter(),
+                state.task.stage2.mappings.iter(),
             );
             reconcile_global_frame_owners_after_replay_in(
                 &state.carrier_foreign_mm_transport.custody,
@@ -726,5 +727,18 @@ impl HvfVmState {
         // admitted only against committed backing owners.
         state.populate_vdso_data_page();
         Ok((state, staged))
+    }
+}
+
+impl Stage2State {
+    pub(crate) fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
+        for span in &plan.ro_spans {
+            let Ok(len) = usize::try_from(span.len) else {
+                continue;
+            };
+            if let Some(protections) = self.mm_access.protections.legacy() {
+                protections.set_no_write(span.start, len, true);
+            }
+        }
     }
 }

@@ -354,7 +354,7 @@ fn staged_alias(log: &Arc<parking_lot::Mutex<Vec<String>>>, length: u64, mm: u64
         ))],
     );
     let mut inventory = HvpatchFrameInventory::default();
-    let extent = HvfVmState::stage_mapping_in(
+    let extent = Stage2State::stage_mapping_in(
         &custody,
         &mut inventory,
         &mut reservation,
@@ -366,7 +366,7 @@ fn staged_alias(log: &Arc<parking_lot::Mutex<Vec<String>>>, length: u64, mm: u64
                 write: true,
                 exec: true,
             },
-            backing: HvfVmState::private_backing_identity(),
+            backing: Stage2State::private_backing_identity(),
             inherited_frame: None,
             stage2_lease: None,
             stage2_owner: InventoryStage2OwnerIdentity {

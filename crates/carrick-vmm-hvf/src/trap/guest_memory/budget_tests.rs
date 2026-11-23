@@ -81,7 +81,7 @@ fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
     let mmap = MmapBuffer::new(total_size);
     let mut region = mapped_region(HEAP_START, HEAP_START + total_size as u64, HEAP_START);
     region.host_addr = mmap.ptr;
-    task.mappings.insert(region);
+    task.stage2.mappings.insert(region);
     let mut vm = test_vm_state(task);
     for pages in [1, 16, LARGE_PAGES] {
         unsafe {
@@ -141,7 +141,7 @@ fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
 
     let mut region1 = mapped_region(HEAP_START, HEAP_START + extent1_len as u64, HEAP_START);
     region1.host_addr = host1;
-    task.mappings.insert(region1);
+    task.stage2.mappings.insert(region1);
 
     let region2_start = HEAP_START + extent1_len as u64;
     let mut region2 = mapped_region(
@@ -150,8 +150,11 @@ fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
         region2_start,
     );
     region2.host_addr = host2;
-    task.mappings.insert(region2);
-    assert_eq!(task.mappings.len(), if gap_pages == 0 { 1 } else { 2 });
+    task.stage2.mappings.insert(region2);
+    assert_eq!(
+        task.stage2.mappings.len(),
+        if gap_pages == 0 { 1 } else { 2 }
+    );
 
     let mut vm = test_vm_state(task);
 
@@ -200,7 +203,7 @@ fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
     let mmap = MmapBuffer::new(total_size);
     let mut region = mapped_region(HEAP_START, HEAP_START + total_size as u64, HEAP_START);
     region.host_addr = mmap.ptr;
-    task.mappings.insert(region);
+    task.stage2.mappings.insert(region);
 
     let mut vm = test_vm_state(task);
 
@@ -253,7 +256,7 @@ fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
 
     let mut region1 = mapped_region(HEAP_START, HEAP_START + extent1_len as u64, HEAP_START);
     region1.host_addr = mmap1.ptr;
-    task.mappings.insert(region1);
+    task.stage2.mappings.insert(region1);
 
     let region2_start = HEAP_START + extent1_len as u64 + hole_len as u64;
     let mut region2 = mapped_region(
@@ -262,7 +265,7 @@ fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
         region2_start,
     );
     region2.host_addr = mmap2.ptr;
-    task.mappings.insert(region2);
+    task.stage2.mappings.insert(region2);
 
     let mut vm = test_vm_state(task);
 

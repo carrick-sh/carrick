@@ -2596,7 +2596,7 @@ pub(crate) fn perform_foreign_cow_transaction(
             .ledger
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        HvfVmState::cow_inventory_split_shape(
+        Stage2State::cow_inventory_split_shape(
             &inventory,
             old_physical_ipa,
             retain_old_compound,
@@ -2702,8 +2702,8 @@ pub(crate) fn perform_foreign_cow_transaction(
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
     owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
     foreign_cow_failpoint(&lease.state, 2)?;
-    let backing = HvfVmState::private_backing_identity();
-    let split = match HvfVmState::stage_cow_inventory_split(
+    let backing = Stage2State::private_backing_identity();
+    let split = match Stage2State::stage_cow_inventory_split(
         &mut reservation,
         old_key,
         old,
@@ -2809,10 +2809,10 @@ pub(crate) fn perform_foreign_cow_transaction(
         || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
         |tables| {
             rollback = Some(
-                HvfVmState::rollback_pre_image(&mut recycled, tables.manager)
+                Stage2State::rollback_pre_image(&mut recycled, tables.manager)
                     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
             );
-            HvfVmState::refresh_stage1_exclusivity(tables.manager);
+            Stage2State::refresh_stage1_exclusivity(tables.manager);
             tables
                 .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
                 .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
@@ -3233,7 +3233,7 @@ fn perform_foreign_guest_cow(
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
     owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
     foreign_cow_failpoint(&lease.state, 2)?;
-    let backing = HvfVmState::private_backing_identity();
+    let backing = Stage2State::private_backing_identity();
     let stage2_owner = InventoryStage2OwnerIdentity {
         host_addr: new_host_ptr as usize,
         generation: owner_generation,
@@ -3260,7 +3260,7 @@ fn perform_foreign_guest_cow(
         owner_rollback,
     )
     .map_err(|_| Error::MutationFailed)?;
-    let split = HvfVmState::stage_cow_inventory_split(
+    let split = Stage2State::stage_cow_inventory_split(
         &mut reservation,
         old_key,
         old,
@@ -3491,8 +3491,8 @@ fn finish_foreign_cow_publication(
     let host_resolved = owner_rollback.is_some();
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
+        Stage2State::commit_cow_inventory_split(&mut inventory, &split, || {
+            Stage2State::retire_stage2_extent_from_mappings_in(
                 &lease.custody,
                 &mut TaskMappingIndex::new(),
                 split.old.stage2_base,

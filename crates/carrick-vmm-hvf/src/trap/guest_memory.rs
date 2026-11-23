@@ -215,7 +215,9 @@ mod guest_copy_mapping_tests {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     pub(crate) fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
-        if let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, gpa, len.max(1)) {
+        if let Some(mapping) =
+            Stage2State::mapping_for_ipa_range(&self.task.stage2.mappings, gpa, len.max(1))
+        {
             let offset = (gpa.wrapping_sub(mapping.ipa)) as usize;
             return Some(unsafe { mapping.host_addr.add(offset) });
         }
@@ -310,11 +312,15 @@ impl HvfVmState {
         let custody = self.carrier_vm_custody();
         let mut copied = 0usize;
         while copied < length {
-            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (chunk_address, chunk_len) =
+                Stage2State::guest_copy_chunk(address, copied, length)?;
             // For a `repoint_private` overlay VA the region+offset are keyed on the
             // translated overlay IPA, not the VA (see `syscall_buffer_lookup_addr`).
             // Identity otherwise — no walk. PROT_NONE was already gated on the VA.
-            let translated_lookup = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let translated_lookup = self
+                .task
+                .stage2
+                .syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let view = {
                 // Private-overlay descriptors are keyed by their translated
                 // IPA, while a boot brk descriptor remains keyed by Linux VA
@@ -337,7 +343,7 @@ impl HvfVmState {
                         )
                     });
                 let Some((_lookup_address, copied_view)) = resolved else {
-                    if let Some(state) = self.deferred_anonymous_state() {
+                    if let Some(state) = self.task.stage2.deferred_anonymous_state() {
                         let chunk = &mut dst[copied..copied + chunk_len];
                         if state
                             .copy_pristine_zero(
@@ -368,22 +374,28 @@ impl HvfVmState {
                     // output—not that shortcut—to join a descriptorless exec
                     // heap to the current global-frame owner.
                     let stage1_lookup = self
+                        .task
+                        .stage2
                         .translate_va(chunk_address)
                         .unwrap_or(translated_lookup);
                     let Some((mapping_start, mapping_end)) = copy_from_global_frame_owner_in(
-                        self.custody(),
+                        self.task.stage2.custody(),
                         stage1_lookup,
                         &mut dst[copied..copied + chunk_len],
                     ) else {
-                        let stage1 = self.translate_va(chunk_address);
+                        let stage1 = self.task.stage2.translate_va(chunk_address);
                         let semantic_mapping = self
+                            .task
+                            .stage2
                             .mappings
                             .iter()
                             .any(|mapping| mapping.contains_range(chunk_address, chunk_len));
                         let stage1_mapping = stage1.is_some_and(|ipa| {
-                            self.mappings
+                            self.task
+                                .stage2
+                                .mappings
                                 .iter()
-                                .any(|mapping| Self::region_owns_ipa(mapping, ipa))
+                                .any(|mapping| Stage2State::region_owns_ipa(mapping, ipa))
                         });
                         if absent_is_zero
                             && stage1.is_none()
@@ -402,14 +414,20 @@ impl HvfVmState {
                             copied += chunk_len;
                             continue;
                         }
-                        let owner_count = self.custody().global_frame_host_owners.lock().len();
+                        let owner_count = self
+                            .task
+                            .stage2
+                            .custody()
+                            .global_frame_host_owners
+                            .lock()
+                            .len();
                         return Err(MemoryError::HostMap(format!(
                             "live core read has no current backing: va=0x{chunk_address:x} len={chunk_len} hot_lookup=0x{translated_lookup:x} stage1={stage1:x?} mappings={} semantic_mapping={semantic_mapping} stage1_mapping={stage1_mapping} global_owners={owner_count} persistent={}",
-                            self.mappings.len(),
-                            self.persistent_vm_lifecycle
+                            self.task.stage2.mappings.len(),
+                            self.task.stage2.persistent_vm_lifecycle
                         )));
                     };
-                    self.emit_guest_mem_copy_decision(
+                    self.task.stage2.emit_guest_mem_copy_decision(
                         crate::probes::guest_mem_dir::READ_GUEST,
                         chunk_address,
                         chunk_len,
@@ -422,7 +440,7 @@ impl HvfVmState {
                 };
                 copied_view?
             };
-            self.emit_guest_mem_copy_decision(
+            self.task.stage2.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::READ_GUEST,
                 chunk_address,
                 chunk_len,
@@ -439,7 +457,9 @@ impl HvfVmState {
         );
         Ok(())
     }
+}
 
+impl Stage2State {
     /// Host VA of `backing_gpa` iff it lives in a host-`MAP_SHARED` guest region
     /// (the boot-mapped shared aperture; shared across carrick processes via
     /// the inherited MAP_SHARED backing). Used to back a cross-process futex
@@ -514,7 +534,9 @@ impl HvfVmState {
             persistent_vm_lifecycle,
         )
     }
+}
 
+impl HvfVmState {
     pub(crate) fn write_guest_bytes(
         &mut self,
         address: u64,
@@ -529,19 +551,23 @@ impl HvfVmState {
         self.validate_guest_write_range(address, length, false)?;
         let mut copied = 0usize;
         while copied < length {
-            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (chunk_address, chunk_len) =
+                Stage2State::guest_copy_chunk(address, copied, length)?;
             // See `read_guest_bytes_into`: a `repoint_private` overlay VA resolves
             // its region+offset via the translated overlay IPA, so a syscall write
             // lands in the PRIVATE overlay backing the guest reads, not the shared
             // aperture. Identity otherwise; PROT_NONE already gated on the VA.
-            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let lookup_address = self
+                .task
+                .stage2
+                .syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let mapping = self.task.copy_guest_mapping_in(
                 &self.carrier_vm_custody(),
                 lookup_address,
                 chunk_address,
                 &bytes[copied..copied + chunk_len],
             )?;
-            self.emit_guest_mem_copy_decision(
+            self.task.stage2.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::WRITE_GUEST,
                 chunk_address,
                 chunk_len,
@@ -568,8 +594,12 @@ impl HvfVmState {
         let mut checked = 0usize;
         let mut first: Option<(u64, u64, u64, usize, u64, *mut u8)> = None;
         while checked < length {
-            let (chunk_va, chunk_len) = Self::guest_copy_chunk(stripped, checked, length).ok()?;
-            let lookup = self.syscall_buffer_lookup_addr(chunk_va, chunk_len);
+            let (chunk_va, chunk_len) =
+                Stage2State::guest_copy_chunk(stripped, checked, length).ok()?;
+            let lookup = self
+                .task
+                .stage2
+                .syscall_buffer_lookup_addr(chunk_va, chunk_len);
             let mapping = self.mapping_for_range(lookup, chunk_len)?;
             let mapping_offset = lookup.checked_sub(mapping.start)?;
             let physical = mapping.ipa.checked_add(mapping_offset)?;
@@ -611,7 +641,7 @@ impl HvfVmState {
         address: u64,
         length: usize,
     ) -> Option<carrick_guest_mem::HostRead> {
-        if length == 0 || self.range_no_access(address, length) {
+        if length == 0 || self.task.stage2.range_no_access(address, length) {
             return None;
         }
         let custody = self.carrier_vm_custody();
@@ -625,7 +655,7 @@ impl HvfVmState {
     /// written by the kernel through a raw host pointer. See
     /// `GuestMemory::host_ptr_for_write`.
     pub(crate) fn host_ptr_for_write(&mut self, address: u64, length: usize) -> Option<*mut u8> {
-        if length == 0 || self.range_no_access(address, length) {
+        if length == 0 || self.task.stage2.range_no_access(address, length) {
             return None;
         }
         let stripped = strip_pointer_tag(address);
@@ -660,7 +690,7 @@ impl HvfVmState {
         }
         let before = crate::trap::cow_engine::MmMaintenanceVisits::read();
         let outcome = self.zero_guest_backing_targets(address, length);
-        self.emit_mm_maintenance_census(
+        self.task.stage2.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::ScrubTargets,
             address,
             length,
@@ -691,7 +721,10 @@ impl HvfVmState {
         {
             eprintln!(
                 "[FORKDBG pid={:?}] zero_guest_backing va={address:#x} len={length:#x}\n{}",
-                self.cow_identity.map(|identity| identity.linux_pid),
+                self.task
+                    .stage2
+                    .cow_identity
+                    .map(|identity| identity.linux_pid),
                 std::backtrace::Backtrace::force_capture(),
             );
         }
@@ -704,7 +737,7 @@ impl HvfVmState {
         // final writes are batched. See kernel.mm.backing-maintenance-lookup.
         let page_tables = self.page_tables_authority();
         while cleared < length {
-            let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
+            let (chunk_va, chunk_len) = Stage2State::guest_copy_chunk(address, cleared, length)?;
             // munmap invalidates the leaf but intentionally preserves its PA.
             // Backing maintenance runs before the replacement VMA is made
             // guest-visible, so an ordinary hardware-valid translation cannot
@@ -731,8 +764,8 @@ impl HvfVmState {
                     chunk_va,
                     ipa,
                     chunk_len,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.task.stage2.mm_root_slot,
+                    self.task.stage2.container_root,
                 )
             });
             // WRITE TARGETS ARE STAGE-1-AUTHENTICATED, PERIOD. This used to
@@ -755,7 +788,9 @@ impl HvfVmState {
             let mut selected_mapping = None;
             let chunk_resolved = ipa
                 .and_then(|ipa| {
-                    self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
+                    self.task
+                        .stage2
+                        .mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
                         .and_then(|mapping| {
                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
                             selected_mapping =
@@ -818,7 +853,10 @@ impl HvfVmState {
                 eprintln!(
                     "[SCRUBDBG pid={:?}] chunk va={chunk_va:#x}+{chunk_len:#x} live_ipa={live_ipa:x?} \
                      retained_ipa={retained_ipa:x?} target={:?}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
+                    self.task
+                        .stage2
+                        .cow_identity
+                        .map(|identity| identity.linux_pid),
                     chunk_resolved.map(|(target, _)| target),
                 );
             }
@@ -903,17 +941,21 @@ impl HvfVmState {
         self.validate_guest_write_range(address, length, true)?;
         let mut copied = 0usize;
         while copied < length {
-            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (chunk_address, chunk_len) =
+                Stage2State::guest_copy_chunk(address, copied, length)?;
             // `repoint_private` overlay VAs resolve region+offset via the translated
             // overlay IPA (see `syscall_buffer_lookup_addr`); identity otherwise.
-            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let lookup_address = self
+                .task
+                .stage2
+                .syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let mapping = self.task.copy_guest_mapping_in(
                 &self.carrier_vm_custody(),
                 lookup_address,
                 lookup_address,
                 &bytes[copied..copied + chunk_len],
             )?;
-            self.emit_guest_mem_copy_decision(
+            self.task.stage2.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::WRITE_GUEST_CHECKED,
                 chunk_address,
                 chunk_len,
@@ -958,11 +1000,15 @@ impl HvfVmState {
         })?;
         let mut checked = 0usize;
         while checked < length {
-            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, checked, length)?;
+            let (chunk_address, chunk_len) =
+                Stage2State::guest_copy_chunk(address, checked, length)?;
             // The writability check follows the same region a `repoint_private`
             // overlay VA's copy will hit (the translated overlay IPA), so the
             // overlay's guest_writable flag — not the stale shared region's — gates.
-            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let lookup_address = self
+                .task
+                .stage2
+                .syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let mapping = self.mapping_for_range(lookup_address, chunk_len);
             let mapping = if let Some(mapping) = mapping {
                 mapping
@@ -975,12 +1021,16 @@ impl HvfVmState {
                 // writes still materialize and authenticate their physical owner.
                 // If publication won while the initial lookup ran, the pristine
                 // lock serializes us behind its complete mapping publication.
-                let deferred = self.deferred_anonymous_state();
+                let deferred = self.task.stage2.deferred_anonymous_state();
                 match resolve_missing_mapping_after_pristine_handoff(
                     deferred.as_deref(),
                     carrick_guest_mem::GuestVa::new(chunk_address),
                     chunk_len,
-                    || self.syscall_buffer_lookup_addr(chunk_address, chunk_len),
+                    || {
+                        self.task
+                            .stage2
+                            .syscall_buffer_lookup_addr(chunk_address, chunk_len)
+                    },
                     |published_lookup| self.mapping_for_range(published_lookup, chunk_len),
                 ) {
                     MissingMappingResolution::Pristine => {
@@ -1046,11 +1096,18 @@ impl HvfVmState {
                     |protections| protections.range_write_denied(chunk_address, chunk_len)
                 ),
                 self.mapping_for_range(lookup_address, chunk_len).is_some(),
-                self.deferred_anonymous_state().is_some_and(|state| state
-                    .covers_pristine(carrick_guest_mem::GuestVa::new(chunk_address), chunk_len)),
+                self.task
+                    .stage2
+                    .deferred_anonymous_state()
+                    .is_some_and(|state| state.covers_pristine(
+                        carrick_guest_mem::GuestVa::new(chunk_address),
+                        chunk_len
+                    )),
             ),
         );
         if let Some(region) = self
+            .task
+            .stage2
             .mappings
             .iter()
             .find(|m| m.start <= lookup_address && lookup_address < m.end)
@@ -1072,7 +1129,9 @@ impl HvfVmState {
             );
         }
     }
+}
 
+impl Stage2State {
     pub(crate) fn guest_copy_chunk(
         address: u64,
         offset: usize,
@@ -1244,6 +1303,7 @@ impl HvfTaskState {
             length: bytes.len(),
         };
         let write = self
+            .stage2
             .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
                 source.begin_access(
                     super::host_writes::HostAccess::Write,
@@ -1276,8 +1336,11 @@ impl HvfTaskState {
         copy_address: u64,
         dst: &mut [u8],
     ) -> Option<Result<MappingView, MemoryError>> {
-        let read =
-            self.with_mapping_for_range_in(custody, lookup_address, dst.len(), |source| {
+        let read = self.stage2.with_mapping_for_range_in(
+            custody,
+            lookup_address,
+            dst.len(),
+            |source| {
                 source.begin_access(
                     super::host_writes::HostAccess::Read,
                     self,
@@ -1286,7 +1349,8 @@ impl HvfTaskState {
                     dst.len(),
                     None,
                 )
-            })?;
+            },
+        )?;
         Some(read.map(|read| {
             // SAFETY: the selected live mapping contains this complete fragment
             // and its exact owner stays pinned until `read` drops.

@@ -1636,12 +1636,12 @@ mod alias_registry_tests {
         alias_registry().lock().push(alias);
 
         let mut child_task = super::HvfTaskState::neutral();
-        child_task.container_root = container_1;
-        child_task.mm_root_slot = Some(child_root_slot);
+        child_task.stage2.container_root = container_1;
+        child_task.stage2.mm_root_slot = Some(child_root_slot);
         // This test isolates container/mm alias visibility. Persistent HVPatch
         // sources additionally require an exact live owner pin; dedicated
         // custody tests above cover that production contract.
-        child_task.persistent_vm_lifecycle = false;
+        child_task.stage2.persistent_vm_lifecycle = false;
 
         let source = child_task.physical_cow_source(mmap_va, mmap_ipa);
         assert!(
@@ -1663,7 +1663,7 @@ mod alias_registry_tests {
         let physical_host = physical.as_ptr() as *mut u8;
         let semantic_host = physical_host.wrapping_add(0x1000);
         let mut task = super::HvfTaskState::neutral();
-        task.mappings.insert(HvfMappedRegion {
+        task.stage2.mappings.insert(HvfMappedRegion {
             start: semantic_va,
             ipa: semantic_ipa,
             physical_ipa,

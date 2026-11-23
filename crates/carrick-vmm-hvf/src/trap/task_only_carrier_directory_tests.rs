@@ -118,20 +118,21 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
     let length = 0x4000;
     let calls = Arc::new(AtomicUsize::new(0));
     let mut task = HvfTaskState::neutral();
-    task.cow_authority = Some(Arc::new(LiveForkReceiptAuthority {
+    task.stage2.cow_authority = Some(Arc::new(LiveForkReceiptAuthority {
         calls: Arc::clone(&calls),
         mapping,
         frame,
         ipa,
         length,
     }));
-    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+    task.stage2.cow_identity = Some(carrick_hal::FrameCowIdentity {
         linux_pid: 123,
         linux_tid: 124,
         mm: 9,
         asid: 7,
     });
-    task.pending_fork_frame_receipts
+    task.stage2
+        .pending_fork_frame_receipts
         .push(PendingForkFrameReceipt {
             transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
                 std::num::NonZeroU64::new(101).unwrap(),
@@ -145,11 +146,13 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
         });
 
     let mut events = Vec::new();
-    task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
-    task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+    task.stage2
+        .publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+    task.stage2
+        .publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(task.pending_fork_frame_receipts.is_empty());
+    assert!(task.stage2.pending_fork_frame_receipts.is_empty());
     assert_eq!(
         events,
         vec![
@@ -178,11 +181,12 @@ fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
     let mut task = HvfTaskState::neutral();
     let mut events = Vec::new();
 
-    task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+    task.stage2
+        .publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
 
     assert!(events.is_empty());
-    assert!(task.cow_authority.is_none());
-    assert!(task.cow_identity.is_none());
+    assert!(task.stage2.cow_authority.is_none());
+    assert!(task.stage2.cow_identity.is_none());
 }
 
 #[test]
@@ -275,14 +279,16 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
         )
         .unwrap();
 
-    assert_eq!(runtime.pending_fork_frame_receipts.len(), 1);
+    assert_eq!(runtime.stage2.pending_fork_frame_receipts.len(), 1);
     assert_eq!(task_mm.pending_receipts.lock().len(), 1);
     let mut events = Vec::new();
-    runtime.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+    runtime
+        .stage2
+        .publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(events.len(), 1);
-    assert!(runtime.pending_fork_frame_receipts.is_empty());
+    assert!(runtime.stage2.pending_fork_frame_receipts.is_empty());
     assert_eq!(
         task_mm.pending_receipts.lock().len(),
         1,
@@ -300,7 +306,7 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
         )
         .unwrap();
     assert!(
-        reloaded.pending_fork_frame_receipts.is_empty(),
+        reloaded.stage2.pending_fork_frame_receipts.is_empty(),
         "an executor reload must not republish a fork receipt whose mapping may have been superseded by COW",
     );
     assert_eq!(
@@ -336,7 +342,8 @@ fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
         asid: 27,
     };
     let mut task = HvfTaskState::neutral();
-    task.pending_fork_frame_receipts
+    task.stage2
+        .pending_fork_frame_receipts
         .push(PendingForkFrameReceipt {
             transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
                 std::num::NonZeroU64::new(103).unwrap(),
@@ -352,12 +359,12 @@ fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
     task.bind_frame_cow(Arc::clone(&authority), identity);
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(task.pending_fork_frame_receipts.is_empty());
+    assert!(task.stage2.pending_fork_frame_receipts.is_empty());
     assert!(Arc::ptr_eq(
-        task.cow_authority.as_ref().unwrap(),
+        task.stage2.cow_authority.as_ref().unwrap(),
         &authority
     ));
-    assert_eq!(task.cow_identity, Some(identity));
+    assert_eq!(task.stage2.cow_identity, Some(identity));
 }
 
 /// An unmap must void the deferred-COW promises naming the range it tears
@@ -401,12 +408,12 @@ fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
         .min()
         .expect("end of unregister_process_alias")];
     let supersede = body
-        .find("self.supersede_cow_receipts(")
+        .find(".supersede_cow_receipts(")
         .expect("an unmap must void the deferred-COW receipts naming its range");
     for teardown in [
         "self.cow_armed.lock().disarm(",
         "unregister_alias(",
-        "self.split_local_rows_for_unmap(",
+        ".split_local_rows_for_unmap(",
     ] {
         let at = body.find(teardown).unwrap_or_else(|| {
             panic!("teardown step {teardown} not found in unregister_process_alias")
@@ -450,7 +457,7 @@ fn a_private_repoint_supersedes_the_previous_cow_receipt_before_publication() {
 #[test]
 fn pending_fork_frame_authentication_false_and_error_paths_fail_closed() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    let source = include_str!("../trap.rs");
+    let source = include_str!("stage2_state.rs");
     let helper = source
         .rsplit_once("fn publish_pending_fork_frame_receipts_with(")
         .expect("fork-frame publication helper")

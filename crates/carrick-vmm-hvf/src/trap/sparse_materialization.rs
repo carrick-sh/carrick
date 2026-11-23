@@ -122,7 +122,7 @@ pub(super) fn prepare(
         }
         carrick_observability::probes::hvpatch_frame_pool_hit(1, ipa);
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
-        let inventory_backing = HvfVmState::private_backing_identity();
+        let inventory_backing = Stage2State::private_backing_identity();
         let page_granular_arm = false;
         let owner_generation = register_pooled_global_frame_host_owner_in(
             &custody,
@@ -199,7 +199,7 @@ pub(super) fn prepare(
                 ..
             } => (
                 carrick_hal::MemPerms::ReadWriteExec,
-                HvfVmState::private_backing_identity(),
+                Stage2State::private_backing_identity(),
                 false,
             ),
             SparseExtentBacking::FileView { .. } => {
@@ -211,7 +211,7 @@ pub(super) fn prepare(
                 // fork COW still protects those owners when another MM shares them.
                 (
                     carrick_hal::MemPerms::ReadWriteExec,
-                    HvfVmState::private_file_view_backing_identity(),
+                    Stage2State::private_file_view_backing_identity(),
                     true,
                 )
             }
@@ -321,7 +321,7 @@ fn publish_frame_grant_backing(
             TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
         })?;
     if let Some(retirement) = retirement {
-        HvfVmState::stage_inventory_lease_retirement(&mut reservation, retirement)?;
+        Stage2State::stage_inventory_lease_retirement(&mut reservation, retirement)?;
     }
     let PreparedSparseBacking {
         physical_host,
@@ -349,7 +349,7 @@ fn publish_frame_grant_backing(
     }
     let inventory_mapping = {
         let mut inventory = context.state.frame_inventory.ledger.lock();
-        HvfVmState::stage_mapping_in(
+        Stage2State::stage_mapping_in(
             &context.custody,
             &mut inventory,
             &mut reservation,
@@ -398,7 +398,7 @@ fn publish_frame_grant_backing(
     // references as one step with the grant (`apply_inventory_lease_retirement`).
     let applied = match retirement {
         None => apply_grant(reservation.commit(())),
-        Some(retirement) => HvfVmState::apply_inventory_lease_retirement(
+        Some(retirement) => Stage2State::apply_inventory_lease_retirement(
             &context.state.frame_inventory.ledger,
             retirement,
             reservation,
@@ -408,7 +408,7 @@ fn publish_frame_grant_backing(
     let (challenge, (receipt, authenticated_owner_generation)) = match applied {
         Ok(applied) => applied,
         Err(error) => {
-            if let Err(rollback) = HvfVmState::rollback_unpublished_mappings(
+            if let Err(rollback) = Stage2State::rollback_unpublished_mappings(
                 &mut context.state.frame_inventory.ledger.lock(),
                 &[inventory_entry],
             ) {
@@ -447,7 +447,7 @@ fn publish_frame_grant_backing(
                 "kernel frame-grant rollback failed after receipt mismatch: {error}"
             );
         }
-        if let Err(error) = HvfVmState::rollback_unpublished_mappings(
+        if let Err(error) = Stage2State::rollback_unpublished_mappings(
             &mut context.state.frame_inventory.ledger.lock(),
             &[inventory_entry],
         ) {
@@ -1404,7 +1404,7 @@ pub(super) fn publish_replacing(
     } else {
         let inventory_mapping = {
             let mut inventory = context.state.frame_inventory.ledger.lock();
-            HvfVmState::stage_mapping_in(
+            Stage2State::stage_mapping_in(
                 &context.custody,
                 &mut inventory,
                 &mut reservation,
@@ -1448,7 +1448,7 @@ pub(super) fn publish_replacing(
                     editor.begin_undo().map_err(|error| {
                         sparse_mmap_stage1_error(editor.manager, "begin_undo", error, has_source)
                     })?;
-                    HvfVmState::refresh_stage1_exclusivity(editor.manager);
+                    Stage2State::refresh_stage1_exclusivity(editor.manager);
                     // The leaves are built read-only and non-executable; the
                     // permission publication below sets the mapping's own
                     // protection (or PROT_NONE) before the edit commits.
@@ -1623,7 +1623,7 @@ pub(super) fn publish_replacing(
                     "sparse page-table rollback failed after publication failure: start=0x{start:x} end=0x{end:x} error={rollback_error}"
                 );
             }
-            HvfVmState::rollback_unpublished_mappings(
+            Stage2State::rollback_unpublished_mappings(
                 &mut context.state.frame_inventory.ledger.lock(),
                 &[inventory_entry],
             )?;
@@ -3312,7 +3312,7 @@ impl PendingTransferGrant {
             alias_registry()
                 .lock()
                 .remove_exact_values_in_batch(&[publication.alias]);
-            HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, expected)])
+            Stage2State::rollback_unpublished_mappings(&mut inventory, &[(key, expected)])
                 .unwrap_or_else(|error| {
                     carrick_fatal!("hvpatch::user_transfer", "rollback target backend: {error}")
                 });

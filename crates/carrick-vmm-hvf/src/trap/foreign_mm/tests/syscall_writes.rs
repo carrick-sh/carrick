@@ -22,9 +22,9 @@ impl WriteFixture {
             .owner()
             .clone();
         let mut task = hvpatch_neutral_task_state_for_test();
-        task.mm_access = Arc::clone(&installed.state);
-        task.persistent_vm_lifecycle = true;
-        task.mm_root_slot = Some(installed.owners.0[0]);
+        task.stage2.mm_access = Arc::clone(&installed.state);
+        task.stage2.persistent_vm_lifecycle = true;
+        task.stage2.mm_root_slot = Some(installed.owners.0[0]);
         let mut row = crate::trap::thread_sibling_tests::mapped_region(
             TEST_VA,
             TEST_VA + OWNER_LEN as u64,
@@ -32,7 +32,7 @@ impl WriteFixture {
         );
         row.host_addr = owner.ptr();
         row.owner_generation = owner.generation();
-        task.mappings = TaskMappingIndex::from_region(row);
+        task.stage2.mappings = TaskMappingIndex::from_region(row);
         Self {
             task,
             writes: HostWrites::default(),
@@ -197,7 +197,7 @@ fn native_code_content_host_write_rejects_stale_owner_permissions_and_bounds() {
         );
         row.host_addr = owner.ptr();
         row.owner_generation = generation;
-        fixture.task.mappings = TaskMappingIndex::from_region(row);
+        fixture.task.stage2.mappings = TaskMappingIndex::from_region(row);
         assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
         assert!(fixture.write_bytes_raw(TEST_VA, b"bad!").is_err());
     }
@@ -293,8 +293,8 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
             GuestMappingSharing::Private,
-            fixture.task.mm_root_slot,
-            fixture.task.container_root,
+            fixture.task.stage2.mm_root_slot,
+            fixture.task.stage2.container_root,
         ),
         inventory_backing: InventoryBackingIdentity::Private(2010),
         shared_key_base: None,
@@ -342,7 +342,7 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     row.host_addr = unsafe { owner.ptr().add(4096) };
     row.structural_owner = Some(Arc::clone(&owner));
     row.owner_generation = epoch.raw();
-    task.mappings = TaskMappingIndex::from_region(row);
+    task.stage2.mappings = TaskMappingIndex::from_region(row);
     let outside = owner.retained.mapping.code_content.observe(0, 4).unwrap();
     let dependent = owner
         .retained

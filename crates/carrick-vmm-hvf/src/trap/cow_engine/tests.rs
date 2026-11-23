@@ -671,7 +671,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
                 write: true,
                 exec: true,
             },
-            backing: HvfVmState::private_backing_identity(),
+            backing: Stage2State::private_backing_identity(),
             inherited_frame: None,
             stage2_lease: Some((gpa, length)),
             stage2_owner: InventoryStage2OwnerIdentity {
@@ -727,7 +727,7 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantPublication 
                 None,
                 ContainerRootToken::ROOT,
             ),
-            inventory_backing: HvfVmState::private_backing_identity(),
+            inventory_backing: Stage2State::private_backing_identity(),
             shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
@@ -946,7 +946,7 @@ fn el1_frame_grant_rollback_matches_only_the_grants_own_alias() {
             None,
             ContainerRootToken::ROOT,
         ),
-        inventory_backing: HvfVmState::private_backing_identity(),
+        inventory_backing: Stage2State::private_backing_identity(),
         shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 17,
@@ -1118,7 +1118,7 @@ fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
     let page = |index: u64| base + index * PAGE;
     let repoint = |fault: u64| {
         let candidate = task.cow_armed.lock().span_for(fault).expect("armed");
-        task.live_cow_span(candidate, fault)
+        task.stage2.live_cow_span(candidate, fault)
     };
     assert_eq!(
         repoint(page(8)),
