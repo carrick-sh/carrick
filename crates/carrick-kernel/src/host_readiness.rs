@@ -55,6 +55,18 @@ pub(crate) struct HostReadinessInterest<'a> {
     pub(crate) events: i16,
 }
 
+/// An in-zone part of a member's wait on a carrier socket (#2867): the
+/// socket's own wait queue, such as a listener's in-zone loopback arrivals,
+/// which no host descriptor reports. The wait enrols on the queue, then
+/// probes the description once, so an arrival between the call's own check
+/// and the enrolment still notifies the member.
+pub(crate) struct HostReadinessZoneInterest {
+    pub(crate) source: HostReadinessSource,
+    pub(crate) description: Arc<crate::kernel::FileDescription>,
+    pub(crate) queue: Arc<crate::kernel::wait_set::WaitQueue>,
+    pub(crate) events: carrick_abi::LinuxEpollEvents,
+}
+
 /// The member a host-readiness wait notifies: its ring record, exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct HostReadyKey {
@@ -79,6 +91,11 @@ pub(crate) struct HostReadyWait {
     /// readiness the reactor saw for a replaced wait notifies nobody.
     serial: u64,
     interests: Vec<(HostReadinessSource, OwnedFd, i16)>,
+    /// The wait's in-zone enrolments, dropped with it.
+    zone: Vec<(
+        HostReadinessSource,
+        crate::kernel::wait_set::WaitCallbackEnrollment,
+    )>,
     deadline: Option<Instant>,
     carrier: Option<CarrierZone>,
 }
@@ -89,6 +106,7 @@ impl std::fmt::Debug for HostReadyWait {
             .field("record", &self.record)
             .field("serial", &self.serial)
             .field("interests", &self.interests.len())
+            .field("zone", &self.zone.len())
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -125,6 +143,10 @@ impl HostReadyWaits {
         &mut self,
         record: carrick_el1_abi::RecordRef,
         interests: Vec<(HostReadinessSource, OwnedFd, i16)>,
+        zone: Vec<(
+            HostReadinessSource,
+            crate::kernel::wait_set::WaitCallbackEnrollment,
+        )>,
         deadline: Option<Instant>,
         carrier: Option<CarrierZone>,
     ) {
@@ -135,6 +157,7 @@ impl HostReadyWaits {
                 record,
                 serial: self.next_serial,
                 interests,
+                zone,
                 deadline,
                 carrier,
             },
@@ -145,8 +168,10 @@ impl HostReadyWaits {
     /// `true` when one was dropped.
     fn forget(&mut self, source: HostReadinessSource) -> bool {
         let before = self.waits.len();
-        self.waits
-            .retain(|_, wait| !wait.interests.iter().any(|(held, _, _)| *held == source));
+        self.waits.retain(|_, wait| {
+            !wait.interests.iter().any(|(held, _, _)| *held == source)
+                && !wait.zone.iter().any(|(held, _)| *held == source)
+        });
         self.waits.len() != before
     }
 
@@ -281,6 +306,21 @@ impl HostReadinessReactor {
         deadline: Option<Instant>,
         carrier: Option<CarrierZone>,
     ) -> bool {
+        self.watch_with_zone(record, interests, Vec::new(), deadline, carrier)
+    }
+
+    /// [`Self::watch`], with in-zone parts (#2867): each enrols a
+    /// notification of `record`'s queue on its wait queue, and the wait then
+    /// probes each description once, notifying at once when one is already
+    /// ready.
+    pub(crate) fn watch_with_zone(
+        &self,
+        record: carrick_el1_abi::RecordRef,
+        interests: &[HostReadinessInterest<'_>],
+        zone: Vec<HostReadinessZoneInterest>,
+        deadline: Option<Instant>,
+        carrier: Option<CarrierZone>,
+    ) -> bool {
         let Some(service) = self.service() else {
             return false;
         };
@@ -291,13 +331,30 @@ impl HostReadinessReactor {
             };
             held.push((interest.source, fd, interest.events));
         }
-        let mut enrolment = Some((held, carrier));
+        let mut enrolled = Vec::with_capacity(zone.len());
+        for interest in &zone {
+            let notified = carrier.clone();
+            let enrolment = interest.queue.enroll_callback(move |_| {
+                crate::el1_zone::notify_host_ready(notified.as_ref(), record);
+            });
+            enrolled.push((interest.source, enrolment));
+        }
+        let mut enrolment = Some((held, enrolled, carrier.clone()));
         service.change_host_ready_waits(&mut |waits| {
-            if let Some((held, carrier)) = enrolment.take() {
-                waits.enrol(record, held, deadline, carrier);
+            if let Some((held, enrolled, carrier)) = enrolment.take() {
+                waits.enrol(record, held, enrolled, deadline, carrier);
             }
             true
         });
+        // The enrolments are live: an arrival before them is seen here.
+        if zone.iter().any(|interest| {
+            !interest
+                .description
+                .readiness(interest.events, &crate::kernel::NoReadinessContext)
+                .is_empty()
+        }) {
+            crate::el1_zone::notify_host_ready(carrier.as_ref(), record);
+        }
         true
     }
 

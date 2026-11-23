@@ -1184,6 +1184,13 @@ pub(crate) struct IpcPhysicalHold {
     backing: Option<OpaqueFileDescriptionBacking>,
     admitted: Arc<AtomicBool>,
     mapping_description: Option<Arc<FileDescription>>,
+    /// The readiness identity of a host socket's native waits through this
+    /// hold (#2867), and the reactor they enrol in, which forgets them when
+    /// the ring releases the hold, as it does a native socket's.
+    net_readiness: std::sync::OnceLock<(
+        crate::host_readiness::HostReadinessToken,
+        Arc<crate::host_readiness::HostReadinessReactor>,
+    )>,
 }
 
 pub(crate) enum MappingAdmission<'a> {
@@ -1218,6 +1225,24 @@ impl IpcPhysicalHold {
         Arc::ptr_eq(&self.physical, &description.common.physical)
     }
 
+    /// The readiness identity a native network call's wait on this hold's
+    /// socket enrols under (#2867). The first wait binds the hold to
+    /// `reactor`; the hold's release forgets every wait enrolled under it.
+    pub(crate) fn net_readiness_source(
+        &self,
+        reactor: &Arc<crate::host_readiness::HostReadinessReactor>,
+    ) -> crate::host_readiness::HostReadinessSource {
+        self.net_readiness
+            .get_or_init(|| {
+                (
+                    crate::host_readiness::HostReadinessToken::new(),
+                    Arc::clone(reactor),
+                )
+            })
+            .0
+            .source()
+    }
+
     /// Project only the physical byte source. The projection cannot reach the
     /// publication pin, so retaining it never keeps its own IPC resource alive.
     /// The caller owns a pinned resource for the entire admission.
@@ -1243,6 +1268,11 @@ fn finish_description(
 
 impl Drop for IpcPhysicalHold {
     fn drop(&mut self) {
+        // The ring released the last descriptor naming this hold: no wait
+        // lingers on its socket in the reactor.
+        if let Some((token, reactor)) = self.net_readiness.get() {
+            reactor.forget(token.source());
+        }
         // Failed admission never acquired a physical hold. Its rollback can
         // destroy the capsule while the admission transition is still locked.
         if !self.admitted.load(Ordering::Acquire) {
@@ -1367,6 +1397,7 @@ impl FileDescription {
             backing,
             admitted: Arc::clone(&admitted),
             mapping_description,
+            net_readiness: std::sync::OnceLock::new(),
         }))?;
         let backing = IpcBacking::Host(token).encode();
         let description = match owner.admit_description(fd::Description::new(

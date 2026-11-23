@@ -367,10 +367,9 @@ impl carrick_guest_mem::CurrentMmMemory for StagedMemory {}
 
 /// The Linux type of a native socket's description (`SOCK_STREAM`,
 /// `SOCK_DGRAM`, ...), whatever backs it.
-fn native_socket_type(socket: &NativeNetFile) -> Option<i32> {
+fn native_socket_type(description: &crate::kernel::FileDescription) -> Option<i32> {
     use crate::dispatch::fd_table::OpenDescription;
-    socket
-        .description()
+    description
         .inspect_kind(|open| match open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_ & 0xf),
             OpenDescription::InMemorySocket { socket, .. } => Some(socket.socket_type),
@@ -394,7 +393,7 @@ fn native_socket_type(socket: &NativeNetFile) -> Option<i32> {
 /// `Some` is the call's answer before any handler runs.
 fn native_transfer_extent(
     call: &NetCall<'_>,
-    socket: Option<&NativeNetFile>,
+    kind: Option<i32>,
     args: &mut [u64; 6],
 ) -> Option<NetServed> {
     use carrick_abi::syscall::nr;
@@ -411,7 +410,7 @@ fn native_transfer_extent(
         return None;
     }
     if send {
-        match socket.and_then(native_socket_type) {
+        match kind {
             Some(carrick_abi::LINUX_SOCK_STREAM) => {}
             Some(carrick_abi::LINUX_SOCK_DGRAM | carrick_abi::LINUX_SOCK_RAW) => {
                 return Some(NetServed::Reply(
@@ -449,7 +448,7 @@ fn native_transfer_extent(
 ///   it only for an EPIPE answer.
 fn native_message_admission(
     call: &NetCall<'_>,
-    socket: Option<&NativeNetFile>,
+    kind: Option<i32>,
     nonblock: bool,
     args: &mut [u64; 6],
 ) -> Option<NetServed> {
@@ -462,7 +461,6 @@ fn native_message_admission(
         c if c == nr::RECVMMSG.raw() => (false, args[3]),
         _ => return None,
     };
-    let kind = socket.and_then(native_socket_type);
     let datagram = matches!(
         kind,
         Some(carrick_abi::LINUX_SOCK_DGRAM | carrick_abi::LINUX_SOCK_RAW)
@@ -491,6 +489,54 @@ fn native_message_admission(
         return Some(NetServed::Refused);
     }
     None
+}
+
+/// The readiness a wait entry's host poll bits name, as the socket's
+/// in-zone part reports it.
+fn zone_events(events: i16) -> carrick_abi::LinuxEpollEvents {
+    let mut zone = carrick_abi::LinuxEpollEvents::empty();
+    if events & libc::POLLIN != 0 {
+        zone |= carrick_abi::LinuxEpollEvents::IN;
+    }
+    if events & libc::POLLOUT != 0 {
+        zone |= carrick_abi::LinuxEpollEvents::OUT;
+    }
+    zone
+}
+
+/// The socket one native network call runs on.
+enum NetSocket<'a> {
+    /// A socket a native call created ([`NativeNetFile`]).
+    Native(&'a NativeNetFile),
+    /// A host socket the run root's host table created, which the caller's
+    /// ring descriptor names through a physical hold: the root's own
+    /// description, inherited across a fork, or the root's own descriptor
+    /// once its table is the ring's (#2867). The lease pins the
+    /// description for the call.
+    Inherited {
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        hold: &'a crate::kernel::objects::IpcPhysicalHold,
+    },
+}
+
+impl NetSocket<'_> {
+    fn description(&self) -> Arc<crate::kernel::FileDescription> {
+        match self {
+            Self::Native(socket) => socket.description(),
+            Self::Inherited { lease, .. } => Arc::clone(lease.description()),
+        }
+    }
+
+    /// The readiness identity a wait on this socket enrols under.
+    fn source(
+        &self,
+        reactor: &Arc<HostReadinessReactor>,
+    ) -> crate::host_readiness::HostReadinessSource {
+        match self {
+            Self::Native(socket) => socket.source(),
+            Self::Inherited { hold, .. } => hold.net_readiness_source(reactor),
+        }
+    }
 }
 
 /// One served network call.
@@ -543,17 +589,31 @@ impl SyscallDispatcher {
             return self.run_native_net_call(owner, table, &call, &caller, None, waiter, revision);
         }
         match owner.with_pinned_host_description(table, fd::Fd(header.fd), |resource, flags| {
-            let Some(socket) = resource.downcast_ref::<NativeNetFile>() else {
-                // A host file or stdio stream is not a socket. A socket the
-                // run root created and this member inherited has no native
-                // venue yet: a counted ENOSYS, never a fabricated ENOTSOCK
-                // its `fstat` (S_IFSOCK) contradicts.
-                return match crate::dispatch::native_files::native_resource_is_socket(resource) {
+            let socket = if let Some(socket) = resource.downcast_ref::<NativeNetFile>() {
+                NetSocket::Native(socket)
+            } else {
+                // A host file or stdio stream is not a socket, never a
+                // fabricated ENOTSOCK for a socket its `fstat` (S_IFSOCK)
+                // names. A socket the run root's host table created is
+                // served through its physical hold (#2867).
+                match crate::dispatch::native_files::native_resource_is_socket(resource) {
                     Some(false) => {
-                        NetServed::Reply(carrick_abi::LINUX_ENOTSOCK.guest_retval(), Vec::new())
+                        return NetServed::Reply(
+                            carrick_abi::LINUX_ENOTSOCK.guest_retval(),
+                            Vec::new(),
+                        );
                     }
-                    Some(true) | None => NetServed::Refused,
-                };
+                    Some(true) => {
+                        match resource
+                            .downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()
+                            .and_then(|hold| Some((hold.retain_io()?, hold)))
+                        {
+                            Some((lease, hold)) => NetSocket::Inherited { lease, hold },
+                            None => return NetServed::Refused,
+                        }
+                    }
+                    None => return NetServed::Refused,
+                }
             };
             self.run_native_net_call(
                 owner,
@@ -582,7 +642,7 @@ impl SyscallDispatcher {
         table: fd::TableId,
         call: &NetCall<'_>,
         caller: &Arc<NativeNetCaller>,
-        socket: Option<(&NativeNetFile, bool)>,
+        socket: Option<(NetSocket<'_>, bool)>,
         waiter: Option<carrick_el1_abi::RecordRef>,
         revision: Option<u64>,
     ) -> NetServed {
@@ -601,29 +661,33 @@ impl SyscallDispatcher {
             return NetServed::Refused;
         };
         let mut args = call.args;
-        if let Some(answer) =
-            native_transfer_extent(call, socket.map(|(socket, _)| socket), &mut args).or_else(
-                || {
-                    native_message_admission(
-                        call,
-                        socket.map(|(socket, _)| socket),
-                        socket.is_some_and(|(_, nonblock)| nonblock),
-                        &mut args,
-                    )
-                },
-            )
+        let kind = socket
+            .as_ref()
+            .and_then(|(socket, _)| native_socket_type(&socket.description()));
+        let nonblock = socket.as_ref().is_some_and(|(_, nonblock)| *nonblock);
+        if let Some(answer) = native_transfer_extent(call, kind, &mut args)
+            .or_else(|| native_message_admission(call, kind, nonblock, &mut args))
         {
             return answer;
         }
+        // A loopback connect replaces its socket's description with an
+        // in-zone pair, which only a native socket's descriptors follow
+        // (`NativeNetFile::replace`): a held description is the root's.
+        if matches!(socket, Some((NetSocket::Inherited { .. }, _)))
+            && call.canonical == carrick_abi::syscall::nr::CONNECT.raw()
+        {
+            return NetServed::Refused;
+        }
         // What the ring's transfer continuation needs of this socket.
         let facts = carrick_core_abi::host_file::NetTransferFacts {
-            stream: socket.and_then(|(socket, _)| native_socket_type(socket))
-                == Some(carrick_abi::LINUX_SOCK_STREAM),
-            blocking: socket.is_some_and(|(_, nonblock)| !nonblock)
+            stream: kind == Some(carrick_abi::LINUX_SOCK_STREAM),
+            blocking: socket.is_some()
+                && !nonblock
                 && args[3] & carrick_abi::LINUX_MSG_DONTWAIT as u64 == 0,
         };
         let scratch = Arc::new(crate::kernel::FileTable::new(scratch_id));
-        if let Some((socket, nonblock)) = socket {
+        if let Some((socket, nonblock)) = &socket {
+            let nonblock = *nonblock;
             let description = socket.description();
             // The guest's O_NONBLOCK lives in its ring description, which
             // `fcntl` and `ioctl(FIONBIO)` change in ring.
@@ -680,14 +744,15 @@ impl SyscallDispatcher {
         // slots' references pass to this call.
         let slots = scratch.drain_functional_refs();
         for (number, slot) in &slots {
-            match socket {
-                Some((socket, _)) if *number == NATIVE_SOCKET_FD => {
+            match &socket {
+                Some((NetSocket::Native(socket), _)) if *number == NATIVE_SOCKET_FD => {
                     socket.replace(&slot.description);
                 }
+                Some((NetSocket::Inherited { .. }, _)) if *number == NATIVE_SOCKET_FD => {}
                 _ => created = Some((*number, slot.clone())),
             }
         }
-        if let Some((socket, _)) = socket
+        if let Some((NetSocket::Native(socket), _)) = &socket
             && let Some(epolls) = owner.existing_native_socket_epolls()
         {
             epolls.socket_changed(owner, socket);
@@ -711,24 +776,41 @@ impl SyscallDispatcher {
             }
             Ran::Outcome(DispatchOutcome::WaitOnFds {
                 fds, timeout: None, ..
-            }) => match (socket, waiter, revision) {
-                (Some((socket, _)), Some(record), Some(revision))
-                    if !fds.fds.is_empty() && fds.fds.iter().all(|wait| wait.fd() >= 0) =>
-                {
-                    let interests: Vec<_> = fds
-                        .fds
-                        .iter()
-                        .map(|wait| crate::host_readiness::HostReadinessInterest {
-                            source: socket.source(),
-                            // SAFETY: the scratch slot and the ring's
-                            // descriptor retain this description's host fd
-                            // until the reactor holds its own duplicate.
-                            fd: unsafe { std::os::fd::BorrowedFd::borrow_raw(wait.fd()) },
-                            events: wait.events(),
-                        })
-                        .collect();
+            }) => match (&socket, waiter, revision) {
+                (Some((socket, _)), Some(record), Some(revision)) if !fds.fds.is_empty() => {
                     let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
-                    if owner.watch_host_ready(&reactor, record, &interests, None) {
+                    let source = socket.source(&reactor);
+                    let description = socket.description();
+                    // A wait entry with no host descriptor is the socket's
+                    // in-zone part (#2867): a listener's loopback arrivals,
+                    // or an in-zone pair's peer. It enrols on the socket's
+                    // own wait queue; a socket with none has no venue.
+                    let mut interests = Vec::with_capacity(fds.fds.len());
+                    let mut zone = Vec::new();
+                    for wait in fds.fds.iter() {
+                        if wait.fd() >= 0 {
+                            interests.push(crate::host_readiness::HostReadinessInterest {
+                                source,
+                                // SAFETY: the scratch slot and the ring's
+                                // descriptor retain this description's host
+                                // fd until the reactor holds its own
+                                // duplicate.
+                                fd: unsafe { std::os::fd::BorrowedFd::borrow_raw(wait.fd()) },
+                                events: wait.events(),
+                            });
+                            continue;
+                        }
+                        let Some(queue) = description.wait_queue() else {
+                            return NetServed::Refused;
+                        };
+                        zone.push(crate::host_readiness::HostReadinessZoneInterest {
+                            source,
+                            description: Arc::clone(&description),
+                            queue,
+                            events: zone_events(wait.events()),
+                        });
+                    }
+                    if owner.watch_host_ready_with_zone(&reactor, record, &interests, zone) {
                         NetServed::Wait(revision)
                     } else {
                         NetServed::Refused
@@ -818,7 +900,7 @@ impl SyscallDispatcher {
                 table,
                 &call,
                 &caller,
-                Some((socket, nonblock)),
+                Some((NetSocket::Native(socket), nonblock)),
                 waiter,
                 revision,
             ) {
