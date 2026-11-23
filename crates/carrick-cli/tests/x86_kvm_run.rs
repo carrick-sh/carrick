@@ -911,7 +911,7 @@ fn mounted_static_x86_writable_shared_file_mapping_matches_native() {
         "native oracle: {native_rows}"
     );
     assert!(
-        native_rows.lines().count() == 32 && !native_rows.contains("BAD"),
+        native_rows.lines().count() == 50 && !native_rows.contains("BAD"),
         "native Linux keeps every written byte: {native_rows}"
     );
 
