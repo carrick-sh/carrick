@@ -115,8 +115,8 @@ macro_rules! export_carrier {
 
         #[cfg(all(target_os = "none", target_arch = "x86_64"))]
         #[panic_handler]
-        fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-            $crate::entry::halt()
+        fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+            $crate::entry::fatal_panic(info)
         }
     };
 }

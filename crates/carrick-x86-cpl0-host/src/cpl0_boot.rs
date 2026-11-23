@@ -3005,6 +3005,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, None))
                 }
                 _ => {
+                    if *port == FATAL_PORT
+                        && let Some(report) = carrick_x86::fatal_port_panic_report(|reg| lease.io.get_gpr(reg))?
+                    {
+                        return Err(fail(format!("CPL0 kernel panic at {report}")));
+                    }
                     let detail = format!(
                         "unexpected idle peer physical doorbell {port:#x}: rax={:#x} rip={:#x} rsp={:#x} cr3={:#x}",
                         lease.io.get_gpr(X86Reg::Rax)?, lease.io.get_gpr(X86Reg::Rip)?,
@@ -3450,6 +3455,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, None, None))
                 }
                 None => {
+                    if *port == FATAL_PORT
+                        && let Some(report) = carrick_x86::fatal_port_panic_report(|reg| lease.io.get_gpr(reg))?
+                    {
+                        return Err(fail(format!("CPL0 kernel panic at {report}")));
+                    }
                     let binding = custody.binding(slot);
                     let rip = lease.io.get_gpr(X86Reg::Rip).unwrap_or(0);
                     let rax = lease.io.get_gpr(X86Reg::Rax).unwrap_or(0);
