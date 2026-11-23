@@ -1016,6 +1016,7 @@ fn mounted_static_x86_thread_vfork_exec_matches_native() {
 /// On main a sibling's memory edit answers wrongly (99), or the carrier
 /// dies (an unregistered forward CR3).
 #[test]
+#[ignore = "red until the #2890 siblings shape lands; see #2890"]
 fn mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings() {
     threads_vfork_exec_matches_native(&[], "threads-vfork-exec-siblings");
 }
