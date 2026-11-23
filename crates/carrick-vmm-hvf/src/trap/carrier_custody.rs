@@ -4182,7 +4182,7 @@ mod carrier_vm_custody_tests {
 
         let exact_generation = mappings.first().unwrap().owner_generation;
         mappings.first_mut().unwrap().owner_generation = exact_generation.saturating_add(1);
-        let drift_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let drift_error = super::Stage2State::retire_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa,
@@ -4213,7 +4213,7 @@ mod carrier_vm_custody_tests {
         );
         mappings.first_mut().unwrap().owner_generation = exact_generation;
 
-        let subextent_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let subextent_error = super::Stage2State::retire_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa + 0x1000,
@@ -4231,8 +4231,13 @@ mod carrier_vm_custody_tests {
             "failed-closed subextent retirement must preserve the whole structural map",
         );
 
-        super::HvfVmState::retire_stage2_extent_from_mappings_in(&custody, &mut mappings, ipa, len)
-            .expect("explicitly retire structural root slot");
+        super::Stage2State::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            ipa,
+            len,
+        )
+        .expect("explicitly retire structural root slot");
 
         assert!(
             custody.stage2_record_snapshot(identity.record_id).is_none(),
@@ -4316,7 +4321,7 @@ mod carrier_vm_custody_tests {
             .expect("pin structural root slot");
         let mut mappings = super::TaskMappingIndex::from_region(region);
 
-        let retirement_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let retirement_error = super::Stage2State::retire_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa,

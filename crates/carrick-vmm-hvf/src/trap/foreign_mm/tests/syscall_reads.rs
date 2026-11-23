@@ -30,12 +30,12 @@ impl PooledReadFixture {
         // SAFETY: the freshly registered owner exclusively covers `key.1` bytes.
         unsafe { std::ptr::write_bytes(owner.ptr(), fill, key.1 as usize) };
         let mut task = hvpatch_neutral_task_state_for_test();
-        task.persistent_vm_lifecycle = true;
+        task.stage2.persistent_vm_lifecycle = true;
         let mut row =
             crate::trap::thread_sibling_tests::mapped_region(READ_VA, READ_VA + key.1, key.0);
         row.host_addr = owner.ptr();
         row.owner_generation = generation;
-        task.mappings = TaskMappingIndex::from_region(row);
+        task.stage2.mappings = TaskMappingIndex::from_region(row);
         Self {
             custody,
             pool,
@@ -132,7 +132,7 @@ fn guest_copy_out_pins_only_the_exact_live_owner() {
 
     // A row stamped with a stale generation names a previous incarnation.
     let mut task = hvpatch_neutral_task_state_for_test();
-    task.persistent_vm_lifecycle = true;
+    task.stage2.persistent_vm_lifecycle = true;
     let mut row = crate::trap::thread_sibling_tests::mapped_region(
         READ_VA,
         READ_VA + fixture.key.1,
@@ -140,7 +140,7 @@ fn guest_copy_out_pins_only_the_exact_live_owner() {
     );
     row.host_addr = owner.ptr();
     row.owner_generation = fixture.generation + 1;
-    task.mappings = TaskMappingIndex::from_region(row);
+    task.stage2.mappings = TaskMappingIndex::from_region(row);
     let mut stale = [0_u8; 64];
     assert!(
         !matches!(
@@ -179,14 +179,15 @@ fn untracked_rows_are_admitted_only_for_carrier_control_mappings() {
     };
     for persistent in [true, false] {
         let mut task = hvpatch_neutral_task_state_for_test();
-        task.persistent_vm_lifecycle = persistent;
+        task.stage2.persistent_vm_lifecycle = persistent;
         let carrier = carrick_mem::memory::LINUX_EL1_MAINT_BASE;
-        task.mappings = TaskMappingIndex::from_region(row_at(carrier));
+        task.stage2.mappings = TaskMappingIndex::from_region(row_at(carrier));
         let read = task
             .admit_host_read(&custody, carrier, 16)
             .expect("carrier control mapping admits an untracked read");
         assert_eq!(read.as_ptr(), backing.as_ptr() as *const u8);
         let access = task
+            .stage2
             .with_mapping_for_range_in(&custody, carrier, 16, |source| {
                 source.begin_access(
                     crate::trap::host_writes::HostAccess::Read,
@@ -202,7 +203,7 @@ fn untracked_rows_are_admitted_only_for_carrier_control_mappings() {
         assert!(!access.retains_owner());
 
         let guest = carrick_mem::memory::LINUX_ROSETTA_IPA_BASE;
-        task.mappings = TaskMappingIndex::from_region(row_at(guest));
+        task.stage2.mappings = TaskMappingIndex::from_region(row_at(guest));
         assert_eq!(
             task.admit_host_read(&custody, guest, 16).is_some(),
             !persistent,
@@ -236,6 +237,7 @@ fn read_pin_cost_microbenchmark() {
     time("unpinned_select_and_copy_4k", &mut || {
         let view = fixture
             .task
+            .stage2
             .mapping_for_range_in(&fixture.custody, READ_VA, dst.len())
             .unwrap();
         // SAFETY: benchmark of the pre-fix shape on a fixture-owned frame.

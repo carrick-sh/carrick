@@ -450,7 +450,7 @@ pub(super) fn project_owner_fork_frames(
             }
             let backing = source
                 .map(|entry| entry.backing)
-                .unwrap_or_else(HvfVmState::private_backing_identity);
+                .unwrap_or_else(Stage2State::private_backing_identity);
             let owner_generation = structural.as_ref().map_or(
                 source.map_or(0, |entry| entry.stage2_owner.generation),
                 |owner| owner.epoch().raw(),
@@ -595,7 +595,7 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 continue;
             }
             let pointer = owner.ptr();
-            let backing = HvfVmState::private_backing_identity();
+            let backing = Stage2State::private_backing_identity();
             let generation = owner.epoch().raw();
             mappings.push(ProcessMappingDesc {
                 start: owner.physical_ipa,
@@ -733,7 +733,7 @@ impl HvfVmState {
                 TrapError::Hypervisor("owner child control physical capacity exhausted".into())
             })?
             .0;
-        let state = self.task.mm_access_authority();
+        let state = self.task.stage2.mm_access_authority();
         let runtime = state.cow_runtime.read().clone().ok_or_else(|| {
             TrapError::Hypervisor("owner parent source custody is unbound".into())
         })?;
@@ -790,8 +790,8 @@ impl HvfVmState {
             syscall_transport: self.syscall_transport,
             transport: Arc::clone(&self.carrier_foreign_mm_transport),
             vm: (*self._vm).clone(),
-            container_root: self.task.container_root,
-            persistent: self.task.persistent_vm_lifecycle,
+            container_root: self.task.stage2.container_root,
+            persistent: self.task.stage2.persistent_vm_lifecycle,
             settled: false,
         }))
     }

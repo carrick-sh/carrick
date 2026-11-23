@@ -428,7 +428,12 @@ impl HvfAarch64Vmm {
 
     /// Exact-MM COW accounting; retain the handle before detaching the MM.
     pub fn host_cow_stats(&self) -> HostCowStats {
-        self.state.task.mm_access_authority().host_cow_stats.clone()
+        self.state
+            .task
+            .stage2
+            .mm_access_authority()
+            .host_cow_stats
+            .clone()
     }
 }
 
@@ -449,8 +454,8 @@ use carrick_mem::memory::AddressSpace;
 use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
 use crate::trap::{
     GuestMappingPlan, HvfInner, HvfTaskState, HvfVmState, HvpatchPreparedCarrierTaskState,
-    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, ThreadSpec, VcpuSnapshot,
-    hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
+    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, Stage2State, ThreadSpec,
+    VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
     swap_hvpatch_task_state,
 };
 pub use crate::trap::{
@@ -1274,8 +1279,8 @@ impl TaskOnlyRuntimeProjectionSlot {
         let projection = slot.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
         })?;
-        let mm_access = parked.mm_access_authority();
-        if !parked.runtime_authorities_match(
+        let mm_access = parked.stage2.mm_access_authority();
+        if !parked.stage2.runtime_authorities_match(
             &mm_access,
             &projection.page_tables,
             &projection.protections,
@@ -1501,7 +1506,7 @@ impl HvpatchTaskOnlyEngineState {
             self._backend.unregister_foreign_mm();
             return Err(error);
         }
-        task.publish_pending_fork_frame_receipts();
+        task.stage2.publish_pending_fork_frame_receipts();
         task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {
             carrick_fatal!(
@@ -1757,7 +1762,7 @@ pub fn attach_task_only_engine(
             "parked task state missing during task-only engine attach: mm_generation={mm_generation} asid_generation={asid_generation}"
         );
     });
-    let expected_mm_access = parked.mm_access_authority();
+    let expected_mm_access = parked.stage2.mm_access_authority();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
     executor.state.publish_live_vcpu();
     if !executor.state.task_runtime_authorities_match(
@@ -1873,11 +1878,16 @@ pub fn retire_detached_task_engine(
 ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
     let backend = state.backend_mut();
     backend.state.retire_process_mappings()?;
-    backend.state.take_retirement_inventory().ok_or_else(|| {
-        TrapError::Hypervisor(
-            "detached HVPatch task retirement produced no inventory commit".to_owned(),
-        )
-    })
+    backend
+        .state
+        .task
+        .stage2
+        .take_retirement_inventory()
+        .ok_or_else(|| {
+            TrapError::Hypervisor(
+                "detached HVPatch task retirement produced no inventory commit".to_owned(),
+            )
+        })
 }
 
 pub fn retire_detached_task_engine_with_root_proof(
@@ -1892,15 +1902,20 @@ pub fn retire_detached_task_engine_with_root_proof(
     TrapError,
 > {
     let backend = state.backend_mut();
-    let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
+    let proof = Stage2State::retire_task_state_process_mappings_with_root_proof(
         &mut backend.state.task,
         (expected_root_base, expected_root_size),
     )?;
-    let inventory = backend.state.take_retirement_inventory().ok_or_else(|| {
-        TrapError::Hypervisor(
-            "detached HVPatch task retirement produced no inventory commit".to_owned(),
-        )
-    })?;
+    let inventory = backend
+        .state
+        .task
+        .stage2
+        .take_retirement_inventory()
+        .ok_or_else(|| {
+            TrapError::Hypervisor(
+                "detached HVPatch task retirement produced no inventory commit".to_owned(),
+            )
+        })?;
     Ok((inventory, proof))
 }
 
@@ -1909,7 +1924,7 @@ pub fn retire_detached_task_shared_root_with_proof(
     expected_root_base: u64,
     expected_root_size: u64,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
-    HvfVmState::retire_task_state_mm_root_only(
+    Stage2State::retire_task_state_mm_root_only(
         &mut state.backend_mut().state.task,
         (expected_root_base, expected_root_size),
     )
@@ -1920,7 +1935,7 @@ pub fn retire_detached_task_shared_root_with_proof(
 pub fn settle_detached_task_engine_declined_remainders(
     state: &mut HvpatchTaskEngineState,
 ) -> Result<(), TrapError> {
-    HvfVmState::settle_task_state_declined_lease_remainders(&state.backend_mut().state.task)
+    Stage2State::settle_task_state_declined_lease_remainders(&state.backend_mut().state.task)
         .map(|_| ())
 }
 
@@ -1932,7 +1947,7 @@ pub fn settle_detached_task_only_engine_declined_remainders(
     let task = parked.as_ref().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only settlement has no parked task state".to_owned())
     })?;
-    HvfVmState::settle_task_state_declined_lease_remainders(task).map(|_| ())
+    Stage2State::settle_task_state_declined_lease_remainders(task).map(|_| ())
 }
 
 pub fn retire_detached_task_only_engine(
@@ -1942,8 +1957,8 @@ pub fn retire_detached_task_only_engine(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_process_mappings(task)?;
-    HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
+    Stage2State::retire_task_state_process_mappings(task)?;
+    Stage2State::take_task_state_retirement_inventory(task).ok_or_else(|| {
         TrapError::Hypervisor(
             "detached task-only retirement produced no inventory commit".to_owned(),
         )
@@ -1965,11 +1980,11 @@ pub fn retire_detached_task_only_engine_with_root_proof(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
+    let proof = Stage2State::retire_task_state_process_mappings_with_root_proof(
         task,
         (expected_root_base, expected_root_size),
     )?;
-    let inventory = HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
+    let inventory = Stage2State::take_task_state_retirement_inventory(task).ok_or_else(|| {
         TrapError::Hypervisor(
             "detached task-only retirement produced no inventory commit".to_owned(),
         )
@@ -1990,7 +2005,7 @@ pub fn retire_detached_task_only_shared_root_with_proof(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_mm_root_only(task, (expected_root_base, expected_root_size))
+    Stage2State::retire_task_state_mm_root_only(task, (expected_root_base, expected_root_size))
 }
 
 /// The final shared-inventory owner may have a relocated bootstrap root,
@@ -2003,13 +2018,13 @@ pub fn retire_detached_task_only_shared_rootless_capacity(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(task)
+    Stage2State::retire_task_state_shared_inventory_table_capacity(task)
 }
 
 pub fn retire_detached_exec_predecessor(
     state: &mut HvpatchTaskEngineState,
 ) -> Result<(), TrapError> {
-    HvfVmState::retire_task_state_exec_predecessor(&mut state.backend_mut().state.task)
+    Stage2State::retire_task_state_exec_predecessor(&mut state.backend_mut().state.task)
 }
 
 pub fn retire_detached_exec_predecessor_with_root_proof(
@@ -2017,7 +2032,7 @@ pub fn retire_detached_exec_predecessor_with_root_proof(
     expected_root_base: u64,
     expected_root_size: u64,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
-    HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
+    Stage2State::retire_task_state_exec_predecessor_with_root_proof(
         &mut state.backend_mut().state.task,
         (expected_root_base, expected_root_size),
     )
@@ -2030,7 +2045,7 @@ pub fn retire_detached_task_only_exec_predecessor(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_exec_predecessor(task)
+    Stage2State::retire_task_state_exec_predecessor(task)
 }
 
 pub fn retire_detached_task_only_exec_predecessor_with_root_proof(
@@ -2042,7 +2057,7 @@ pub fn retire_detached_task_only_exec_predecessor_with_root_proof(
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
+    Stage2State::retire_task_state_exec_predecessor_with_root_proof(
         task,
         (expected_root_base, expected_root_size),
     )
@@ -2350,13 +2365,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         output: u64,
         len: u64,
     ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
-        self.state.publish_user_executable(output, len)
+        self.state.task.stage2.publish_user_executable(output, len)
     }
 
     type AnonymousDiscard = HvfAnonymousDiscard;
 
     fn frame_cow_authority(&self) -> Option<Arc<dyn carrick_hal::FrameCowAuthority>> {
-        self.state.cow_authority.clone()
+        self.state.task.stage2.cow_authority.clone()
     }
 
     fn native_fork_table_arenas(&self) -> usize {
@@ -2392,14 +2407,20 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // keeps the physical lease while any neighboring Linux page owns it.
         // The invalidated leaf plus fresh deferred provenance prevents its
         // former bytes from being re-exposed, without a frame-COW scrub.
-        if !hvpatch_discard_admits(self.state.persistent_vm_lifecycle, va, len) {
+        if !hvpatch_discard_admits(self.state.task.stage2.persistent_vm_lifecycle, va, len) {
             return Ok(None);
         }
         let identity = self
             .state
+            .task
+            .stage2
             .cow_identity
             .ok_or_else(|| TrapError::Hypervisor("anonymous discard has no exact MM".into()))?;
-        let prepared = self.state.prepare_process_alias_retirement(va, len)?;
+        let prepared = self
+            .state
+            .task
+            .stage2
+            .prepare_process_alias_retirement(va, len)?;
         Ok(Some(HvfAnonymousDiscard {
             va,
             len,
@@ -2412,10 +2433,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         ticket: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
-        let identity = self
-            .state
-            .cow_identity
-            .ok_or_else(|| TrapError::Hypervisor("anonymous discard lost MM identity".into()))?;
+        let identity =
+            self.state.task.stage2.cow_identity.ok_or_else(|| {
+                TrapError::Hypervisor("anonymous discard lost MM identity".into())
+            })?;
         if identity.mm != ticket.mm {
             return Err(TrapError::Hypervisor(
                 "anonymous discard MM identity changed".into(),
@@ -2476,7 +2497,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
-        self.state.set_persistent_vm_lifecycle(enabled);
+        self.state.task.stage2.set_persistent_vm_lifecycle(enabled);
     }
 
     fn prepare_exec_address_space(
@@ -2486,6 +2507,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         asid: u16,
     ) -> Result<(), TrapError> {
         self.state
+            .task
+            .stage2
             .prepare_exec_address_space(root_slot_base, root_slot_size, asid)
     }
 
@@ -2493,28 +2516,31 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         identity: carrick_hal::ExecPredecessorIdentity,
     ) -> Result<(), TrapError> {
-        self.state.bind_exec_predecessor_identity(identity)
+        self.state
+            .task
+            .stage2
+            .bind_exec_predecessor_identity(identity)
     }
 
     fn mark_exec_predecessor_shared(&mut self, shared: bool) {
-        self.state.mark_exec_predecessor_shared(shared);
+        self.state.task.stage2.mark_exec_predecessor_shared(shared);
     }
 
     fn bind_deferred_anonymous_state(
         &mut self,
         state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     ) {
-        self.state.bind_deferred_anonymous_state(state);
+        self.state.task.stage2.bind_deferred_anonymous_state(state);
     }
 
     fn deferred_anonymous_state(
         &self,
     ) -> Option<std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>> {
-        self.state.deferred_anonymous_state()
+        self.state.task.stage2.deferred_anonymous_state()
     }
 
     fn sparse_mmap_arena_enabled(&self) -> bool {
-        self.state.sparse_mmap_arena_enabled()
+        self.state.task.stage2.sparse_mmap_arena_enabled()
     }
 
     fn private_file_view_granule(&self) -> Option<u64> {
@@ -2522,7 +2548,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
-        self.state.retire_initial_mmap_arena()
+        self.state.task.stage2.retire_initial_mmap_arena()
     }
 
     fn ensure_sparse_mmap_backing(
@@ -2548,37 +2574,46 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn frame_inventory_extent_count(&self) -> usize {
-        self.state.frame_inventory_extent_count()
+        self.state.task.stage2.frame_inventory_extent_count()
     }
 
     fn inventory_initial_mappings(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
-        self.state.inventory_initial_mappings(reservation)
+        self.state
+            .task
+            .stage2
+            .inventory_initial_mappings(reservation)
     }
 
     fn begin_alias_inventory(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.state.begin_alias_inventory(reservation)
+        self.state.task.stage2.begin_alias_inventory(reservation)
     }
 
     fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.state.take_alias_inventory()
+        self.state.task.stage2.take_alias_inventory()
     }
 
     fn abandon_alias_inventory(&mut self) -> bool {
-        self.state.abandon_alias_inventory()
+        self.state.task.stage2.abandon_alias_inventory()
     }
 
     fn frame_inventory_exec_extent_counts(&self, new_image: &AddressSpace) -> (usize, usize) {
-        self.state.frame_inventory_exec_extent_counts(new_image)
+        self.state
+            .task
+            .stage2
+            .frame_inventory_exec_extent_counts(new_image)
     }
 
     fn inject_next_begin_exec_inventory_failure(&mut self) {
-        self.state.inject_next_begin_exec_inventory_failure();
+        self.state
+            .task
+            .stage2
+            .inject_next_begin_exec_inventory_failure();
     }
 
     fn begin_exec_inventory(
@@ -2595,33 +2630,36 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Option<carrick_hal::FrameInventoryCommit<()>>,
         Option<carrick_hal::FrameInventoryCommit<()>>,
     )> {
-        self.state.take_exec_inventory()
+        self.state.task.stage2.take_exec_inventory()
     }
 
     fn begin_process_inventory(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.state.begin_process_inventory(reservation)
+        self.state.task.stage2.begin_process_inventory(reservation)
     }
 
     fn cancel_process_inventory(&mut self) -> bool {
-        self.state.cancel_process_inventory()
+        self.state.task.stage2.cancel_process_inventory()
     }
 
     fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.state.take_process_inventory()
+        self.state.task.stage2.take_process_inventory()
     }
 
     fn begin_retirement_inventory(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.state.begin_retirement_inventory(reservation)
+        self.state
+            .task
+            .stage2
+            .begin_retirement_inventory(reservation)
     }
 
     fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.state.take_retirement_inventory()
+        self.state.task.stage2.take_retirement_inventory()
     }
 
     fn apply_exec_inventory(
@@ -2645,7 +2683,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     type ProcessBuilder = ProcessSpec;
 
     fn bind_stage1_page_tables(&mut self, page_tables: carrick_aarch64::Stage1Authority) {
-        self.state.bind_stage1_page_tables(page_tables);
+        self.state.task.stage2.bind_stage1_page_tables(page_tables);
     }
 
     fn publish_stage1_extension_arenas(
@@ -2675,7 +2713,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         len: u64,
         perms: carrick_hal::MemPerms,
     ) -> Result<(), TrapError> {
-        self.state.map_stage2(ipa, host, len, perms)
+        self.state.task.stage2.map_stage2(ipa, host, len, perms)
     }
 
     fn handle_memory_exit(&mut self, gpa: u64, va: u64) -> Result<bool, TrapError> {
@@ -2703,7 +2741,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
-        self.state.protections_ref()
+        self.state.task.stage2.protections_ref()
     }
 
     fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
@@ -2727,14 +2765,17 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn frame_cow_arm_snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        self.state.frame_cow_arm_snapshot()
+        self.state.task.stage2.frame_cow_arm_snapshot()
     }
 
     fn restore_frame_cow_arm_snapshot(
         &mut self,
         snapshot: Vec<carrick_aarch64::vmm::ForkCowRange>,
     ) {
-        self.state.restore_frame_cow_arm_snapshot(snapshot);
+        self.state
+            .task
+            .stage2
+            .restore_frame_cow_arm_snapshot(snapshot);
     }
 
     fn armed_frame_cow_ranges(
@@ -2742,7 +2783,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         va: u64,
         len: usize,
     ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
-        self.state.armed_frame_cow_ranges(va, len)
+        self.state.task.stage2.armed_frame_cow_ranges(va, len)
     }
 
     fn record_host_lane_sample(
@@ -2750,7 +2791,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         site: carrick_aarch64::stage1_authority::GuestLaneSite,
         engine_authority: &carrick_aarch64::Stage1Authority,
     ) {
-        let backend = self.state.task.mm_access_authority();
+        let backend = self.state.task.stage2.mm_access_authority();
         let cause = if engine_authority.live_descriptor_owner()
             == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
         {
@@ -2776,6 +2817,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         >,
     ) {
         self.state
+            .task
+            .stage2
             .custody()
             .host_cow_ledger
             .record_guest_lane(outcome);
@@ -2787,12 +2830,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         protections: &carrick_guest_mem::UserMemoryAuthority,
         token: carrick_el1_abi::PortalClosedRootBind,
     ) -> Result<(), TrapError> {
-        if token.carrier() != self.state.custody().transfer_carrier {
+        if token.carrier() != self.state.task.stage2.custody().transfer_carrier {
             return Err(TrapError::Hypervisor(
                 "first-load backing belongs to another carrier".into(),
             ));
         }
-        let cow = self.state.task.cow_identity.ok_or_else(|| {
+        let cow = self.state.task.stage2.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("first-load backing lacks bound kernel MM identity".into())
         })?;
         let asid = token.ttbr0() >> 48;
@@ -2809,7 +2852,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .and_then(std::num::NonZeroU16::new)
             .map(carrick_hal::ForeignAsid::from_kernel_allocation)
             .ok_or_else(|| TrapError::Hypervisor("first-load ASID is invalid".into()))?;
-        let backing = self.state.task.mm_access_authority();
+        let backing = self.state.task.stage2.mm_access_authority();
         self.state
             .carrier_foreign_mm_transport
             .register_closed_initial_identity(
@@ -2908,6 +2951,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         self.state
+            .task
+            .stage2
             .repoint_guest_alias(va, target_ipa, len, content, access, services)
     }
 
@@ -2920,6 +2965,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), carrick_aarch64::vmm::GuestAliasRefusal> {
         self.state
+            .task
+            .stage2
             .publish_guest_host_alias(va, gpa, len, writable, services)
     }
 
@@ -2929,7 +2976,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         len: usize,
         services: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
-        self.state.restore_guest_shared_identity(va, len, services)
+        self.state
+            .task
+            .stage2
+            .restore_guest_shared_identity(va, len, services)
     }
 
     fn publish_private_repoint(
@@ -2940,6 +2990,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         self.state
+            .task
+            .stage2
             .publish_private_repoint(va, overlay_ipa, len, access)
     }
 
@@ -2951,6 +3003,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         access: carrick_mmu_core::aarch64::UserLeafAccess,
     ) -> Result<(), TrapError> {
         self.state
+            .task
+            .stage2
             .publish_shared_repoint(va, target_ipa, len, access)
     }
 
@@ -3035,7 +3089,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        self.state.set_no_access(address, len, no_access);
+        self.state
+            .task
+            .stage2
+            .set_no_access(address, len, no_access);
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -3043,7 +3100,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn shared_futex_location(&self, backing_gpa: Gpa) -> Option<SharedFutexLocation> {
-        self.state.shared_futex_location(backing_gpa.raw())
+        self.state
+            .task
+            .stage2
+            .shared_futex_location(backing_gpa.raw())
     }
 
     fn on_unmap(&mut self, va: u64, len: usize) -> Result<(), TrapError> {
@@ -3116,7 +3176,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn exec_protections(&self) -> Option<carrick_guest_mem::UserMemoryAuthority> {
-        Some(self.state.task_protections_authority())
+        Some(self.state.task.stage2.task_protections_authority())
     }
 
     // ── threaded sibling lifecycle ──
@@ -3212,11 +3272,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
-        self.state.commit_process_materialization()
+        self.state.task.stage2.commit_process_materialization()
     }
 
     fn abort_process_materialization(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state.abort_process_materialization()?;
+        self.state.task.stage2.abort_process_materialization()?;
         // A materialized fork child's vCPU never ran: its setup failed.
         let site = crate::trap::VcpuDestroySite::CreationError;
         self.state
@@ -3544,7 +3604,7 @@ mod task_only_materializer_tests {
             .find("self._backend.activate()")
             .expect("inventory activation");
         let publish = activate_child
-            .find("task.publish_pending_fork_frame_receipts();")
+            .find("task.stage2.publish_pending_fork_frame_receipts();")
             .expect("fork-frame receipt publication");
         let park = activate_child
             .find("task.registration = self._backend.take_registration();")
@@ -3552,7 +3612,7 @@ mod task_only_materializer_tests {
 
         assert_eq!(
             activate_child
-                .matches("task.publish_pending_fork_frame_receipts();")
+                .matches("task.stage2.publish_pending_fork_frame_receipts();")
                 .count(),
             1,
             "activation must publish the observation copy exactly once"
@@ -3968,7 +4028,7 @@ mod task_only_materializer_tests {
             "inventory_stage2_map",
             "lease.mark_mapped()",
             "rebind_inherited_alias_to_process",
-            "Self::stage_mapping",
+            "Stage2State::stage_mapping",
             "process_reservation.commit(())",
             "PendingForkFrameReceipt",
         ] {

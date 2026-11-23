@@ -3898,6 +3898,8 @@ impl crate::trap::HvfVmState {
             }
         } else {
             let row = self
+                .task
+                .stage2
                 .mappings
                 .iter_mut()
                 .find(|row| row.start == carrick_el1_abi::EL1_REGION_BASE)

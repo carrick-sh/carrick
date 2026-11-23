@@ -409,7 +409,7 @@ impl PersistentCarrierMappings {
     }
 
     pub(crate) fn host_pointer_for_ipa(&self, ipa: u64, length: usize) -> Option<*mut u8> {
-        let mapping = HvfVmState::mapping_for_ipa_range(&self.mappings, ipa, length.max(1))?;
+        let mapping = Stage2State::mapping_for_ipa_range(&self.mappings, ipa, length.max(1))?;
         let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
         Some(unsafe { mapping.host_addr.add(offset) })
     }
@@ -965,7 +965,7 @@ impl HvfVmState {
         // memory once, for every process the carrier runs.
         super::stage2_backend::install_registered_ipc_window(&custody)?;
         let carrier_mappings = std::sync::Arc::new(PersistentCarrierMappings::extract(
-            &mut self.mappings,
+            &mut self.task.stage2.mappings,
             custody,
         )?);
 
@@ -1150,6 +1150,8 @@ impl HvfVmState {
     /// the sibling vCPU via `restore_thread_start` after `from_thread_spec`.
     pub(crate) fn build_thread_spec(&self) -> Result<ThreadSpec, TrapError> {
         let mappings: Vec<ThreadMappingDesc> = self
+            .task
+            .stage2
             .mappings
             .iter()
             .map(ThreadMappingDesc::from_region)
@@ -1157,15 +1159,15 @@ impl HvfVmState {
         Ok(ThreadSpec {
             vm: (*self._vm).clone(),
             mappings,
-            mm_access: std::sync::Arc::clone(&self.mm_access),
+            mm_access: std::sync::Arc::clone(&self.task.stage2.mm_access),
             carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
-            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
-            mm_root_slot: self.mm_root_slot,
-            container_root: self.container_root,
-            cow_authority: self.cow_authority.clone(),
-            cow_identity: self.cow_identity,
+            persistent_vm_lifecycle: self.task.stage2.persistent_vm_lifecycle,
+            mm_root_slot: self.task.stage2.mm_root_slot,
+            container_root: self.task.stage2.container_root,
+            cow_authority: self.task.stage2.cow_authority.clone(),
+            cow_identity: self.task.stage2.cow_identity,
         })
     }
 
@@ -1200,17 +1202,26 @@ impl HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
-                #[cfg(not(test))]
-                custody,
-                mappings: TaskMappingIndex::new(),
-                mm_root_slot,
-                container_root,
-                pending_exec_mm_root_slot: None,
-                pending_exec_asid: None,
-                pending_exec_predecessor_identity: None,
-                pending_exec_stage2_cleanup: None,
-                shared_process_mm: false,
-                mm_access,
+                stage2: Stage2State {
+                    #[cfg(not(test))]
+                    custody,
+                    mappings: TaskMappingIndex::new(),
+                    mm_root_slot,
+                    container_root,
+                    pending_exec_mm_root_slot: None,
+                    pending_exec_asid: None,
+                    pending_exec_predecessor_identity: None,
+                    pending_exec_stage2_cleanup: None,
+                    shared_process_mm: false,
+                    mm_access,
+                    persistent_vm_lifecycle,
+                    cow_authority,
+                    cow_identity,
+                    pending_fork_frame_receipts: Vec::new(),
+                    pending_process_aliases: Vec::new(),
+                    fail_next_begin_exec_inventory: false,
+                    cow_rollback_scratch: None,
+                },
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -1218,13 +1229,6 @@ impl HvfVmState {
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
                 live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
-                persistent_vm_lifecycle,
-                cow_authority,
-                cow_identity,
-                pending_fork_frame_receipts: Vec::new(),
-                pending_process_aliases: Vec::new(),
-                fail_next_begin_exec_inventory: false,
-                cow_rollback_scratch: None,
                 registration: None,
             },
             carrier_mappings: None,
@@ -1244,7 +1248,11 @@ impl HvfVmState {
             // an already-mapped no-op and at worst map-table churn while other
             // vCPUs are running. Keep only local metadata used by syscall-path
             // guest-memory accessors.
-            state.mappings.insert(mapping.into_unowned_region());
+            state
+                .task
+                .stage2
+                .mappings
+                .insert(mapping.into_unowned_region());
         }
 
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;

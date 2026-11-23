@@ -148,7 +148,7 @@ fn shared_futex_route_skips_private_row_at_recycled_ipa() {
     retired_private.host_addr = 0x1177_d0000usize as *mut u8;
     let mappings = TaskMappingIndex::from_iter([shared, retired_private]);
 
-    let location = HvfVmState::shared_futex_mapping_for_ipa(&mappings, backing_ipa + 4, false)
+    let location = Stage2State::shared_futex_mapping_for_ipa(&mappings, backing_ipa + 4, false)
         .expect("the older exact shared owner must remain routable");
 
     assert_eq!(location.wait_addr().raw(), 0x1046_78004);
@@ -296,11 +296,12 @@ impl FakeStageCopyHarness {
         let mut copied = 0usize;
         let mut plan = Vec::new();
         while copied < length {
-            let (chunk_address, chunk_len) = HvfVmState::guest_copy_chunk(address, copied, length)?;
+            let (chunk_address, chunk_len) =
+                Stage2State::guest_copy_chunk(address, copied, length)?;
             let stage1_ipa = crate::memory::is_high_va(chunk_address)
                 .then(|| self.translate(chunk_address))
                 .flatten();
-            let mapping_idx = HvfVmState::mapping_index_for_range(
+            let mapping_idx = Stage2State::mapping_index_for_range(
                 &self.mappings,
                 chunk_address,
                 chunk_len,
@@ -343,7 +344,7 @@ fn high_va_mapping_lookup_prefers_stage1_ipa_owner_over_newer_va_overlap() {
     ];
 
     let idx =
-        HvfVmState::mapping_index_for_range(&mappings, b_start + 0x1000, 8, Some(b_ipa + 0x1000));
+        Stage2State::mapping_index_for_range(&mappings, b_start + 0x1000, 8, Some(b_ipa + 0x1000));
 
     assert_eq!(idx, Some(0));
 }
@@ -366,7 +367,7 @@ fn guest_copy_chunks_reselect_stage1_owner_across_alias_boundary() {
     // start and use it for bytes after new_start, even though stage-1 has
     // already repointed that tail to the newer alias.
     assert_eq!(
-        HvfVmState::mapping_index_for_range(
+        Stage2State::mapping_index_for_range(
             &mappings,
             address,
             length,
@@ -379,13 +380,13 @@ fn guest_copy_chunks_reselect_stage1_owner_across_alias_boundary() {
     let mut owners = Vec::new();
     while offset < length {
         let (chunk_address, chunk_len) =
-            HvfVmState::guest_copy_chunk(address, offset, length).unwrap();
+            Stage2State::guest_copy_chunk(address, offset, length).unwrap();
         let stage1_ipa = if chunk_address < new_start {
             old_ipa + (chunk_address - old_start)
         } else {
             new_ipa + (chunk_address - new_start)
         };
-        let idx = HvfVmState::mapping_index_for_range(
+        let idx = Stage2State::mapping_index_for_range(
             &mappings,
             chunk_address,
             chunk_len,
@@ -502,7 +503,7 @@ fn mapping_lookup_falls_back_to_newest_overlap_without_stage1_ipa() {
     );
     let mappings = vec![old, new];
 
-    let idx = HvfVmState::mapping_index_for_range(&mappings, start + 0x1000, 8, None);
+    let idx = Stage2State::mapping_index_for_range(&mappings, start + 0x1000, 8, None);
 
     assert_eq!(idx, Some(1));
 }
@@ -518,13 +519,13 @@ fn raw_ipa_lookup_selects_rebased_mm_global_frame_backing() {
         root_slot_ipa,
     ));
 
-    let mapping = HvfVmState::mapping_for_ipa_range(&mappings, root_slot_ipa + 0x4000, 8)
+    let mapping = Stage2State::mapping_for_ipa_range(&mappings, root_slot_ipa + 0x4000, 8)
         .expect("rebased page-table IPA must resolve by IPA, not guest VA");
 
     assert_eq!(mapping.start, guest_va);
     assert_eq!(mapping.ipa, root_slot_ipa);
     assert!(
-        HvfVmState::mapping_for_ipa_range(&mappings, guest_va + 0x4000, 8).is_none(),
+        Stage2State::mapping_for_ipa_range(&mappings, guest_va + 0x4000, 8).is_none(),
         "raw GPA access must not silently select a VA-only match"
     );
 }

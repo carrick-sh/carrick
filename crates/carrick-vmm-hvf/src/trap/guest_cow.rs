@@ -94,7 +94,7 @@ pub(crate) fn provision_guest_cow_grants(
                 gpa: new_physical_ipa,
                 length: CowArmedRanges::COMPOUND_SIZE,
                 permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
-                backing: HvfVmState::private_backing_identity(),
+                backing: Stage2State::private_backing_identity(),
                 inherited_frame: None,
                 stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
                 stage2_owner: InventoryStage2OwnerIdentity {
@@ -145,7 +145,7 @@ pub(crate) fn provision_guest_cow_grants(
     Ok(published)
 }
 
-impl HvfTaskState {
+impl Stage2State {
     /// A guest COW write fault reached the host: see [`refill_guest_cow_pool`].
     pub(crate) fn refill_guest_cow_pool(
         &self,
@@ -569,7 +569,7 @@ pub(crate) fn settle_one(
         fragments,
         retirement,
         sole_owner: _,
-    } = HvfVmState::cow_inventory_split_shape(
+    } = Stage2State::cow_inventory_split_shape(
         &state.frame_inventory.ledger.lock(),
         old_physical_ipa,
         retain_old_compound,
@@ -588,7 +588,7 @@ pub(crate) fn settle_one(
         .authority
         .reserve(1, mapping_candidates, event_count)
         .map_err(|error| TrapError::Hypervisor(format!("reserve settlement: {error}")))?;
-    let split = HvfVmState::stage_cow_inventory_split(
+    let split = Stage2State::stage_cow_inventory_split(
         &mut reservation,
         old_key,
         old,
@@ -610,11 +610,11 @@ pub(crate) fn settle_one(
         .authority
         .apply(reservation.commit(()))
         .map_err(|error| TrapError::Hypervisor(format!("settlement inventory: {error}")))?;
-    let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
+    let retired_old_stage2 = Stage2State::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
         || {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
+            Stage2State::retire_stage2_extent_from_mappings_in(
                 custody,
                 &mut TaskMappingIndex::new(),
                 split.old.stage2_base,

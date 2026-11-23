@@ -76,7 +76,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
                 Vec::new(),
             )
         };
-        let parent_candidates = HvfVmState::stage_retirement(
+        let parent_candidates = Stage2State::stage_retirement(
             &mut parent,
             &mut reservation(1),
             &TestFrameMappingCount::Exact(2),
@@ -99,7 +99,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
                     .all(|byte| *byte == 0x7c)
             );
         }
-        let child_candidates = HvfVmState::stage_retirement(
+        let child_candidates = Stage2State::stage_retirement(
             &mut child,
             &mut reservation(2),
             &TestFrameMappingCount::Exact(1),
@@ -110,7 +110,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
         for (base, length, generation, _) in physical {
             assert!(child_candidates.contains(&(base, length)));
             assert!(
-                HvfVmState::retire_stage2_candidate_if_unreferenced(
+                Stage2State::retire_stage2_candidate_if_unreferenced(
                     &child.frames,
                     (base, length),
                     || {
@@ -169,7 +169,7 @@ fn lease_retirement_visits_only_the_selected_extents() {
             registry.stage2_references.insert(lease, 1);
         }
         let before = hot_path_rows_scanned(HotPathScan::FrameExtents);
-        let retirement = HvfVmState::inventory_lease_retirement_shape(
+        let retirement = Stage2State::inventory_lease_retirement_shape(
             &inventory,
             &std::collections::BTreeSet::from([AuthenticatedLease::new(target, 0)]),
             &|_| Ok(Some(1)),
@@ -242,7 +242,7 @@ fn private_alias_scopes_never_collide_across_carrier_containers() {
 }
 
 fn predecessor_test_identity(task: &HvfTaskState) -> (carrick_hal::ExecPredecessorIdentity, u64) {
-    let cow = task.cow_identity.expect("fixture COW identity");
+    let cow = task.stage2.cow_identity.expect("fixture COW identity");
     (
         carrick_hal::ExecPredecessorIdentity {
             task_serial: u64::try_from(cow.linux_pid).unwrap(),
@@ -262,26 +262,31 @@ fn bootstrap_exec_predecessor_uses_bound_kernel_identity_without_registration() 
     let mut task = hvpatch_task_state_test_fixture(31, 0x4000, 31);
     let (identity, _) = predecessor_test_identity(&task);
     assert!(task.registration.is_none());
-    bind_exec_predecessor_identity_slot(&mut task.pending_exec_predecessor_identity, identity)
-        .expect("bind bootstrap predecessor identity");
+    bind_exec_predecessor_identity_slot(
+        &mut task.stage2.pending_exec_predecessor_identity,
+        identity,
+    )
+    .expect("bind bootstrap predecessor identity");
     let mut duplicate = identity;
     duplicate.thread_serial += 1;
-    assert!(bind_exec_predecessor_identity_slot(
-        &mut task.pending_exec_predecessor_identity,
-        duplicate,
-    )
-    .is_err());
+    assert!(
+        bind_exec_predecessor_identity_slot(
+            &mut task.stage2.pending_exec_predecessor_identity,
+            duplicate,
+        )
+        .is_err()
+    );
     assert_eq!(
-        task.pending_exec_predecessor_identity,
+        task.stage2.pending_exec_predecessor_identity,
         Some(identity),
         "duplicate bind must not replace the first exact identity",
     );
 
     let observed = task
-        .take_exec_predecessor_identity(task.cow_identity.unwrap())
+        .take_exec_predecessor_identity(task.stage2.cow_identity.unwrap())
         .expect("bound bootstrap predecessor identity");
     assert_eq!(observed, identity);
-    assert!(task.pending_exec_predecessor_identity.is_none());
+    assert!(task.stage2.pending_exec_predecessor_identity.is_none());
 }
 
 #[test]
@@ -342,7 +347,8 @@ fn exec_predecessor_rejects_each_retained_authority_anchor_mismatch() {
     assert_exec_predecessor_mismatch(task, cow, KERNEL_REGISTRATION);
 
     let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
-    task.pending_exec_predecessor_identity
+    task.stage2
+        .pending_exec_predecessor_identity
         .as_mut()
         .unwrap()
         .linux_pid += 1;
@@ -354,11 +360,16 @@ fn exec_predecessor_rejects_each_retained_authority_anchor_mismatch() {
     assert_exec_predecessor_mismatch(task, cow, KERNEL_COW);
 
     let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
-    task.pending_exec_predecessor_identity.as_mut().unwrap().mm += 1;
+    task.stage2
+        .pending_exec_predecessor_identity
+        .as_mut()
+        .unwrap()
+        .mm += 1;
     assert_exec_predecessor_mismatch(task, cow, KERNEL_COW);
 
     let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
-    task.pending_exec_predecessor_identity
+    task.stage2
+        .pending_exec_predecessor_identity
         .as_mut()
         .unwrap()
         .asid += 1;
@@ -416,7 +427,7 @@ fn exec_predecessor_authority_test_fixture() -> (
         mm: 200,
         asid: 8,
     };
-    task.cow_identity = Some(current_cow);
+    task.stage2.cow_identity = Some(current_cow);
     let directory = std::sync::Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
     task.registration = Some(HvpatchTaskRegistration {
@@ -452,7 +463,7 @@ fn exec_predecessor_authority_test_fixture() -> (
         asid: 8,
     };
     bind_exec_predecessor_identity_slot(
-        &mut task.pending_exec_predecessor_identity,
+        &mut task.stage2.pending_exec_predecessor_identity,
         current_kernel,
     )
     .expect("bind current Kernel predecessor identity");
@@ -1290,10 +1301,10 @@ fn retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent() {
     // inheriting whatever a sibling left behind.
     carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
     let mut state = HvfTaskState::neutral();
-    state.persistent_vm_lifecycle = true;
+    state.stage2.persistent_vm_lifecycle = true;
     // Under persistent VM lifecycle, if the initial eager mmap arena was not mapped
     // (as for subsequent containers in a persistent carrier), retirement is an idempotent Ok(()).
-    assert!(state.retire_initial_mmap_arena().is_ok());
+    assert!(state.stage2.retire_initial_mmap_arena().is_ok());
 }
 
 #[test]
@@ -1312,9 +1323,9 @@ fn second_container_never_unmaps_the_carrier_arena_again() {
     carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
 
     let mut first = HvfTaskState::neutral();
-    first.persistent_vm_lifecycle = true;
+    first.stage2.persistent_vm_lifecycle = true;
     assert!(
-        first.retire_initial_mmap_arena().is_ok(),
+        first.stage2.retire_initial_mmap_arena().is_ok(),
         "first container retires the eager arena"
     );
     assert!(
@@ -1326,20 +1337,20 @@ fn second_container_never_unmaps_the_carrier_arena_again() {
     // the guard were absent this would be validated and unmapped a second
     // time. With the guard it returns before touching `mappings` at all.
     let mut second = HvfTaskState::neutral();
-    second.persistent_vm_lifecycle = true;
+    second.stage2.persistent_vm_lifecycle = true;
     let mut region = thread_sibling_tests::mapped_region(
         crate::memory::LINUX_MMAP_BASE,
         crate::memory::LINUX_MMAP_BASE + 0x4000,
         crate::memory::LINUX_MMAP_BASE,
     );
     region.physical_size = 0x4000;
-    second.mappings.insert(region);
+    second.stage2.mappings.insert(region);
     assert!(
-        second.retire_initial_mmap_arena().is_ok(),
+        second.stage2.retire_initial_mmap_arena().is_ok(),
         "a later container must skip retirement entirely"
     );
     assert_eq!(
-        second.mappings.len(),
+        second.stage2.mappings.len(),
         1,
         "the later container's arena mapping must be left untouched"
     );
@@ -1359,15 +1370,15 @@ fn retire_initial_mmap_arena_rejects_corrupted_shape() {
     // caller regardless of sibling test order.
     carrier_initial_arena_retired().store(false, std::sync::atomic::Ordering::Release);
     let mut state = HvfTaskState::neutral();
-    state.persistent_vm_lifecycle = true;
+    state.stage2.persistent_vm_lifecycle = true;
     let mut region = thread_sibling_tests::mapped_region(
         crate::memory::LINUX_MMAP_BASE,
         crate::memory::LINUX_MMAP_BASE + 0x4000,
         crate::memory::LINUX_MMAP_BASE,
     );
     region.physical_size = 0x4000;
-    state.mappings.insert(region);
-    assert!(state.retire_initial_mmap_arena().is_err());
+    state.stage2.mappings.insert(region);
+    assert!(state.stage2.retire_initial_mmap_arena().is_err());
 }
 
 #[test]
@@ -1487,7 +1498,7 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
     mapping.stage2_lease = Some(lease);
     let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
-    task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+    task.stage2.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::from_region(mapping),
         extents: [(
             (0x1234_0000, 0x4000),
@@ -1500,7 +1511,7 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
         .collect(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        mm_root_slot: task.mm_root_slot,
+        mm_root_slot: task.stage2.mm_root_slot,
         mm_access: None,
         predecessor_identity,
         predecessor_mm,
@@ -1509,13 +1520,13 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
     });
 
     assert!(alias_backing_is_live(host_addr as usize));
-    HvfVmState::retire_task_state_exec_predecessor(&mut task).expect("post-TLBI detached cleanup");
+    Stage2State::retire_task_state_exec_predecessor(&mut task).expect("post-TLBI detached cleanup");
     assert!(
         !observed.load(std::sync::atomic::Ordering::SeqCst),
         "lease Drop must not execute stage-2 retirement"
     );
     assert!(!alias_backing_is_live(host_addr as usize));
-    assert!(task.pending_exec_stage2_cleanup.is_none());
+    assert!(task.stage2.pending_exec_stage2_cleanup.is_none());
 }
 
 #[test]
@@ -1528,7 +1539,7 @@ fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        mm_root_slot: task.mm_root_slot,
+        mm_root_slot: task.stage2.mm_root_slot,
         mm_access: None,
         predecessor_identity,
         predecessor_mm,
@@ -1589,7 +1600,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         .insert((lease_key.0, lease_key.1 as u64), 1);
     let mut task = hvpatch_task_state_test_fixture(17, 0x4000, 17);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
-    let predecessor_scope = task.mm_root_slot.expect("predecessor MM root slot");
+    let predecessor_scope = task.stage2.mm_root_slot.expect("predecessor MM root slot");
     let sibling_scope = (
         predecessor_scope.0 + predecessor_scope.1,
         predecessor_scope.1,
@@ -1627,7 +1638,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
             size: sibling_scope.1,
         },
     ));
-    task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+    task.stage2.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::from_region(mapping),
         extents: [(
             lease_key,
@@ -1646,7 +1657,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
             },
         )],
         frames,
-        mm_root_slot: task.mm_root_slot,
+        mm_root_slot: task.stage2.mm_root_slot,
         mm_access: None,
         predecessor_identity,
         predecessor_mm,
@@ -1654,7 +1665,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         armed: true,
     });
 
-    HvfVmState::retire_task_state_exec_predecessor(&mut task)
+    Stage2State::retire_task_state_exec_predecessor(&mut task)
         .expect("recheck deferred predecessor cleanup");
     assert!(
         !observed.load(std::sync::atomic::Ordering::SeqCst),
@@ -1713,7 +1724,7 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
 
     let mut task = hvpatch_task_state_test_fixture(18, 0x4000, 18);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
-    task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+    task.stage2.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::from_region(thread_sibling_tests::mapped_region(
             lease_key.0,
             lease_key.0 + lease_key.1 as u64,
@@ -1733,7 +1744,7 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
             .collect(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        mm_root_slot: task.mm_root_slot,
+        mm_root_slot: task.stage2.mm_root_slot,
         mm_access: None,
         predecessor_identity,
         predecessor_mm,
@@ -1741,7 +1752,7 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
         armed: true,
     });
 
-    HvfVmState::retire_task_state_exec_predecessor(&mut task)
+    Stage2State::retire_task_state_exec_predecessor(&mut task)
         .expect("reject recycled exec predecessor owner");
     assert_eq!(
         global_frame_host_owner_generation(lease_key.0, lease_key.1 as u64),
@@ -1794,8 +1805,8 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
     let task = hvpatch_task_state_test_fixture(222, 0x4000, 222);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
     let scope = AliasOwnershipScope::MmRootSlot {
-        base: task.mm_root_slot.unwrap().0,
-        size: task.mm_root_slot.unwrap().1,
+        base: task.stage2.mm_root_slot.unwrap().0,
+        size: task.stage2.mm_root_slot.unwrap().1,
     };
     let old_alias = AliasBacking {
         start: 0x6002_3400_0000,
@@ -1839,7 +1850,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         .collect(),
         predecessor_aliases: vec![old_alias],
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        mm_root_slot: task.mm_root_slot,
+        mm_root_slot: task.stage2.mm_root_slot,
         mm_access: None,
         predecessor_identity,
         predecessor_mm,
@@ -1902,7 +1913,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
 
     let aliases = alias_registry()
         .lock()
-        .process_visible_ordered(task.mm_root_slot, task.container_root);
+        .process_visible_ordered(task.stage2.mm_root_slot, task.stage2.container_root);
     assert!(aliases.contains(&successor_alias));
     assert!(
         alias_registry()
@@ -1914,8 +1925,8 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         missing_process_aliases(
             &std::collections::HashSet::new(),
             &aliases,
-            task.mm_root_slot,
-            task.container_root,
+            task.stage2.mm_root_slot,
+            task.stage2.container_root,
         ),
         vec![successor_alias],
         "the reused exact alias must remain eligible for fork materialization",
@@ -1934,7 +1945,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
 fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut task = hvpatch_task_state_test_fixture(8, 0x8000, 8);
-    task.shared_process_mm = true;
+    task.stage2.shared_process_mm = true;
     let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -1955,7 +1966,8 @@ fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
         )
         .unwrap();
     let parent_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(tables));
-    task.mm_access
+    task.stage2
+        .mm_access
         .bind_page_tables_authority(parent_tables.clone());
     assert_eq!(
         parent_tables
@@ -1967,7 +1979,8 @@ fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
     parent_ledger.lock().initialized = true;
     let (_unused, replacement) = inventory_pair(11);
 
-    task.begin_exec_inventory(None, replacement)
+    task.stage2
+        .begin_exec_inventory(None, replacement)
         .expect("arm shared-process exec inventory");
 
     assert_eq!(
@@ -2013,12 +2026,12 @@ fn retained_old_mm_reports_no_exec_retirement_extents() {
         );
     }
 
-    assert!(task.exec_retires_old_mm());
-    assert_eq!(task.exec_retired_extent_count(), 1);
+    assert!(task.stage2.exec_retires_old_mm());
+    assert_eq!(task.stage2.exec_retired_extent_count(), 1);
 
-    task.shared_process_mm = true;
-    assert!(!task.exec_retires_old_mm());
-    assert_eq!(task.exec_retired_extent_count(), 0);
+    task.stage2.shared_process_mm = true;
+    assert!(!task.stage2.exec_retires_old_mm());
+    assert_eq!(task.stage2.exec_retired_extent_count(), 0);
 }
 
 #[test]
@@ -2661,7 +2674,7 @@ fn a_stale_alias_row_never_retires_the_recycled_lease_successor() {
 
     let stale = AuthenticatedLease::from_rows(&planned, &[row(5083)]);
     let shape =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &stale, &only_owner).unwrap();
+        Stage2State::inventory_lease_retirement_shape(&inventory, &stale, &only_owner).unwrap();
     assert!(
         shape.mappings.is_empty() && shape.frames.is_empty() && shape.stage2_leases.is_empty(),
         "a row of retired incarnation 5083 retired the successor at the recycled IPA: {shape:?}"
@@ -2669,7 +2682,7 @@ fn a_stale_alias_row_never_retires_the_recycled_lease_successor() {
 
     let current = AuthenticatedLease::from_rows(&planned, &[row(5083), row(5169)]);
     let shape =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &current, &only_owner).unwrap();
+        Stage2State::inventory_lease_retirement_shape(&inventory, &current, &only_owner).unwrap();
     assert_eq!(shape.mappings, vec![(lease, successor)]);
     assert_eq!(shape.stage2_leases, planned);
 
@@ -2711,7 +2724,7 @@ fn lease_retirement_waits_for_the_last_global_stage2_reference() {
     let leases = std::collections::BTreeSet::from([AuthenticatedLease::new(lease, 0)]);
     let authority_agrees = |_frame| Ok(Some(2usize));
     let shared =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
+        Stage2State::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
             .unwrap();
     assert!(shared.frames.is_empty());
     assert!(shared.stage2_leases.is_empty());
@@ -2722,7 +2735,7 @@ fn lease_retirement_waits_for_the_last_global_stage2_reference() {
         registry.stage2_references.insert(lease, 2);
     }
     let final_owner =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
+        Stage2State::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
             .unwrap();
     assert_eq!(
         final_owner.frames,
@@ -2800,16 +2813,16 @@ fn process_retirement_task(
     .unwrap();
     let host_addr = host.as_ptr();
     let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
-    task.cow_authority = Some(std::sync::Arc::new(authority));
-    task.mappings[0].start = key.0;
-    task.mappings[0].end = key.0 + key.1;
-    task.mappings[0].ipa = key.0;
-    task.mappings[0].physical_ipa = key.0;
-    task.mappings[0].host_addr = host_addr;
-    task.mappings[0].size = key.1 as usize;
-    task.mappings[0].physical_size = key.1 as usize;
-    task.mappings[0].owner_generation = generation;
-    task.mappings[0].stage2_lease = Some(GlobalFrameStage2Lease::fixed(key.0, key.1));
+    task.stage2.cow_authority = Some(std::sync::Arc::new(authority));
+    task.stage2.mappings[0].start = key.0;
+    task.stage2.mappings[0].end = key.0 + key.1;
+    task.stage2.mappings[0].ipa = key.0;
+    task.stage2.mappings[0].physical_ipa = key.0;
+    task.stage2.mappings[0].host_addr = host_addr;
+    task.stage2.mappings[0].size = key.1 as usize;
+    task.stage2.mappings[0].physical_size = key.1 as usize;
+    task.stage2.mappings[0].owner_generation = generation;
+    task.stage2.mappings[0].stage2_lease = Some(GlobalFrameStage2Lease::fixed(key.0, key.1));
     {
         let mut inventory = task.frame_inventory.lock();
         inventory.initialized = true;
@@ -2876,9 +2889,9 @@ fn process_retirement_does_not_retire_a_frame_still_mapped_by_another_mm() {
     let (mut task, frame, mapping, _key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(2));
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("stage process-terminal retirement");
-    let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+    let commit = Stage2State::take_task_state_retirement_inventory(&mut task)
         .expect("process-terminal retirement commit");
     assert!(commit.batch().events().iter().any(|event| {
         matches!(
@@ -2937,10 +2950,11 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(451));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(452));
     let mut task = hvpatch_task_state_test_fixture(12, root_slot.0, 12);
-    task.mm_root_slot = Some(root_slot);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
-    task.mappings = TaskMappingIndex::from_region(root_region);
-    task.mm_access
+    task.stage2.mm_root_slot = Some(root_slot);
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+    task.stage2.mappings = TaskMappingIndex::from_region(root_region);
+    task.stage2
+        .mm_access
         .install_structural_mapping_authority(Some(root_slot), std::sync::Arc::clone(&root_owner))
         .expect("install exact root authority");
     {
@@ -2981,7 +2995,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     }
 
     let proof =
-        HvfVmState::retire_task_state_process_mappings_with_root_proof(&mut task, root_slot)
+        Stage2State::retire_task_state_process_mappings_with_root_proof(&mut task, root_slot)
             .expect("retire process whose structural root frame is not globally complete");
     assert_eq!(proof.root_slot_base(), root_slot.0);
     assert_eq!(proof.root_slot_size(), root_slot.1);
@@ -3070,10 +3084,11 @@ fn shared_inventory_root_fixture(
         .expect("shared-inventory root has structural custody");
     let identity = owner.record_identity();
     let mut task = hvpatch_task_state_test_fixture(12, root_slot.0, 12);
-    task.mm_root_slot = Some(root_slot);
-    task.shared_process_mm = true;
-    task.mappings = TaskMappingIndex::from_region(root_region);
-    task.mm_access
+    task.stage2.mm_root_slot = Some(root_slot);
+    task.stage2.shared_process_mm = true;
+    task.stage2.mappings = TaskMappingIndex::from_region(root_region);
+    task.stage2
+        .mm_access
         .install_structural_mapping_authority(Some(root_slot), std::sync::Arc::clone(&owner))
         .expect("install shared-inventory exact root authority");
     (std::sync::Arc::clone(custody), task, owner, identity)
@@ -3107,7 +3122,7 @@ fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
         );
     }
 
-    let proof = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
+    let proof = Stage2State::retire_task_state_mm_root_only(&mut task, root_slot)
         .expect("retire only final shared-inventory root");
 
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
@@ -3129,7 +3144,7 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let root_slot = (0x7d60_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
 
-    let mismatch = HvfVmState::retire_task_state_mm_root_only(
+    let mismatch = Stage2State::retire_task_state_mm_root_only(
         &mut task,
         (root_slot.0 + root_slot.1, root_slot.1),
     )
@@ -3144,13 +3159,13 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let pin = custody
         .pin_stage2_record(identity)
         .expect("pin exact structural root record");
-    let pinned = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
+    let pinned = Stage2State::retire_task_state_mm_root_only(&mut task, root_slot)
         .expect_err("an active record pin must prevent a root proof");
     assert!(pinned.to_string().contains("remained nonterminal"));
     assert!(custody.stage2_record_snapshot(identity.record_id).is_some());
 
     drop(pin);
-    let proof = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
+    let proof = Stage2State::retire_task_state_mm_root_only(&mut task, root_slot)
         .expect("retry exact root retirement after pin release");
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
     assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
@@ -3163,15 +3178,15 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d80_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
-    task.shared_process_mm = false;
+    task.stage2.shared_process_mm = false;
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
-    task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
-        mappings: std::mem::take(&mut task.mappings),
+    task.stage2.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+        mappings: std::mem::take(&mut task.stage2.mappings),
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
         mm_root_slot: Some(root_slot),
-        mm_access: Some(std::sync::Arc::clone(&task.mm_access)),
+        mm_access: Some(std::sync::Arc::clone(&task.stage2.mm_access)),
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
@@ -3179,7 +3194,7 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
     });
 
     let proof =
-        HvfVmState::retire_task_state_exec_predecessor_with_root_proof(&mut task, root_slot)
+        Stage2State::retire_task_state_exec_predecessor_with_root_proof(&mut task, root_slot)
             .expect("exec predecessor exact root proof");
 
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
@@ -3194,16 +3209,16 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
     let key = (0x7e00_0000_0000_u64, 0x4000_u64);
     let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
-    task.mappings[0].start = key.0;
-    task.mappings[0].end = key.0 + key.1;
-    task.mappings[0].ipa = key.0;
-    task.mappings[0].physical_ipa = key.0;
-    task.mappings[0].host_addr = 0x1000usize as *mut u8;
-    task.mappings[0].size = key.1 as usize;
-    task.mappings[0].physical_size = key.1 as usize;
-    task.mappings[0].owner_generation = 0;
-    task.mappings[0].stage2_lease = None;
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+    task.stage2.mappings[0].start = key.0;
+    task.stage2.mappings[0].end = key.0 + key.1;
+    task.stage2.mappings[0].ipa = key.0;
+    task.stage2.mappings[0].physical_ipa = key.0;
+    task.stage2.mappings[0].host_addr = 0x1000usize as *mut u8;
+    task.stage2.mappings[0].size = key.1 as usize;
+    task.stage2.mappings[0].physical_size = key.1 as usize;
+    task.stage2.mappings[0].owner_generation = 0;
+    task.stage2.mappings[0].stage2_lease = None;
     {
         let mut inventory = task.frame_inventory.lock();
         inventory.initialized = true;
@@ -3244,7 +3259,7 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
     register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
     let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("retire the backend's final known row");
 
     {
@@ -3268,8 +3283,8 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
         "carrier teardown consumes the one-shot authority-retained handoff",
     );
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
+        Stage2State::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+            Stage2State::retire_stage2_extent_from_mappings(
                 &mut TaskMappingIndex::new(),
                 key.0,
                 key.1,
@@ -3303,8 +3318,8 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
     const EXTENT_SIZE: u64 = 0x4000;
 
     let mut task = hvpatch_task_state_test_fixture(12, 0x1_0000_0000, 12);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
-    task.mappings.clear();
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+    task.stage2.mappings.clear();
 
     let mut guards = Vec::with_capacity(EXTENTS);
     let mut hosts = Vec::with_capacity(EXTENTS);
@@ -3359,7 +3374,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
         guards.push(TestGlobalFrameOwnerGuard { key, generation });
         hosts.push(host_addr);
     }
-    task.mappings.extend(rows);
+    task.stage2.mappings.extend(rows);
 
     {
         let mut inventory = task.frame_inventory.lock();
@@ -3402,7 +3417,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
     }
 
     let before = hot_path_rows_scanned(HotPathScan::TaskMappings);
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("stage terminal retirement over a many-extent inventory");
     let scanned = hot_path_rows_scanned(HotPathScan::TaskMappings) - before;
 
@@ -3435,7 +3450,7 @@ fn process_retirement_does_not_combine_counts_from_different_populations() {
     }
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed_attempts = std::sync::Arc::clone(&attempts);
-    task.cow_authority = Some(std::sync::Arc::new(
+    task.stage2.cow_authority = Some(std::sync::Arc::new(
         TestFrameMappingCount::SnapshotThenInterleave(Box::new(move || {
             observed_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Deterministic contender: try the real backend registry lock
@@ -3449,10 +3464,10 @@ fn process_retirement_does_not_combine_counts_from_different_populations() {
             }
         })),
     ));
-    let authority = task.cow_authority.as_ref().unwrap();
+    let authority = task.stage2.cow_authority.as_ref().unwrap();
     let mut inventory = task.frame_inventory.lock();
     let mut reservation = inventory.retirement_reservation.take().unwrap();
-    HvfVmState::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())
+    Stage2State::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())
         .expect("stage retirement with one sibling publication attempt");
     let commit = reservation.commit(());
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3473,9 +3488,9 @@ fn process_retirement_retires_the_exact_last_authoritative_mapping() {
     let (mut task, frame, _, _key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("stage last-owner process-terminal retirement");
-    let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+    let commit = Stage2State::take_task_state_retirement_inventory(&mut task)
         .expect("last-owner process-terminal retirement commit");
     assert!(commit.batch().events().iter().any(|event| {
         matches!(
@@ -3493,14 +3508,14 @@ fn process_retirement_fails_when_the_authoritative_mapping_count_is_unavailable(
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _, _, _key, _guard) = process_retirement_task(TestFrameMappingCount::Error);
 
-    let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+    let error = Stage2State::retire_task_state_process_mappings(&mut task)
         .expect_err("an unavailable VM-wide mapping count must fail retirement");
     assert!(
         error.to_string().contains("injected mapping-count failure"),
         "the authority-query cause must remain visible: {error}",
     );
     assert!(
-        HvfVmState::take_task_state_retirement_inventory(&mut task).is_none(),
+        Stage2State::take_task_state_retirement_inventory(&mut task).is_none(),
         "a failed authority query must not publish a retirement commit",
     );
 }
@@ -3510,8 +3525,8 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
-    let stale_host = task.mappings[0].host_addr as usize;
-    let stale_generation = task.mappings[0].owner_generation;
+    let stale_host = task.stage2.mappings[0].host_addr as usize;
+    let stale_generation = task.stage2.mappings[0].owner_generation;
 
     let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
@@ -3562,9 +3577,9 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
         .lock()
         .extend([stale_alias, successor_alias]);
 
-    task.mappings[0].stage2_lease = None;
+    task.stage2.mappings[0].stage2_lease = None;
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("process-terminal retirement should succeed");
     assert_eq!(
         global_frame_host_owner_generation(key.0, key.1),
@@ -3597,7 +3612,7 @@ fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (mut task, _frame, _mapping, key, _guard) =
         process_retirement_task(TestFrameMappingCount::Exact(1));
-    let live_generation = task.mappings[0].owner_generation;
+    let live_generation = task.stage2.mappings[0].owner_generation;
     assert_ne!(live_generation, 0);
 
     for stale_generation in [
@@ -3605,6 +3620,7 @@ fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
         live_generation.saturating_sub(2),
     ] {
         let mut stale = hvpatch_task_state_test_fixture(13, key.0, 13)
+            .stage2
             .mappings
             .into_values()
             .next_back()
@@ -3619,10 +3635,10 @@ fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
         stale.owner_generation = stale_generation;
         stale.is_dynamic_alias = true;
         stale.stage2_lease = None;
-        task.mappings.insert(stale);
+        task.stage2.mappings.insert(stale);
     }
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("the inventory's exact live owner must outrank stale descriptor rows");
     assert_eq!(
         global_frame_host_owner_generation(key.0, key.1),
@@ -3643,12 +3659,12 @@ fn process_retirement_uses_inventory_owner_when_task_local_rows_are_absent() {
     // publication snapshot. Runtime-created extents remain authoritative in
     // the inventory but need not have a duplicate row in that snapshot.
     // The carrier/global owner retains the physical lease in this state.
-    task.mappings[0].stage2_lease = None;
-    task.mappings.clear();
+    task.stage2.mappings[0].stage2_lease = None;
+    task.stage2.mappings.clear();
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("the exact inventory/global owner pair is sufficient authority");
-    let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+    let commit = Stage2State::take_task_state_retirement_inventory(&mut task)
         .expect("rowless process-terminal retirement commit");
     assert!(commit.batch().events().iter().any(|event| {
         matches!(
@@ -3682,10 +3698,10 @@ fn process_retirement_rejects_rowless_inventory_not_owned_by_the_retiring_mm() {
         process_retirement_task(TestFrameMappingCount::ExactButMappingNotLive(1));
     let live =
         global_frame_host_owner_identity(key.0, key.1).expect("the physical owner starts live");
-    task.mappings[0].stage2_lease = None;
-    task.mappings.clear();
+    task.stage2.mappings[0].stage2_lease = None;
+    task.stage2.mappings.clear();
 
-    let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+    let error = Stage2State::retire_task_state_process_mappings(&mut task)
         .expect_err("physical identity alone must not authorize another MM's mapping");
     assert!(
         error.to_string().contains("not exact-live for retiring mm"),
@@ -3705,7 +3721,7 @@ fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
         process_retirement_task(TestFrameMappingCount::Exact(1));
     let live = global_frame_host_owner_identity(key.0, key.1).expect("test owner is published");
     let wrong_host = live.0 + key.1 as usize;
-    task.mappings[0].host_addr = wrong_host as *mut u8;
+    task.stage2.mappings[0].host_addr = wrong_host as *mut u8;
     task.frame_inventory
         .lock()
         .extents
@@ -3714,7 +3730,7 @@ fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
         .stage2_owner
         .host_addr = wrong_host;
 
-    let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+    let error = Stage2State::retire_task_state_process_mappings(&mut task)
         .expect_err("a generation match must not hide a host-pointer mismatch");
     assert!(
         error.to_string().contains("owner pointer drifted"),
@@ -3789,7 +3805,7 @@ fn stage_mapping_owner_rejection_leaves_all_reference_maps_unchanged() {
         vec![mapping],
     );
     let mut inventory = HvpatchFrameInventory::default();
-    let error = HvfVmState::stage_mapping(
+    let error = Stage2State::stage_mapping(
         &mut inventory,
         &mut reservation,
         InventoryMappingStage {
@@ -3998,8 +4014,8 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
     let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-    task.mappings = TaskMappingIndex::from_region(region);
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+    task.stage2.mappings = TaskMappingIndex::from_region(region);
     {
         let mut inventory = task.frame_inventory.lock();
         inventory.initialized = true;
@@ -4035,7 +4051,7 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
         );
     }
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("process-terminal retirement should succeed");
 
     assert_eq!(
@@ -4115,8 +4131,8 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
 
     // Build a task state with unowned runtime region holding the stamped owner_generation
     let mut task = hvpatch_task_state_test_fixture(21, key.0, 21);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-    task.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+    task.stage2.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
         start: 0x7fff_0000,
         ipa: key.0,
         physical_ipa: key.0,
@@ -4177,7 +4193,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
         );
     }
 
-    HvfVmState::retire_task_state_process_mappings(&mut task)
+    Stage2State::retire_task_state_process_mappings(&mut task)
         .expect("detached child retirement with registered global frame owner should succeed");
 
     assert_eq!(
@@ -4241,8 +4257,8 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
 
     // 1. Negative test: generation == 0 fails because reusable global frame extent requires owner
     let mut task_gen0 = hvpatch_task_state_test_fixture(22, key.0, 22);
-    task_gen0.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-    task_gen0.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
+    task_gen0.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+    task_gen0.stage2.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
         start: 0x7fff_0000,
         ipa: key.0,
         physical_ipa: key.0,
@@ -4301,7 +4317,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
             ),
         );
     }
-    let err = HvfVmState::retire_task_state_process_mappings(&mut task_gen0).unwrap_err();
+    let err = Stage2State::retire_task_state_process_mappings(&mut task_gen0).unwrap_err();
     assert!(
         matches!(err, TrapError::Hypervisor(ref msg) if msg.contains("unexpectedly has live global owner")),
         "expected unowned retirement error for generation 0 with live owner, got: {err}"
@@ -4310,8 +4326,8 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
     // 2. Negative test: absent owner fails authentication
     let absent_key = (key.0 + 0x10_0000, key.1);
     let mut task_absent = hvpatch_task_state_test_fixture(23, absent_key.0, 23);
-    task_absent.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-    task_absent.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
+    task_absent.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+    task_absent.stage2.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
         start: 0x7fff_0000,
         ipa: absent_key.0,
         physical_ipa: absent_key.0,
@@ -4370,7 +4386,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
             ),
         );
     }
-    let err = HvfVmState::retire_task_state_process_mappings(&mut task_absent).unwrap_err();
+    let err = Stage2State::retire_task_state_process_mappings(&mut task_absent).unwrap_err();
     assert!(
         matches!(err, TrapError::Hypervisor(ref msg) if msg.contains("the owner is absent")),
         "expected absent owner generation error, got: {err}"
@@ -4379,8 +4395,8 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
     // 3. Positive test: exact live owner generation authenticates and unmaps cleanly
     disarm_test_owner_stage2_unmap(key, owner_generation);
     let mut task_valid = hvpatch_task_state_test_fixture(24, key.0, 24);
-    task_valid.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-    task_valid.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
+    task_valid.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
+    task_valid.stage2.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
         start: 0x7fff_0000,
         ipa: key.0,
         physical_ipa: key.0,
@@ -4437,7 +4453,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
             ),
         );
     }
-    HvfVmState::retire_task_state_process_mappings(&mut task_valid)
+    Stage2State::retire_task_state_process_mappings(&mut task_valid)
         .expect("exact live owner generation must authenticate and retire cleanly");
     assert_eq!(global_frame_host_owner_generation(key.0, key.1), 0);
 }
@@ -4751,7 +4767,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
         frames.stage2_references.insert(old_key, 1);
     }
     let shape =
-        HvfVmState::cow_inventory_split_shape(&inventory, old_key.0, false, |_| Ok(Some(2)))
+        Stage2State::cow_inventory_split_shape(&inventory, old_key.0, false, |_| Ok(Some(2)))
             .expect("plan COW with a sibling-mm authority mapping");
     assert!(
         !shape.retirement.backend_frame_references_complete,
@@ -4777,7 +4793,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     let stage2_retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = std::sync::Arc::clone(&stage2_retired);
 
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, move || {
+    let retired = Stage2State::commit_cow_inventory_split(&mut inventory, &split, move || {
         observed.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     })
@@ -4802,8 +4818,8 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
         "carrier teardown must preserve a COW lease retained by Kernel authority",
     );
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
+        Stage2State::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
+            Stage2State::retire_stage2_extent_from_mappings(
                 &mut TaskMappingIndex::new(),
                 old_key.0,
                 old_key.1,
@@ -4838,7 +4854,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     }
     register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
     let frames = std::sync::Arc::clone(&inventory.frames);
-    let retirement = HvfVmState::inventory_lease_retirement_shape(
+    let retirement = Stage2State::inventory_lease_retirement_shape(
         &inventory,
         &std::collections::BTreeSet::from([AuthenticatedLease::new(key, 0)]),
         &|_| Ok(Some(2)),
@@ -4846,7 +4862,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     .expect("plan alias retirement with an out-of-population Kernel mapping");
     assert!(retirement.stage2_leases.is_empty());
 
-    HvfVmState::commit_inventory_lease_retirement(&mut inventory, &retirement)
+    Stage2State::commit_inventory_lease_retirement(&mut inventory, &retirement)
         .expect("commit alias backend retirement");
     assert!(
         !frames.lock().stage2_references.contains_key(&key),
@@ -4861,8 +4877,8 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
         "carrier teardown must preserve an alias lease retained by Kernel authority",
     );
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
+        Stage2State::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+            Stage2State::retire_stage2_extent_from_mappings(
                 &mut TaskMappingIndex::new(),
                 key.0,
                 key.1,
@@ -4883,7 +4899,7 @@ fn stale_stage2_retirement_candidate_rechecks_under_the_publication_lock() {
     let retired_in_callback = std::sync::Arc::clone(&retired);
 
     assert!(
-        !HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
+        !Stage2State::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
             retired_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         },)
@@ -4895,7 +4911,7 @@ fn stale_stage2_retirement_candidate_rechecks_under_the_publication_lock() {
     frames.lock().stage2_references.remove(&candidate);
     let frames_in_callback = std::sync::Arc::clone(&frames);
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
+        Stage2State::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
             assert!(
                 frames_in_callback.try_lock().is_none(),
                 "the shared publication registry must stay locked through IPA recycle",
@@ -4930,8 +4946,8 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
 
     frames.lock().stage2_references.remove(&key);
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
+        Stage2State::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+            Stage2State::retire_stage2_extent_from_mappings(
                 &mut TaskMappingIndex::new(),
                 key.0,
                 key.1,
@@ -4958,7 +4974,7 @@ fn final_carrier_mm_drop_requests_then_safe_point_releases_stage2_once() {
 
     assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     assert!(carrier_stage2_leases().lock().contains_key(&key));
-    HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
+    Stage2State::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
         .expect("explicit safe point performs requested carrier retirement");
     assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     assert!(!carrier_stage2_leases().lock().contains_key(&key));
@@ -5071,7 +5087,7 @@ fn unowned_retirement_rejects_an_unmapped_local_lease() {
         shared_key_offset: 0,
         owner_generation: 0,
     });
-    let error = HvfVmState::retire_unowned_stage2_extent_from_mappings(
+    let error = Stage2State::retire_unowned_stage2_extent_from_mappings(
         &mut mappings,
         key.0,
         key.1,
@@ -5203,7 +5219,7 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
     assert!(ledger.extents.is_empty());
     assert!(ledger.frames.lock().stage2_references.is_empty());
     drop(ledger);
-    HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
+    Stage2State::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
         .expect("directory rollback safe point performs requested carrier retirement");
     assert!(
         !carrier_stage2_leases().lock().contains_key(&key),
@@ -5278,7 +5294,7 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         },
     };
 
-    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(()))
+    let error = Stage2State::commit_cow_inventory_split(&mut inventory, &split, || Ok(()))
         .expect_err("colliding COW extent must fail closed");
     assert!(error.to_string().contains("before backend mutation"));
     assert_eq!(
@@ -5366,7 +5382,7 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
         },
     };
 
-    assert!(!HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(!Stage2State::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
     assert_eq!(
         inventory
             .extents
@@ -5438,7 +5454,7 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
     let frames = std::sync::Arc::clone(&inventory.frames);
 
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+        Stage2State::commit_cow_inventory_split(&mut inventory, &split, || {
             assert!(
                 frames.try_lock().is_none(),
                 "COW must retain the shared registry lock through old-IPA recycle",
@@ -5492,7 +5508,7 @@ fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
     // Two mms map the frame; this transaction unmaps one of them.
     let sibling_still_maps = |_frame| Ok(Some(2usize));
     let shape =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &sibling_still_maps)
+        Stage2State::inventory_lease_retirement_shape(&inventory, &leases, &sibling_still_maps)
             .unwrap();
     assert_eq!(shape.mappings.len(), 1, "the mapping is still unmapped");
     assert!(
@@ -5511,7 +5527,7 @@ fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
             "injected alias mapping-count failure".to_owned(),
         ))
     };
-    let error = HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &unavailable)
+    let error = Stage2State::inventory_lease_retirement_shape(&inventory, &leases, &unavailable)
         .expect_err("alias retirement must fail when authority is unavailable");
     assert!(
         error
@@ -5521,7 +5537,7 @@ fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
 
     let last_owner = |_frame| Ok(Some(1usize));
     let shape =
-        HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &last_owner).unwrap();
+        Stage2State::inventory_lease_retirement_shape(&inventory, &leases, &last_owner).unwrap();
     assert_eq!(shape.frames, std::collections::BTreeSet::from([frame]));
 }
 
@@ -5564,7 +5580,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
         Vec::new(),
         Vec::new(),
     );
-    let mut split = HvfVmState::stage_cow_inventory_split(
+    let mut split = Stage2State::stage_cow_inventory_split(
         &mut reservation,
         old_key,
         old,
@@ -5584,7 +5600,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(reservation.commit(()).batch().events().len(), 2);
     split.new_extent.stage2_owner.generation += 1;
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || panic!(
+        Stage2State::commit_cow_inventory_split(&mut inventory, &split, || panic!(
             "stale destination must fail before retirement"
         ))
         .is_err()
@@ -5592,7 +5608,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(inventory.extents[&old_key], old);
     assert_eq!(inventory.extents[&new_key], new);
     split.new_extent = new;
-    assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(Stage2State::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
     assert_eq!(inventory.extents.len(), 1);
     assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
     let frames = inventory.frames.lock();
@@ -5750,7 +5766,7 @@ fn partial_semantic_cow_retains_the_old_physical_compound() {
     }
 
     let shape =
-        HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true, |_| Ok(Some(1)))
+        Stage2State::cow_inventory_split_shape(&inventory, physical_ipa, true, |_| Ok(Some(1)))
             .expect("partial semantic COW split shape");
 
     assert_eq!(
@@ -5955,7 +5971,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         frames.stage2_references.insert(old_key, 2);
     }
     let shape =
-        HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, retain, |_| Ok(Some(2)))
+        Stage2State::cow_inventory_split_shape(&inventory, physical_ipa, retain, |_| Ok(Some(2)))
             .expect("plan COW with distant live projection");
     assert_eq!(shape.fragments, vec![old_key]);
     let split = CowInventorySplit {
@@ -5981,7 +5997,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         },
         retirement: shape.retirement,
     };
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+    let retired = Stage2State::commit_cow_inventory_split(&mut inventory, &split, || {
         panic!("a live distant projection must prevent physical retirement")
     })
     .expect("commit COW while preserving old inventory authority");
@@ -6003,16 +6019,20 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
 fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let owner = HvfTaskState::neutral();
-    let sibling_mm_access = std::sync::Arc::clone(&owner.mm_access);
-    let before = std::sync::Arc::as_ptr(&owner.mm_access);
+    let sibling_mm_access = std::sync::Arc::clone(&owner.stage2.mm_access);
+    let before = std::sync::Arc::as_ptr(&owner.stage2.mm_access);
     let page_tables = carrick_aarch64::Stage1Authority::new();
 
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(page_tables.clone());
 
-    assert_eq!(std::sync::Arc::as_ptr(&owner.mm_access), before);
-    assert!(std::sync::Arc::ptr_eq(&owner.mm_access, &sibling_mm_access));
+    assert_eq!(std::sync::Arc::as_ptr(&owner.stage2.mm_access), before);
+    assert!(std::sync::Arc::ptr_eq(
+        &owner.stage2.mm_access,
+        &sibling_mm_access
+    ));
     assert!(
         owner
             .page_tables_authority()
@@ -6023,7 +6043,11 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
             .page_tables_authority()
             .shares_exact_authority(&page_tables)
     );
-    assert!(owner.runtime_authorities_match(&sibling_mm_access, &page_tables, &owner.protections,));
+    assert!(owner.stage2.runtime_authorities_match(
+        &sibling_mm_access,
+        &page_tables,
+        &owner.protections,
+    ));
 
     let distinct_state = MmAccessState::new_unbound(
         page_tables.clone(),
@@ -6034,7 +6058,9 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
         crate::hvf_aarch64_engine::HostCowStats::default(),
     );
     assert!(
-        !owner.runtime_authorities_match(&distinct_state, &page_tables, &owner.protections,),
+        !owner
+            .stage2
+            .runtime_authorities_match(&distinct_state, &page_tables, &owner.protections,),
         "matching component Arcs must not authenticate a distinct MM access state",
     );
 }
@@ -6051,12 +6077,14 @@ fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
     );
     let old_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(old_authority.clone());
     drop(old_authority);
 
     let new_authority = carrick_aarch64::Stage1Authority::new();
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(new_authority.clone());
 
@@ -6096,6 +6124,7 @@ fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
     assert!(old_authority.has_source());
 
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(old_authority.clone());
     drop(old_authority);
@@ -6109,6 +6138,7 @@ fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
     assert!(!new_authority.has_source());
 
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(new_authority.clone());
 
@@ -6138,11 +6168,13 @@ fn bind_page_tables_authority_preserves_shared_previous_authority() {
     let parent_clone = shared_authority.clone();
 
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(shared_authority.clone());
 
     let new_authority = carrick_aarch64::Stage1Authority::new();
     owner
+        .stage2
         .mm_access
         .bind_page_tables_authority(new_authority.clone());
 
@@ -6169,13 +6201,14 @@ fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mut engine_a = HvfTaskState::neutral();
     let mut engine_b = HvfTaskState::neutral();
-    engine_b.mm_access = std::sync::Arc::clone(&engine_a.mm_access);
+    engine_b.stage2.mm_access = std::sync::Arc::clone(&engine_a.stage2.mm_access);
     let ledger = engine_a.frame_inventory.shared_ledger();
 
-    engine_a.fail_next_begin_exec_inventory = true;
+    engine_a.stage2.fail_next_begin_exec_inventory = true;
 
     let (b_retired, b_replacement) = inventory_pair(1);
     engine_b
+        .stage2
         .begin_exec_inventory(Some(b_retired), b_replacement)
         .expect("unarmed engine B must not consume engine A's injection");
     {
@@ -6186,6 +6219,7 @@ fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
 
     let (a_retired, a_replacement) = inventory_pair(3);
     let error = engine_a
+        .stage2
         .begin_exec_inventory(Some(a_retired), a_replacement)
         .expect_err("armed engine A must receive its own injected error");
     assert!(
@@ -6196,6 +6230,7 @@ fn foreign_mm_shared_state_keeps_exec_injection_executor_local() {
 
     let (retry_retired, retry_replacement) = inventory_pair(5);
     engine_a
+        .stage2
         .begin_exec_inventory(Some(retry_retired), retry_replacement)
         .expect("engine A injection must be consumed exactly once");
 }
@@ -6758,8 +6793,8 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
     assert_eq!(inherited_private.frame, frame);
     assert_eq!(inherited_private.backing, backing);
     assert_ne!(
-        HvfVmState::shared_anon_backing_identity(),
-        HvfVmState::shared_anon_backing_identity(),
+        Stage2State::shared_anon_backing_identity(),
+        Stage2State::shared_anon_backing_identity(),
         "independent shared-anonymous mappings must never deduplicate globally"
     );
 }
@@ -7329,7 +7364,7 @@ fn route_for(
     compound: u64,
     kernel_count: usize,
 ) -> CowWriteRoute {
-    HvfVmState::cow_inventory_split_shape(inventory, compound, false, |_| Ok(Some(kernel_count)))
+    Stage2State::cow_inventory_split_shape(inventory, compound, false, |_| Ok(Some(kernel_count)))
         .expect("plan the COW")
         .write_route(
             carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
@@ -7391,7 +7426,7 @@ fn reuse_is_limited_to_a_whole_private_guest_visible_compound() {
     let (inventory, key, _) =
         sole_compound_inventory(1, InventoryBackingIdentity::Private(301), 0x4000);
     let shape =
-        HvfVmState::cow_inventory_split_shape(&inventory, key.0, false, |_| Ok(Some(1))).unwrap();
+        Stage2State::cow_inventory_split_shape(&inventory, key.0, false, |_| Ok(Some(1))).unwrap();
     let compound = CowArmedRanges::COMPOUND_SIZE as usize;
     assert_eq!(
         shape.write_route(
@@ -7542,10 +7577,10 @@ fn exit_task_holding_owned_lease(
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(frame));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(mapping));
     let mut task = hvpatch_task_state_test_fixture(mm, key.0, mm as i32);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
         std::sync::Arc::clone(kernel),
     )));
-    task.mappings = TaskMappingIndex::from_region(region);
+    task.stage2.mappings = TaskMappingIndex::from_region(region);
     {
         let mut inventory = task.frame_inventory.lock();
         inventory.frames = std::sync::Arc::clone(frames);
@@ -7600,7 +7635,7 @@ fn fork_sibling_of(
         (key, extent, std::sync::Arc::clone(&inventory.frames))
     };
     let mut task = hvpatch_task_state_test_fixture(mm, key.0, mm as i32);
-    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
+    task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
         std::sync::Arc::clone(kernel),
     )));
     let mut inventory = task.frame_inventory.lock();
@@ -7642,7 +7677,8 @@ fn fork_sibling_of(
 }
 
 fn carries_conditional_retire_of(task: &mut HvfTaskState, frame: carrick_hal::FrameId) -> bool {
-    let commit = HvfVmState::take_task_state_retirement_inventory(task).expect("retirement commit");
+    let commit =
+        Stage2State::take_task_state_retirement_inventory(task).expect("retirement commit");
     commit.batch().events().iter().any(|event| {
         matches!(
             *event,
@@ -7694,7 +7730,7 @@ impl carrick_mmu_core::aarch64::TableArenaSource for BootstrapRetirementArenaSou
 }
 
 fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStage2RecordIdentity {
-    task.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
+    task.stage2.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
     let custody = legacy_test_carrier_vm_custody_arc();
     let manager = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
@@ -7702,7 +7738,7 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
         carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     let tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
-    task.mm_access = MmAccessState::new(
+    task.stage2.mm_access = MmAccessState::new(
         tables.clone(),
         task.protections.clone(),
         task.frame_inventory.shared_ledger(),
@@ -7826,7 +7862,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
         .install_exec_successor(new.page_tables_authority())
         .unwrap();
     let successor_owner =
-        new.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
+        new.stage2.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
     // SAFETY: both MMs are stopped fixtures with separate exact table slots.
     unsafe { successor_owner.ptr().add(0x1000).write(0x79) };
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&old);
@@ -7836,7 +7872,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
         predecessor_aliases: Vec::new(),
         frames: frames.clone(),
         mm_root_slot: None,
-        mm_access: Some(old.mm_access.clone()),
+        mm_access: Some(old.stage2.mm_access.clone()),
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
@@ -7863,8 +7899,8 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     assert_eq!(unsafe { successor_owner.ptr().add(0x1000).read() }, 0x79);
     assert!(engine.shares_exact_authority(&new.page_tables_authority()));
     assert_eq!(old.page_tables_authority().root_base(), Some(base));
-    HvfVmState::retire_task_state_process_mappings(&mut old).unwrap();
-    HvfVmState::retire_task_state_process_mappings(&mut new).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut old).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut new).unwrap();
     drop(reused);
     assert_eq!(pool.allocated_count(), 0);
 }
@@ -7890,11 +7926,11 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
     assert_eq!(pool.allocated_count(), 2);
     assert_ne!(first_record, second_record);
     let second_owner =
-        second.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
+        second.stage2.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
     // SAFETY: both MMs are stopped fixtures and the second owns this complete slot.
     unsafe { second_owner.ptr().add(0x1000).write(0x73) };
 
-    HvfVmState::retire_task_state_process_mappings(&mut first).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut first).unwrap();
     assert!(
         custody
             .stage2_record_snapshot(first_record.record_id)
@@ -7916,7 +7952,7 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
             .mapped
     );
     assert_eq!(unsafe { second_owner.ptr().add(0x1000).read() }, 0x73);
-    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut second).unwrap();
     drop(reused);
     assert_eq!(pool.allocated_count(), 0);
 }
@@ -7939,10 +7975,10 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let base = pool.base_ipa();
     let first_record = relocate_exit_fixture_root(&mut first, base);
     let peer_record = relocate_exit_fixture_root(&mut peer, base + 0x20_0000);
-    let parked = std::sync::Arc::clone(&first.mm_access);
+    let parked = std::sync::Arc::clone(&first.stage2.mm_access);
     assert!(pool.allocate_slot_at(base).is_none());
     drop(parked); // The final parked holder has retired.
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    Stage2State::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
     assert!(
         custody
             .stage2_record_snapshot(first_record.record_id)
@@ -7951,7 +7987,7 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let (mut successor, _, _, _) =
         exit_task_holding_owned_lease(725, 0xc000, 725, 726, &kernel, &frames);
     let successor_record = relocate_exit_fixture_root(&mut successor, base);
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    Stage2State::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
     assert!(
         pool.allocate_slot_at(base).is_none(),
         "late prior retirement must not release successor"
@@ -7966,9 +8002,9 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
             .stage2_record_snapshot(peer_record.record_id)
             .is_some()
     );
-    HvfVmState::retire_task_state_process_mappings(&mut first).unwrap();
-    HvfVmState::retire_task_state_process_mappings(&mut peer).unwrap();
-    HvfVmState::retire_task_state_process_mappings(&mut successor).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut first).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut peer).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut successor).unwrap();
     assert_eq!(pool.allocated_count(), 0);
 }
 
@@ -7992,9 +8028,16 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     let record = relocate_exit_fixture_root(&mut first, base);
     let other = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
     let pin = custody.pin_stage2_record(record).unwrap();
-    let publisher = first.mm_access.arena_publisher.read().clone().unwrap();
+    let publisher = first
+        .stage2
+        .mm_access
+        .arena_publisher
+        .read()
+        .clone()
+        .unwrap();
     let result = publisher.retire_raw_table_arena(base);
     let kept_owner = first
+        .stage2
         .mm_access
         .structural_owners
         .read()
@@ -8020,9 +8063,12 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     if custody.stage2_record_snapshot(record.record_id).is_some() {
         retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
     }
-    first.mm_access.release_structural_owner_at(base, 0x20_0000);
+    first
+        .stage2
+        .mm_access
+        .release_structural_owner_at(base, 0x20_0000);
     retire_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation);
-    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut second).unwrap();
     assert!(
         result.is_err(),
         "deferred physical retirement is not a capacity-return receipt"
@@ -8063,8 +8109,8 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
             .is_retired()
     );
     first.frame_inventory.lock().extents.clear();
-    first.mappings = TaskMappingIndex::default();
-    HvfVmState::retire_task_state_process_mappings(&mut first)
+    first.stage2.mappings = TaskMappingIndex::default();
+    Stage2State::retire_task_state_process_mappings(&mut first)
         .expect("terminal exact record still permits its owned capacity release");
     let reused = pool
         .allocate_slot_at(base)
@@ -8077,7 +8123,7 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
             .mapped
     );
     assert!(pool.allocate_slot_at(base + 0x20_0000).is_none());
-    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut second).unwrap();
     drop(reused);
     assert_eq!(pool.allocated_count(), 0);
 }
@@ -8106,11 +8152,11 @@ fn fork_siblings_retiring_together_retire_the_shared_grant_in_either_apply_order
 
         // The child decides first: the parent still holds a backend
         // reference, so the child neither retires nor carries a retirement.
-        HvfVmState::retire_task_state_process_mappings(&mut child).unwrap();
+        Stage2State::retire_task_state_process_mappings(&mut child).unwrap();
         assert!(!carries_conditional_retire_of(&mut child, frame));
         // The parent drops the last backend reference while the Kernel still
         // counts the child's pending unmap: it carries the conditional.
-        HvfVmState::retire_task_state_process_mappings(&mut parent).unwrap();
+        Stage2State::retire_task_state_process_mappings(&mut parent).unwrap();
         assert!(carries_conditional_retire_of(&mut parent, frame));
         assert_eq!(global_frame_host_owner_generation(key.0, key.1), generation);
 
@@ -8124,14 +8170,14 @@ fn fork_siblings_retiring_together_retire_the_shared_grant_in_either_apply_order
         };
         kernel.counts.lock().insert(frame, 1);
         assert_eq!(
-            HvfVmState::settle_task_state_declined_lease_remainders(first).unwrap(),
+            Stage2State::settle_task_state_declined_lease_remainders(first).unwrap(),
             0,
             "the Kernel still knows the frame after the first apply"
         );
         assert_eq!(global_frame_host_owner_generation(key.0, key.1), generation);
         kernel.counts.lock().remove(&frame);
         assert_eq!(
-            HvfVmState::settle_task_state_declined_lease_remainders(second).unwrap(),
+            Stage2State::settle_task_state_declined_lease_remainders(second).unwrap(),
             1,
             "the retirement whose batch retired the frame retires its owner"
         );
@@ -8154,7 +8200,7 @@ fn a_declined_remainder_never_retires_a_successor_owner_at_the_same_lease() {
     let (mut holder, key, generation, frame) =
         exit_task_holding_owned_lease(14, 0x40_0000, 61, 62, &kernel, &frames);
     kernel.counts.lock().insert(frame, 2);
-    HvfVmState::retire_task_state_process_mappings(&mut holder).unwrap();
+    Stage2State::retire_task_state_process_mappings(&mut holder).unwrap();
     assert_eq!(holder.frame_inventory.lock().declined_leases.len(), 1);
 
     // The incarnation leaves by another path; a successor takes the lease.
@@ -8177,7 +8223,7 @@ fn a_declined_remainder_never_retires_a_successor_owner_at_the_same_lease() {
     kernel.counts.lock().remove(&frame);
 
     assert_eq!(
-        HvfVmState::settle_task_state_declined_lease_remainders(&holder).unwrap(),
+        Stage2State::settle_task_state_declined_lease_remainders(&holder).unwrap(),
         0
     );
     assert_eq!(
@@ -8200,7 +8246,7 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (unmapping, key, generation, frame) =
         exit_task_holding_owned_lease(16, 0x40_0000, 81, 82, &kernel, &frames);
-    let retirement = HvfVmState::inventory_lease_retirement_shape(
+    let retirement = Stage2State::inventory_lease_retirement_shape(
         &unmapping.frame_inventory.lock(),
         &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
         &|_| Ok(Some(2)),
@@ -8218,9 +8264,9 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
         Vec::new(),
         Vec::new(),
     );
-    HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    Stage2State::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
     let mut carried = false;
-    HvfVmState::apply_inventory_lease_retirement(
+    Stage2State::apply_inventory_lease_retirement(
         &unmapping.frame_inventory.ledger,
         &retirement,
         reservation,
@@ -8247,7 +8293,7 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
             0,
             0,
         );
-        HvfVmState::settle_declined_lease_remainders(
+        Stage2State::settle_declined_lease_remainders(
             legacy_test_carrier_vm_custody(),
             &frames,
             &TestFrameMappingCount::PerFrame(std::sync::Arc::clone(&kernel)),
@@ -8434,7 +8480,7 @@ pub(crate) fn assert_fork_child_exec_retirement(
         );
     }
     let mut reservation = kernel.reserve(0, 0, child.extents.len() * 2).unwrap();
-    let retired = HvfVmState::stage_retirement(child, &mut reservation, &kernel)
+    let retired = Stage2State::stage_retirement(child, &mut reservation, &kernel)
         .expect("stage the fork child's old-mm exec retirement");
     kernel
         .apply(reservation.commit(()))
@@ -8479,19 +8525,19 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
         carrick_hal::MappingId::from_kernel_allocation(id(93)),
         frame,
     );
-    unmapping.cow_authority = Some(kernel.clone());
+    unmapping.stage2.cow_authority = Some(kernel.clone());
     let sibling = std::cell::RefCell::new(sibling);
-    sibling.borrow_mut().cow_authority = Some(kernel.clone());
+    sibling.borrow_mut().stage2.cow_authority = Some(kernel.clone());
 
     // The sibling's exit decision, run inside the unmap's gap when it can.
     let decided_in_gap = std::cell::Cell::new(false);
     let decide =
-        || HvfVmState::retire_task_state_process_mappings(&mut sibling.borrow_mut()).unwrap();
+        || Stage2State::retire_task_state_process_mappings(&mut sibling.borrow_mut()).unwrap();
 
     // The unmap: plan while the sibling still holds the frame, then apply.
     let retirement = {
         let inventory = unmapping.frame_inventory.lock();
-        HvfVmState::inventory_lease_retirement_shape(
+        Stage2State::inventory_lease_retirement_shape(
             &inventory,
             &std::collections::BTreeSet::from([AuthenticatedLease::new(key, generation)]),
             &|frame| Ok(kernel.count(frame)),
@@ -8501,8 +8547,8 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
     let mut reservation =
         carrick_hal::FrameCowAuthority::reserve(kernel.as_ref(), 0, 0, retirement.event_count())
             .unwrap();
-    HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
-    HvfVmState::apply_inventory_lease_retirement(
+    Stage2State::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    Stage2State::apply_inventory_lease_retirement(
         &unmapping.frame_inventory.ledger,
         &retirement,
         reservation,
@@ -8528,7 +8574,7 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
             0,
             0,
         );
-        HvfVmState::settle_declined_lease_remainders(
+        Stage2State::settle_declined_lease_remainders(
             legacy_test_carrier_vm_custody(),
             &frames,
             kernel.as_ref(),
@@ -8540,10 +8586,10 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
     settle(retirement.declined.clone());
 
     // The sibling's exit is applied last.
-    let commit = HvfVmState::take_task_state_retirement_inventory(&mut sibling.borrow_mut())
+    let commit = Stage2State::take_task_state_retirement_inventory(&mut sibling.borrow_mut())
         .expect("sibling retirement commit");
     carrick_hal::FrameCowAuthority::apply(kernel.as_ref(), commit).unwrap();
-    HvfVmState::settle_task_state_declined_lease_remainders(&sibling.borrow()).unwrap();
+    Stage2State::settle_task_state_declined_lease_remainders(&sibling.borrow()).unwrap();
 
     assert_eq!(
         kernel.count(frame),

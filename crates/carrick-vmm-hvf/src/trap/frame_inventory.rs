@@ -439,7 +439,7 @@ pub(crate) struct InventoryFrameRegistry {
 /// batch applies its last unmap. The owner follows the frame: after its own
 /// apply, the retirement that recorded this remainder retires the owner if
 /// the Kernel has retired every frame it names
-/// ([`HvfVmState::settle_declined_lease_remainders`]). It is authenticated by
+/// ([`Stage2State::settle_declined_lease_remainders`]). It is authenticated by
 /// owner generation, never by address.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
@@ -1295,7 +1295,7 @@ impl HvpatchFrameInventoryState {
             "hvpatch alias cancel"
         );
         if !staged.is_empty()
-            && let Err(error) = HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)
+            && let Err(error) = Stage2State::rollback_unpublished_mappings(&mut inventory, &staged)
         {
             // The ledger and the authority have already diverged; continuing
             // would hand a later retirement an extent naming a mapping that
@@ -1395,7 +1395,7 @@ pub(crate) fn final_exec_physical_extents(
 #[cfg(test)]
 pub(crate) mod tests;
 
-impl HvfVmState {
+impl Stage2State {
     pub(crate) fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
         #[cfg(not(test))]
         {
@@ -2736,7 +2736,7 @@ impl HvfVmState {
     }
 
     pub(crate) fn frame_inventory_extent_count(&self) -> usize {
-        let inventory = self.frame_inventory.lock();
+        let inventory = self.mm_access.frame_inventory.lock();
         if inventory.initialized {
             inventory.extents.len()
         } else {
@@ -2753,7 +2753,7 @@ impl HvfVmState {
         &mut self,
         mut reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
-        let mut inventory = self.frame_inventory.lock();
+        let mut inventory = self.mm_access.frame_inventory.lock();
         if !inventory.extents.is_empty() {
             return Ok(reservation.commit(()));
         }
@@ -2790,11 +2790,13 @@ impl HvfVmState {
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.frame_inventory.begin_alias_inventory(reservation)
+        self.mm_access
+            .frame_inventory
+            .begin_alias_inventory(reservation)
     }
 
     pub(crate) fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        let mut inventory = self.frame_inventory.lock();
+        let mut inventory = self.mm_access.frame_inventory.lock();
         // Handing the commit off makes the staged extents the authority's
         // business, so they are no longer this transaction's to roll back.
         tracing::trace!(
@@ -2807,19 +2809,23 @@ impl HvfVmState {
     }
 
     pub(crate) fn abandon_alias_inventory(&mut self) -> bool {
-        self.frame_inventory.cancel_alias_inventory()
+        self.mm_access.frame_inventory.cancel_alias_inventory()
     }
+}
 
+impl HvfVmState {
     pub(crate) fn begin_exec_inventory(
         &mut self,
         retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.task.begin_exec_inventory(retired, replacement)
+        self.task.stage2.begin_exec_inventory(retired, replacement)
     }
+}
 
+impl Stage2State {
     pub(crate) fn inject_next_begin_exec_inventory_failure(&mut self) {
-        self.task.fail_next_begin_exec_inventory = true;
+        self.fail_next_begin_exec_inventory = true;
     }
 
     pub(crate) fn frame_inventory_exec_extent_counts(
@@ -2838,28 +2844,36 @@ impl HvfVmState {
     }
 
     pub(crate) fn take_exec_inventory(&mut self) -> Option<carrick_hal::ExecInventoryCommits> {
-        self.frame_inventory.lock().exec_commits.take()
+        self.mm_access.frame_inventory.lock().exec_commits.take()
     }
 
     pub(crate) fn begin_process_inventory(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.frame_inventory.begin_process_inventory(reservation)
+        self.mm_access
+            .frame_inventory
+            .begin_process_inventory(reservation)
     }
 
     pub(crate) fn cancel_process_inventory(&mut self) -> bool {
-        self.frame_inventory.cancel_process_inventory()
+        self.mm_access.frame_inventory.cancel_process_inventory()
     }
 
     pub(crate) fn take_process_inventory(
         &mut self,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.frame_inventory.lock().process_commit.take()
+        self.mm_access.frame_inventory.lock().process_commit.take()
     }
 
     pub(crate) fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
-        if self.frame_inventory.lock().process_commit.is_none() {
+        if self
+            .mm_access
+            .frame_inventory
+            .lock()
+            .process_commit
+            .is_none()
+        {
             return Err(TrapError::Hypervisor(
                 "HVPatch process materialization has no inventory commit".to_owned(),
             ));
@@ -2879,7 +2893,9 @@ impl HvfVmState {
         }
         Ok(())
     }
+}
 
+impl HvfVmState {
     pub(crate) fn refresh_fork_process_state(
         &mut self,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
@@ -2888,12 +2904,14 @@ impl HvfVmState {
         self.task
             .refresh_fork_process_state_in(&custody, flush_stage1)
     }
+}
 
+impl Stage2State {
     pub(crate) fn abort_process_materialization(&mut self) -> Result<(), TrapError> {
         self.pending_process_aliases.clear();
         self.pending_fork_frame_receipts.clear();
         {
-            let mut inventory = self.frame_inventory.lock();
+            let mut inventory = self.mm_access.frame_inventory.lock();
             let staged: Vec<_> = inventory
                 .extents
                 .iter()
@@ -2914,7 +2932,7 @@ impl HvfVmState {
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        let mut inventory = self.frame_inventory.lock();
+        let mut inventory = self.mm_access.frame_inventory.lock();
         if inventory.retirement_reservation.is_some() {
             return Err(TrapError::Hypervisor(
                 "overlapping HVPatch retirement inventory transaction".to_owned(),
@@ -2927,7 +2945,11 @@ impl HvfVmState {
     pub(crate) fn take_retirement_inventory(
         &mut self,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.frame_inventory.lock().retirement_commit.take()
+        self.mm_access
+            .frame_inventory
+            .lock()
+            .retirement_commit
+            .take()
     }
 
     pub(crate) fn bind_stage1_page_tables(
@@ -2945,7 +2967,9 @@ impl HvfVmState {
         );
         self.mm_access.bind_page_tables_authority(page_tables);
     }
+}
 
+impl HvfVmState {
     pub(crate) fn task_runtime_authorities_match(
         &self,
         mm_access: &std::sync::Arc<MmAccessState>,
@@ -2953,15 +2977,18 @@ impl HvfVmState {
         protections: &carrick_guest_mem::UserMemoryAuthority,
     ) -> bool {
         self.task
+            .stage2
             .runtime_authorities_match(mm_access, page_tables, protections)
     }
 
     pub(crate) fn task_mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {
-        self.task.mm_access_authority()
+        self.task.stage2.mm_access_authority()
     }
+}
 
+impl Stage2State {
     pub(crate) fn task_protections_authority(&self) -> carrick_guest_mem::UserMemoryAuthority {
-        self.protections.clone()
+        self.mm_access.protections.clone()
     }
 
     /// Tell `manager` whether THIS thread's edit is exclusive, before an
@@ -3008,11 +3035,15 @@ impl HvfVmState {
             None => manager.snapshot_image(),
         }
     }
+}
 
+impl HvfVmState {
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
-        Self::retire_task_state_process_mappings(&mut self.task)
+        Stage2State::retire_task_state_process_mappings(&mut self.task)
     }
+}
 
+impl Stage2State {
     pub(crate) fn retire_task_state_process_mappings(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {
@@ -3037,7 +3068,7 @@ impl HvfVmState {
     pub(crate) fn settle_task_state_declined_lease_remainders(
         task: &HvfTaskState,
     ) -> Result<usize, TrapError> {
-        if !task.persistent_vm_lifecycle {
+        if !task.stage2.persistent_vm_lifecycle {
             return Ok(0);
         }
         let (frames, remainders) = {
@@ -3050,18 +3081,19 @@ impl HvfVmState {
         if remainders.is_empty() {
             return Ok(0);
         }
-        let authority = task.cow_authority.clone().ok_or_else(|| {
+        let authority = task.stage2.cow_authority.clone().ok_or_else(|| {
             TrapError::Hypervisor(
                 "HVPatch declined-remainder settlement has no frame inventory authority".to_owned(),
             )
         })?;
         #[cfg(not(test))]
-        let custody = std::sync::Arc::clone(&task.custody);
+        let custody = std::sync::Arc::clone(&task.stage2.custody);
         #[cfg(not(test))]
         let custody = custody.as_ref();
         #[cfg(test)]
         let custody = legacy_test_carrier_vm_custody();
         let (pid, tid) = task
+            .stage2
             .cow_identity
             .map_or((0, 0), |identity| (identity.linux_pid, identity.linux_tid));
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
@@ -3069,7 +3101,7 @@ impl HvfVmState {
             pid,
             tid,
         );
-        Self::settle_declined_lease_remainders(
+        Stage2State::settle_declined_lease_remainders(
             custody,
             &frames,
             authority.as_ref(),
@@ -3090,7 +3122,7 @@ impl HvfVmState {
         /// O(extents x rows): a CPython `test_compile` guest retires with 33,471
         /// inventory extents against 33,478 mapping rows, so one executor spins
         /// through ~1.1e9 row visits inside
-        /// [`HvfVmState::retire_task_state_process_mappings_inner`] while its
+        /// [`Stage2State::retire_task_state_process_mappings_inner`] while its
         /// Linux task is already a zombie. That is the shape the always-on
         /// process-graph liveness sink reports as "1 container job(s) unpublished
         /// with 0 live task(s), 1 live thread(s) and 0 runnable row(s) for
@@ -3161,7 +3193,7 @@ impl HvfVmState {
         }
 
         #[cfg(not(test))]
-        let custody = std::sync::Arc::clone(&task.custody);
+        let custody = std::sync::Arc::clone(&task.stage2.custody);
         #[cfg(not(test))]
         let custody = custody.as_ref();
         #[cfg(test)]
@@ -3169,16 +3201,17 @@ impl HvfVmState {
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
         // per-process frame-inventory retirement.
-        if !task.persistent_vm_lifecycle {
+        if !task.stage2.persistent_vm_lifecycle {
             return Ok(None);
         }
         if let Some(mm) = task
+            .stage2
             .cow_identity
             .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))
         {
             custody.fork_stock.lock().retire_root(mm);
         }
-        let authority = task.cow_authority.as_ref().cloned().ok_or_else(|| {
+        let authority = task.stage2.cow_authority.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor(
                 "HVPatch process retirement has no frame inventory authority".to_owned(),
             )
@@ -3195,7 +3228,7 @@ impl HvfVmState {
         let (candidates, frames, retirement_commit, stage2_owners) = {
             let mut inventory = ledger.lock();
             if inventory.extents.is_empty() {
-                if task.mappings.is_empty() {
+                if task.stage2.mappings.is_empty() {
                     drop(inventory);
                     return Self::retire_task_table_capacity(task, custody, expected_root_slot)
                         .map(|root| root.map(|root| root.proof));
@@ -3220,7 +3253,7 @@ impl HvfVmState {
             // One pass builds the physical-extent index the per-extent
             // containment queries below read; see `PhysicalExtentIndex` for
             // why the direct per-extent scan is the exit residual.
-            let mapping_extents = PhysicalExtentIndex::build(task.mappings.iter());
+            let mapping_extents = PhysicalExtentIndex::build(task.stage2.mappings.iter());
             let mut stage2_owners = std::collections::BTreeMap::new();
             for (&(_gpa, mapping_length), extent) in &inventory.extents {
                 if mapping_length == 0 {
@@ -3373,12 +3406,15 @@ impl HvfVmState {
             } else {
                 Vec::new()
             };
-            let candidates =
-                Self::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())?;
+            let candidates = Stage2State::stage_retirement(
+                &mut inventory,
+                &mut reservation,
+                authority.as_ref(),
+            )?;
             let scope = CowInventoryLifecycleScope {
                 custody,
-                identity: task.cow_identity,
-                mm_root_slot: task.mm_root_slot,
+                identity: task.stage2.cow_identity,
+                mm_root_slot: task.stage2.mm_root_slot,
                 semantic_va: 0,
                 semantic_length: 0,
             };
@@ -3417,10 +3453,10 @@ impl HvfVmState {
                             "HVPatch process retirement unowned candidate {lease:?} unexpectedly has live global owner {live_owner:?}"
                         )));
                     }
-                    if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                        Self::retire_unowned_stage2_extent_from_mappings_in(
+                    if Stage2State::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
+                        Stage2State::retire_unowned_stage2_extent_from_mappings_in(
                             custody,
-                            &mut task.mappings,
+                            &mut task.stage2.mappings,
                             ipa,
                             length,
                             owner.host_addr,
@@ -3429,7 +3465,7 @@ impl HvfVmState {
                         extents.insert((ipa, size));
                     }
                 } else if live_owner == Some((owner.host_addr, owner.generation)) {
-                    if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
+                    if Stage2State::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
                         let outcome = retire_global_frame_host_owner_if_generation_in(
                             custody,
                             ipa,
@@ -3462,10 +3498,10 @@ impl HvfVmState {
                     )));
                 }
             } else {
-                if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                    Self::retire_stage2_extent_from_mappings_in(
+                if Stage2State::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
+                    Stage2State::retire_stage2_extent_from_mappings_in(
                         custody,
-                        &mut task.mappings,
+                        &mut task.stage2.mappings,
                         ipa,
                         length,
                     )
@@ -3481,7 +3517,7 @@ impl HvfVmState {
         let retiring_aliases = if cow_refusal_diagnostics_enabled() {
             alias_registry()
                 .lock()
-                .process_visible_ordered(task.mm_root_slot, task.container_root)
+                .process_visible_ordered(task.stage2.mm_root_slot, task.stage2.container_root)
         } else {
             Vec::new()
         };
@@ -3507,8 +3543,8 @@ impl HvfVmState {
             }))
             .collect();
         retire_process_aliases(
-            task.mm_root_slot,
-            task.container_root,
+            task.stage2.mm_root_slot,
+            task.stage2.container_root,
             &retired_projections,
             |alias| {
                 let key = (alias.physical_ipa, alias.physical_size as u64);
@@ -3523,9 +3559,9 @@ impl HvfVmState {
         record_alias_unmap_lifecycle(
             CowDiagnosticLifecycleSite::ProcessRetirement,
             custody,
-            task.cow_identity,
-            task.mm_root_slot,
-            task.container_root,
+            task.stage2.cow_identity,
+            task.stage2.mm_root_slot,
+            task.stage2.container_root,
             &retiring_aliases,
         );
 
@@ -3533,7 +3569,7 @@ impl HvfVmState {
         // Reclaim only exact extents removed above and preserve the remaining
         // backing until the single VM is finally destroyed.
         let mut retained_backings = Vec::new();
-        for mapping in std::mem::take(&mut task.mappings) {
+        for mapping in std::mem::take(&mut task.stage2.mappings) {
             if extents.contains(&(mapping.physical_ipa, mapping.physical_size)) {
                 drop(mapping);
             } else {
@@ -3541,7 +3577,7 @@ impl HvfVmState {
             }
         }
         std::mem::forget(retained_backings);
-        task.mm_root_slot = None;
+        task.stage2.mm_root_slot = None;
 
         ledger.lock().retirement_commit = Some(retirement_commit);
         Ok(retired_root.map(|root| root.proof))
@@ -3554,6 +3590,7 @@ impl HvfVmState {
     ) -> Result<Option<RetiredMmRootStage2>, TrapError> {
         if let Some(root_slot) = expected_root_slot {
             return task
+                .stage2
                 .mm_access
                 .retire_mm_root_stage2_in(custody, root_slot)
                 .map(Some);
@@ -3576,7 +3613,7 @@ impl HvfVmState {
     pub(crate) fn retire_task_state_shared_inventory_table_capacity(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {
-        if task.mm_root_slot.is_some() {
+        if task.stage2.mm_root_slot.is_some() {
             return Err(TrapError::Hypervisor(
                 "rootless shared-inventory retirement received a pooled root".to_owned(),
             ));
@@ -3595,20 +3632,21 @@ impl HvfVmState {
         expected_root_slot: (u64, u64),
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
         #[cfg(not(test))]
-        let custody = std::sync::Arc::clone(&task.custody);
+        let custody = std::sync::Arc::clone(&task.stage2.custody);
         #[cfg(not(test))]
         let custody = custody.as_ref();
         #[cfg(test)]
         let custody = legacy_test_carrier_vm_custody();
-        if !task.persistent_vm_lifecycle {
+        if !task.stage2.persistent_vm_lifecycle {
             return Err(TrapError::Hypervisor(
                 "stage-1 root-only retirement requires persistent HVPatch lifecycle".to_owned(),
             ));
         }
         let retired = task
+            .stage2
             .mm_access
             .retire_mm_root_stage2_in(custody, expected_root_slot)?;
-        task.mm_root_slot = None;
+        task.stage2.mm_root_slot = None;
         Ok(retired.proof)
     }
 
@@ -3621,11 +3659,15 @@ impl HvfVmState {
     pub(crate) fn retire_task_state_exec_predecessor(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {
-        let mut cleanup = task.pending_exec_stage2_cleanup.take().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
-            )
-        })?;
+        let mut cleanup = task
+            .stage2
+            .pending_exec_stage2_cleanup
+            .take()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
+                )
+            })?;
         cleanup.retire()
     }
 
@@ -3633,14 +3675,20 @@ impl HvfVmState {
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
-        let mut cleanup = task.pending_exec_stage2_cleanup.take().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
-            )
-        })?;
+        let mut cleanup = task
+            .stage2
+            .pending_exec_stage2_cleanup
+            .take()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
+                )
+            })?;
         cleanup.retire_with_root_proof(expected_root_slot)
     }
+}
 
+impl HvfVmState {
     pub(crate) fn retire_task_state_dormant_authority(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {

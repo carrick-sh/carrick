@@ -112,7 +112,8 @@ impl MappingSource<'_> {
             Some(BackingOwner::Global(pin))
         } else {
             let structural = direct_structural.cloned().or_else(|| {
-                task.mm_access
+                task.stage2
+                    .mm_access
                     .structural_owners
                     .read()
                     .get(&(physical_ipa, physical_size))
@@ -177,7 +178,7 @@ impl MappingSource<'_> {
     /// The non-persistent lifecycle exists only for single-mm bring-up before
     /// the runtime enables the persistent carrier, with no sibling to unmap.
     fn untracked_backing_outlives_access(&self, task: &HvfTaskState) -> bool {
-        if !task.persistent_vm_lifecycle {
+        if !task.stage2.persistent_vm_lifecycle {
             return true;
         }
         match self {
@@ -377,13 +378,14 @@ fn admit_contiguous(
     };
     let writable = |view: &MappingView| access == HostAccess::Read || view.guest_writable;
     let lookup = if crate::memory::needs_stage1_translation(address, len as u64) {
-        task.translate_va(address).unwrap_or(address)
+        task.stage2.translate_va(address).unwrap_or(address)
     } else {
         address
     };
     // A zero-copy range is one contiguous mapping. Retain that owner
     // once, rather than growing a pin/vector entry for every 4 KiB.
     let admitted = task
+        .stage2
         .with_mapping_for_range_in(custody, lookup, len, |source| {
             if !writable(&source.view()) {
                 return Err(error());
@@ -399,13 +401,14 @@ fn admit_contiguous(
     let first_host = admitted.pointer as usize;
     let mut checked = 0;
     while checked < len {
-        let (va, chunk) = HvfVmState::guest_copy_chunk(address, checked, len)?;
+        let (va, chunk) = Stage2State::guest_copy_chunk(address, checked, len)?;
         let lookup = if crate::memory::needs_stage1_translation(va, chunk as u64) {
-            task.translate_va(va).unwrap_or(va)
+            task.stage2.translate_va(va).unwrap_or(va)
         } else {
             va
         };
         let view = task
+            .stage2
             .mapping_for_range_in(custody, lookup, chunk)
             .ok_or_else(error)?;
         let offset = lookup.checked_sub(view.start).ok_or_else(error)?;

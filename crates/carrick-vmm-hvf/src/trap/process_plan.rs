@@ -595,12 +595,12 @@ impl HvfTaskState {
         let mut cursor = request.root_slot_base;
         let current_revision = alias_registry()
             .lock()
-            .process_visible_revision(self.mm_root_slot, self.container_root);
+            .process_visible_revision(self.stage2.mm_root_slot, self.stage2.container_root);
         let (alias_revision_begin, aliases, alias_index, mut source_mappings, all_aliases_covered) =
             if let Some(cached) = cached_snapshot
                 && cached.revision == current_revision
-                && cached.mm_root_slot == self.mm_root_slot
-                && cached.container_root == self.container_root
+                && cached.mm_root_slot == self.stage2.mm_root_slot
+                && cached.container_root == self.stage2.container_root
             {
                 (
                     cached.revision,
@@ -611,20 +611,22 @@ impl HvfTaskState {
                 )
             } else {
                 let registry = alias_registry().lock();
-                let revision =
-                    registry.process_visible_revision(self.mm_root_slot, self.container_root);
-                let aliases = std::sync::Arc::new(
-                    registry.process_visible_ordered(self.mm_root_slot, self.container_root),
-                );
+                let revision = registry
+                    .process_visible_revision(self.stage2.mm_root_slot, self.stage2.container_root);
+                let aliases =
+                    std::sync::Arc::new(registry.process_visible_ordered(
+                        self.stage2.mm_root_slot,
+                        self.stage2.container_root,
+                    ));
                 let alias_index = std::sync::Arc::new(process_alias_index(
                     &aliases,
-                    self.mm_root_slot,
-                    self.container_root,
+                    self.stage2.mm_root_slot,
+                    self.stage2.container_root,
                 ));
-                let has_shadowed = self.mappings.shadowed_len() > 0;
+                let has_shadowed = self.stage2.mappings.shadowed_len() > 0;
                 let mut seen_dynamic_aliases = if has_shadowed {
                     Some(ProcessAliasSet::with_capacity_and_hasher(
-                        self.mappings.len(),
+                        self.stage2.mappings.len(),
                         FastKeyBuildHasher::default(),
                     ))
                 } else {
@@ -632,6 +634,7 @@ impl HvfTaskState {
                 };
                 let mut dynamic_count = 0usize;
                 let source_mappings: Vec<ThreadMappingDesc> = self
+                    .stage2
                     .mappings
                     .iter()
                     .filter_map(|mapping| {
@@ -665,7 +668,7 @@ impl HvfTaskState {
         record_alias_revision(
             CowDiagnosticAliasRevisionSite::ForkSnapshotBegin,
             &carrier_foreign_mm_transport.custody,
-            self.cow_identity,
+            self.stage2.cow_identity,
             0,
             alias_revision_begin,
         );
@@ -685,7 +688,7 @@ impl HvfTaskState {
                     "[UNIONDBG pid={:?}] alias [{:#x}+{:#x}) ipa={:#x} host={:#x} \
                      phys=({:#x}+{:#x}) scope={:?} in_scope={} sharing={:?} writable={} \
                      covers_va={}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
+                    self.stage2.cow_identity.map(|identity| identity.linux_pid),
                     alias.start,
                     alias.size,
                     alias.ipa,
@@ -695,8 +698,8 @@ impl HvfTaskState {
                     alias.ownership_scope,
                     alias_matches_process_scope(
                         alias.ownership_scope,
-                        self.mm_root_slot,
-                        self.container_root,
+                        self.stage2.mm_root_slot,
+                        self.stage2.container_root,
                     ),
                     alias.sharing,
                     alias.guest_writable,
@@ -705,6 +708,7 @@ impl HvfTaskState {
                 );
             }
             for mapping in self
+                .stage2
                 .mappings
                 .iter()
                 .filter(|mapping| mapping.start < window_hi && mapping.end > window_lo)
@@ -714,7 +718,7 @@ impl HvfTaskState {
                     "[UNIONDBG pid={:?}] local row [{:#x},{:#x}) ipa={:#x} host={:p} \
                      size={:#x} sem={:#x} dyn={} sharing={:?} guest_writable={} kept={} \
                      covers_va={}",
-                    self.cow_identity.map(|identity| identity.linux_pid),
+                    self.stage2.cow_identity.map(|identity| identity.linux_pid),
                     mapping.start,
                     mapping.end,
                     mapping.ipa,
@@ -739,7 +743,7 @@ impl HvfTaskState {
             eprintln!(
                 "[UNIONDBG pid={:?}] fork_cow_ranges covering {debug_va:#x}: {covering:x?} \
                  (total {} ranges)",
-                self.cow_identity.map(|identity| identity.linux_pid),
+                self.stage2.cow_identity.map(|identity| identity.linux_pid),
                 armed.len(),
             );
         }
@@ -759,8 +763,8 @@ impl HvfTaskState {
             missing_process_aliases(
                 &local_aliases,
                 &aliases,
-                self.mm_root_slot,
-                self.container_root,
+                self.stage2.mm_root_slot,
+                self.stage2.container_root,
             )
         };
         let candidate_regions = missing.len() as u64;
@@ -967,9 +971,12 @@ impl HvfTaskState {
                             custody: carrier_foreign_mm_transport.custody.as_ref()
                                 as *const CarrierVmCustody
                                 as usize,
-                            linux_pid: self.cow_identity.map_or(0, |identity| identity.linux_pid),
-                            mm: self.cow_identity.map_or(0, |identity| identity.mm),
-                            mm_root_slot_base: self.mm_root_slot.map_or(0, |slot| slot.0),
+                            linux_pid: self
+                                .stage2
+                                .cow_identity
+                                .map_or(0, |identity| identity.linux_pid),
+                            mm: self.stage2.cow_identity.map_or(0, |identity| identity.mm),
+                            mm_root_slot_base: self.stage2.mm_root_slot.map_or(0, |slot| slot.0),
                             semantic_va: mapping.start,
                             semantic_length: mapping.size as u64,
                             logical_gpa: mapping.physical_ipa,
@@ -1011,7 +1018,7 @@ impl HvfTaskState {
                         record_alias_revision(
                             CowDiagnosticAliasRevisionSite::ForkSnapshotEnd,
                             &carrier_foreign_mm_transport.custody,
-                            self.cow_identity,
+                            self.stage2.cow_identity,
                             live_translation
                                 .map(|ipa| align_down(ipa, CowArmedRanges::COMPOUND_SIZE))
                                 .unwrap_or(0),
@@ -1029,8 +1036,8 @@ impl HvfTaskState {
                     fork_frame_receipt_kind(disposition, mapping.start, mapping.size);
                 let scope = CowInventoryLifecycleScope {
                     custody: &carrier_foreign_mm_transport.custody,
-                    identity: self.cow_identity,
-                    mm_root_slot: self.mm_root_slot,
+                    identity: self.stage2.cow_identity,
+                    mm_root_slot: self.stage2.mm_root_slot,
                     semantic_va: mapping.start,
                     semantic_length: mapping.size as u64,
                 };
@@ -1335,7 +1342,7 @@ impl HvfTaskState {
                 ))
             })?;
             let physical_host_addr = host.ptr();
-            let inventory_backing = HvfVmState::private_backing_identity();
+            let inventory_backing = Stage2State::private_backing_identity();
             mappings.push(ProcessMappingDesc {
                 start: mapping.start,
                 ipa,
@@ -1387,8 +1394,8 @@ impl HvfTaskState {
         let stage_started = std::time::Instant::now();
         let mut child_pte_receipts = Vec::new();
         // Copied out so the memoizing closures below borrow neither `self`.
-        let fork_mm_root_slot = self.mm_root_slot;
-        let fork_container_root = self.container_root;
+        let fork_mm_root_slot = self.stage2.mm_root_slot;
+        let fork_container_root = self.stage2.container_root;
         // Built once for the whole fork; see `ForkTranslationOverlayIndex`.
         let overlay_index =
             ForkTranslationOverlayIndex::build(&mappings, fork_mm_root_slot, fork_container_root);
@@ -1627,7 +1634,7 @@ impl HvfTaskState {
                     let ptr = owned.as_ptr();
                     (ProcessMappingHost::Owned(owned), ptr)
                 };
-            let inventory_backing = HvfVmState::private_backing_identity();
+            let inventory_backing = Stage2State::private_backing_identity();
             let stage2_lease = Some(GlobalFrameStage2Lease::fixed(*base, TWO_MIB as u64));
             mappings.push(ProcessMappingDesc {
                 start: *base,
@@ -1766,7 +1773,7 @@ impl HvfTaskState {
         record_alias_revision(
             CowDiagnosticAliasRevisionSite::ForkSnapshotEnd,
             &carrier_foreign_mm_transport.custody,
-            self.cow_identity,
+            self.stage2.cow_identity,
             0,
             alias_revision_end,
         );
@@ -1827,8 +1834,8 @@ impl HvfTaskState {
             eprintln!(
                 "[ARMDBG child-build parent_pid={:?} parent_mm={:?} child_slot={:x} \
                  ranges={} watch_covered={covered}]",
-                self.cow_identity.map(|identity| identity.linux_pid),
-                self.cow_identity.map(|identity| identity.mm),
+                self.stage2.cow_identity.map(|identity| identity.linux_pid),
+                self.stage2.cow_identity.map(|identity| identity.mm),
                 request.root_slot_base,
                 child_cow_armed.ranges.len(),
             );
@@ -1840,9 +1847,9 @@ impl HvfTaskState {
                 protections,
                 mailbox_slots,
                 syscall_transport,
-                persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+                persistent_vm_lifecycle: self.stage2.persistent_vm_lifecycle,
                 mm_root_slot: (request.root_slot_base, request.root_slot_size),
-                container_root: self.container_root,
+                container_root: self.stage2.container_root,
                 frame_inventory,
                 cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
                 carrier_foreign_mm_transport,
