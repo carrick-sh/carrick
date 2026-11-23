@@ -102,6 +102,38 @@ fn applevisor_permissions_live_only_in_the_backend_module() {
     );
 }
 
+/// A stage-2 map or destroy that custody takes as a closure returns
+/// `carrick_aarch64::stage2::Stage2Status`, the backend's status, never a
+/// bare integer or applevisor's `hv_return_t` (#2814, S0b). vCPU operations
+/// (closures over `hv_vcpu_t`) move behind their own type in the next layer.
+#[test]
+fn custody_stage2_closures_return_the_neutral_status() {
+    let sources = hvf_sources();
+    let raw_returns = ["i32", "applevisor_sys::hv_return_t", "hv_return_t"];
+    let mut raw = Vec::new();
+    for (path, source) in &sources {
+        for (index, line) in source.lines().enumerate() {
+            let Some((params, ret)) = line
+                .split_once("impl Fn")
+                .and_then(|(_, tail)| tail.rsplit_once("->"))
+            else {
+                continue;
+            };
+            if params.contains("hv_vcpu_t") {
+                continue;
+            }
+            let ret = ret.trim().trim_end_matches(',').trim();
+            if raw_returns.contains(&ret) {
+                raw.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        raw.is_empty(),
+        "stage-2 closures must return `Stage2Status`, not a raw integer: {raw:?}"
+    );
+}
+
 #[test]
 fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
     let sources = hvf_sources();
