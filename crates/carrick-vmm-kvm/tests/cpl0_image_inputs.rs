@@ -69,10 +69,10 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
     );
     // The original target-filtered closure plus the conservative host-only
     // carrick-el1-linux -> carrick-fatal edge, and the watch-only
-    // carrick-el1-linux -> carrick-test-support edge: an optional, host-only
+    // carrick-el1-linux -> carrick-zeroed-pages edge: an optional, host-only
     // dependency enabled solely by `host-test`, which the image build never
     // compiles: `cargo tree -p carrick-x86-cpl0 -e normal,build --target all`
-    // lists no carrick-test-support (0 matches; #2822).
+    // lists no carrick-zeroed-pages (0 matches; #2822).
     let packages = [
         "carrick-abi",
         "carrick-core",
@@ -92,9 +92,9 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
         "carrick-sched-core",
         "carrick-signal-core",
         "carrick-syscall-abi",
-        "carrick-test-support",
         "carrick-x86-carrier",
         "carrick-x86-cpl0",
+        "carrick-zeroed-pages",
     ];
     assert_eq!(inputs.package_dirs.len(), packages.len());
     for package in packages {

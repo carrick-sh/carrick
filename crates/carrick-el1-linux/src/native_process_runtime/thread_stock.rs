@@ -1028,7 +1028,7 @@ mod tests {
     fn notification_source_busy_is_not_exhaustion_and_release_allows_admission() {
         // SAFETY: exact aligned, zero-valid scheduler allocation owned by Box.
         let zone = unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>::new_zeroed()
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>::new_zeroed()
         };
         let controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
         let page = Box::new(ThreadLifecyclePage::new());

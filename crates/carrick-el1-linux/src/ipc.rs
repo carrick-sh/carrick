@@ -3150,7 +3150,7 @@ mod tests {
 
     // ---- the world: region (host-initialized), zone, one slot, task A ----
     enum TestZone {
-        Standalone(carrick_test_support::ZeroedBox<ZoneTables>),
+        Standalone(carrick_zeroed_pages::ZeroedBox<ZoneTables>),
         Carrier(Box<crate::mm_portal::test_support::Region>),
     }
     impl core::ops::Deref for TestZone {
@@ -3177,9 +3177,9 @@ mod tests {
         /// The IPC directory, pool and table map behind the `'static` views
         /// above, which must not outlive the world. Unmapped last (#2822).
         _backing: (
-            carrick_test_support::ZeroedPages,
-            carrick_test_support::ZeroedPages,
-            carrick_test_support::ZeroedBox<IpcTableMap>,
+            carrick_zeroed_pages::ZeroedPages,
+            carrick_zeroed_pages::ZeroedPages,
+            carrick_zeroed_pages::ZeroedBox<IpcTableMap>,
         ),
     }
 
@@ -3199,14 +3199,14 @@ mod tests {
 
     fn world() -> World {
         // SAFETY: all-zero is a valid empty zone table.
-        let zone = unsafe { carrick_test_support::ZeroedBox::new_zeroed() };
+        let zone = unsafe { carrick_zeroed_pages::ZeroedBox::new_zeroed() };
         world_with_zone(TestZone::Standalone(zone))
     }
 
     fn world_with_zone(zone: TestZone) -> World {
         // Committed only where touched, as the carrier's reservation is.
-        let dir = carrick_test_support::ZeroedPages::new(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES);
-        let pool = carrick_test_support::ZeroedPages::new(32 << 20);
+        let dir = carrick_zeroed_pages::ZeroedPages::new(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES);
+        let pool = carrick_zeroed_pages::ZeroedPages::new(32 << 20);
         // SAFETY: the world owns `dir` and `pool` and drops them after its views.
         let region = unsafe {
             IpcRegion::initialize(
@@ -3246,7 +3246,7 @@ mod tests {
         task.mm.thread_generation.store(1101, Ordering::Relaxed);
         let a_tid = task.execution.task.load(Ordering::Relaxed);
         // SAFETY: all-zero is the empty table map.
-        let map_backing = unsafe { carrick_test_support::ZeroedBox::<IpcTableMap>::new_zeroed() };
+        let map_backing = unsafe { carrick_zeroed_pages::ZeroedBox::<IpcTableMap>::new_zeroed() };
         // SAFETY: the world drops `map_backing` after every view of it.
         let map: &'static IpcTableMap = unsafe { &*core::ptr::from_ref(&*map_backing) };
         // The fake CPU records switches and SGIs in vectors: reserve them so

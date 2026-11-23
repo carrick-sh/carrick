@@ -20,7 +20,7 @@ pub struct Region {
     pub ptr: NonNull<u8>,
     pub bank: Option<std::sync::Arc<Bank>>,
     /// Lazily committed: a fixture pays only for the region pages it touches.
-    _pages: carrick_test_support::ZeroedPages,
+    _pages: carrick_zeroed_pages::ZeroedPages,
 }
 impl Default for Region {
     fn default() -> Self {
@@ -31,7 +31,7 @@ impl Region {
     pub fn new() -> Self {
         // The exact carrier region size, zeroed and page-aligned.
         let pages =
-            carrick_test_support::ZeroedPages::new(carrick_el1_abi::EL1_REGION_SIZE as usize);
+            carrick_zeroed_pages::ZeroedPages::new(carrick_el1_abi::EL1_REGION_SIZE as usize);
         Self {
             ptr: pages.as_non_null(),
             bank: None,
