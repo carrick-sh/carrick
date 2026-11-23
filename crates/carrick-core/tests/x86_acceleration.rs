@@ -249,7 +249,7 @@ mod fork_cow {
     };
     use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmuRefusal, OwnerTranslation};
     use carrick_mmu_core::x86::descriptor_txn::{
-        COW, HUGE, MAY_WRITE, NX, PREPARED, PRESENT, USER, WRITE,
+        ACCESSED, COW, DIRTY, HUGE, MAY_WRITE, NX, PREPARED, PRESENT, USER, WRITE,
     };
     use carrick_mmu_core::x86::owner_mmu::X86Mmu;
     use core::num::NonZeroU64;
@@ -1280,6 +1280,149 @@ mod fork_cow {
         }
         assert!(scratch.edits.is_empty());
         assert!(scratch.reads.is_empty());
+    }
+
+    /// Live words where another CPU's page walker sets Accessed and Dirty on one
+    /// parent word between the fork's read check and its first swap on that word
+    /// (#2914, from #2890's siblings shape: `...807` became `...867`).
+    struct WalkerRacedWords {
+        inner: TestMemory,
+        raced_pa: u64,
+        raced: AtomicBool,
+    }
+
+    impl LiveDescriptorWords for WalkerRacedWords {
+        fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+            self.inner.load(pa)
+        }
+
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, DescriptorRefusal> {
+            if pa == self.raced_pa && !self.raced.swap(true, Ordering::SeqCst) {
+                let word = self.inner.load(pa)?;
+                self.inner.store(pa, word | ACCESSED | DIRTY);
+            }
+            self.inner.compare_exchange(pa, before, after)
+        }
+
+        fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+            self.inner.store_unlinked(pa, value)
+        }
+
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {}
+    }
+
+    fn prepare_private_leaf_fork(
+        words: &TestMemory,
+        request: PortalForkRequest,
+        root_pa: u64,
+    ) -> PreparedOwnerFork<X86Mmu> {
+        let mut scratch = ForkScratch::bounded(request, 1, 512 * 4, 512 * 4, 512 * 4, 512).unwrap();
+        scratch.mappings = vec![Mapping {
+            range: ReservationRange::new(0, 0x0000_8000_0000_0000).unwrap(),
+            protection: ReservationProtection::READ_WRITE,
+            anonymous: true,
+            flags: ReservationNodeFlags::PRIVATE,
+            generation: ReservationGeneration::new(1).unwrap(),
+            host_backing: None,
+        }];
+        copy_table::<X86Mmu, _, _>(
+            &LinuxForkPolicy,
+            words,
+            request,
+            &mut scratch,
+            ForkTableCursor {
+                table: root_pa,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
+        )
+        .unwrap();
+        PreparedOwnerFork::<X86Mmu>::new(request, root_pa, scratch)
+    }
+
+    /// Contention, not EFAULT: a parent leaf that gains Accessed/Dirty after the
+    /// fork's read check fails its swap. The fork must roll back and answer
+    /// `ParentChanged` (which reruns the clone), never `Stale` (EFAULT). The rerun
+    /// from a fresh snapshot then publishes: Busy once, then success.
+    #[test]
+    fn x86_fork_publish_reruns_when_a_parent_leaf_gains_accessed_dirty_before_its_swap() {
+        let request = sample_request(5);
+        let words = WalkerRacedWords {
+            inner: TestMemory::new(),
+            raced_pa: 0x10_3000,
+            raced: AtomicBool::new(false),
+        };
+        let root_pa = 0x10_0000;
+        let leaf = 0x10_4000 | PRESENT | WRITE | USER;
+        words
+            .inner
+            .store(root_pa, 0x10_1000 | PRESENT | WRITE | USER);
+        words
+            .inner
+            .store(0x10_1000, 0x10_2000 | PRESENT | WRITE | USER);
+        words
+            .inner
+            .store(0x10_2000, 0x10_3000 | PRESENT | WRITE | USER);
+        words.inner.store(0x10_3000, leaf);
+        let parent_root = TestParentRoot {
+            incarnation: 1,
+            generation: ReservationGeneration::new(5).unwrap(),
+            sequence: 1,
+            ready: true,
+            authorized: true,
+            finished: false,
+        };
+        let child_root = || TestChildRoot {
+            incarnation: 1,
+            admitted: false,
+            authorized: true,
+            origin: None,
+            finished: false,
+            retired: Arc::new(AtomicBool::new(false)),
+        };
+
+        let first = prepare_private_leaf_fork(&words.inner, request, root_pa);
+        assert!(
+            first.scratch.edits.iter().any(|edit| edit.pa == 0x10_3000),
+            "the fork arms the parent leaf for COW"
+        );
+        assert_eq!(
+            first
+                .publish(
+                    &words,
+                    parent_root.clone(),
+                    child_root(),
+                    sample_child_handle(20)
+                )
+                .err(),
+            Some(ForkError::ParentChanged),
+            "a parent word changed by the walker is contention, not a stale parent"
+        );
+        assert_eq!(
+            words.load(0x10_3000).unwrap(),
+            leaf | ACCESSED | DIRTY,
+            "the refused fork leaves the walker's word as it found it"
+        );
+
+        let rerun = prepare_private_leaf_fork(&words.inner, request, root_pa);
+        let published = rerun
+            .publish(&words, parent_root, child_root(), sample_child_handle(20))
+            .expect("the rerun from a fresh snapshot publishes");
+        let armed = words.load(0x10_3000).unwrap();
+        assert_eq!(armed & WRITE, 0, "the rerun arms the parent leaf");
+        assert_eq!(armed & (COW | MAY_WRITE), COW | MAY_WRITE);
+        assert_ne!(
+            published.completion().child_tables_used,
+            0,
+            "the rerun publishes the child's tables"
+        );
     }
 }
 
