@@ -2126,6 +2126,11 @@ jobs:
           tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      # The host authority census pins its Linux profiles to this triple, a
+      # cross target here. Declared on this job, not in rust-toolchain.toml,
+      # which every host (the Mac gate runners too) installs (#2854).
+      - name: Install the authority census's Linux target
+        run: rustup target add x86_64-unknown-linux-gnu
       - name: Configure persisted compiler cache
         id: compiler-cache
         env:
