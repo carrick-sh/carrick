@@ -615,6 +615,15 @@ struct TestSourceScan {
     /// Out-of-line `mod x;` declarations in the file, for following into the
     /// files they name.
     mod_decls: Vec<ModDecl>,
+    /// Resolved in-crate `include!("x.rs")` items, for filing the included
+    /// file's tests under the including module.
+    includes: Vec<IncludeDecl>,
+}
+
+/// A resolved `include!` and the inline modules it sits in.
+struct IncludeDecl {
+    inline: Vec<String>,
+    file: PathBuf,
 }
 
 /// A `mod name;` declaration, with the inline modules it sits in.
@@ -647,21 +656,47 @@ impl TestSourceScan {
         else {
             return false;
         };
-        let candidate = self.file_dir.join(lit.value());
+        self.scanned_rs_file(&lit.value()).is_some()
+    }
+
+    /// `relative`, resolved against the visiting file's directory, when it
+    /// names a regular (not symlinked) `.rs` file that is one of the exact
+    /// files this scan reads, so following it hides nothing the scan doesn't
+    /// see. Returns the canonical path.
+    fn scanned_rs_file(&self, relative: &str) -> Option<PathBuf> {
+        let candidate = self.file_dir.join(relative);
         if candidate.extension().is_none_or(|e| e != "rs") {
-            return false;
+            return None;
         }
-        // No symlinked final component; the target must be one of the exact
-        // files this scan reads, so it hides nothing the scan doesn't see.
-        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
-            return false;
-        };
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
         if !meta.file_type().is_file() {
-            return false;
+            return None;
         }
-        candidate
-            .canonicalize()
-            .is_ok_and(|target| self.scanned.contains(&target))
+        let target = candidate.canonicalize().ok()?;
+        self.scanned.contains(&target).then_some(target)
+    }
+
+    /// The scanned file a plain `include!("x.rs")` / `std::include!` /
+    /// `core::include!` names. A computed argument stays unresolved.
+    fn resolve_include(&self, mac: &syn::Macro) -> Option<PathBuf> {
+        let segments: Vec<String> = mac
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if !matches!(
+            segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            ["include"] | ["std" | "core", "include"]
+        ) {
+            return None;
+        }
+        let lit = mac.parse_body::<syn::LitStr>().ok()?;
+        self.scanned_rs_file(&lit.value())
     }
 }
 
@@ -721,7 +756,9 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
         // An imported generator can emit tests without a local macro_rules!.
         // `global_asm!` and `thread_local!` provably can't: they emit
         // assembly or thread-local statics, never Rust test functions.
-        if !is_non_generating_item_macro(&item.mac.path) {
+        if !is_non_generating_item_macro(&item.mac.path)
+            && self.resolve_include(&item.mac).is_none()
+        {
             self.item_generator = Some("item macro generator");
         }
         syn::visit::visit_item_macro(self, item);
@@ -781,7 +818,13 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
             if name.ident == "macro_rules" {
                 self.item_generator = Some("macro_rules! generator");
             } else if name.ident == "include" {
-                self.unresolved = Some("include! source");
+                match self.resolve_include(mac) {
+                    Some(file) => self.includes.push(IncludeDecl {
+                        inline: self.module.clone(),
+                        file,
+                    }),
+                    None => self.unresolved = Some("include! source"),
+                }
             }
         }
         syn::visit::visit_macro(self, mac);
@@ -1012,6 +1055,33 @@ fn attribute_module_file(
         inventory
             .tests
             .insert((bin.to_string(), path.join("::")), lane.to_string());
+    }
+    for include in &scan.includes {
+        let mut module = prefix.to_vec();
+        module.extend(include.inline.iter().cloned());
+        // The included file is spliced into this module: its tests join
+        // the module path. Its own `mod`s or includes would need their
+        // files located from the includer, so they stay unresolved.
+        match scans.get(&include.file) {
+            Some(included) if included.mod_decls.is_empty() && included.includes.is_empty() => {
+                for relative in &included.test_paths {
+                    let mut path = module.clone();
+                    path.push(relative.clone());
+                    inventory
+                        .tests
+                        .insert((bin.to_string(), path.join("::")), lane.to_string());
+                }
+            }
+            _ => {
+                inventory.unresolved.get_or_insert_with(|| {
+                    format!(
+                        "include! of {} in {} declares modules or was not scanned",
+                        include.file.display(),
+                        file.display()
+                    )
+                });
+            }
+        }
     }
     let parent = canonical.parent().unwrap_or(Path::new(""));
     let child_dir = if mod_rs {
