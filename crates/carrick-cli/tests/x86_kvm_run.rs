@@ -1118,6 +1118,39 @@ fn mounted_static_x86_sched_unported_refusal_returns_enosys() {
     );
 }
 
+/// #1092: `sched_getaffinity` and `sched_setaffinity` by the x86 root, a
+/// second live thread and a fork child print what the native run prints.
+#[test]
+fn mounted_static_x86_affinity_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("affinity");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_affinity.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &[]);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native x86 affinity oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native oracle stderr: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let guest = run_mounted_binary(&elf, "affinity", false);
+    assert_eq!(
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "guest stdout vs the native oracle; status: {:?}; stderr: {}",
+        guest.status,
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), Some(0));
+}
+
 #[test]
 fn mounted_static_x86_descriptor_stdio_matches_native() {
     if skip_without_kvm() {
