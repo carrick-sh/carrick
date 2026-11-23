@@ -822,6 +822,15 @@ impl SyscallDispatcher {
             // native venue yet: never a guessed result.
             Ran::Outcome(_) => NetServed::Refused,
         };
+        // An answered call ends the wait an earlier attempt of it enrolled
+        // (a rerun after its wake): a wait lives no longer than its call.
+        if let (NetServed::Reply(..), Some(record)) = (&served, waiter) {
+            self.kernel_binding
+                .read()
+                .kernel()
+                .host_readiness()
+                .cancel(record);
+        }
         // The scratch table's references: a moved socket now has its ring's.
         for (_, slot) in slots {
             slot.description.release_fd_ref();
