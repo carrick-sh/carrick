@@ -2590,6 +2590,46 @@ fn run_mounted_binary_in_archive_with_census(
     )
 }
 
+fn mounted_carrier_scope(run_id: &str, _dir: &std::path::Path) -> String {
+    match std::env::var("CARRICK_RUN_ID") {
+        Ok(scope) => format!("{scope}-x86-kvm-{run_id}-test"),
+        Err(_) => format!("x86-kvm-{run_id}-test"),
+    }
+}
+
+#[test]
+fn mounted_carriers_with_the_same_label_publish_distinct_debug_endpoints() {
+    use carrick_kernel::kernel::debug::DebugEndpoint;
+    use std::os::unix::net::UnixListener;
+
+    let base = tempfile::Builder::new()
+        .prefix("ck")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let endpoint = |dir: &tempfile::TempDir| {
+        let scope = mounted_carrier_scope("root-network", dir.path());
+        DebugEndpoint::in_base(base.path().to_owned(), &scope).expect("resolve endpoint")
+    };
+
+    let first = endpoint(&first_dir);
+    first.claim(1).expect("claim first endpoint");
+    let _first_listener = UnixListener::bind(first.socket_path()).expect("bind first listener");
+    first.write_owner(1).expect("publish first owner");
+
+    let second = endpoint(&second_dir);
+    second
+        .claim(2)
+        .expect("claim second endpoint with first still live");
+    let _second_listener = UnixListener::bind(second.socket_path()).expect("bind second listener");
+    second.write_owner(2).expect("publish second owner");
+
+    for endpoint in [first, second] {
+        assert_eq!(endpoint.live_owner_pid().unwrap(), std::process::id());
+    }
+}
+
 /// One mounted run with its own deadline, for a fixture whose work is large
 /// by design. Every other fixture keeps the five-second deadline.
 fn run_mounted_binary_within(
@@ -2617,10 +2657,7 @@ fn run_mounted_binary_within(
         String::from_utf8_lossy(&load.stderr)
     );
     let mut command = std::process::Command::new(&cli);
-    let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
-        Ok(scope) => format!("{scope}-x86-kvm-{run_id}-test"),
-        Err(_) => format!("x86-kvm-{run_id}-test"),
-    };
+    let scoped_run_id = mounted_carrier_scope(run_id, dir.path());
     command
         .env("CARRICK_HOME", &home)
         .env("CARRICK_RUN_ID", &scoped_run_id);
