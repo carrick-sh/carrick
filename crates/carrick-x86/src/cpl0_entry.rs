@@ -273,8 +273,13 @@ pub struct NativeFrame {
     /// Actual user GPRs, independent of the saved IRET PC and flags above.
     pub user_rcx: u64,
     pub user_r11: u64,
+    /// Where the return PC (`rcx`) sits relative to this call's `SYSCALL`
+    /// (#2900). The entry assembly pushes zero, after the instruction; a
+    /// rewind, a sigreturn, a handler entry or a context restored at its
+    /// resume point sets it with the PC. Every capture and rerun reads it.
+    pub syscall_position: carrick_guest_arch::SavedSyscallPcWord,
 }
-const _: () = assert!(core::mem::size_of::<NativeFrame>() == 144);
+const _: () = assert!(core::mem::size_of::<NativeFrame>() == 152);
 const _: () = {
     assert!(core::mem::offset_of!(NativeFrame, r15) == 0);
     assert!(core::mem::offset_of!(NativeFrame, r14) == 8);
@@ -294,16 +299,28 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeFrame, rsp) == 120);
     assert!(core::mem::offset_of!(NativeFrame, user_rcx) == 128);
     assert!(core::mem::offset_of!(NativeFrame, user_r11) == 136);
+    assert!(core::mem::offset_of!(NativeFrame, syscall_position) == 144);
 };
 
-impl carrick_guest_arch::SyscallReturnFrame for NativeFrame {
+impl carrick_guest_arch::SyscallReturnRegisters for NativeFrame {
     const SYSCALL_LEN: u64 = carrick_guest_arch::X86_64_SYSCALL_LEN;
     fn return_pc(&self) -> u64 {
         self.rcx
     }
-    fn resume_at(&mut self, pc: u64, entry_word: u64) {
-        self.rax = entry_word;
+    fn set_return_pc(&mut self, pc: u64) {
         self.rcx = pc;
+    }
+    fn set_entry_word(&mut self, entry_word: u64) {
+        self.rax = entry_word;
+    }
+}
+
+impl carrick_guest_arch::SyscallReturnFrame for NativeFrame {
+    fn syscall_position(&self) -> Option<carrick_guest_arch::SavedSyscallPc> {
+        self.syscall_position.get()
+    }
+    fn set_syscall_position(&mut self, position: carrick_guest_arch::SavedSyscallPc) {
+        self.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(position);
     }
 }
 
@@ -320,18 +337,6 @@ impl NativeFrame {
     /// flags and non-user targets before constructing the return frame.
     pub fn valid_user_return(&self) -> bool {
         carrick_sched_core::valid_user_return_words(self.rcx, self.rsp, self.r11)
-    }
-
-    /// The PC of this call's `SYSCALL`: RCX holds the return PC it saved.
-    /// A parked or restarted call re-executes the instruction here.
-    pub fn syscall_pc(&self) -> u64 {
-        self.rcx
-            .wrapping_sub(carrick_guest_arch::X86_64_SYSCALL_LEN)
-    }
-
-    /// Re-enter this call's `SYSCALL` with every argument register intact.
-    pub fn restart_syscall(&mut self) {
-        self.rcx = self.syscall_pc();
     }
 
     /// The register carrying `SYSCALL` argument `index` (rdi, rsi, rdx,
@@ -445,63 +450,73 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    use carrick_guest_arch::{SavedSyscallPc, SyscallReturnFrame};
     /// #1756 S1 resume token: an x86 operation resumes at its 2-byte
     /// `SYSCALL`, which the native dispatch frame's `operation_resume_pc`
-    /// and `restart_syscall` hooks both take from here.
+    /// and `restart_syscall` hooks both take from here. A fresh trap is after
+    /// its `SYSCALL`; a second rewind keeps the PC on it (#2900).
     #[test]
-    fn syscall_resume_pc_rewinds_rcx_by_the_syscall_length() {
+    fn syscall_resume_pc_rewinds_rcx_by_the_syscall_length_once() {
         let mut frame = super::NativeFrame {
             rcx: 0x40_1007,
             rax: 0x1234,
             rdi: 3,
             ..Default::default()
         };
-        assert_eq!(frame.syscall_pc(), 0x40_1005);
-        frame.restart_syscall();
+        assert_eq!(frame.syscall_position(), Some(SavedSyscallPc::AfterSyscall));
+        assert_eq!(frame.syscall_pc(), Some(0x40_1005));
+        assert_eq!(frame.rewind_to_syscall(), Some(0x40_1005));
+        assert_eq!(frame.rewind_to_syscall(), Some(0x40_1005));
         assert_eq!(frame.rcx, 0x40_1005);
+        assert_eq!(frame.syscall_position(), Some(SavedSyscallPc::AtSyscall));
         assert_eq!((frame.rax, frame.rdi), (0x1234, 3));
     }
-    /// #2872: the x86 signal machine's `SA_RESTART` rerun reads where the
-    /// interrupted call's saved context puts its PC. A context parked at its
-    /// `SYSCALL` keeps RCX there; one after it rewinds exactly once. Red
-    /// before the fix: an `AtSyscall` context was rewound to `SYSCALL - 2`.
+    /// #2872, #2900: the x86 signal machine's `SA_RESTART` rerun reads where
+    /// the frame's own PC sits. A frame at its `SYSCALL` keeps RCX there;
+    /// one after it rewinds exactly once.
     #[test]
     fn sa_restart_rerun_keeps_an_at_syscall_rcx_on_its_syscall() {
-        sa_restart_reruns_interrupted_syscall_once(carrick_guest_arch::SavedSyscallPc::AtSyscall);
+        sa_restart_reruns_interrupted_syscall_once(SavedSyscallPc::AtSyscall);
     }
     #[test]
     fn sa_restart_rerun_rewinds_an_after_syscall_rcx_once() {
-        sa_restart_reruns_interrupted_syscall_once(
-            carrick_guest_arch::SavedSyscallPc::AfterSyscall,
-        );
+        sa_restart_reruns_interrupted_syscall_once(SavedSyscallPc::AfterSyscall);
     }
-    fn sa_restart_reruns_interrupted_syscall_once(position: carrick_guest_arch::SavedSyscallPc) {
+    fn sa_restart_reruns_interrupted_syscall_once(position: SavedSyscallPc) {
         const SYSCALL: u64 = 0x42_8bb5;
         const WAIT4: u64 = 61;
         let saved_pc = match position {
-            carrick_guest_arch::SavedSyscallPc::AtSyscall => SYSCALL,
-            carrick_guest_arch::SavedSyscallPc::AfterSyscall => SYSCALL + 2,
+            SavedSyscallPc::AtSyscall => SYSCALL,
+            SavedSyscallPc::AfterSyscall => SYSCALL + 2,
         };
+        // The interrupted call's entry context: always saved after its
+        // SYSCALL. Its label says nothing about the frame now rerun.
         let mut original = carrick_sched_core::ParkedContextWords::ZERO;
         original.frame[10] = WAIT4; // saved RAX
-        original.replace_saved_pc(saved_pc, position);
+        original.replace_saved_pc(SYSCALL + 2, SavedSyscallPc::AfterSyscall);
         // The interrupted wait answered EINTR in RAX; RCX is where the
-        // context says.
+        // frame says.
         let mut frame = super::NativeFrame {
             rcx: saved_pc,
             rax: 4u64.wrapping_neg(), // -EINTR
             rdi: 7,
             ..Default::default()
         };
-        assert_eq!(
-            carrick_guest_arch::rerun_interrupted_syscall(&mut frame, &original),
-            Some(carrick_guest_arch::SavedSyscallPc::AtSyscall)
-        );
+        frame.set_syscall_position(position);
+        assert!(carrick_guest_arch::rerun_interrupted_syscall(
+            &mut frame, &original
+        ));
         assert_eq!(
             frame.rcx, SYSCALL,
             "the rerun enters the interrupted SYSCALL itself, exactly once ({position:?})"
         );
+        assert_eq!(frame.syscall_position(), Some(SavedSyscallPc::AtSyscall));
         assert_eq!((frame.rax, frame.rdi), (WAIT4, 7));
+        // A second rerun of the same frame (a retried SA_RESTART) stays put.
+        assert!(carrick_guest_arch::rerun_interrupted_syscall(
+            &mut frame, &original
+        ));
+        assert_eq!(frame.rcx, SYSCALL);
     }
     #[test]
     fn scheduler_slot_conversion_rejects_unissued_high_bits() {
