@@ -507,6 +507,38 @@ fn grant_page_available<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     Ok(false)
 }
 
+/// What an owner grant may publish for its window, decided by the window's
+/// node (#1338). A grant of the other kind is refused before any store.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum GrantPages {
+    /// Pages this MM owns: fresh anonymous memory, or a private copy of a
+    /// file's bytes. Served by a `Prepare` of fresh backing.
+    Private,
+    /// A shared file window: the node is `FILE` without `PRIVATE`, so its
+    /// pages are the file's own. Served only by a `MapAlias` onto the
+    /// carrier's window slot; a private copy would drop every store.
+    SharedWindow,
+}
+
+impl GrantPages {
+    /// The pages a node with these attributes takes, for a window that names
+    /// a host source (`backed`).
+    pub fn of(flags: carrick_core_abi::ReservationNodeFlags, backed: bool) -> Self {
+        use carrick_core_abi::ReservationNodeFlags as F;
+        if backed && flags.contains(F::FILE) && !flags.contains(F::PRIVATE) {
+            Self::SharedWindow
+        } else {
+            Self::Private
+        }
+    }
+}
+
 /// An editor retained from target admission through descriptor completion.
 /// The caller owns the immutable window snapshot; authentication and execution
 /// borrow that same snapshot instead of copying it onto each nested frame.
@@ -518,6 +550,7 @@ pub struct GrantTarget<
     grant: carrick_sched_core::SpaceGrant,
     _editor: SpaceEditor<'a, C>,
     authenticated: bool,
+    pages: GrantPages,
 }
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> GrantTarget<'a, C> {
@@ -531,8 +564,15 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> GrantTarget<'a, C> {
         carrick_sched_core::SpaceGrant,
         SpaceEditor<'a, C>,
         bool,
+        GrantPages,
     ) {
-        (self.window, self.grant, self._editor, self.authenticated)
+        (
+            self.window,
+            self.grant,
+            self._editor,
+            self.authenticated,
+            self.pages,
+        )
     }
 }
 
@@ -636,11 +676,17 @@ fn authenticate_target<
         window.host_backing,
         window.fork_sequence,
     );
+    let pages = root
+        .node(window.fault_page)
+        .map_or(GrantPages::Private, |(mapping, _)| {
+            GrantPages::of(mapping.flags, window.host_backing.is_some())
+        });
     Ok(GrantTarget {
         window,
         grant,
         _editor: editor,
         authenticated,
+        pages,
     })
 }
 
@@ -1037,7 +1083,7 @@ fn apply_grant_inner<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorOutcome, DescriptorRefusal,
     };
-    let (window, grant, editor, authenticated) = target.into_parts();
+    let (window, grant, editor, authenticated, pages) = target.into_parts();
     let mm = window.operation.mm;
     let Some(claimed) = slot.descriptor().claim_for_mm(mm.raw()) else {
         return GrantApplyOutcome::Empty;
@@ -1123,6 +1169,41 @@ fn apply_grant_inner<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             }
             return OutcomeOrCapacity::Terminal(B::execute_grant(words, grant.ttbr0, txn));
         }
+        if let DescriptorOp::MapAlias { access, span, .. } = txn.op {
+            // A shared file window page (#1338): one resident leaf onto the
+            // carrier's window slot, whose bytes are the file's. It holds no
+            // private custody, so it takes no residency row.
+            let permitted = matches!(
+                access,
+                carrick_mmu_core::aarch64::descriptor_txn::AliasAccess::User {
+                    writable,
+                    executable,
+                } if writable
+                    == window
+                        .protection
+                        .permits(carrick_core_abi::mm::ReservationProtection::WRITE)
+                    && executable
+                        == window
+                            .protection
+                            .permits(carrick_core_abi::mm::ReservationProtection::EXECUTE)
+            );
+            if pages != GrantPages::SharedWindow
+                || span.va != window.fault_page
+                || span.len != 4096
+                || !permitted
+            {
+                return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                    DescriptorRefusal::BadEncoding,
+                ));
+            }
+            return OutcomeOrCapacity::Terminal(
+                match grant_page_available::<B, _>(words, grant.ttbr0, span.va) {
+                    Ok(true) => B::execute_grant(words, grant.ttbr0, txn),
+                    Ok(false) => DescriptorOutcome::Refused(DescriptorRefusal::Occupied),
+                    Err(reason) => DescriptorOutcome::Refused(reason),
+                },
+            );
+        }
         let DescriptorOp::Prepare {
             publication,
             resident,
@@ -1133,6 +1214,13 @@ fn apply_grant_inner<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
                 DescriptorRefusal::BadEncoding,
             ));
         };
+        // A shared file window's pages are the file's: a private copy here
+        // would drop every store through the mapping (#1338).
+        if pages == GrantPages::SharedWindow {
+            return OutcomeOrCapacity::Terminal(DescriptorOutcome::Refused(
+                DescriptorRefusal::BadEncoding,
+            ));
+        }
         if publication.va != window.range.start()
             || publication.len > window.range.len()
             || publication.len == 0

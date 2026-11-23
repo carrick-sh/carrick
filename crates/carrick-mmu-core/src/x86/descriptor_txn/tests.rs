@@ -92,6 +92,79 @@ fn owner_grant_projection_preserves_prepared_neighbors_and_refuses_exhaustion() 
     );
 }
 
+/// #1338: an owner grant for a shared file window page projects to one
+/// resident host `Map` leaf on the window slot: writable as the mapping is,
+/// never `PRIVATE` (so it is never retired into a private lease or COW
+/// copied), and the projection both the guest and the host settlement use
+/// names the exact page.
+#[test]
+fn owner_grant_projects_a_shared_file_window_page_as_a_host_map_leaf() {
+    use crate::aarch64::SubstrateGpa;
+    use crate::aarch64::descriptor_txn::{
+        AliasAccess, DescriptorOp as WireOp, DescriptorOutcome as WireOutcome,
+        DescriptorTxn as WireTxn, TableGrants,
+    };
+    use crate::owner_mmu::OwnerGrantMmu;
+    use crate::x86::owner_mmu::X86Mmu;
+    let tables = [
+        SubstrateGpa(0x2000),
+        SubstrateGpa(0x3000),
+        SubstrateGpa(0x4000),
+    ];
+    let grant = |access| WireTxn {
+        id: txn(DescriptorOp::Unmap(PageSpan::new(0x4000, PAGE)), &[]).id,
+        root: SubstrateGpa(0x1000),
+        op: WireOp::MapAlias {
+            access,
+            span: crate::aarch64::descriptor_txn::PageSpan::new(0x5000, PAGE),
+            target_ipa: SubstrateGpa(0x4000_0000 + 3 * PAGE),
+            backing: backing(),
+        },
+        tables: TableGrants::new(&tables).unwrap(),
+    };
+    let words = Words::new();
+    let before = words.words.borrow().clone();
+    // A deferred alias has no user leaf to give a window page.
+    assert_eq!(
+        X86Mmu::execute_grant(&words, 0x1000, &grant(AliasAccess::Deferred)),
+        WireOutcome::Refused(DescriptorRefusal::BadEncoding)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    let writable = grant(AliasAccess::User {
+        writable: true,
+        executable: false,
+    });
+    let WireOutcome::Applied(applied) = X86Mmu::execute_grant(&words, 0x1000, &writable) else {
+        panic!("window page grant applies");
+    };
+    assert_eq!(applied.pages, 1);
+    assert_eq!(applied.resident, PageSpan::new(0x5000, PAGE));
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x5000))
+        .unwrap()
+        .0;
+    assert_eq!(leaf & ADDRESS, 0x4000_0000 + 3 * PAGE);
+    assert_eq!(leaf & PRIVATE, 0);
+    assert_ne!(leaf & PRESENT, 0);
+    assert_ne!(leaf & WRITE, 0);
+    assert_ne!(leaf & NX, 0);
+    // The page beside it is untouched.
+    assert!(matches!(
+        translate_leaf(
+            &words,
+            root(0x1000),
+            UserVa::new(0x6000),
+            Access::Read,
+            true
+        ),
+        Err(FaultClass::NotPresent)
+    ));
+    // A second grant over the live leaf is refused, not stacked.
+    assert!(matches!(
+        X86Mmu::execute_grant(&words, 0x1000, &writable),
+        WireOutcome::Refused(_)
+    ));
+}
+
 #[test]
 fn neutral_prepare_intent_publishes_one_native_page() {
     use carrick_guest_arch::{
