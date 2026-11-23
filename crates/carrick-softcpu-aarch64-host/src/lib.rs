@@ -10,6 +10,7 @@
 
 pub mod facade;
 mod memory;
+pub mod rootfs_command;
 pub mod runner;
 
 pub use facade::{
