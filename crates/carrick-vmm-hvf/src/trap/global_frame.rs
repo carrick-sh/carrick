@@ -1537,6 +1537,7 @@ impl GlobalFrameHostOwner {
 
     #[cfg(test)]
     pub(crate) fn new(
+        custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
         mut lease: GlobalFrameStage2Lease,
         mapping: crate::host_mapping::OwnedHostMapping,
         perms: u64,
@@ -1547,7 +1548,7 @@ impl GlobalFrameHostOwner {
         if !lease.mapped {
             lease.mark_test_mapped_without_backend();
         }
-        let custody = std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let custody = std::sync::Arc::clone(custody);
         let identity = transfer_global_frame_stage2_lease_to_custody(
             &custody,
             lease,
@@ -1743,8 +1744,10 @@ impl Drop for GlobalFrameOwnerPin {
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn next_global_frame_owner_generation() -> u64 {
-    legacy_test_carrier_vm_custody()
+pub(crate) fn next_global_frame_owner_generation(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+) -> u64 {
+    custody
         .allocate_logical_owner()
         .map_or(0, |owner| owner.generation)
 }
@@ -2670,6 +2673,7 @@ pub(crate) struct StructuralBackingCustodyEntry {
 impl StructuralBackingOwner {
     #[cfg(test)]
     pub(crate) fn new(
+        custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
         mapping: crate::host_mapping::OwnedHostMapping,
         mut stage2_lease: GlobalFrameStage2Lease,
         epoch: StructuralEpoch,
@@ -2680,7 +2684,7 @@ impl StructuralBackingOwner {
             stage2_lease.mark_test_mapped_without_backend();
         }
         Self::new_in(
-            legacy_test_carrier_vm_custody_arc(),
+            &custody,
             mapping,
             stage2_lease,
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
@@ -4479,83 +4483,6 @@ pub(crate) fn global_frame_region_owner_matches_in(
         identity.host_addr,
         identity.generation,
     )
-}
-
-// Legacy fixtures share one directory only inside this test binary. Production
-// code cannot name these adapters because they do not exist in a non-test build.
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
-    global_frame_host_owner_generation_in(legacy_test_carrier_vm_custody(), ipa, length)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn global_frame_host_owner_identity(ipa: u64, length: u64) -> Option<(usize, u64)> {
-    global_frame_host_owner_identity_in(legacy_test_carrier_vm_custody(), ipa, length)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn register_global_frame_host_owner(
-    lease: GlobalFrameStage2Lease,
-    mapping: crate::host_mapping::OwnedHostMapping,
-    perms: u64,
-) -> Result<u64, TrapError> {
-    register_global_frame_host_owner_in(legacy_test_carrier_vm_custody_arc(), lease, mapping, perms)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn publish_exec_region_host_owner(
-    region: &mut HvfMappedRegion,
-    lease: GlobalFrameStage2Lease,
-) -> Result<u64, TrapError> {
-    publish_exec_region_host_owner_in(legacy_test_carrier_vm_custody_arc(), region, lease, None)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retire_global_frame_host_owner(
-    ipa: u64,
-    length: u64,
-) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_in(legacy_test_carrier_vm_custody(), ipa, length)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retire_global_frame_host_owner_if_generation(
-    ipa: u64,
-    length: u64,
-    generation: u64,
-) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_if_generation_in(
-        legacy_test_carrier_vm_custody(),
-        ipa,
-        length,
-        generation,
-    )
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drain_and_retry_pending_global_frame_retirements() -> Result<(), TrapError> {
-    drain_and_retry_pending_global_frame_retirements_in(legacy_test_carrier_vm_custody())
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn global_frame_host_owner_matches(
-    ipa: u64,
-    length: u64,
-    host_addr: usize,
-    generation: u64,
-) -> bool {
-    global_frame_host_owner_matches_in(
-        legacy_test_carrier_vm_custody(),
-        ipa,
-        length,
-        host_addr,
-        generation,
-    )
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
-    global_frame_region_owner_matches_in(legacy_test_carrier_vm_custody(), mapping)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

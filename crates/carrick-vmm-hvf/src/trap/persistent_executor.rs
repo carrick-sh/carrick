@@ -1209,14 +1209,12 @@ impl HvfVmState {
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
 
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport,
             task: HvfTaskState {
                 stage2: Stage2State {
-                    #[cfg(not(test))]
                     custody,
                     mappings: TaskMappingIndex::new(),
                     mm_root_slot,

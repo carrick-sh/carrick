@@ -499,7 +499,7 @@ impl Stage2State {
         None
     }
 
-    fn shared_futex_mapping_for_ipa_in(
+    pub(crate) fn shared_futex_mapping_for_ipa_in(
         custody: &CarrierVmCustody,
         mappings: &TaskMappingIndex,
         backing_gpa: u64,
@@ -519,20 +519,6 @@ impl Stage2State {
                 .then(|| mapping.view().shared_futex_location_for_ipa(backing_gpa))
                 .flatten()
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shared_futex_mapping_for_ipa(
-        mappings: &TaskMappingIndex,
-        backing_gpa: u64,
-        persistent_vm_lifecycle: bool,
-    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        Self::shared_futex_mapping_for_ipa_in(
-            legacy_test_carrier_vm_custody(),
-            mappings,
-            backing_gpa,
-            persistent_vm_lifecycle,
-        )
     }
 }
 

@@ -1397,20 +1397,8 @@ pub(crate) mod tests;
 
 impl Stage2State {
     pub(crate) fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
-        #[cfg(not(test))]
-        {
-            let custody = std::sync::Arc::clone(&self.custody);
-            Self::retire_stage2_extent_from_mappings_in(&custody, &mut self.mappings, ipa, length)
-        }
-        #[cfg(test)]
-        {
-            Self::retire_stage2_extent_from_mappings_in(
-                legacy_test_carrier_vm_custody(),
-                &mut self.mappings,
-                ipa,
-                length,
-            )
-        }
+        let custody = std::sync::Arc::clone(&self.custody);
+        Self::retire_stage2_extent_from_mappings_in(&custody, &mut self.mappings, ipa, length)
     }
 
     pub(crate) fn retire_stage2_extent_from_mappings_in(
@@ -1546,36 +1534,6 @@ impl Stage2State {
             )));
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire_stage2_extent_from_mappings(
-        mappings: &mut TaskMappingIndex,
-        ipa: u64,
-        length: u64,
-    ) -> Result<(), TrapError> {
-        Self::retire_stage2_extent_from_mappings_in(
-            legacy_test_carrier_vm_custody(),
-            mappings,
-            ipa,
-            length,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire_unowned_stage2_extent_from_mappings(
-        mappings: &mut TaskMappingIndex,
-        ipa: u64,
-        length: u64,
-        host_addr: usize,
-    ) -> Result<(), TrapError> {
-        Self::retire_unowned_stage2_extent_from_mappings_in(
-            legacy_test_carrier_vm_custody(),
-            mappings,
-            ipa,
-            length,
-            host_addr,
-        )
     }
 
     pub(crate) fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
@@ -2464,20 +2422,6 @@ impl Stage2State {
         Ok(extent)
     }
 
-    #[cfg(test)]
-    pub(crate) fn stage_mapping(
-        inventory: &mut HvpatchFrameInventory,
-        reservation: &mut carrick_hal::FrameInventoryReservation,
-        stage: InventoryMappingStage,
-    ) -> Result<InventoryExtent, TrapError> {
-        Self::stage_mapping_in(
-            legacy_test_carrier_vm_custody(),
-            inventory,
-            reservation,
-            stage,
-        )
-    }
-
     pub(crate) fn rollback_unpublished_mappings(
         inventory: &mut HvpatchFrameInventory,
         mappings: &[((u64, u64), InventoryExtent)],
@@ -3088,12 +3032,8 @@ impl Stage2State {
                 "HVPatch declined-remainder settlement has no frame inventory authority".to_owned(),
             )
         })?;
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.stage2.custody);
-        #[cfg(not(test))]
         let custody = custody.as_ref();
-        #[cfg(test)]
-        let custody = legacy_test_carrier_vm_custody();
         let (pid, tid) = task
             .stage2
             .cow_identity
@@ -3194,12 +3134,8 @@ impl Stage2State {
             }
         }
 
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.stage2.custody);
-        #[cfg(not(test))]
         let custody = custody.as_ref();
-        #[cfg(test)]
-        let custody = legacy_test_carrier_vm_custody();
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
         // per-process frame-inventory retirement.
@@ -3633,12 +3569,8 @@ impl Stage2State {
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.stage2.custody);
-        #[cfg(not(test))]
         let custody = custody.as_ref();
-        #[cfg(test)]
-        let custody = legacy_test_carrier_vm_custody();
         if !task.stage2.persistent_vm_lifecycle {
             return Err(TrapError::Hypervisor(
                 "stage-1 root-only retirement requires persistent HVPatch lifecycle".to_owned(),

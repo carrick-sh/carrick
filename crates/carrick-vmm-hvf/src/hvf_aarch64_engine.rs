@@ -3662,10 +3662,11 @@ mod task_only_materializer_tests {
 
     #[test]
     fn parked_task_projection_mismatch_rejects_without_consuming_projection() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root = 0x9a_0000_0000;
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(root, 2));
-        let parked = crate::trap::hvpatch_task_state_test_fixture(2, 0x7000, 702);
+        let parked = crate::trap::hvpatch_task_state_test_fixture(&custody, 2, 0x7000, 702);
 
         assert!(
             slot.validate_parked_task(&parked)
@@ -4058,10 +4059,11 @@ mod task_only_materializer_tests {
 
     #[test]
     fn one_worker_swaps_every_distinct_task_mm_mapping_and_cow_authority() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let mut worker = crate::trap::hvpatch_task_state_test_fixture(1, 0x1000, 101);
-        let mut first = crate::trap::hvpatch_task_state_test_fixture(2, 0x2000, 202);
-        let mut second = crate::trap::hvpatch_task_state_test_fixture(3, 0x3000, 303);
+        let mut worker = crate::trap::hvpatch_task_state_test_fixture(&custody, 1, 0x1000, 101);
+        let mut first = crate::trap::hvpatch_task_state_test_fixture(&custody, 2, 0x2000, 202);
+        let mut second = crate::trap::hvpatch_task_state_test_fixture(&custody, 3, 0x3000, 303);
         let worker_expected = crate::trap::hvpatch_task_state_test_identity(&worker);
         let first_expected = crate::trap::hvpatch_task_state_test_identity(&first);
         let second_expected = crate::trap::hvpatch_task_state_test_identity(&second);
@@ -4100,6 +4102,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn factory_and_idle_worker_retain_no_root_task_authority_after_root_retire() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = include_str!("trap.rs");
         let factory_shape = source
@@ -4125,8 +4128,8 @@ mod task_only_materializer_tests {
             "factory must retain only the VM-global executor control projection"
         );
 
-        let root_task = crate::trap::hvpatch_task_state_test_fixture(7, 0x7000, 707);
-        let idle_worker = crate::trap::hvpatch_neutral_task_state_for_test();
+        let root_task = crate::trap::hvpatch_task_state_test_fixture(&custody, 7, 0x7000, 707);
+        let idle_worker = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
         drop(root_task);
         crate::trap::audit_hvpatch_neutral_task_state_for_test(&idle_worker).unwrap();
     }

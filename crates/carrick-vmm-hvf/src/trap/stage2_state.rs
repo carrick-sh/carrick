@@ -2,7 +2,6 @@ use super::*;
 
 /// Stage-2 custody and MM authority that move with a logical HVPatch task.
 pub(crate) struct Stage2State {
-    #[cfg(not(test))]
     pub(super) custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) mappings: TaskMappingIndex,
     /// Per-mm stage-1 root-table slot. It contains page-table/control backing
@@ -55,25 +54,11 @@ pub(crate) struct Stage2State {
 
 impl Stage2State {
     pub(crate) fn custody(&self) -> &CarrierVmCustody {
-        #[cfg(not(test))]
-        {
-            &self.custody
-        }
-        #[cfg(test)]
-        {
-            legacy_test_carrier_vm_custody()
-        }
+        &self.custody
     }
 
     pub(super) fn custody_arc(&self) -> std::sync::Arc<CarrierVmCustody> {
-        #[cfg(not(test))]
-        {
-            std::sync::Arc::clone(&self.custody)
-        }
-        #[cfg(test)]
-        {
-            std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc())
-        }
+        std::sync::Arc::clone(&self.custody)
     }
 
     pub(crate) fn mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {

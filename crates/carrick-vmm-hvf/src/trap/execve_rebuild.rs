@@ -5,7 +5,6 @@ use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PendingExecStage2Cleanup {
-    #[cfg(not(test))]
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
     pub(crate) mappings: TaskMappingIndex,
     /// Physical candidates selected at exec publication, bound to the exact
@@ -84,12 +83,8 @@ impl PendingExecStage2Cleanup {
         ),
         after_exact_owner_retirement: &mut dyn FnMut(RetiredStage2Projection),
     ) -> Result<Option<HvpatchMmRootRetirementProof>, TrapError> {
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&self.custody);
-        #[cfg(not(test))]
         let custody = custody.as_ref();
-        #[cfg(test)]
-        let custody = legacy_test_carrier_vm_custody();
         let identity = self.predecessor_identity;
         let classification =
             carrick_observability::probes::HvpatchExecPredecessorClassification::new(
@@ -2168,7 +2163,6 @@ impl HvfVmState {
                 .stage2
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
-                    #[cfg(not(test))]
                     custody: std::sync::Arc::clone(&custody),
                     mappings: predecessor_mappings,
                     extents: predecessor_extents,

@@ -138,17 +138,23 @@ pub(crate) struct CarrierForeignMmTransport {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierForeignMmTransport {
     pub(crate) fn new() -> Self {
-        #[cfg(not(test))]
-        {
-            Self::default()
+        Self::default()
+    }
+
+    /// A transport bound to a test fixture's own carrier VM custody, so each
+    /// test carries its custody the way a carrier does (#1236, M2c).
+    #[cfg(test)]
+    pub(crate) fn with_custody(custody: std::sync::Arc<CarrierVmCustody>) -> Self {
+        Self {
+            custody,
+            ..Self::default()
         }
-        #[cfg(test)]
-        {
-            Self {
-                custody: std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()),
-                ..Self::default()
-            }
-        }
+    }
+
+    /// A transport with a fresh live-carrier custody owned by this fixture.
+    #[cfg(test)]
+    pub(crate) fn live_fixture() -> Self {
+        Self::with_custody(std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
     }
 
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -930,6 +936,7 @@ impl MmAccessState {
 
     #[cfg(test)]
     pub(crate) fn for_foreign_read_test(
+        custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
         binding: CarrierForeignMmBinding,
         page_tables: carrick_aarch64::Stage1Authority,
         protections: carrick_guest_mem::UserMemoryAuthority,
@@ -951,8 +958,7 @@ impl MmAccessState {
         );
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
         state.install_identity(snapshot.mm, snapshot.binding);
-        let resolver =
-            MmAccessLiveResolver::new(&state, legacy_test_carrier_vm_custody_arc().clone());
+        let resolver = MmAccessLiveResolver::new(&state, std::sync::Arc::clone(&custody));
         state.set_live_resolver(resolver);
         state
     }

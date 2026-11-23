@@ -29,7 +29,7 @@ impl PooledReadFixture {
         let owner = Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
         // SAFETY: the freshly registered owner exclusively covers `key.1` bytes.
         unsafe { std::ptr::write_bytes(owner.ptr(), fill, key.1 as usize) };
-        let mut task = hvpatch_neutral_task_state_for_test();
+        let mut task = hvpatch_neutral_task_state_for_test(&custody);
         task.stage2.persistent_vm_lifecycle = true;
         let mut row =
             crate::trap::thread_sibling_tests::mapped_region(READ_VA, READ_VA + key.1, key.0);
@@ -116,6 +116,7 @@ fn host_read_retains_pooled_frame_across_concurrent_munmap() {
 /// read, and a live one is pinned only for the copy.
 #[test]
 fn guest_copy_out_pins_only_the_exact_live_owner() {
+    let custody = crate::trap::test_carrier_custody();
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let fixture = PooledReadFixture::new(b'A');
     let owner = Arc::clone(fixture.custody.global_frame_host_owners.lock()[&fixture.key].owner());
@@ -131,7 +132,7 @@ fn guest_copy_out_pins_only_the_exact_live_owner() {
     assert_eq!(owner.mapping.pin_count(), pins, "copy leaked its owner pin");
 
     // A row stamped with a stale generation names a previous incarnation.
-    let mut task = hvpatch_neutral_task_state_for_test();
+    let mut task = hvpatch_neutral_task_state_for_test(&custody);
     task.stage2.persistent_vm_lifecycle = true;
     let mut row = crate::trap::thread_sibling_tests::mapped_region(
         READ_VA,
@@ -178,7 +179,7 @@ fn untracked_rows_are_admitted_only_for_carrier_control_mappings() {
         row
     };
     for persistent in [true, false] {
-        let mut task = hvpatch_neutral_task_state_for_test();
+        let mut task = hvpatch_neutral_task_state_for_test(&custody);
         task.stage2.persistent_vm_lifecycle = persistent;
         let carrier = carrick_mem::memory::LINUX_EL1_MAINT_BASE;
         task.stage2.mappings = TaskMappingIndex::from_region(row_at(carrier));

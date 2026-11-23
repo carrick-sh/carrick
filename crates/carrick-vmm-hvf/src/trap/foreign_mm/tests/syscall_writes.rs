@@ -3,6 +3,7 @@ use crate::trap::host_writes::HostWrites;
 use carrick_guest_mem::{GuestMemory, HostVa, HostWriteGuard, HostWriteRange, MemoryError};
 
 struct WriteFixture {
+    custody: Arc<CarrierVmCustody>,
     task: HvfTaskState,
     writes: HostWrites,
     installed: InstalledMm,
@@ -10,18 +11,20 @@ struct WriteFixture {
 
 impl WriteFixture {
     fn new() -> Self {
-        let transport = CarrierForeignMmTransport::new();
+        let transport = CarrierForeignMmTransport::live_fixture();
+        let custody = Arc::clone(&transport.custody);
         let installed = install_mm(
+            &custody,
             &transport,
             201,
             0x9a00_6700_0000,
             0x9b00_6700_0000,
             *b"old!",
         );
-        let owner = global_frame_host_owners().lock()[&installed.owners.0[1]]
+        let owner = custody.global_frame_host_owners.lock()[&installed.owners.0[1]]
             .owner()
             .clone();
-        let mut task = hvpatch_neutral_task_state_for_test();
+        let mut task = hvpatch_neutral_task_state_for_test(&custody);
         task.stage2.mm_access = Arc::clone(&installed.state);
         task.stage2.persistent_vm_lifecycle = true;
         task.stage2.mm_root_slot = Some(installed.owners.0[0]);
@@ -34,6 +37,7 @@ impl WriteFixture {
         row.owner_generation = owner.generation();
         task.stage2.mappings = TaskMappingIndex::from_region(row);
         Self {
+            custody,
             task,
             writes: HostWrites::default(),
             installed,
@@ -41,7 +45,7 @@ impl WriteFixture {
     }
 
     fn owner(&self) -> Arc<GlobalFrameHostOwner> {
-        global_frame_host_owners().lock()[&self.installed.owners.0[1]]
+        self.custody.global_frame_host_owners.lock()[&self.installed.owners.0[1]]
             .owner()
             .clone()
     }
@@ -64,12 +68,11 @@ impl GuestMemory for WriteFixture {
     }
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.task
-            .copy_guest_mapping_in(legacy_test_carrier_vm_custody(), address, address, bytes)
+            .copy_guest_mapping_in(&self.custody, address, address, bytes)
             .map(|_| ())
     }
     fn begin_host_write(&mut self, ranges: &[HostWriteRange]) -> Result<(), MemoryError> {
-        self.writes
-            .begin(&self.task, legacy_test_carrier_vm_custody(), ranges)
+        self.writes.begin(&self.task, &self.custody, ranges)
     }
     fn finish_host_write(&mut self, _: &[HostWriteRange]) {
         self.writes.finish();
@@ -250,12 +253,13 @@ fn native_code_content_host_write_rejects_changed_second_leaf_and_releases_pin()
 
 #[test]
 fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read() {
+    let custody = crate::trap::test_carrier_custody();
     use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let _aliases = ExternalAliasStateRestore::capture();
     let mut fixture = WriteFixture::new();
     let owner = fixture.owner();
-    let transport = CarrierForeignMmTransport::new();
+    let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     transport.register(&fixture.installed.snapshot, &fixture.installed.state);
     let mut bytes = [0; 4];
     let receipt = read_instructions_installed(&transport, &fixture.installed, &mut bytes).unwrap();
@@ -316,6 +320,7 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
 
 #[test]
 fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
+    let custody = crate::trap::test_carrier_custody();
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let size = 0x4000;
     let ipa = 0x8800_7100_0000;
@@ -326,6 +331,7 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     .unwrap();
     let epoch = next_structural_epoch().unwrap();
     let owner = StructuralBackingOwner::new(
+        &custody,
         mapping,
         GlobalFrameStage2Lease::fixed(ipa, size as u64),
         epoch,
@@ -334,8 +340,8 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     )
     .unwrap();
     let identity = owner.record_identity();
-    let custody = legacy_test_carrier_vm_custody();
-    let mut task = hvpatch_neutral_task_state_for_test();
+    let custody = &custody;
+    let mut task = hvpatch_neutral_task_state_for_test(&custody);
     let mut row = crate::trap::thread_sibling_tests::mapped_region(0x400000, 0x401000, ipa + 4096);
     row.physical_ipa = ipa;
     row.physical_size = size;
@@ -504,12 +510,13 @@ fn syscall_code_write_cost_contract() {
 
 #[test]
 fn native_code_content_syscall_copy_after_cow_preserves_source_dependency() {
+    let custody = crate::trap::test_carrier_custody();
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let _aliases = ExternalAliasStateRestore::capture();
     let mut fixture = WriteFixture::new();
     let old_owner = fixture.owner();
     let unchanged = old_owner.mapping.code_content.observe(0, 4).unwrap();
-    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&fixture.installed);
+    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&custody, &fixture.installed);
     let cow = lease
         .break_cow(
             &mut invalidator,
@@ -521,7 +528,9 @@ fn native_code_content_syscall_copy_after_cow_preserves_source_dependency() {
         .unwrap();
     let key = (cow.physical_base().raw(), cow.physical_len());
     fixture.installed.owners.0.push(key);
-    let owner = global_frame_host_owners().lock()[&key].owner().clone();
+    let owner = custody.global_frame_host_owners.lock()[&key]
+        .owner()
+        .clone();
     let changed = owner.mapping.code_content.observe(0, 4).unwrap();
     fixture.write_bytes_raw(TEST_VA, b"new!").unwrap();
     assert!(!changed.is_current());

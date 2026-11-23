@@ -11,6 +11,7 @@ mod alias_remap_limiter_tests {
 
     #[test]
     fn exact_replay_marker_turns_a_sibling_race_into_success() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let backing = AliasBacking {
             start: 0x1000,
@@ -39,9 +40,7 @@ mod alias_remap_limiter_tests {
             .insert(key);
 
         // The exact installed marker returns before touching Hypervisor.framework.
-        let result = unsafe {
-            inventory_stage2_map_replay(legacy_test_carrier_vm_custody().stage2_backend(), backing)
-        };
+        let result = unsafe { inventory_stage2_map_replay(custody.stage2_backend(), backing) };
         assert_eq!(result, 0);
         assert!(alias_registry().lock().contains_replay(&key));
 
@@ -656,6 +655,7 @@ mod alias_registry_tests {
 
     #[test]
     fn fork_shared_anonymous_alias_survives_a_second_fork_without_global_scope() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let parent_root_slot = (
             carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
@@ -730,10 +730,11 @@ mod alias_registry_tests {
             },
         )]);
         let child_source = super::ThreadMappingDesc::from_alias(alias).unwrap();
-        let grandchild_extent = inherited_fork_inventory_extents(&child_source, &inventory)
-            .pop()
-            .expect("grandchild retains exact inherited mapping")
-            .1;
+        let grandchild_extent =
+            inherited_fork_inventory_extents(&custody, &child_source, &inventory)
+                .pop()
+                .expect("grandchild retains exact inherited mapping")
+                .1;
         assert_eq!(grandchild_extent.frame, frame);
         assert_eq!(grandchild_extent.backing, alias.inventory_backing);
 
@@ -763,6 +764,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_partial_unmap_preserves_exact_live_fragments() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_0000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7d00_0000;
@@ -870,7 +872,7 @@ mod alias_registry_tests {
         for fragment in fragments {
             let desc = super::ThreadMappingDesc::from_alias(fragment).unwrap();
             assert_eq!(
-                inherited_fork_inventory_extents(&desc, &inventory)
+                inherited_fork_inventory_extents(&custody, &desc, &inventory)
                     .pop()
                     .expect("fragment retains inherited mapping")
                     .1
@@ -889,6 +891,7 @@ mod alias_registry_tests {
 
     #[test]
     fn retained_private_reuse_republishes_semantic_fragment_before_sibling_unmap() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_0800_0000;
         let physical_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c80_0000;
@@ -924,7 +927,8 @@ mod alias_registry_tests {
         let mut registry = AliasRegistry::default();
         registry.extend([prefix]);
 
-        let reused = retained_private_reuse_alias_fragment(
+        let reused = retained_private_reuse_alias_fragment_in(
+            &custody,
             &registry,
             va + 0x1000,
             physical_ipa + 0x1000,
@@ -967,6 +971,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_prefix_unmap_preserves_exact_suffix() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_1000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c00_0000;
@@ -1020,6 +1025,7 @@ mod alias_registry_tests {
         )]);
         assert_eq!(
             inherited_fork_inventory_extents(
+                &custody,
                 &super::ThreadMappingDesc::from_alias(fragment).unwrap(),
                 &inventory,
             )
@@ -1035,6 +1041,7 @@ mod alias_registry_tests {
 
     #[test]
     fn alias_registry_suffix_unmap_preserves_exact_prefix() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let va = 0x1383_2000_0000;
         let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7b00_0000;
@@ -1088,6 +1095,7 @@ mod alias_registry_tests {
         )]);
         assert_eq!(
             inherited_fork_inventory_extents(
+                &custody,
                 &super::ThreadMappingDesc::from_alias(fragment).unwrap(),
                 &inventory,
             )
@@ -1603,6 +1611,7 @@ mod alias_registry_tests {
 
     #[test]
     fn container_child_nonpersistent_cow_physical_source_lookup() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let container_1 = ContainerRootToken::from_raw(2);
         let child_root_slot = (
@@ -1637,7 +1646,7 @@ mod alias_registry_tests {
 
         alias_registry().lock().push(alias);
 
-        let mut child_task = super::HvfTaskState::neutral();
+        let mut child_task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
         child_task.stage2.container_root = container_1;
         child_task.stage2.mm_root_slot = Some(child_root_slot);
         // This test isolates container/mm alias visibility. Persistent HVPatch
@@ -1656,6 +1665,7 @@ mod alias_registry_tests {
 
     #[test]
     fn cow_physical_source_accepts_compound_prefix_before_an_offset_view() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let physical_ipa = 0x9b03_b60000_u64;
         let semantic_ipa = physical_ipa + 0x1000;
@@ -1664,7 +1674,7 @@ mod alias_registry_tests {
         let physical = vec![0u8; 0x4000];
         let physical_host = physical.as_ptr() as *mut u8;
         let semantic_host = physical_host.wrapping_add(0x1000);
-        let mut task = super::HvfTaskState::neutral();
+        let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
         task.stage2.mappings.insert(HvfMappedRegion {
             start: semantic_va,
             ipa: semantic_ipa,
@@ -1698,6 +1708,7 @@ mod alias_registry_tests {
 
     #[test]
     fn thread_mapping_desc_from_region_and_fork_inheritance_with_offset() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         let physical_len = 0x8000_usize;
@@ -1714,8 +1725,9 @@ mod alias_registry_tests {
         let physical_host = host_mapping.as_ptr() as usize;
         let semantic_host = (physical_host + semantic_offset as usize) as *mut u8;
 
-        let generation = super::next_global_frame_owner_generation();
+        let generation = super::next_global_frame_owner_generation(&custody);
         let owner = super::GlobalFrameHostOwner::new(
+            &custody,
             super::GlobalFrameStage2Lease::fixed(physical_ipa, physical_len as u64),
             host_mapping,
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
@@ -1724,7 +1736,8 @@ mod alias_registry_tests {
             physical_len as u64,
         );
         assert!(
-            super::global_frame_host_owners()
+            custody
+                .global_frame_host_owners
                 .lock()
                 .insert(
                     (physical_ipa, physical_len as u64),
@@ -1778,7 +1791,7 @@ mod alias_registry_tests {
             inventory_extent,
         )]);
 
-        let inherited = inherited_fork_inventory_extents(&desc, &parent_inventory);
+        let inherited = inherited_fork_inventory_extents(&custody, &desc, &parent_inventory);
         assert_eq!(
             inherited.len(),
             1,
@@ -1787,7 +1800,8 @@ mod alias_registry_tests {
         assert_eq!(inherited[0].1.stage2_owner.host_addr, physical_host);
         assert_eq!(inherited[0].1.stage2_owner.generation, generation);
 
-        super::global_frame_host_owners()
+        custody
+            .global_frame_host_owners
             .lock()
             .remove(&(physical_ipa, physical_len as u64));
     }
