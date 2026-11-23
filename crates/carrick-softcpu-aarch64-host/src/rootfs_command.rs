@@ -224,7 +224,54 @@ mod tests {
         let script = root.path().join("usr/bin/hello");
         std::fs::write(&script, b"#!/bin/sh -e\necho hi\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // An ELF without the execute bit, and a script whose interpreter is it.
+        let noexec = root.path().join("usr/bin/noexec");
+        std::fs::write(&noexec, b"\x7fELF\x02\x01\x01").unwrap();
+        std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let badinterp = root.path().join("usr/bin/badinterp");
+        std::fs::write(&badinterp, b"#!/usr/bin/noexec\n").unwrap();
+        std::fs::set_permissions(&badinterp, std::fs::Permissions::from_mode(0o755)).unwrap();
         root
+    }
+
+    #[test]
+    fn a_path_or_an_interpreter_without_the_execute_bit_is_refused() {
+        let root = rootfs();
+        assert!(resolve_command(root.path(), &argv(&["/usr/bin/noexec"]), DEFAULT_PATH).is_err());
+        assert!(resolve_command(root.path(), &argv(&["usr/bin/noexec"]), DEFAULT_PATH).is_err());
+        assert!(resolve_command(root.path(), &argv(&["badinterp"]), "/usr/bin").is_err());
+        assert!(resolve_command(root.path(), &argv(&["/usr/bin"]), DEFAULT_PATH).is_err());
+    }
+
+    #[test]
+    fn dot_dot_through_a_symlinked_directory_cannot_leave_the_rootfs() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        for dir in ["usr/local/go/bin", "usr/bin", "etc"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // A host file beside the rootfs, which no guest path may reach.
+        std::fs::write(outer.path().join("secret"), b"host").unwrap();
+        std::fs::write(root.join("etc/readme"), b"text").unwrap();
+        symlink("/usr/local/go/bin", root.join("usr/bin/godir")).unwrap();
+        symlink("../../../../..", root.join("etc/up")).unwrap();
+        // `..` after a symlinked directory is its target's parent ...
+        assert_eq!(
+            resolve_guest_path(&root, "/usr/bin/godir/..").unwrap(),
+            "/usr/local/go"
+        );
+        // ... and every `..` stops at the rootfs root.
+        assert_eq!(
+            resolve_guest_path(&root, "/usr/bin/godir/../../../../../etc/readme").unwrap(),
+            "/etc/readme"
+        );
+        assert_eq!(resolve_guest_path(&root, "/etc/up").unwrap(), "/");
+        assert_eq!(
+            resolve_guest_path(&root, "/etc/up/etc/readme").unwrap(),
+            "/etc/readme"
+        );
+        assert!(resolve_guest_path(&root, "/etc/up/secret").is_err());
+        assert!(resolve_guest_path(&root, "/usr/bin/godir/../../../../../secret").is_err());
     }
 
     fn argv(words: &[&str]) -> Vec<String> {
