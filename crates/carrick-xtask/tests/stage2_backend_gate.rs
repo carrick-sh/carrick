@@ -199,3 +199,62 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         "inventory_stage2_destroy must appear only in its definition and the custody wrapper"
     );
 }
+
+fn struct_fields(source: &str, name: &str) -> Vec<String> {
+    let header = format!("struct {name} {{");
+    let (_, body) = source
+        .split_once(&header)
+        .unwrap_or_else(|| panic!("missing {header}"));
+    let (body, _) = body.split_once("\n}").expect("unclosed struct body");
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('/') || line.starts_with('#') {
+                return None;
+            }
+            let (declaration, _) = line.split_once(':')?;
+            Some(declaration.split_whitespace().last()?.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn hvf_task_state_owns_custody_through_stage2_state() {
+    let hvf = workspace().join("crates/carrick-vmm-hvf/src");
+    let task_source = std::fs::read_to_string(hvf.join("trap.rs")).unwrap();
+    let task_fields = struct_fields(&task_source, "HvfTaskState");
+    let custody_fields = [
+        "custody",
+        "mappings",
+        "mm_root_slot",
+        "container_root",
+        "pending_exec_mm_root_slot",
+        "pending_exec_asid",
+        "pending_exec_predecessor_identity",
+        "pending_exec_stage2_cleanup",
+        "shared_process_mm",
+        "mm_access",
+        "persistent_vm_lifecycle",
+        "cow_authority",
+        "cow_identity",
+        "pending_fork_frame_receipts",
+        "pending_process_aliases",
+        "cow_rollback_scratch",
+        "fail_next_begin_exec_inventory",
+    ];
+    for field in custody_fields {
+        assert!(
+            !task_fields.iter().any(|name| name == field),
+            "HvfTaskState still declares custody field {field}"
+        );
+    }
+    let stage2_source = std::fs::read_to_string(hvf.join("trap/stage2_state.rs")).unwrap();
+    let stage2_fields = struct_fields(&stage2_source, "Stage2State");
+    assert_eq!(stage2_fields.len(), custody_fields.len());
+    for field in custody_fields {
+        assert!(
+            stage2_fields.iter().any(|name| name == field),
+            "Stage2State must declare custody field {field}"
+        );
+    }
+}
