@@ -459,6 +459,37 @@ pub fn control_doorbell(frame: &NativeFrame) {
     doorbell(CONTROL_PORT, frame);
 }
 
+/// Publish a ring panic's location and message through the fatal port, then
+/// halt. The words ride in `carrick_x86::PANIC_REPORT_REGS` order.
+#[cold]
+#[inline(never)]
+pub fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
+    let mut report =
+        info.location()
+            .map_or(carrick_el1_abi::PanicReport::new("", 0, 0), |location| {
+                carrick_el1_abi::PanicReport::new(
+                    location.file(),
+                    location.line(),
+                    location.column(),
+                )
+            });
+    let _ = write!(report.message_writer(), "{}", info.message());
+    let words = report.words();
+    // SAFETY: terminal CPL0 fatal crossing. The host reads the stopped
+    // registers and never resumes this CPU.
+    unsafe {
+        core::arch::asm!("out dx, al", "2: cli", "hlt", "jmp 2b",
+            in("dx") FATAL_PORT,
+            in("rax") carrick_el1_abi::PanicReport::SENTINEL,
+            in("rdi") words[0], in("rsi") words[1], in("rcx") words[2],
+            in("r8") words[3], in("r9") words[4], in("r10") words[5],
+            in("r11") words[6], in("r12") words[7], in("r13") words[8],
+            in("r14") words[9],
+            options(noreturn));
+    }
+}
+
 pub fn halt() -> ! {
     loop {
         // SAFETY: terminal CPL0 fatal path, never returns to user.

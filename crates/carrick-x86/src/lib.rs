@@ -52,6 +52,7 @@ pub use vmm::{
     ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion, X86_PML4_CAPACITY, X86Exit,
     X86FaultKind, X86Reg, X86Seg, X86Vcpu, X86Vmm, XSAVE_AVX_OFFSET, XSAVE_LEN, fxsave_to_xsave,
 };
+pub use vmm::{PANIC_REPORT_REGS, fatal_port_panic_report};
 
 pub mod cpl0_lifecycle;
 

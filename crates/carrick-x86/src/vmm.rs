@@ -59,6 +59,35 @@ pub enum X86Reg {
     Efer,
 }
 
+/// The registers that carry a ring panic's record across [`crate::cpl0_entry::FATAL_PORT`], in
+/// `PanicReport::words` order. RAX holds `PanicReport::SENTINEL`.
+pub const PANIC_REPORT_REGS: [X86Reg; carrick_el1_abi::PANIC_REPORT_WORDS] = [
+    X86Reg::Rdi,
+    X86Reg::Rsi,
+    X86Reg::Rcx,
+    X86Reg::R8,
+    X86Reg::R9,
+    X86Reg::R10,
+    X86Reg::R11,
+    X86Reg::R12,
+    X86Reg::R13,
+    X86Reg::R14,
+];
+
+/// The ring's panic record at a stopped [`crate::cpl0_entry::FATAL_PORT`] exit, when it published one.
+pub fn fatal_port_panic_report<E>(
+    mut gpr: impl FnMut(X86Reg) -> Result<u64, E>,
+) -> Result<Option<carrick_el1_abi::PanicReport>, E> {
+    if gpr(X86Reg::Rax)? != carrick_el1_abi::PanicReport::SENTINEL {
+        return Ok(None);
+    }
+    let mut words = [0; carrick_el1_abi::PANIC_REPORT_WORDS];
+    for (word, reg) in words.iter_mut().zip(PANIC_REPORT_REGS) {
+        *word = gpr(reg)?;
+    }
+    Ok(Some(carrick_el1_abi::PanicReport::from_words(words)))
+}
+
 /// The x86 segment registers the long-mode bring-up programs. Each backend
 /// realizes `set_segment` via `kvm_segment`/`kvm_sregs` (KVM), `vm_set_desc`
 /// ordinals (bhyve), or the `NvmmX64StateSeg` array (NVMM).

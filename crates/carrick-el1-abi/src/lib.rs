@@ -28,6 +28,7 @@ pub use carrick_guest_arch::ContextGeneration;
 
 use carrick_core_abi::{ExclusiveSeq, OpenLifetime, SeqByteBuf, SeqLockAtomic, SeqWriteGuard};
 mod entry_binding_fatal;
+mod panic_report;
 mod stack_overflow;
 pub use stack_overflow::*;
 #[cfg(all(test, not(feature = "loom")))]
@@ -35,6 +36,7 @@ mod image_layout_tests;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
 pub use entry_binding_fatal::*;
+pub use panic_report::*;
 mod open_lifetime;
 pub use open_lifetime::*;
 mod cow_grants;
