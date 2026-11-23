@@ -701,6 +701,21 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         Ok(())
     }
 
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn maybe_inject_death_after_exec_seal(&self) -> Result<(), TrapError> {
+        if self.injected_death == Some(crate::prepare::KvmInjectedExecutorDeath::AfterExecSealed)
+            && self
+                .physical
+                .exec_owner_census()
+                .is_ok_and(|census| census.sealed > census.adopted)
+        {
+            return Err(TrapError::Hypervisor(
+                "injected executor death after exec seal".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn service_syscall_trap(
         &mut self,
         task: TaskIdentity,
@@ -1305,6 +1320,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         }
                     }
                 } else {
+                    #[cfg(feature = "kvm-pool-test-control")]
+                    self.maybe_inject_death_after_exec_seal()?;
                     Ok(ExecutorExit::ResumeEl1)
                 }
             }
@@ -1372,6 +1389,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     self.publish_exit(carrick_vmm_kvm::cpl0_boot::initial_process_exit(
                         status, exits,
                     ))?;
+                } else {
+                    #[cfg(feature = "kvm-pool-test-control")]
+                    self.maybe_inject_death_after_exec_seal()?;
                 }
                 Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
                     self.zone_slot(),

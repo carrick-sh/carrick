@@ -162,6 +162,40 @@ pub fn try_run_pool_fixture_with_test_control(
     )
 }
 
+/// Run `elf` on the production pool with caller-supplied frame inventory,
+/// syscall dispatcher, and `test_control`, invoking `before_run` after the
+/// initial carrier is booted and before the pool runs.
+#[allow(dead_code)]
+pub fn try_run_pool_fixture_with_inventory_dispatcher_and_test_control(
+    elf: &[u8],
+    max_exits: usize,
+    inventory: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    test_control: carrick_runtime::prepare::KvmPoolTestControl,
+    before_run: impl FnOnce(),
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    let (carrier, root) = boot_program_carrier_with_inventory(
+        &program,
+        ROOT_AFFINITY_ANY,
+        |_| {},
+        &dispatcher,
+        None,
+        inventory,
+    );
+    before_run();
+    carrick_runtime::prepare::try_run_prepared_kvm_pool_with_test_control(
+        carrier,
+        root,
+        dispatcher,
+        max_exits,
+        test_control,
+    )
+}
+
 /// Load the issued root of a booted production carrier on a real KVM
 /// executor and retarget it to a committed `execve` successor (#2142).
 #[allow(dead_code)]
@@ -183,10 +217,27 @@ fn boot_program_carrier(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     production_image: Option<&[u8]>,
 ) -> (Cpl0Carrier, carrick_kernel::kernel::KernelContext) {
+    boot_program_carrier_with_inventory(
+        program,
+        affinity,
+        configure,
+        dispatcher,
+        production_image,
+        physical_inventory(),
+    )
+}
+
+fn boot_program_carrier_with_inventory(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    affinity: u64,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    production_image: Option<&[u8]>,
+    inventory: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
+) -> (Cpl0Carrier, carrick_kernel::kernel::KernelContext) {
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let inventory = physical_inventory();
     let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(dispatcher);
     let mut carrier = match production_image {
         Some(image) => Cpl0Carrier::boot_production_image(inventory, image, extent, ipc),

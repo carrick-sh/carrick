@@ -84,3 +84,74 @@ fn executor_death_after_the_guest_exit_keeps_the_exit() {
         .expect("a death after the guest exit keeps the exit");
     assert_eq!(outcome.run.exit_code, 7, "the guest's own exit status");
 }
+
+/// #2826: a worker dies after sealing an exec row (before the guest resumes
+/// to adopt it), so `run_prepared_kvm_pool_with_debug` returns `Err`. The
+/// carrier-exit drain must still run after `pool.shutdown()`, retiring the
+/// sealed row (`carrier_exit == 1`, `unretired() == 0`) and rolling back its
+/// staged frames to the pre-run baseline.
+#[test]
+fn exec_sealed_then_executor_death_drains_at_carrier_exit() {
+    if bounded("exec_sealed_then_executor_death_drains_at_carrier_exit") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    carrick_test_support::executable::write_executable_mode(
+        &successor,
+        kvm_pool_fixture::assemble_fixture("native_root_exec_successor.S", &[]),
+        0o700,
+    );
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = kvm_pool_fixture::assemble_fixture("native_root_exec.S", &[&define]);
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let authority = std::sync::Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new());
+    let inventory = authority.physical_projection(std::sync::Arc::new(
+        carrick_kernel::kernel::ObjectIdRegistry::new(),
+    ));
+    let baseline_mappings = std::cell::Cell::new(0usize);
+    let failure =
+        kvm_pool_fixture::try_run_pool_fixture_with_inventory_dispatcher_and_test_control(
+            &elf,
+            256,
+            inventory,
+            dispatcher,
+            KvmPoolTestControl {
+                loaded_pre_entry_hook: None,
+                injected_death: Some(KvmInjectedExecutorDeath::AfterExecSealed),
+            },
+            || baseline_mappings.set(authority.snapshot().mappings.len()),
+        )
+        .err()
+        .expect("injected executor death after exec seal must return Err");
+    let error = failure.error.to_string();
+    assert!(
+        error.contains("injected executor death after exec seal"),
+        "expected injected death error, got: {error}"
+    );
+    let physical = failure
+        .physical
+        .as_ref()
+        .expect("failed KVM pool run returns physical carrier");
+    let census = physical.exec_owner_census().expect("exec owner census");
+    assert_eq!(
+        (
+            census.reserved,
+            census.sealed,
+            census.adopted,
+            census.carrier_exit,
+            census.unretired(),
+        ),
+        (1, 1, 0, 1, 0),
+        "carrier-exit drain must retire the sealed, unadopted row on Err exit: {census:?}"
+    );
+    assert_eq!(
+        authority.snapshot().mappings.len(),
+        baseline_mappings.get(),
+        "carrier-exit drain must roll back the sealed exec's staged frames to baseline"
+    );
+}
