@@ -2320,7 +2320,7 @@ impl MultiSlotEnv {
                 self.user_sp
             }
             fn restart(
-                &self,
+                &mut self,
                 _: &mut carrick_el1_abi::TrapFrame,
                 _: &Aarch64ParkedContext,
             ) -> bool {

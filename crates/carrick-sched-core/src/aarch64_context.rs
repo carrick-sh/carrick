@@ -173,13 +173,10 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     /// Only a PC after `SVC` moves: a context already at its `SVC` (rewound
     /// once, parked on an object at it, or interrupted) keeps it (#2851).
     fn restart_syscall(&mut self) {
-        if self.saved_syscall_pc() == Some(SavedSyscallPc::AfterSyscall) {
-            self.replace_saved_pc(
-                self.native
-                    .pc
-                    .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN),
-                SavedSyscallPc::AtSyscall,
-            );
+        if let Some(pc) = self.saved_syscall_pc().and_then(|position| {
+            position.syscall_instruction(self.native.pc, carrick_guest_arch::AARCH64_SVC_LEN)
+        }) {
+            self.replace_saved_pc(pc, SavedSyscallPc::AtSyscall);
         }
     }
     fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {

@@ -1206,10 +1206,10 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     fn user_sp(&self, _: &carrick_el1_abi::TrapFrame) -> UserVa {
         UserVa::new(0x400000)
     }
-    fn restart(&self, _: &mut carrick_el1_abi::TrapFrame, _: &ParkedContextWords) -> bool {
+    fn restart(&mut self, _: &mut carrick_el1_abi::TrapFrame, _: &ParkedContextWords) -> bool {
         false
     }
-    fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
+    fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
     fn group_exit_custody(

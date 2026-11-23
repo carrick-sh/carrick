@@ -19,13 +19,16 @@ pub trait SignalMachine<C> {
         &self,
         frame: &<Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
     ) -> UserVa;
+    /// Rerun `original`'s interrupted call from `frame`. A machine whose
+    /// frame persists into a parked context records the position the rerun
+    /// leaves, for `sync_parked_context` (#2872).
     fn restart(
-        &self,
+        &mut self,
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
         original: &C,
     ) -> bool;
     fn restart_forwarded(
-        &self,
+        &mut self,
         _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
     ) -> Option<bool> {
         None
@@ -34,7 +37,8 @@ pub trait SignalMachine<C> {
     /// Reflect the successfully published frame in a saved execution context.
     fn published_stack(&mut self, _sp: UserVa) {}
     /// Copy the current pre-handler return frame into the parked context before
-    /// suspending on address-space contention.
+    /// suspending on address-space contention, with the syscall position a
+    /// restart left the frame at, never the context's stale one.
     fn sync_parked_context(
         &self,
         _frame: &<Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
