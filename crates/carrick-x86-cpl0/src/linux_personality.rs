@@ -434,9 +434,9 @@ pub fn complete_run_failure(
 pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     let exit = carrick_core_abi::NativeRootExit::new(
         carrick_el1_linux::common_entry::execution_binding(task),
-        status.terminal_status().unwrap_or_else(|_| fatal_boot()),
+        status.terminal_status().unwrap_or_else(|_| fatal_boot!()),
     )
-    .unwrap_or_else(|| fatal_boot());
+    .unwrap_or_else(|| fatal_boot!());
     // SAFETY: shared retirement authenticated this exact root completion.
     unsafe {
         core::arch::asm!(
@@ -517,7 +517,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
     ) {
         use carrick_el1::isa::x86::context;
         let native = context::context_words::into_native(*ctx, self.address)
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         let updated = context::context_words::from_syscall(
             frame,
             self.address,
@@ -525,8 +525,8 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
             native.gs_base,
             &native.xsave,
         )
-        .unwrap_or_else(|_| fatal_boot());
-        let position = self.frame_position(ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot()));
+        .unwrap_or_else(|_| fatal_boot!());
+        let position = self.frame_position(ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot!()));
         *ctx = context::context_words::from_native(&updated, position);
     }
 }
@@ -561,8 +561,8 @@ pub fn signal_user_return(
     if !native_process::is_admitted() {
         return false;
     }
-    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot());
-    let slot = SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| fatal_boot());
+    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot!());
+    let slot = SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| fatal_boot!());
     let source = carrick_x86_carrier::native_execution::source(slot);
     // SAFETY: return validation runs on the CPU that owns this task binding.
     let task = unsafe { &*(binding.task_address as *const CurrentTask) };
@@ -573,9 +573,9 @@ pub fn signal_user_return(
         let words = capture(frame, xsave);
         let mut service = native_process::Service::new(task, slot);
         native_process::drain_external_ingress(source, &mut service)
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         let (process_runtime, address) =
-            native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
+            native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot!());
         let mut process = process_runtime
             .enter_registered(
                 native_process::registry(),
@@ -585,7 +585,7 @@ pub fn signal_user_return(
                 &words,
                 &mut service,
             )
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         if let Some(info) = forced {
             use carrick_personality_linux::signal::policy::{SigBlockMask, Signal};
             let Some(thread) = GuestLifecycleVenue.thread(task) else {
@@ -614,7 +614,7 @@ pub fn signal_user_return(
             &mut X86SignalMachine::new(address),
         ) {
             if route != CompletionRoute::Suspended {
-                fatal_boot();
+                fatal_boot!();
             }
             suspended = true;
         }
@@ -638,8 +638,8 @@ pub fn signal_irq_return(
     xsave: &mut XsaveArea,
 ) {
     use carrick_el1::isa::x86::context;
-    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot());
-    let slot = SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| fatal_boot());
+    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot!());
+    let slot = SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| fatal_boot!());
     let source = carrick_x86_carrier::native_execution::source(slot);
     if !native_process::is_admitted() {
         return;
@@ -647,10 +647,10 @@ pub fn signal_irq_return(
     // SAFETY: this CPU owns its retained current-task binding during IRQ entry.
     let task = unsafe { &*(binding.task_address as *const CurrentTask) };
     let mm = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire))
-        .unwrap_or_else(|| fatal_boot());
+        .unwrap_or_else(|| fatal_boot!());
     let address = anonymous::live_words(mm)
         .and_then(|words| words.context)
-        .unwrap_or_else(|| fatal_boot());
+        .unwrap_or_else(|| fatal_boot!());
     let mut native = context::scheduler::NativeContext {
         frame: *frame,
         address,
@@ -659,22 +659,22 @@ pub fn signal_irq_return(
         xsave: xsave.clone(),
     };
     let mut returned = context::context_words::syscall_frame_from_native(&native, address)
-        .unwrap_or_else(|_| fatal_boot());
+        .unwrap_or_else(|_| fatal_boot!());
     let record = source
         .zone
         .slot(slot)
         .current()
         .or_else(|| source.zone.slot(slot).host_record())
-        .unwrap_or_else(|| fatal_boot());
+        .unwrap_or_else(|| fatal_boot!());
     let mut suspended = false;
     let root_exit;
     {
         let _copy_gate = user_fault_gate::install();
         let mut service = native_process::Service::new(task, slot);
         native_process::drain_external_ingress(source, &mut service)
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         let (process_runtime, runtime_address) =
-            native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
+            native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot!());
         let mut process = process_runtime
             .enter_registered(
                 native_process::registry(),
@@ -687,7 +687,7 @@ pub fn signal_irq_return(
                 ),
                 &mut service,
             )
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         if let Some(route) = deliver_signal_on_syscall_return(
             task,
             &mut process,
@@ -696,7 +696,7 @@ pub fn signal_irq_return(
             &mut X86SignalMachine::new(runtime_address),
         ) {
             if route != CompletionRoute::Suspended {
-                fatal_boot();
+                fatal_boot!();
             }
             suspended = true;
         }
@@ -713,7 +713,7 @@ pub fn signal_irq_return(
             native.gs_base,
             xsave,
         )
-        .unwrap_or_else(|_| fatal_boot());
+        .unwrap_or_else(|_| fatal_boot!());
         *frame = native.frame;
         if source.zone.runnable_head(slot).is_some() {
             // SAFETY: IRQ entry owns this exact running/home record's context.
@@ -728,7 +728,7 @@ pub fn signal_irq_return(
             // IRQ entry owns this running/home record: a refusal is a broken
             // invariant, never contention (#1100).
             if !source.zone.requeue_preempted(slot, record).is_queued() {
-                fatal_boot();
+                fatal_boot!();
             }
             suspended = true;
         } else if source.zone.slot(slot).queued() != 0 {
@@ -964,7 +964,7 @@ fn native_exec_call(
                             restart_native_syscall(frame, ordinal);
                             CompletionRoute::Served
                         }
-                        anonymous::ContendedFault::Refused => fatal_boot(),
+                        anonymous::ContendedFault::Refused => fatal_boot!(),
                     }
                 }
                 UserFaultSupply::TypedRelease(wait) => {
@@ -975,7 +975,7 @@ fn native_exec_call(
                             restart_native_syscall(frame, ordinal);
                             CompletionRoute::Served
                         }
-                        anonymous::ContendedFault::Refused => fatal_boot(),
+                        anonymous::ContendedFault::Refused => fatal_boot!(),
                     }
                 }
                 UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
@@ -984,7 +984,7 @@ fn native_exec_call(
                 }
             };
         }
-        None => fatal_boot(),
+        None => fatal_boot!(),
     };
     let table = carrick_el1_linux::ipc::guest_venue(u32::from(slot.raw()))
         .and_then(|venue| carrick_el1_linux::ipc::native_exec_table(venue.tables, task));
@@ -1065,7 +1065,7 @@ fn inline_service(
             | NativeResume::Left(Some(_))
             | NativeResume::Invalid,
         )
-        | Err(_) => fatal_boot(),
+        | Err(_) => fatal_boot!(),
     }
 }
 
@@ -1076,7 +1076,7 @@ fn restart_native_syscall(frame: &mut NativeFrame, native: carrick_guest_arch::N
     frame.rcx = frame
         .rcx
         .checked_sub(carrick_guest_arch::X86_64_SYSCALL_LEN)
-        .unwrap_or_else(|| fatal_boot());
+        .unwrap_or_else(|| fatal_boot!());
 }
 
 fn supply_syscall_fault(
@@ -1577,7 +1577,7 @@ impl Personality for LinuxPersonality {
             frame.rax = ret.raw() as u64
         });
         let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
-            .unwrap_or_else(|| fatal_boot());
+            .unwrap_or_else(|| fatal_boot!());
         let source = carrick_x86_carrier::native_execution::source(slot);
         let child = source.zone.slot(slot).current().is_some_and(|record| {
             native_process::registry()
@@ -1689,19 +1689,19 @@ impl Personality for LinuxPersonality {
         };
 
         let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
-            .unwrap_or_else(|| fatal_boot());
+            .unwrap_or_else(|| fatal_boot!());
         let source = carrick_x86_carrier::native_execution::source(slot);
         let words = capture(frame, early_xstate);
-        native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot());
+        native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot!());
         admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let mut service = native_process::Service::new(task, slot);
         native_process::drain_external_ingress(source, &mut service)
-            .unwrap_or_else(|_| fatal_boot());
+            .unwrap_or_else(|_| fatal_boot!());
         let crossing_operand;
         let (route, root_exit) = {
             let (runtime, address) =
-                native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
+                native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot!());
             let mut process = runtime
                 .enter_registered(
                     native_process::registry(),
@@ -1711,7 +1711,7 @@ impl Personality for LinuxPersonality {
                     &words,
                     &mut service,
                 )
-                .unwrap_or_else(|_| fatal_boot());
+                .unwrap_or_else(|_| fatal_boot!());
             let origin = if process.is_root_process() {
                 carrick_core_abi::service::ServiceOrigin::Initial
             } else {
@@ -1893,7 +1893,7 @@ impl Personality for LinuxPersonality {
                                 match anonymous::park_contended_fault(task, slot, cause, &restart) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
-                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                    anonymous::ContendedFault::Refused => fatal_boot!(),
                                 }
                                 None
                             }
@@ -1905,7 +1905,7 @@ impl Personality for LinuxPersonality {
                                 match anonymous::park_owner_fault_wait(task, slot, wait, &restart) {
                                     anonymous::ContendedFault::Parked => parked = true,
                                     anonymous::ContendedFault::Rerun => retry = true,
-                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                    anonymous::ContendedFault::Refused => fatal_boot!(),
                                 }
                                 None
                             }
@@ -1972,7 +1972,7 @@ impl Personality for LinuxPersonality {
                         HostFileStage::Fault { .. }
                         | HostFileStage::FaultAfterPrefix { .. }
                         | HostFileStage::PrepareOutput { .. },
-                    ) => fatal_boot(),
+                    ) => fatal_boot!(),
                     Some(HostFileStage::InRing) => {
                         counters.record_refusal(
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
@@ -2068,7 +2068,7 @@ impl Personality for LinuxPersonality {
             CompletionRoute::Suspended => {
                 if let Some(status) = root_exit {
                     ControlFlow::Terminate(TerminationRequest::new(
-                        status.terminal_status().unwrap_or_else(|_| fatal_boot()),
+                        status.terminal_status().unwrap_or_else(|_| fatal_boot!()),
                     ))
                 } else {
                     ControlFlow::Suspend(OwnedContinuation::new(0))

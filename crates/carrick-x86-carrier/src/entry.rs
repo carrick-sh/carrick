@@ -13,8 +13,10 @@ use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_guest_arch::{InterruptArch, UserVa};
 use core::sync::atomic::Ordering;
 
-pub use crate::initial_boot::fatal_boot;
 pub use crate::native_execution::read_msr;
+/// Refuse a broken carrier invariant through the shared kernel's fatal
+/// transport, naming the raising site: `fatal_boot!()`.
+pub use carrick_el1::x86_fatal_boot as fatal_boot;
 
 #[cfg(target_os = "none")]
 core::arch::global_asm!(
@@ -831,7 +833,7 @@ pub fn carrier_enter<P: Personality>(
         ControlFlow::Suspend(_continuation) => {
             drop(_user_fault_gate);
             let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
-                .unwrap_or_else(|| fatal_boot());
+                .unwrap_or_else(|| fatal_boot!());
             P::schedule(slot);
         }
         ControlFlow::Terminate(termination) => {

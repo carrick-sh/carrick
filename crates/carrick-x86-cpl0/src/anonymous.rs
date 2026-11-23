@@ -932,5 +932,5 @@ pub(super) fn park_owner_fault_wait(
 }
 
 fn fatal_reservation() -> ! {
-    carrick_x86_carrier::entry::fatal_boot()
+    carrick_x86_carrier::entry::fatal_boot!()
 }

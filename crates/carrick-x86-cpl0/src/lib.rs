@@ -269,7 +269,7 @@ mod test_support {
             return;
         }
         let Some(index) = source.zone.spaces.find(mm) else {
-            carrick_x86_carrier::entry::fatal_boot();
+            carrick_x86_carrier::entry::fatal_boot!();
         };
         GATE_MM.store(mm, Ordering::Release);
         source.zone.spaces.raise(index);
@@ -305,7 +305,7 @@ mod test_support {
         counter.fetch_add(1, Ordering::AcqRel);
         let mm = GATE_MM.load(Ordering::Acquire);
         let Some(index) = source.zone.spaces.find(mm) else {
-            carrick_x86_carrier::entry::fatal_boot();
+            carrick_x86_carrier::entry::fatal_boot!();
         };
         carrick_core::wait::space_access(source.zone, slot, crate::native_process::release)
             .lower(index);
@@ -321,7 +321,7 @@ mod test_support {
             .is_ok()
         {
             if !carrick_sched_core::spaces::inject_editor_busy_once() {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             SELECTED_SERVE_BUSIES.fetch_add(1, Ordering::AcqRel);
         }
@@ -335,7 +335,7 @@ mod test_support {
             .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
             && (carrick_sched_core::spaces::inject_editor_busy_once()
-                || carrick_x86_carrier::entry::fatal_boot())
+                || carrick_x86_carrier::entry::fatal_boot!())
     }
 
     /// The held access returned. If it was refused with an owner wait, the
@@ -351,7 +351,7 @@ mod test_support {
             return;
         }
         if !waited || !crate::anonymous::release_injected_editor_now(source, task) {
-            carrick_x86_carrier::entry::fatal_boot();
+            carrick_x86_carrier::entry::fatal_boot!();
         }
         EARLY_RELEASES.fetch_add(1, Ordering::AcqRel);
     }
@@ -371,12 +371,12 @@ mod test_support {
         let now = |backend: &mut carrick_el1::isa::x86::X86Backend| {
             backend
                 .counter()
-                .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot())
+                .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!())
                 .raw()
         };
         let hz = backend
             .frequency()
-            .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot())
+            .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!())
             .raw()
             .get();
         let ticks = u128::from(hz) * u128::from(SCAN_HOLD_NS) / 1_000_000_000;
@@ -413,7 +413,7 @@ mod test_support {
             .compare_exchange(site as u8, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
             && (roots.hold_for_test(index, mm, FORK_ROOT_HOLDER)
-                || carrick_x86_carrier::entry::fatal_boot())
+                || carrick_x86_carrier::entry::fatal_boot!())
     }
 
     /// The held acquisition returned: the holder releases the root. A hold
@@ -428,7 +428,7 @@ mod test_support {
             return;
         }
         if !roots.release_test_hold(index, FORK_ROOT_HOLDER) {
-            carrick_x86_carrier::entry::fatal_boot();
+            carrick_x86_carrier::entry::fatal_boot!();
         }
         if refused_busy {
             FORK_ROOT_REFUSALS.fetch_add(1, Ordering::AcqRel);
@@ -479,7 +479,7 @@ mod test_support {
                 break;
             }
             if carrick_el1::isa::x86::interrupt::sync_user_memory_generation().is_err() {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             core::hint::spin_loop();
         }
@@ -505,7 +505,7 @@ mod test_support {
         while BIRTH_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
             spins += 1;
             if spins > BIRTH_HOLD_SPINS {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             core::hint::spin_loop();
         }
@@ -528,12 +528,12 @@ mod test_support {
         while FORK_COMMIT_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
             spins += 1;
             if spins > BIRTH_HOLD_SPINS {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             // A real fork preparation returns; the hold must still
             // acknowledge a sibling's TLB shootdown on this running root.
             if carrick_el1::isa::x86::interrupt::service_shootdowns().is_err() {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             core::hint::spin_loop();
         }
@@ -603,7 +603,7 @@ mod test_support {
             RELEASE_ARMED if slot.raw() == 0 => {
                 PEER_IDLE_RELEASE.store(RELEASE_ON_PEER, Ordering::Release);
                 carrick_el1::isa::x86::interrupt::send_resched(carrick_sched_core::SlotId::new(1))
-                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
                 true
             }
             RELEASE_ARMED => true,
@@ -718,10 +718,10 @@ mod test_support {
         while OWNED_PUBLISH_GATE.load(Ordering::Acquire) == BIRTH_HELD {
             spins += 1;
             if spins > OWNED_PUBLISH_GATE_SPINS {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             if carrick_el1::isa::x86::interrupt::sync_user_memory_generation().is_err() {
-                carrick_x86_carrier::entry::fatal_boot();
+                carrick_x86_carrier::entry::fatal_boot!();
             }
             core::hint::spin_loop();
         }
@@ -761,7 +761,7 @@ mod test_support {
         if METADATA_ON_REPROBE.swap(false, Ordering::AcqRel)
             && !carrick_core::mm::reservation::inject_metadata_required_once()
         {
-            carrick_x86_carrier::entry::fatal_boot();
+            carrick_x86_carrier::entry::fatal_boot!();
         }
     }
 
@@ -913,7 +913,7 @@ mod test_support {
                 }
                 let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
                 carrick_el1::isa::x86::interrupt::send_resched(peer)
-                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
                 Some(0)
             }
             INJECT_HOLD_NEXT_FORK_COMMIT => FORK_COMMIT_HOLD
@@ -964,7 +964,7 @@ mod test_support {
                 // idle CPU instead of waiting for this one to yield.
                 let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
                 carrick_el1::isa::x86::interrupt::send_resched(peer)
-                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
                 Some(0)
             }
             INJECT_FORK_CENSUS_ROOT_HELD_ONCE | INJECT_FORK_COMMIT_ROOT_HELD_ONCE => {
@@ -989,7 +989,7 @@ mod test_support {
                 }
                 SCAN_HOLD_SLOT.store(peer.raw() + 1, Ordering::Release);
                 carrick_el1::isa::x86::interrupt::send_resched(peer)
-                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
                 Some(0)
             }
             INJECT_PEER_SCAN_HELD => {
@@ -1049,7 +1049,7 @@ mod test_support {
                 }
                 let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
                 carrick_el1::isa::x86::interrupt::send_resched(peer)
-                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
                 Some(0)
             }
             INJECT_RELEASE_OWNED_COPY_PUBLISH => {

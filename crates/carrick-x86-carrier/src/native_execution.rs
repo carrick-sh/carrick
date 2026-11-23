@@ -18,9 +18,9 @@ pub fn source(slot: SlotId) -> BornInZoneSource<'static, ParkedContextWords> {
 }
 
 pub fn task() -> &'static CurrentTask {
-    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot());
+    let binding = context::current_cpu_binding().unwrap_or_else(|| fatal_boot!());
     if binding.task_address == 0 {
-        fatal_boot();
+        fatal_boot!();
     }
     // SAFETY: this bound CPU owns the retained current-task record.
     unsafe { &*(binding.task_address as *const CurrentTask) }
@@ -33,13 +33,13 @@ pub fn capture(
 ) -> ParkedContextWords {
     let current_task = task();
     let mm = ReservationMm::new(current_task.mm.key.load(Ordering::Acquire))
-        .unwrap_or_else(|| fatal_boot());
-    let words = table_span::live_words(mm).unwrap_or_else(|| fatal_boot());
-    let address = words.context.unwrap_or_else(|| fatal_boot());
+        .unwrap_or_else(|| fatal_boot!());
+    let words = table_span::live_words(mm).unwrap_or_else(|| fatal_boot!());
+    let address = words.context.unwrap_or_else(|| fatal_boot!());
     let fs = read_msr(0xc000_0100);
     let user_gs = read_msr(0xc000_0102);
     let native = context::context_words::from_syscall(frame, address, fs, user_gs, xstate)
-        .unwrap_or_else(|_| fatal_boot());
+        .unwrap_or_else(|_| fatal_boot!());
     context::context_words::from_native(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall)
 }
 
@@ -59,7 +59,7 @@ pub fn migrate(slot: SlotId) {
     source(slot).zone.migrate_queued(slot, &mut effects);
     for target in effects.sgi_slots() {
         if x86::interrupt::send_resched(target).is_err() {
-            fatal_boot();
+            fatal_boot!();
         }
     }
 }
@@ -70,7 +70,7 @@ pub fn publish_root_exit(
     status: carrick_personality_api::TerminationStatus,
 ) -> ! {
     let binding = carrick_core::entry::binding(&current.execution, &current.mm);
-    let exit = NativeRootExit::new(binding, status).unwrap_or_else(|| fatal_boot());
+    let exit = NativeRootExit::new(binding, status).unwrap_or_else(|| fatal_boot!());
     // SAFETY: owned retirement authenticated this exact VM completion.
     unsafe {
         core::arch::asm!(
@@ -92,13 +92,13 @@ pub fn park_on_maintenance_root(source: BornInZoneSource<'static, ParkedContextW
         let Some(root) = carrick_guest_arch::RootGpa::page_aligned(
             carrick_guest_arch::FrameGpa::new(maintenance),
         ) else {
-            fatal_boot();
+            fatal_boot!();
         };
         // Already parked on the maintenance root: no second CR3 write.
         if x86::hardware_live_root().ok() != Some(root)
             && x86::interrupt::install_maintenance_root(root).is_err()
         {
-            fatal_boot();
+            fatal_boot!();
         }
     }
     maintenance != 0
