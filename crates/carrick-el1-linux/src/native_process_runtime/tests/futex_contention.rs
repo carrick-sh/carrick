@@ -32,8 +32,8 @@ impl<C: ProcessContext + 'static> Fixture<C> {
             carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap());
         // SAFETY: one lazily committed mapping owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
-        let zone = carrick_test_support::ZeroedBox::leak(unsafe {
-            carrick_test_support::ZeroedBox::<ZoneTables<C>>::new_zeroed()
+        let zone = carrick_zeroed_pages::ZeroedBox::leak(unsafe {
+            carrick_zeroed_pages::ZeroedBox::<ZoneTables<C>>::new_zeroed()
         });
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));

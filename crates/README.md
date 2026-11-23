@@ -79,6 +79,7 @@ lists it). Do not read the crate map as a completed neutral/Linux layering.
 | `carrick-host-bsd` | BSD-family host glue selected by macOS/FreeBSD/NetBSD: errno translation, kqueue, BSD futex, signal-number translation. |
 | `carrick-host-linux` | Linux host glue selected by `platform-linux`: epoll multiplexer and Linux errno identity hook. |
 | `carrick-portable` | Thin raw-`libc` shim for symbols/constants that differ or are absent across hosts. |
+| `carrick-zeroed-pages` | `ZeroedPages` and `ZeroedBox<T>`: zeroed, page-aligned anonymous host mappings that commit only touched pages and unmap on drop. A product crate so `carrick-el1-linux`'s `host-test` fixtures can use it without reaching `carrick-test-support`, which re-exports it. |
 
 ## VMM Backends and Guest ISA
 
@@ -112,7 +113,7 @@ lifecycle semantics.
 | `carrick-conformance-next` | In-process conformance framework using `carrick-embed` (Phase J): `TestContainer` + `AuditObserver` `#[test]` ports of LTP/probe cases, semantic probe observers, fuzzing, and golden traces. `carrick-conformance` stays the verdict authority until the new framework reproduces every historical false-green rejection. |
 | `carrick-coordinator` | Host-wide resource coordinator enforcing mutual exclusion between Carrick guest execution and Docker oracle phases across checkouts, quiet timing windows, and campaign budgets. |
 | `carrick-investigation` | Durable event-sourced investigation engine driving validated stage transitions, experiment planning, and review-package assembly for contract-driven conformance investigations. |
-| `carrick-test-support` | Shared test helpers: synthetic rootfs tar/gzip assembly, aligned EL1 region backing for VM-free ABI tests, and guest user buffers below the user ceiling on every host. |
+| `carrick-test-support` | Shared test helpers: synthetic rootfs tar/gzip assembly, aligned, lazily committed EL1 region backing for VM-free ABI tests (re-exporting `carrick-zeroed-pages`), and guest user buffers below the user ceiling on every host. |
 | `carrick-xtask` | Repository maintenance, gate drivers, facts ledger verification, baseline recording/comparison, assembly diffs, and test lane checks. |
 
 ## Feature Closure Rules

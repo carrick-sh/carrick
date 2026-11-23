@@ -1,0 +1,16 @@
+[package]
+name = "carrick-zeroed-pages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lazily committed, zeroed, page-aligned host mappings that unmap on drop."
+
+[lib]
+name = "carrick_zeroed_pages"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true

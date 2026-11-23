@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-zeroed-pages = { path = "../carrick-zeroed-pages" }
 libc.workspace = true
 flate2.workspace = true
 tar.workspace = true

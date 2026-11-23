@@ -24,7 +24,7 @@ zerocopy.workspace = true
 
 [features]
 default = []
-host-test = ["carrick-el1/host-test", "carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test", "dep:carrick-test-support"]
+host-test = ["carrick-el1/host-test", "carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test", "dep:carrick-zeroed-pages"]
 allocator-test-control = ["carrick-el1/allocator-test-control"]
 
 [[bin]]
@@ -41,6 +41,7 @@ carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-test-support = { path = "../carrick-test-support" }
+carrick-zeroed-pages = { path = "../carrick-zeroed-pages" }
 carrick-vfs = { path = "../carrick-vfs" }
 carrick-core = { path = "../carrick-core", features = ["host-test", "test-support"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
@@ -52,4 +53,6 @@ carrick-personality-linux = { path = "../carrick-personality-linux", features = 
 carrick-fatal = { path = "../carrick-fatal" }
 libc.workspace = true
 # Host-test fixtures (`mm_portal::test_support`) back carrier regions with it.
-carrick-test-support = { path = "../carrick-test-support", optional = true }
+# Never carrick-test-support: the carrier-only process invariant keeps every
+# non-product crate out of a product crate's dependencies (#2822).
+carrick-zeroed-pages = { path = "../carrick-zeroed-pages", optional = true }

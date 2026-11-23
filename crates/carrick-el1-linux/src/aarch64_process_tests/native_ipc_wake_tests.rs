@@ -212,7 +212,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     reader.install(table.id(), fd::Fd(3), false).unwrap();
     writer.install(table.id(), fd::Fd(4), false).unwrap();
     let region =
-        carrick_test_support::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
+        carrick_zeroed_pages::ZeroedBox::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: aligned ABI storage retained for all inherited table bindings.
     let map = unsafe {
         &*region

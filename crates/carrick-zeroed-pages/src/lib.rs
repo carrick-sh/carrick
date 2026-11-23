@@ -1,5 +1,11 @@
-//! Large zeroed, page-aligned backing that costs only the pages a test
+//! Large zeroed, page-aligned backing that costs only the pages its user
 //! touches.
+//!
+//! A product crate (it holds no test-only behaviour), so the host-test
+//! fixtures that product crates such as `carrick-el1-linux` export can reach
+//! it without depending on `carrick-test-support`, which the carrier-only
+//! process invariant keeps out of every product dependency graph.
+//! `carrick-test-support` re-exports both types.
 //!
 //! VM-free tests back carrier-sized ABI areas (the 128 MiB EL1 region, the
 //! IPC directory and its pools) with zeroed memory. `alloc_zeroed` does not
