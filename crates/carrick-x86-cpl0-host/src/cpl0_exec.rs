@@ -752,8 +752,10 @@ where
 /// Apply the exec owner's carrier-exit verdict (#2799) to the rows it retired:
 /// a staged successor's tables, data frames and build extent go back exactly
 /// as a ring cancellation (a sealed row) or a refusal (an unsealed one)
-/// returns them. A claimed or parked row holds no carrier frames. Returns the
-/// rows retired.
+/// returns them. A claimed or parked row holds no carrier frames. No lane is
+/// left to run the drain again, so a row whose release fails does not keep
+/// the rows after it: every row is released, and the first failure is the
+/// result. Returns the rows retired.
 pub fn release_x86_execs_at_carrier_exit<T, C, F, P, A>(
     retired: Vec<ExecRetired<X86ExecPreparation<F::Data>, P, A>>,
     stock: &mut ForkStock<T, C>,
@@ -766,17 +768,21 @@ where
     F: X86ExecFrames,
 {
     let rows = retired.len();
+    let mut first = None;
     for row in retired {
         let ExecRetained::Staged(preparation) = row.held else {
             continue;
         };
-        if row.retirement.sealed {
-            cancel_x86_exec(preparation, stock, frames)?;
+        let released = if row.retirement.sealed {
+            cancel_x86_exec(preparation, stock, frames)
         } else {
-            release_x86_exec(preparation, stock, frames, roots, zone)?;
+            release_x86_exec(preparation, stock, frames, roots, zone)
+        };
+        if let Err(error) = released {
+            first.get_or_insert(error);
         }
     }
-    Ok(rows)
+    first.map_or(Ok(rows), Err)
 }
 
 /// A successor's data frames on the carrier: one private extent, its
