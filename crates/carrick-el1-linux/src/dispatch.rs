@@ -2375,10 +2375,73 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         }
         return Action::Served;
     };
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let Some(source) = arm_signal_user_return_check(
+        frame,
+        task,
+        page,
+        control,
+        zone,
+        carrick_el1::isa::signal_ingress_guest().is_empty(),
+    ) else {
+        return Action::Served;
+    };
+    let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
+    let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, source.slot)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    arm_signal_user_return_admitted_with_cpu(
+        frame,
+        source,
+        task,
+        page,
+        control,
+        &mut sched::HardwareCpu,
+        ttbr0,
+        &mut service,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn arm_signal_user_return_with_cpu<C, X>(
+    frame: &mut TrapFrame,
+    task: &'static CurrentTask,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    zone: &'static ZoneTables,
+    cpu: &mut C,
+    ttbr0: u64,
+    ingress_empty: bool,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+) -> Action
+where
+    C: sched::ThreadCpu,
+    X: super::aarch64_process::ForkStockCrossing,
+{
+    let Some(source) =
+        arm_signal_user_return_check(frame, task, page, control, zone, ingress_empty)
+    else {
+        return Action::Served;
+    };
+    arm_signal_user_return_admitted_with_cpu(
+        frame, source, task, page, control, cpu, ttbr0, service,
+    )
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(always)]
+fn arm_signal_user_return_check(
+    frame: &TrapFrame,
+    task: &'static CurrentTask,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    zone: &'static ZoneTables,
+    ingress_empty: bool,
+) -> Option<carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>> {
+    let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(slot) = SlotId::from_index(frame.slot as usize) else {
         invalid_completion(NativeInvariant::EntryBinding)
     };
-    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
     if arm_signal_return_gate(
         source,
@@ -2387,25 +2450,37 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         control,
         frame.esr,
         frame.x[0],
-        carrick_el1::isa::signal_ingress_guest().is_empty(),
+        ingress_empty,
     )
     .is_none()
     {
         if fatal_owner_cancel {
             invalid_completion(NativeInvariant::EntryBinding)
         }
-        return Action::Served;
+        return None;
     }
+    Some(source)
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn arm_signal_user_return_admitted_with_cpu<C, X>(
+    frame: &mut TrapFrame,
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    cpu: &mut C,
+    ttbr0: u64,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+) -> Action
+where
+    C: sched::ThreadCpu,
+    X: super::aarch64_process::ForkStockCrossing,
+{
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(
-        &mut sched::HardwareCpu,
-        frame,
-        &mut saved,
-        sched::CpuExitCause::Svc,
-    );
-    let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
-    let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
-        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    sched::ThreadCpu::save(cpu, frame, &mut saved, sched::CpuExitCause::Svc);
     let (action, _) = arm_signal_user_return_admitted_entry(
         source,
         task,
@@ -2413,13 +2488,15 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         ttbr0,
         page,
         control,
-        &mut service,
-        |process| super::arm_signal::deliver_on_user_return(task, process, frame),
+        service,
+        |process| {
+            super::arm_signal::deliver_on_user_return_with_cpu(cpu, task, control, process, frame)
+        },
     )
     // The fatal names the refusal's kind, not only its site (#1958).
     .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     if action == Action::Idle {
-        native_service_idle(zone, slot, &mut sched::HardwareCpu)
+        native_service_idle(source.zone, source.slot, cpu)
     } else {
         action
     }
