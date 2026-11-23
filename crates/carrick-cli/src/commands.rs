@@ -947,6 +947,22 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 census,
                 all,
             } => crate::debug_venue_gaps::run_venue_gaps(&profiles, &census, all)?,
+            #[cfg(target_os = "linux")]
+            DebugCommand::SoftRun {
+                rootfs,
+                el1_elf,
+                env,
+                max_syscalls,
+                summary_out,
+                argv,
+            } => crate::debug_soft_run::run(&crate::debug_soft_run::SoftRunOptions {
+                rootfs: &rootfs,
+                el1_elf: el1_elf.as_deref(),
+                env: &env,
+                max_syscalls,
+                summary_out: summary_out.as_deref(),
+                argv: &argv,
+            })?,
             DebugCommand::Zonedump {
                 run_id,
                 post_mortem,

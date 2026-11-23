@@ -139,6 +139,12 @@ wait-timeout = "0.2.1"
 # an OS-only dependency edge would drag libvmmapi / -lnvmm and the x86 engine
 # into an aarch64 BSD build that has no VMM lane. `platform-freebsd` /
 # `platform-netbsd` still name the host backend on both arches.
+# `debug soft-run` (#1236, #1906): the soft AArch64 CPU's block runner is
+# Linux-only (it executes natively on arm64 and refuses other hosts).
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-softcpu-aarch64-host = { path = "../carrick-softcpu-aarch64-host" }
+carrick-hal = { path = "../carrick-hal" }
+
 [target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
 carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
 
