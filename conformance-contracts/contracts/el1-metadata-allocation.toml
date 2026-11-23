@@ -21,6 +21,13 @@
 # No GIC, fault, metadata or page-table layout/algorithm changed here; retain
 # those existing regression bindings. New transfer unit tests do not prove
 # these contracts, and fresh signed promotion remains required.
+# #1715: 64 size classes (through 2^37 bytes) instead of 28, so every class
+# but the last is bounded above and the larger-bin head always fits. With 28,
+# every block from 768 KiB up shared one class and a large request missed a
+# fitting block behind a smaller head (x86 node exec: 2 MiB failed with a
+# 5575 KiB block free). Witness: carrick-core mm::capacity
+# large_request_reaches_a_fitting_block_behind_a_smaller_large_one. The two
+# bin and two block budgets below are unchanged.
 schema_version = 1
 id = "kernel.el1.metadata-allocation"
 title = "EL1 elastic metadata allocation, bounded reclamation, authenticated extent grants, and exact-once return"
