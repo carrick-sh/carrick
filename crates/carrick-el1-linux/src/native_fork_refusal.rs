@@ -95,6 +95,11 @@ impl NativeForkRefusal {
             NativeForkCause::Mm(MmError::Busy)
             | NativeForkCause::Reservation(Refusal::Busy | Refusal::PreparedConflict)
             | NativeForkCause::Fork(ForkError::Busy) => E::Busy,
+            // The parent changed while its editor was released for the
+            // stock crossing (#2890): the fork backs out and reruns from a
+            // fresh snapshot, never EFAULT.
+            NativeForkCause::Mm(MmError::ParentChanged)
+            | NativeForkCause::Fork(ForkError::ParentChanged) => E::Busy,
             NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
             NativeForkCause::StockReservation(R::Stale) => E::Stale,
             NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
@@ -278,6 +283,40 @@ mod tests {
         assert_eq!(
             diagnostic.message(),
             Some("ProcessNative::fork error=Busy; not now")
+        );
+    }
+
+    /// #2890: a parent that changed since the fork's snapshot (a sibling's
+    /// edit while the editor was released for the stock crossing) is
+    /// contention at Prepare and at Publish, on both ISAs, never EFAULT.
+    #[test]
+    fn a_changed_parent_reruns_the_fork_instead_of_answering_efault() {
+        for (stage, cause) in [
+            (
+                NativeForkStage::Prepare,
+                NativeForkCause::Mm(MmError::ParentChanged),
+            ),
+            (
+                NativeForkStage::Publish,
+                NativeForkCause::Mm(MmError::ParentChanged),
+            ),
+            (
+                NativeForkStage::Publish,
+                NativeForkCause::Fork(ForkError::ParentChanged),
+            ),
+        ] {
+            let error = NativeForkRefusal { stage, cause }.error();
+            assert_eq!(error, NativeProcessError::Busy, "{stage:?} {cause:?}");
+            assert_eq!(error.failure(), Err(NativeContention::BUSY));
+        }
+        // A replaced parent (another incarnation) is still stale custody.
+        assert_eq!(
+            NativeForkRefusal {
+                stage: NativeForkStage::Prepare,
+                cause: NativeForkCause::Mm(MmError::Stale),
+            }
+            .error(),
+            NativeProcessError::Fault
         );
     }
 

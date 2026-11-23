@@ -2643,9 +2643,11 @@ fn owner_fork_refuses_stale_unchanged_shared_leaf_during_custody() {
         )
         .unwrap();
     parent_tables.words[1536].store((IPA + 4096) | RW, Ordering::Release);
+    // A parent word changed during custody: contention, the fork reruns
+    // from a fresh snapshot (#2890), never a refusal answered as a fault.
     assert!(matches!(
         portal.publish_fork(plan, &words, 0),
-        Err(MmError::Stale)
+        Err(MmError::ParentChanged)
     ));
     assert!(
         !region
@@ -4055,7 +4057,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                 &words,
                 1
             ),
-            Err(MmError::Stale)
+            Err(MmError::ParentChanged)
         ));
         assert_eq!(grandchild.words[1536].load(Ordering::Acquire), 0);
         let mut request = request;
