@@ -47,6 +47,8 @@ core::arch::global_asm!(
     "swapgs",
     "mov gs:[8], rsp",
     "mov rsp, gs:[0]",
+    // NativeFrame.syscall_position: a fresh trap is after its SYSCALL.
+    "push 0",
     "push r11",
     "push rcx",
     "push qword ptr gs:[8]",

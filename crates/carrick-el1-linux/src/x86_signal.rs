@@ -1,5 +1,5 @@
 //! x86_64 signal frame setup and restoration for in-guest Linux personality.
-use carrick_guest_arch::{ReturnKind, UserFlags, UserReturn, UserVa};
+use carrick_guest_arch::{ReturnKind, SyscallReturnFrame, UserFlags, UserReturn, UserVa};
 use carrick_personality_linux::signal::{SignalBackend, SignalFrameParams};
 
 use carrick_el1::isa::ArchError;
@@ -164,7 +164,11 @@ impl LinuxX86Backend {
         let uc_addr = new_sp + core::mem::offset_of!(RtSigframe, uc) as u64;
 
         frame.r11 = resume.flags.raw() & !((1 << 10) | (1 << 8));
-        frame.rcx = params.handler.raw(); // user RIP
+        // The handler entry is where the thread resumes (#2900).
+        frame.replace_return_pc(
+            params.handler.raw(),
+            carrick_guest_arch::SavedSyscallPc::AtSyscall,
+        );
         frame.rsp = new_sp; // user RSP
         frame.rdi = params.signal.number() as u64; // arg 1: signum
         frame.rsi = info_addr; // arg 2: siginfo_t*
@@ -303,7 +307,12 @@ impl SignalBackend for LinuxX86Backend {
         frame.rbx = uc.uc_mcontext.rbx;
         frame.rdx = uc.uc_mcontext.rdx;
         frame.rax = uc.uc_mcontext.rax;
-        frame.rcx = uc.uc_mcontext.rip;
+        // The restored RIP is where the thread resumes, never a PC after
+        // this sigreturn's SYSCALL: nothing may rewind it (#2900).
+        frame.replace_return_pc(
+            uc.uc_mcontext.rip,
+            carrick_guest_arch::SavedSyscallPc::AtSyscall,
+        );
         frame.user_rcx = uc.uc_mcontext.rcx;
         frame.rsp = uc.uc_mcontext.rsp;
 

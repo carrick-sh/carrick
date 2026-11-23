@@ -524,7 +524,12 @@ impl Personality for FixturePersonality {
                 {
                     fatal_error(frame);
                 }
-                frame.rcx = loaded.context.frame[15];
+                // A fresh image's entry is where it resumes (#2900).
+                carrick_guest_arch::SyscallReturnFrame::replace_return_pc(
+                    frame,
+                    loaded.context.frame[15],
+                    carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                );
                 frame.rsp = loaded.context.frame[18];
                 frame.r11 = loaded.context.frame[17];
                 frame.rax = 0;

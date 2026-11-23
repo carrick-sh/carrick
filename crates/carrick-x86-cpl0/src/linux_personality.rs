@@ -165,15 +165,16 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         true
     }
     fn restart_syscall(&mut self) {
-        self.frame.restart_syscall();
+        if carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(self.frame).is_none() {
+            fatal_boot();
+        }
     }
     fn operation_resume_pc(
         &self,
     ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
         // x86 instructions are byte-aligned: only a null PC is refused.
-        carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw(
-            self.frame.syscall_pc(),
-        )
+        carrick_guest_arch::SyscallReturnFrame::syscall_pc(self.frame)
+            .and_then(carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw)
     }
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         self.call.native
@@ -449,12 +450,12 @@ pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     halt();
 }
 
+/// The x86 frame carries its own syscall position (`NativeFrame`'s
+/// `syscall_position`, #2900): a rerun, a handler entry and a parked copy
+/// all read and write it there.
 pub(crate) struct X86SignalMachine {
     backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
     address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    /// The syscall position a restart left the frame at; `None` keeps the
-    /// parked context's own.
-    restarted: Option<carrick_sched_core::SavedSyscallPc>,
 }
 
 impl X86SignalMachine {
@@ -464,17 +465,7 @@ impl X86SignalMachine {
         Self {
             backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
             address,
-            restarted: None,
         }
-    }
-
-    /// Where the returned frame's PC sits relative to its syscall, given the
-    /// position of the context it was built from (#2872).
-    pub(crate) fn frame_position(
-        &self,
-        parked: carrick_sched_core::SavedSyscallPc,
-    ) -> carrick_sched_core::SavedSyscallPc {
-        self.restarted.unwrap_or(parked)
     }
 }
 
@@ -496,11 +487,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
         frame: &mut NativeFrame,
         original: &carrick_sched_core::ParkedContextWords,
     ) -> bool {
-        let Some(position) = carrick_guest_arch::rerun_interrupted_syscall(frame, original) else {
-            return false;
-        };
-        self.restarted = Some(position);
-        true
+        carrick_guest_arch::rerun_interrupted_syscall(frame, original)
     }
 
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
@@ -526,7 +513,8 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
             &native.xsave,
         )
         .unwrap_or_else(|_| fatal_boot());
-        let position = self.frame_position(ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot()));
+        let position = carrick_guest_arch::SyscallReturnFrame::syscall_position(frame)
+            .unwrap_or_else(|| fatal_boot());
         *ctx = context::context_words::from_native(&updated, position);
     }
 }
@@ -658,8 +646,14 @@ pub fn signal_irq_return(
         gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
         xsave: xsave.clone(),
     };
-    let mut returned = context::context_words::syscall_frame_from_native(&native, address)
-        .unwrap_or_else(|_| fatal_boot());
+    // An interrupt saves the instruction it interrupted: the frame stands
+    // at its resume point, which no rerun may rewind (#2851).
+    let mut returned = context::context_words::syscall_frame_from_native(
+        &native,
+        address,
+        carrick_sched_core::SavedSyscallPc::AtSyscall,
+    )
+    .unwrap_or_else(|_| fatal_boot());
     let record = source
         .zone
         .slot(slot)
@@ -717,13 +711,14 @@ pub fn signal_irq_return(
         *frame = native.frame;
         if source.zone.runnable_head(slot).is_some() {
             // SAFETY: IRQ entry owns this exact running/home record's context.
-            // An interrupt saves the instruction it interrupted, which a
-            // retained rerun must never rewind again (#2851).
+            // The frame says where its PC sits: the interrupted instruction
+            // or a handler entry, which a retained rerun must never rewind
+            // again (#2851, #2900).
+            let position = carrick_guest_arch::SyscallReturnFrame::syscall_position(&returned)
+                .unwrap_or_else(|| fatal_boot());
             unsafe {
-                *source.zone.record(record).ctx_mut() = context::context_words::from_native(
-                    &native,
-                    carrick_sched_core::SavedSyscallPc::AtSyscall,
-                );
+                *source.zone.record(record).ctx_mut() =
+                    context::context_words::from_native(&native, position);
             }
             // IRQ entry owns this running/home record: a refusal is a broken
             // invariant, never contention (#1100).
@@ -1069,14 +1064,16 @@ fn inline_service(
     }
 }
 
-/// The x86 mechanic of a restart: rewind RCX to this call's `SYSCALL` and
-/// restore its number in RAX; every argument register is still the call's.
+/// The x86 mechanic of a restart: put RCX on this call's `SYSCALL`, from
+/// where the frame says it sits, and restore its number in RAX; every
+/// argument register is still the call's. A frame already on its `SYSCALL`
+/// stays there (#2900).
 fn restart_native_syscall(frame: &mut NativeFrame, native: carrick_guest_arch::NativeOrdinal) {
-    frame.rax = native.raw();
-    frame.rcx = frame
-        .rcx
-        .checked_sub(carrick_guest_arch::X86_64_SYSCALL_LEN)
-        .unwrap_or_else(|| fatal_boot());
+    use carrick_guest_arch::{SyscallReturnFrame, SyscallReturnRegisters};
+    if frame.rewind_to_syscall().is_none() {
+        fatal_boot();
+    }
+    frame.set_entry_word(native.raw());
 }
 
 fn supply_syscall_fault(
@@ -1495,6 +1492,10 @@ fn deliver_page_fault_signal(
         rsp: frame.rsp,
         user_rcx: frame.saved_gprs[11],
         user_r11: frame.saved_gprs[6],
+        // A fault saves the faulting instruction; nothing rewinds it.
+        syscall_position: carrick_guest_arch::SavedSyscallPcWord::new(
+            carrick_sched_core::SavedSyscallPc::AtSyscall,
+        ),
     };
     let info = LinuxSiginfo {
         si_signo: signum,

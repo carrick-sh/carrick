@@ -10896,7 +10896,13 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         frame: &mut carrick_el1_abi::TrapFrame,
         original: &Aarch64ParkedContext,
     ) -> bool {
-        carrick_guest_arch::rerun_interrupted_syscall(frame, original).is_some()
+        let Some(position) = original.saved_syscall_pc() else {
+            return false;
+        };
+        carrick_guest_arch::rerun_interrupted_syscall(
+            &mut carrick_guest_arch::PositionedFrame { frame, position },
+            original,
+        )
     }
 
     fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {

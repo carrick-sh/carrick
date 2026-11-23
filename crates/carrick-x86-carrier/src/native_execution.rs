@@ -26,7 +26,10 @@ pub fn task() -> &'static CurrentTask {
     unsafe { &*(binding.task_address as *const CurrentTask) }
 }
 
-/// Save the complete SYSCALL return using the early assembly-owned XSAVE.
+/// Save the complete SYSCALL return using the early assembly-owned XSAVE,
+/// with the syscall position the frame carries: a frame rewound onto its
+/// `SYSCALL`, restored by a sigreturn or entering a handler is never saved
+/// as one after its `SYSCALL` (#2900).
 pub fn capture(
     frame: &crate::entry::NativeFrame,
     xstate: &context::scheduler::XsaveArea,
@@ -40,7 +43,9 @@ pub fn capture(
     let user_gs = read_msr(0xc000_0102);
     let native = context::context_words::from_syscall(frame, address, fs, user_gs, xstate)
         .unwrap_or_else(|_| fatal_boot());
-    context::context_words::from_native(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall)
+    let position = carrick_guest_arch::SyscallReturnFrame::syscall_position(frame)
+        .unwrap_or_else(|| fatal_boot());
+    context::context_words::from_native(&native, position)
 }
 
 pub fn read_msr(msr: u32) -> u64 {
