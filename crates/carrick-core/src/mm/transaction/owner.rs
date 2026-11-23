@@ -704,7 +704,7 @@ impl<
                     .and_then(|source| source.advance(plan.range.start() - mapping.range.start()))
             });
             drop(root);
-            return Ok(TransferStep::Supply(carrick_core_abi::PortalGrantWindow {
+            let window = carrick_core_abi::PortalGrantWindow {
                 operation: carrick_core_abi::PortalOperation {
                     carrier: continuation.handle.carrier(),
                     mm: continuation.handle.mm(),
@@ -717,7 +717,22 @@ impl<
                 fault_page: plan.fault_page,
                 host_backing,
                 fork_sequence: continuation.fork_sequence(),
-            }));
+            };
+            // The plan is the mapping's window; pages in it may already be
+            // backed (an earlier supply, before the mapping grew). Supply
+            // only the unused span around the page, as the fault path does:
+            // the supplier refuses a window that holds a published page.
+            use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+            let window = match prepared.select_backing_window(grant.ttbr0, window) {
+                Ok(window) => window,
+                // The page was published since this selection translated it.
+                Err(DescriptorRefusal::AlreadyValid | DescriptorRefusal::Occupied) => {
+                    return Err(pending.map_or(MmError::Busy, MmError::Wait));
+                }
+                // This venue reads no live descriptors: its supplier checks.
+                Err(_) => window,
+            };
+            return Ok(TransferStep::Supply(window));
         };
         // SAFETY: the exact editor, admitted MM, reservation and translation
         // license this selection. Copy still requires physical custody and revalidation.
