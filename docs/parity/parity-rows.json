@@ -68,7 +68,7 @@
       },
       "timeout_secs": 900,
       "stages": [
-        {"name": "update", "command": ["sh", "-c", "apt-get update && echo UPDATE_OK"], "expect": "UPDATE_OK"},
+        {"name": "update", "command": ["sh", "-c", "apt-get -o APT::Update::Error-Mode=any update && echo UPDATE_OK"], "expect": "UPDATE_OK"},
         {"name": "row", "command": ["sh", "-c", "apt-get update && apt-get install -y git gcc && cd /tmp && printf \"int main(){return 0;}\" > t.c && gcc t.c -o t && ./t && git --version && echo SHELL_OK"], "expect": "SHELL_OK"}
       ]
     }
