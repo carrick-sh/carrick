@@ -2590,10 +2590,18 @@ fn run_mounted_binary_in_archive_with_census(
     )
 }
 
-fn mounted_carrier_scope(run_id: &str, _dir: &std::path::Path) -> String {
+fn mounted_carrier_scope(label: &str, dir: &std::path::Path) -> String {
+    // Parallel fixtures can reuse a label. Each launch owns its temp directory
+    // until the carrier exits, including while timeout diagnostics look it up.
+    let instance = dir.file_name().expect("mounted run directory name");
+    let run_id = format!(
+        "x86-kvm-{label}-{}-{}",
+        std::process::id(),
+        instance.to_string_lossy()
+    );
     match std::env::var("CARRICK_RUN_ID") {
-        Ok(scope) => format!("{scope}-x86-kvm-{run_id}-test"),
-        Err(_) => format!("x86-kvm-{run_id}-test"),
+        Ok(scope) => format!("{scope}-{run_id}"),
+        Err(_) => run_id,
     }
 }
 
