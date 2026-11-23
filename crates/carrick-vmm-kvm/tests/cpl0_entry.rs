@@ -2518,7 +2518,10 @@ fn x1_boot_shared_substrate() {
         xsave: XsaveArea::ZERO,
     };
     // SAFETY: this new record remains host-owned until requeue.
-    unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
+    unsafe {
+        *zone.record(record).ctx_mut() =
+            park_native_context(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall)
+    };
     assert!(zone.requeue_preempted(slot, record).is_queued());
     let on_cpu = zone.switch_in(slot).unwrap();
     assert_eq!(on_cpu, record);

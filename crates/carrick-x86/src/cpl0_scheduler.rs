@@ -3,7 +3,7 @@
 //! Included directly by the freestanding image; no host dependencies here.
 use carrick_guest_arch::{AddressContext, RootGpa};
 use carrick_sched_core::{
-    Claim, ParkedContextWords, RecordRef, SlotId, X86_XSAVE_BYTES, ZoneTables,
+    Claim, ParkedContextWords, RecordRef, SavedSyscallPc, SlotId, X86_XSAVE_BYTES, ZoneTables,
 };
 
 /// PUSH order paired with the interrupt image leaf; IRET's five words follow.
@@ -67,7 +67,12 @@ const _: () = {
 
 /// Serialize machine state into the zero-valid shared record. The caller owns
 /// that record's claim until it publishes the runnable or parked transition.
-pub fn park_native_context(context: &NativeContext) -> ParkedContextWords {
+/// `position` is where the saved RIP sits: after `SYSCALL` for a syscall
+/// save, at the interrupted instruction for an interrupt or fault save.
+pub fn park_native_context(
+    context: &NativeContext,
+    position: SavedSyscallPc,
+) -> ParkedContextWords {
     let mut frame = [0; 20];
     frame[..15].copy_from_slice(&context.frame.gpr);
     frame[15..].copy_from_slice(&[
@@ -77,13 +82,15 @@ pub fn park_native_context(context: &NativeContext) -> ParkedContextWords {
         context.frame.rsp,
         context.frame.ss,
     ]);
-    ParkedContextWords::from_parts(
+    let mut words = ParkedContextWords::from_parts(
         frame,
         context.address,
         context.fs_base,
         context.gs_base,
         context.xsave.0,
-    )
+    );
+    words.replace_saved_pc(context.frame.rip, position);
+    words
 }
 
 /// Refuse zero, stale or recycled machine state before restoring CR3 or EL0.
@@ -340,7 +347,7 @@ mod tests {
             gs_base: 0,
             xsave: XsaveArea::ZERO,
         };
-        let words = park_native_context(&context);
+        let words = park_native_context(&context, SavedSyscallPc::AfterSyscall);
         assert!(restore_native_context(words, address).is_some());
         for (index, value) in [
             (15, 1_u64 << 47), // non-user RIP
@@ -413,7 +420,10 @@ mod tests {
                 xsave: XsaveArea([mm as u8; XSAVE_BYTES]),
             };
             // SAFETY: this new record remains host-owned until requeue.
-            unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
+            unsafe {
+                *zone.record(record).ctx_mut() =
+                    park_native_context(&native, SavedSyscallPc::AfterSyscall)
+            };
             assert!(zone.requeue_preempted(slot, record).is_queued());
             bindings.push(ContextBinding {
                 record: zone.record_ref(record),

@@ -170,11 +170,17 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn syscall_return(&self) -> u64 {
         Aarch64ParkedContext::syscall_return(self)
     }
+    /// Only a PC after `SVC` moves: a context already at its `SVC` (rewound
+    /// once, parked on an object at it, or interrupted) keeps it (#2851).
     fn restart_syscall(&mut self) {
-        self.native.pc = self
-            .native
-            .pc
-            .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+        if self.saved_syscall_pc() == Some(SavedSyscallPc::AfterSyscall) {
+            self.replace_saved_pc(
+                self.native
+                    .pc
+                    .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN),
+                SavedSyscallPc::AtSyscall,
+            );
+        }
     }
     fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
         Aarch64ParkedContext::saved_syscall_pc(self)
@@ -215,6 +221,27 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    /// #2851, one lane: a saved SVC rerun twice stays at `SVC`, and a context
+    /// an object park saved at its `SVC` is never rewound by a host resume.
+    #[test]
+    fn a_saved_svc_rerun_twice_stays_at_its_instruction() {
+        let mut native = ThreadCtx::ZERO;
+        native.pc = 0x4008; // ELR after `svc` at 0x4004.
+        let mut ctx = Aarch64ParkedContext::from_parts(native, test_address(0x1000, 1, 1));
+        ctx.restart_syscall();
+        assert_eq!(
+            (ctx.native.pc, ctx.saved_syscall_pc()),
+            (0x4004, Some(SavedSyscallPc::AtSyscall))
+        );
+        ctx.restart_syscall();
+        assert_eq!(ctx.native.pc, 0x4004);
+        let mut parked =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, test_address(0x1000, 1, 1));
+        parked.replace_saved_pc(0x5004, SavedSyscallPc::AtSyscall);
+        parked.restart_syscall();
+        assert_eq!(parked.native.pc, 0x5004);
     }
 
     fn test_address(root_addr: u64, mm_val: u64, gen_val: u64) -> AddressContext<RootGpa> {

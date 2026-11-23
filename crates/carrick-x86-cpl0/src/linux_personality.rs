@@ -504,7 +504,8 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
             &native.xsave,
         )
         .unwrap_or_else(|_| fatal_boot());
-        *ctx = context::context_words::from_native(&updated);
+        let position = ctx.saved_syscall_pc().unwrap_or_else(|| fatal_boot());
+        *ctx = context::context_words::from_native(&updated, position);
     }
 }
 
@@ -662,7 +663,10 @@ pub fn signal_irq_return(
                 source,
                 task,
                 runtime_address,
-                &context::context_words::from_native(&native),
+                &context::context_words::from_native(
+                    &native,
+                    carrick_sched_core::SavedSyscallPc::AtSyscall,
+                ),
                 &mut service,
             )
             .unwrap_or_else(|_| fatal_boot());
@@ -695,9 +699,13 @@ pub fn signal_irq_return(
         *frame = native.frame;
         if source.zone.runnable_head(slot).is_some() {
             // SAFETY: IRQ entry owns this exact running/home record's context.
+            // An interrupt saves the instruction it interrupted, which a
+            // retained rerun must never rewind again (#2851).
             unsafe {
-                *source.zone.record(record).ctx_mut() =
-                    context::context_words::from_native(&native);
+                *source.zone.record(record).ctx_mut() = context::context_words::from_native(
+                    &native,
+                    carrick_sched_core::SavedSyscallPc::AtSyscall,
+                );
             }
             // IRQ entry owns this running/home record: a refusal is a broken
             // invariant, never contention (#1100).
@@ -779,7 +787,11 @@ fn park_owner_waiting_user_fault(
         gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
         xsave: fpstate.clone(),
     });
-    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    // A fault saves the faulting instruction; nothing rewinds it.
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(
+        &native,
+        carrick_sched_core::SavedSyscallPc::AtSyscall,
+    ));
     drop(native);
     if !native_process::is_admitted()
         && native_process::admit_root(
@@ -829,7 +841,11 @@ fn park_contended_user_fault(
         gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
         xsave: fpstate.clone(),
     });
-    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    // A fault saves the faulting instruction; nothing rewinds it.
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(
+        &native,
+        carrick_sched_core::SavedSyscallPc::AtSyscall,
+    ));
     drop(native);
     if !native_process::is_admitted()
         && native_process::admit_root(

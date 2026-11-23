@@ -215,7 +215,10 @@ pub fn witness(
         };
         // SAFETY: both vCPUs are stopped and this newly allocated record is
         // host-owned until the queue or park publication below.
-        unsafe { *zone.record(id).ctx_mut() = park_native_context(&native) };
+        unsafe {
+            *zone.record(id).ctx_mut() =
+                park_native_context(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall)
+        };
         if initial_context.is_none() {
             initial_context = Some(native);
         }

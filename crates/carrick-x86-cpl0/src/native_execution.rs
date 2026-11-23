@@ -141,6 +141,10 @@ pub fn schedule(slot: SlotId) -> ! {
                         use carrick_el1_linux::native_process_runtime::{
                             NativeFailure, NativeResume,
                         };
+                        let position = entry
+                            .resume_context()
+                            .saved_syscall_pc()
+                            .ok_or_else(|| NativeFailure::Quarantined.run_failure_reason())?;
                         let native = context::context_words::into_native(
                             *entry.resume_context(),
                             state.address,
@@ -168,6 +172,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                         &native.xsave,
                                     )
                                     .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?,
+                                    position,
                                 );
                                 Ok(None)
                             }
@@ -233,7 +238,9 @@ pub fn schedule(slot: SlotId) -> ! {
                     // instruction; the parked context needs no further edit.
                     carrick_el1_linux::native_process_runtime::NativeResume::RetrySavedSyscall => {}
                     // Preparation completed without generating entropy. Re-enter
-                    // the saved x86 SYSCALL with its original arguments.
+                    // the saved x86 SYSCALL with its original arguments. The
+                    // context records the rewind, so a preemption before the
+                    // instruction runs cannot have it rewound again (#2851).
                     carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
                         carrick_guest_arch::ProcessContext::restart_syscall(&mut words);
                     }
@@ -242,6 +249,7 @@ pub fn schedule(slot: SlotId) -> ! {
                     }
                 }
                 if !suspended {
+                    let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot());
                     let native = context::context_words::into_native(words, state.address)
                         .unwrap_or_else(|_| fatal_boot());
                     let mut frame =
@@ -270,6 +278,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             &native.xsave,
                         )
                         .unwrap_or_else(|_| fatal_boot()),
+                        position,
                     );
                 }
                 if let Some(status) = entry.take_root_exit() {

@@ -7858,9 +7858,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 NativeResume::Returned(result) => {
                     self.words.set_syscall_return(result.raw() as u64)
                 }
-                NativeResume::RetrySavedSyscall | NativeResume::RetrySyscall => {
-                    self.words.restart_syscall()
-                }
+                // A saved retry already names its syscall instruction, as
+                // both ISAs' ring resumes read it (#2851).
+                NativeResume::RetrySyscall => self.words.restart_syscall(),
                 _ => {}
             }
             if self.current.linux.has_pending_host_work() {
