@@ -43,6 +43,26 @@ impl Region {
                 .cast()
         }
     }
+    /// Publish the closed, unadmitted root of `successor`, as the ring does
+    /// before it asks for an exec.
+    fn publish_successor(&self, successor: u64) {
+        let index = self.zone().spaces.publish_closed(successor, 0, 0).unwrap();
+        self.roots()
+            .publish(
+                index.index(),
+                ReservationMm::new(successor).unwrap(),
+                carrick_el1::memory::reservations::Layout {
+                    heap: ReservationRange::new(0x1000_0000, 0x1100_0000).unwrap(),
+                    arena: ReservationRange::new(0x4000_0000, 0x4400_0000).unwrap(),
+                    brk: 0x1000_0000,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+    }
 }
 
 /// The carrier frames, staged under the production inventory transaction
@@ -54,6 +74,9 @@ struct TestFrames {
     released: usize,
     written: std::collections::BTreeMap<u64, Vec<u8>>,
     cleared: usize,
+    /// Release calls so far, and the one (by that count) reported failed.
+    release_calls: usize,
+    fail_release: Option<usize>,
 }
 
 impl TestFrames {
@@ -67,6 +90,8 @@ impl TestFrames {
             released: 0,
             written: std::collections::BTreeMap::new(),
             cleared: 0,
+            release_calls: 0,
+            fail_release: None,
         }
     }
     fn mapped(&self) -> usize {
@@ -108,6 +133,11 @@ impl X86ExecFrames for TestFrames {
         data.inventory
             .rollback()
             .map_err(|error| fail(error.to_string()))?;
+        let call = self.release_calls;
+        self.release_calls += 1;
+        if self.fail_release == Some(call) {
+            return Err(fail("injected release failure"));
+        }
         self.released += 1;
         Ok(())
     }
@@ -172,28 +202,7 @@ impl Fixture {
     /// unadmitted successor root the ring publishes before it asks.
     fn new(pages: u64) -> Self {
         let region = Region::new();
-        let mm = ReservationMm::new(SUCCESSOR).unwrap();
-        let index = region
-            .zone()
-            .spaces
-            .publish_closed(SUCCESSOR, 0, 0)
-            .unwrap();
-        region
-            .roots()
-            .publish(
-                index.index(),
-                mm,
-                carrick_el1::memory::reservations::Layout {
-                    heap: ReservationRange::new(0x1000_0000, 0x1100_0000).unwrap(),
-                    arena: ReservationRange::new(0x4000_0000, 0x4400_0000).unwrap(),
-                    brk: 0x1000_0000,
-                    address_limit: u64::MAX,
-                    data_limit: u64::MAX,
-                    external_address_bytes: 0,
-                    external_data_bytes: 0,
-                },
-            )
-            .unwrap();
+        region.publish_successor(SUCCESSOR);
         let mut stock = ForkStock::new(
             CARRIER,
             ForkControlCapacity::unused(0x1_0000_0000),
@@ -658,4 +667,83 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
         (1, 1, 1, 1)
     );
     assert_eq!(fixture.stock.counters().successor_table_refusals, 1);
+}
+
+/// #2826: the carrier's exit drain is the last chance any row has, so one
+/// row's failed release must not keep the rows after it. Two staged rows are
+/// live at the exit, a sealed one (returned as a ring cancellation) and an
+/// unsealed one (returned as a refusal); the sealed row's build extent
+/// reports a failed release. The drain still returns the unsealed row's
+/// tables, data frames and build extent, and its result is that first
+/// failure. The fork stock and the frame inventory end at their baseline.
+#[test]
+fn the_carrier_exit_drain_releases_every_row_and_reports_the_first_failure() {
+    const SECOND: u64 = 13;
+    let mut fixture = Fixture::new(32);
+    assert!(matches!(
+        fixture.stage(request(image(argv(), vec![]).unwrap())),
+        X86ExecStage::Staged(..)
+    ));
+    let sealed = fixture.receipt.unwrap();
+    fixture.preparations.seal(sealed).unwrap();
+
+    fixture.region.publish_successor(SECOND);
+    let second = ReservationMm::new(SECOND).unwrap();
+    let unsealed = fixture
+        .preparations
+        .claim(child_identity(), second, ROOT_GENERATION)
+        .unwrap()
+        .receipt();
+    assert!(unsealed.raw() > sealed.raw(), "the sealed row drains first");
+    let staged = stage_x86_exec(
+        CpuId::new(0),
+        unsealed,
+        X86ExecRequest {
+            image: Box::new(image(argv(), vec![]).unwrap()),
+            successor: second,
+            root_generation: ROOT_GENERATION,
+        },
+        &mut fixture.preparations,
+        &mut fixture.stock,
+        &mut fixture.frames,
+        fixture.region.roots(),
+        fixture.region.zone(),
+        StockReleaseWake::new(|| {}),
+        [9; 16],
+    )
+    .unwrap();
+    assert!(matches!(staged, X86ExecStage::Staged(..)));
+    assert_eq!(fixture.stock.table_stock().len(), 32 - 2 * 10);
+    assert_ne!(fixture.frames.mapped(), 0);
+
+    // The sealed row's second release, its build extent, reports a failure.
+    fixture.frames.fail_release = Some(1);
+    let retired = fixture.preparations.retire_at_carrier_exit();
+    assert_eq!(retired.len(), 2);
+    let error = release_x86_execs_at_carrier_exit(
+        retired,
+        &mut fixture.stock,
+        &mut fixture.frames,
+        fixture.region.roots(),
+        fixture.region.zone(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("injected release failure"),
+        "the drain reports the first failure: {error:?}"
+    );
+    assert_eq!(
+        fixture.frames.release_calls, 4,
+        "both rows' data frames and build extents were released"
+    );
+    assert_eq!(fixture.frames.released, 3, "all but the injected failure");
+    assert_eq!(fixture.frames.cleared, 10, "the sealed row's tables");
+    assert_eq!(
+        fixture.stock.table_stock().len(),
+        32,
+        "the stock's baseline"
+    );
+    assert_eq!(fixture.frames.mapped(), 0, "the inventory's baseline");
+    assert_eq!(fixture.preparations.census().carrier_exit, 2);
+    assert_eq!(fixture.preparations.census().unretired(), 0);
 }

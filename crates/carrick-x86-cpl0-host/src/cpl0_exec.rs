@@ -42,7 +42,7 @@ use carrick_el1::memory::reservations::{
 use carrick_guest_arch::{ExecutionGeneration, TaskIdentity, TaskSerial};
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
 use carrick_hal::exec_owner::{
-    ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecSettleLane,
+    ExecParkWake, ExecPreparations, ExecRetained, ExecRetireReason, ExecRetired, ExecSettleLane,
     ExecSettleRefusal, ExecSettlement, ParkedProbe, SettledExec, StockParked,
 };
 use carrick_hal::fork_stock::GrantExecution;
@@ -749,6 +749,36 @@ where
     Ok(request)
 }
 
+/// Apply the exec owner's carrier-exit verdict (#2799) to the rows it retired:
+/// a staged successor's tables, data frames and build extent go back exactly
+/// as a ring cancellation (a sealed row) or a refusal (an unsealed one)
+/// returns them. A claimed or parked row holds no carrier frames. Returns the
+/// rows retired.
+pub fn release_x86_execs_at_carrier_exit<T, C, F, P, A>(
+    retired: Vec<ExecRetired<X86ExecPreparation<F::Data>, P, A>>,
+    stock: &mut ForkStock<T, C>,
+    frames: &mut F,
+    roots: &X86Cpl0Reservations,
+    zone: &X86Cpl0Zone,
+) -> Result<usize, TrapError>
+where
+    T: ChildAddressTags,
+    F: X86ExecFrames,
+{
+    let rows = retired.len();
+    for row in retired {
+        let ExecRetained::Staged(preparation) = row.held else {
+            continue;
+        };
+        if row.retirement.sealed {
+            cancel_x86_exec(preparation, stock, frames)?;
+        } else {
+            release_x86_exec(preparation, stock, frames, roots, zone)?;
+        }
+    }
+    Ok(rows)
+}
+
 /// A successor's data frames on the carrier: one private extent, its
 /// frames' identities bound per page under boot's inventory transaction.
 pub struct CarrierExecData {
@@ -978,34 +1008,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)
     }
 
-    /// Apply the exec owner's carrier-exit verdict (#2799): every row the run
-    /// left unadopted is retired, and a staged successor's tables, data
-    /// frames and build extent go back exactly as a ring cancellation (a
-    /// sealed row) or a refusal (an unsealed one) returns them. A claimed or
-    /// parked row holds no carrier frames. Call only once every CPU lane has
-    /// stopped. Returns the rows retired.
+    /// Retire every exec row the run left unadopted (#2799) and return what
+    /// each held; see [`release_x86_execs_at_carrier_exit`]. Call only once
+    /// every CPU lane has stopped. Returns the rows retired.
     pub(crate) fn retire_native_execs_at_carrier_exit(&mut self) -> Result<usize, TrapError> {
+        // The tables first: a carrier without them keeps its rows.
+        let ram = Arc::clone(&self.ram);
+        let (roots, zone) = Self::exec_tables(&ram)?;
         let retired = self.exec_owner.retire_at_carrier_exit();
-        let rows = retired.len();
-        for row in retired {
-            let ExecRetained::Staged(preparation) = row.held else {
-                continue;
-            };
-            let ram = Arc::clone(&self.ram);
-            let (roots, zone) = Self::exec_tables(&ram)?;
-            let mut frames = CarrierExecFrames {
-                vm: &mut self._vm,
-                next: &mut self.anonymous_next_gpa,
-                inventory: &self.frame_inventory,
-                rollback_fault: &self.initial_rollback_fault,
-            };
-            if row.retirement.sealed {
-                cancel_x86_exec(preparation, &mut self.fork_stock, &mut frames)?;
-            } else {
-                release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)?;
-            }
-        }
-        Ok(rows)
+        let mut frames = CarrierExecFrames {
+            vm: &mut self._vm,
+            next: &mut self.anonymous_next_gpa,
+            inventory: &self.frame_inventory,
+            rollback_fault: &self.initial_rollback_fault,
+        };
+        release_x86_execs_at_carrier_exit(retired, &mut self.fork_stock, &mut frames, roots, zone)
     }
 }
 
