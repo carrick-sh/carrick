@@ -209,11 +209,13 @@ impl<
             .grant(index, request.operation.mm.raw())
             .ok_or(MmError::Busy)?;
         let mut root = self.root(request.operation.mm, worker)?;
+        if root.incarnation().raw() != request.operation.incarnation.get() {
+            return Err(MmError::Stale);
+        }
         if root.generation() != request.parent_generation
-            || root.incarnation().raw() != request.operation.incarnation.get()
             || root.operation_sequence() != request.operation.sequence.get()
         {
-            return Err(MmError::Stale);
+            return Err(MmError::ParentChanged);
         }
         if !root.fork_ready() {
             return Err(MmError::Busy);
@@ -299,11 +301,16 @@ impl<
             return Err(MmError::Stale);
         }
         let mut root = self.root(request.operation.mm, worker)?;
-        if root.incarnation().raw() != request.operation.incarnation.get()
-            || root.generation() != request.parent_generation
+        if root.incarnation().raw() != request.operation.incarnation.get() {
+            return Err(MmError::Stale);
+        }
+        // The request's snapshot precedes the stock crossing, which ran
+        // with this editor released: a sibling's edit since then is
+        // contention, and the fork reruns from a fresh snapshot (#2890).
+        if root.generation() != request.parent_generation
             || root.operation_sequence() != request.operation.sequence.get()
         {
-            return Err(MmError::Stale);
+            return Err(MmError::ParentChanged);
         }
         if !root.fork_ready() {
             return Err(MmError::Busy);

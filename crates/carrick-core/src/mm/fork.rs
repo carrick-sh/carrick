@@ -30,6 +30,14 @@ pub enum ForkError {
     NoMemory,
     Busy,
     Stale,
+    /// The parent MM, at the same incarnation, changed since the fork's
+    /// snapshot: its generation or operation sequence moved, or a table
+    /// word the plan read differs. The snapshot is taken before the
+    /// fork-stock crossing, which runs with the parent's editor released,
+    /// so a sibling thread's edit (or a COW settlement) may land in
+    /// between. Contention, never an errno: the fork backs out and reruns
+    /// from a fresh snapshot (#2890).
+    ParentChanged,
     /// Owner metadata backing must be supplied before publication can finish.
     MetadataRequired,
     OwnerRefusal(ForkOwnerRefusal),
@@ -351,19 +359,20 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
         mut child: C,
         child_handle: El1MmHandle,
     ) -> Result<UnpublishedChild<B>, ForkError> {
-        for (pa, before) in &self.scratch.reads {
-            if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
-                return Err(ForkError::Stale);
-            }
-        }
-        if self.request.parent_generation.raw() >= u64::MAX - 1 {
-            return Err(ForkError::Stale);
-        }
-        if parent.incarnation() != self.request.operation.incarnation.get()
-            || parent.generation() != self.request.parent_generation
-            || parent.operation_sequence() != self.request.operation.sequence.get()
+        if self.request.parent_generation.raw() >= u64::MAX - 1
+            || parent.incarnation() != self.request.operation.incarnation.get()
         {
             return Err(ForkError::Stale);
+        }
+        for (pa, before) in &self.scratch.reads {
+            if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
+                return Err(ForkError::ParentChanged);
+            }
+        }
+        if parent.generation() != self.request.parent_generation
+            || parent.operation_sequence() != self.request.operation.sequence.get()
+        {
+            return Err(ForkError::ParentChanged);
         }
         if !parent.fork_ready() || child.is_admitted() {
             return Err(ForkError::Busy);

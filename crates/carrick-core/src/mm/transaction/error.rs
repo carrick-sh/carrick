@@ -19,6 +19,7 @@ impl From<crate::mm::fork::ForkError> for MmError {
             ForkError::NoMemory => Self::NoMemory,
             ForkError::Busy => Self::Busy,
             ForkError::Stale => Self::Stale,
+            ForkError::ParentChanged => Self::ParentChanged,
             ForkError::MetadataRequired => Self::MetadataRequired,
             ForkError::OwnerRefusal(refusal) => Self::from(match refusal {
                 ForkOwnerRefusal::Invalid => Refusal::Invalid,
@@ -38,6 +39,10 @@ pub enum MmError {
     UnsupportedExecutableCow,
     Stale,
     Busy,
+    /// A fork's parent changed since its snapshot, at the same incarnation
+    /// ([`crate::mm::fork::ForkError::ParentChanged`]): contention, the
+    /// fork reruns from a fresh snapshot.
+    ParentChanged,
     Wait(carrick_core_abi::PortalOwnerWait),
     NoMemory,
     MetadataRequired,
