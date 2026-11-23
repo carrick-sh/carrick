@@ -1946,7 +1946,14 @@ fn arm_sa_restart_rewinds_an_after_syscall_pc_once() {
     arm_sa_restart_reruns_interrupted_svc_once(carrick_sched_core::SavedSyscallPc::AfterSyscall);
 }
 
-fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::SavedSyscallPc) {
+/// Deliver a caught SIGUSR1 (`SA_RESTART`) through the production
+/// saved-context checkpoint to a context saved at `position`, whose call
+/// was interrupted (and retained for the rerun) when `interrupted`. Returns
+/// the resumed context and the handler frame's saved PC and x0.
+fn arm_checkpoint_delivers_usr1(
+    position: carrick_sched_core::SavedSyscallPc,
+    interrupted: bool,
+) -> (Aarch64ParkedContext, u64, u64) {
     const SVC: u64 = 0x40_0000;
     const ARG0: u64 = 0x99;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -2059,10 +2066,12 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
             entry
                 .resume_context_mut()
                 .replace_saved_pc(saved_pc, position);
-            entry.retain_interrupted_syscall().unwrap();
-            entry
-                .resume_context_mut()
-                .set_syscall_return(carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64);
+            if interrupted {
+                entry.retain_interrupted_syscall().unwrap();
+                entry
+                    .resume_context_mut()
+                    .set_syscall_return(carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64);
+            }
             let checkpoint = crate::arm_signal::checkpoint_saved_user_return(task, entry);
             assert!(
                 matches!(checkpoint, Ok(None)),
@@ -2072,7 +2081,6 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
         },
     )
     .unwrap();
-    assert_eq!(resumed.native.pc, 0x70_0000, "the SA_RESTART handler runs");
 
     let written_sp = sp_top.raw()
         - (core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>() as u64);
@@ -2087,6 +2095,14 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
         .unwrap();
     let restart_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
     let restart_x0 = { sigframe.rt.ucontext.uc_mcontext.regs[0] };
+    (resumed, restart_pc, restart_x0)
+}
+
+fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::SavedSyscallPc) {
+    const SVC: u64 = 0x40_0000;
+    const ARG0: u64 = 0x99;
+    let (resumed, restart_pc, restart_x0) = arm_checkpoint_delivers_usr1(position, true);
+    assert_eq!(resumed.native.pc, 0x70_0000, "the SA_RESTART handler runs");
     assert_eq!(
         restart_pc, SVC,
         "sigreturn reruns the interrupted SVC itself, exactly once ({position:?})"
@@ -2096,5 +2112,24 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
         resumed.saved_syscall_pc(),
         Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
         "a restarted context is at its SVC: nothing may rewind it again"
+    );
+}
+
+/// #2900 on ARM: a handler entry is where the thread resumes. Once the
+/// production saved-context checkpoint installs a handler for a context
+/// saved after its `SVC`, the resumed context names the handler as its
+/// resume point, so a later rerun never rewinds it into the instruction in
+/// front of the handler. Red before the fix: the handler entry kept the
+/// saved context's "after `SVC`" label.
+#[test]
+fn arm_handler_entry_is_a_resume_point() {
+    const SVC: u64 = 0x40_0000;
+    let (resumed, restart_pc, _) =
+        arm_checkpoint_delivers_usr1(carrick_sched_core::SavedSyscallPc::AfterSyscall, false);
+    assert_eq!(resumed.native.pc, 0x70_0000, "the handler runs");
+    assert_eq!(restart_pc, SVC + 4, "an uninterrupted call is not rerun");
+    assert_eq!(
+        resumed.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
     );
 }

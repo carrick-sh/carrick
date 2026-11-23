@@ -226,7 +226,9 @@ mod test_support {
     pub fn observe_resumed_position(words: &carrick_sched_core::ParkedContextWords) {
         use carrick_sched_core::X86ParkedGpr as Gpr;
         if words.saved_syscall_pc() == Some(carrick_sched_core::SavedSyscallPc::AfterSyscall)
-            && words.user_rip().checked_add(carrick_guest_arch::X86_64_SYSCALL_LEN)
+            && words
+                .user_rip()
+                .checked_add(carrick_guest_arch::X86_64_SYSCALL_LEN)
                 == Some(words.frame[Gpr::Rcx as usize])
         {
             MISLABELLED_RESUMES.fetch_add(1, Ordering::Relaxed);
