@@ -1695,6 +1695,7 @@ mod tests {
                     "tid=1 stack=frame1".to_owned(),
                 ],
                 unavailable: Vec::new(),
+                el1_census: None,
             }
         }
     }
@@ -1764,6 +1765,7 @@ mod tests {
                     .map(|index| format!("tid={index} stack={chunk}"))
                     .collect(),
                 unavailable: Vec::new(),
+                el1_census: None,
             }
         }
     }

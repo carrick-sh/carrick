@@ -491,6 +491,22 @@ pub fn publish_counters_terminal(
     )
 }
 
+/// The census so far, as the JSON `publish_counters_terminal` would write
+/// for a run without an identity, for a live debug capture. `None` when the
+/// run did not opt in (`CARRICK_EL1_CENSUS`): a capture adds nothing to a
+/// run that asked for no census. Nothing is published; the caller of the
+/// capture owns the file.
+pub fn live_capture_json(
+    counters: Option<&carrick_el1_abi::Counters>,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Option<String> {
+    init_from_env();
+    if !enabled() {
+        return None;
+    }
+    serde_json::to_string(&snapshot_counters(None, counters, isa)).ok()
+}
+
 fn destination() -> std::path::PathBuf {
     DIRECTORY
         .get()
