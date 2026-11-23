@@ -3890,3 +3890,50 @@ fn mounted_static_x86_empty_select_sleep() {
         "guest empty-set select/poll differed from native oracle"
     );
 }
+
+/// #2909: the run root's `select` and `pselect6` over host descriptors (a
+/// host regular file, stdin and stdout, a host UDP socket) and over sets
+/// that mix a ring pipe with a host descriptor, both already ready and
+/// woken later by a fork child, match the native run line for line. The
+/// ring poll owner admits the x86 root only for sets it can serve; a host
+/// member must never answer EBADF or ENOSYS.
+#[test]
+fn mounted_static_x86_root_select_host_descriptors_match_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("root-select-host");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/x86_root_select_host.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &[]);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native root-select-host oracle");
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native oracle failed: stdout={native_stdout} stderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(
+        native_stdout.ends_with("done\n"),
+        "native oracle must finish:\n{native_stdout}"
+    );
+
+    let guest = run_mounted_binary(&elf, "root-select-host", false);
+    let guest_stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        guest.status.code(),
+        native.status.code(),
+        "guest exit {:?} stderr={}\nstdout:\n{guest_stdout}",
+        guest.status.code(),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        guest_stdout, native_stdout,
+        "the root's select over host descriptors differed from the native oracle"
+    );
+}
