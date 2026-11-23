@@ -24402,5 +24402,65 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
         (CompletionRoute::Served, LINUX_FD_CLOEXEC as i64)
     );
 
+    // close_range (#2904) in the single-threaded child, through the same
+    // owned close: fds 2, 3, 4 are dups of fd 1, and 12 is open from above.
+    const CLOSE_RANGE: u64 = 436;
+    for expected in [2, 3, 4] {
+        assert_eq!(
+            call_process(&child_binding, 23, [1, 0, 0, 0, 0, 0]),
+            (CompletionRoute::Served, expected)
+        );
+    }
+    macro_rules! child_fd {
+        ($fd:expr) => {
+            call_process(&child_binding, 25, [$fd, LINUX_F_GETFD, 0, 0, 0, 0]).1
+        };
+    }
+    // EINVAL first: an inverted range and an unknown flag change nothing.
+    assert_eq!(
+        call_process(&child_binding, CLOSE_RANGE, [4, 3, 0, 0, 0, 0]),
+        (CompletionRoute::Served, -22)
+    );
+    assert_eq!(
+        call_process(&child_binding, CLOSE_RANGE, [2, 4, 8, 0, 0, 0]),
+        (CompletionRoute::Served, -22)
+    );
+    assert_eq!([child_fd!(2), child_fd!(3), child_fd!(4)], [0, 0, 0]);
+    // CLOSE_RANGE_CLOEXEC marks without closing.
+    assert_eq!(
+        call_process(&child_binding, CLOSE_RANGE, [2, 2, 4, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(child_fd!(2), LINUX_FD_CLOEXEC as i64);
+    // A range past the table closes 3, 4 and 12, whatever `last` is.
+    assert_eq!(
+        call_process(
+            &child_binding,
+            CLOSE_RANGE,
+            [3, u64::from(u32::MAX), 0, 0, 0, 0]
+        ),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!([child_fd!(3), child_fd!(4), child_fd!(12)], [-9, -9, -9]);
+    // CLOSE_RANGE_UNSHARE on a table no other thread shares is a plain range.
+    assert_eq!(
+        call_process(&child_binding, CLOSE_RANGE, [2, 2, 2, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!([child_fd!(2), child_fd!(1)], [-9, 0]);
+    assert_eq!(
+        call_process(&child_binding, CLOSE_RANGE, [100, 200, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    // The root's table is untouched by the child's ranges.
+    assert_eq!(
+        call_process(&parent_binding, 25, [2, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(
+        call_process(&parent_binding, 25, [3, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, LINUX_FD_CLOEXEC as i64)
+    );
+
     registry().unregister_root_for_test(&runtime);
 }
