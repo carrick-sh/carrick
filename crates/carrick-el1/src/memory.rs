@@ -347,14 +347,19 @@ pub fn decide_reservation_syscall_for_origin<
                     ),
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
-                None if service_origin == ServiceOrigin::Descendant => model
-                    .mmap_with_advisory_hint(
-                        placement,
-                        frame.arguments()[1],
-                        prot,
-                        AnonymousHintVenue::Ring,
-                    ),
-                None => model.mmap(placement, frame.arguments()[1], prot),
+                // Linux places a free hint at the address asked for
+                // (mmap(2)), inside the layout or in a free carrier aperture
+                // outside it; a taken or unusable hint relocates. A run root
+                // may still have a host venue that searches its alias gaps.
+                None => {
+                    let len = frame.arguments()[1];
+                    let external = model.external_anonymous_hint(placement, len, G::USER_VA_END);
+                    let venue = match service_origin {
+                        ServiceOrigin::Descendant => AnonymousHintVenue::Ring,
+                        ServiceOrigin::Initial => AnonymousHintVenue::Host,
+                    };
+                    model.mmap_with_advisory_hint(placement, len, prot, venue, external)
+                }
             }
         }
         SYS_MUNMAP | SYS_MPROTECT => {

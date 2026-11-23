@@ -456,6 +456,8 @@ pub trait ReservationGeometry {
     const REGION_BASE: u64;
     const BOOTSTRAP_BASE: u64;
     const BOOTSTRAP_SIZE: u64;
+    /// The exclusive end of this ISA's user virtual address space.
+    const USER_VA_END: u64;
     fn authorizes_internal_read(address: u64, len: u64) -> bool;
     fn authorizes_identity_write(_address: u64, _len: u64) -> bool {
         false
@@ -465,6 +467,10 @@ pub trait ReservationGeometry {
 /// The Linux client interprets the neutral node; core owns its storage and work.
 pub trait ReservationPolicy {
     fn validates_layout(layout: Layout) -> bool;
+    /// Whether a private anonymous `range` outside `layout` lies in an
+    /// aperture no carrier mapping occupies, below the ISA's `user_end`.
+    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64)
+    -> bool;
     fn active_value(policy: ReservationPolicyPayload) -> u64;
     fn apply_value(policy: &mut ReservationPolicyPayload, value: u64);
     fn admits_charges(

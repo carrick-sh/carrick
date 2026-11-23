@@ -30,8 +30,20 @@ pub use storage::ResolvedReservationNodes;
 pub enum AnonymousHintVenue {
     /// A ring-only MM can use its allocation layout without a raw crossing.
     Ring,
-    /// Host VMA and aperture checks authorized this optional outside range.
-    Host { external: Option<ReservationRange> },
+    /// A host venue may still search its alias gaps when the layout is full.
+    Host,
+}
+
+/// A private anonymous hint outside the allocation layout that the
+/// personality placed in a free carrier aperture below this ISA's user VA
+/// end. Only [`Reservations::external_anonymous_hint`] mints one, so the
+/// root's outside-layout prepare needs no venue-specific authorization.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct ExternalAnonymousHint(ReservationRange);
+impl ExternalAnonymousHint {
+    pub fn range(self) -> ReservationRange {
+        self.0
+    }
 }
 
 /// One prepared image mapping. The caller retains every referenced backing
@@ -2625,20 +2637,42 @@ impl<
     ) -> Result<Decision, Refusal> {
         Policy::mmap(self, placement, GuestLen::new(len), prot)
     }
+    /// A free-aperture token for a page-aligned private anonymous hint
+    /// outside the allocation layout, below both `user_end` and this
+    /// geometry's user VA end, or `None` (an in-layout or unaligned hint,
+    /// or one the personality places in no free aperture).
+    pub fn external_anonymous_hint(
+        &self,
+        placement: Placement,
+        len: u64,
+        user_end: u64,
+    ) -> Option<ExternalAnonymousHint> {
+        let Placement::Hint(hint) = placement else {
+            return None;
+        };
+        if !hint.is_multiple_of(4096) {
+            return None;
+        }
+        let len = len.checked_add(4095)? & !4095;
+        let range = ReservationRange::new(hint, hint.checked_add(len)?)?;
+        let layout = self.state().layout;
+        (!self.in_layout(range)
+            && Policy::external_anonymous_aperture(layout, range, user_end.min(Geometry::USER_VA_END)))
+        .then_some(ExternalAnonymousHint(range))
+    }
     /// Settle a private anonymous hint through this MM's allocation owner.
-    /// A host-authorized external placement takes precedence over relocation.
+    /// A free external aperture (`external`) takes precedence over
+    /// relocation, as Linux places a free hint at the address asked for.
     pub fn mmap_with_advisory_hint(
         &mut self,
         placement: Placement,
         len: u64,
         prot: ReservationProtection,
         venue: AnonymousHintVenue,
+        external: Option<ExternalAnonymousHint>,
     ) -> Result<Decision, Refusal> {
-        if let AnonymousHintVenue::Host {
-            external: Some(range),
-        } = venue
-        {
-            match self.prepare_external_anonymous(range, prot) {
+        if let Some(external) = external {
+            match self.prepare_external_anonymous(external, prot) {
                 Err(Refusal::Collision | Refusal::ForeignMapping | Refusal::Hole) => {}
                 result => return result,
             }
@@ -2647,7 +2681,7 @@ impl<
             Err(Refusal::ForeignMapping) if matches!(placement, Placement::Hint(_)) => {
                 match self.mmap(Placement::Anywhere, len, prot) {
                     // The host still has an alias-gap search outside this layout.
-                    Err(Refusal::Limit) if matches!(venue, AnonymousHintVenue::Host { .. }) => {
+                    Err(Refusal::Limit) if matches!(venue, AnonymousHintVenue::Host) => {
                         Err(Refusal::ForeignMapping)
                     }
                     result => result,
@@ -2668,22 +2702,17 @@ impl<
     ) -> Result<Decision, Refusal> {
         Policy::mmap_private_file(self, placement, GuestLen::new(len), prot, backing, sharing)
     }
-    /// Prepare an anonymous range outside the allocation layout. The host
-    /// placement authority validates user VA bounds, reserved apertures and
-    /// boot VMAs first. This exact root still checks collisions, owed returns,
-    /// limits and metadata before retaining the ordinary rollbackable proposal.
+    /// Prepare an anonymous range outside the allocation layout. The token
+    /// proves the personality placed it in a free carrier aperture below the
+    /// ISA's user VA end. This exact root still checks collisions, owed
+    /// returns, limits and metadata before retaining the ordinary
+    /// rollbackable proposal, from either venue.
     pub fn prepare_external_anonymous(
         &mut self,
-        range: ReservationRange,
+        external: ExternalAnonymousHint,
         prot: ReservationProtection,
     ) -> Result<Decision, Refusal> {
-        if !self.host_holder
-            || !self.host_proposal
-            || !range.start().is_multiple_of(4096)
-            || !range.end().is_multiple_of(4096)
-        {
-            return Err(Refusal::Invalid);
-        }
+        let range = external.range();
         if self
             .next(range.start())
             .is_some_and(|node| node.start < range.end())
@@ -7727,9 +7756,13 @@ mod tests {
 
         // Go `sysReserveOS` outside layout, then `sysMapOS` `MAP_FIXED` within it.
         let arena = range(0xc0_0000_0000, 0xc0_0400_0000);
-        g.begin_host_proposal().unwrap();
+        // No host proposal: the aperture token is the whole authority.
+        let external = g
+            .external_anonymous_hint(Placement::Hint(arena.start()), arena.len(), u64::MAX)
+            .expect("a free alias-window hint");
+        assert_eq!(external.range(), arena);
         let reserve = g
-            .prepare_external_anonymous(arena, ReservationProtection::NONE)
+            .prepare_external_anonymous(external, ReservationProtection::NONE)
             .unwrap();
         complete(&mut g, reserve);
 
