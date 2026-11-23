@@ -24,7 +24,11 @@ impl SourceSite {
     /// The caller's source site (through every `#[track_caller]` frame).
     #[track_caller]
     pub fn caller() -> Self {
-        let location = core::panic::Location::caller();
+        Self::from_location(core::panic::Location::caller())
+    }
+
+    /// The site a compiler-recorded `location` names.
+    pub fn from_location(location: &core::panic::Location<'_>) -> Self {
         Self::new(location.file(), location.line(), location.column())
     }
 

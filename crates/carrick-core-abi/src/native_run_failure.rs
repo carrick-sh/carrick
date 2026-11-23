@@ -62,22 +62,63 @@ impl NativeRunFailureReason {
     /// This reason, raised at the caller's source site.
     #[track_caller]
     pub fn at_caller(self) -> NativeRunFailureCause {
+        self.at(core::panic::Location::caller())
+    }
+
+    /// This reason, raised at `location`.
+    pub const fn at(
+        self,
+        location: &'static core::panic::Location<'static>,
+    ) -> NativeRunFailureCause {
         NativeRunFailureCause {
             reason: self,
-            site: crate::SourceSite::caller(),
+            location,
         }
     }
 }
 
 /// A terminal native run failure: its reason and the kernel site that raised
 /// it, so the host names the site without a per-site diagnostic build (#2853).
+///
+/// Two words: it rides the kernel's resume `Result` chains on the small EL1
+/// and CPL0 stacks, so the site stays the compiler's `Location` until
+/// [`NativeRunFailure::new`] packs it into wire words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeRunFailureCause {
+    pub reason: NativeRunFailureReason,
+    pub location: &'static core::panic::Location<'static>,
+}
+
+impl NativeRunFailureCause {
+    /// The raising site as carried on the wire.
+    pub fn site(&self) -> crate::SourceSite {
+        crate::SourceSite::from_location(self.location)
+    }
+
+    /// What the host decodes from this cause's record.
+    pub fn report(&self) -> NativeRunFailureReport {
+        NativeRunFailureReport {
+            reason: self.reason,
+            site: self.site(),
+        }
+    }
+}
+
+impl core::fmt::Display for NativeRunFailureCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.report().fmt(f)
+    }
+}
+
+/// A native run failure as the host decodes it from the wire record: its
+/// reason and the kernel site that raised it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeRunFailureReport {
     pub reason: NativeRunFailureReason,
     pub site: crate::SourceSite,
 }
 
-impl core::fmt::Display for NativeRunFailureCause {
+impl core::fmt::Display for NativeRunFailureReport {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{} at {}", self.reason.as_str(), self.site)
     }
@@ -105,10 +146,10 @@ impl NativeRunFailure {
             binding.thread_generation.raw(),
             cause.reason as u64,
         ]);
-        words[Self::SITE..Self::RESERVED].copy_from_slice(&cause.site.words());
+        words[Self::SITE..Self::RESERVED].copy_from_slice(&cause.site().words());
         Self { words }
     }
-    pub fn cause_for(&self, expected: ExecutionBinding) -> Option<NativeRunFailureCause> {
+    pub fn cause_for(&self, expected: ExecutionBinding) -> Option<NativeRunFailureReport> {
         if !expected.issued()
             || self.words[..5]
                 != [
@@ -125,7 +166,7 @@ impl NativeRunFailure {
         let reason = NativeRunFailureReason::from_raw(self.words[5])?;
         let mut site = [0; crate::SOURCE_SITE_WORDS];
         site.copy_from_slice(&self.words[Self::SITE..Self::RESERVED]);
-        Some(NativeRunFailureCause {
+        Some(NativeRunFailureReport {
             reason,
             site: crate::SourceSite::from_words(site),
         })
@@ -146,7 +187,7 @@ impl NativeRunFailureConsumer {
         &mut self,
         record: &NativeRunFailure,
         expected: ExecutionBinding,
-    ) -> Option<(NativeRunFailureCause, u64)> {
+    ) -> Option<(NativeRunFailureReport, u64)> {
         if self.consumed {
             return None;
         }
@@ -159,6 +200,10 @@ impl NativeRunFailureConsumer {
 }
 
 const _: () = {
+    // The raising site's words end inside the record.
+    assert!(NativeRunFailure::RESERVED <= 16);
+    // The kernel-side cause stays two words on the EL1 and CPL0 stacks.
+    assert!(core::mem::size_of::<NativeRunFailureCause>() == 16);
     assert!(core::mem::size_of::<NativeRunFailure>() == 128);
     assert!(core::mem::align_of::<NativeRunFailure>() == 64);
 };

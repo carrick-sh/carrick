@@ -57,6 +57,6 @@ fn test_terminal_failure(binding: ExecutionBinding, cause: NativeRunFailureCause
     std::panic::panic_any(NativeRunFailurePanic {
         binding,
         reason: cause.reason,
-        site: cause.site,
+        site: cause.site(),
     })
 }

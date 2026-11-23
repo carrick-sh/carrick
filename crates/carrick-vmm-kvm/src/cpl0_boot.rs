@@ -3326,7 +3326,7 @@ pub enum InitialProcessExit {
         exits: usize,
     },
     RunFailed {
-        cause: carrick_core_abi::NativeRunFailureCause,
+        cause: carrick_core_abi::NativeRunFailureReport,
         exits: usize,
     },
     Exited {
@@ -3347,7 +3347,9 @@ pub fn initial_process_exit(exit: PhysicalProcessExit, exits: usize) -> InitialP
             ) {
                 Ok(status) => InitialProcessExit::OwnedExit { status, exits },
                 Err(_) => InitialProcessExit::RunFailed {
-                    cause: carrick_core_abi::NativeRunFailureReason::NativeInvalid.at_caller(),
+                    cause: carrick_core_abi::NativeRunFailureReason::NativeInvalid
+                        .at_caller()
+                        .report(),
                     exits,
                 },
             }
@@ -3382,7 +3384,7 @@ mod root_exit_validation_tests {
                 assert!(matches!(
                     outcome,
                     InitialProcessExit::RunFailed {
-                        cause: carrick_core_abi::NativeRunFailureCause {
+                        cause: carrick_core_abi::NativeRunFailureReport {
                             reason: carrick_core_abi::NativeRunFailureReason::NativeInvalid,
                             ..
                         },
