@@ -2059,6 +2059,37 @@ fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
     }
 }
 
+/// #2890 and #2924 on ARM: the Go runtime's `fork/exec` once it runs more
+/// than one P. A thread `vfork`s and execs the fixture sixteen times while
+/// four sibling threads map, touch and unmap memory. On x86 this shape is
+/// `x86_kvm_run::mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings`.
+/// After #2905 the arm64 go rows die of SIGSEGV (139) where they used to
+/// answer `fork/exec: bad address`; this is the minimal ARM shape to read.
+#[test]
+fn el1_sched_thread_vfork_exec_beside_memory_editing_siblings() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["vfork-exec-siblings", "4", "16"],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched vfork-exec-siblings exits={} wall_ms={} {}",
+        measured.exits,
+        measured.wall.as_millis(),
+        stdout.trim()
+    );
+    assert!(
+        measured.result.success() && stdout.contains("vfork-exec-siblings ok rounds=16"),
+        "94 a failed vfork (errno printed), 95 a child that did not exit 0 (wait \
+         status printed), 98 a timeout, 99 a memory edit that did not answer as \
+         Linux does: {}",
+        describe(&measured)
+    );
+}
+
 /// Contract `kernel.mm.address-space-occupancy` (EL1 increment 2, first-touch checkpoint):
 /// two live processes, each running twice as many writer threads as guest
 /// CPUs (pairs handing a turn off through private futexes, so EL1 switches
