@@ -539,6 +539,15 @@ impl NetSocket<'_> {
     }
 }
 
+/// The member a native network call that would block waits as: its ring
+/// record, and the call's ring serial, which keys a socket timeout's
+/// deadline across the call's records (#2878).
+#[derive(Clone, Copy)]
+struct NetWaiter {
+    record: carrick_el1_abi::RecordRef,
+    call: Option<carrick_core_abi::host_file::HostCallSerial>,
+}
+
 /// One served network call.
 pub(in crate::dispatch) enum NetServed {
     /// The call's result and the reply output (written extents).
@@ -585,6 +594,10 @@ impl SyscallDispatcher {
         // Sample before the call's own probe: a readiness notification after
         // this point reruns the member's park at once.
         let revision = waiter.and_then(|record| owner.host_ready_revision(record));
+        let waiter = waiter.map(|record| NetWaiter {
+            record,
+            call: carrick_core_abi::host_file::call_serial(&header),
+        });
         if header.fd < 0 {
             return self.run_native_net_call(owner, table, &call, &caller, None, waiter, revision);
         }
@@ -643,7 +656,7 @@ impl SyscallDispatcher {
         call: &NetCall<'_>,
         caller: &Arc<NativeNetCaller>,
         socket: Option<(NetSocket<'_>, bool)>,
-        waiter: Option<carrick_el1_abi::RecordRef>,
+        waiter: Option<NetWaiter>,
         revision: Option<u64>,
     ) -> NetServed {
         // The handlers borrow the run's container and network namespace
@@ -775,9 +788,34 @@ impl SyscallDispatcher {
                 NetServed::Reply(errno.guest_retval(), Vec::new())
             }
             Ran::Outcome(DispatchOutcome::WaitOnFds {
-                fds, timeout: None, ..
+                fds,
+                timeout,
+                completion,
+                ..
             }) => match (&socket, waiter, revision) {
-                (Some((socket, _)), Some(record), Some(revision)) if !fds.fds.is_empty() => 'wait: {
+                (Some((socket, _)), Some(waiter), Some(revision)) if !fds.fds.is_empty() => 'wait: {
+                    let record = waiter.record;
+                    // A socket timeout (`SO_RCVTIMEO`, `SO_SNDTIMEO`) is the
+                    // call's: its first wait fixes the deadline, keyed on
+                    // the call's ring serial, and every rerun of the same
+                    // call keeps it (#2878). Past it, the call answers the
+                    // wait's timeout result (EAGAIN).
+                    let deadline = match (timeout, waiter.call, &completion) {
+                        (None, ..) => None,
+                        (
+                            Some(timeout),
+                            Some(call),
+                            crate::dispatch::FdWaitCompletion::Fd { on_timeout },
+                        ) => {
+                            let deadline = owner.poll_deadlines().deadline(record, call, timeout);
+                            if deadline <= std::time::Instant::now() {
+                                owner.poll_deadlines().clear(record);
+                                break 'wait NetServed::Reply(*on_timeout, Vec::new());
+                            }
+                            Some(deadline)
+                        }
+                        _ => break 'wait NetServed::Refused,
+                    };
                     let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
                     let source = socket.source(&reactor);
                     let description = socket.description();
@@ -811,7 +849,9 @@ impl SyscallDispatcher {
                             events: zone_events(wait.events()),
                         });
                     }
-                    if owner.watch_host_ready_with_zone(&reactor, record, &interests, zone) {
+                    if owner
+                        .watch_host_ready_with_zone(&reactor, record, &interests, zone, deadline)
+                    {
                         NetServed::Wait(revision)
                     } else {
                         NetServed::Refused
@@ -819,18 +859,19 @@ impl SyscallDispatcher {
                 }
                 _ => NetServed::Refused,
             },
-            // A timed wait, an in-zone wait or a retained continuation has no
-            // native venue yet: never a guessed result.
+            // A retained continuation has no native venue yet: never a
+            // guessed result.
             Ran::Outcome(_) => NetServed::Refused,
         };
         // An answered call ends the wait an earlier attempt of it enrolled
         // (a rerun after its wake): a wait lives no longer than its call.
-        if let (NetServed::Reply(..), Some(record)) = (&served, waiter) {
+        if let (NetServed::Reply(..), Some(waiter)) = (&served, waiter) {
             self.kernel_binding
                 .read()
                 .kernel()
                 .host_readiness()
-                .cancel(record);
+                .cancel(waiter.record);
+            owner.poll_deadlines().clear(waiter.record);
         }
         // The scratch table's references: a moved socket now has its ring's.
         for (_, slot) in slots {
@@ -901,6 +942,10 @@ impl SyscallDispatcher {
         let encoded = NetCall::encode(canonical, args, &[segment], staged.as_slice())?;
         let call = NetCall::decode(&encoded)?;
         let revision = waiter.and_then(|record| owner.host_ready_revision(record));
+        let waiter = waiter.map(|record| NetWaiter {
+            record,
+            call: carrick_core_abi::host_file::call_serial(&header),
+        });
         let caller = Arc::new(NativeNetCaller::unstamped(
             self.kernel_binding.read().kernel().object_ids(),
         )?);

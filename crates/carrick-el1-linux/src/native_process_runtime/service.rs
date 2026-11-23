@@ -1806,17 +1806,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &mut record,
             || self.caller_file_size_soft_limit(),
         )?;
-        self.stamp_poll_serial(&mut record)?;
+        self.stamp_call_serial(&mut record)?;
         self.publish_host_file(record, output, map, chdir, call)
     }
 
-    /// A poll call's ring serial, new at the call's own entry: the carrier
-    /// keys the call's deadline on it (#2414). Any other record is left as
-    /// staged.
-    fn stamp_poll_serial(&self, record: &mut [u8]) -> Result<(), NativeProcessError> {
+    /// A waiting call's ring serial, new at the call's own entry: the
+    /// carrier keys a poll's deadline (#2414) and a socket timeout's (#2878)
+    /// on it. Any other record is left as staged.
+    fn stamp_call_serial(&self, record: &mut [u8]) -> Result<(), NativeProcessError> {
         if carrick_core_abi::host_file::request_parts(record).is_some_and(|(header, _, _)| {
-            header.op == carrick_core_abi::host_file::HostFileOp::Poll
-        }) && !carrick_personality_linux::native_host_file::stamp_poll_call(
+            carrick_core_abi::host_file::call_serial_arg(header.op).is_some()
+        }) && !carrick_personality_linux::native_host_file::stamp_call_serial(
             record,
             self.next_host_call_serial(),
         ) {
@@ -1887,7 +1887,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Invalid)?;
             // A socket call is the root's own as every member's is (#1906):
             // its record leads with its task row's identity, and a poll of
-            // its host sockets carries its call serial.
+            // its host sockets or a socket call carries its call serial.
             let stamped = match self.stamp_net_caller(record) {
                 Ok(record) => record,
                 Err(resume) => {
@@ -1896,7 +1896,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             };
             record = stamped;
-            self.stamp_poll_serial(&mut record)?;
+            self.stamp_call_serial(&mut record)?;
             if chdir {
                 call.counters.record_refusal(
                     call.ordinal,

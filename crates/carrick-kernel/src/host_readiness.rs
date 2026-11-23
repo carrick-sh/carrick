@@ -418,7 +418,8 @@ impl HostReadinessReactor {
     }
 }
 
-/// A member's poll deadline (#231), keyed by the member and the poll call's
+/// A member's poll deadline (#231), or its socket call's timeout deadline
+/// (`SO_RCVTIMEO`, `SO_SNDTIMEO`, #2878), keyed by the member and the call's
 /// ring serial (#2414 review P0-2). The call's first empty snapshot fixes
 /// it; every record the ring publishes again for the same call after a
 /// readiness wake carries the same serial and keeps it, as Linux keeps one

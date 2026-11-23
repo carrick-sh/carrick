@@ -1581,19 +1581,21 @@ impl HostIpc {
         )
     }
 
-    /// [`Self::watch_host_ready`], with in-zone parts of the wait (#2867).
+    /// [`Self::watch_host_ready`], with in-zone parts of the wait (#2867)
+    /// and, for a socket timeout, the call's deadline (#2878).
     pub(crate) fn watch_host_ready_with_zone(
         &self,
         reactor: &crate::host_readiness::HostReadinessReactor,
         record: carrick_el1_abi::RecordRef,
         interests: &[crate::host_readiness::HostReadinessInterest<'_>],
         zone: Vec<crate::host_readiness::HostReadinessZoneInterest>,
+        deadline: Option<std::time::Instant>,
     ) -> bool {
         reactor.watch_with_zone(
             record,
             interests,
             zone,
-            None,
+            deadline,
             self.carrier_zone.get().cloned(),
         )
     }

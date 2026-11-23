@@ -513,6 +513,34 @@ impl PollWait {
 /// ([`HostCallSerial`]).
 pub const POLL_CALL_SERIAL_ARG: usize = 2;
 
+/// `args[3]` of a [`HostFileOp::NetSyscall`], [`HostFileOp::Read`] or
+/// [`HostFileOp::Write`] record: its call's ring serial ([`HostCallSerial`]),
+/// which keys a socket timeout's deadline (`SO_RCVTIMEO`, `SO_SNDTIMEO`)
+/// across the call's records (#2878).
+pub const SOCKET_CALL_SERIAL_ARG: usize = 3;
+
+/// The header argument that carries `op`'s call serial ([`HostCallSerial`]),
+/// for each record whose call may wait with a deadline. `None` for any
+/// other operation.
+pub const fn call_serial_arg(op: HostFileOp) -> Option<usize> {
+    match op {
+        HostFileOp::Poll => Some(POLL_CALL_SERIAL_ARG),
+        HostFileOp::NetSyscall | HostFileOp::Read | HostFileOp::Write => {
+            Some(SOCKET_CALL_SERIAL_ARG)
+        }
+        _ => None,
+    }
+}
+
+/// The call serial `header` carries, if its operation carries one and the
+/// ring stamped it.
+pub const fn call_serial(header: &HostFileHeader) -> Option<HostCallSerial> {
+    match call_serial_arg(header.op) {
+        Some(index) => HostCallSerial::from_raw(header.args[index]),
+        None => None,
+    }
+}
+
 /// [`HostFileOp::Poll`] `args[3]`: the shape of the set ([`PollShape`]).
 pub const POLL_SHAPE_ARG: usize = 3;
 
@@ -615,8 +643,8 @@ impl SelectSets {
     }
 }
 
-/// One poll call's identity across the records its ring publishes for it
-/// (#2414 review P0-2). The ring stamps a new serial on a call's first
+/// One waiting call's identity across the records its ring publishes for it
+/// (#2414 review P0-2): a poll, or a socket call under a timeout (#2878). The ring stamps a new serial on a call's first
 /// record, at the call's own entry, and keeps it on every record it
 /// publishes again for that call after a host-readiness wake; the carrier
 /// keys the call's deadline on the member and this serial. A new call,
