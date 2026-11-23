@@ -991,6 +991,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, bytes)
     }
+    /// Whether the memory owner can write or prepare `mm`'s user memory at
+    /// all ([`Self::copy_owned_bytes`], [`Self::prepare_owned_write`],
+    /// [`Self::prepare_owned_read`]). A copy the owner cannot reach has no
+    /// one to wait for: the refusal where it was tried is the answer.
+    fn owner_reaches(&self, _mm: &Self::Mm) -> bool {
+        true
+    }
     /// Whether [`Self::copy_signal_frame_bytes`] can reach `mm` at all: the
     /// owner path writes a signal frame only into an owner-admitted MM.
     fn signal_frames_reach(&self, _mm: &Self::Mm) -> bool {
@@ -9776,6 +9783,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 {
     fn is_root_process(&self) -> bool {
         NativeProcessEntry::is_root_process(self)
+    }
+
+    fn owner_reaches_memory(&mut self) -> bool {
+        self.process_mm()
+            .is_ok_and(|mm| self.service.owner_reaches(&mm))
     }
 
     fn monotonic_counter(

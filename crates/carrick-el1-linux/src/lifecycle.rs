@@ -79,6 +79,17 @@ impl<
         (venue.binding() == binding).then_some(venue)
     }
 
+    /// Whether a copy this entry could not make is the memory owner's to
+    /// finish ("not yet"), or already the answer (EFAULT). The owner must be
+    /// bound to the caller and must reach its MM: a venue whose owner can't
+    /// write that MM (the soft carrier's unadmitted root) would only refuse
+    /// the copy again, as a broken invariant instead of EFAULT.
+    #[inline(never)]
+    fn copy_owner_reaches(&mut self) -> bool {
+        self.process_venue()
+            .is_some_and(|venue| venue.owner_reaches_memory())
+    }
+
     /// The venue that serves this caller's clocks in ring. The ARM root can
     /// still have an embedder-controlled ClockDomain, so it keeps its legacy
     /// dispatch until that domain is available in ring.
@@ -141,7 +152,7 @@ impl<
         match copied {
             Ok(()) => CopyOutcome::Done,
             Err(reason) => {
-                let owner = self.process_venue().is_some();
+                let owner = self.copy_owner_reaches();
                 self.record_copy_refusal(src, dst.len(), false, reason);
                 if owner {
                     CopyOutcome::NotYet(GuestCopyRequest {
@@ -202,7 +213,7 @@ impl<
         match copied {
             Ok(()) => CopyOutcome::Done,
             Err(reason) => {
-                let owner = self.process_venue().is_some();
+                let owner = self.copy_owner_reaches();
                 self.record_copy_refusal(dst, src.len(), true, reason);
                 if owner {
                     CopyOutcome::NotYet(GuestCopyRequest {

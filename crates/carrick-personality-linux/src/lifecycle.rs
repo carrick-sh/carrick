@@ -330,6 +330,14 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     }
     /// The admitted process graph owns root identity; namespace PID 1 does not.
     fn is_root_process(&self) -> bool;
+    /// Whether this process's memory owner can finish an output or prepare
+    /// an input on its MM. Only then is a copy the entry could not make
+    /// "not yet" (the owner waits for the page, or answers EFAULT for an
+    /// address that is not the guest's); otherwise the entry's own refusal
+    /// is final, EFAULT.
+    fn owner_reaches_memory(&mut self) -> bool {
+        true
+    }
     /// A native execution record owns its complete published descriptor
     /// namespace even when the carrier supplied its initial table. Borrowed
     /// host records retain their host mutation owner.

@@ -2715,11 +2715,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     /// (`access_user_target`): a root opened on the legacy venue has none.
     /// HVF and x86 carriers deliver to every MM they run.
     fn signal_frames_reach(&self, mm: &Mm) -> bool {
-        self.signal_frames.reaches(|| {
-            self.portal().is_ok_and(|owner| {
-                ReservationMm::new(mm.mm.raw().get())
-                    .is_some_and(|key| owner.admitted_handle(key, self.worker()).is_ok())
-            })
+        self.signal_frames.reaches(|| self.owner_reaches(mm))
+    }
+
+    /// The owner's user copies (`access_user_target`) work only through the
+    /// MM's portal admission, on every carrier. A root the portal never
+    /// admitted (the soft carrier's root, #2645 slice D; an HVF root with the
+    /// descriptor lane off) has no owner to finish or prepare its copies.
+    #[inline(never)]
+    fn owner_reaches(&self, mm: &Mm) -> bool {
+        self.portal().is_ok_and(|owner| {
+            ReservationMm::new(mm.mm.raw().get())
+                .is_some_and(|key| owner.admitted_handle(key, self.worker()).is_ok())
         })
     }
 
