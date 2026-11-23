@@ -2101,12 +2101,14 @@ jobs:
   # shards' union equals `just test` on Linux. While the macOS jobs are off
   # (owner 2026-11-22, #231) this is the only job that runs the unit set, and
   # Linux arm64 is the ARM coverage for ISA-neutral host code.
+  # Ready pull requests and merge groups only (#2846): four jobs of 10 to 40
+  # minutes on a draft take hosted runners from the merge queue.
   # One job per runner, each with a literal runs-on (tests/ci_cache.rs).
   # Never export CARGO_BUILD_JOBS here: carrick-xtask's fixtures tests refuse
   # an ambient value.
   linux-unit-arm:
     needs: changes
-    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -2170,7 +2172,7 @@ jobs:
 
   linux-unit-x86:
     needs: changes
-    if: needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     strategy:
       fail-fast: false
       matrix:
