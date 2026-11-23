@@ -58,7 +58,7 @@ impl ZeroedPages {
             )
         };
         assert!(
-            mapped != libc::MAP_FAILED,
+            mapped != libc::MAP_FAILED && !mapped.is_null(),
             "anonymous mapping of {len} bytes failed: {}",
             std::io::Error::last_os_error()
         );
@@ -70,7 +70,8 @@ impl ZeroedPages {
             libc::madvise(mapped, len, libc::MADV_NOHUGEPAGE);
         }
         Self {
-            ptr: NonNull::new(mapped.cast()).unwrap(),
+            // SAFETY: the assertion above rejects a null mapping.
+            ptr: unsafe { NonNull::new_unchecked(mapped.cast()) },
             len,
         }
     }
@@ -166,7 +167,8 @@ impl<T> Drop for ZeroedBox<T> {
 fn page_size() -> usize {
     // SAFETY: sysconf reads a constant of this process.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(size).unwrap()
+    assert!(size > 0, "sysconf(_SC_PAGESIZE) failed");
+    size.unsigned_abs() as usize
 }
 
 #[cfg(test)]

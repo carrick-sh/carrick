@@ -21,6 +21,8 @@ NON_GUEST_CRATES = {
     "crates/carrick-test-support",
     "crates/carrick-observability",
     "crates/carrick-xtask",
+    # Host anonymous mappings for host-test fixtures; never in a guest image.
+    "crates/carrick-zeroed-pages",
 }
 
 _VIS_PREFIX = r"(?:pub(?:\s*\(\s*(?:crate|super|self|in\s+[A-Za-z0-9_:]+)\s*\))?\s+)?"
