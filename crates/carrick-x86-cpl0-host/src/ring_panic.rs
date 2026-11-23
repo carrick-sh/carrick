@@ -24,7 +24,7 @@ const SUPERVISOR_HALF: u64 = 0xffff_8000_0000_0000;
 /// The walk stops at the first record it cannot trust: an unaligned or
 /// non-supervisor frame, an unreadable word, a return address outside the
 /// supervisor half, or a caller frame that is not strictly above its callee
-/// within [`RING_FRAME_STEP_MAX`]. It therefore ends on any stack, and
+/// within `RING_FRAME_STEP_MAX` (1 MiB). It therefore ends on any stack, and
 /// reports at most [`RING_BACKTRACE_FRAMES`] addresses.
 pub fn walk_ring_frames(mut frame: u64, mut read: impl FnMut(u64) -> Option<u64>) -> Vec<u64> {
     let mut returns = Vec::new();
