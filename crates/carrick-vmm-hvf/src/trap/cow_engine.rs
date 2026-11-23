@@ -956,10 +956,8 @@ impl HvfVmState {
         };
         reg.activate()
     }
-}
 
-impl Stage2State {
-    const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
+    pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
 
     pub(crate) fn fault_window_bytes() -> u64 {
         static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -971,9 +969,7 @@ impl Stage2State {
                 .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
         })
     }
-}
 
-impl HvfVmState {
     /// Materialize private zero backing for the exact accessible pieces of the
     /// sparse HVPatch mmap arena. One VMA hole becomes one host mapping, one
     /// stage-2 lease, and one inventory frame; there is no shared source frame
@@ -1098,7 +1094,7 @@ impl HvfVmState {
                         .map(|r| (r.start.raw(), r.end.raw()))
                 });
             if let Some((p_start, p_end)) = pristine {
-                let w = Stage2State::fault_window_bytes();
+                let w = Self::fault_window_bytes();
                 if w < COMPOUND {
                     // Hatch CARRICK_FAULT_WINDOW_BYTES=4096: single-page fallback.
                     let has_local = self
