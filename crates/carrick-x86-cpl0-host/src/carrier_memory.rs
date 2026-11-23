@@ -117,6 +117,32 @@ enum ExtentStorage {
         owner: Arc<dyn carrick_el1_abi::IpcWindowBacking>,
         part: IpcWindowPart,
     },
+    /// One chunk of a host file's page cache (#1338 shared file window):
+    /// guest stores through the slot are the file's bytes, so there is no
+    /// copy and nothing to write back.
+    HostFile(HostFileMapping),
+}
+
+/// A retained host `mmap(MAP_SHARED)` of one file range, unmapped when the
+/// extent that owns it drops. The mapping keeps the file's pages alive on
+/// its own; the descriptor it was made from may close.
+struct HostFileMapping {
+    host: core::ptr::NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is a plain shared host range with no thread affinity;
+// all access goes through the carrier's own custody checks.
+unsafe impl Send for HostFileMapping {}
+// SAFETY: as above; the carrier never hands out a `&mut` to the bytes.
+unsafe impl Sync for HostFileMapping {}
+
+impl Drop for HostFileMapping {
+    fn drop(&mut self) {
+        // SAFETY: `host`/`len` name exactly the live mapping this value owns,
+        // made once by `BackingExtent::host_file_window` and never shared.
+        unsafe { libc::munmap(self.host.as_ptr().cast(), self.len) };
+    }
 }
 
 /// Which allocation of the original IPC authority this extent retains.
@@ -183,6 +209,58 @@ impl BackingExtent {
         })
     }
 
+    /// Retain one range of a host file as a live shared extent (#1338): a
+    /// host `mmap(MAP_SHARED)` of `len` bytes at `file_offset`, so the slot
+    /// projects the file's page cache. Only offsets the window record admits
+    /// below the file's size may ever be published from it: a host access
+    /// past EOF is a host `SIGBUS`, never a guest one.
+    pub fn host_file_window(
+        base: FrameGpa,
+        file: std::os::fd::BorrowedFd<'_>,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<Self, MemoryError> {
+        use std::os::fd::AsRawFd;
+        if len == 0
+            || !(len as u64).is_multiple_of(PAGE)
+            || !file_offset.is_multiple_of(PAGE)
+            || base.raw() & !ADDRESS != 0
+            || base
+                .raw()
+                .checked_add(len as u64)
+                .is_none_or(|end| end > 1 << 52)
+        {
+            return Err(error("invalid host-file window extent"));
+        }
+        let offset = libc::off_t::try_from(file_offset)
+            .map_err(|_| error("host-file window offset exceeds off_t"))?;
+        // SAFETY: a fresh shared mapping of a caller-borrowed descriptor,
+        // checked against MAP_FAILED before it is retained.
+        let host = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                offset,
+            )
+        };
+        if host == libc::MAP_FAILED {
+            return Err(error(format!(
+                "host-file window mmap failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let host = core::ptr::NonNull::new(host.cast::<u8>())
+            .ok_or_else(|| error("host-file window mmap returned null"))?;
+        Ok(Self {
+            storage: ExtentStorage::HostFile(HostFileMapping { host, len }),
+            base,
+            len,
+        })
+    }
+
     pub fn initialize(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if offset
             .checked_add(bytes.len())
@@ -191,7 +269,9 @@ impl BackingExtent {
             return Err(error("extent initialization bounds"));
         }
         let ExtentStorage::Ram(ram) = &mut self.storage else {
-            return Err(error("IPC authority cannot be initialized as private RAM"));
+            return Err(error(
+                "a retained IPC or host-file authority cannot be initialized as private RAM",
+            ));
         };
         Arc::get_mut(ram)
             .ok_or_else(|| error("extent already shared"))?
@@ -228,6 +308,11 @@ impl BackingExtent {
                 // SAFETY: the retained authority owns this complete allocation;
                 // the extent bounds were checked above.
                 Some(unsafe { ptr.add((pa - self.base.raw()) as usize) })
+            }
+            // SAFETY: the owned mapping covers exactly `self.len` bytes from
+            // `self.base`; the extent bounds were checked above.
+            ExtentStorage::HostFile(mapping) => {
+                Some(unsafe { mapping.host.as_ptr().add((pa - self.base.raw()) as usize) })
             }
         }
     }
