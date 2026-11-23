@@ -1149,6 +1149,42 @@ mod tests {
         }
     }
 
+    /// A large request must find a free block that fits whenever one sits in
+    /// a larger size class, even when a smaller large block was freed last.
+    /// The x86 ring's exec build hit this: node's 2 MiB `Vec` growth failed
+    /// in a 9 MiB heap with 6.5 MiB free (#1715).
+    #[test]
+    fn large_request_reaches_a_fitting_block_behind_a_smaller_large_one() {
+        const MIB: usize = 1024 * 1024;
+        let mut backing = vec![0u8; 4 * MIB];
+        let base = (backing.as_mut_ptr() as usize + 15) & !15;
+        let len = (backing.len() - 16) & !15;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(base as u64, len, ExtentKind::Bootstrap)
+            .expect("admit");
+        let small = alloc.allocate(MIB, 16).expect("1 MiB block");
+        let guard_a = alloc.allocate(64, 16).expect("guard");
+        let large = alloc.allocate(5 * MIB / 2, 16).expect("2.5 MiB block");
+        let guard_b = alloc.allocate(64, 16).expect("guard");
+        // Leave the tail smaller than the request, so only the 2.5 MiB hole fits.
+        let tail = len - (MIB + 5 * MIB / 2 + 2 * 64 + 4 * HEADER_SIZE) - 2 * MIB / 8;
+        let tail_block = alloc.allocate(tail, 16).expect("tail");
+        // Free the 2.5 MiB block first and the 1 MiB block last.
+        alloc.deallocate(large, 16);
+        alloc.deallocate(small, 16);
+
+        let (grown, metrics) = alloc.allocate_with_metrics(2 * MIB, 8);
+        assert_eq!(grown, Some(large), "the 2.5 MiB hole fits a 2 MiB request");
+        assert!(metrics.bins_checked <= 2, "bins_checked bound");
+        assert!(metrics.blocks_inspected <= 2, "blocks_inspected bound");
+
+        for ptr in [grown.unwrap(), guard_a, guard_b, tail_block] {
+            alloc.deallocate(ptr, 16);
+        }
+        assert_eq!(alloc.diagnostics().allocated_bytes, 0);
+    }
+
     #[test]
     fn oversized_layout_fails_without_panic_or_state_change() {
         let mut alloc = MetadataAllocatorCore::new();
