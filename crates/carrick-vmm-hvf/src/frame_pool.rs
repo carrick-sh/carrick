@@ -60,6 +60,10 @@ pub(crate) struct PreMappedFramePool {
     /// reach one through a stale translation, so it is neither scrubbed nor
     /// reused until every invalidation owed at its release has completed.
     quarantined: Mutex<Vec<(u32, u64)>>,
+    /// The owed invalidations this pool's releases wait for: the carrier's
+    /// ledger, or a test fixture's own, so a test's owed invalidation never
+    /// quarantines another test's frames (#2884).
+    invalidations: &'static carrick_aarch64::resume_invalidation::InvalidationLedger,
     allocated_count: AtomicUsize,
 }
 
@@ -123,6 +127,7 @@ impl PreMappedFramePool {
             lease: Mutex::new(Some(lease)),
             free_compounds: Mutex::new(free_compounds),
             quarantined: Mutex::new(Vec::new()),
+            invalidations: carrick_aarch64::resume_invalidation::InvalidationLedger::global(),
             allocated_count: AtomicUsize::new(0),
         })
     }
@@ -148,8 +153,19 @@ impl PreMappedFramePool {
             lease: Mutex::new(None),
             free_compounds: Mutex::new(free_compounds),
             quarantined: Mutex::new(Vec::new()),
+            invalidations: Box::leak(Box::new(
+                carrick_aarch64::resume_invalidation::InvalidationLedger::new(),
+            )),
             allocated_count: AtomicUsize::new(0),
         }
+    }
+
+    /// The ledger this pool's releases wait for.
+    #[cfg(test)]
+    pub(crate) fn invalidations(
+        &self,
+    ) -> &'static carrick_aarch64::resume_invalidation::InvalidationLedger {
+        self.invalidations
     }
 
     /// Allocate a 16 KiB compound from the pool, if available.
@@ -173,7 +189,7 @@ impl PreMappedFramePool {
     /// Return a compound to the pool upon final reference drop.
     /// Re-zeros the compound buffer before releasing it back to the free list.
     fn recycle(&self, compound_index: u32, host_ptr: *mut u8, len: usize) {
-        if let Some(tag) = carrick_aarch64::resume_invalidation::release_tag() {
+        if let Some(tag) = self.invalidations.release_tag() {
             self.quarantined.lock().push((compound_index, tag));
             return;
         }
@@ -199,7 +215,7 @@ impl PreMappedFramePool {
             }
             let mut released = Vec::new();
             quarantined.retain(|&(index, tag)| {
-                let done = carrick_aarch64::resume_invalidation::completed_through(tag);
+                let done = self.invalidations.completed_through(tag);
                 if done {
                     released.push(index);
                 }
@@ -713,12 +729,11 @@ mod tests {
     /// would land after the scrub) until the invalidation completed.
     #[test]
     fn frame_pool_quarantines_compounds_released_under_an_owed_invalidation() {
-        use carrick_aarch64::resume_invalidation::ResumeInvalidation;
         let pool = Arc::new(PreMappedFramePool::new_test_fixture(2));
         let c0 = pool.allocate_compound().expect("c0");
         let c1 = pool.allocate_compound().expect("c1");
         let released_ipa = c0.ipa();
-        let owed = ResumeInvalidation::owe(0x7e57, 0x7e);
+        let owed = pool.invalidations().owe(0x7e57, 0x7e);
         drop(c0);
         // Only c0 was free and it is quarantined.
         assert!(pool.allocate_compound().is_none());
