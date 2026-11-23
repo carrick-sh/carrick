@@ -7,6 +7,12 @@ use carrick_el1_abi::KernelFaultVenues;
 
 /// Physical crossings and ISA byte access for the shared native-write protocol.
 struct NativeWriteVenue<'a> {
+    /// Only a preparation may select a page for the fault service: its
+    /// caller begins that service with the selection. A copy that selected
+    /// one would leave it published with no service to take it, and the
+    /// CPU's next selection (the caller's own preparation, or a later COW
+    /// fault) would find the slot taken.
+    allow_backing: bool,
     task: &'a CurrentTask,
     address: UserVa,
     slot: SlotId,
@@ -106,6 +112,9 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Option<Result<(), Self::Error>> {
+        if !self.allow_backing {
+            return None;
+        }
         Some((|| {
             let slot = self
                 .slots
@@ -193,6 +202,7 @@ impl Service {
         let prepared =
             unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words) };
         let mut venue = NativeWriteVenue {
+            allow_backing: bytes.is_none(),
             task: self.task,
             address,
             slot: self.slot,
