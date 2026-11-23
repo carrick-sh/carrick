@@ -2,6 +2,11 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract
+# #2826: the carrier-exit terminal global-frame cleanup now drains the exec
+# owner's unadopted rows first, so the exit arm that finds the VM already
+# gone cannot skip the drain. Witness bound under kernel.vcpu.vm-lifetime:
+# carrick-vmm-hvf::trap::carrier_custody::carrier_vm_custody_tests::carrier_exit_after_vm_destroy_drains_a_sealed_exec_preparation
+# This contract's expectations, bindings and budgets are unchanged.
 schema_version = 1
 id = "kernel.mm.native-code-content"
 title = "Carrier byte writes revoke physical instruction dependencies"

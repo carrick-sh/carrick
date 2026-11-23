@@ -61,6 +61,11 @@
 # owner-admitted MM failed on its own pause gate. The terminal owner now
 # reads through capture's exclusion and parks a Busy capture on another
 # holder's release before rerunning it; see the binding below.
+# #2826: the carrier-exit terminal global-frame cleanup now drains the exec
+# owner's unadopted rows first, so the exit arm that finds the VM already
+# gone cannot skip the drain. Witness bound under kernel.vcpu.vm-lifetime:
+# carrick-vmm-hvf::trap::carrier_custody::carrier_vm_custody_tests::carrier_exit_after_vm_destroy_drains_a_sealed_exec_preparation
+# This contract's expectations, bindings and budgets are unchanged.
 schema_version = 1
 id = "process.native.terminal-child"
 title = "Terminal child retirement and parent handback retain exact execution custody"
