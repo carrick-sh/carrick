@@ -50,6 +50,12 @@ mod serial_host {
         fn drop(&mut self) {
             recall_all_delegated();
             clear_el1_region_host_ptr();
+            // The next test's files reuse these inode numbers (#2852).
+            let dropped = owned_recall::wait_for_recall_jobs_dropped();
+            assert!(
+                dropped || std::thread::panicking(),
+                "a recall job outlived its test's region"
+            );
         }
     }
 
@@ -773,16 +779,21 @@ mod serial_host {
         // Point the process-global aperture pointer at a different region before
         // releasing `pa`, proving `ZoneFileService::release` marks the pending
         // handoff in its own `ZoneFileTables` region rather than the global pointer.
-        record_el1_region_host_ptr(other_region.as_ptr() as usize);
-        assert_eq!(ready(svc.release(pa)), Ok(()));
-        assert_eq!(venue.terminal.get(), 1);
-        assert_eq!(venue.last.get(), Some(a.key()));
-        assert!(
-            !unsafe { carrick_el1_abi::pending_at(other_region.as_ptr() as usize) }
-                .is_marked(a.handle())
-        );
-        assert!(unsafe { carrick_el1_abi::pending_at(service_region_ptr) }.is_marked(a.handle()));
-        record_el1_region_host_ptr(service_region_ptr);
+        // `close_host` armed the host drain; the redirect holds it off (#2852).
+        {
+            let _redirect = owned_recall::ApertureRedirect::to(other_region.as_ptr() as usize);
+            assert_eq!(ready(svc.release(pa)), Ok(()));
+            assert_eq!(venue.terminal.get(), 1);
+            assert_eq!(venue.last.get(), Some(a.key()));
+            assert!(
+                !unsafe { carrick_el1_abi::pending_at(other_region.as_ptr() as usize) }
+                    .is_marked(a.handle())
+            );
+            assert!(
+                unsafe { carrick_el1_abi::pending_at(service_region_ptr) }.is_marked(a.handle())
+            );
+        }
+        assert_eq!(get_el1_region_host_ptr(), service_region_ptr);
         owned_recall::test_drain_external_at(service_region_ptr);
         assert!(!unsafe { carrick_el1_abi::pending_at(service_region_ptr) }.is_marked(a.handle()));
         assert!(owned_recall::wait_for_open_retirement(a.handle()));
