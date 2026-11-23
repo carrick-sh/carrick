@@ -107,6 +107,7 @@ impl carrick_hal::FrameCowAuthority for LiveForkReceiptAuthority {
 
 #[test]
 fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(42).unwrap());
@@ -117,7 +118,7 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
     let ipa = 0xa0_0000_0000;
     let length = 0x4000;
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     task.stage2.cow_authority = Some(Arc::new(LiveForkReceiptAuthority {
         calls: Arc::clone(&calls),
         mapping,
@@ -177,8 +178,9 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
 
 #[test]
 fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let mut events = Vec::new();
 
     task.stage2
@@ -191,6 +193,7 @@ fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
 
 #[test]
 fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(52).unwrap());
@@ -247,6 +250,7 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
     let registration = HvpatchTaskRegistration {
+        custody: std::sync::Arc::clone(&custody),
         directory: Arc::clone(&directory),
         key: HvpatchCarrierTaskStateKey {
             directory_instance: directory.instance,
@@ -318,6 +322,7 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
 
 #[test]
 fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let mapping =
         carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(62).unwrap());
@@ -341,7 +346,7 @@ fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
         mm: 29,
         asid: 27,
     };
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     task.stage2
         .pending_fork_frame_receipts
         .push(PendingForkFrameReceipt {
@@ -536,15 +541,18 @@ fn prepared_abort_rolls_back_inventory_before_dropping_carrier_leases() {
 /// fails at "prepared HVPatch task has no carrier custody" before reaching
 /// the behaviour under test. Take the carrier custody from the same live
 /// fixture the rest of this module's carrier state comes from.
-fn prepared_task() -> HvpatchPreparedTaskAuthority {
+fn prepared_task(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+) -> HvpatchPreparedTaskAuthority {
     HvpatchPreparedTaskAuthority {
-        custody: Some(Arc::clone(legacy_test_carrier_vm_custody_arc())),
+        custody: Some(Arc::clone(&custody)),
         ..HvpatchPreparedTaskAuthority::default()
     }
 }
 
 #[test]
 fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -555,7 +563,7 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
             test_state(&rollbacks),
             HvpatchPreparedTaskAuthority {
                 mm_root_slot: slot,
-                ..prepared_task()
+                ..prepared_task(&custody)
             },
         )
         .unwrap();
@@ -579,7 +587,7 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
                 commit: None,
                 challenge: None,
             },
-            ..prepared_task()
+            ..prepared_task(&custody)
         },
     );
     let successor = successor
@@ -606,7 +614,7 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
             test_state(&rollbacks),
             HvpatchPreparedTaskAuthority {
                 mm_root_slot: slot,
-                ..prepared_task()
+                ..prepared_task(&custody)
             },
         )
         .unwrap();
@@ -634,7 +642,7 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
             test_state(&rollbacks),
             HvpatchPreparedTaskAuthority {
                 mm_root_slot: slot,
-                ..prepared_task()
+                ..prepared_task(&custody)
             },
         )
         .unwrap();
@@ -657,6 +665,7 @@ fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
 
 #[test]
 fn retired_process_mm_indexes_do_not_grow_with_historical_forks() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -670,7 +679,7 @@ fn retired_process_mm_indexes_do_not_grow_with_historical_forks() {
                     test_state(&rollbacks),
                     HvpatchPreparedTaskAuthority {
                         mm_root_slot: Some((0x1100_0000, 0x20_0000)),
-                        ..prepared_task()
+                        ..prepared_task(&custody)
                     },
                 )
                 .unwrap();
@@ -699,15 +708,16 @@ fn owner_key(
 
 #[test]
 fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let first = directory
-        .publish(identity(1), test_state(&rollbacks), prepared_task())
+        .publish(identity(1), test_state(&rollbacks), prepared_task(&custody))
         .unwrap();
     assert!(
         directory
-            .publish(identity(1), test_state(&rollbacks), prepared_task(),)
+            .publish(identity(1), test_state(&rollbacks), prepared_task(&custody),)
             .is_err()
     );
     assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
@@ -715,7 +725,7 @@ fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
     drop(first);
     assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
     let successor = directory
-        .publish(identity(2), test_state(&rollbacks), prepared_task())
+        .publish(identity(2), test_state(&rollbacks), prepared_task(&custody))
         .unwrap();
     assert_ne!(first_key, successor.registration.as_ref().unwrap().key);
     drop(successor);
@@ -724,6 +734,7 @@ fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
 
 #[test]
 fn injected_alias_and_directory_failures_rollback_before_visibility() {
+    let custody = crate::trap::test_carrier_custody();
     let _test_lock = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
     for failpoint in [1, 2] {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -738,7 +749,7 @@ fn injected_alias_and_directory_failures_rollback_before_visibility() {
                     test_state(&rollbacks),
                     HvpatchPreparedTaskAuthority {
                         pending_aliases: vec![replacement],
-                        ..prepared_task()
+                        ..prepared_task(&custody)
                     },
                     failpoint
                 )
@@ -2711,6 +2722,7 @@ fn exec_predecessor_authority_retires_without_aborting_active_drop() {
 
 #[test]
 fn exclusive_rebind_retires_predecessor_authority() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -2732,7 +2744,7 @@ fn exclusive_rebind_retires_predecessor_authority() {
                     receipt,
                     retirement: None,
                 },
-                ..prepared_task()
+                ..prepared_task(&custody)
             },
         )
         .unwrap();
@@ -2772,7 +2784,7 @@ fn exclusive_rebind_retires_predecessor_authority() {
             replacement,
             (0x1200_0000, 0x20_0000),
             Vec::new(),
-            legacy_test_carrier_vm_custody_arc(),
+            &custody,
             false,
         )
         .unwrap();
@@ -2795,6 +2807,7 @@ fn exclusive_rebind_retires_predecessor_authority() {
 /// (`holder=registration-cleanup`).
 #[test]
 fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -2828,7 +2841,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
                 receipt,
                 retirement: None,
             },
-            ..prepared_task()
+            ..prepared_task(&custody)
         },
     );
     owner
@@ -2845,7 +2858,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
             inventory: HvpatchTaskInventoryAuthority::SiblingShared {
                 ledger: Arc::clone(&ledger),
             },
-            ..prepared_task()
+            ..prepared_task(&custody)
         },
     );
     exec_thread
@@ -2863,7 +2876,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
             inventory: HvpatchTaskInventoryAuthority::SharedProcess {
                 ledger: Arc::clone(&ledger),
             },
-            ..prepared_task()
+            ..prepared_task(&custody)
         },
     );
     vfork_child
@@ -2918,7 +2931,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
             replacement,
             (0x1400_0000, 0x20_0000),
             Vec::new(),
-            legacy_test_carrier_vm_custody_arc(),
+            &custody,
             true,
         )
         .unwrap();
@@ -2953,6 +2966,7 @@ fn owner_exec_hands_active_inventory_to_live_clone_vm_sharer() {
 /// numeric slot.
 #[test]
 fn shared_process_authority_preserves_the_exact_mm_access_arc() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let cow_armed = Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
@@ -2973,7 +2987,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
             cow_armed: Some(cow_armed),
             cow_deferred_publications: Some(cow_deferred_publications),
             inherited_mm_access: Some(Arc::clone(&inherited)),
-            ..prepared_task()
+            ..prepared_task(&custody)
         },
         AliasPublicationReceipt::default(),
     );
@@ -2989,6 +3003,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
 
 #[test]
 fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -3010,7 +3025,7 @@ fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
                     inventory: HvpatchTaskInventoryAuthority::SharedProcess {
                         ledger: Arc::clone(&ledger),
                     },
-                    ..prepared_task()
+                    ..prepared_task(&custody)
                 },
             )
             .unwrap()
@@ -3064,7 +3079,7 @@ fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
             replacement,
             (0x1000_0000, 0x20_0000),
             Vec::new(),
-            legacy_test_carrier_vm_custody_arc(),
+            &custody,
             true,
         )
         .unwrap();
@@ -3080,6 +3095,7 @@ fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
 
 #[test]
 fn shared_mm_retires_carrier_before_final_task_authority() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -3101,7 +3117,7 @@ fn shared_mm_retires_carrier_before_final_task_authority() {
                         .into_iter()
                         .collect(),
                     drop_order: Some(Arc::clone(&order)),
-                    ..prepared_task()
+                    ..prepared_task(&custody)
                 },
             )
             .unwrap()
@@ -3191,13 +3207,14 @@ fn serial_host_process_descriptor_lease_retires_while_host_backing_is_live() {
 
 #[test]
 fn exhausted_nonce_aborts_prepared_authority_before_visibility() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     directory.next.store(u64::MAX, Ordering::SeqCst);
     let rollbacks = Arc::new(AtomicUsize::new(0));
     assert!(
         directory
-            .publish(identity(9), test_state(&rollbacks), prepared_task(),)
+            .publish(identity(9), test_state(&rollbacks), prepared_task(&custody),)
             .is_err()
     );
     assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
@@ -3206,12 +3223,17 @@ fn exhausted_nonce_aborts_prepared_authority_before_visibility() {
 
 #[test]
 fn carrier_token_is_rejected_by_a_different_directory_instance() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let first = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let second = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let binding = first
-        .publish(identity(11), test_state(&rollbacks), prepared_task())
+        .publish(
+            identity(11),
+            test_state(&rollbacks),
+            prepared_task(&custody),
+        )
         .unwrap();
     let key = binding.registration.as_ref().unwrap().key;
     assert!(second.retire(key).is_err());
@@ -3222,18 +3244,23 @@ fn carrier_token_is_rejected_by_a_different_directory_instance() {
 
 #[test]
 fn duplicate_core_key_rejects_different_linux_metadata() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let rollbacks = Arc::new(AtomicUsize::new(0));
     let binding = directory
-        .publish(identity(12), test_state(&rollbacks), prepared_task())
+        .publish(
+            identity(12),
+            test_state(&rollbacks),
+            prepared_task(&custody),
+        )
         .unwrap();
     let mut mismatched = identity(12);
     mismatched.linux_tid += 1;
     mismatched.asid += 1;
     assert!(
         directory
-            .publish(mismatched, test_state(&rollbacks), prepared_task(),)
+            .publish(mismatched, test_state(&rollbacks), prepared_task(&custody),)
             .is_err()
     );
     assert_eq!(directory.inner.lock().states.len(), 1);
@@ -3248,25 +3275,26 @@ fn duplicate_core_key_rejects_different_linux_metadata() {
 /// activation, after the child had already been published.
 #[test]
 fn prepared_task_authority_rejects_half_a_cow_authority() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let armed = || Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
     let publications = || Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-    prepared_task()
+    prepared_task(&custody)
         .validate_cow_authority_pairing()
         .expect("neither half present is a complete, COW-less authority");
 
     HvpatchPreparedTaskAuthority {
         cow_armed: Some(armed()),
         cow_deferred_publications: Some(publications()),
-        ..prepared_task()
+        ..prepared_task(&custody)
     }
     .validate_cow_authority_pairing()
     .expect("both halves present is a complete COW authority");
 
     let error = HvpatchPreparedTaskAuthority {
         cow_armed: Some(armed()),
-        ..prepared_task()
+        ..prepared_task(&custody)
     }
     .validate_cow_authority_pairing()
     .expect_err("arming without a publication slot must fail closed");
@@ -3279,7 +3307,7 @@ fn prepared_task_authority_rejects_half_a_cow_authority() {
 
     let error = HvpatchPreparedTaskAuthority {
         cow_deferred_publications: Some(publications()),
-        ..prepared_task()
+        ..prepared_task(&custody)
     }
     .validate_cow_authority_pairing()
     .expect_err("a publication slot without arming must fail closed");
@@ -3293,6 +3321,7 @@ fn prepared_task_authority_rejects_half_a_cow_authority() {
 
 #[test]
 fn committed_child_requires_fresh_exact_kernel_cow_binding() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let (issuer, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
     let directory = Arc::new(HvpatchCarrierTaskStateDirectory::new(
@@ -3308,7 +3337,7 @@ fn committed_child_requires_fresh_exact_kernel_cow_binding() {
                 inventory: HvpatchTaskInventoryAuthority::SiblingShared {
                     ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                 },
-                ..prepared_task()
+                ..prepared_task(&custody)
             },
         )
         .unwrap();

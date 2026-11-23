@@ -1903,7 +1903,7 @@ mod carrier_vm_custody_tests {
     #[allow(clippy::expect_used)]
     fn executable_publication_invalidates_a_frame_once_per_incarnation() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x51_0000;
         let len = 0x8000_u64;
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1911,8 +1911,9 @@ mod carrier_vm_custody_tests {
             crate::host_mapping::HostMappingKind::FrameCow,
         )
         .expect("test frame backing");
-        let generation = super::super::global_frame::next_global_frame_owner_generation();
+        let generation = super::super::global_frame::next_global_frame_owner_generation(&custody);
         let owner = std::sync::Arc::new(super::super::global_frame::GlobalFrameHostOwner::new(
+            &custody,
             super::super::global_frame::GlobalFrameStage2Lease::fixed(ipa, len),
             mapping,
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
@@ -2020,17 +2021,77 @@ mod carrier_vm_custody_tests {
         assert!(second.global_frame_host_owners.lock().is_empty());
     }
 
+    /// Two live threads, each with its own test task, publish an owner at the
+    /// same global-frame key through the task's held custody. Each task's
+    /// custody holds exactly its own owner, so tests that run in parallel no
+    /// longer share one record table (#1236, M2c of the custody move).
+    #[test]
+    fn two_threads_publish_through_distinct_task_custodies() {
+        let key = (0xa082_0000_0000, 0x4000);
+        let both_published = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let both_published = std::sync::Arc::clone(&both_published);
+                std::thread::spawn(move || {
+                    let task = crate::trap::hvpatch_neutral_task_state_for_test(
+                        &crate::trap::test_carrier_custody(),
+                    );
+                    let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                        key.1 as usize,
+                        crate::host_mapping::HostMappingKind::PerMmKernelState,
+                    )
+                    .expect("allocate task-local owner backing");
+                    let host_addr = mapping.as_ptr() as usize;
+                    let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+                    lease.mark_test_mapped_without_backend();
+                    super::register_global_frame_host_owner_in(
+                        &task.stage2.custody_arc(),
+                        lease,
+                        mapping,
+                        carrick_aarch64::stage2::stage2_perms_bits(
+                            carrick_hal::MemPerms::ReadWrite,
+                        ),
+                    )
+                    .expect("each task's custody admits its own owner at the shared key");
+                    // Both owners are live at the same key before either looks.
+                    both_published.wait();
+                    let identity = super::global_frame_host_owner_identity_in(
+                        task.stage2.custody(),
+                        key.0,
+                        key.1,
+                    )
+                    .expect("the task's custody holds its owner");
+                    assert_eq!(identity.0, host_addr, "the custody holds this task's owner");
+                    assert_eq!(
+                        task.stage2.custody().global_frame_host_owners.lock().len(),
+                        1
+                    );
+                    both_published.wait();
+                    (
+                        std::sync::Arc::as_ptr(&task.stage2.custody_arc()) as usize,
+                        host_addr,
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker thread"))
+            .collect();
+        assert_ne!(
+            results[0].0, results[1].0,
+            "each task holds its own custody"
+        );
+        assert_ne!(results[0].1, results[1].1, "each owner has its own backing");
+    }
+
     #[test]
     fn production_global_frame_owner_operations_require_carrier_custody_static_audit() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(include_str!("../trap.rs"), include_str!("global_frame.rs"));
-        let legacy_directory = concat!(
-            "#[cfg(all(test, target_os = \"macos\", target_arch = \"aarch64\"))]\n",
-            "fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory"
-        );
         assert!(
-            source.contains(legacy_directory),
-            "the legacy process-global-shaped owner directory must remain cfg(test)-only"
+            !source.contains(concat!("fn global_frame_host_owners", "()")),
+            "no process-global-shaped owner directory may stand in for a carrier's custody"
         );
 
         for operation in [

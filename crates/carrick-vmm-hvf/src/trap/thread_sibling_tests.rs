@@ -12,6 +12,7 @@ use super::*;
 
 #[test]
 fn shared_mm_task_projection_preserves_structural_owner() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let size = 0x4000usize;
     let ipa = 0x8800_3100_0000u64;
@@ -23,6 +24,7 @@ fn shared_mm_task_projection_preserves_structural_owner() {
     let host = mapping.as_ptr();
     let epoch = next_structural_epoch().expect("shared-MM projection epoch");
     let owner = StructuralBackingOwner::new(
+        &custody,
         mapping,
         GlobalFrameStage2Lease::fixed(ipa, size as u64),
         epoch,
@@ -62,15 +64,9 @@ fn shared_mm_task_projection_preserves_structural_owner() {
     drop(projected);
     drop(owner);
     retry_structural_backing_identities_in_using(
-        legacy_test_carrier_vm_custody(),
+        &custody,
         &[identity],
-        &mut |ipa, len| {
-            unmap_global_frame_stage2_record(
-                legacy_test_carrier_vm_custody().stage2_backend(),
-                ipa,
-                len,
-            )
-        },
+        &mut |ipa, len| unmap_global_frame_stage2_record(custody.stage2_backend(), ipa, len),
         &mut release_retired_stage2_ipa,
     )
     .expect("retire shared-MM projection fixture");
@@ -141,6 +137,7 @@ fn global_frame_futex_resolves_raw_backing_ipa_not_semantic_va() {
 
 #[test]
 fn shared_futex_route_skips_private_row_at_recycled_ipa() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
     let mut shared = mapped_region(0x100_0080_0000, 0x100_0080_4000, backing_ipa);
@@ -154,8 +151,9 @@ fn shared_futex_route_skips_private_row_at_recycled_ipa() {
     retired_private.host_addr = 0x1177_d0000usize as *mut u8;
     let mappings = TaskMappingIndex::from_iter([shared, retired_private]);
 
-    let location = Stage2State::shared_futex_mapping_for_ipa(&mappings, backing_ipa + 4, false)
-        .expect("the older exact shared owner must remain routable");
+    let location =
+        Stage2State::shared_futex_mapping_for_ipa_in(&custody, &mappings, backing_ipa + 4, false)
+            .expect("the older exact shared owner must remain routable");
 
     assert_eq!(location.wait_addr().raw(), 0x1046_78004);
     assert_eq!(location.waiter_key(), 0x1046_78004);
@@ -568,6 +566,7 @@ fn mailbox_route_rejects_unrelated_retired_row_at_recycled_ipa() {
 
 #[test]
 fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let carrier_region = |start: u64, size: u64, host: usize| {
         let mut region = mapped_region(start, start + size, start);
@@ -623,7 +622,7 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
         "task image and stage-1 root stay task-owned"
     );
 
-    let neutral = HvfTaskState::neutral();
+    let neutral = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     neutral
         .audit_neutral()
         .expect("idle worker stays task-neutral");

@@ -611,13 +611,6 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
     Ok(region)
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn prepare_exec_region_raw(
-    mapping: &GuestMapping,
-) -> Result<HvfMappedRegion, TrapError> {
-    prepare_exec_region_raw_in(legacy_test_carrier_vm_custody(), mapping)
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn exec_stage2_install(
     mapping: &GuestMapping,
@@ -1247,6 +1240,7 @@ mod tests {
 
     #[test]
     fn el1_aperture_pointer_retires_with_its_host_mapping() {
+        let custody = crate::trap::test_carrier_custody();
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mapping = GuestMapping {
             guest_start: carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
@@ -1263,7 +1257,7 @@ mod tests {
             image: std::sync::Arc::new(Vec::new()),
             private_file_backing: None,
         };
-        let region = prepare_exec_region_raw(&mapping).expect("EL1 host mapping");
+        let region = prepare_exec_region_raw_in(&custody, &mapping).expect("EL1 host mapping");
         let stale = region.host_addr as usize;
         assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), stale);
         drop(region);
@@ -1301,6 +1295,7 @@ mod tests {
 
     #[test]
     fn el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable() {
+        let custody = crate::trap::test_carrier_custody();
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mapping = GuestMapping {
             guest_start: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
@@ -1318,7 +1313,8 @@ mod tests {
             private_file_backing: None,
         };
 
-        let region = prepare_exec_region_raw(&mapping).expect("prepare stage-1 table region");
+        let region =
+            prepare_exec_region_raw_in(&custody, &mapping).expect("prepare stage-1 table region");
         assert_eq!(
             region.perms,
             carrick_hal::MemPerms::ReadWriteExec,
@@ -1378,6 +1374,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn stage2_map_refuses_the_gic_window() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use carrick_mem::memory::{
         LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
@@ -1394,7 +1391,7 @@ fn stage2_map_refuses_the_gic_window() {
         // SAFETY: the test stub records the call; nothing reaches HVF.
         let rc = unsafe {
             inventory_stage2_map(
-                legacy_test_carrier_vm_custody().stage2_backend(),
+                custody.stage2_backend(),
                 page.as_mut_ptr().cast(),
                 ipa,
                 0x4000,
@@ -1410,7 +1407,7 @@ fn stage2_map_refuses_the_gic_window() {
     // SAFETY: as above.
     let rc = unsafe {
         inventory_stage2_map(
-            legacy_test_carrier_vm_custody().stage2_backend(),
+            custody.stage2_backend(),
             page.as_mut_ptr().cast(),
             LINUX_GIC_WINDOW_BASE - 0x4000,
             0x4000,

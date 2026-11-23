@@ -49,11 +49,16 @@ impl Drop for MmapBuffer {
     }
 }
 
-pub(super) fn test_vm_state(task: HvfTaskState) -> HvfVmState {
+pub(super) fn test_vm_state(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    task: HvfTaskState,
+) -> HvfVmState {
     HvfVmState {
         _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
         task,
-        carrier_foreign_mm_transport: std::sync::Arc::new(CarrierForeignMmTransport::new()),
+        carrier_foreign_mm_transport: std::sync::Arc::new(CarrierForeignMmTransport::with_custody(
+            std::sync::Arc::clone(&custody),
+        )),
         carrier_mappings: None,
         mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
@@ -74,15 +79,16 @@ fn isolated_alias_registry() -> crate::trap::foreign_mm::tests::ExternalAliasSta
 
 #[test]
 fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let total_size = LARGE_PAGES * PAGE_SIZE;
     let mmap = MmapBuffer::new(total_size);
     let mut region = mapped_region(HEAP_START, HEAP_START + total_size as u64, HEAP_START);
     region.host_addr = mmap.ptr;
     task.stage2.mappings.insert(region);
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
     for pages in [1, 16, LARGE_PAGES] {
         unsafe {
             core::ptr::write_bytes(mmap.ptr, 0xaa, total_size);
@@ -106,17 +112,21 @@ fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
 
 #[test]
 fn zero_guest_backing_two_mappings_task_rows_are_bounded_per_page() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // macOS host VM pages are 16 KiB; a one-Linux-page guard would also
     // protect the beginning of the second extent.
     for gap_pages in [0, 4] {
-        zero_guest_backing_two_mappings_with_host_gap(gap_pages);
+        zero_guest_backing_two_mappings_with_host_gap(&custody, gap_pages);
     }
 }
 
-fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
+fn zero_guest_backing_two_mappings_with_host_gap(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    gap_pages: usize,
+) {
     let _registry = isolated_alias_registry();
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let extent1_pages = 128;
     let extent2_pages = 128;
     let total_pages = extent1_pages + extent2_pages;
@@ -156,7 +166,7 @@ fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
         if gap_pages == 0 { 1 } else { 2 }
     );
 
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
 
     unsafe {
         core::ptr::write_bytes(host1, 0x11, extent1_len);
@@ -196,16 +206,17 @@ fn zero_guest_backing_two_mappings_with_host_gap(gap_pages: usize) {
 
 #[test]
 fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let total_size = 4 * PAGE_SIZE;
     let mmap = MmapBuffer::new(total_size);
     let mut region = mapped_region(HEAP_START, HEAP_START + total_size as u64, HEAP_START);
     region.host_addr = mmap.ptr;
     task.stage2.mappings.insert(region);
 
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
 
     unsafe {
         core::ptr::write_bytes(mmap.ptr, 0x5a, total_size);
@@ -244,9 +255,10 @@ fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
 
 #[test]
 fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _registry = isolated_alias_registry();
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let extent1_len = 2 * PAGE_SIZE;
     let hole_len = 2 * PAGE_SIZE;
     let extent2_len = 2 * PAGE_SIZE;
@@ -267,7 +279,7 @@ fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
     region2.host_addr = mmap2.ptr;
     task.stage2.mappings.insert(region2);
 
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
 
     unsafe {
         core::ptr::write_bytes(mmap1.ptr, 0x77, extent1_len);

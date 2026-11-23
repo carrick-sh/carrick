@@ -15,14 +15,18 @@ fn tables() -> carrick_mmu_core::aarch64::PageTableManager {
     )
 }
 
-fn translation_after_hole(reusable: bool, retained: bool) {
+fn translation_after_hole(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    reusable: bool,
+    retained: bool,
+) {
     let backing = MmapBuffer::new(LEN);
     let translated = MmapBuffer::new(LEN);
     unsafe {
         std::ptr::write_bytes(backing.ptr, 0xa5, LEN);
         std::ptr::write_bytes(translated.ptr, 0xb6, LEN);
     }
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     let ipa = if reusable {
         carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7840_0000
     } else {
@@ -54,7 +58,7 @@ fn translation_after_hole(reusable: bool, retained: bool) {
         pt.set_prot_none(VA + PAGE as u64, PAGE, None).unwrap();
     }
     task.page_tables_authority().set_manager(pt);
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
     vm.zero_guest_backing(VA, 2 * PAGE).unwrap();
     assert_eq!(
         unsafe { *translated.ptr },
@@ -71,26 +75,31 @@ fn translation_after_hole(reusable: bool, retained: bool) {
 
 #[test]
 fn fallback_stops_before_live_translation() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    translation_after_hole(false, false);
+    translation_after_hole(&custody, false, false);
 }
 #[test]
 fn fallback_stops_before_retained_translation() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    translation_after_hole(false, true);
+    translation_after_hole(&custody, false, true);
 }
 #[test]
 fn reusable_skip_stops_before_live_translation() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    translation_after_hole(true, false);
+    translation_after_hole(&custody, true, false);
 }
 #[test]
 fn reusable_skip_stops_before_retained_translation() {
-    translation_after_hole(true, true);
+    let custody = crate::trap::test_carrier_custody();
+    translation_after_hole(&custody, true, true);
 }
 
 #[test]
 fn retained_interior_pages_republish_lifetime_edges() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _restore = crate::trap::foreign_mm::tests::ExternalAliasStateRestore::capture();
     let backing = MmapBuffer::new(LEN);
@@ -99,7 +108,7 @@ fn retained_interior_pages_republish_lifetime_edges() {
         carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
         2 * 1024 * 1024,
     );
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     task.stage2.mm_root_slot = Some(root);
     let mut row = mapped_region(VA, VA + LEN as u64, ipa);
     row.host_addr = backing.ptr;
@@ -145,7 +154,7 @@ fn retained_interior_pages_republish_lifetime_edges() {
     .unwrap();
     pt.set_prot_none(VA, LEN, None).unwrap();
     task.page_tables_authority().set_manager(pt);
-    let mut vm = test_vm_state(task);
+    let mut vm = test_vm_state(&custody, task);
     let initial_registry = alias_registry().lock().clone();
     unsafe {
         std::ptr::write_bytes(backing.ptr, 0xa5, LEN);
@@ -374,6 +383,7 @@ impl HvfVmState {
 
 #[test]
 fn enumerated_layouts_match_pre_batch_page_reference() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // Four states per page: hole, first backing, second backing, retained
     // second backing. Enumerate all four-page layouts, including alternating
@@ -381,7 +391,7 @@ fn enumerated_layouts_match_pre_batch_page_reference() {
     let first = MmapBuffer::new(LEN);
     let second = MmapBuffer::new(LEN);
     for layout in 0..256u32 {
-        let mut task = HvfTaskState::neutral();
+        let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
         let mut a = mapped_region(VA, VA + LEN as u64, 0x2000_0000);
         a.host_addr = first.ptr;
         task.stage2.mappings.insert(a);
@@ -422,7 +432,7 @@ fn enumerated_layouts_match_pre_batch_page_reference() {
                     kernel_only: false,
                 }]);
         }
-        let mut vm = test_vm_state(task);
+        let mut vm = test_vm_state(&custody, task);
         for (head, tail) in [(0, 0), (0x123, 0x321), (PAGE - 1, PAGE - 3)] {
             let reset = || unsafe {
                 std::ptr::write_bytes(first.ptr, 0xa5, LEN);

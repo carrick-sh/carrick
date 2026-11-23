@@ -981,27 +981,12 @@ impl Drop for AliasRegistryWriteGuard<'_> {
 type GlobalFrameHostOwnerDirectory =
     parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameOwnerEntry>>;
 
+/// A fresh live carrier VM custody owned by one test fixture. Each test holds
+/// its own, exactly as each carrier does, so parallel tests never share a
+/// stage-2 record table or global-frame owner directory (#1236, M2c).
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory {
-    &legacy_test_carrier_vm_custody().global_frame_host_owners
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn legacy_test_carrier_vm_custody() -> &'static CarrierVmCustody {
-    legacy_test_carrier_vm_custody_arc().as_ref()
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn legacy_test_carrier_vm_custody_arc() -> &'static std::sync::Arc<CarrierVmCustody> {
-    static CELL: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn carrier_stage2_leases()
--> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>
-{
-    &legacy_test_carrier_vm_custody_arc().carrier_stage2_records
+pub(crate) fn test_carrier_custody() -> std::sync::Arc<CarrierVmCustody> {
+    std::sync::Arc::new(CarrierVmCustody::new_live_fixture())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1803,7 +1788,6 @@ impl HvfTaskState {
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let task = Self {
             stage2: Stage2State {
-                #[cfg(not(test))]
                 custody: std::sync::Arc::new(CarrierVmCustody::new()),
                 mappings: TaskMappingIndex::new(),
                 mm_root_slot: None,
@@ -1908,6 +1892,7 @@ impl HvfTaskState {
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvpatch_task_state_test_fixture(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     mm_slot: u64,
     mapping_start: u64,
     linux_tid: i32,
@@ -1924,6 +1909,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     HvfTaskState {
         stage2: Stage2State {
+            custody: std::sync::Arc::clone(&custody),
             mappings: TaskMappingIndex::from_region(HvfMappedRegion {
                 start: mapping_start,
                 end: mapping_start + 0x1000,
@@ -2033,8 +2019,12 @@ pub(crate) fn hvpatch_task_state_test_identity(
 
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn hvpatch_neutral_task_state_for_test() -> HvfTaskState {
-    HvfTaskState::neutral()
+pub(crate) fn hvpatch_neutral_task_state_for_test(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+) -> HvfTaskState {
+    let mut state = HvfTaskState::neutral();
+    state.stage2.custody = std::sync::Arc::clone(custody);
+    state
 }
 
 #[cfg(test)]
@@ -3052,15 +3042,7 @@ impl HvpatchTaskOnlyBackendState {
             .registration
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?;
-        #[cfg(not(test))]
-        {
-            Ok(std::sync::Arc::clone(&registration.custody))
-        }
-        #[cfg(test)]
-        {
-            let _ = registration;
-            Ok(std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()))
-        }
+        Ok(std::sync::Arc::clone(&registration.custody))
     }
 
     pub(crate) fn take_registration(&mut self) -> Option<HvpatchTaskRegistration> {
@@ -3236,6 +3218,7 @@ enum HvpatchCarrierMmAuthority {
     #[cfg(test)]
     LeaseTest {
         stage2_lease_keys: Vec<(u64, u64)>,
+        custody: std::sync::Arc<CarrierVmCustody>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     },
 }
@@ -3328,9 +3311,9 @@ impl Drop for HvpatchCarrierMmAuthority {
             #[cfg(test)]
             Self::LeaseTest {
                 stage2_lease_keys,
+                custody,
                 frames,
             } => {
-                let custody = legacy_test_carrier_vm_custody_arc();
                 let identities = stage2_lease_keys
                     .drain(..)
                     .filter_map(|key| custody.carrier_stage2_records.lock().get(&key).copied())
@@ -5469,7 +5452,6 @@ pub(crate) struct HvpatchTaskRegistration {
     cow_identity: Option<carrick_hal::FrameCowIdentity>,
     cow_authority_identity: Option<std::num::NonZeroU64>,
     child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
-    #[cfg(not(test))]
     custody: std::sync::Arc<CarrierVmCustody>,
 }
 
@@ -5550,14 +5532,7 @@ impl HvpatchTaskRegistration {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch task lacks COW publication state".to_owned())
             })?;
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&self.custody);
-        #[cfg(test)]
-        let custody = task_mm
-            .foreign_mm_transport
-            .as_ref()
-            .map(|t| std::sync::Arc::clone(&t.custody))
-            .unwrap_or_else(|| std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()));
         let mm_access = {
             let mut slot = task_mm.mm_access.lock();
             std::sync::Arc::clone(slot.get_or_insert_with(|| {
@@ -5610,7 +5585,6 @@ impl HvpatchTaskRegistration {
         custody.register_guest_cow_state(cow_identity.mm, &mm_access);
         Ok(HvfTaskState {
             stage2: Stage2State {
-                #[cfg(not(test))]
                 custody: std::sync::Arc::clone(&self.custody),
                 mappings: task_mm
                     .mappings
@@ -6063,7 +6037,6 @@ impl HvpatchCarrierTaskStateDirectory {
         task: HvpatchPreparedTaskAuthority,
         failpoint: u8,
     ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
-        #[cfg(not(test))]
         let custody = match task.custody.as_ref() {
             Some(custody) => std::sync::Arc::clone(custody),
             None => {
@@ -6332,6 +6305,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 };
                 (
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::LeaseTest {
+                        custody: std::sync::Arc::clone(&carrier_custody),
                         stage2_lease_keys: stage2_record_identities
                             .iter()
                             .filter_map(|identity| {
@@ -6430,7 +6404,6 @@ impl HvpatchCarrierTaskStateDirectory {
                 cow_identity: None,
                 cow_authority_identity: None,
                 child_token_verifier: std::sync::Arc::clone(&self.child_token_verifier),
-                #[cfg(not(test))]
                 custody,
             }),
         })
@@ -7405,14 +7378,12 @@ impl HvfVmState {
                 )?;
             }
         }
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&plan.carrier_foreign_mm_transport.custody);
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             carrier_foreign_mm_transport: std::sync::Arc::clone(&plan.carrier_foreign_mm_transport),
             task: HvfTaskState {
                 stage2: Stage2State {
-                    #[cfg(not(test))]
                     custody,
                     mappings: mapped,
                     mm_root_slot: Some(plan.mm_root_slot),

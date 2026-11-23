@@ -297,11 +297,12 @@ impl ForkOverlayOwnerIndex {
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn inherited_fork_inventory_extents(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     mapping: &ThreadMappingDesc,
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
     inherited_fork_inventory_extents_indexed(
-        legacy_test_carrier_vm_custody(),
+        &custody,
         mapping,
         &index_fork_inventory_by_stage2(inventory),
     )

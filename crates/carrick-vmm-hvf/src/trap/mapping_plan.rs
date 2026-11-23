@@ -528,7 +528,6 @@ impl HvfVmState {
         let vm = SetupVmGuard::new(vm, carrier.is_none());
         drop(boot_gate);
 
-        #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let root_custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let root_host_cow_stats = carrier_foreign_mm_transport
@@ -540,7 +539,6 @@ impl HvfVmState {
             carrier_foreign_mm_transport,
             task: HvfTaskState {
                 stage2: Stage2State {
-                    #[cfg(not(test))]
                     custody,
                     mappings: TaskMappingIndex::new(),
                     mm_root_slot: None,

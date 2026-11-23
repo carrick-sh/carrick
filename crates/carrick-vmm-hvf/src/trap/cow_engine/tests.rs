@@ -601,7 +601,7 @@ fn guest_cow_caller_requires_driving_vcpu_before_touching_backing() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     use super::*;
     let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
-    let mut task = HvfTaskState::neutral();
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     task.page_tables_authority()
         .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
     let mut flushed = false;
@@ -1073,6 +1073,7 @@ fn host_cow_is_split_by_mm_concentration_and_by_lane() {
 /// to page 7 vanished.
 #[test]
 fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
+    let custody = crate::trap::test_carrier_custody();
     use super::*;
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     const PAGE: u64 = 0x1000;
@@ -1110,7 +1111,7 @@ fn frame_cow_repoints_only_pages_that_name_the_faulting_frame() {
             None,
         )
         .expect("map the replacement");
-    let task = HvfTaskState::neutral();
+    let task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
     task.page_tables_authority().set_manager(tables);
     // The arm the unmap left behind still covers the replaced pages.
     task.cow_armed

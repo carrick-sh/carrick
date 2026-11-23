@@ -3834,26 +3834,6 @@ pub(crate) fn retained_private_reuse_alias_fragment_in(
     })
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retained_private_reuse_alias_fragment(
-    registry: &AliasRegistry,
-    va: u64,
-    ipa: u64,
-    len: usize,
-    mm_root_slot: Option<(u64, u64)>,
-    container_root: ContainerRootToken,
-) -> Option<AliasBacking> {
-    retained_private_reuse_alias_fragment_in(
-        legacy_test_carrier_vm_custody(),
-        registry,
-        va,
-        ipa,
-        len,
-        mm_root_slot,
-        container_root,
-    )
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retired_alias_disarm_spans(
     registry: &[AliasBacking],

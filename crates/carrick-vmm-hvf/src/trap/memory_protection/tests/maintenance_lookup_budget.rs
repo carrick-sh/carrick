@@ -252,6 +252,7 @@ fn containing_va_candidates_ignore_fork_siblings_at_the_same_va() {
 
 #[test]
 fn retained_reuse_fragment_is_bounded_by_the_physical_extent() {
+    let custody = crate::trap::test_carrier_custody();
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     // The scrubbed VA was carved out of the compound by a partial munmap:
     // no live row covers it, but its invalid leaf still names the compound's
@@ -290,7 +291,8 @@ fn retained_reuse_fragment_is_bounded_by_the_physical_extent() {
             ));
         }
         let before = alias_state_rows_scanned();
-        let fragment = retained_private_reuse_alias_fragment(
+        let fragment = retained_private_reuse_alias_fragment_in(
+            &custody,
             &registry,
             reused_va,
             reused_ipa,
