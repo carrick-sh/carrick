@@ -808,7 +808,6 @@ mismatch codes.
 | `x86_poll_timeout` | `exit 99` | `""` | `forward 0xfffffffffffffeff=1` | `doorbell 0xd3` |
 | `x86_ppoll_timeout` | `exit 99` | `"B\n"` | `forward 0x1=2` | `doorbell 0xd3` |
 | `x86_sched_inring` | `exit 7` | `"S\n"` | `doorbell 0xd9` | `doorbell 0xd3` |
-| `x86_sched_refusal` | `exit 7` | `"R\n"` | `forward 0x1=2` | `doorbell 0xd3` |
 | `x86_signal_abort` | `exit 7` | `"A\n"` | `doorbell 0xd9` | `doorbell 0xd3` |
 | `x86_signal_altstack` | `exit 7` | `"S\n"` | `forward 0x1=2` | `doorbell 0xd3` |
 | `x86_signal_bad_fault_handler` | `terminated by signal 11` | `""` | `doorbell 0xd3` | `doorbell 0xd3` |

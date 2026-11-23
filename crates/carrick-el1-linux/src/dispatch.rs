@@ -3766,7 +3766,7 @@ impl<
     }
     fn sched_venue(&mut self) -> Option<&mut dyn carrick_personality_linux::sched::SchedVenue> {
         if matches!(self.frame.canonical_ordinal().raw(), 122 | 123)
-            && (self.process.is_none() || self.zone.as_ref()?.tables.carrier_cpu_count().is_none())
+            && (self.process.is_none() || self.carrier_topology().is_none())
         {
             return None;
         }
@@ -5440,6 +5440,18 @@ impl<
     Context: DispatchContext,
 > El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
+    /// The carrier's installed CPU count, from the scheduler zone this call
+    /// runs in: the entry's zone venue on ARM, the native source's zone on
+    /// x86 (which binds no zone venue yet, #1089). `None` until the carrier
+    /// publishes its topology.
+    fn carrier_topology(&self) -> Option<usize> {
+        match (&self.zone, &self.source) {
+            (Some(zone), _) => zone.tables.carrier_cpu_count(),
+            (None, Some(source)) => source.zone.carrier_cpu_count(),
+            (None, None) => None,
+        }
+    }
+
     fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
         use carrick_core_abi::service::ServiceOrigin;
         if self
@@ -6874,10 +6886,7 @@ impl<
         )
     }
     fn guest_cpu_count(&self) -> usize {
-        self.zone
-            .as_ref()
-            .and_then(|z| z.tables.carrier_cpu_count())
-            .unwrap_or(0)
+        self.carrier_topology().unwrap_or(0)
     }
     fn current_tid(&self) -> Option<u32> {
         let task = self.current_tasks.get(self.frame.task_index())?;
@@ -6885,9 +6894,11 @@ impl<
         control.visible_tid()
     }
     fn current_cpu(&self) -> Option<u32> {
-        let slot = self.frame.slot()?;
-        let zone = self.zone.as_ref()?;
-        zone.tables.slot(slot).bound_cpu()
+        match (&self.zone, &self.source) {
+            (Some(zone), _) => zone.tables.slot(self.frame.slot()?).bound_cpu(),
+            (None, Some(source)) => source.zone.slot(source.slot).bound_cpu(),
+            (None, None) => None,
+        }
     }
     fn get_affinity(
         &self,

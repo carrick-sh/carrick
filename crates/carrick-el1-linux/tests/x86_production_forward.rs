@@ -627,7 +627,8 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         };
         result.raw() as u32
     };
-    // The unported x86 affinity venue has no published carrier topology.
+    // This fixture's carrier has published no topology (production x86
+    // publishes it at boot, #1092).
     // Fork inherits the parent's unpublished control mask, not the fixture's
     // numeric scheduler mask (3). A live alias must not turn that zero into
     // an empty allowed-CPU set and strand the child.

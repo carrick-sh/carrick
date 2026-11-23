@@ -780,12 +780,6 @@ fn serve_family<'a, C: EntryContext + 'a>(
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
     // Native ARM signal calls share the process owner used by x86.
     match ordinal {
-        nr if nr == carrick_syscall_abi::nr::SCHED_SETAFFINITY.raw() => {
-            Family::Sched(SchedCall::SetAffinity)
-        }
-        nr if nr == carrick_syscall_abi::nr::SCHED_GETAFFINITY.raw() => {
-            Family::Sched(SchedCall::GetAffinity)
-        }
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
@@ -825,6 +819,12 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == crate::crossing::nr::CLOCK_GETTIME.raw() => Family::ClockGettime,
         nr if nr == crate::crossing::nr::GETTIMEOFDAY.raw() => Family::RealtimeAlias,
         nr if nr == crate::crossing::nr::TIMES.raw() => Family::Times,
+        nr if nr == carrick_syscall_abi::nr::SCHED_SETAFFINITY.raw() => {
+            Family::Sched(SchedCall::SetAffinity)
+        }
+        nr if nr == carrick_syscall_abi::nr::SCHED_GETAFFINITY.raw() => {
+            Family::Sched(SchedCall::GetAffinity)
+        }
         124 => Family::Sched(SchedCall::Yield),
         93 => Family::Lifecycle(LifecycleCall::Exit),
         129 => Family::Signal(crate::signal::SignalCall::Kill),
@@ -1516,7 +1516,7 @@ pub const fn stream_socket_ordinal(ordinal: CanonicalNr) -> bool {
 }
 
 /// Retirement ceiling, checked against the PR base by authority-debt.
-pub const ISA_WIRING_GAP_CEILING: usize = 10;
+pub const ISA_WIRING_GAP_CEILING: usize = 8;
 
 /// Today's ISA wiring, explicit even when the shared owner owes a ring family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2114,23 +2114,19 @@ mod ring_first_tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn affinity_routes_are_arm_only_even_after_x86_canonicalization() {
-        for (native, canonical) in [(203, 122), (204, 123)] {
+    fn affinity_routes_are_shared_by_both_isas() {
+        for (native, canonical, call) in [
+            (203, 122, SchedCall::SetAffinity),
+            (204, 123, SchedCall::GetAffinity),
+        ] {
             let translated = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
                 carrick_syscall_abi::NativeNr(native),
             )
             .unwrap();
             assert_eq!(translated.raw(), canonical);
-            assert_eq!(route_x86(canonical, u64::MAX), Family::Unported);
+            assert_eq!(route_x86(canonical, u64::MAX), Family::Sched(call));
+            assert_eq!(route_aarch64(canonical, u64::MAX), Family::Sched(call));
         }
-        assert_eq!(
-            route_aarch64(122, u64::MAX),
-            Family::Sched(SchedCall::SetAffinity)
-        );
-        assert_eq!(
-            route_aarch64(123, u64::MAX),
-            Family::Sched(SchedCall::GetAffinity)
-        );
     }
 
     #[test]
