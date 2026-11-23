@@ -421,7 +421,9 @@ pub trait ProcessSignals {
 
     /// Whether this owner serves `nanosleep`/`clock_nanosleep` in ring. An
     /// owner with a host continuation (the run root) keeps that continuation,
-    /// which also honours an embedder-controlled clock domain.
+    /// which also honours an embedder-controlled clock domain, wherever its
+    /// crossing set carries the sleep ([`crate::sleep::SleepCall::host_continuation`]);
+    /// elsewhere the ring serves it.
     fn sleeps_in_ring(&self) -> bool {
         false
     }

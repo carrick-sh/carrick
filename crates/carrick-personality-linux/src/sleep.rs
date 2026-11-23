@@ -34,6 +34,24 @@ pub enum SleepCall {
     ClockNanosleep,
 }
 
+impl SleepCall {
+    pub const fn canonical(self) -> carrick_syscall_abi::CanonicalNr {
+        match self {
+            Self::Nanosleep => crate::crossing::nr::NANOSLEEP,
+            Self::ClockNanosleep => crate::crossing::nr::CLOCK_NANOSLEEP,
+        }
+    }
+
+    /// Whether an owner with a host sleep continuation (the run root) keeps
+    /// it for this call on this crossing set. The continuation exists only
+    /// where the set carries the call: the x86 set does not, so an x86 run
+    /// root sleeps in ring like every other process. Leaving it to the
+    /// crossing would answer a counted ENOSYS.
+    pub const fn host_continuation(self, crossing: crate::crossing::HostCrossingSet) -> bool {
+        crossing.is_allowed(self.canonical())
+    }
+}
+
 /// The time base an absolute deadline is expressed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SleepClock {
@@ -142,13 +160,15 @@ pub struct SleepRequest {
     pub remaining: Option<UserVa>,
 }
 
-/// Serve one routed sleep for a caller of `isa`. `None` leaves the call to
-/// its host continuation or counted crossing refusal, always before any user
-/// access: a caller whose owner does not sleep in ring, a clock the ring
-/// cannot measure, or an absolute deadline without a guest-visible epoch.
+/// Serve one routed sleep for a caller of `isa` under `crossing`. `None`
+/// leaves the call to its host continuation or counted crossing refusal,
+/// always before any user access: a caller whose owner keeps a host
+/// continuation `crossing` carries, a clock the ring cannot measure, or an
+/// absolute deadline without a guest-visible epoch.
 pub fn invoke(
     call: SleepCall,
     isa: GuestIsa,
+    crossing: crate::crossing::HostCrossingSet,
     native: &mut dyn SignalNative<'_>,
 ) -> Option<SignalOutcome> {
     let returned = |value: i64| {
@@ -163,7 +183,7 @@ pub fn invoke(
         SleepCall::Nanosleep => (LINUX_CLOCK_MONOTONIC, 0, args[0], args[1]),
         SleepCall::ClockNanosleep => (args[0], args[1], args[2], args[3]),
     };
-    if !native.process_signals()?.sleeps_in_ring() {
+    if !native.process_signals()?.sleeps_in_ring() && call.host_continuation(crossing) {
         return None;
     }
     // Linux reads only TIMER_ABSTIME; every other flag bit is ignored
@@ -216,6 +236,17 @@ pub fn invoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run root's host sleep continuation is ARM's only: the x86
+    /// crossing set does not carry either sleep (#2832 record B).
+    #[test]
+    fn only_the_arm_root_keeps_a_host_sleep_continuation() {
+        use crate::crossing::HostCrossingSet::{Aarch64, X86};
+        for call in [SleepCall::Nanosleep, SleepCall::ClockNanosleep] {
+            assert!(call.host_continuation(Aarch64), "{call:?}");
+            assert!(!call.host_continuation(X86), "{call:?}");
+        }
+    }
 
     /// Each row is a native Linux 6.12 `clock_nanosleep` errno number for a
     /// clock given before an unreadable request.
