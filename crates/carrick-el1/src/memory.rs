@@ -1737,7 +1737,7 @@ fn serve_delegated_anonymous_attempt<
                 reservations::Refusal::Busy if pending_edit => {
                     DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
                 }
-                reservations::Refusal::Busy => forward(Leave::RootUnavailableBusy),
+                reservations::Refusal::Busy => forward(Leave::MetadataBankBusy),
                 reservations::Refusal::MetadataRequired => {
                     forward(Leave::RootUnavailableMetadataRequired)
                 }

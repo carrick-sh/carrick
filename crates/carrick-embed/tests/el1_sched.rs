@@ -594,34 +594,13 @@ fn host_work_breakdown(measured: &Measured) -> String {
 /// Each named reason EL1 left a delegated-MM anonymous call for the host,
 /// nonzero ones only: the cause list a red `el1_` anonymous witness reports.
 fn anonymous_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
-    use carrick_el1_abi::AnonymousLeave as L;
-    [
-        ("pending_host_work", L::PendingHostWork),
-        ("root_busy", L::RootBusy),
-        ("root_unavailable", L::RootUnavailable),
-        ("root_unavailable_busy", L::RootUnavailableBusy),
-        ("root_unavailable_stale", L::RootUnavailableStale),
-        (
-            "root_unavailable_metadata_required",
-            L::RootUnavailableMetadataRequired,
-        ),
-        ("root_declined", L::RootDeclined),
-        ("no_grant", L::NoGrant),
-        ("editor_busy", L::EditorBusy),
-        ("backing_host_owned_leaf", L::BackingHostOwnedLeaf),
-        ("backing_block", L::BackingBlock),
-        ("backing_multi_run", L::BackingMultiRun),
-        ("backing_malformed", L::BackingMalformed),
-        ("backing_retired", L::BackingRetired),
-        ("edit_refused", L::EditRefused),
-        ("journal_full", L::JournalFull),
-    ]
-    .into_iter()
-    .filter_map(|(name, reason)| {
-        let count = measured.anonymous_leaves[reason as usize];
-        (count != 0).then_some((name, count))
-    })
-    .collect()
+    carrick_el1_abi::AnonymousLeave::ALL
+        .into_iter()
+        .filter_map(|reason| {
+            let count = measured.anonymous_leaves[reason as usize];
+            (count != 0).then_some((reason.name(), count))
+        })
+        .collect()
 }
 
 fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
