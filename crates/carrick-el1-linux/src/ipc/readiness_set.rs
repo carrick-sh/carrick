@@ -100,7 +100,7 @@ pub fn transient_epoll<W: LockWait>(
     op: &IpcOperation,
     wait: W,
 ) -> Option<IpcObjectHandle> {
-    if op.kind != IpcOpKind::SelectWait {
+    if !matches!(op.kind, IpcOpKind::SelectWait | IpcOpKind::PollWait) {
         return None;
     }
     let pin = OfdPin::from_raw(op.pin);
@@ -203,12 +203,14 @@ pub fn recorded_answer(
 
 /// What a fresh set call accepted at entry.
 pub(super) struct SetCall {
+    pub kind: IpcOpKind,
     pub layout: IpcSelectOutput,
-    /// Read, write and except bitmaps, `layout.words` each.
+    /// Read, write and except bitmaps, `layout.words` each (empty when no
+    /// descriptor is named).
     pub sets: Vec<u64>,
     pub timeout: IpcUserVa,
     pub deadline: IpcCounterDeadline,
-    /// A pselect6 mask not yet armed (a slot-wait replay armed it already).
+    /// A pselect6/ppoll mask not yet armed (a slot-wait replay armed it already).
     pub sigmask: Option<u64>,
     pub arg0: u64,
 }
@@ -240,7 +242,7 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
             Err(Build::Unrouted) => return IpcServed::Forward,
         };
         let op = IpcOperation {
-            kind: IpcOpKind::SelectWait,
+            kind: call.kind,
             pin: pin.into_raw(),
             object: epoll.to_raw(),
             task: task_key(sched.task()),
@@ -351,6 +353,9 @@ fn enrol<E: IpcExecution>(
     call: &SetCall,
     epoll: IpcObjectHandle,
 ) -> Result<(), Build> {
+    if call.sets.is_empty() {
+        return Ok(());
+    }
     let authority = region.fd(EL1_WAIT);
     let words = call.layout.words as usize;
     for index in 0..words {
@@ -444,6 +449,9 @@ fn wait<E: IpcExecution, M: UserCopy>(
         let deadline = op.deadline;
         if !ready.is_empty() || deadline.get().is_some_and(|end| sched.now() >= end) {
             retire(sched, token, &op);
+            if op.kind == IpcOpKind::PollWait {
+                return Some(poll_result(frame, 0));
+            }
             let result = ready
                 .iter()
                 .map(|entry| i64::from(entry.ready.count_ones()))

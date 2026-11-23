@@ -736,7 +736,7 @@ const SELECT_INTERESTS: [i16; 3] = [
 
 /// The descriptors a select call names, decoded once at entry.
 enum SelectInterest {
-    /// No set names a descriptor: the shared body sleeps without a pin.
+    /// No set names a descriptor: served as an empty readiness set.
     None,
     /// Exactly one descriptor: the single-description owner.
     One(crate::file_table::PollFd),
@@ -903,7 +903,7 @@ pub fn select_copies<'a>(
         .sets
         .into_iter()
         .zip(SELECT_INTERESTS)
-        .filter(move |(address, _)| result >= 0 && address.0 != 0)
+        .filter(move |(address, _)| result >= 0 && output.words > 0 && address.0 != 0)
         .map(move |(address, interest)| WaitCopy {
             address,
             len: output.words as usize * 8,
@@ -1007,6 +1007,27 @@ fn read_select_sigmask(
     Ok(Some(u64::from_ne_bytes(set)))
 }
 
+/// Read ppoll's `{sigmask, sigsetsize}` arguments.
+fn read_ppoll_sigmask(
+    mask_va: u64,
+    size: u64,
+    user: &mut impl UserCopy,
+) -> Result<Option<u64>, carrick_syscall_abi::LinuxErrno> {
+    use carrick_syscall_abi::{LINUX_EFAULT, LINUX_EINVAL};
+
+    if mask_va == 0 {
+        return Ok(None);
+    }
+    if size != SELECT_SIGSET_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    let mut set = [0u8; SELECT_SIGSET_BYTES as usize];
+    if !user.copy_in(&mut set, mask_va) {
+        return Err(LINUX_EFAULT);
+    }
+    Ok(Some(u64::from_ne_bytes(set)))
+}
+
 fn select_input_error(
     frame: &mut impl GuestDispatchFrame,
     user: &impl UserCopy,
@@ -1075,20 +1096,21 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             ..IpcSelectOutput::EMPTY
         });
     let timeout_kind = frame.poll_timeout_kind();
-    let (timeout_arg, is_timeval) = if let Some(layout) = &select {
+    let (timeout_arg, is_timeval, poll_nfds) = if let Some(layout) = &select {
         if (arg0 as i32) < 0 {
             return poll_result(frame, LINUX_EINVAL.guest_retval());
         }
-        (argument_word(frame, 4), layout.timeval)
+        (argument_word(frame, 4), layout.timeval, 0)
     } else {
+        let nfds = argument_word(frame, 1);
         let mask_arg = match timeout_kind {
             PollTimeoutKind::Timespec => argument_word(frame, 3),
             PollTimeoutKind::Milliseconds => 0,
         };
-        if !frame.may_serve_poll() || argument_word(frame, 1) != 1 || mask_arg != 0 {
+        if !frame.may_serve_poll() || (nfds != 0 && (nfds != 1 || mask_arg != 0)) {
             return IpcServed::Forward;
         }
-        (argument_word(frame, 2), false)
+        (argument_word(frame, 2), false, nfds)
     };
     let syscall_nr = frame.native_number().raw() as u32;
     let kind = if select.is_some() {
@@ -1153,7 +1175,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 }
                 return poll_result(frame, result);
             }
-            if select.is_some() && readiness_set::names_set(region, &op) {
+            if readiness_set::names_set(region, &op) {
                 return readiness_set::resume(
                     sched,
                     frame,
@@ -1204,6 +1226,27 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 return poll_result(frame, result);
             }
             if select.is_none() {
+                if poll_nfds == 0 {
+                    let call = readiness_set::SetCall {
+                        kind,
+                        layout: IpcSelectOutput::EMPTY,
+                        sets: alloc::vec::Vec::new(),
+                        timeout: IpcUserVa(0),
+                        deadline,
+                        sigmask: None,
+                        arg0,
+                    };
+                    return readiness_set::serve(
+                        sched,
+                        frame,
+                        venue,
+                        user,
+                        output,
+                        keep_sigmask,
+                        table,
+                        call,
+                    );
+                }
                 let bytes = unsafe {
                     core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
                 };
@@ -1214,30 +1257,39 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 let Ok(capacity) = authority.backing_capacity(table) else {
                     return IpcServed::Forward;
                 };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(SelectInterest::One(decoded)) => pollfd = decoded,
-                    Ok(SelectInterest::None) => return IpcServed::Forward,
-                    Ok(SelectInterest::Many(sets)) => {
-                        let call = readiness_set::SetCall {
-                            layout: *layout,
-                            sets,
-                            timeout: IpcUserVa(timeout_arg),
-                            deadline,
-                            sigmask: None,
-                            arg0,
-                        };
-                        return readiness_set::serve(
-                            sched,
-                            frame,
-                            venue,
-                            user,
-                            output,
-                            keep_sigmask,
-                            table,
-                            call,
-                        );
+                let sets = match read_select_interest(
+                    layout,
+                    (arg0 as i32 as usize).min(capacity),
+                    user,
+                ) {
+                    Ok(SelectInterest::One(decoded)) => {
+                        pollfd = decoded;
+                        None
                     }
+                    Ok(SelectInterest::None) => Some(alloc::vec::Vec::new()),
+                    Ok(SelectInterest::Many(sets)) => Some(sets),
                     Err(errno) => return select_input_error(frame, user, errno),
+                };
+                if let Some(sets) = sets {
+                    let call = readiness_set::SetCall {
+                        kind,
+                        layout: *layout,
+                        sets,
+                        timeout: IpcUserVa(timeout_arg),
+                        deadline,
+                        sigmask: None,
+                        arg0,
+                    };
+                    return readiness_set::serve(
+                        sched,
+                        frame,
+                        venue,
+                        user,
+                        output,
+                        keep_sigmask,
+                        table,
+                        call,
+                    );
                 }
             }
             (pollfd, deadline, None)
@@ -1245,13 +1297,18 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
             };
-            if select.is_none() && !user.copy_in(bytes, arg0) {
+            if select.is_none() && poll_nfds != 0 && !user.copy_in(bytes, arg0) {
                 return IpcServed::Forward;
             }
-            if let Some(layout) = &select
-                && !layout.timeval
-            {
-                match read_select_sigmask(argument_word(frame, 5), user) {
+            if let Some(layout) = &select {
+                if !layout.timeval {
+                    match read_select_sigmask(argument_word(frame, 5), user) {
+                        Ok(mask) => sigmask = mask,
+                        Err(errno) => return select_input_error(frame, user, errno),
+                    }
+                }
+            } else if poll_nfds == 0 && matches!(timeout_kind, PollTimeoutKind::Timespec) {
+                match read_ppoll_sigmask(argument_word(frame, 3), argument_word(frame, 4), user) {
                     Ok(mask) => sigmask = mask,
                     Err(errno) => return select_input_error(frame, user, errno),
                 }
@@ -1281,7 +1338,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     } else {
                         let mut timeout = [0u8; 16];
                         if !user.copy_in(&mut timeout, timeout_arg) {
-                            return if select.is_some() {
+                            return if select.is_some() || poll_nfds == 0 {
                                 select_input_error(frame, user, LINUX_EFAULT)
                             } else {
                                 IpcServed::Forward
@@ -1317,31 +1374,60 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 let Ok(capacity) = authority.backing_capacity(table) else {
                     return IpcServed::Forward;
                 };
-                match read_select_interest(layout, (arg0 as i32 as usize).min(capacity), user) {
-                    Ok(SelectInterest::One(decoded)) => pollfd = decoded,
-                    Ok(SelectInterest::None) => return IpcServed::Forward,
-                    Ok(SelectInterest::Many(sets)) => {
-                        let call = readiness_set::SetCall {
-                            layout: *layout,
-                            sets,
-                            timeout: IpcUserVa(timeout_arg),
-                            deadline,
-                            sigmask: sigmask.take(),
-                            arg0,
-                        };
-                        return readiness_set::serve(
-                            sched,
-                            frame,
-                            venue,
-                            user,
-                            output,
-                            keep_sigmask,
-                            table,
-                            call,
-                        );
+                let sets = match read_select_interest(
+                    layout,
+                    (arg0 as i32 as usize).min(capacity),
+                    user,
+                ) {
+                    Ok(SelectInterest::One(decoded)) => {
+                        pollfd = decoded;
+                        None
                     }
+                    Ok(SelectInterest::None) => Some(alloc::vec::Vec::new()),
+                    Ok(SelectInterest::Many(sets)) => Some(sets),
                     Err(errno) => return select_input_error(frame, user, errno),
+                };
+                if let Some(sets) = sets {
+                    let call = readiness_set::SetCall {
+                        kind,
+                        layout: *layout,
+                        sets,
+                        timeout: IpcUserVa(timeout_arg),
+                        deadline,
+                        sigmask: sigmask.take(),
+                        arg0,
+                    };
+                    return readiness_set::serve(
+                        sched,
+                        frame,
+                        venue,
+                        user,
+                        output,
+                        keep_sigmask,
+                        table,
+                        call,
+                    );
                 }
+            } else if poll_nfds == 0 {
+                let call = readiness_set::SetCall {
+                    kind,
+                    layout: IpcSelectOutput::EMPTY,
+                    sets: alloc::vec::Vec::new(),
+                    timeout: IpcUserVa(0),
+                    deadline,
+                    sigmask: sigmask.take(),
+                    arg0,
+                };
+                return readiness_set::serve(
+                    sched,
+                    frame,
+                    venue,
+                    user,
+                    output,
+                    keep_sigmask,
+                    table,
+                    call,
+                );
             }
             (pollfd, deadline, None)
         }
@@ -4678,6 +4764,306 @@ mod tests {
             );
             assert!(out.is_none());
         }
+    }
+
+    /// #2848: ARM empty-set `pselect6` and `nfds=0` `ppoll` park in ring on a
+    /// transient epoll with zero items, preserve sigmask and deadline semantics,
+    /// and complete with 0 on deadline or -EINTR on a pending signal.
+    #[test]
+    fn arm_empty_set_pselect6_and_ppoll_sleep_and_interrupt() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (r2, w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+
+        let sigusr1 = 1u64 << (10 - 1);
+        w.mem.write(MM, va + 0x40, &sigusr1.to_ne_bytes());
+        let mut pack = [0u8; 16];
+        pack[..8].copy_from_slice(&(va + 0x40).to_ne_bytes());
+        pack[8..].copy_from_slice(&8u64.to_ne_bytes());
+        w.mem.write(MM, va + 0x50, &pack);
+
+        let mut cpu = core::mem::take(&mut w.cpu);
+        cpu.now = 1_000;
+        cpu.freq = 1_000_000_000;
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
+
+        // 1. Zero-timeout pselect6(0, NULL, NULL, NULL, {0, 0}, NULL) returns 0 immediately.
+        w.mem.write(MM, va + 0x20, &[0u8; 16]);
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            ..Default::default()
+        };
+        frame.x[4] = va + 0x20;
+        frame.x[8] = 72; // pselect6
+        let mut out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                RETURNED
+            );
+        }
+        assert_eq!(frame.x[0], 0);
+        assert!(matches!(out, Some(PollOutput::Select { result: 0, .. })));
+
+        // 2. Finite-timeout pselect6(0, NULL, NULL, NULL, {0, 10ms}, &pack) parks,
+        //    arms sigmask, keeps waiting before deadline, and returns 0 after deadline.
+        let mut ts_10ms = [0u8; 16];
+        ts_10ms[8..].copy_from_slice(&10_000_000i64.to_ne_bytes());
+        w.mem.write(MM, va + 0x20, &ts_10ms);
+
+        let b_read = syscall(SYS_READ, r2, va, 16, B_SVC);
+        w.queue(202, OTHER_MM, &b_read, B_SVC);
+
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            ..Default::default()
+        };
+        frame.x[4] = va + 0x20;
+        frame.x[5] = va + 0x50;
+        frame.x[8] = 72; // pselect6
+        out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                SWITCHED
+            );
+        }
+        assert_eq!(frame.elr, B_SVC, "A yields to B while parked");
+        assert_eq!(mask.armed.get(), Some(sigusr1));
+
+        // Let B block on empty pipe r2, handing vCPU back to A.
+        let mut b_frame = frame;
+        reenter(&mut b_frame, B_SVC);
+        {
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_ipc(&mut sched, &mut b_frame, &venue, &mut user),
+                SWITCHED
+            );
+        }
+
+        // Advance past the 10ms deadline and resume A.
+        cpu.now = 20_000_000;
+        frame = b_frame;
+        reenter(&mut frame, A_SVC);
+        out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                RETURNED
+            );
+        }
+        assert_eq!(frame.x[0], 0);
+        assert_eq!(mask.armed.get(), None, "temporary mask disarmed on timeout");
+        let Some(PollOutput::Select { spans, result: 0 }) = out else {
+            panic!("expected Select output on pselect6 timeout");
+        };
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0.raw(), va + 0x20);
+        assert_eq!(spans[0].1, [0u8; 16]);
+
+        // 3. nfds=0 ppoll(NULL, 0, {0, 10ms}, sigusr1, 8) parks and returns 0 without
+        //    touching the const timespec, and disarms sigmask.
+        // Wake B onto the runqueue by writing 1 byte to w2 so when A parks in ppoll,
+        // B runs, drains r2, and blocks on empty r2 again, handing the vCPU back to A.
+        w.mem.write(MM, va + 0x100, b"k");
+        w.mem.write(OTHER_MM, va + 0x100, b"z");
+        {
+            let mut a_wake_b = syscall(SYS_WRITE, w2, va + 0x100, 1, A_SVC);
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                (
+                    serve_ipc(&mut sched, &mut a_wake_b, &venue, &mut user),
+                    a_wake_b.x[0]
+                ),
+                (RETURNED, 1)
+            );
+        }
+        w.mem.write(MM, va + 0x20, &ts_10ms);
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            ..Default::default()
+        };
+        frame.x[2] = va + 0x20;
+        frame.x[3] = va + 0x40;
+        frame.x[4] = 8;
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                SWITCHED
+            );
+        }
+        assert_eq!(mask.armed.get(), Some(sigusr1));
+
+        let mut g = frame;
+        reenter(&mut g, B_SVC);
+        {
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                (serve_ipc(&mut sched, &mut g, &venue, &mut user), g.x[0]),
+                (RETURNED, 1)
+            );
+            let mut b_park = syscall(SYS_READ, r2, va + 0x200, 1, B_SVC);
+            assert_eq!(
+                serve_ipc(&mut sched, &mut b_park, &venue, &mut user),
+                SWITCHED
+            );
+            frame = b_park;
+        }
+
+        cpu.now = 40_000_000;
+        reenter(&mut frame, A_SVC);
+        out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                RETURNED
+            );
+        }
+        assert_eq!(frame.x[0], 0);
+        assert!(out.is_none(), "ppoll must not write back const timespec");
+        assert_eq!(mask.armed.get(), None);
+
+        // 4. Pending signal during empty-set pselect6(0, ..., {2s, 0}, &pack) parks,
+        //    marks pending host work, and leaves the temporary sigmask armed for host
+        //    signal settlement.
+        let mut ts_2s = [0u8; 16];
+        ts_2s[..8].copy_from_slice(&2i64.to_ne_bytes());
+        w.mem.write(MM, va + 0x20, &ts_2s);
+        owner.signal = true;
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            ..Default::default()
+        };
+        frame.x[4] = va + 0x20;
+        frame.x[5] = va + 0x50;
+        frame.x[8] = 72; // pselect6
+        out = None;
+        {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            assert_eq!(
+                serve_single_zone_ppoll(&mut sched, &mut frame, &venue, &mut owner, &mut out),
+                IpcServed::Idle
+            );
+        }
+        assert!(
+            w.task.linux.has_pending_host_work(),
+            "pending signal marks host work after parking"
+        );
+        assert_eq!(
+            mask.armed.get(),
+            Some(sigusr1),
+            "EINTR park keeps temporary mask armed for signal settlement"
+        );
+        assert!(out.is_none());
     }
 
     /// #1671 review P0-2: a fresh `epoll_pwait` with a sigmask whose events

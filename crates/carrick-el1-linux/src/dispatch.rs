@@ -3355,6 +3355,9 @@ fn complete_ring_poll_output<'p, C: carrick_core_abi::EntryContext>(
             diagnostic,
         ),
         ipc::PollOutput::Select { spans, result } => {
+            if spans.is_empty() {
+                return FamilyCompletion::Complete(result);
+            }
             let Some(process) = process else {
                 return FamilyCompletion::Forward;
             };
@@ -3548,7 +3551,9 @@ impl<
     fn may_serve_poll(&self) -> bool {
         if carrick_personality_linux::dispatch::select_ordinal(self.frame.canonical_ordinal()) {
             return self.process.as_deref().is_some_and(|process| {
-                !process.is_root_process() && process.owns_descriptor_namespace()
+                self.frame.crossing_set()
+                    == carrick_personality_linux::crossing::HostCrossingSet::X86
+                    || (!process.is_root_process() && process.owns_descriptor_namespace())
             });
         }
         self.frame.may_serve_poll()

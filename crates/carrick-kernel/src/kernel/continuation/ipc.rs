@@ -527,11 +527,10 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
         sigpipe: false,
     };
     let select = op.kind == IpcOpKind::SelectWait;
-    // A multi-descriptor select pins a transient epoll: its items are the
-    // set, the epoll's harvest is its probe, and they keep the decided answer.
-    let set = select
-        .then(|| readiness_set::transient_epoll(region, &op, HostIpcWait))
-        .flatten();
+    // A multi-descriptor or empty-set select/poll pins a transient epoll:
+    // its items are the set, the epoll's harvest is its probe, and they keep
+    // the decided answer.
+    let set = readiness_set::transient_epoll(region, &op, HostIpcWait);
     let mut bytes = op.value.0.to_ne_bytes();
     let fd = i32::from_ne_bytes(bytes[..4].try_into().unwrap_or_default());
     if op.progress.len == 0 {
@@ -543,7 +542,9 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
         }
         let clock = wake.counter();
         let pending = op.deadline.get().is_none_or(|end| clock.now < end);
-        let (revents, ready) = if interrupted || (select && cause == Some(IpcCause::Timeout)) {
+        let (revents, ready) = if interrupted
+            || ((select || set.is_some()) && cause == Some(IpcCause::Timeout))
+        {
             (0, 0)
         } else if let Some(epoll) = set {
             let answer = readiness_set::harvest_ready(region, epoll, &HostIpcWait)?;
@@ -619,6 +620,9 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
                 .map(|copy| copy.len as u64)
                 .sum();
             op.progress = WriteProgress::new(length);
+        } else if set.is_some() {
+            op.result = 0;
+            op.progress = WriteProgress::new(0);
         } else {
             bytes[6..].copy_from_slice(&revents.to_ne_bytes());
             op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(bytes));
@@ -627,7 +631,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
         }
         region.update_operation(&token, op)?;
     }
-    let poll_output = if select {
+    let poll_output = if select || set.is_some() {
         None
     } else {
         let field = PollReventsOutput::new(
@@ -640,7 +644,8 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
     let mut offset = op.progress.written as usize;
     let mut window = Vec::new();
     let answer = match set {
-        Some(epoll) => readiness_set::recorded_answer(region, epoll, &HostIpcWait)?,
+        Some(epoll) if select => readiness_set::recorded_answer(region, epoll, &HostIpcWait)?,
+        Some(_) => Vec::new(),
         None => vec![SelectReady {
             fd,
             ready: op.select.ready,
