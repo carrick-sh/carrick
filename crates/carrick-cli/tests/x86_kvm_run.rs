@@ -3761,3 +3761,53 @@ fn mounted_root_fcntl_redirect_restore_preserves_host_description_owner() {
     );
     assert!(guest.stdout.is_empty(), "redirect must reach pipe");
 }
+
+/// #2848: empty-set select/pselect6 (and nfds=0 poll/ppoll) sleep for the
+/// requested timeout or wake on a signal with -EINTR instead of returning
+/// -ENOSYS (-38) for root and fork child.
+#[test]
+fn mounted_static_x86_empty_select_sleep() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("empty-select-sleep");
+    compile_assembly_with_flags(
+        "x86_empty_select_sleep.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native empty-select-sleep oracle");
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(
+        native.status.code(),
+        Some(7),
+        "native oracle failed: stdout={native_stdout} stderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(
+        !native_stdout.is_empty() && native_stdout.lines().all(|line| line.ends_with(" ok=1")),
+        "native oracle must pass every row:\n{native_stdout}"
+    );
+
+    let guest = run_mounted_binary(&elf, "empty-select-sleep", false);
+    let guest_stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        guest.status.code(),
+        native.status.code(),
+        "guest exit {:?} stderr={}\nstdout:\n{guest_stdout}",
+        guest.status.code(),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        guest_stdout, native_stdout,
+        "guest empty-set select/poll differed from native oracle"
+    );
+}
