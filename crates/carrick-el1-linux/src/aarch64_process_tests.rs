@@ -6865,6 +6865,75 @@ fn arm_rt_sigaction_handler_gate_follows_carrier_signal_frame_custody() {
     }
 }
 
+/// #2843 on the soft carrier: `prlimit64(0, RLIMIT_STACK, NULL, old)` with
+/// an `old` the entry can't write. Where the portal admitted the MM, the
+/// memory owner finishes the output and answers (EFAULT for an address that
+/// isn't the guest's). Where it never admitted the MM (the soft carrier's
+/// root), no owner can write it: the entry's refusal is the answer, EFAULT,
+/// and the owner is never asked (it would only refuse the unadmitted MM as
+/// stale, and fail the run).
+#[test]
+fn arm_output_owner_is_asked_only_for_an_mm_it_reaches() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    struct ResetAccess;
+    impl Drop for ResetAccess {
+        fn drop(&mut self) {
+            super::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _reset = ResetAccess;
+    for admitted in [true, false] {
+        let fixture = Box::leak(Box::new(if admitted {
+            Fixture::new(0x10000, asid(1))
+        } else {
+            Fixture::unadmitted(0x10000, asid(1))
+        }));
+        let mut service = fixture.process_service();
+        let old = carrick_test_support::GuestUserBuffer::from_value([u64::MAX; 2]);
+        let target = old.arg();
+        let asked = std::rc::Rc::new(core::cell::Cell::new(0u32));
+        let asked_in_hook = std::rc::Rc::clone(&asked);
+        // The owner's answer for each MM, as production gives it: an
+        // address outside the guest's mappings is a fault; an MM the portal
+        // never admitted is stale.
+        super::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_mm, address, _len, _bytes, _access| {
+                if address.raw() != target {
+                    return None;
+                }
+                asked_in_hook.set(asked_in_hook.get() + 1);
+                Some(Err(if admitted {
+                    NativeProcessError::Fault
+                } else {
+                    NativeProcessError::Stale
+                }))
+            }));
+        });
+        // The entry's own copy can't write `old`.
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |address, _, _| address.raw() != target));
+        });
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[..4].copy_from_slice(&[0, 3, 0, target]);
+        frame.x[8] = 261;
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        assert_ne!(route, CompletionRoute::Forward, "admitted={admitted}");
+        assert_eq!(frame.x[0] as i64, -14, "admitted={admitted}: EFAULT");
+        assert_eq!(
+            asked.get() > 0,
+            admitted,
+            "admitted={admitted}: the owner is asked only for an MM it reaches"
+        );
+        assert_eq!(
+            old.read::<[u64; 2]>(0),
+            [u64::MAX; 2],
+            "admitted={admitted}"
+        );
+    }
+}
+
 #[test]
 fn arm_native_signal_calls_route_to_shared_owner() {
     use carrick_personality_linux::dispatch::{Family, route_aarch64};
