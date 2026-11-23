@@ -958,6 +958,7 @@ mod tests {
             rows,
             refused_calls: Vec::new(),
             refused_calls_dropped: 0,
+            syscall_frames: String::new(),
         }
     }
 

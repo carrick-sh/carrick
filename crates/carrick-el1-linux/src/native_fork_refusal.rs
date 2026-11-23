@@ -2,6 +2,45 @@
 
 use carrick_core::mm::{fork::ForkError, reservation::Refusal, transaction::MmError};
 
+/// DIAGNOSTICS ONLY (#2890): the last fork refusal's Debug text (112 bytes),
+/// for the x86 CPL0 EFAULT sample; x86 has no native diagnostic crossing.
+pub static LAST_FORK_REFUSAL: [core::sync::atomic::AtomicU64; 14] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 14];
+
+struct Stash {
+    buf: [u8; 112],
+    len: usize,
+}
+
+impl core::fmt::Write for Stash {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inline(never)]
+pub fn stash(arguments: core::fmt::Arguments<'_>) {
+    let mut s = Stash {
+        buf: [0; 112],
+        len: 0,
+    };
+    let _ = core::fmt::write(&mut s, arguments);
+    for (i, word) in LAST_FORK_REFUSAL.iter().enumerate() {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&s.buf[i * 8..i * 8 + 8]);
+        word.store(
+            u64::from_le_bytes(bytes),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkStage {
     ParentLifecycleGate {
@@ -117,6 +156,12 @@ pub fn refused(
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     emit(format_args!("{refusal:?}"));
+    if !matches!(
+        refusal.cause,
+        NativeForkCause::Busy | NativeForkCause::SiblingBirth { .. }
+    ) {
+        stash(format_args!("{refusal:?}"));
+    }
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
 }
 
@@ -187,6 +232,7 @@ pub fn refused_prepare(
     ));
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     let _ = (request, alias);
+    stash(format_args!("{refusal:?} prepare"));
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
 }
 
@@ -206,6 +252,7 @@ fn observe_process_error_with(
         error,
         super::native_process_runtime::NativeProcessError::ForkRefused(_)
     ) {
+        stash(format_args!("final {error:?}"));
         match error.failure() {
             Ok(failure) => observe(format_args!(
                 "ProcessNative::fork error={error:?}; errno={}; run_failure={:?}",

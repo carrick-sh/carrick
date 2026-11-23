@@ -2068,6 +2068,27 @@ impl Personality for LinuxPersonality {
                 call.args[5],
                 frame.rsp,
             ]);
+            if call.native.raw() == 56 || call.native.raw() == 57 || call.native.raw() == 58 {
+                let text = &carrick_el1_linux::native_fork_refusal::LAST_FORK_REFUSAL;
+                let w = |i: usize| text[i].load(Ordering::Relaxed);
+                counters.record_diag_frame([
+                    carrick_el1_abi::SyscallFrameSource::ForkRefusalText as u64,
+                    w(0),
+                    w(1),
+                    w(2),
+                    w(3),
+                    w(4),
+                    w(5),
+                    w(6),
+                    w(7),
+                    w(8),
+                    w(9),
+                    w(10),
+                    w(11),
+                    w(12),
+                    w(13),
+                ]);
+            }
         }
         if !matches!(route, CompletionRoute::Suspended) {
             migrate(slot);

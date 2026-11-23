@@ -3235,6 +3235,8 @@ pub enum SyscallFrameSource {
     EfaultReturn = 10,
     /// DIAGNOSTICS ONLY (#2890): an exec-stage copy fault the owner refused.
     ExecStageFault = 11,
+    /// DIAGNOSTICS ONLY (#2890): the last native fork refusal, as text.
+    ForkRefusalText = 12,
 }
 impl SyscallFrameSource {
     pub const fn label(self) -> &'static str {
@@ -3250,6 +3252,7 @@ impl SyscallFrameSource {
             Self::FutexErrorReturn => "futex-error-return",
             Self::EfaultReturn => "efault-return",
             Self::ExecStageFault => "exec-stage-fault",
+            Self::ForkRefusalText => "fork-refusal-text",
         }
     }
     fn from_code(code: u64) -> Option<Self> {
@@ -3265,6 +3268,7 @@ impl SyscallFrameSource {
             9 => Self::FutexErrorReturn,
             10 => Self::EfaultReturn,
             11 => Self::ExecStageFault,
+            12 => Self::ForkRefusalText,
             _ => return None,
         })
     }
@@ -3849,6 +3853,23 @@ impl Counters {
             let source = SyscallFrameSource::from_code(word(1)).map_or("unknown", |s| s.label());
             if word(1) == SyscallFrameSource::FutexErrorReturn as u64 {
                 Self::write_futex_error_sample(output, sample, row)?;
+                continue;
+            }
+            if word(1) == SyscallFrameSource::ForkRefusalText as u64 {
+                write!(output, "fork-refusal-text sample={sample} text=")?;
+                for i in 2..16 {
+                    for byte in word(i).to_le_bytes() {
+                        if byte == 0 {
+                            continue;
+                        }
+                        output.write_char(if byte.is_ascii_graphic() || byte == b' ' {
+                            byte as char
+                        } else {
+                            '?'
+                        })?;
+                    }
+                }
+                writeln!(output)?;
                 continue;
             }
 
