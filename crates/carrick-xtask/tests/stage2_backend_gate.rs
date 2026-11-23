@@ -1,0 +1,112 @@
+//! The HVF stage-2 calls go through `carrick_aarch64::stage2::Stage2Backend`
+//! (#2814, step S0 of the staged custody move).
+//!
+//! `carrick-vmm-hvf` compiles only for macOS on aarch64, so these source
+//! gates run here, on every Linux CI lane, instead of beside the code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::path::{Path, PathBuf};
+
+fn workspace() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn rust_sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            out.push((path, source));
+        }
+    }
+}
+
+fn hvf_sources() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    rust_sources(&workspace().join("crates/carrick-vmm-hvf/src"), &mut out);
+    assert!(out.len() > 50, "carrick-vmm-hvf sources not found");
+    out
+}
+
+fn count(sources: &[(PathBuf, String)], needle: &str) -> usize {
+    sources
+        .iter()
+        .map(|(_, source)| source.matches(needle).count())
+        .sum()
+}
+
+/// The body of HVF's `Stage2Backend` implementation.
+fn hvf_backend_impl(sources: &[(PathBuf, String)]) -> String {
+    let header = "impl carrick_aarch64::stage2::Stage2Backend for HvfStage2 {";
+    let (_, source) = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("trap/stage2_backend.rs"))
+        .expect("trap/stage2_backend.rs");
+    source
+        .split(header)
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("stage2_backend.rs must hold `{header}`"))
+        .to_owned()
+}
+
+#[test]
+fn raw_hvf_stage2_calls_live_only_in_the_backend_impl() {
+    let sources = hvf_sources();
+    let backend = hvf_backend_impl(&sources);
+    for call in ["map(", "unmap(", "destroy()"] {
+        let raw = format!("applevisor_sys::hv_vm_{call}");
+        assert_eq!(
+            count(&sources, &raw),
+            1,
+            "raw `{raw}` must appear exactly once in carrick-vmm-hvf"
+        );
+        assert_eq!(
+            backend.matches(&raw).count(),
+            1,
+            "raw `{raw}` must be inside `impl Stage2Backend for HvfStage2`"
+        );
+    }
+}
+
+#[test]
+fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
+    let sources = hvf_sources();
+    let old_wrappers = concat!("inventory_hv_", "vm_");
+    let stale: Vec<_> = sources
+        .iter()
+        .filter(|(_, source)| source.contains(old_wrappers))
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the HVF-named stage-2 wrappers are gone; use `inventory_stage2_*`: {stale:?}"
+    );
+    // Each wrapper reaches the backend once, through the trait.
+    let backend_calls = count(&sources, "HVF_STAGE2.map(")
+        + count(&sources, "HVF_STAGE2.unmap(")
+        + count(&sources, "HVF_STAGE2.destroy()");
+    assert_eq!(
+        backend_calls, 3,
+        "only the three inventory wrappers may call the HVF backend"
+    );
+    // Both lazy replay paths keep the exact serialized replay.
+    assert_eq!(
+        count(&sources, concat!("inventory_stage2_map_replay", "(b)")),
+        2,
+        "both lazy replay paths must use exact serialized replay"
+    );
+    // VM destruction stays a custody transaction: the wrapper's definition
+    // and the custody transaction's one call.
+    assert_eq!(
+        count(&sources, concat!("inventory_stage2_", "destroy()")),
+        2,
+        "inventory_stage2_destroy must appear only in its definition and the custody wrapper"
+    );
+}
