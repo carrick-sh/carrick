@@ -13,6 +13,9 @@
 # #2621: select/pselect6 over several zone descriptors is a client of the
 # zone epoll owner (a transient epoll the operation pins); the multi-fd
 # witnesses are bound below. Guest semantics and budgets are unchanged.
+# #2848: empty-set select/pselect6 and nfds=0 poll/ppoll park on the same
+# transient epoll owner with zero items, honoring deadline, sigmask and EINTR.
+# Guest semantics and budgets are unchanged.
 schema_version = 1
 id = "kernel.el1.poll-select-owner"
 title = "One readiness owner for zone and mixed waitsets"
@@ -42,6 +45,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_pselect6_multi_fd_wakes_on_one_parent_pipe (#2621 apt shape: nfds 9, two read pipes and one write pipe through the transient epoll; immediate, zero timeout, a park ended by the parent's write to ONE read pipe or its drain of the write pipe, and a masked signal)",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_arm_pselect6_set_host_settlement (a parked set settled by the host through the same epoll harvest: timeout, signal, stop that keeps the wait, stop after EOF)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_trap_frame_ppoll_retains_completed_output_across_owner_wait,poll_revents_crossing_a_page_retains_partial_copy_and_fault}",
+  "carrick-el1-linux::ipc::tests::arm_empty_set_pselect6_and_ppoll_sleep_and_interrupt",
 ]
 
 embed = [
@@ -49,6 +53,7 @@ embed = [
   "carrick-vmm-kvm::cpl0_shared_entry::native_child_select_timeval_wakes_on_sibling_pipe_write (x86 select timeval normalization, invalid negative fraction, and remaining-time copyout)",
   "carrick-vmm-kvm::cpl0_shared_entry::{native_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_wakes_on_exec_successor_write,native_exec_child_pselect6_wakes_on_parent_pipe_write,native_child_pselect6_sigmask_holds_a_signal_until_the_wait_ends,native_two_children_pselect6_release_default_pool_capacity}",
   "carrick-vmm-kvm::cpl0_initial_mm::native_child_pselect6_wakes_on_sibling_pipe_write (production CPL0 guest; a ready pipe and a parked pselect6 on that same pipe; the sibling writes only after the test has observed enrollment)",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_empty_select_sleep",
 ]
 
 [bindings.unresolved]
