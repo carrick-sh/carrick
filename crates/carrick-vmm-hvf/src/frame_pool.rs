@@ -736,6 +736,25 @@ mod tests {
         drop(c1);
     }
 
+    /// A fixture pool waits only for its own ledger: an invalidation owed
+    /// on the carrier's ledger, by the engine or by a test running beside
+    /// this one, never quarantines its frames (#2884).
+    #[test]
+    fn frame_pool_fixture_ignores_invalidations_owed_on_the_carrier_ledger() {
+        use carrick_aarch64::resume_invalidation::ResumeInvalidation;
+        let pool = Arc::new(PreMappedFramePool::new_test_fixture(1));
+        let c0 = pool.allocate_compound().expect("c0");
+        let elsewhere = ResumeInvalidation::owe(0x2884, 0x28);
+        drop(c0);
+        let freed = pool.allocated_count();
+        elsewhere.complete();
+        assert_eq!(
+            freed, 0,
+            "an unrelated owed invalidation quarantined the frame"
+        );
+        assert!(pool.allocate_compound().is_some());
+    }
+
     #[test]
     fn frame_pool_contains_ipa_predicate() {
         let pool = Arc::new(PreMappedFramePool::new_test_fixture(8));
