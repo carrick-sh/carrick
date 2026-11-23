@@ -351,7 +351,7 @@ mod tests {
     impl FakeMapper {
         fn new(stale: bool) -> Self {
             Self {
-                region: std::ptr::NonNull::from(Box::leak(
+                region: std::ptr::NonNull::from(carrick_test_support::ZeroedBox::leak(
                     carrick_test_support::TestEl1Region::zeroed(),
                 )),
                 stale,
