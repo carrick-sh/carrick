@@ -1,14 +1,14 @@
 // Blocking waits across a run root and its fork child, with no select, on
 // x86_64 (#1051's gap 2). The root holds a loopback listener and a pipe's
 // write end; the child holds a connected TCP socket and the pipe's read
-// end. Five rows, with no interval timer (x86 setitimer is a gap of its
-// own, #2876); each wait but row a's is bounded by a poll timeout or by a
-// later write of the other process:
+// end. Six rows, with no interval timer (x86 setitimer is a gap of its
+// own, #2876); each wait is bounded by a receive timeout, a poll timeout
+// or a later write of the other process:
 //   accept: the root blocks in accept4 before the child connects;
 //   b: the child writes the socket, then the root receives with a
 //      receive timeout (is the child's write delivered at all);
-//   a: the root blocks reading its accepted socket, then the child writes
-//      (does the root's blocking socket read wake);
+//   a: the root blocks reading its accepted socket under a receive
+//      timeout, then the child writes (does the root's socket read wake);
 //   c: the child blocks in poll on the pipe (bounded by poll's timeout),
 //      then the root writes it (does a zone pipe write wake a parked
 //      descendant), and reads the byte;
@@ -16,7 +16,10 @@
 //      fork. The child's receive must see it (EAGAIN, not a block until
 //      the root's later write), and the child's call must leave it set for
 //      the root (EAGAIN, not a block until the child's later write): the
-//      flag belongs to the open description, which the fork shares.
+//      flag belongs to the open description, which the fork shares;
+//   e: socket timeouts that must wait (#2878): the child's receive under a
+//      short SO_RCVTIMEO answers EAGAIN when nothing arrives, and the
+//      root's receive under a longer one is woken by the child's write.
 // Every line is `who.name result`, where a failure prints as `-errno`; the
 // native run is the oracle. The root prints after the child exits, so the
 // processes' lines never interleave.
@@ -125,6 +128,19 @@ int main(void) {
         pause_ms(800);
         byte = 'z';
         value("d.write", syscall(SYS_write, shared_peer, &byte, 1));
+        // Row e: nothing arrives within the receive timeout.
+        struct timeval brief = {0, 300000};
+        value("e.rcvtimeo", syscall(SYS_setsockopt, sock, SOL_SOCKET, SO_RCVTIMEO, &brief, sizeof brief));
+        byte = 0;
+        value("e.recv", syscall(SYS_recvfrom, sock, &byte, 1, 0, NULL, NULL));
+        // Wakes the root's receive under its longer timeout.
+        pause_ms(200);
+        byte = 'e';
+        value("e.write", syscall(SYS_write, sock, &byte, 1));
+        // Keep the connection open until the root's short timeout passed.
+        ready.revents = 0;
+        value("e.poll", syscall(SYS_poll, &ready, 1, 3000));
+        value("e.done", syscall(SYS_read, pipe_fds[0], &byte, 1));
         _exit(0);
     }
     close(pipe_fds[0]);
@@ -151,10 +167,12 @@ int main(void) {
     // Row a: a plain blocking read the child's later write must wake. It is
     // unbounded: a receive timeout's wait is a venue gap of its own (#2878),
     // and the test's own timeout ends a lost wake.
-    // A timed poll cannot bound it yet: the root's poll of this socket
-    // (the root's half of the child's in-zone loopback connection) is the
-    // venue's refusal of a mixed readiness set (#1051).
+    // Bounded by a receive timeout: a timed poll of this socket (the root's
+    // half of the child's in-zone loopback connection) is the venue's
+    // refusal of a mixed readiness set (#1051).
     byte = 0;
+    struct timeval bound = {3, 0};
+    record("a.rcvtimeo", syscall(SYS_setsockopt, peer, SOL_SOCKET, SO_RCVTIMEO, &bound, sizeof bound));
     record("a.read", syscall(SYS_read, peer, &byte, 1));
     record("a.byte", byte);
 
@@ -179,6 +197,18 @@ int main(void) {
     record("d.read1", syscall(SYS_read, shared, &byte, 1));
     record("d.byte1", byte);
     record("d.read2", syscall(SYS_read, shared, &byte, 1));
+
+    // Row e: the child's byte arrives within this timeout; then a short one
+    // passes with nothing.
+    struct timeval longer = {3, 0}, brief = {0, 300000};
+    record("e.rcvtimeo", syscall(SYS_setsockopt, peer, SOL_SOCKET, SO_RCVTIMEO, &longer, sizeof longer));
+    byte = 0;
+    record("e.recv", syscall(SYS_recvfrom, peer, &byte, 1, 0, NULL, NULL));
+    record("e.byte", byte);
+    record("e.brief", syscall(SYS_setsockopt, peer, SOL_SOCKET, SO_RCVTIMEO, &brief, sizeof brief));
+    record("e.timeout", syscall(SYS_recvfrom, peer, &byte, 1, 0, NULL, NULL));
+    byte = 'f';
+    record("e.done", syscall(SYS_write, pipe_fds[1], &byte, 1));
 
     int status = 0;
     long reaped = waitpid(pid, &status, 0) == pid ? 0 : -1;

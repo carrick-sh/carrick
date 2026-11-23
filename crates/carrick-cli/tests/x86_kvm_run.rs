@@ -3416,11 +3416,11 @@ fn mounted_static_x86_netlink_sockets_match_native() {
 /// child's later write; and the root's pipe write wakes the child parked
 /// in its poll. A root `O_NONBLOCK` set after the fork on a socket both
 /// hold reaches the child, and the child's receive leaves it set for the
-/// root, as on Linux, where the flag is the shared description's. Each
-/// wait but the root's read is bounded by a poll timeout or by the other
-/// process's later write, so a lost wake prints a wrong line against the
-/// oracle instead of hanging; the root's read ends at the test's timeout
-/// (its timed poll is #1051's gap).
+/// root, as on Linux, where the flag is the shared description's. Socket
+/// receive timeouts that must wait answer EAGAIN when they pass, and a
+/// write within one wakes the receive (#2878). Each wait is bounded by a
+/// receive timeout, a poll timeout or the other process's later write, so
+/// a lost wake prints a wrong line against the oracle instead of hanging.
 #[test]
 fn mounted_static_x86_child_socket_wake_matches_native() {
     compare_socket_fixture_with_native("x86_child_socket_wake.c");
