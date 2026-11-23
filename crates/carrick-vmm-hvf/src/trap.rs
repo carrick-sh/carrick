@@ -161,6 +161,8 @@ use crate::syscall_mailbox::{
     HvfSyscallTransport, MailboxBinding, MailboxRequest, MailboxSlotAllocator, MailboxSlotId,
 };
 use carrick_aarch64::Aarch64VcpuSnapshot;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use carrick_aarch64::vmm::CarrierVcpuId;
 use carrick_guest_mem::{GuestVa, MemoryError};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
@@ -415,6 +417,10 @@ pub(crate) use task_mapping_index::*;
 mod admission_retry;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_admission;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vcpu_backend;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use vcpu_backend::{SetupVcpuCleanup, SetupVcpuGuard};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -705,7 +711,7 @@ pub(crate) enum PersistentCarrierCellEntry {
     CreateCleanup {
         custody: std::sync::Arc<CarrierVmCustody>,
         generation: CarrierVmGeneration,
-        vcpu_id: Option<applevisor_sys::hv_vcpu_t>,
+        vcpu_id: Option<CarrierVcpuId>,
         raw_vm_destroyed: bool,
     },
 }
