@@ -95,13 +95,13 @@ pub fn schedule(slot: SlotId) -> ! {
                 match park_on_gate(source, slot, selected.record, mm_raw) {
                     RetainedDeferral::Parked => continue 'schedule,
                     RetainedDeferral::Rerun => {}
-                    RetainedDeferral::Refused => fatal_boot(),
+                    RetainedDeferral::Refused => fatal_boot!(),
                 }
             }
             settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(
-                    i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot()),
+                    i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot!()),
                 ),
                 carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
                 identity.file_table,
@@ -117,12 +117,12 @@ pub fn schedule(slot: SlotId) -> ! {
             current.publish_visible_pid(state.visible_pid);
             current.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
             if x86::X86Backend.install_context(state.address).is_err() {
-                fatal_boot();
+                fatal_boot!();
             }
             let mut words = state.words;
             let mut service = native_process::Service::new(current, slot);
             native_process::drain_external_ingress(source, &mut service)
-                .unwrap_or_else(|_| fatal_boot());
+                .unwrap_or_else(|_| fatal_boot!());
             let mut suspended = false;
             {
                 let _copy_gate = user_fault_gate::install();
@@ -135,7 +135,7 @@ pub fn schedule(slot: SlotId) -> ! {
                         &words,
                         &mut service,
                     )
-                    .unwrap_or_else(|_| fatal_boot());
+                    .unwrap_or_else(|_| fatal_boot!());
                 match entry
                     .resume_checkpoint(|entry| {
                         use carrick_el1_linux::native_process_runtime::{
@@ -227,7 +227,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             // syscall has no return word.
                             Some(replaced) if replaced.address != state.address => {
                                 if x86::X86Backend.install_context(replaced.address).is_err() {
-                                    fatal_boot();
+                                    fatal_boot!();
                                 }
                                 words = replaced.words;
                                 state = replaced;
@@ -237,7 +237,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                     words.set_syscall_return(result);
                                 }
                             }
-                            None => fatal_boot(),
+                            None => fatal_boot!(),
                         }
                     }
                     // A typed saved retry already names its x86 syscall
@@ -251,16 +251,16 @@ pub fn schedule(slot: SlotId) -> ! {
                         carrick_guest_arch::ProcessContext::restart_syscall(&mut words);
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::Invalid => {
-                        fatal_boot()
+                        fatal_boot!()
                     }
                 }
                 if !suspended {
-                    let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot());
+                    let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot!());
                     let native = context::context_words::into_native(words, state.address)
-                        .unwrap_or_else(|_| fatal_boot());
+                        .unwrap_or_else(|_| fatal_boot!());
                     let mut frame =
                         context::context_words::syscall_frame_from_native(&native, state.address)
-                            .unwrap_or_else(|_| fatal_boot());
+                            .unwrap_or_else(|_| fatal_boot!());
                     let mut machine =
                         crate::linux_personality::X86SignalMachine::new(state.address);
                     if let Some(route) = deliver_signal_on_syscall_return(
@@ -274,7 +274,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
                                 suspended = true
                             }
-                            _ => fatal_boot(),
+                            _ => fatal_boot!(),
                         }
                     }
                     words = context::context_words::from_native(
@@ -285,7 +285,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             native.gs_base,
                             &native.xsave,
                         )
-                        .unwrap_or_else(|_| fatal_boot()),
+                        .unwrap_or_else(|_| fatal_boot!()),
                         machine.frame_position(position),
                     );
                 }
@@ -316,7 +316,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 })
             } {
                 Ok(never) => match never {},
-                Err(_) => fatal_boot(),
+                Err(_) => fatal_boot!(),
             }
         }
         if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
@@ -370,7 +370,7 @@ fn expire_timers(slot: SlotId) {
     }
     let zone = carrick_x86_carrier::native_execution::source(slot).zone;
     let mut backend = x86::X86Backend;
-    let now = backend.counter().unwrap_or_else(|_| fatal_boot());
+    let now = backend.counter().unwrap_or_else(|_| fatal_boot!());
     let retry_ticks = ticks(&mut backend, TIMER_RETRY_NS);
     let deadline = zone.expire_timer_and_rearm(
         slot,
@@ -383,7 +383,7 @@ fn expire_timers(slot: SlotId) {
     );
     backend
         .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
-        .unwrap_or_else(|_| fatal_boot());
+        .unwrap_or_else(|_| fatal_boot!());
 }
 
 /// A thread has completed return preparation on `slot`: start its slice when
@@ -419,14 +419,14 @@ fn program_slice(
     let timer_deadline = zone.timer_deadline(slot);
     let slice_ticks = ticks(&mut backend, carrick_sched_core::PREEMPT_SLICE_NS);
     let retry_ticks = ticks(&mut backend, TIMER_RETRY_NS);
-    let now = backend.counter().unwrap_or_else(|_| fatal_boot()).raw();
+    let now = backend.counter().unwrap_or_else(|_| fatal_boot!()).raw();
     if restart {
         zone.slot(slot).restart_slice(now);
     }
     let deadline = with_slice(zone, slot, now, slice_ticks, retry_ticks, timer_deadline);
     backend
         .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
-        .unwrap_or_else(|_| fatal_boot());
+        .unwrap_or_else(|_| fatal_boot!());
 }
 
 /// `deadline`, or the running thread's slice end when that is earlier. A
@@ -459,7 +459,7 @@ fn ticks(backend: &mut x86::X86Backend, ns: u64) -> u64 {
     use carrick_guest_arch::InterruptBackend;
     let hz = backend
         .frequency()
-        .unwrap_or_else(|_| fatal_boot())
+        .unwrap_or_else(|_| fatal_boot!())
         .raw()
         .get();
     u64::try_from(u128::from(hz) * u128::from(ns) / 1_000_000_000).unwrap_or(u64::MAX)
@@ -477,17 +477,17 @@ fn park_on_gate(
 ) -> RetainedDeferral {
     let zone = source.zone;
     let Some(index) = zone.spaces.find(mm) else {
-        fatal_boot();
+        fatal_boot!();
     };
     let gate_raised = || zone.spaces.gate(index) != 0;
     if !gate_raised() && zone.spaces.installed_grant(index, mm).is_none() {
-        fatal_boot();
+        fatal_boot!();
     }
     let Some(lease) = core::num::NonZeroU64::new(mm)
         .and_then(|key| zone.space_entry(key))
         .and_then(|entry| entry.live_notifications().ok())
     else {
-        fatal_boot();
+        fatal_boot!();
     };
     carrick_core::wait::defer_switched_in_record(
         zone,

@@ -1,4 +1,4 @@
-use crate::entry::InitialWords;
+use crate::entry::{InitialWords, fatal_boot};
 use crate::personality::Personality;
 use carrick_core_abi::{
     X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
@@ -450,17 +450,10 @@ unsafe extern "C" {
     fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !;
 }
 
-/// Refuse a broken carrier invariant through the shared kernel's fatal
-/// transport, naming the caller's source site.
-#[track_caller]
-pub fn fatal_boot() -> ! {
-    carrick_el1::isa::x86::transport::fatal_boot()
-}
-
 pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
     P::on_boot();
     if request_va != X86_CPL0_INITIAL_EXTENT_VA {
-        fatal_boot();
+        fatal_boot!();
     }
     // SAFETY: the carrier owns and retained this exact initialized request.
     let request = unsafe { &mut *(request_va as *mut X86InitialBootRequest) };
@@ -476,16 +469,16 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
         core::arch::asm!("out dx, al", in("dx") X86_INITIAL_BOOT_PORT, in("rax") request_va, options(nostack, preserves_flags));
     }
     let Some((entry, stack)) = loaded else {
-        fatal_boot()
+        fatal_boot!()
     };
     let Some(root) = RootGpa::page_aligned(FrameGpa::new(request.result_root_gpa)) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let Some(mm) = NonZeroU64::new(request.mm_key) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let Some(generation) = NonZeroU64::new(request.generation) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let context = carrick_guest_arch::AddressContext {
         root,
@@ -532,25 +525,25 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
 /// It owns no process row until switch_in_full transfers a runnable claim.
 pub fn carrier_peer_boot<P: Personality>() -> ! {
     let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else {
-        fatal_boot()
+        fatal_boot!()
     };
     if binding.cpu_slot != 1 {
-        fatal_boot();
+        fatal_boot!();
     }
     // SAFETY: initial boot has published and physically settled this retained
     // request before the host admits the peer entry. It stays immutable here.
     let request = unsafe { &*(X86_CPL0_INITIAL_EXTENT_VA as *const X86InitialBootRequest) };
     if request.result_status != X86_INITIAL_BOOT_LOADED {
-        fatal_boot();
+        fatal_boot!();
     }
     let Some(root) = RootGpa::page_aligned(FrameGpa::new(request.result_root_gpa)) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let Some(mm) = NonZeroU64::new(request.mm_key) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let Some(generation) = NonZeroU64::new(request.generation) else {
-        fatal_boot()
+        fatal_boot!()
     };
     let context = carrick_guest_arch::AddressContext {
         root,
@@ -561,7 +554,7 @@ pub fn carrier_peer_boot<P: Personality>() -> ! {
         .install_context(context)
         .is_err()
     {
-        fatal_boot();
+        fatal_boot!();
     }
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: physical bootstrap initialized and retains the compact zone.
@@ -573,7 +566,7 @@ pub fn carrier_peer_boot<P: Personality>() -> ! {
     zone.enter_guest(slot);
     crate::entry::user_fault_gate::install_persistent();
     if !zone.enter_idle(slot, true) {
-        fatal_boot();
+        fatal_boot!();
     }
     // SAFETY: slot publication and its shared sleep guard precede this
     // physical readiness notification; the host admits CPU0 only afterwards.

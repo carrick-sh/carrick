@@ -59,14 +59,11 @@ impl PanicReport {
     /// raising site ([`PanicReportKind::FatalSite`]).
     pub const FATAL_SITE_SENTINEL: u64 = 0xDEAD_CAFE_9A41_F5E5;
 
-    /// A record for the caller's source site, with `what` as its message.
-    #[track_caller]
-    pub fn at_caller(what: &str) -> Self {
+    /// A record for the source site `file:line:column`, with `what` as its
+    /// message.
+    pub fn at_site(file: &str, line: u32, column: u32, what: &str) -> Self {
         use fmt::Write;
-        let mut report = Self {
-            site: carrick_core_abi::SourceSite::caller(),
-            message: [0; PANIC_MESSAGE_BYTES],
-        };
+        let mut report = Self::new(file, line, column);
         let _ = report.message_writer().write_str(what);
         report
     }
@@ -175,13 +172,13 @@ mod tests {
 
     #[test]
     fn a_fatal_site_record_names_its_caller_and_kind() {
-        let line = line!() + 1;
-        let report = PanicReport::at_caller("fatal_boot");
-        assert_eq!(report.line(), line);
+        let (line, column) = (line!(), column!());
+        let report = PanicReport::at_site(file!(), line, column, "fatal_boot");
+        assert_eq!((report.line(), report.column()), (line, column));
         assert!(
-            report
-                .to_string()
-                .ends_with(&std::format!("src/panic_report.rs:{line}:22: fatal_boot")),
+            report.to_string().ends_with(&std::format!(
+                "src/panic_report.rs:{line}:{column}: fatal_boot"
+            )),
             "{report}"
         );
         for kind in [PanicReportKind::Panic, PanicReportKind::FatalSite] {

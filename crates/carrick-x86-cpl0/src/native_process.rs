@@ -1497,5 +1497,5 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     Ok(())
 }
 fn fatal() -> ! {
-    carrick_x86_carrier::entry::fatal_boot()
+    carrick_x86_carrier::entry::fatal_boot!()
 }
