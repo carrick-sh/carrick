@@ -38,14 +38,21 @@
 //! ([`HostFileStage::FaultAfterPrefix`]): Linux stops there and answers
 //! the count moved.
 //!
-//! `socket` of AF_UNIX and AF_NETLINK crosses too (#1906): the carrier's
-//! socket implementation owns a named or abstract AF_UNIX socket and the
-//! run's netlink view, exactly as the run root reaches them, and a native
-//! process had no way to create either (glibc's `getaddrinfo` opens both).
-//! The descriptor is then a host-backed description like an inet socket's.
-//! The ring keeps what it owns: an AF_UNIX stream `socketpair` is in-zone,
-//! and a call on an in-zone descriptor stays with its ring owner. A
-//! `socket` of any other domain is not decoded here.
+//! `socket` of AF_NETLINK crosses too (#1906): the carrier's socket
+//! implementation owns the run's synthetic netlink view, which is no host
+//! object, and a native process had no way to create one (glibc's
+//! `getaddrinfo` and `getifaddrs` open it). The descriptor is then a
+//! host-backed description like an inet socket's.
+//!
+//! AF_UNIX does not cross. A local socket is a compat-zone object: the
+//! carrier's AF_UNIX model binds a host socket under a host-global
+//! directory, so a second bind of a name would take over a live listener
+//! and two runs would share one node (#2816 review, #2847). The ring owns
+//! the AF_UNIX stream `socketpair`; a named or abstract AF_UNIX `socket`
+//! is not decoded here, a counted ENOSYS for a native process until the
+//! in-zone owner exists (#2847). A call on an in-zone descriptor stays
+//! with its ring owner, and a `socket` of any other domain is not decoded
+//! here either.
 
 use super::{
     Access, HostFileOp, HostFileOutput, HostFileStage, HostFileUser, IOVEC_BYTES, LINUX_UIO_MAXIOV,
@@ -89,12 +96,12 @@ pub struct SocketCall {
 }
 
 impl SocketCall {
-    /// The `socket` domains that cross: the host networks, and the two
-    /// local families the carrier's socket implementation serves.
-    pub const CARRIER_DOMAINS: [i32; 4] = [
+    /// The `socket` domains that cross: the host networks, and the run's
+    /// netlink view. AF_UNIX is never one of them: a local socket is a
+    /// compat-zone object, not the carrier's (#2847).
+    pub const CARRIER_DOMAINS: [i32; 3] = [
         carrick_syscall_abi::LINUX_AF_INET,
         carrick_syscall_abi::LINUX_AF_INET6,
-        carrick_syscall_abi::LINUX_AF_UNIX,
         carrick_syscall_abi::LINUX_AF_NETLINK,
     ];
 

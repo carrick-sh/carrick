@@ -3153,13 +3153,13 @@ fn mounted_static_x86_root_network_family_matches_native() {
     compare_socket_fixture_with_native("x86_root_network.c");
 }
 
-/// The local socket families glibc's resolver opens (#1906): a netlink
-/// route socket and AF_UNIX sockets, made by the run root and by a fork
-/// child, match the native run, and no caller's socket call is refused.
-/// Before the venue decoded their `socket`, both were counted ENOSYS for
-/// every caller.
+/// The netlink route socket glibc's resolver opens (#1906), made by the
+/// run root and by a fork child, matches the native run, and no caller's
+/// socket call is refused. Before the venue decoded its `socket`, it was a
+/// counted ENOSYS for every caller. AF_UNIX is not here: a local socket is
+/// a compat-zone object and has no in-zone owner yet (#2847).
 #[test]
-fn mounted_static_x86_netlink_and_unix_sockets_match_native() {
+fn mounted_static_x86_netlink_sockets_match_native() {
     compare_socket_fixture_with_native("x86_local_sockets.c");
 }
 

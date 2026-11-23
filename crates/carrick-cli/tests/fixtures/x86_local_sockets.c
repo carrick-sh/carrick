@@ -1,8 +1,9 @@
-// The local socket families glibc's resolver opens, on x86_64 (#1906): a
-// netlink route socket (`getifaddrs`, `getaddrinfo`'s AI_ADDRCONFIG) and
-// AF_UNIX sockets (the nscd probe, a local listener), made by the run root
-// and then by a fork child. Every line is `who.name result`, where an fd
-// prints as `fd` and a failure as `-errno`; the native run is the oracle.
+// The netlink route socket glibc's resolver opens, on x86_64 (#1906):
+// `getifaddrs` and `getaddrinfo`'s AI_ADDRCONFIG, made by the run root and
+// then by a fork child. AF_UNIX sockets are not here: they are compat-zone
+// objects with no in-zone owner yet (#2847). Every line is `who.name
+// result`, where an fd prints as `fd` and a failure as `-errno`; the
+// native run is the oracle.
 // Only facts both worlds share are printed: the loopback interface and its
 // address, never an interface count or a port id.
 #define _GNU_SOURCE
@@ -14,7 +15,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -119,53 +119,14 @@ static void netlink(void) {
     value("netlink.close", syscall(SYS_close, nl));
 }
 
-static void local(void) {
-    // glibc's nscd probe: a stream socket whose connect finds no daemon.
-    int probe = fd("unix.socket", syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    struct sockaddr_un name;
-    memset(&name, 0, sizeof name);
-    name.sun_family = AF_UNIX;
-    strcpy(name.sun_path, "/nonexistent-carrick-c3/socket");
-    value("unix.connect.absent", syscall(SYS_connect, probe, &name, sizeof name));
-    value("unix.close", syscall(SYS_close, probe));
-
-    // A listener on an abstract name, a client, and one exchange.
-    memset(&name, 0, sizeof name);
-    name.sun_family = AF_UNIX;
-    int length = snprintf(name.sun_path + 1, sizeof name.sun_path - 1, "carrick-c3-%s-%d", who,
-                          (int)getpid());
-    socklen_t size = (socklen_t)(sizeof(sa_family_t) + 1 + length);
-    int listener = fd("unix.listener", syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    value("unix.bind", syscall(SYS_bind, listener, &name, size));
-    value("unix.listen", syscall(SYS_listen, listener, 4));
-    int client = fd("unix.client", syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    value("unix.connect", syscall(SYS_connect, client, &name, size));
-    int peer = fd("unix.accept", syscall(SYS_accept4, listener, NULL, NULL, SOCK_CLOEXEC));
-    value("unix.sendto", syscall(SYS_sendto, client, "hi", 2, 0, NULL, 0));
-    char got[3] = {0};
-    value("unix.recvfrom", syscall(SYS_recvfrom, peer, got, 2, 0, NULL, NULL));
-    printf("%s.unix.recvfrom.data %s\n", who, got);
-    struct sockaddr_un bound;
-    memset(&bound, 0, sizeof bound);
-    socklen_t bound_size = sizeof bound;
-    value("unix.getsockname", syscall(SYS_getsockname, listener, &bound, &bound_size));
-    printf("%s.unix.getsockname.family %d same %d\n", who, bound.sun_family,
-           bound_size == size && memcmp(&bound, &name, size) == 0);
-    value("unix.close.peer", syscall(SYS_close, peer));
-    value("unix.close.client", syscall(SYS_close, client));
-    value("unix.close.listener", syscall(SYS_close, listener));
-}
-
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     who = "root";
     netlink();
-    local();
     pid_t child = fork();
     if (child == 0) {
         who = "child";
         netlink();
-        local();
         _exit(0);
     }
     int status = 0;

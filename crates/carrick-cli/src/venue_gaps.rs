@@ -708,13 +708,27 @@ VENUEPROFILE1|complete|root=19767
     }
 
     #[test]
-    fn a_childs_packet_socket_is_a_gap_and_the_carrier_domains_cross() {
-        // AF_PACKET has no venue.
-        let packet = route(GuestIsa::X86_64, GuestIsa::X86_64, key(true, 41, 17, 3));
-        assert!(packet.is_gap(), "{packet:?}");
-        // AF_INET, and since #2816 AF_UNIX and AF_NETLINK, take the socket
-        // venue: for a child, and for the x86 root.
-        for (domain, kind) in [(2, 2), (1, 1), (16, 3)] {
+    fn a_childs_unix_socket_is_a_gap_and_an_inet_socket_crosses() {
+        // AF_UNIX is a compat-zone family with no in-zone owner yet
+        // (#2847), and AF_PACKET has no venue: neither crosses, for a
+        // child or for the x86 root.
+        for (domain, kind) in [(1, 1), (17, 3)] {
+            let child = route(
+                GuestIsa::X86_64,
+                GuestIsa::X86_64,
+                key(true, 41, domain, kind),
+            );
+            assert!(child.is_gap(), "domain {domain}: {child:?}");
+            let root = route(
+                GuestIsa::X86_64,
+                GuestIsa::X86_64,
+                key(false, 41, domain, kind),
+            );
+            assert_ne!(root, Route::HostFile, "domain {domain}");
+        }
+        // AF_INET, and since #2816 AF_NETLINK, take the socket venue: for
+        // a child, and for the x86 root.
+        for (domain, kind) in [(2, 2), (16, 3)] {
             for child in [true, false] {
                 assert_eq!(
                     route(
@@ -784,16 +798,12 @@ VENUEPROFILE1|complete|root=19767
 
     #[test]
     fn render_lists_the_gap_and_the_seccomp_refusals() {
-        // The known answer's child socket is AF_UNIX, which crosses since
-        // #2816; an AF_PACKET socket in its place is the gap.
-        let profile = KNOWN_ANSWER.replace("@calls[1, 41, 1, 1]: 1", "@calls[1, 41, 17, 3]: 1");
-        let p = parse_profile(&profile).unwrap();
+        let p = parse_profile(KNOWN_ANSWER).unwrap();
         let text = render("known-answer", &p, None, false).unwrap();
         assert!(
-            text.contains("| socket | 41 | domain=17 type=3 | child |"),
+            text.contains("| socket | 41 | AF_UNIX type=1 | child |"),
             "{text}"
         );
-        assert!(!text.contains("AF_UNIX"), "{text}");
         assert!(text.contains("root nr511 ret=-38 ×1"), "{text}");
         assert!(text.contains("child nr510 ret=-38 ×2"), "{text}");
     }

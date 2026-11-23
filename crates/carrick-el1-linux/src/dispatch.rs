@@ -7799,38 +7799,41 @@ mod tests {
             ),
             None
         );
-        // A named AF_UNIX socket and a netlink socket are the carrier's too
-        // (#1906): the ring owns only the AF_UNIX stream `socketpair`.
-        for domain in [1, 16] {
+        // A netlink socket is the carrier's too (#1906): the run's
+        // synthetic netlink view.
+        frame.x[0] = 16;
+        let staged = native_host_file_stage(
+            &frame,
+            &task,
+            &Resident,
+            table,
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            |_| panic!("socket names no descriptor"),
+            &mut |_| 0,
+        );
+        assert!(
+            matches!(staged, Some(HostFileStage::Request { .. })),
+            "a fork child's netlink socket crosses: {staged:?}"
+        );
+        // AF_UNIX never crosses: a local socket is a compat-zone object,
+        // and the carrier would make it a host one (#2847). It and any
+        // other domain (AF_PACKET) have no venue: a counted ENOSYS.
+        for domain in [1, 17] {
             frame.x[0] = domain;
-            let staged = native_host_file_stage(
-                &frame,
-                &task,
-                &Resident,
-                table,
-                carrick_core_abi::service::ServiceOrigin::Descendant,
-                |_| panic!("socket names no descriptor"),
-                &mut |_| 0,
-            );
-            assert!(
-                matches!(staged, Some(HostFileStage::Request { .. })),
-                "a fork child's socket of domain {domain} crosses: {staged:?}"
+            assert_eq!(
+                native_host_file_stage(
+                    &frame,
+                    &task,
+                    &Resident,
+                    table,
+                    carrick_core_abi::service::ServiceOrigin::Descendant,
+                    |_| panic!("socket names no descriptor"),
+                    &mut |_| 0,
+                ),
+                None,
+                "a fork child's socket of domain {domain} stays unrouted"
             );
         }
-        // Any other domain (AF_PACKET) has no venue: a counted ENOSYS.
-        frame.x[0] = 17;
-        assert_eq!(
-            native_host_file_stage(
-                &frame,
-                &task,
-                &Resident,
-                table,
-                carrick_core_abi::service::ServiceOrigin::Descendant,
-                |_| panic!("socket names no descriptor"),
-                &mut |_| 0,
-            ),
-            None
-        );
     }
 
     /// #2418: a fork child's resolver message calls are host network
