@@ -919,6 +919,44 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
+/// `close_range` in the run root and in a fork child (#1906's table: a
+/// counted ENOSYS for a native child). `x86_close_range.c` opens two pipes
+/// and prints each call's return value with `F_GETFD` of its four fds after it:
+/// the EINVAL shapes, `CLOSE_RANGE_CLOEXEC`, a range past the table,
+/// `CLOSE_RANGE_UNSHARE` and an empty range.
+#[test]
+fn mounted_static_x86_close_range_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("close-range");
+    compile_assembly_with_flags(
+        "x86_close_range.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native close-range oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, "close-range", false);
+    assert_eq!(
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "c is the fork child, r the root; each line is a call's return value, then \
+         F_GETFD of the four pipe fds (-9 EBADF, 1 FD_CLOEXEC). Stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), native.status.code());
+}
+
 /// #2832 record B: the run root and its thread sleep. The sleep family
 /// declined for the run root, leaving the call to a host continuation the
 /// x86 crossing set does not carry, so every root `nanosleep` and
