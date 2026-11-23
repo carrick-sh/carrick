@@ -603,6 +603,11 @@ struct Table<'a> {
     limit: usize,
 }
 impl Table<'_> {
+    /// One past the last descriptor of an inclusive range ending at `last`,
+    /// bounded by storage even for `last = u32::MAX`.
+    fn range_end(&self, last: u32) -> usize {
+        (u64::from(last) + 1).min(self.storage.capacity() as u64) as usize
+    }
     fn lowest(&self, min: usize) -> (Option<usize>, usize) {
         if min >= self.limit {
             return (None, 0);
@@ -2198,8 +2203,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::InvalidArgument);
         }
         let (_guard, t) = self.lock(table)?;
-        let end = (u64::from(last) + 1).min(t.storage.capacity() as u64) as usize;
-        for fd in first as usize..end {
+        for fd in first as usize..t.range_end(last) {
             let Some(mut entry) = t.storage.get(fd) else {
                 continue;
             };
@@ -2211,6 +2215,16 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             }
         }
         Ok(())
+    }
+    /// The lowest open descriptor in `[from, last]`, bounded by storage as
+    /// [`Self::close_range`] is, or `None` when the range holds none. A ring
+    /// `close_range` walks the open numbers with this and closes each through
+    /// its one owned `close`, so the cost follows the table, never `last`.
+    pub fn next_open(&self, table: TableId, from: u32, last: u32) -> Result<Option<Fd>, Error> {
+        let (_guard, t) = self.lock(table)?;
+        Ok((from as usize..t.range_end(last))
+            .find(|&fd| t.storage.get(fd).is_some())
+            .map(|fd| Fd(fd as i32)))
     }
     /// CLOSE_RANGE_UNSHARE: prepare a private successor without changing the
     /// old CLONE_FILES table. The venue must atomically publish the returned ID
