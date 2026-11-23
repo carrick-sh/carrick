@@ -258,3 +258,67 @@ fn hvf_task_state_owns_custody_through_stage2_state() {
         );
     }
 }
+
+/// The parameter list of `fn <name>(` in `source`, up to its return arrow.
+fn fn_params<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let header = format!("fn {name}(");
+    let tail = source.split(header.as_str()).nth(1)?;
+    tail.split_once(") ->").map(|(params, _)| params)
+}
+
+/// The stage-2 inventory wrappers reach the backend that the carrier VM's
+/// custody holds, never the HVF unit struct by name, so the soft VM can hand
+/// its own backend to the same custody code (#1236, M2b of the custody move).
+#[test]
+fn inventory_wrappers_reach_the_held_backend() {
+    let sources = hvf_sources();
+    let (_, backend_source) = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("trap/stage2_backend.rs"))
+        .expect("trap/stage2_backend.rs");
+    let by_name: Vec<_> = ["HvfStage2.map(", "HvfStage2.unmap(", "HvfStage2.destroy()"]
+        .into_iter()
+        .filter(|call| count(&sources, call) > 0)
+        .collect();
+    assert!(
+        by_name.is_empty(),
+        "the inventory wrappers must call the held `&dyn Stage2Backend`, not {by_name:?}"
+    );
+    for wrapper in [
+        "inventory_stage2_map",
+        "inventory_stage2_map_replay",
+        "inventory_stage2_unmap",
+        "inventory_stage2_destroy",
+    ] {
+        let params = fn_params(backend_source, wrapper)
+            .unwrap_or_else(|| panic!("trap/stage2_backend.rs must define `fn {wrapper}(`"));
+        assert!(
+            params.contains("dyn ") && params.contains("Stage2Backend"),
+            "`{wrapper}` must take the backend as `&dyn Stage2Backend`, has ({params})"
+        );
+    }
+    // Outside its own definition and trait impl, the HVF backend is named
+    // only where the carrier VM's custody is built.
+    let named_elsewhere: Vec<_> = sources
+        .iter()
+        .filter(|(path, _)| !path.ends_with("trap/carrier_custody.rs"))
+        .flat_map(|(path, source)| {
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("HvfStage2")
+                        && !line.contains("struct HvfStage2;")
+                        && !line.contains("Stage2Backend for HvfStage2 {")
+                        && !line.trim_start().starts_with("//")
+                })
+                .map(move |(index, line)| {
+                    format!("{}:{}: {}", path.display(), index + 1, line.trim())
+                })
+        })
+        .collect();
+    assert!(
+        named_elsewhere.is_empty(),
+        "only trap/carrier_custody.rs may build the HVF backend: {named_elsewhere:?}"
+    );
+}
