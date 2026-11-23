@@ -142,9 +142,10 @@ Docker oracle. The scoreboard is the fast smoke check.
   `just cross-check-macos` for macOS or HVF code; `just check-linux` and
   `cargo check -p carrick-vmm-kvm` for KVM, HAL or host-linux code; and
   `just build-cpl0` for shared personality, lifecycle or guest-copy code.
-- **macOS-only diffs run on a Mac** (`cargo test -p <crate> --lib`, or a
-  green `carrick-macos-ci` unit shard on the exact head) before their review
-  counts.
+- **macOS-only diffs run on a Mac** (`RUST_TEST_THREADS=1 cargo test -p
+  <crate> --lib`, or a green `carrick-macos-ci` unit shard on the exact head)
+  before their review counts. Without the single thread, `carrick-vmm-hvf`'s
+  `serial_host` tests run in parallel and flake (#2884).
 - **Done means live-verified:** a clean build, the tests, and a runtime demo
   on the exact binary. Rebuild after every merge you claim.
 - **One signed result belongs to one artifact.** Record HEAD, SHA-256,
