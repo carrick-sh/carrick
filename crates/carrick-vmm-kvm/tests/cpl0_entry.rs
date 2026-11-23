@@ -2680,6 +2680,25 @@ fn ring_panic_reaches_the_host_with_its_location_and_message() {
     );
 }
 
+/// A carrier invariant refusal (`fatal_boot`, about a hundred raising sites)
+/// must name its raising site and its callers, not only a halted CPU (#2853).
+#[test]
+fn carrier_fatal_reaches_the_host_with_its_raising_site() {
+    let fatal_prog = transport_program(3);
+    let peer_prog = transport_program(0);
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&fatal_prog, &peer_prog])
+        .expect("real KVM + CPL0 image");
+    let error = carrier
+        .observe(0)
+        .expect_err("a carrier fatal must end the run")
+        .to_string();
+    assert!(
+        error.contains("CPL0 fatal exit at src/isa/x86/transport.rs:")
+            && error.contains(": fatal_boot; ring return addresses: 0x"),
+        "expected the raising site and its callers, got {error}"
+    );
+}
+
 fn context_program() -> Vec<u8> {
     const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
     let mut bytes = Vec::new();

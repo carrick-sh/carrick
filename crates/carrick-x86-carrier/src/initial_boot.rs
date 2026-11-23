@@ -450,13 +450,9 @@ unsafe extern "C" {
     fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !;
 }
 
+/// Refuse a broken carrier invariant through the shared kernel's fatal transport.
 pub fn fatal_boot() -> ! {
-    // SAFETY: the carrier owns this fatal control doorbell; HLT prevents a
-    // refused boot from spinning inside KVM_RUN if the host resumes it.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") crate::entry::FATAL_PORT, in("al") 0_u8, options(nostack, preserves_flags));
-    }
-    crate::entry::halt()
+    carrick_el1::isa::x86::transport::fatal_boot()
 }
 
 pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
