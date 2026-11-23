@@ -3461,8 +3461,8 @@ fn mounted_static_x86_netlink_sockets_match_native() {
 /// in its poll. A root `O_NONBLOCK` set after the fork on a socket both
 /// hold reaches the child, and the child's receive leaves it set for the
 /// root, as on Linux, where the flag is the shared description's. Socket
-/// receive timeouts that must wait answer EAGAIN when they pass, and a
-/// write within one wakes the receive (#2878). Each wait is bounded by a
+/// receive and send timeouts that must wait answer EAGAIN when they pass,
+/// and a write within a receive timeout wakes the receive (#2878). Each wait is bounded by a
 /// receive timeout, a poll timeout or the other process's later write, so
 /// a lost wake prints a wrong line against the oracle instead of hanging.
 #[test]
