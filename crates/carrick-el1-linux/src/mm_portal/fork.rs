@@ -346,7 +346,16 @@ impl<
         if !root.fork_ready() {
             return Err(MmError::Busy);
         }
-        let _ = cow;
+        // A completed guest COW of the parent that the carrier has not yet
+        // settled leaves a replacement leaf the carrier still has to
+        // publish as present, writable and not COW. Arming it for this fork
+        // would break that publication. Completions are claimed and
+        // completed only under this editor, so with it held and none
+        // outstanding none can appear; one outstanding is the settlement's
+        // "not now": the caller rings it and the fork reruns (#2890).
+        if cow.has_completions_for(request.operation.mm.raw()) {
+            return Err(MmError::Busy);
+        }
         let child = self.child_root(request.child_mm, worker)?;
         if child.is_admitted() {
             return Err(MmError::Stale);
