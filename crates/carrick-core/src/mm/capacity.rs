@@ -2,7 +2,12 @@
 
 pub const MIN_BLOCK_SIZE: usize = 32;
 pub const HEADER_SIZE: usize = 32;
-pub const NUM_BINS: usize = 28;
+/// Two size classes per power of two from 64 bytes, through 2^37 bytes.
+/// Every class but the last is bounded above, so a block in any class
+/// above a request's class fits it: the two-head search below never misses
+/// a fitting block because a smaller one in a catch-all class was freed
+/// last (#1715: with 28 classes, everything from 768 KiB up shared one).
+pub const NUM_BINS: usize = 64;
 pub const MAX_EXTENTS: usize = 128;
 pub const BLOCK_MAGIC: u16 = 0xCA77;
 pub const NO_PREV_BLOCK: u32 = 0xFFFF_FFFF;
@@ -108,7 +113,7 @@ pub struct DeallocMetrics {
 /// Bounded segregated-fit allocator core.
 pub struct MetadataAllocatorCore {
     bins: [*mut BlockHeader; NUM_BINS],
-    active_bins: u32,
+    active_bins: u64,
     extents: [ExtentDescriptor; MAX_EXTENTS],
     extents_admitted_count: usize,
     active_extents_count: usize,
@@ -161,18 +166,11 @@ impl MetadataAllocatorCore {
         }
         let fls = (usize::BITS - 1 - size.leading_zeros()) as usize;
         if fls <= 6 {
-            0
-        } else if fls >= 23 {
-            NUM_BINS - 1
-        } else {
-            let base_bin = (fls - 6) * 2;
-            let half = 1usize << (fls - 1);
-            if (size & half) != 0 && base_bin + 1 < NUM_BINS {
-                base_bin + 1
-            } else {
-                base_bin.min(NUM_BINS - 1)
-            }
+            return 0;
         }
+        let half = 1usize << (fls - 1);
+        let bin = (fls - 6) * 2 + usize::from(size & half != 0);
+        bin.min(NUM_BINS - 1)
     }
 
     #[inline]
@@ -191,7 +189,7 @@ impl MetadataAllocatorCore {
                 (*head).prev_free = block;
             }
             self.bins[bin] = block;
-            self.active_bins |= 1u32 << bin;
+            self.active_bins |= 1u64 << bin;
         }
     }
 
@@ -207,7 +205,7 @@ impl MetadataAllocatorCore {
             } else {
                 self.bins[bin] = next;
                 if next.is_null() {
-                    self.active_bins &= !(1u32 << bin);
+                    self.active_bins &= !(1u64 << bin);
                 }
             }
 
@@ -339,7 +337,7 @@ impl MetadataAllocatorCore {
         let mut chosen_block: *mut BlockHeader = core::ptr::null_mut();
 
         // 1. Try head of target bin
-        if (self.active_bins & (1u32 << target_bin)) != 0 {
+        if (self.active_bins & (1u64 << target_bin)) != 0 {
             metrics.bins_checked += 1;
             let head = self.bins[target_bin];
             if !head.is_null() {
@@ -352,7 +350,7 @@ impl MetadataAllocatorCore {
 
         // 2. If target bin head didn't fit, check head of next non-empty bin
         if chosen_block.is_null() && target_bin + 1 < NUM_BINS {
-            let mask = !((1u32 << (target_bin + 1)) - 1);
+            let mask = !((1u64 << (target_bin + 1)) - 1);
             let next_bins = self.active_bins & mask;
             if next_bins != 0 {
                 metrics.bins_checked += 1;
@@ -704,7 +702,7 @@ pub struct AllocatorDiagnostics {
     pub active_extents: usize,
     pub total_capacity_bytes: usize,
     pub allocated_bytes: usize,
-    pub active_bins_mask: u32,
+    pub active_bins_mask: u64,
 }
 
 #[cfg(test)]
