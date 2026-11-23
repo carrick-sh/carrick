@@ -627,9 +627,10 @@ fn serve_family<'a, C: EntryContext + 'a>(
     if let Family::Sleep(call) = family {
         let original = pending.original_argument0();
         let isa = pending.guest_isa();
+        let crossing = pending.crossing_set();
         return pending
             .signal_native()
-            .and_then(|native| crate::sleep::invoke(call, isa, native))
+            .and_then(|native| crate::sleep::invoke(call, isa, crossing, native))
             .map_or(FamilyCompletion::Forward.into(), |outcome| {
                 let returned = match outcome {
                     crate::signal::SignalOutcome::Returned { result, .. } => {
