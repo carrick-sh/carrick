@@ -277,6 +277,66 @@ fn owner_private_file_len(description: &OpenDescription) -> Option<Result<u64, L
     }
 }
 
+/// How a `MAP_SHARED` mapping of a description may be served when the live
+/// host-file alias does not take it (#1338 C1), partitioned by description
+/// kind.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+enum SharedMapRoute {
+    /// A regular file whose description can store to it: a host file, an
+    /// overlay or `O_TMPFILE` file, or a memfd that no seal makes read-only.
+    /// Linux shares its page cache, so only a live view (the alias arm, or
+    /// the shared file window) serves it. A snapshot would drop every store
+    /// at munmap, so the snapshot arm never takes it: a counted `ENOSYS`.
+    LiveViewOnly,
+    /// A description whose snapshot is its whole Linux contract: `/dev/zero`
+    /// and other devices, packet rings, `memfd_secret`, synthetic and
+    /// executable files, and a regular file that can never be written
+    /// through this mapping (a read-only description, or a write-sealed
+    /// memfd). Today's route, unchanged.
+    Snapshot,
+}
+
+impl SharedMapRoute {
+    /// Whether a description's kind holds a regular file's bytes: a host
+    /// file, an overlay or `O_TMPFILE` file, or an in-memory file.
+    fn regular_file(description: &OpenDescription) -> bool {
+        match description {
+            OpenDescription::HostFile { metadata, .. } => {
+                metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File
+            }
+            OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn of(
+        regular_file: bool,
+        common: &crate::kernel::DescriptionCommon,
+        read_only_description: bool,
+    ) -> Self {
+        let write_sealed = common
+            .seals()
+            .and_then(carrick_abi::LinuxMemfdSeals::from_bits)
+            .is_some_and(|seals| {
+                seals.intersects(
+                    carrick_abi::LinuxMemfdSeals::WRITE
+                        | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
+                )
+            });
+        if regular_file && !read_only_description && !write_sealed && !common.secretmem() {
+            Self::LiveViewOnly
+        } else {
+            Self::Snapshot
+        }
+    }
+}
+
 fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
     address.checked_add(length).ok_or(LINUX_ENOMEM)?;
     Ok(super::overlaps_el0_clock_stub(address, length))
@@ -350,15 +410,17 @@ impl<'a> MemView<'a> {
             // before the mapping branches borrow or duplicate the descriptor.
             // Host-backed overlay files carry that guest-relative authority in
             // RootFsMetadata; never expose the host scratch path from F_GETPATH.
-            let proc_map_path = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
-                String::new()
+            // The same inspection classifies the description's kind for the
+            // shared-file fence below (`SharedMapRoute`).
+            let (proc_map_path, regular_file_description) = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                (String::new(), false)
             } else {
                 this.open_file(fd.0)
                     .map(|open_file| {
                         let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
-                            return String::new();
+                            return (String::new(), false);
                         };
-                        match &*open {
+                        let path = match &*open {
                             OpenDescription::File { path, .. }
                             | OpenDescription::SyntheticFile { path, .. }
                             | OpenDescription::InMemoryFile { path, .. } => path.clone(),
@@ -379,7 +441,8 @@ impl<'a> MemView<'a> {
                             }
                             OpenDescription::Packet { .. } => "[packet_ring]".to_string(),
                             _ => String::new(),
-                        }
+                        };
+                        (path, SharedMapRoute::regular_file(&open))
                     })
                     .unwrap_or_default()
             };
@@ -1238,6 +1301,34 @@ impl<'a> MemView<'a> {
                         prot_none,
                     });
                 }
+            }
+
+            // A MAP_SHARED regular file the live alias above did not take
+            // (MAP_FIXED, past EOF, an offset off the host granule, no host
+            // view) would otherwise fall to the snapshot arms below, which
+            // copy its bytes into private memory and drop every store (#1338
+            // C1). Every venue that forwards a shared file mmap reaches this
+            // one dispatcher, so the fence here covers them all.
+            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && map_sharing == MmapSharing::Shared
+                && this.open_file(fd.0).is_some_and(|open_file| {
+                    SharedMapRoute::of(
+                        regular_file_description,
+                        open_file.description.common(),
+                        mmap_read_only_shared_file,
+                    ) == SharedMapRoute::LiveViewOnly
+                })
+            {
+                cx.reporter.record(CompatEvent::partial_syscall(
+                    cx.number(),
+                    "mmap",
+                    cx.raw_args(),
+                    "MAP_SHARED of a writable regular file with no live host view (#1338)",
+                ));
+                return Ok(request.refused(
+                    MmapRefusal::Internal("MAP_SHARED of a writable regular file with no live host view"),
+                    LINUX_ENOSYS,
+                ));
             }
 
             // Guest MAP_SHARED|MAP_ANON: a sub-range of the shared aperture.
