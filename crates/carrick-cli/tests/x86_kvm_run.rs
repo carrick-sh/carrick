@@ -804,6 +804,43 @@ fn mounted_static_x86_first_call_after_exec_is_not_refused_for_owed_work() {
     );
 }
 
+/// #2832: an exec'd fork child's thread asks the host for a file. The exec
+/// gave the process leader a new execution generation; a thread born after
+/// it carries its own. The host compared the two and ended the run
+/// (`GenerationMismatch { stopped: 1, registered: 2 }`).
+#[test]
+fn mounted_static_x86_exec_child_member_reads_a_host_file() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exec-child-member");
+    compile_assembly_with_flags(
+        "x86_exec_child_member_host_file.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native exec-child-member oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"ok=4\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "exec-child-member-host-file", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "93 is exec failure, 95 a child that did not exit 0. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
