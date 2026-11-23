@@ -36061,6 +36061,13 @@
     {
       "family": "contention_variant",
       "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::window::SizeAdmission",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
       "owner": "carrick_core::mm::fork::ForkError",
       "lane": "shared",
       "ceiling": 1
