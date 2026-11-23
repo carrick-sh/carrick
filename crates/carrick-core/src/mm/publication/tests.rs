@@ -1574,7 +1574,15 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
     }
     let words = Arenas([&parent_tables, &child_tables, &supply]);
     let scratch = portal.census_fork(request, &words, 0).unwrap();
-    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(
+            request,
+            scratch,
+            &words,
+            &carrick_el1_abi::CowGrantPool::new(),
+            0,
+        )
+        .unwrap();
     // Descriptor arenas remain retained until both MMs are dropped. Physical
     // source custody is modeled by the selected IPA, not installed stage-2
     // backing; this component witness claims no host service or execution.

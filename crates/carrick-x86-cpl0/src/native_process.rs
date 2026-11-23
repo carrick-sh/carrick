@@ -494,9 +494,30 @@ impl Service {
             Ok(scratch) => scratch,
             Err(e) => return Err(free(child_space, refused(NativeForkStage::Scratch, e))),
         };
-        let plan = match owner.prepare_fork(loan.request, scratch, live, self.worker()) {
-            Ok(plan) => plan,
+        let cow = match carrick_el1_linux::mm_portal::carrier_cow_pool() {
+            Ok(cow) => cow,
             Err(e) => return Err(free(child_space, refused(NativeForkStage::Prepare, e))),
+        };
+        let plan = match owner.prepare_fork(loan.request, scratch, live, cow, self.worker()) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let refusal = free(child_space, refused(NativeForkStage::Prepare, e));
+                // The parent has a guest COW completion the carrier has not
+                // settled: ring that settlement now, with this fork's editor,
+                // index and loan released, so the rerun finds it settled
+                // (Busy once, then success). One left after the crossing met
+                // another CPU's editor; that CPU's member rings it again on
+                // its release (#2890).
+                if e == carrick_core::mm::transaction::MmError::Busy
+                    && cow.has_completions_for(loan.request.operation.mm.raw())
+                {
+                    carrick_x86_carrier::entry::cross_owner_grant(
+                        carrick_guest_arch::CpuId::new(self.worker()),
+                        carrick_guest_arch::UserVa::new(0),
+                    );
+                }
+                return Err(refusal);
+            }
         };
         let mut custody = Vec::new();
         if custody.try_reserve_exact(plan.custody().len()).is_err() {
