@@ -3555,6 +3555,97 @@ mod tests {
             }
         }
 
+        /// #1338 C1, the ring half: a `MAP_SHARED` file mapping that can
+        /// store to its file is never served in ring from a private source,
+        /// on any route (admitted root with or without a retained source,
+        /// `MAP_FIXED`, `MAP_POPULATE|MAP_FIXED`, or an MM with no admitted
+        /// root). Each leaves the root without a node and goes to the host
+        /// dispatcher, whose description-kind fence decides it
+        /// (`shared_file_mmap_without_a_live_view_is_fenced_by_description_kind`).
+        #[test]
+        fn writable_shared_file_mmap_leaves_the_ring_on_every_route() {
+            const MAP_POPULATE: u64 = 0x8000;
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let admitted = mm(&spaces, &table, 17, true);
+            let unadmitted = mm(&spaces, &table, 18, false);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let source = carrick_el1_abi::HostBackingIdentity::new(
+                core::num::NonZeroU64::new(9).unwrap(),
+                core::num::NonZeroU64::MIN,
+                0,
+            );
+            let rw = PROT_READ | PROT_WRITE;
+            let rows: [(&str, &Mm, [u64; 6], Option<_>, DelegatedAnonymous); 6] = [
+                (
+                    "admitted, plain",
+                    &admitted,
+                    [0, 0x2000, rw, MAP_SHARED, 3, 0],
+                    None,
+                    DelegatedAnonymous::Forward,
+                ),
+                (
+                    "admitted, plain, retained source",
+                    &admitted,
+                    [0, 0x2000, rw, MAP_SHARED, 3, 0],
+                    Some(source),
+                    DelegatedAnonymous::Forward,
+                ),
+                (
+                    "admitted, MAP_FIXED",
+                    &admitted,
+                    [ARENA, 0x2000, rw, MAP_SHARED | MAP_FIXED, 3, 0],
+                    None,
+                    DelegatedAnonymous::Forward,
+                ),
+                (
+                    "admitted, MAP_POPULATE|MAP_FIXED, retained source",
+                    &admitted,
+                    [
+                        ARENA,
+                        0x2000,
+                        rw,
+                        MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+                        3,
+                        0,
+                    ],
+                    Some(source),
+                    DelegatedAnonymous::Forward,
+                ),
+                (
+                    "no admitted root, plain",
+                    &unadmitted,
+                    [0, 0x2000, rw, MAP_SHARED, 3, 0],
+                    None,
+                    DelegatedAnonymous::NotDelegated,
+                ),
+                (
+                    "no admitted root, MAP_FIXED",
+                    &unadmitted,
+                    [ARENA, 0x2000, rw, MAP_SHARED | MAP_FIXED, 3, 0],
+                    None,
+                    DelegatedAnonymous::NotDelegated,
+                ),
+            ];
+            for (row, mm, args, file, expected) in rows {
+                let (route, _) = syscall_with_file(
+                    mm,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    args,
+                    file,
+                );
+                assert_eq!(route, expected, "{row}");
+            }
+            let mut model = root(&spaces, &table, &admitted);
+            assert!(
+                model.mapping(ARENA).is_none(),
+                "no writable shared file node was committed in ring"
+            );
+        }
+
         /// A read-only `MAP_SHARED` file mapping whose byte source the
         /// host-file venue retained is served in ring like a private one.
         /// It never becomes writable: `mprotect` asking for `PROT_WRITE` is
