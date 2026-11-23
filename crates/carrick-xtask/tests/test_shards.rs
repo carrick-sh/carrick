@@ -540,3 +540,49 @@ fn fixture_lockfile_gate_rejects_missing_nested_lock_before_cargo() {
             .contains("crates/backend/fixtures/probe/Cargo.toml")
     );
 }
+
+/// Every `rust-toolchain.toml` target installs on every host, the Mac gate
+/// runners included, so a target only one Linux job uses is declared by that
+/// job instead (#2854). The host authority census pins its Linux profiles to
+/// one triple: the host on x86_64 Linux, a cross target on Linux arm64. Its
+/// live test (`authority_debt`'s `cfg(target_os = "linux")` case) needs that
+/// triple's `rust-std` only on `linux-unit-arm`.
+#[test]
+fn census_linux_triple_installs_only_on_the_arm64_unit_lane() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let census =
+        std::fs::read_to_string(root.join("scripts/migrate/check-host-authority-transitions.py"))
+            .unwrap();
+    let triple = census
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("\"linux\": \"")?
+                .strip_suffix("\",")
+        })
+        .expect("the census's HOST_TRIPLES names a linux triple");
+    let pin: toml::Table = std::fs::read_to_string(root.join("rust-toolchain.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let targets = pin["toolchain"]["targets"].as_array().unwrap();
+    assert!(
+        !targets.iter().any(|t| t.as_str() == Some(triple)),
+        "rust-toolchain.toml must not declare {triple}: every host installs its targets, \
+         and the Mac runners refuse this one (#2854)"
+    );
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let documents = yaml_rust2::YamlLoader::load_from_str(&workflow).unwrap();
+    let steps = documents[0]["jobs"]["linux-unit-arm"]["steps"]
+        .as_vec()
+        .unwrap();
+    let position = |run: &str| steps.iter().position(|s| s["run"].as_str() == Some(run));
+    let toolchain = position("just ci-toolchain").expect("linux-unit-arm installs the pin");
+    let census_target = position(&format!("rustup target add {triple}"))
+        .unwrap_or_else(|| panic!("linux-unit-arm must install {triple} for the census test"));
+    let shard = position("just test-shard-${{ matrix.shard }}").unwrap();
+    assert!(
+        toolchain < census_target && census_target < shard,
+        "linux-unit-arm installs {triple} on the pinned toolchain, before the shard runs"
+    );
+}
