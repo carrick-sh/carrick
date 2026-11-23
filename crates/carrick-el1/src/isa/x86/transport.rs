@@ -68,7 +68,22 @@ pub fn witness(op: u64) -> u64 {
         }
         // A real Rust panic in the ring, through the image's panic handler.
         2 => panic!("transport witness panic {op}"),
+        // A carrier invariant refusal, through the carriers' `fatal_boot`.
+        3 => fatal_boot(),
         _ => u64::MAX,
+    }
+}
+
+/// Terminal refusal of a broken carrier invariant: publish it through the
+/// fatal port and halt this CPU.
+#[cold]
+#[inline(never)]
+pub fn fatal_boot() -> ! {
+    // SAFETY: the carrier owns this fatal control doorbell; HLT prevents a
+    // refused boot from spinning inside KVM_RUN if the host resumes it.
+    unsafe {
+        core::arch::asm!("out dx, al", "2: cli", "hlt", "jmp 2b",
+            in("dx") FATAL_PORT, in("al") 0_u8, options(noreturn));
     }
 }
 
