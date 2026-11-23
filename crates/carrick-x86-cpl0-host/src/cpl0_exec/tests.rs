@@ -74,9 +74,11 @@ struct TestFrames {
     released: usize,
     written: std::collections::BTreeMap<u64, Vec<u8>>,
     cleared: usize,
-    /// Release calls so far, and the one (by that count) reported failed.
+    /// Release calls so far, and the ones (by that count) reported failed.
     release_calls: usize,
-    fail_release: Option<usize>,
+    fail_release: Vec<usize>,
+    /// Report every table clear failed, clearing nothing.
+    fail_clear: bool,
 }
 
 impl TestFrames {
@@ -91,7 +93,8 @@ impl TestFrames {
             written: std::collections::BTreeMap::new(),
             cleared: 0,
             release_calls: 0,
-            fail_release: None,
+            fail_release: Vec::new(),
+            fail_clear: false,
         }
     }
     fn mapped(&self) -> usize {
@@ -135,7 +138,7 @@ impl X86ExecFrames for TestFrames {
             .map_err(|error| fail(error.to_string()))?;
         let call = self.release_calls;
         self.release_calls += 1;
-        if self.fail_release == Some(call) {
+        if self.fail_release.contains(&call) {
             return Err(fail("injected release failure"));
         }
         self.released += 1;
@@ -152,6 +155,9 @@ impl X86ExecFrames for TestFrames {
         Ok(bytes)
     }
     fn clear_tables(&mut self, tables: &[RootGpa]) -> Result<(), TrapError> {
+        if self.fail_clear {
+            return Err(fail("injected clear failure"));
+        }
         self.cleared += tables.len();
         Ok(())
     }
@@ -717,7 +723,7 @@ fn the_carrier_exit_drain_releases_every_row_and_reports_the_first_failure() {
     assert_ne!(fixture.frames.mapped(), 0);
 
     // The sealed row's second release, its build extent, reports a failure.
-    fixture.frames.fail_release = Some(1);
+    fixture.frames.fail_release = vec![1];
     let retired = fixture.preparations.retire_at_carrier_exit();
     assert_eq!(retired.len(), 2);
     let error = release_x86_execs_at_carrier_exit(
@@ -746,4 +752,104 @@ fn the_carrier_exit_drain_releases_every_row_and_reports_the_first_failure() {
     assert_eq!(fixture.frames.mapped(), 0, "the inventory's baseline");
     assert_eq!(fixture.preparations.census().carrier_exit, 2);
     assert_eq!(fixture.preparations.census().unretired(), 0);
+}
+
+/// Stage one row on `fixture` and leave it live for the carrier's exit,
+/// sealed (a ring cancellation returns it) or not (a refusal does).
+fn one_row_at_carrier_exit(fixture: &mut Fixture, sealed: bool) {
+    assert!(matches!(
+        fixture.stage(request(image(argv(), vec![]).unwrap())),
+        X86ExecStage::Staged(..)
+    ));
+    if sealed {
+        fixture.preparations.seal(fixture.receipt.unwrap()).unwrap();
+    }
+    assert_eq!(fixture.stock.table_stock().len(), 32 - 10);
+    assert_ne!(fixture.frames.mapped(), 0);
+}
+
+fn drain_at_carrier_exit(fixture: &mut Fixture) -> Result<usize, TrapError> {
+    let retired = fixture.preparations.retire_at_carrier_exit();
+    release_x86_execs_at_carrier_exit(
+        retired,
+        &mut fixture.stock,
+        &mut fixture.frames,
+        fixture.region.roots(),
+        fixture.region.zone(),
+    )
+}
+
+/// #2826 (review of #2868): a step that fails inside one row must not keep
+/// that row's later steps either, since the drain is the row's last chance.
+/// A sealed and an unsealed row each report their data frames' release
+/// failed; each still returns its build extent and its tables, and the
+/// failure is the drain's result.
+#[test]
+fn a_row_whose_data_release_fails_still_returns_its_build_extent_and_tables() {
+    for sealed in [true, false] {
+        let mut fixture = Fixture::new(32);
+        one_row_at_carrier_exit(&mut fixture, sealed);
+        fixture.frames.fail_release = vec![0];
+        let error = drain_at_carrier_exit(&mut fixture).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("injected release failure"),
+            "sealed={sealed}: the drain reports the failure: {error:?}"
+        );
+        assert_eq!(
+            fixture.frames.release_calls, 2,
+            "sealed={sealed}: the build extent was released after the data failed"
+        );
+        assert_eq!(
+            fixture.frames.mapped(),
+            0,
+            "sealed={sealed}: inventory baseline"
+        );
+        assert_eq!(
+            fixture.stock.table_stock().len(),
+            32,
+            "sealed={sealed}: stock baseline"
+        );
+        assert_eq!(fixture.preparations.census().unretired(), 0);
+    }
+}
+
+/// A sealed row whose tables fail to clear still returns its data frames and
+/// build extent. Its tables stay out of the stock, whose pages must be zero:
+/// a build may have written them.
+#[test]
+fn a_sealed_row_whose_tables_fail_to_clear_returns_its_frames_but_withholds_its_tables() {
+    let mut fixture = Fixture::new(32);
+    one_row_at_carrier_exit(&mut fixture, true);
+    fixture.frames.fail_clear = true;
+    let error = drain_at_carrier_exit(&mut fixture).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("injected clear failure"),
+        "the drain reports the clear failure: {error:?}"
+    );
+    assert_eq!(
+        fixture.frames.release_calls, 2,
+        "data frames and build extent"
+    );
+    assert_eq!(fixture.frames.released, 2);
+    assert_eq!(fixture.frames.mapped(), 0, "the inventory's baseline");
+    assert_eq!(
+        fixture.stock.table_stock().len(),
+        32 - 10,
+        "uncleared tables never return to the stock"
+    );
+}
+
+/// Every failure counts: the drain's result is the first failure, and names
+/// how many steps failed after it.
+#[test]
+fn the_carrier_exit_drain_counts_the_failures_after_the_first() {
+    let mut fixture = Fixture::new(32);
+    one_row_at_carrier_exit(&mut fixture, true);
+    fixture.frames.fail_release = vec![0, 1];
+    let error = drain_at_carrier_exit(&mut fixture).unwrap_err();
+    let text = format!("{error}");
+    assert!(
+        text.contains("injected release failure") && text.contains("1 more"),
+        "the first failure, and the count after it: {text}"
+    );
 }
