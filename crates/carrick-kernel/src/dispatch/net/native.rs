@@ -777,7 +777,7 @@ impl SyscallDispatcher {
             Ran::Outcome(DispatchOutcome::WaitOnFds {
                 fds, timeout: None, ..
             }) => match (&socket, waiter, revision) {
-                (Some((socket, _)), Some(record), Some(revision)) if !fds.fds.is_empty() => {
+                (Some((socket, _)), Some(record), Some(revision)) if !fds.fds.is_empty() => 'wait: {
                     let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
                     let source = socket.source(&reactor);
                     let description = socket.description();
@@ -800,8 +800,9 @@ impl SyscallDispatcher {
                             });
                             continue;
                         }
+                        // The scratch slots still need their release below.
                         let Some(queue) = description.wait_queue() else {
-                            return NetServed::Refused;
+                            break 'wait NetServed::Refused;
                         };
                         zone.push(crate::host_readiness::HostReadinessZoneInterest {
                             source,
