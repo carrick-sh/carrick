@@ -9,6 +9,11 @@ name: Soft aarch64 on demand
 # Only people with write access can dispatch it. It checks out the requested
 # ref with no persisted credentials, gets no secrets (no compiler-cache
 # credentials, so it builds cold), and only reads repository contents.
+#
+# Dispatch from main: gh workflow run soft-a64-dispatch.yml -f ref=<branch-or-sha>
+#   [-f filter=<test name>] [-f ignored=false]. The workflow definition comes
+# from the dispatched branch (main); the code under test, including the
+# repository's local actions and scripts/ci, comes from `ref`.
 
 on:
   workflow_dispatch:
@@ -77,6 +82,11 @@ jobs:
           status=0
           filter=()
           [ -n "$FILTER" ] && filter=("$FILTER")
+          # The unit pass always runs (the same three packages as ci.yml's
+          # soft-aarch64-native job); the ignored witnesses run on top of it.
+          cargo test -p carrick-softcpu-aarch64 -p carrick-host-jit -p carrick-softcpu-aarch64-host \
+            -- "${filter[@]}" > soft-aarch64-logs/unit.log 2>&1 || status=$?
+          cat soft-aarch64-logs/unit.log
           if [ "$IGNORED" = "true" ]; then
             cargo build -p carrick-el1-image > soft-aarch64-logs/el1-build.log 2>&1 || status=$?
             cat soft-aarch64-logs/el1-build.log
@@ -87,15 +97,11 @@ jobs:
             host=$(rustc -vV | sed -n 's/^host: //p')
             export CARRICK_LLVM_OBJDUMP="$sysroot/lib/rustlib/$host/bin/llvm-objdump"
             CARRICK_A64_ELF="$PWD/$elf" cargo test --release -p carrick-softcpu-aarch64 -p carrick-softcpu-aarch64-host --tests \
-              -- --include-ignored --nocapture "${filter[@]}" \
+              -- --ignored --nocapture "${filter[@]}" \
               --skip generated_loader_vector_spans_are_typed \
               --skip production_loader_vector_spans_split_and_translate_with_no_undefined_word \
               > soft-aarch64-logs/probe.log 2>&1 || status=$?
             cat soft-aarch64-logs/probe.log
-          else
-            cargo test -p carrick-softcpu-aarch64 -p carrick-host-jit -p carrick-softcpu-aarch64-host \
-              -- "${filter[@]}" > soft-aarch64-logs/unit.log 2>&1 || status=$?
-            cat soft-aarch64-logs/unit.log
           fi
           exit "$status"
       - uses: actions/upload-artifact@v4
