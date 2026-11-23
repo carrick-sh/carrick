@@ -7649,3 +7649,23 @@ fn production_syscall_boundary_reenters_once_after_contended_signal_copies() {
 fn production_syscall_boundary_reenters_once_after_owner_waited_signal_copies() {
     syscall_boundary_rerun(&["-DEDITOR_BUSY"]);
 }
+
+/// #2900 acceptance guard: Go's netpoller shape. The root blocks in
+/// `epoll_pwait` through Go's `Syscall6` argument shuffle while a peer
+/// thread on the other CPU interrupts it with an `SA_RESTART` signal and
+/// wakes it through an eventfd. Every return keeps every argument register,
+/// `events` above all: #2900 saw it hold the call's own return RIP.
+#[test]
+fn production_go_shaped_epoll_pwait_keeps_its_arguments_under_signals() {
+    let elf = native_exit_fixture("native_epoll_wait_args.S");
+    assert_eq!(native_oracle_status(&elf), Some(0), "native Linux oracle");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 1 << 16)
+        .map_err(|failure| failure.error)
+        .expect("Go-shaped epoll_pwait run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_epoll_wait_args.S): {:?}",
+        outcome.run
+    );
+}
