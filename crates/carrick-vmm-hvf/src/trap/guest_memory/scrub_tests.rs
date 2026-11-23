@@ -112,7 +112,7 @@ fn retained_interior_pages_republish_lifetime_edges() {
         physical_ipa: ipa,
         physical_host_addr: backing.ptr as usize,
         physical_size: LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {

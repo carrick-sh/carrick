@@ -40,7 +40,7 @@ fn shared_mm_task_projection_preserves_structural_owner() {
         physical_ipa: ipa,
         physical_host_addr: host,
         physical_size: size,
-        perms: applevisor::memory::MemPerms::ReadExec,
+        perms: carrick_hal::MemPerms::ReadExec,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: false,
@@ -86,7 +86,7 @@ fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
         physical_ipa: 0x1000,
         physical_host_addr: 0x7000usize as *mut u8,
         physical_size: 0x4000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::GlobalShared,
         guest_writable: true,
@@ -102,7 +102,7 @@ fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
     assert_eq!(copied.end, 0x5000);
     assert_eq!(copied.host_addr, 0x7000usize as *mut u8);
     assert_eq!(copied.size, 0x4000);
-    assert_eq!(copied.perms, applevisor::memory::MemPerms::ReadWrite);
+    assert_eq!(copied.perms, carrick_hal::MemPerms::ReadWrite);
     assert!(copied.memory.is_none());
     assert!(copied.host_mapping.is_none());
     assert_eq!(copied.sharing, GuestMappingSharing::GlobalShared);
@@ -164,7 +164,7 @@ pub(crate) fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
         host_addr: std::ptr::null_mut(),
         size: usize::try_from(end - start).unwrap(),
         physical_size: usize::try_from(end - start).unwrap(),
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -566,7 +566,7 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
         let mut region = mapped_region(start, start + size, start);
         region.host_addr = host as *mut u8;
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
-            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.perms = carrick_hal::MemPerms::ReadWrite;
             region.guest_writable = true;
         }
         region
@@ -643,7 +643,7 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
         .iter_mut()
         .find(|mapping| mapping.start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE)
         .expect("fd ceiling control descriptor");
-    control.perms = applevisor::memory::MemPerms::Read;
+    control.perms = carrick_hal::MemPerms::Read;
     control.guest_writable = false;
     assert!(
         audit_persistent_executor_carrier_mappings(&carrier).is_err(),
@@ -722,7 +722,7 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
         region.host_mapping = Some(host.into());
         region.stage2_lease = Some(lease);
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
-            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.perms = carrick_hal::MemPerms::ReadWrite;
             region.guest_writable = true;
         }
         task_mappings.insert(region);
@@ -834,7 +834,7 @@ fn fixture_persistent_carrier() -> (
         region.host_mapping = Some(host.into());
         region.stage2_lease = Some(lease);
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
-            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.perms = carrick_hal::MemPerms::ReadWrite;
             region.guest_writable = true;
         }
         task_mappings.insert(region);

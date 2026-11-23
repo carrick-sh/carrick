@@ -740,7 +740,7 @@ fn install_owner(ipa: u64, bytes: &[u8]) -> (u64, usize) {
     let owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(ipa, length as u64),
         mapping,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         generation,
         ipa,
         length as u64,
@@ -996,7 +996,7 @@ fn prepare_foreign_cow(
         physical_ipa: data_key.0,
         physical_host_addr: host_addr,
         physical_size: data_key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -2334,7 +2334,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         physical_ipa: old_key.0,
         physical_host_addr: host_addr,
         physical_size: old_key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadExec),
         guest_writable: false,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -2355,7 +2355,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         physical_ipa: old_key.0,
         physical_host_addr: host_addr,
         physical_size: old_key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -2556,7 +2556,7 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
         physical_ipa: old_key.0,
         physical_host_addr: host_addr,
         physical_size: old_key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadExec),
         guest_writable: false,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -2688,7 +2688,7 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         physical_ipa: old_key.0,
         physical_host_addr: host_addr,
         physical_size: old_key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadExec),
         guest_writable: false,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -5305,7 +5305,7 @@ fn fork_overlay_owner_lookup_does_not_rescan_every_source_mapping() {
             physical_ipa,
             physical_host_addr: std::ptr::null_mut(),
             physical_size: 0x4000,
-            perms: applevisor::memory::MemPerms::RW,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -5450,7 +5450,7 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
             "a drifted structural host must fail closed",
         );
     let mut wrong_perms = desc.clone();
-    wrong_perms.perms = applevisor::memory::MemPerms::ReadWrite;
+    wrong_perms.perms = carrick_hal::MemPerms::ReadWrite;
     assert!(
         inherited_fork_inventory_extents_indexed(
             &transport.custody,
@@ -5622,7 +5622,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         host_addr: page_tables_host_addr,
         size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
         physical_size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: Some(page_tables_host.into()),
         structural_owner: None,
@@ -6583,7 +6583,7 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
         .expect("G1 structural owner");
     let g1_identity = *owner.retained.record_identity.lock();
     let host_addr = owner.ptr() as usize;
-    let perms = u64::from(region.perms);
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(region.perms);
 
     destroy_vm_with_custody_using(&transport.custody, "structural G1 destroy", || 0, || {})
         .expect("destroy G1 structural fixture");
@@ -6728,7 +6728,7 @@ fn structural_alias_rejects_forged_semantic_host_projection() {
         physical_ipa: region.physical_ipa,
         physical_host_addr: source.physical_host_addr as usize,
         physical_size: region.physical_size,
-        perms: u64::from(region.perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(region.perms),
         guest_writable: region.guest_writable,
         sharing: region.sharing,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -7072,7 +7072,7 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
         physical_ipa: overlay_base,
         physical_host_addr: region.host_addr as usize,
         physical_size: overlay_size as usize,
-        perms: u64::from(region.perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(region.perms),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -7134,7 +7134,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         &transport.custody,
         host,
         source_lease,
-        u64::from(applevisor::memory::MemPerms::ReadExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadExec),
         next_structural_epoch().expect("mint borrowed structural epoch"),
         physical_ipa,
         len as usize,
@@ -7157,7 +7157,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
             physical_host_addr: host_addr,
             physical_size: len as usize,
             inventory_backing: InventoryBackingIdentity::Private(801),
-            perms: applevisor::memory::MemPerms::ReadExec,
+            perms: carrick_hal::MemPerms::ReadExec,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: false,
@@ -7706,7 +7706,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_pt_addr,
             size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
             physical_size: crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             guest_writable: true,
             memory: None,
             host_mapping: Some(parent_pt_host.into()),
@@ -7726,7 +7726,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_el1_addr,
             size: crate::memory::LINUX_EL1_VECTORS_SIZE as usize,
             physical_size: crate::memory::LINUX_EL1_VECTORS_SIZE as usize,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             guest_writable: true,
             memory: None,
             host_mapping: Some(parent_el1_host.into()),
@@ -7747,7 +7747,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_mailbox_addr,
             size: crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize,
             physical_size: crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             guest_writable: true,
             memory: None,
             host_mapping: Some(parent_mailbox_host.into()),
@@ -7767,7 +7767,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_rx_addr,
             size: 0x4000,
             physical_size: 0x4000,
-            perms: applevisor::memory::MemPerms::ReadExec,
+            perms: carrick_hal::MemPerms::ReadExec,
             guest_writable: false,
             memory: None,
             host_mapping: None,
@@ -7787,7 +7787,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_rw_addr,
             size: 0x4000,
             physical_size: 0x4000,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             guest_writable: true,
             memory: None,
             host_mapping: None,
@@ -7807,7 +7807,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_addr: parent_cow_addr,
             size: 0x4000,
             physical_size: 0x4000,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             guest_writable: true,
             memory: None,
             host_mapping: None,
@@ -8082,7 +8082,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             .iter()
             .find(|m| m.start == crate::memory::LINUX_EL1_VECTORS_BASE)
             .expect("child el1 mapping descriptor");
-        assert_eq!(el1_desc.perms, applevisor::memory::MemPerms::ReadWrite);
+        assert_eq!(el1_desc.perms, carrick_hal::MemPerms::ReadWrite);
         assert_ne!(el1_desc.physical_ipa, 0);
         assert_ne!(el1_desc.physical_ipa, pt_physical_ipa);
         (el1_desc.physical_ipa, el1_desc.physical_size)
@@ -8094,7 +8094,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             .iter()
             .find(|m| m.start == crate::memory::LINUX_SYSCALL_MAILBOX_BASE)
             .expect("child mailbox mapping descriptor");
-        assert_eq!(mb_desc.perms, applevisor::memory::MemPerms::ReadWrite);
+        assert_eq!(mb_desc.perms, carrick_hal::MemPerms::ReadWrite);
         assert_ne!(mb_desc.physical_ipa, 0);
         assert_ne!(mb_desc.physical_ipa, pt_physical_ipa);
         assert_ne!(mb_desc.physical_ipa, el1_physical_ipa);
@@ -8209,7 +8209,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         .iter()
         .find(|m| m.physical_ipa == el1_physical_ipa)
         .expect("prepared el1 mapping");
-    assert_eq!(prepared_el1.perms, applevisor::memory::MemPerms::ReadWrite);
+    assert_eq!(prepared_el1.perms, carrick_hal::MemPerms::ReadWrite);
     assert_eq!(prepared_el1.physical_ipa, el1_physical_ipa);
     let el1_owner = custody
         .global_frame_host_owners
@@ -8230,7 +8230,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         .iter()
         .find(|m| m.physical_ipa == mailbox_physical_ipa)
         .expect("prepared mailbox mapping");
-    assert_eq!(prepared_mb.perms, applevisor::memory::MemPerms::ReadWrite);
+    assert_eq!(prepared_mb.perms, carrick_hal::MemPerms::ReadWrite);
     assert_eq!(prepared_mb.physical_ipa, mailbox_physical_ipa);
     let mb_owner = custody
         .global_frame_host_owners
@@ -8251,7 +8251,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         .find(|m| m.start == 0x0040_0000)
         .expect("prepared rx mapping");
     assert_eq!(prepared_rx.owner_generation, parent_rx_gen);
-    assert_eq!(prepared_rx.perms, applevisor::memory::MemPerms::ReadExec);
+    assert_eq!(prepared_rx.perms, carrick_hal::MemPerms::ReadExec);
 
     let prepared_rw = prepared_task
         .mappings
@@ -8259,7 +8259,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         .find(|m| m.start == 0x0060_0000)
         .expect("prepared rw mapping");
     assert_eq!(prepared_rw.owner_generation, parent_rw_gen);
-    assert_eq!(prepared_rw.perms, applevisor::memory::MemPerms::ReadWrite);
+    assert_eq!(prepared_rw.perms, carrick_hal::MemPerms::ReadWrite);
 
     let prepared_cow = prepared_task
         .mappings
@@ -8267,7 +8267,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         .find(|m| m.start == 0x0080_0000)
         .expect("prepared cow mapping");
     assert_eq!(prepared_cow.owner_generation, parent_cow_gen);
-    assert_eq!(prepared_cow.perms, applevisor::memory::MemPerms::ReadWrite);
+    assert_eq!(prepared_cow.perms, carrick_hal::MemPerms::ReadWrite);
 
     // Verify staged inventory row received the exact minted structural epoch
     if let HvpatchTaskInventoryAuthority::ProcessPrepared { staged, .. } = &prepared_task.inventory
@@ -8819,7 +8819,7 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -8915,7 +8915,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         physical_ipa: extent_base,
         physical_host_addr: host_addr,
         physical_size: size,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
         ownership_scope: AliasOwnershipScope::Global,
@@ -8939,7 +8939,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         host_addr: host_addr as *mut u8,
         size,
         physical_size: size,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -9167,7 +9167,7 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
         physical_ipa: key_a.0,
         physical_host_addr: host_addr_a,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -9283,7 +9283,7 @@ fn semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -9348,7 +9348,7 @@ fn semantic_lookup_rejects_stale_owner_generation_and_accepts_current() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -9427,7 +9427,7 @@ fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: size,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -9581,7 +9581,7 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
         physical_ipa: key.0,
         physical_host_addr: host,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
@@ -9602,7 +9602,7 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
         host_addr: stale.host_addr as *mut u8,
         size: edge_len,
         physical_size: OWNER_LEN,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -9763,7 +9763,7 @@ fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
         ownership_scope: AliasOwnershipScope::Global,
@@ -9847,7 +9847,7 @@ fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner
         host_addr: std::ptr::null_mut(),
         size: OWNER_LEN,
         physical_size: OWNER_LEN,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -9895,7 +9895,7 @@ fn persistent_reusable_cow_alias_rejects_zero_owner_generation() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -9937,7 +9937,7 @@ fn persistent_reusable_cow_mapping_rejects_zero_owner_generation() {
         host_addr: host_addr as *mut u8,
         size: OWNER_LEN,
         physical_size: OWNER_LEN,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -10101,7 +10101,7 @@ fn owned_global_frame_alias_uses_the_fresh_registered_owner_generation() {
             physical_host_addr,
             physical_size: len as usize,
             inventory_backing: InventoryBackingIdentity::Private(930),
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -10292,7 +10292,7 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
                 physical_host_addr: pt_host_addr,
                 physical_size: pt_len as usize,
                 inventory_backing: InventoryBackingIdentity::Private(1),
-                perms: applevisor::memory::MemPerms::ReadWrite,
+                perms: carrick_hal::MemPerms::ReadWrite,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
@@ -10315,7 +10315,7 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
                 physical_host_addr: parent_addr,
                 physical_size: parent_len as usize,
                 inventory_backing: InventoryBackingIdentity::Private(2),
-                perms: applevisor::memory::MemPerms::ReadWrite,
+                perms: carrick_hal::MemPerms::ReadWrite,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: false,
@@ -10476,7 +10476,7 @@ fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVm
             physical_host_addr: host_addr,
             physical_size: SIZE,
             inventory_backing: InventoryBackingIdentity::Private(ipa),
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -10569,7 +10569,7 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
         },
         0,
@@ -10625,7 +10625,7 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
         },
         0,
@@ -10662,7 +10662,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
                 sentinel_host.as_ptr().cast(),
                 sentinel_ipa,
                 sentinel_size,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
         },
         0,
@@ -10673,7 +10673,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
         &custody,
         sentinel_host,
         sentinel_lease,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         next_structural_epoch().expect("sentinel epoch"),
         sentinel_ipa,
         sentinel_size,
@@ -10761,7 +10761,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
             physical_host_addr: pt_host_addr,
             physical_size: 0x20_0000,
             inventory_backing: InventoryBackingIdentity::Private(1),
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -10884,7 +10884,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
                 physical_host_addr: pt_host_addr2_row1,
                 physical_size: 0x20_0000,
                 inventory_backing: InventoryBackingIdentity::Private(1),
-                perms: applevisor::memory::MemPerms::ReadWrite,
+                perms: carrick_hal::MemPerms::ReadWrite,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
@@ -10904,7 +10904,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
                 physical_host_addr: pt_host_addr2_row2,
                 physical_size: 0x20_0000,
                 inventory_backing: InventoryBackingIdentity::Private(2),
-                perms: applevisor::memory::MemPerms::ReadWrite,
+                perms: carrick_hal::MemPerms::ReadWrite,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
@@ -11085,7 +11085,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
             physical_host_addr: pt_host_addr3,
             physical_size: 0x20_0000,
             inventory_backing: InventoryBackingIdentity::Private(1),
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -12157,7 +12157,7 @@ fn retained_reuse_fixture(
         host_addr: root_host as *mut u8,
         size: root_key.1 as usize,
         physical_size: root_key.1 as usize,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,

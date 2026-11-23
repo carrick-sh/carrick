@@ -389,7 +389,8 @@ pub(super) fn project_owner_fork_frames(
             };
             let mut take = (record.ipa + record.len as u64).min(end) - cursor;
             let start = va + (cursor - ipa);
-            let perms = applevisor::memory::MemPerms::from(record.perms);
+            let perms = carrick_aarch64::stage2::stage2_perms_from_bits(record.perms)
+                .unwrap_or(carrick_hal::MemPerms::None);
             let source = inventory
                 .lock()
                 .extents
@@ -609,7 +610,7 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 physical_host_addr: pointer,
                 physical_size: owner.physical_size,
                 inventory_backing: backing,
-                perms: applevisor::memory::MemPerms::ReadWriteExec,
+                perms: carrick_hal::MemPerms::ReadWriteExec,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: false,
@@ -741,7 +742,7 @@ impl HvfVmState {
         if let Err(error) = state.publish_raw_stage1_arenas_into(
             &custody,
             &[request.root_slot_base, control],
-            applevisor::memory::MemPerms::ReadWriteExec,
+            carrick_hal::MemPerms::ReadWriteExec,
             &mut raw,
         ) {
             for region in &raw {
@@ -855,7 +856,7 @@ mod tests {
             &custody,
             lease,
             host,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .unwrap();
         let frame = carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(1).unwrap());
@@ -992,7 +993,7 @@ mod tests {
                 &custody,
                 mapping,
                 lease,
-                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
                 next_structural_epoch().unwrap(),
                 ipa,
                 0x4000,
@@ -1038,7 +1039,7 @@ mod tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
             )
             .unwrap();
         }
@@ -1084,7 +1085,7 @@ mod tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .unwrap();
         }

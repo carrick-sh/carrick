@@ -256,7 +256,8 @@ impl ForkStockHostCustody {
             let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
             let len = crate::frame_pool::ROOT_SLOT_SIZE;
-            let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+            let perms =
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
             let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base, len as u64);
             let owner =
                 if let Some(arena) = pool.as_ref().and_then(|pool| pool.allocate_slot_at(base)) {
@@ -338,7 +339,8 @@ impl ForkStockHostCustody {
             crate::host_mapping::HostMappingKind::PerMmKernelState,
         )
         .map_err(|error| TrapError::Hypervisor(format!("native fork control backing: {error}")))?;
-        let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
         // SAFETY: the fresh IPA lease and mapping are retained by the owner.
         let result =
             unsafe { crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms) };
@@ -1031,7 +1033,7 @@ mod tests {
                 &custody,
                 mapping,
                 lease,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 crate::trap::next_structural_epoch().unwrap(),
                 ipa,
                 0x4000,

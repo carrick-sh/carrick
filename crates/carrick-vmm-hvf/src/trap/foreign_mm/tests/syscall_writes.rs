@@ -288,7 +288,7 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
         physical_ipa: key.0,
         physical_host_addr: owner.ptr() as usize,
         physical_size: OWNER_LEN,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(

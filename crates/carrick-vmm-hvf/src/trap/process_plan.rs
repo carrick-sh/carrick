@@ -174,7 +174,7 @@ pub(super) fn disarm_independent_fork_mappings(
         armed.disarm(CowArmedSpan {
             va: mapping.start,
             len: mapping.size,
-            executable: u64::from(mapping.perms) & 4 != 0,
+            executable: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms) & 4 != 0,
             kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
         });
     }
@@ -1024,7 +1024,7 @@ impl HvfTaskState {
                     }
                     continue;
                 };
-                let raw = u64::from(mapping.perms);
+                let raw = carrick_aarch64::stage2::stage2_perms_bits(mapping.perms);
                 let fork_frame_receipt_kind =
                     fork_frame_receipt_kind(disposition, mapping.start, mapping.size);
                 let scope = CowInventoryLifecycleScope {
@@ -1313,7 +1313,8 @@ impl HvfTaskState {
                     mapping.end.saturating_sub(mapping.start),
                     carrick_mmu_core::aarch64::UserLeafAccess {
                         writable: mapping.guest_writable,
-                        executable: u64::from(mapping.perms) & 4 != 0,
+                        executable: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms) & 4
+                            != 0,
                     },
                     None,
                 )
@@ -1359,7 +1360,7 @@ impl HvfTaskState {
                 gpa: physical_ipa,
                 length: physical_size as u64,
                 permissions: {
-                    let raw = u64::from(mapping.perms);
+                    let raw = carrick_aarch64::stage2::stage2_perms_bits(mapping.perms);
                     carrick_hal::MemPerms {
                         read: raw & 1 != 0,
                         write: raw & 2 != 0,
@@ -1638,7 +1639,7 @@ impl HvfTaskState {
                 physical_host_addr,
                 physical_size: TWO_MIB,
                 inventory_backing,
-                perms: applevisor::memory::MemPerms::ReadWrite,
+                perms: carrick_hal::MemPerms::ReadWrite,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
@@ -1911,7 +1912,7 @@ mod tests {
             physical_ipa: ipa,
             physical_host_addr: std::ptr::null_mut(),
             physical_size: 0x20_0000,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,

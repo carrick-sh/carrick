@@ -2357,7 +2357,7 @@ pub(crate) fn publish_exec_region_host_owner_in(
             custody,
             host_mapping,
             lease,
-            u64::from(region.perms),
+            carrick_aarch64::stage2::stage2_perms_bits(region.perms),
             epoch,
             key.0,
             usize::try_from(key.1).map_err(|_| TrapError::MappingTooLarge(key.1))?,
@@ -2365,7 +2365,12 @@ pub(crate) fn publish_exec_region_host_owner_in(
         region.structural_owner = Some(owner);
         epoch.raw()
     } else {
-        register_global_frame_host_owner_in(custody, lease, host_mapping, u64::from(region.perms))?
+        register_global_frame_host_owner_in(
+            custody,
+            lease,
+            host_mapping,
+            carrick_aarch64::stage2::stage2_perms_bits(region.perms),
+        )?
     };
     region.owner_generation = owner_generation;
     Ok(owner_generation)
@@ -2394,7 +2399,7 @@ pub(crate) fn publish_pooled_exec_root_owner_in(
         custody,
         handle,
         lease,
-        u64::from(region.perms),
+        carrick_aarch64::stage2::stage2_perms_bits(region.perms),
         epoch,
         key.0,
         usize::try_from(key.1).map_err(|_| TrapError::MappingTooLarge(key.1))?,
@@ -2424,7 +2429,7 @@ pub(crate) fn publish_installed_exec_region_owner_in(
         || snapshot.ipa != region.physical_ipa
         || snapshot.len != region.physical_size
         || snapshot.host_addr != region.host_addr as usize
-        || snapshot.perms != u64::from(region.perms)
+        || snapshot.perms != carrick_aarch64::stage2::stage2_perms_bits(region.perms)
         || !snapshot.mapped
         || !snapshot.backend_map_installed
         || !snapshot.release_ipa
@@ -2479,7 +2484,7 @@ fn publish_installed_structural_owner(
         || snapshot.ipa != region.physical_ipa
         || snapshot.len != region.physical_size
         || snapshot.host_addr != region.host_addr as usize
-        || snapshot.perms != u64::from(region.perms)
+        || snapshot.perms != carrick_aarch64::stage2::stage2_perms_bits(region.perms)
         || snapshot.logical_owner
             != Some(CarrierLogicalOwner {
                 id: epoch.raw(),
@@ -2677,7 +2682,7 @@ impl StructuralBackingOwner {
             legacy_test_carrier_vm_custody_arc(),
             mapping,
             stage2_lease,
-            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
             epoch,
             physical_ipa,
             physical_size,
@@ -4432,7 +4437,7 @@ pub(crate) fn replayed_global_frame_owners_for_regions_in<'a>(
                 ipa: key.0,
                 length: key.1,
                 host_addr: identity.host_addr,
-                perms: u64::from(mapping.perms),
+                perms: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
             });
         }
     }

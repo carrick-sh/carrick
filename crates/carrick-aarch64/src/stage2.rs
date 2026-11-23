@@ -140,6 +140,26 @@ mod tests {
         );
     }
 
+    /// The named sets encode as the hypervisor words they replace
+    /// (`HV_MEMORY_READ` 1, `HV_MEMORY_WRITE` 2, `HV_MEMORY_EXEC` 4).
+    #[test]
+    fn every_named_set_encodes_as_its_hypervisor_word() {
+        let named = [
+            (MemPerms::None, 0),
+            (MemPerms::Read, 1),
+            (MemPerms::Write, 2),
+            (MemPerms::ReadWrite, 3),
+            (MemPerms::Exec, 4),
+            (MemPerms::ReadExec, 5),
+            (MemPerms::WriteExec, 6),
+            (MemPerms::ReadWriteExec, 7),
+        ];
+        for (perms, bits) in named {
+            assert_eq!(stage2_perms_bits(perms), bits, "{perms:?}");
+            assert_eq!(stage2_perms_from_bits(bits), Some(perms));
+        }
+    }
+
     #[test]
     fn a_word_outside_rwx_is_refused() {
         assert_eq!(stage2_perms_from_bits(8), None);

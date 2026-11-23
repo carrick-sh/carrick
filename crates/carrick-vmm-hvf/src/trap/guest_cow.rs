@@ -73,7 +73,7 @@ pub(crate) fn provision_guest_cow_grants(
             "guest COW grants serve only a guest-owned MM".to_owned(),
         ));
     }
-    let stage2_perms = super::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
+    let stage2_perms = carrick_hal::physical_grants::COW_GRANT_PERMISSIONS;
     let mut published = 0;
     while published < count {
         let (new_host_ptr, new_physical_ipa, owner_generation) =
@@ -277,13 +277,13 @@ pub(crate) fn require_guest_cow_settled(mm: u64, site: &'static str) {
 /// frame owner: its host pointer, IPA and owner generation.
 pub(crate) fn allocate_grant_compound(
     custody: &std::sync::Arc<CarrierVmCustody>,
-    stage2_perms: applevisor::memory::MemPerms,
+    stage2_perms: carrick_hal::MemPerms,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
     allocate_grant_extent(custody, stage2_perms, CowArmedRanges::COMPOUND_SIZE)
 }
 pub(crate) fn allocate_grant_extent(
     custody: &std::sync::Arc<CarrierVmCustody>,
-    stage2_perms: applevisor::memory::MemPerms,
+    stage2_perms: carrick_hal::MemPerms,
     length: u64,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
     if length == 0
@@ -299,8 +299,11 @@ pub(crate) fn allocate_grant_extent(
     {
         let host_ptr = handle.as_mut_ptr();
         let physical_ipa = handle.ipa();
-        let generation =
-            register_pooled_global_frame_host_owner_in(custody, handle, u64::from(stage2_perms))?;
+        let generation = register_pooled_global_frame_host_owner_in(
+            custody,
+            handle,
+            carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
+        )?;
         return Ok((host_ptr, physical_ipa, generation));
     }
     let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -321,7 +324,7 @@ pub(crate) fn allocate_grant_extent(
                 host_ptr.cast(),
                 physical_ipa,
                 length as usize,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if rc != 0 {
@@ -333,8 +336,12 @@ pub(crate) fn allocate_grant_extent(
     }
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     lease.mark_test_mapped_without_backend();
-    let generation =
-        register_global_frame_host_owner_in(custody, lease, new_host, u64::from(stage2_perms))?;
+    let generation = register_global_frame_host_owner_in(
+        custody,
+        lease,
+        new_host,
+        carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
+    )?;
     Ok((host_ptr, physical_ipa, generation))
 }
 
@@ -635,7 +642,7 @@ pub(crate) fn settle_one(
         physical_ipa: new_physical_ipa,
         physical_host_addr: new_host_addr,
         physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: source_guest_writable,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(

@@ -440,7 +440,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .publish_raw_stage1_arenas_into(
                 &self.custody,
                 &[base],
-                applevisor::memory::MemPerms::ReadWrite,
+                carrick_hal::MemPerms::ReadWrite,
                 &mut published,
             )
             .map_err(|error| error.to_string())
@@ -489,7 +489,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .publish_stage1_extension_arenas(
                 &self.custody,
                 manager,
-                applevisor::memory::MemPerms::ReadWrite,
+                carrick_hal::MemPerms::ReadWrite,
             )
             .map(|_rows| ())
             .map_err(|error| error.to_string())
@@ -2672,7 +2672,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     let new_ipa = new_physical_ipa
         .checked_add(old_offset)
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+    let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
         let map_result = unsafe {
@@ -2680,7 +2680,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_result != 0 {
@@ -2696,7 +2696,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         &lease.custody,
         new_lease,
         new_host,
-        u64::from(stage2_perms),
+        carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
     )
     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
@@ -3203,7 +3203,7 @@ fn perform_foreign_guest_cow(
     let new_ipa = new_physical_ipa
         .checked_add(old_offset)
         .ok_or(Error::MutationFailed)?;
-    let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+    let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
         let map_result = unsafe {
@@ -3211,7 +3211,7 @@ fn perform_foreign_guest_cow(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_result != 0 {
@@ -3227,7 +3227,7 @@ fn perform_foreign_guest_cow(
         &lease.custody,
         new_lease,
         new_host,
-        u64::from(stage2_perms),
+        carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
     )
     .map_err(|_| Error::MutationFailed)?;
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
@@ -3441,7 +3441,7 @@ struct ForeignCowPublished<'a> {
     span: CowArmedSpan,
     split: CowInventorySplit,
     registry: crate::fork_quiesce::FrameRegistryGuard<'static>,
-    stage2_perms: applevisor::memory::MemPerms,
+    stage2_perms: carrick_hal::MemPerms,
     new_host_ptr: *mut u8,
     old_offset: u64,
     new_ipa: u64,
@@ -3589,7 +3589,7 @@ fn finish_foreign_cow_publication(
         physical_ipa: new_physical_ipa,
         physical_host_addr: new_host_ptr as usize,
         physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-        perms: u64::from(stage2_perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
         guest_writable: source_guest_writable,
         sharing: GuestMappingSharing::Private,
         ownership_scope: alias_ownership_scope(
@@ -4697,7 +4697,9 @@ pub mod foreign_cow_test_support {
                 physical_ipa: data_key.0,
                 physical_host_addr: data_host,
                 physical_size: shape.data_len as usize,
-                perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                perms: carrick_aarch64::stage2::stage2_perms_bits(
+                    carrick_hal::MemPerms::ReadWriteExec,
+                ),
                 guest_writable: true,
                 sharing: GuestMappingSharing::Private,
                 ownership_scope: alias_ownership_scope(
@@ -4960,10 +4962,10 @@ pub mod foreign_cow_test_support {
                 },
                 |alias| {
                     alias.guest_writable = writable;
-                    alias.perms = u64::from(if writable {
-                        applevisor::memory::MemPerms::ReadWriteExec
+                    alias.perms = carrick_aarch64::stage2::stage2_perms_bits(if writable {
+                        carrick_hal::MemPerms::ReadWriteExec
                     } else {
-                        applevisor::memory::MemPerms::ReadExec
+                        carrick_hal::MemPerms::ReadExec
                     });
                 },
             );
@@ -5086,7 +5088,7 @@ pub mod foreign_cow_test_support {
             custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         )
         .map_err(|error| format!("register carrier fixture physical owner: {error}"))?;
         Ok((generation, host_addr))

@@ -1880,7 +1880,7 @@ mod carrier_vm_custody_tests {
         let owner = std::sync::Arc::new(super::super::global_frame::GlobalFrameHostOwner::new(
             super::super::global_frame::GlobalFrameStage2Lease::fixed(ipa, len),
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             generation,
             ipa,
             len,
@@ -1952,7 +1952,7 @@ mod carrier_vm_custody_tests {
             mapped: true,
             backend_map_installed: true,
             release_ipa: true,
-            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             logical_owner: Some(CarrierLogicalOwner {
                 id: 7,
                 generation: owner_generation,
@@ -1977,7 +1977,7 @@ mod carrier_vm_custody_tests {
             &first,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register carrier-local owner");
 
@@ -2135,7 +2135,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register pinned global owner");
         let exact_owner =
@@ -2218,7 +2218,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 replacement_lease,
                 replacement_mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 &mut |_, _| Ok(()),
             )
             .is_err(),
@@ -2264,7 +2264,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register global owner retirement lock-order fixture");
         let exact_owner =
@@ -2389,7 +2389,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register exclusive retirement fixture");
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
@@ -2443,7 +2443,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register foreign-MM release safe-point fixture");
         let pin = custody.global_frame_host_owners.lock()[&key]
@@ -2512,7 +2512,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register foreign-MM transient retry fixture");
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
@@ -2572,7 +2572,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .expect("register removable FIFO fixture");
             assert!(matches!(
@@ -2654,7 +2654,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register concurrent idle-turn fixture");
         assert!(matches!(
@@ -2722,7 +2722,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register disappearing retirement slot fixture");
         let record_id = custody.global_frame_host_owners.lock()[&key]
@@ -2779,7 +2779,7 @@ mod carrier_vm_custody_tests {
             &custody,
             incumbent_lease,
             incumbent_mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register incumbent global owner");
 
@@ -2799,7 +2799,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 candidate_lease,
                 candidate_mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 &mut |_, _| {
                     rollback_calls += 1;
                     Err(injected)
@@ -2857,7 +2857,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .expect("register large live-directory owner");
             live.push((key, generation));
@@ -2876,7 +2876,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .expect("register fair-retry directory owner");
             assert!(matches!(
@@ -2905,7 +2905,7 @@ mod carrier_vm_custody_tests {
             &custody,
             incumbent_lease,
             incumbent_mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register fair-retry incumbent");
         let candidate_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -2921,7 +2921,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 candidate_lease,
                 candidate_mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 &mut |_, _| Err(super::CarrierStage2BackendError::ConcurrentRetirement),
             )
             .is_err()
@@ -2966,7 +2966,7 @@ mod carrier_vm_custody_tests {
             &custody,
             replacement_lease,
             replacement_mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("reuse retired ready key");
 
@@ -3030,7 +3030,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register reconcile-deferred owner");
         let pin = custody.global_frame_host_owners.lock()[&key]
@@ -3089,7 +3089,7 @@ mod carrier_vm_custody_tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .expect("register same-key global owner")
         };
@@ -3151,7 +3151,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register rebuild owner");
         let old_owner = custody.global_frame_host_owners.lock()[&reserved_key]
@@ -3172,7 +3172,7 @@ mod carrier_vm_custody_tests {
             &custody,
             fixed_lease,
             fixed_mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register fixed rebuild owner");
         let fixed_old_identity = custody.global_frame_host_owners.lock()[&fixed_key]
@@ -3206,13 +3206,17 @@ mod carrier_vm_custody_tests {
                     ipa: reserved_key.0,
                     length: reserved_key.1,
                     host_addr,
-                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(
+                        carrick_hal::MemPerms::ReadWrite,
+                    ),
                 },
                 super::GlobalFrameReplayExtent {
                     ipa: fixed_key.0,
                     length: fixed_key.1,
                     host_addr: fixed_host,
-                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(
+                        carrick_hal::MemPerms::ReadWrite,
+                    ),
                 },
             ],
             false,
@@ -3266,13 +3270,17 @@ mod carrier_vm_custody_tests {
                     ipa: reserved_key.0,
                     length: reserved_key.1,
                     host_addr,
-                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(
+                        carrick_hal::MemPerms::ReadWrite,
+                    ),
                 },
                 super::GlobalFrameReplayExtent {
                     ipa: fixed_key.0,
                     length: fixed_key.1,
                     host_addr: fixed_host,
-                    perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(
+                        carrick_hal::MemPerms::ReadWrite,
+                    ),
                 },
             ],
             false,
@@ -3332,7 +3340,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register pending rebuild owner");
         let identity = custody.global_frame_host_owners.lock()[&key]
@@ -3417,7 +3425,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register carrier-exit owner");
         let identity = custody.global_frame_host_owners.lock()[&key]
@@ -3468,7 +3476,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register terminal release owner");
         let owner = custody
@@ -3926,7 +3934,7 @@ mod carrier_vm_custody_tests {
             &custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .expect("register concurrent-retirement owner");
         let generation = custody
@@ -3993,7 +4001,7 @@ mod carrier_vm_custody_tests {
             &custody,
             mapping,
             lease,
-            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
             super::next_structural_epoch().expect("structural epoch"),
             key.0,
             key.1 as usize,
@@ -4152,7 +4160,7 @@ mod carrier_vm_custody_tests {
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
-                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 )
             },
             0,
@@ -4245,7 +4253,7 @@ mod carrier_vm_custody_tests {
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
-                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 )
             },
             0,
@@ -4276,7 +4284,8 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate rebuild structural backing");
         let host_addr = mapping.as_ptr() as usize;
-        let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
         lease.mark_test_mapped_without_backend();
         let owner = super::StructuralBackingOwner::new_in(
@@ -4723,7 +4732,7 @@ mod carrier_vm_custody_tests {
                     custody,
                     lease,
                     mapping,
-                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                    carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 )
                 .expect("register global frame owner");
                 let identity = custody

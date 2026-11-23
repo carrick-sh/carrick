@@ -505,7 +505,7 @@ impl HvfVmState {
                 carrick_aarch64::vmm::ForkCowRange {
                     va: mapping.start,
                     len,
-                    executable: u64::from(mapping.perms) & 4 != 0,
+                    executable: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms) & 4 != 0,
                     kernel_only: is_kernel_only_stage1_range(mapping.start, len),
                     granule,
                 }
@@ -889,7 +889,7 @@ impl HvfVmState {
             physical_ipa,
             physical_host_addr,
             physical_size,
-            perms: u64::from(perms),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(perms),
             guest_writable: true,
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
@@ -2361,13 +2361,13 @@ impl HvfTaskState {
         let new_ipa = new_physical_ipa
             .checked_add(physical_offset)
             .ok_or_else(|| TrapError::Hypervisor("retained reuse IPA overflow".to_owned()))?;
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_result = unsafe {
             inventory_stage2_map(
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_result != 0 {
@@ -2380,7 +2380,7 @@ impl HvfTaskState {
             custody,
             new_lease,
             new_host,
-            u64::from(stage2_perms),
+            carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
         )?;
         let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(custody));
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
@@ -2641,7 +2641,7 @@ impl HvfTaskState {
             physical_ipa: new_physical_ipa,
             physical_host_addr: new_host_ptr as usize,
             physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-            perms: u64::from(stage2_perms),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             guest_writable: true,
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
@@ -2819,17 +2819,8 @@ impl HvfTaskState {
                         "shared repoint IPA 0x{target_ipa:x} size {len} has no physical owner"
                     ))
                 })?;
-            let perms = match alias.perms {
-                0 => applevisor::memory::MemPerms::None,
-                1 => applevisor::memory::MemPerms::Read,
-                2 => applevisor::memory::MemPerms::Write,
-                3 => applevisor::memory::MemPerms::ReadWrite,
-                4 => applevisor::memory::MemPerms::Exec,
-                5 => applevisor::memory::MemPerms::ReadExec,
-                6 => applevisor::memory::MemPerms::WriteExec,
-                7 => applevisor::memory::MemPerms::ReadWriteExec,
-                _ => applevisor::memory::MemPerms::ReadWrite,
-            };
+            let perms = carrick_aarch64::stage2::stage2_perms_from_bits(alias.perms)
+                .unwrap_or(carrick_hal::MemPerms::ReadWrite);
             (
                 alias.physical_ipa,
                 alias.physical_size,
@@ -2907,7 +2898,7 @@ impl HvfTaskState {
             physical_ipa,
             physical_host_addr,
             physical_size,
-            perms: u64::from(perms),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(perms),
             guest_writable: true,
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
@@ -3687,7 +3678,7 @@ impl HvfTaskState {
         } else {
             None
         };
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let pooled = if fresh_destination {
             custody.frame_pool().and_then(|p| p.allocate_compound())
         } else {
@@ -3760,7 +3751,7 @@ impl HvfTaskState {
                 let owner_generation = register_pooled_global_frame_host_owner_in(
                     custody,
                     handle,
-                    u64::from(stage2_perms),
+                    carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
                 )?;
                 (host_ptr, physical_ipa, owner_generation)
             } else {
@@ -3813,7 +3804,7 @@ impl HvfTaskState {
                         new_host_ptr.cast(),
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE as usize,
-                        u64::from(stage2_perms),
+                        carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
                     )
                 };
                 if map_result != 0 {
@@ -3826,7 +3817,7 @@ impl HvfTaskState {
                     custody,
                     new_lease,
                     new_host,
-                    u64::from(stage2_perms),
+                    carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
                 )?;
                 (new_host_ptr, new_physical_ipa, owner_generation)
             };
@@ -4453,7 +4444,7 @@ impl HvfTaskState {
             physical_ipa: new_physical_ipa,
             physical_host_addr: new_host_ptr as usize,
             physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-            perms: u64::from(stage2_perms),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             guest_writable: source_guest_writable,
             sharing: GuestMappingSharing::Private,
             ownership_scope: alias_ownership_scope(
@@ -5378,7 +5369,7 @@ impl HvfVmState {
         len: u64,
         perms: carrick_hal::MemPerms,
     ) -> Result<(), TrapError> {
-        let perms_raw: u64 = u64::from(hvf_mem_perms(perms));
+        let perms_raw: u64 = carrick_aarch64::stage2::stage2_perms_bits(perms);
         let r = unsafe {
             inventory_stage2_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
         };
@@ -5645,7 +5636,14 @@ impl HvfVmState {
             None
         };
         let ipa = global_lease.as_ref().map_or(ipa, |lease| lease.base);
-        let r = unsafe { inventory_stage2_map(host.cast(), ipa, physical_size, u64::from(perms)) };
+        let r = unsafe {
+            inventory_stage2_map(
+                host.cast(),
+                ipa,
+                physical_size,
+                carrick_aarch64::stage2::stage2_perms_bits(perms),
+            )
+        };
         crate::probes::hv_vm_map_alias(
             va,
             ipa,
@@ -5669,7 +5667,7 @@ impl HvfVmState {
                     TrapError::Hypervisor("HVPatch alias lost its global IPA lease".to_owned())
                 })?,
                 host_mapping,
-                u64::from(perms),
+                carrick_aarch64::stage2::stage2_perms_bits(perms),
             )?;
             (None, owner_generation)
         } else {
@@ -5692,7 +5690,7 @@ impl HvfVmState {
             physical_ipa: ipa,
             physical_host_addr: host as usize,
             physical_size,
-            perms: u64::from(perms),
+            perms: carrick_aarch64::stage2::stage2_perms_bits(perms),
             guest_writable: alias_guest_writable,
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
@@ -7295,7 +7293,7 @@ impl HvfTaskState {
                     .find(|m| m.ipa == root_base)
                     .map(|m| m.perms)
             })
-            .unwrap_or(applevisor::memory::MemPerms::ReadWrite);
+            .unwrap_or(carrick_hal::MemPerms::ReadWrite);
 
         let published = self.mm_access.publish_stage1_extension_arenas(
             &self.custody_arc(),

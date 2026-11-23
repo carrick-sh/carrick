@@ -93,13 +93,13 @@ impl PreMappedFramePool {
             crate::trap::TrapError::Hypervisor(format!("allocate frame pool backing: {error}"))
         })?;
 
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
             crate::trap::inventory_stage2_map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_rc != 0 {
@@ -385,13 +385,13 @@ impl PreMappedRootSlotPool {
             crate::trap::TrapError::Hypervisor(format!("allocate root slot pool backing: {error}"))
         })?;
 
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let map_rc = unsafe {
             crate::trap::inventory_stage2_map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_rc != 0 {

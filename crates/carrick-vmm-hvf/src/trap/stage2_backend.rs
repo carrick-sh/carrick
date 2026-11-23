@@ -617,7 +617,7 @@ pub(crate) fn exec_stage2_install(
         ipa: mapping.ipa_start,
         size: region.physical_size,
         host: region.host_addr,
-        perms: u64::from(region.perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(region.perms),
         replay_registered: false,
         pre_mapped,
     }
@@ -771,7 +771,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         );
     }
     let perms = exec_mapping_stage2_perms(mapping);
-    let perms_raw: u64 = u64::from(perms);
+    let perms_raw: u64 = carrick_aarch64::stage2::stage2_perms_bits(perms);
     // Map at the IPA (identity for all but the Rosetta alias); the guest's
     // stage-1 page tables translate the VIRTUAL `guest_start` to this IPA.
     if emit_exec_backing_census {
@@ -860,7 +860,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             custody,
             host_mapping,
             lease,
-            u64::from(region.perms),
+            carrick_aarch64::stage2::stage2_perms_bits(region.perms),
             epoch,
             region.physical_ipa,
             region.physical_size,
@@ -1013,8 +1013,8 @@ pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn hvf_perms(perms: SegmentPerms) -> applevisor::memory::MemPerms {
-    use applevisor::memory::MemPerms;
+pub(crate) fn hvf_perms(perms: SegmentPerms) -> carrick_hal::MemPerms {
+    use carrick_hal::MemPerms;
 
     // HVF stage-2 quirk on macOS 26 (Tahoe) / Apple Silicon: a stage-2
     // mapping created with `HV_MEMORY_READ | HV_MEMORY_WRITE` (no
@@ -1067,7 +1067,7 @@ pub(crate) fn hvf_perms(perms: SegmentPerms) -> applevisor::memory::MemPerms {
 /// permission upgrade at the stage-2 boundary rather than marking the semantic
 /// mapping writable to Linux userspace.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn exec_mapping_stage2_perms(mapping: &GuestMapping) -> applevisor::memory::MemPerms {
+fn exec_mapping_stage2_perms(mapping: &GuestMapping) -> carrick_hal::MemPerms {
     let mut perms = mapping.perms;
     if mapping.guest_start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE {
         perms.write = true;
@@ -1080,12 +1080,13 @@ pub(crate) fn hvf_error(error: applevisor::error::HypervisorError) -> TrapError 
     TrapError::Hypervisor(error.to_string())
 }
 
-/// Convert a neutral [`carrick_hal::MemPerms`] to the applevisor stage-2
-/// `MemPerms` for [`HvfVmState::map_stage2`]. A DIRECT mapping (no RWX
-/// escalation): that escalation is the `hvf_perms(SegmentPerms)` boot/alias path;
-/// the engine's `map_stage2` callers pass the perms they want verbatim.
+/// Convert a neutral [`carrick_hal::MemPerms`] to applevisor's stage-2
+/// `MemPerms` for the host call in [`HvfStage2`]'s `map`, the one place
+/// custody's neutral permissions become HVF's. A DIRECT conversion (no RWX
+/// escalation): that escalation is the `hvf_perms(SegmentPerms)` boot/alias
+/// policy; every other caller passes the perms it wants verbatim.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory::MemPerms {
+fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory::MemPerms {
     use applevisor::memory::MemPerms;
     match (perms.read, perms.write, perms.exec) {
         (false, false, false) => MemPerms::None,
@@ -1308,7 +1309,7 @@ mod tests {
         let region = prepare_exec_region_raw(&mapping).expect("prepare stage-1 table region");
         assert_eq!(
             region.perms,
-            applevisor::memory::MemPerms::ReadWriteExec,
+            carrick_hal::MemPerms::ReadWriteExec,
             "EL1 must be able to publish new table descriptors through its fixed alias"
         );
         assert!(

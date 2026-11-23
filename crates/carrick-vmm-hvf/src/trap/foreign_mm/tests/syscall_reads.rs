@@ -23,7 +23,7 @@ impl PooledReadFixture {
         let generation = register_pooled_global_frame_host_owner_in(
             &custody,
             handle,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .unwrap();
         let owner = Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
