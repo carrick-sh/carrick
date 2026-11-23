@@ -128,6 +128,7 @@ mod ipc;
 mod sample_buffer;
 mod threads;
 mod tlb;
+mod vfork_exec;
 use sample_buffer::measured_samples;
 
 const SYS_FUTEX: u64 = 98;
@@ -3951,6 +3952,12 @@ fn main() {
             println!("exec-child ok");
             0
         }
+        "vfork-exec-siblings" => vfork_exec::vfork_exec_siblings(
+            &args[0],
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(4),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
+        ),
+        "vfork-exec-child" => 0,
         "reused-slot-exec" => match args.get(2) {
             Some(successor) => reused_slot_exec(successor),
             None => {
