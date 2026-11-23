@@ -3231,6 +3231,10 @@ pub enum SyscallFrameSource {
     SchedulerSavedReplay = 7,
     HostIpcReplay = 8,
     FutexErrorReturn = 9,
+    /// DIAGNOSTICS ONLY (#2890): a ring syscall that completed EFAULT.
+    EfaultReturn = 10,
+    /// DIAGNOSTICS ONLY (#2890): an exec-stage copy fault the owner refused.
+    ExecStageFault = 11,
 }
 impl SyscallFrameSource {
     pub const fn label(self) -> &'static str {
@@ -3244,6 +3248,8 @@ impl SyscallFrameSource {
             Self::SchedulerSavedReplay => "scheduler-saved-replay",
             Self::HostIpcReplay => "host-ipc-replay",
             Self::FutexErrorReturn => "futex-error-return",
+            Self::EfaultReturn => "efault-return",
+            Self::ExecStageFault => "exec-stage-fault",
         }
     }
     fn from_code(code: u64) -> Option<Self> {
@@ -3257,6 +3263,8 @@ impl SyscallFrameSource {
             7 => Self::SchedulerSavedReplay,
             8 => Self::HostIpcReplay,
             9 => Self::FutexErrorReturn,
+            10 => Self::EfaultReturn,
+            11 => Self::ExecStageFault,
             _ => return None,
         })
     }
@@ -3809,6 +3817,11 @@ impl Counters {
                 None,
             );
         }
+    }
+
+    /// DIAGNOSTICS ONLY (#2890): publish one raw frame sample.
+    pub fn record_diag_frame(&self, words: [u64; 15]) {
+        self.publish_syscall_frame(words);
     }
 
     fn publish_syscall_frame(&self, words: [u64; 15]) {

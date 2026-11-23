@@ -944,7 +944,31 @@ fn native_exec_call(
                         anonymous::ContendedFault::Refused => fatal_boot(),
                     }
                 }
-                UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                verdict @ (UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_)) => {
+                    let why = match verdict {
+                        UserFaultSupply::Signal { signum, code, .. } => {
+                            0x5100_0000 | ((signum as u64 & 0xff) << 16) | (code as u64 & 0xffff)
+                        }
+                        UserFaultSupply::Unresolved(reason) => reason,
+                        _ => 0,
+                    };
+                    counters.record_diag_frame([
+                        carrick_el1_abi::SyscallFrameSource::ExecStageFault as u64,
+                        ordinal.raw(),
+                        frame.rcx,
+                        slot.raw() as u64,
+                        task.mm.key.load(Ordering::Acquire),
+                        0,
+                        0,
+                        0,
+                        fault.address.raw(),
+                        request.path,
+                        request.argv,
+                        request.envp,
+                        why,
+                        frame.rsp,
+                        0,
+                    ]);
                     frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     CompletionRoute::Served
                 }
@@ -2024,6 +2048,27 @@ impl Personality for LinuxPersonality {
             let root_exit = process.take_root_exit();
             (route, root_exit)
         };
+        if route == CompletionRoute::Served
+            && frame.rax == carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64
+        {
+            counters.record_diag_frame([
+                carrick_el1_abi::SyscallFrameSource::EfaultReturn as u64,
+                call.native.raw(),
+                frame.rcx,
+                slot.raw() as u64,
+                task.mm.key.load(Ordering::Acquire),
+                0,
+                0,
+                0,
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+                call.args[4],
+                call.args[5],
+                frame.rsp,
+            ]);
+        }
         if !matches!(route, CompletionRoute::Suspended) {
             migrate(slot);
         }

@@ -199,6 +199,9 @@ pub struct Census {
     /// concurrent writer held their row (`Counters::refused_call_dropped`).
     #[serde(default)]
     pub refused_calls_dropped: u64,
+    /// DIAGNOSTICS ONLY (#2890): `Counters::write_syscall_frames`.
+    #[serde(default)]
+    pub syscall_frames: String,
 }
 
 /// One counted refusal's typed record, as the census file keeps it.
@@ -399,6 +402,11 @@ fn snapshot_counters(
         }),
         refused_calls_dropped: counters.map_or(0, |counters| {
             counters.refused_call_dropped.load(Ordering::Acquire)
+        }),
+        syscall_frames: counters.map_or_else(String::new, |counters| {
+            let mut text = String::new();
+            let _ = counters.write_syscall_frames(&mut text);
+            text
         }),
     }
 }
