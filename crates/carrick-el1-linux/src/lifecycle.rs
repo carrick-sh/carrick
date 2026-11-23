@@ -1309,6 +1309,12 @@ impl<
             task,
             validator: &crate::file::HardwareValidator,
         });
+        #[cfg(test)]
+        if let (Some(zone), Some(arm_frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
+            return crate::arm_signal::restore_live_arm_signal_frame_with_cpu(
+                zone.cpu, arm_frame, &mut copy,
+            );
+        }
         self.frame.restore_signal_frame(&mut copy)
     }
 }
