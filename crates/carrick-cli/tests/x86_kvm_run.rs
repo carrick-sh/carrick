@@ -828,6 +828,57 @@ fn mounted_static_x86_exec_child_member_reads_a_host_file() {
     );
 }
 
+/// #1338 step 2: the Go linker maps its output file `PROT_READ|PROT_WRITE`
+/// `MAP_SHARED`, writes it in place, unmaps it with no `msync`, grows it and
+/// maps it again; another description then reads the file. A parent and a
+/// forked child also share one writable file mapping while both live. The
+/// root and a forked child must report the native rows: every byte written
+/// through a mapping is in the file and in the other process's mapping.
+#[test]
+fn mounted_static_x86_writable_shared_file_mapping_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("shared-file-write");
+    compile_assembly_with_flags(
+        "x86_shared_file_write.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native shared-file-write oracle");
+    let native_rows = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        native.status.code(),
+        Some(7),
+        "native oracle: {native_rows}"
+    );
+    assert!(
+        native_rows.lines().count() == 32 && !native_rows.contains("BAD"),
+        "native Linux keeps every written byte: {native_rows}"
+    );
+
+    let guest = run_mounted_binary(&elf, "shared-file-write", false);
+    let guest_rows = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        guest_rows,
+        native_rows,
+        "exit {:?} (95: the child failed). Stderr: {}",
+        guest.status.code(),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), Some(7));
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
