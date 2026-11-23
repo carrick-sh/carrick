@@ -39,6 +39,12 @@ pub trait OwnerMmu {
 /// inheritance, custody selection, admission and rollback stay in that owner.
 pub trait OwnerForkMmu: OwnerMmu {
     const ADDRESS_MASK: u64;
+    /// Descriptor bits this ISA's hardware walker sets by itself on a live
+    /// word another CPU can reach (x86 Accessed and Dirty). A word that
+    /// differs from what an edit stored only in these bits still holds that
+    /// edit. AArch64 runs with hardware Access-flag and dirty-state updates
+    /// off (TCR_EL1.HA/HD clear), so none.
+    const WALKER_SET_BITS: u64 = 0;
     /// Supervisor root branches shared by this ISA's address spaces. Private
     /// branches retain the normal child clone and exact census. The default
     /// preserves the AArch64 walk of every root entry.
