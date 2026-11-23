@@ -12,7 +12,7 @@ pub(super) struct PreparedSparseBacking {
     pub(super) semantic_ipa: u64,
     pub(super) physical_len: u64,
     pub(super) physical_size: usize,
-    pub(super) stage2_perms: applevisor::memory::MemPerms,
+    pub(super) stage2_perms: carrick_hal::MemPerms,
     pub(super) inventory_backing: InventoryBackingIdentity,
     pub(super) page_granular_arm: bool,
     pub(super) owner_generation: u64,
@@ -121,11 +121,14 @@ pub(super) fn prepare(
             std::ptr::write_bytes(host_ptr, 0, CowArmedRanges::COMPOUND_SIZE as usize);
         }
         carrick_observability::probes::hvpatch_frame_pool_hit(1, ipa);
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         let inventory_backing = HvfVmState::private_backing_identity();
         let page_granular_arm = false;
-        let owner_generation =
-            register_pooled_global_frame_host_owner_in(&custody, handle, u64::from(stage2_perms))?;
+        let owner_generation = register_pooled_global_frame_host_owner_in(
+            &custody,
+            handle,
+            carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
+        )?;
         (
             host_ptr,
             host_ptr,
@@ -195,7 +198,7 @@ pub(super) fn prepare(
                 source: carrick_guest_mem::PrivateFileSource::ImmutableLower,
                 ..
             } => (
-                applevisor::memory::MemPerms::ReadWriteExec,
+                carrick_hal::MemPerms::ReadWriteExec,
                 HvfVmState::private_backing_identity(),
                 false,
             ),
@@ -207,7 +210,7 @@ pub(super) fn prepare(
                 // lower views above already have private host backing; ordinary
                 // fork COW still protects those owners when another MM shares them.
                 (
-                    applevisor::memory::MemPerms::ReadWriteExec,
+                    carrick_hal::MemPerms::ReadWriteExec,
                     HvfVmState::private_file_view_backing_identity(),
                     true,
                 )
@@ -235,7 +238,7 @@ pub(super) fn prepare(
                 physical_host.cast(),
                 physical_ipa,
                 physical_size,
-                u64::from(stage2_perms),
+                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
         };
         if map_result != 0 {
@@ -248,7 +251,7 @@ pub(super) fn prepare(
             &custody,
             lease,
             host_mapping,
-            u64::from(stage2_perms),
+            carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
         )?;
         (
             physical_host,
@@ -467,7 +470,7 @@ fn publish_frame_grant_backing(
         physical_ipa,
         physical_host_addr: physical_host as usize,
         physical_size,
-        perms: u64::from(stage2_perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
         guest_writable: true,
         sharing,
         ownership_scope: alias_ownership_scope(
@@ -795,7 +798,7 @@ impl MmAccessState {
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
-        root_perms: applevisor::memory::MemPerms,
+        root_perms: carrick_hal::MemPerms,
     ) -> Result<Vec<HvfMappedRegion>, TrapError> {
         let mut published = Vec::new();
         self.publish_stage1_extension_arenas_into(custody, manager, root_perms, &mut published)?;
@@ -806,7 +809,7 @@ impl MmAccessState {
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
-        root_perms: applevisor::memory::MemPerms,
+        root_perms: carrick_hal::MemPerms,
         published: &mut Vec<HvfMappedRegion>,
     ) -> Result<(), TrapError> {
         self.publish_raw_stage1_arenas_into(
@@ -821,7 +824,7 @@ impl MmAccessState {
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         bases: &[u64],
-        root_perms: applevisor::memory::MemPerms,
+        root_perms: carrick_hal::MemPerms,
         published: &mut Vec<HvfMappedRegion>,
     ) -> Result<(), TrapError> {
         const TWO_MIB: usize = 2 * 1024 * 1024;
@@ -884,7 +887,7 @@ impl MmAccessState {
                             host_mapping.as_ptr().cast(),
                             base,
                             TWO_MIB,
-                            u64::from(root_perms),
+                            carrick_aarch64::stage2::stage2_perms_bits(root_perms),
                         )
                     };
                     if rc != 0 {
@@ -1509,7 +1512,7 @@ pub(super) fn publish_replacing(
                         // the same explicit permission for extension arenas.
                         &context.custody,
                         editor.manager,
-                        applevisor::memory::MemPerms::ReadWrite,
+                        carrick_hal::MemPerms::ReadWrite,
                         &mut extension_regions,
                     )?;
                     let page_table_resolver = context
@@ -1779,7 +1782,7 @@ pub(super) fn publish_replacing(
         physical_ipa,
         physical_host_addr: physical_host as usize,
         physical_size,
-        perms: u64::from(stage2_perms),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
         guest_writable: true,
         sharing,
         ownership_scope: alias_ownership_scope(
@@ -2021,7 +2024,7 @@ mod arena_pin_tests {
             &custody,
             lease,
             host,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .unwrap();
         let state = MmAccessState::new_unbound(
@@ -2343,7 +2346,7 @@ mod arena_pin_tests {
             &custody,
             host,
             lease,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             next_structural_epoch().unwrap(),
             base,
             size,
@@ -2379,7 +2382,7 @@ mod arena_pin_tests {
             &custody,
             host,
             lease,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             next_structural_epoch().unwrap(),
             base,
             size,

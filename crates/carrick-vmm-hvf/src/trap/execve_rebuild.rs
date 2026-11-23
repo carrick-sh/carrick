@@ -721,7 +721,7 @@ impl PreparedExecBacking {
                 ipa: lease.base,
                 size: region.physical_size,
                 host: region.host_addr,
-                perms: u64::from(region.perms),
+                perms: carrick_aarch64::stage2::stage2_perms_bits(region.perms),
                 replay_registered: false,
                 pre_mapped,
             };
@@ -1724,7 +1724,7 @@ impl HvfVmState {
                 host: mapping.host_addr as usize,
                 size: mapping.size,
                 physical_size: mapping.physical_size,
-                perms: u64::from(mapping.perms),
+                perms: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                 has_memory: mapping.memory.is_some(),
                 host_owner: mapping
                     .host_mapping

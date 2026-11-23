@@ -634,7 +634,7 @@ pub(super) mod tests {
             custody,
             lease,
             mapping,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .unwrap();
         Arc::clone(
@@ -1333,7 +1333,7 @@ pub(super) mod tests {
                 &custody,
                 lease,
                 mapping,
-                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
             .unwrap();
             let source = custody
@@ -1654,7 +1654,7 @@ pub(super) mod tests {
         register_pooled_global_frame_host_owner_in(
             &custody,
             adjacent,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
         .unwrap();
         drop(dirty);

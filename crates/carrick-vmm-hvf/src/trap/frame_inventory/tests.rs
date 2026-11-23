@@ -1604,7 +1604,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         physical_ipa: lease_key.0,
         physical_host_addr: host_addr as usize,
         physical_size: lease_key.1,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope,
@@ -1693,7 +1693,7 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
     let successor = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64),
         successor_host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         successor_gen,
         lease_key.0,
         lease_key.1 as u64,
@@ -1776,7 +1776,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
     let old_owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64),
         old_host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         old_generation,
         lease_key.0,
         lease_key.1 as u64,
@@ -1805,7 +1805,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         physical_ipa: lease_key.0,
         physical_host_addr: old_host_addr,
         physical_size: lease_key.1,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
@@ -1864,7 +1864,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
             let owner = GlobalFrameHostOwner::new(
                 GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64),
                 host,
-                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
                 generation,
                 lease_key.0,
                 lease_key.1 as u64,
@@ -2455,7 +2455,7 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     let owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
         host_mapping,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         owner_gen,
         LIVE_IPA,
         LENGTH,
@@ -2508,7 +2508,7 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     let successor = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
         remap,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         succ_gen,
         LIVE_IPA,
         LENGTH,
@@ -2585,7 +2585,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
         host_addr,
         size,
         physical_size: size,
-        perms: applevisor::memory::MemPerms::ReadWriteExec,
+        perms: carrick_hal::MemPerms::ReadWriteExec,
         memory: None,
         host_mapping: Some(host_mapping.into()),
         structural_owner: None,
@@ -2854,7 +2854,7 @@ fn process_retirement_task(
     let owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         generation,
         key.0,
         key.1,
@@ -2999,7 +2999,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
             replacement.as_ptr().cast(),
             root_slot.0,
             root_len as usize,
-            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
     };
 
@@ -3328,7 +3328,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
             host_addr,
             size: EXTENT_SIZE as usize,
             physical_size: EXTENT_SIZE as usize,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
             structural_owner: None,
@@ -3344,7 +3344,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
         let owner = GlobalFrameHostOwner::new(
             GlobalFrameStage2Lease::fixed(key.0, key.1),
             host,
-            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
             generation,
             key.0,
             key.1,
@@ -3523,7 +3523,7 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     let successor = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         successor_host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         succ_gen,
         key.0,
         key.1,
@@ -3543,7 +3543,7 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
         ownership_scope: AliasOwnershipScope::Global,
@@ -3739,7 +3739,7 @@ fn global_frame_host_owner_rejects_an_unmapped_lease() {
     let error = register_global_frame_host_owner(
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         host_mapping,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
     )
     .expect_err("an unmapped lease must never become a global frame owner");
     assert!(
@@ -3766,7 +3766,7 @@ fn stage_mapping_owner_rejection_leaves_all_reference_maps_unchanged() {
     let live = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         live_gen,
         key.0,
         key.1,
@@ -3838,7 +3838,7 @@ fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
     let owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         generation,
         key.0,
         key.1,
@@ -3858,7 +3858,7 @@ fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
         physical_ipa: key.0,
         physical_host_addr: host_addr,
         physical_size: key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
@@ -3916,7 +3916,7 @@ fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
         host_addr: 0x4000_0000usize as *mut u8,
         size: 0xc000,
         physical_size: 0xc000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -4103,7 +4103,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
     let owner_generation = register_global_frame_host_owner(
         lease,
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register global frame host owner");
     assert!(owner_generation > 0);
@@ -4124,7 +4124,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
         host_addr: host_addr as *mut u8,
         size: 0x4000,
         physical_size: 0x4000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -4208,7 +4208,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
     let gen2 = register_global_frame_host_owner(
         lease2,
         host2,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register second container global frame host owner");
     assert_ne!(gen2, owner_generation);
@@ -4234,7 +4234,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
     let owner_generation = register_global_frame_host_owner(
         lease,
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register global frame host owner");
     assert!(owner_generation > 0);
@@ -4250,7 +4250,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_addr: host_addr as *mut u8,
         size: 0x4000,
         physical_size: 0x4000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -4319,7 +4319,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_addr: host_addr as *mut u8,
         size: 0x4000,
         physical_size: 0x4000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -4388,7 +4388,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_addr: host_addr as *mut u8,
         size: 0x4000,
         physical_size: 0x4000,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -4463,7 +4463,7 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
     let owner_generation = register_global_frame_host_owner(
         lease,
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register global frame host owner");
     assert!(owner_generation > 0);
@@ -4526,7 +4526,7 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
     let collision_res = register_global_frame_host_owner(
         collision_lease,
         collision_host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
     assert!(
         matches!(collision_res, Err(TrapError::Hypervisor(ref msg)) if msg.contains("collision")),
@@ -4615,7 +4615,7 @@ fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_ho
     let owner_generation = register_global_frame_host_owner(
         lease,
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register global frame host owner");
 
@@ -4693,7 +4693,7 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
     let owner_generation = register_global_frame_host_owner(
         lease,
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     )
     .expect("register global frame host owner");
 
@@ -5028,7 +5028,7 @@ fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_withou
                 mapping.as_ptr().cast(),
                 key.0,
                 key.1 as usize,
-                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
             )
         },
         0
@@ -5039,7 +5039,7 @@ fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_withou
         &custody,
         lease,
         mapping,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
     )
     .expect_err("vacant custody rejects mapped publication after explicit rollback");
     assert!(!ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
@@ -5059,7 +5059,7 @@ fn unowned_retirement_rejects_an_unmapped_local_lease() {
         host_addr: 0x5000_0000usize as *mut u8,
         size: key.1 as usize,
         physical_size: key.1 as usize,
-        perms: applevisor::memory::MemPerms::ReadWriteExec,
+        perms: carrick_hal::MemPerms::ReadWriteExec,
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -5632,7 +5632,7 @@ fn cow_lane_reuse_requires_an_unpublished_exact_owner_lane() {
         physical_ipa: key.0,
         physical_host_addr: extent.stage2_owner.host_addr,
         physical_size: key.1 as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
@@ -5818,7 +5818,7 @@ fn distant_live_alias_retains_the_shared_physical_cow_inventory() {
         physical_ipa,
         physical_host_addr: 0x7200_0000,
         physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -5873,7 +5873,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         physical_ipa,
         physical_host_addr: 0x7300_0000,
         physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::MmRootSlot {
@@ -6342,7 +6342,7 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         physical_ipa: ipa,
         physical_host_addr: 0x1000usize as *mut u8,
         physical_size: size as usize,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,
@@ -6780,7 +6780,7 @@ fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
     let owner = GlobalFrameHostOwner::new(
         GlobalFrameStage2Lease::fixed(lease_ipa, lease_length),
         host,
-        u64::from(applevisor::memory::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         current_generation,
         lease_ipa,
         lease_length,
@@ -6807,7 +6807,7 @@ fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
         physical_ipa: lease_ipa,
         physical_host_addr: current_host as *mut u8,
         physical_size: lease_length as usize,
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -7263,7 +7263,7 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         physical_host_addr: host as *mut u8,
         physical_size: 0x4000,
         inventory_backing: InventoryBackingIdentity::Private(ipa),
-        perms: applevisor::memory::MemPerms::ReadWrite,
+        perms: carrick_hal::MemPerms::ReadWrite,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,

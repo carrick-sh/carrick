@@ -66,14 +66,30 @@ pub struct MemPerms {
     pub exec: bool,
 }
 
+/// The eight permission sets by name, so a backend-neutral caller names a set
+/// as plainly as a hypervisor's own enum does.
+#[allow(non_upper_case_globals)]
 impl MemPerms {
-    /// Helper to construct Read-Write-Execute permissions.
-    #[allow(non_upper_case_globals)]
-    pub const ReadWriteExec: Self = Self {
-        read: true,
-        write: true,
-        exec: true,
-    };
+    /// No access.
+    pub const None: Self = Self::new(false, false, false);
+    /// Read only.
+    pub const Read: Self = Self::new(true, false, false);
+    /// Write only.
+    pub const Write: Self = Self::new(false, true, false);
+    /// Execute only.
+    pub const Exec: Self = Self::new(false, false, true);
+    /// Read and write.
+    pub const ReadWrite: Self = Self::new(true, true, false);
+    /// Read and execute.
+    pub const ReadExec: Self = Self::new(true, false, true);
+    /// Write and execute.
+    pub const WriteExec: Self = Self::new(false, true, true);
+    /// Read, write and execute.
+    pub const ReadWriteExec: Self = Self::new(true, true, true);
+
+    const fn new(read: bool, write: bool, exec: bool) -> Self {
+        Self { read, write, exec }
+    }
 }
 
 /// Registers that live in KVM's **core** register file (`struct kvm_regs`),

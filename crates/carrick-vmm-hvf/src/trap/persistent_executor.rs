@@ -15,7 +15,7 @@ pub(crate) struct ThreadMappingDesc {
     pub(crate) physical_ipa: u64,
     pub(crate) physical_host_addr: *mut u8,
     pub(crate) physical_size: usize,
-    pub(crate) perms: applevisor::memory::MemPerms,
+    pub(crate) perms: carrick_hal::MemPerms,
     pub(crate) is_dynamic_alias: bool,
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) guest_writable: bool,
@@ -92,17 +92,7 @@ impl ThreadMappingDesc {
     }
 
     pub(crate) fn from_alias(alias: AliasBacking) -> Option<Self> {
-        let perms = match alias.perms {
-            0 => applevisor::memory::MemPerms::None,
-            1 => applevisor::memory::MemPerms::Read,
-            2 => applevisor::memory::MemPerms::Write,
-            3 => applevisor::memory::MemPerms::ReadWrite,
-            4 => applevisor::memory::MemPerms::Exec,
-            5 => applevisor::memory::MemPerms::ReadExec,
-            6 => applevisor::memory::MemPerms::WriteExec,
-            7 => applevisor::memory::MemPerms::ReadWriteExec,
-            _ => return None,
-        };
+        let perms = carrick_aarch64::stage2::stage2_perms_from_bits(alias.perms)?;
         Some(Self {
             start: alias.start,
             ipa: alias.ipa,
@@ -696,8 +686,7 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
             // `hvf_perms` escalates every writable boot region to RWX.
             let writable = matches!(
                 mapping.perms,
-                applevisor::memory::MemPerms::ReadWrite
-                    | applevisor::memory::MemPerms::ReadWriteExec
+                carrick_hal::MemPerms::ReadWrite | carrick_hal::MemPerms::ReadWriteExec
             );
             if !writable || !mapping.guest_writable {
                 return Err(TrapError::Hypervisor(

@@ -114,7 +114,7 @@ fn alias(
         physical_ipa,
         physical_host_addr: 0x1_0000_0000 + physical_ipa as usize,
         physical_size: physical_size as usize,
-        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         guest_writable: true,
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,

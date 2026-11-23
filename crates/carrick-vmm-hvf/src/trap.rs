@@ -2220,7 +2220,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             host_addr: std::ptr::null_mut(),
             size: 0x1000,
             physical_size: 0x1000,
-            perms: applevisor::memory::MemPerms::ReadWrite,
+            perms: carrick_hal::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
             structural_owner: None,
@@ -2589,7 +2589,7 @@ pub(crate) struct HvfMappedRegion {
     /// Stage-2 permissions used to map the region. Same value that
     /// `hvf_perms` returned; the child rebuilds the mapping with these
     /// exact permissions.
-    pub(crate) perms: applevisor::memory::MemPerms,
+    pub(crate) perms: carrick_hal::MemPerms,
     /// `Memory` owns the host allocation and the hv_vm_unmap that
     /// fires on Drop. In a freshly-forked CHILD we replace this with
     /// `None` (after `mem::forget` on the inherited inner) — the host
@@ -2788,7 +2788,7 @@ struct ProcessMappingDesc {
     pub(crate) physical_host_addr: *mut u8,
     pub(crate) physical_size: usize,
     pub(crate) inventory_backing: InventoryBackingIdentity,
-    pub(crate) perms: applevisor::memory::MemPerms,
+    pub(crate) perms: carrick_hal::MemPerms,
     pub(crate) is_dynamic_alias: bool,
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) guest_writable: bool,
@@ -2859,7 +2859,7 @@ fn authenticated_structural_owner_record_in(
     physical_host_addr: *mut u8,
     physical_ipa: u64,
     physical_size: usize,
-    perms: applevisor::memory::MemPerms,
+    perms: carrick_hal::MemPerms,
     owner_generation: u64,
 ) -> Option<CarrierStage2RecordIdentity> {
     let owner_custody = owner.custody.upgrade()?;
@@ -2896,7 +2896,7 @@ fn authenticated_structural_owner_record_in(
         && snapshot.ipa == physical_ipa
         && snapshot.len == physical_size
         && snapshot.host_addr == physical_host_addr as usize
-        && snapshot.perms == u64::from(perms)
+        && snapshot.perms == carrick_aarch64::stage2::stage2_perms_bits(perms)
         && snapshot.logical_owner == Some(logical_owner)
         && snapshot.mapped
         // A pooled root slot is backend-mapped once by the pool's own lease;
@@ -3783,7 +3783,7 @@ struct HvpatchTaskMappingState {
     physical_host_addr: *mut u8,
     size: usize,
     physical_size: usize,
-    perms: applevisor::memory::MemPerms,
+    perms: carrick_hal::MemPerms,
     guest_writable: bool,
     host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
     structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
@@ -7023,7 +7023,7 @@ impl HvfVmState {
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
-                        u64::from(mapping.perms),
+                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                     )
                 };
                 if rc != 0 {
@@ -7034,7 +7034,7 @@ impl HvfVmState {
                         mapping.physical_host_addr as usize,
                         mapping.physical_ipa,
                         mapping.physical_size,
-                        u64::from(mapping.perms),
+                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                         rc.raw(),
                     );
                     let error = TrapError::ChildMapFailed {
@@ -7075,7 +7075,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 lease,
                                 host_mapping,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                             )?;
                             registered_global_owners.push((
                                 mapping.physical_ipa,
@@ -7137,7 +7137,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
                                 lease,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -7168,7 +7168,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 handle,
                                 lease,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -7230,7 +7230,7 @@ impl HvfVmState {
                     physical_ipa: mapping.physical_ipa,
                     physical_host_addr: mapping.physical_host_addr as usize,
                     physical_size: mapping.physical_size,
-                    perms: u64::from(mapping.perms),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                     guest_writable: mapping.guest_writable,
                     sharing: mapping.sharing,
                     ownership_scope: alias_ownership_scope(
@@ -7497,7 +7497,7 @@ impl HvfVmState {
                         mapping.physical_host_addr.cast(),
                         mapping.physical_ipa,
                         mapping.physical_size,
-                        u64::from(mapping.perms),
+                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                     )
                 };
                 if rc != 0 {
@@ -7506,7 +7506,7 @@ impl HvfVmState {
                         mapping.physical_host_addr as usize,
                         mapping.physical_ipa,
                         mapping.physical_size,
-                        u64::from(mapping.perms),
+                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                         rc.raw(),
                     );
                     let error = TrapError::ChildMapFailed {
@@ -7552,7 +7552,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 lease,
                                 host_mapping,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                             )?;
                             registered_global_owners.push((
                                 mapping.physical_ipa,
@@ -7599,7 +7599,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
                                 lease,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -7624,7 +7624,7 @@ impl HvfVmState {
                                 &plan.carrier_foreign_mm_transport.custody,
                                 handle,
                                 lease,
-                                u64::from(mapping.perms),
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                                 epoch,
                                 mapping.physical_ipa,
                                 mapping.physical_size,
@@ -7679,7 +7679,7 @@ impl HvfVmState {
                     physical_ipa: mapping.physical_ipa,
                     physical_host_addr: mapping.physical_host_addr as usize,
                     physical_size: mapping.physical_size,
-                    perms: u64::from(mapping.perms),
+                    perms: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                     guest_writable: mapping.guest_writable,
                     sharing: mapping.sharing,
                     ownership_scope: alias_ownership_scope(

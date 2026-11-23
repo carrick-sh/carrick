@@ -1623,7 +1623,7 @@ impl HvfVmState {
     }
 
     pub(crate) fn region_permissions(region: &HvfMappedRegion) -> carrick_hal::MemPerms {
-        let raw = u64::from(region.perms);
+        let raw = carrick_aarch64::stage2::stage2_perms_bits(region.perms);
         carrick_hal::MemPerms {
             read: raw & 1 != 0,
             write: raw & 2 != 0,
