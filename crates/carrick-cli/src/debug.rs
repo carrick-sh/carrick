@@ -175,6 +175,7 @@ pub(crate) fn run_debug(
             oracle_only,
             venue_profiles,
             report,
+            provider,
         } => {
             if report {
                 crate::debug_discover::report(&out, limit)?;
@@ -194,6 +195,7 @@ pub(crate) fn run_debug(
                     oracle: oracle.as_deref(),
                     oracle_only,
                     venue_profiles: &venue_profiles,
+                    provider,
                 })?;
             }
         }
