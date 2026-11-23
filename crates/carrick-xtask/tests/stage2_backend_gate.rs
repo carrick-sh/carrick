@@ -305,3 +305,63 @@ fn inventory_wrappers_reach_the_held_backend() {
         "only trap/carrier_custody.rs may build the HVF backend: {named_elsewhere:?}"
     );
 }
+
+/// Tests run custody on the production path: `Stage2State` holds its
+/// carrier VM's custody in every build, and no process-wide test custody
+/// stands in for it, so parallel tests stop sharing one stage-2 record table
+/// (#1236, M2c of the custody move).
+#[test]
+fn stage2_state_holds_its_custody_in_tests_too() {
+    let sources = hvf_sources();
+    let (_, stage2_source) = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("trap/stage2_state.rs"))
+        .expect("trap/stage2_state.rs");
+    let (_, after_header) = stage2_source
+        .split_once("struct Stage2State {")
+        .expect("trap/stage2_state.rs must define `struct Stage2State`");
+    let declares_custody = |line: &str| {
+        let line = line.trim_start();
+        let line = line
+            .strip_prefix("pub(crate) ")
+            .or_else(|| line.strip_prefix("pub(super) "))
+            .unwrap_or(line);
+        line.starts_with("custody:")
+    };
+    assert!(
+        after_header.lines().any(declares_custody),
+        "`Stage2State` must declare `custody`"
+    );
+    let custody_decl: Vec<&str> = after_header
+        .lines()
+        .take_while(|line| !declares_custody(line))
+        .collect();
+    let gated = custody_decl
+        .iter()
+        .rev()
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.starts_with('#') || line.starts_with("///")
+        })
+        .any(|line| line.contains("cfg("));
+    assert!(
+        !gated,
+        "`Stage2State::custody` must exist in every build, not behind a cfg"
+    );
+    for accessor in ["custody", "custody_arc"] {
+        let body = stage2_source
+            .split_once(format!("fn {accessor}(").as_str())
+            .and_then(|(_, tail)| tail.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("trap/stage2_state.rs must define `fn {accessor}(`"));
+        assert!(
+            !body.contains("cfg(test)") && !body.contains("cfg(not(test))"),
+            "`Stage2State::{accessor}..)` must read the held custody in tests too"
+        );
+    }
+    let legacy = count(&sources, "legacy_test_carrier_vm_custody");
+    assert_eq!(
+        legacy, 0,
+        "test fixtures must own their custody; `legacy_test_carrier_vm_custody` is named {legacy} times"
+    );
+}
