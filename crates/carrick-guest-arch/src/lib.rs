@@ -349,6 +349,12 @@ pub struct AddressContext<R> {
 
 pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
 
+/// The exclusive end of AArch64 Linux user VA (a 48-bit TTBR0 space).
+pub const AARCH64_USER_VA_END: u64 = 1 << 48;
+/// The exclusive end of x86-64 four-level Linux user VA: `TASK_SIZE_MAX`
+/// leaves the final lower-half page unmapped.
+pub const X86_64_USER_VA_END: u64 = USER_CEILING - 4096;
+
 /// A user operand must be wholly within the canonical lower half. The
 /// checked end also excludes wraparound into the supervisor address space.
 pub const fn lower_half_range(address: u64, len: u64) -> bool {

@@ -128,7 +128,7 @@ impl GuestArch for Aarch64GuestArch {
     }
 
     fn user_va_ceiling() -> crate::guest_arch::UserVaCeiling {
-        crate::guest_arch::UserVaCeiling::new(1 << 48)
+        crate::guest_arch::UserVaCeiling::new(carrick_guest_arch::AARCH64_USER_VA_END)
     }
 
     fn vdso_bytes() -> Vec<u8> {
