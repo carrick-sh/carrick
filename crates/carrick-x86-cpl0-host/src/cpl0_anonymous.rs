@@ -278,16 +278,22 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
     }
     fn deliver(
         &self,
-        _: &X86Cpl0Zone,
+        zone: &X86Cpl0Zone,
         _: Waker,
         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
             carrick_sched_core::ParkedContextWords,
         >,
     ) {
-        let (_, effects) = owned.deliver_handbacks(&mut |_| {
-            self.error.borrow_mut().get_or_insert_with(|| {
-                fail("native COW release produced unsupported host-home completion custody")
+        // A waiter no guest slot could take (its CPUs stopped, one of them
+        // in this exit; for example a member parked on the gate this
+        // release lowers) goes back to its native ring owner's queue, as a
+        // host IPC release's does. A host thread never completes it.
+        let (_, effects) = owned.deliver_handbacks(&mut |record| {
+            zone.hand_back_to_owner(record, &mut |slot| {
+                if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
+                    self.error.borrow_mut().get_or_insert(error);
+                }
             });
         });
         if effects.owes_host_boundary() || effects.queued_own {
