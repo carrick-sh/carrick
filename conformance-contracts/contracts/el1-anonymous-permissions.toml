@@ -42,6 +42,7 @@ vm_free = [
   "carrick-el1::memory::tests::native_memory_call_uses_projected_task_and_actual_editor_slot",
   "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
   "carrick-el1::memory::tests::invalid_arm_slot_refuses_mprotect_before_editing",
+  "carrick-mmu-core::x86::descriptor_txn::tests::guest_protect_grants_execute_within_the_mapping_ceiling (#2874: an x86 execute grant within the mapping's ceiling applies and tags MAY_EXEC; write widening stays refused)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",
@@ -51,5 +52,5 @@ docker = [
 ]
 
 [bindings.unresolved]
-kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
+kvm = "Executing x86 bindings: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring; carrick-vmm-kvm::cpl0_initial_mm::{production_mprotect_makes_written_anonymous_memory_executable,production_mprotect_makes_a_committed_reserve_executable,production_mprotect_makes_a_forked_childs_anonymous_memory_executable} (#2874: anonymous RW memory written then mprotected PROT_READ|PROT_EXEC and executed, in the root, inside a PROT_NONE reserve and in a forked child; each against the native oracle; red at ENOSYS). Requires real KVM; the contract evaluator has no registered KVM observation layer."
 production = "Exact complete-range resident private-anonymous mprotect now runs under the guest's exact-MM editor across tagged L1/L2 blocks and L3 leaves, preserves output identity and permission ceilings, performs ASID invalidation, and refuses partial coarse blocks or widening to the host fallback. Permission faults no longer request first-touch grants; host syscall-copy paths read the live tagged permissions; host edits adopt guest-grown hierarchy before mutation; and COW parity accepts a stale shadow only for an exact tagged live leaf. The signed 256/1024/4096-page fixture serves all four target-range transitions per round in EL1, preserves bytes, reports SEGV_ACCERR for every denied read/write, returns every initial frame byte, and remains nearly page-scale flat. One fixed one-page signal-stack guard mprotect still forwards per process and each denied-access signal cycle still exits to the host pending the signal increment. Broader mmap-family ownership, fork-COW authority and final host page-table pause removal remain open checkpoint-2 work."
