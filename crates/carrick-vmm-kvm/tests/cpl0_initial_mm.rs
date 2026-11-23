@@ -188,6 +188,52 @@ fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
     );
 }
 
+/// #2706: the run root's free non-fixed hint outside the reservation arena
+/// (V8's cage reservation) is honoured exactly, in ring, as `mmap(2)` places
+/// a free hint. It was declined (`RootDeclined`), a counted ENOSYS.
+#[test]
+fn serial_host_native_root_out_of_arena_hint_is_exact() {
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &[]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_LOADED)
+        .expect("native root out-of-arena hint");
+    assert_root_hint_exact(&outcome, "root");
+}
+
+/// The same hint from a root that exec'd in place (`exec node -e`).
+#[test]
+fn serial_host_native_root_exec_successor_out_of_arena_hint_is_exact() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let image = native_exit_fixture_with_flags("native_root_mmap_hint.S", &[]);
+    carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &["-DROOT_EXEC", &path]);
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_root_hint_exact(&outcome, "root exec successor");
+}
+
+fn assert_root_hint_exact(outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome, who: &str) {
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "{who}: 38=mmap refused, 92=placed elsewhere, 91=later step, 100+=exec errno. \
+         mmap refused={}, anonymous leaves={:?}",
+        load(&counters.refused[9]),
+        counters.anonymous_leaves.each_ref().map(load),
+    );
+    assert_eq!(
+        load(&counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::RootDeclined as usize]),
+        0,
+        "{who}: the shared reservation owner served the hint"
+    );
+}
+
 /// #1846 (V8's `Check failed: 0 == ret`): a live native child's `madvise`
 /// is served in ring. Its inherited written page, a PROT_NONE guard page and
 /// a touched RW page each read zero after `MADV_DONTNEED`; the live parent's
