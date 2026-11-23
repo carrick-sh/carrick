@@ -4159,6 +4159,77 @@ fn test_fork_prepared_box_allocation_failure_allows_index_reuse_without_collisio
     service.abort_mm(prepared).expect("abort_mm should succeed");
 }
 
+/// #2919 review P0-1: a fork whose parent changes during its stock crossing
+/// is refused at Prepare as `ParentChanged` and reruns (#2890). By then it
+/// has published the child's reservation root at its closed space index.
+/// The refusal must retire that root with the index: the rerun claims the
+/// same index for the same child MM and must publish again, never answer
+/// `Collision` (EFAULT) from the stale root.
+#[test]
+fn fork_rerun_after_parent_changed_at_prepare_reuses_the_child_space() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000, 0x28000, 0x29000,
+        0x2a000, 0x2b000, 0x2c000, 0x2d000, 0x2e000, 0x2f000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    // A sibling's edit lands while the fork's editor is released for the
+    // stock crossing: the parent's operation sequence moves past the
+    // fork's snapshot.
+    let region = core::ptr::from_ref(fixture.region) as usize;
+    let zone = core::ptr::from_ref(fixture.zone) as usize;
+    *crossing.on_loan.lock().unwrap() = Some(Box::new(move || {
+        // SAFETY: the fixture leaks both for the life of the test, and the
+        // fork runs this hook synchronously on this thread.
+        let region: &'static crate::mm_portal::test_support::Region =
+            unsafe { &*(region as *const crate::mm_portal::test_support::Region) };
+        // SAFETY: as above.
+        let zone: &'static ZoneTables<Aarch64ParkedContext> =
+            unsafe { &*(zone as *const ZoneTables<Aarch64ParkedContext>) };
+        let owner = super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, region.table(), zone);
+        owner
+            .root(carrick_core_abi::ReservationMm::new(1).unwrap(), 0)
+            .unwrap()
+            .next_transfer_sequence()
+            .unwrap();
+    }));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+
+    let error = service
+        .prepare_mm(&fixture.address, &parked, child_mm)
+        .expect_err("a parent changed during the crossing refuses this attempt");
+    assert_eq!(error.failure(), Err(NativeContention::BUSY));
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("the changed parent lost its refusal site: {error:?}");
+    };
+    assert_eq!(
+        refusal.cause,
+        super::native_fork_refusal::NativeForkCause::Mm(
+            carrick_core::mm::transaction::MmError::ParentChanged
+        )
+    );
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    assert!(fixture.zone.spaces.find(2).is_none());
+
+    // The rerun takes a fresh snapshot, the same child MM and the same
+    // space index.
+    let prepared = service
+        .prepare_mm(&fixture.address, &parked, child_mm)
+        .expect("the rerun publishes the child root again, without Collision");
+    service.abort_mm(prepared).expect("abort_mm should succeed");
+}
+
 #[test]
 fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine() {
     let fixture = Fixture::new(0x10000, asid(1));
