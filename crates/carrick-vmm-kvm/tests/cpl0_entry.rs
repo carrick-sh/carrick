@@ -2655,6 +2655,26 @@ fn ring_panic_reaches_the_host_with_its_location_and_message() {
             && error.contains(": transport witness panic 2"),
         "expected the panic's location and message, got {error}"
     );
+    // The host walks the panicking CPU's kernel stack: every reported return
+    // address lies in the supervisor image, and the chain reaches past the
+    // panic machinery into the ring's callers.
+    let (_, backtrace) = error
+        .split_once("; ring return addresses:")
+        .expect("a ring panic reports its callers");
+    let returns: Vec<u64> = backtrace
+        .split_whitespace()
+        .map(|address| {
+            u64::from_str_radix(address.trim_start_matches("0x"), 16)
+                .expect("a hexadecimal return address")
+        })
+        .collect();
+    assert!(
+        returns.len() >= 3
+            && returns
+                .iter()
+                .all(|address| *address >= 0xffff_ffff_8000_0000),
+        "expected supervisor return addresses, got {error}"
+    );
 }
 
 fn context_program() -> Vec<u8> {

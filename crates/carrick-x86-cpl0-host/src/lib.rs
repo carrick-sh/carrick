@@ -13,3 +13,5 @@ mod cpl0_private_witness;
 pub mod guest_ram;
 #[cfg(target_arch = "x86_64")]
 pub mod host_readiness;
+#[cfg(target_arch = "x86_64")]
+pub mod ring_panic;
