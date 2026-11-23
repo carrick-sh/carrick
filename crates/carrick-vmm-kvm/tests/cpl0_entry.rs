@@ -1658,8 +1658,12 @@ fn production_anonymous_failed_replay_settlement_is_fatal_not_efault() {
     let _ = other;
 
     match try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32) {
+        // The refusal is the carrier's typed fatal, named at its raising
+        // site (`fatal_reservation` in the CPL0 anonymous venue, #2853).
         Err(error) => assert!(
-            error.to_string().contains("production port 0xcc"),
+            error.to_string().contains("CPL0 fatal exit at ")
+                && error.to_string().contains("src/anonymous.rs:")
+                && error.to_string().contains(": fatal_boot"),
             "settlement refusal must ring the fatal doorbell (port 0xcc), not return an errno: {error}"
         ),
         Ok(outcome) => panic!(
