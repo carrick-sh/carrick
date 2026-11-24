@@ -1002,9 +1002,7 @@ fn settle_unsettled_guest_cow_in(
     };
     tables.spaces.raise(index);
     let Some(excluded) = tables.spaces.excluded_without_editor(index) else {
-        if tables.live() {
-            tables.lower(index);
-        }
+        carrick_thread::fork_quiesce::FenceMirror::lower(&SpaceGate { tables, index });
         return GuestCowSettlement::EditorHeld;
     };
     settle_excluded(&tables, &excluded);
