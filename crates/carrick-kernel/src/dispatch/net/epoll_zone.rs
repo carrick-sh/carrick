@@ -401,12 +401,20 @@ impl ZoneEpoll {
 }
 
 /// Remove every zone item of a member's open file whose last descriptor
-/// closed (`man 7 epoll`).
+/// closed (`man 7 epoll`). The last close runs in the carrier-exit
+/// `FileTable` drop too, so it waits with the region's stop-aware wait: a
+/// member or epoll lock a stopped vCPU still holds is quarantined and
+/// counted, and the close goes on (#2955). Any other refusal leaves the
+/// items as before (a stale member has none).
 pub(crate) fn detach_member_file(member: &ZoneMember) {
-    let _ = member
-        .owner
-        .region()
-        .epoll_detach_file(member.object, member.file_key, &HostLockWait);
+    let owner = &member.owner;
+    if let Err(error) =
+        owner
+            .region()
+            .epoll_detach_file(member.object, member.file_key, &owner.wait())
+    {
+        let _ = owner.quarantine_cut_off(error.into());
+    }
 }
 
 #[cfg(test)]
@@ -535,7 +543,9 @@ mod tests {
                 .is_ok(),
             "FileTable drop spins on a member lock a stopped vCPU holds"
         );
-        assert!(owner.quarantined_teardowns() >= 1);
+        // Two steps meet the held lock: the epoll detach, then the
+        // endpoint description's own close (`HostDescription::drop`).
+        assert_eq!(owner.quarantined_teardowns(), 2);
     }
 
     #[test]
