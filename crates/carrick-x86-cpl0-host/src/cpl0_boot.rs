@@ -1302,6 +1302,9 @@ pub mod exec_service;
 
 pub mod retained_slots;
 
+mod stdio;
+pub use stdio::StdioReleaseRefusal;
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -4566,6 +4569,8 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
     initial_task: Option<InitialTaskBinding>,
+    /// The zone's stdio descriptions, admitted once at boot (#2820).
+    stdio: stdio::StdioCustody,
     /// The ISA-neutral fork stock, loans and child quarantine.
     fork_stock: carrick_hal::fork_stock::ForkStock<
         carrick_hal::fork_stock::UntaggedRoots,
@@ -4668,6 +4673,28 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }))
     }
 
+    /// Lend the stdio custody beside the file tables, only while every
+    /// physical CPU is stopped and no guest descriptor transaction is open.
+    fn with_stdio<R>(
+        &mut self,
+        edit: impl FnOnce(&mut stdio::StdioCustody, &carrick_el1_abi::FileTables<'_>) -> R,
+    ) -> Result<R, TrapError> {
+        let _stopped = self
+            .files
+            .execution
+            .try_write()
+            .map_err(|_| fail("stdio tables while a CPU runs"))?;
+        let tables = self
+            .files
+            .registration
+            .tables(self.files.registration.binding())
+            .map_err(|error| fail(format!("stdio tables: {error:?}")))?;
+        if tables.fd_map()[0].mutation_active() {
+            return Err(fail("stdio tables inside a guest descriptor transaction"));
+        }
+        Ok(edit(&mut self.stdio, &tables))
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
@@ -4757,6 +4784,30 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
     /// Who is stopped here: the root binding's leader, or a member of it.
     pub fn subject(&self) -> ForwardSubject {
         self.execution.subject()
+    }
+
+    /// The stopped task released the last reference to a stdio description:
+    /// RDI the binding, RSI the description handle, RDX its incarnation. Only
+    /// the exact description the carrier admitted, once, is accepted; the
+    /// answer is the stdio descriptor number it was admitted as.
+    pub fn release_stdio(
+        &mut self,
+        binding: u64,
+        handle: u64,
+        incarnation: u64,
+    ) -> Result<i32, TrapError> {
+        let handle = u32::try_from(handle)
+            .map_err(|_| fail(format!("host object release handle {handle} out of range")))?;
+        self.custody
+            .stdio
+            .release(
+                binding,
+                carrick_el1_linux::file_table::ReleasedDescription {
+                    handle,
+                    incarnation,
+                },
+            )
+            .map_err(|refusal| fail(refusal.to_string()))
     }
 
     /// Authenticate that the stopped task's own CPL0 file table holds a live
@@ -5956,6 +6007,36 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             carrick_hal::fork_stock::UntaggedRoots,
         );
+        // The carrier launches the boot task: its table gets the zone's one
+        // stdio admission before any guest instruction runs (#2820).
+        // SAFETY: `prepare_boot` initialized the aligned boot task record
+        // inside this retained metadata; nothing runs before this custody.
+        let boot_table = unsafe {
+            metadata_base
+                .0
+                .as_ptr()
+                .add(TASK_OFFSET as usize)
+                .cast::<CurrentTask>()
+                .as_ref()
+        }
+        .ok_or_else(|| fail("boot task metadata"))?
+        .linux
+        .file_table
+        .load(Ordering::Acquire);
+        let stdio = {
+            let tables = files
+                .0
+                .registration
+                .tables(files.0.registration.binding())
+                .map_err(|error| fail(format!("boot stdio tables: {error:?}")))?;
+            stdio::StdioCustody::admit(
+                tables.fd_map(),
+                tables.opens(),
+                tables.objects(),
+                boot_table,
+            )
+            .map_err(|error| fail(format!("boot stdio admission: {error:?}")))?
+        };
         Ok(Self(Cpl0HostCustody {
             _vm: memory,
             ram,
@@ -5973,6 +6054,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             peer_entry: None,
             peer_admission: InitialPeerAdmission::Cold,
             initial_task: None,
+            stdio,
             fork_stock,
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
@@ -6652,7 +6734,6 @@ fn bootstrap_cpu_binding(index: usize, scheduler_witness: u64) -> CpuBinding {
         fault_reason: AtomicU64::new(0),
         mm_owner_generation: AtomicU64::new(1),
         last_seen_generation: AtomicU64::new(0),
-        stdio_table_admitted: AtomicU64::new(0),
         file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
         cr4_snapshot: AtomicU64::new(0),
     }
@@ -8088,6 +8169,16 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             return Err(fail("initial root control slot identity"));
         }
         control.publish_host_birth_identity(birth);
+        let provisional = self
+            .stopped_task(0)
+            .linux
+            .file_table
+            .load(Ordering::Acquire);
+        self.0
+            .with_stdio(|stdio, tables| {
+                stdio.rename_unstarted(tables.fd_map(), provisional, identity.thread.file_table)
+            })?
+            .map_err(|error| fail(format!("initial root stdio table: {error:?}")))?;
         let task = self.stopped_task(0);
         task.set(
             El1TaskId::from_linux_tid(identity.task.id.raw()),
@@ -8195,6 +8286,11 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             return Err(fail("fixture visible task publication"));
         }
         self.stopped_slot(index).publish_host_birth_identity(birth);
+        self.0
+            .with_stdio(|stdio, tables| {
+                stdio.bind_table(tables.fd_map(), tables.opens(), file_table)
+            })?
+            .map_err(|error| fail(format!("initial task stdio table: {error:?}")))?;
         let task = self.stopped_task(index);
         task.set(
             El1TaskId::from_linux_tid(tid),

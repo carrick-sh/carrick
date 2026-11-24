@@ -303,7 +303,7 @@ fn file_region_guest_stdio_parity_and_two_carrier_independence() {
 fn file_region_guest_closes_record_beyond_fifteen() {
     use carrick_core_abi::OpenRelease;
     use carrick_el1_abi::{DELEGATED_FLAG_READABLE, fd_map_lookup};
-    use carrick_el1_linux::file_table::{admit_host_fd, admit_stdio};
+    use carrick_el1_linux::file_table::admit_host_fd;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::Ordering;
     let program = file_region_program(3, 19); // close(fd 19)
@@ -313,13 +313,13 @@ fn file_region_guest_closes_record_beyond_fifteen() {
     let host = std::fs::File::open("/dev/null").expect("real host object");
     {
         let tables = carrier.file_tables(binding).expect("retained tables");
-        admit_stdio(
-            tables.fd_map(),
-            tables.opens(),
-            tables.objects(),
-            5,
-            [true; 3],
-        );
+        // The stopped carrier admitted the boot table's stdio (#2820).
+        for fd in 0..3 {
+            assert_eq!(
+                fd_map_lookup(tables.fd_map(), 5, fd).map(|(handle, _)| handle),
+                Some(fd as u32 + 1)
+            );
+        }
         for fd in 3..20 {
             assert_eq!(
                 admit_host_fd(
