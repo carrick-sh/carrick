@@ -184,9 +184,12 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
                         crate::aarch64::descriptor_txn::DescriptorOp::Prepare {
                             resident, ..
                         } => resident,
-                        crate::aarch64::descriptor_txn::DescriptorOp::Publish { span, .. }
-                        | crate::aarch64::descriptor_txn::DescriptorOp::MapAlias { span, .. } => {
-                            span
+                        crate::aarch64::descriptor_txn::DescriptorOp::Publish { span, .. } => span,
+                        // A window page takes no residency row: the shared
+                        // receipt rule (`verify_receipt`) names no resident
+                        // span for an alias.
+                        crate::aarch64::descriptor_txn::DescriptorOp::MapAlias { .. } => {
+                            PageSpan::EMPTY
                         }
                         _ => return WireOutcome::Refused(DescriptorRefusal::BadEncoding),
                     },
