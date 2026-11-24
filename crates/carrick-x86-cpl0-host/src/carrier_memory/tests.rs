@@ -260,3 +260,15 @@ fn host_file_window_extent_shares_the_file_page_cache() {
         "a window is shareable guest data"
     );
 }
+#[test]
+fn retire_child_keeps_a_shared_file_window_slot_for_the_run() {
+    test_support::retire_child_keeps_a_shared_file_window_slot_for_the_run(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
+fn forked_shared_file_window_leaf_is_never_an_inventoried_frame() {
+    test_support::forked_shared_file_window_leaf_is_never_an_inventoried_frame(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
