@@ -347,14 +347,43 @@ pub fn decide_reservation_syscall_for_origin<
                     ),
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
-                None if service_origin == ServiceOrigin::Descendant => model
-                    .mmap_with_advisory_hint(
+                // Linux places a free hint at the address asked for
+                // (mmap(2)): inside the layout, or in an aperture free to the
+                // ring (the token). Any other hint is advisory. A ring-only
+                // MM relocates it into its layout; a run root whose geometry
+                // keeps a host venue forwards it to that venue's VMA checks.
+                None => {
+                    let len = frame.arguments()[1];
+                    let external = model.external_anonymous_hint(
                         placement,
-                        frame.arguments()[1],
-                        prot,
+                        len,
+                        G::USER_VA_END,
                         AnonymousHintVenue::Ring,
-                    ),
-                None => model.mmap(placement, frame.arguments()[1], prot),
+                    );
+                    let venue = match service_origin {
+                        ServiceOrigin::Descendant => AnonymousHintVenue::Ring,
+                        ServiceOrigin::Initial => G::ROOT_HINT_VENUE,
+                    };
+                    match venue {
+                        AnonymousHintVenue::Ring => model.mmap_with_advisory_hint(
+                            placement,
+                            len,
+                            prot,
+                            AnonymousHintVenue::Ring,
+                            external,
+                        ),
+                        AnonymousHintVenue::Host => {
+                            match external.map(|hint| model.prepare_external_anonymous(hint, prot))
+                            {
+                                Some(Err(
+                                    Refusal::Collision | Refusal::ForeignMapping | Refusal::Hole,
+                                ))
+                                | None => model.mmap(placement, len, prot),
+                                Some(result) => result,
+                            }
+                        }
+                    }
+                }
             }
         }
         SYS_MUNMAP | SYS_MPROTECT => {
@@ -1708,7 +1737,7 @@ fn serve_delegated_anonymous_attempt<
                 reservations::Refusal::Busy if pending_edit => {
                     DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
                 }
-                reservations::Refusal::Busy => forward(Leave::RootUnavailableBusy),
+                reservations::Refusal::Busy => forward(Leave::MetadataBankBusy),
                 reservations::Refusal::MetadataRequired => {
                     forward(Leave::RootUnavailableMetadataRequired)
                 }
@@ -1777,12 +1806,21 @@ fn serve_delegated_anonymous_attempt<
             let _ = pending.cancel(model);
             forward(why)
         };
-    let (Some(grant), Some(owner)) = (
-        spaces.grant(index, mm_key),
-        frame
-            .slot()
-            .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
-    ) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
+        return refuse(pending, &mut model, Leave::NoGrant);
+    };
+    let Some(grant) = spaces.grant(index, mm_key) else {
+        // A raised gate is a host page-table pause of this live space: "not
+        // now", like the editor admission's `Gate` below. Park on the gate's
+        // release (the reprobe re-reads it through the editor admission);
+        // only a closed or re-keyed entry has no grant to wait for.
+        if spaces.table().installed_grant(index, mm_key).is_some() {
+            let _ = pending.cancel(&mut model);
+            return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
+        }
         return refuse(pending, &mut model, Leave::NoGrant);
     };
     let _editor_guard =
@@ -3995,6 +4033,72 @@ mod tests {
             let mut model = root(&spaces, &table, &task);
             assert!(model.mapping(ARENA + 0x3000).is_some());
             assert_eq!(owed_returns(&model).len(), 1);
+        }
+
+        /// #2783 / #2832 record B2: a host page-table pause (a raised gate)
+        /// is "not now". The call parks on the gate's release with the root
+        /// and the descriptors unchanged, and the rerun after the host lowers
+        /// it is served: Busy once, then success, never a Forward.
+        #[test]
+        fn delegated_raised_gate_parks_then_the_rerun_is_served() {
+            use carrick_el1_abi::AnonymousLeave;
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                mmap_fixed(ARENA, 0x2000),
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            editor.calls.clear();
+            let index = spaces.find(task.key).unwrap();
+            let generation = root(&spaces, &table, &task).generation();
+            for (nr, args) in [
+                (SYS_MUNMAP, [ARENA, 0x1000, 0, 0, 0, 0]),
+                (SYS_MPROTECT, [ARENA + 0x1000, 0x1000, PROT_READ, 0, 0, 0]),
+                (SYS_MMAP, mmap_fixed(ARENA + 0x4000, 0x1000)),
+            ] {
+                spaces.raise(index);
+                let (route, _) = syscall(&task, &spaces, &table, &counters, &mut editor, nr, args);
+                assert_eq!(
+                    route,
+                    DelegatedAnonymous::Contended(SpaceWaitCause::Gate),
+                    "syscall {nr} under a raised gate"
+                );
+                assert_eq!(
+                    root(&spaces, &table, &task).generation(),
+                    generation,
+                    "syscall {nr}: a parked call proposes nothing"
+                );
+                assert!(editor.calls.is_empty(), "syscall {nr}: no descriptor step");
+                spaces.lower(index);
+            }
+            assert_eq!(
+                counters.anonymous_leaves[AnonymousLeave::NoGrant as usize].load(Ordering::Relaxed),
+                0
+            );
+            for (nr, args) in [
+                (SYS_MUNMAP, [ARENA, 0x1000, 0, 0, 0, 0]),
+                (SYS_MPROTECT, [ARENA + 0x1000, 0x1000, PROT_READ, 0, 0, 0]),
+                (SYS_MMAP, mmap_fixed(ARENA + 0x4000, 0x1000)),
+            ] {
+                let (route, result) =
+                    syscall(&task, &spaces, &table, &counters, &mut editor, nr, args);
+                assert_eq!(route, DelegatedAnonymous::Served, "syscall {nr} rerun");
+                assert!(result >= 0, "syscall {nr} rerun: {result}");
+            }
+            let mut model = root(&spaces, &table, &task);
+            assert_eq!(model.mapping(ARENA), None);
+            assert!(model.mapping(ARENA + 0x1000).is_some());
+            assert!(model.mapping(ARENA + 0x4000).is_some());
+            for nr in [SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP] {
+                assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+            }
         }
 
         #[test]

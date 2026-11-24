@@ -185,6 +185,11 @@ pub struct Census {
     /// `IpcLeave` name (nonzero only; absent in older files).
     #[serde(default)]
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// Delegated-MM `brk`/`mmap`/`munmap`/`mprotect` calls EL1 left for the
+    /// host (or, for a native child, answered as counted ENOSYS), by
+    /// `AnonymousLeave` name (nonzero only; absent in older files).
+    #[serde(default)]
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<CensusRow>,
 }
 
@@ -286,6 +291,15 @@ fn snapshot_counters(
                 .into_iter()
                 .filter_map(|why| {
                     let count = c.ipc_leaves[why as usize].load(Ordering::Relaxed);
+                    (count != 0).then(|| (why.name().to_owned(), count))
+                })
+                .collect()
+        }),
+        anonymous_leaves: counters.map_or_else(Default::default, |c| {
+            carrick_el1_abi::AnonymousLeave::ALL
+                .into_iter()
+                .filter_map(|why| {
+                    let count = c.anonymous_leaves[why as usize].load(Ordering::Relaxed);
                     (count != 0).then(|| (why.name().to_owned(), count))
                 })
                 .collect()
@@ -455,6 +469,8 @@ pub struct Aggregate {
     pub wall_ns: u64,
     /// `IpcLeave` counts summed across the runs, keyed by variant name.
     pub ipc_leaves: std::collections::BTreeMap<String, u64>,
+    /// `AnonymousLeave` counts summed across the runs, keyed by variant name.
+    pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<AggregateRow>,
 }
 
@@ -466,9 +482,13 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
     let mut ipc_leaves: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut anonymous_leaves: std::collections::BTreeMap<String, u64> = Default::default();
     for census in censuses {
         for (name, count) in &census.ipc_leaves {
             *ipc_leaves.entry(name.clone()).or_default() += count;
+        }
+        for (name, count) in &census.anonymous_leaves {
+            *anonymous_leaves.entry(name.clone()).or_default() += count;
         }
         if census.schema != 2 {
             return Err(format!("unknown census schema {}", census.schema));
@@ -512,6 +532,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             .sum(),
         wall_ns: censuses.iter().map(|c| c.wall_ns).sum(),
         ipc_leaves,
+        anonymous_leaves,
         rows,
     })
 }
@@ -562,6 +583,14 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             .map(|(name, count)| format!("{name}: {count}"))
             .collect();
         out.push_str(&format!("\nIPC leaves: {}\n", leaves.join(", ")));
+    }
+    if !aggregate.anonymous_leaves.is_empty() {
+        let leaves: Vec<_> = aggregate
+            .anonymous_leaves
+            .iter()
+            .map(|(name, count)| format!("{name}: {count}"))
+            .collect();
+        out.push_str(&format!("\nAnonymous leaves: {}\n", leaves.join(", ")));
     }
     out
 }
@@ -793,6 +822,7 @@ mod tests {
             process_sys_ns: 4_000,
             wall_ns: 30_000,
             ipc_leaves: Default::default(),
+            anonymous_leaves: Default::default(),
             rows,
         }
     }
@@ -1102,6 +1132,41 @@ mod tests {
         let aggregate = aggregate(&[a, b]).unwrap();
         assert_eq!(aggregate.ipc_leaves["epoll_not_zone"], 5);
         assert!(render_table(&aggregate, 10).contains("epoll_not_zone: 5"));
+    }
+
+    #[test]
+    fn census_json_names_each_nonzero_anonymous_leave() {
+        use carrick_el1_abi::AnonymousLeave;
+        for (ordinal, why) in AnonymousLeave::ALL.into_iter().enumerate() {
+            assert_eq!(why as usize, ordinal, "{why:?} is out of ordinal order");
+        }
+        let counters = carrick_el1_abi::Counters::new();
+        counters.anonymous_leaves[AnonymousLeave::RootUnavailableBusy as usize]
+            .store(9, Ordering::Relaxed);
+        counters.anonymous_leaves[AnonymousLeave::EditorBusy as usize].store(1, Ordering::Relaxed);
+        let census = snapshot_counters(
+            None,
+            Some(&counters),
+            carrick_spec::syscall_census::CensusIsa::X86_64,
+        );
+        let encoded = serde_json::to_value(&census).unwrap();
+        assert_eq!(
+            encoded["anonymous_leaves"],
+            serde_json::json!({"editor_busy": 1, "root_unavailable_busy": 9})
+        );
+        // Older files carry no such field and still load.
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().unwrap().remove("anonymous_leaves");
+        let legacy: Census = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.anonymous_leaves.is_empty());
+        // Aggregation sums them across carriers.
+        let mut a = census.clone();
+        a.rows = vec![row(222, 1, 1)];
+        let mut b = census;
+        b.rows = vec![row(222, 1, 1)];
+        let aggregate = aggregate(&[a, b]).unwrap();
+        assert_eq!(aggregate.anonymous_leaves["root_unavailable_busy"], 18);
+        assert!(render_table(&aggregate, 10).contains("root_unavailable_busy: 18"));
     }
 
     #[test]

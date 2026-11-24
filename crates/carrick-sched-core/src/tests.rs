@@ -5445,3 +5445,246 @@ fn held_affinity_placement_on_an_away_owner_kicks_live_peers() {
     assert!(effects.sgi_slots().any(|slot| slot == THIRD));
     assert!(zone.take_resched(THIRD));
 }
+
+/// Whether `record` is linked on `slot`'s run queue.
+fn linked_on(zone: &ZoneTables, slot: SlotId, record: RecordId) -> bool {
+    let mut cursor = zone.slot(slot).head.load(Ordering::Acquire);
+    let mut steps = 0;
+    while cursor != NIL && steps < ZONE_RECORDS {
+        if cursor == record.raw() {
+            return true;
+        }
+        cursor = zone.records[cursor as usize].next.load(Ordering::Acquire);
+        steps += 1;
+    }
+    false
+}
+
+/// #2928: two vCPUs run the x86 scheduler loop over one address space
+/// (timer expiry, an idle scan that steals, futex wakes across slots, the
+/// pre-resume migration, preemption and timed parks). A record whose claim
+/// says `Queued { slot }` must be linked on that slot's run queue whenever
+/// no scheduler step is in flight: one that is not is runnable work no vCPU
+/// will ever take (go vet hung with both slots in WFI and such a record).
+#[test]
+fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
+    use std::sync::atomic::AtomicU64 as StdAtomicU64;
+    const THREADS: u64 = 6;
+    const STEPS: usize = 200_000;
+    const ADDRESSES: [u64; 3] = [0x1000, 0x1004, 0x1008];
+    let zone: Arc<Box<ZoneTables>> = Arc::new(zone());
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let records: Vec<RecordId> = (0..THREADS)
+        .map(|t| park(&zone, t + 1, ADDRESSES[t as usize % ADDRESSES.len()]))
+        .collect();
+    for uaddr in ADDRESSES {
+        let _ = wake(&zone, uaddr, u32::MAX, Waker::El1 { slot: SLOT });
+    }
+    let now = Arc::new(StdAtomicU64::new(1));
+    let cpus: Vec<_> = [(SLOT, 0x9e37_79b9_u64), (OTHER, 0x85eb_ca6b_u64)]
+        .into_iter()
+        .map(|(slot, seed)| {
+            let zone = Arc::clone(&zone);
+            let now = Arc::clone(&now);
+            std::thread::spawn(move || {
+                let mut rng = seed;
+                let mut next = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                let mut held: Vec<RecordId> = Vec::new();
+                for _ in 0..STEPS {
+                    let tick = now.fetch_add(1, Ordering::SeqCst);
+                    let _ = zone.expire_timer_and_rearm(slot, tick, 110, 1, &|owned| {
+                        let _ = owned.into_parts();
+                    });
+                    held.retain(|record| zone.place_from_host(*record).is_none());
+                    if next() % 64 == 0 {
+                        // An exit: the executor holds the stopped vCPU and
+                        // moves its EL0-ready queue to slots in the guest.
+                        zone.leave_guest(slot, &HostWait);
+                        zone.relocate(
+                            slot,
+                            None,
+                            &mut |record, discard| {
+                                assert!(!discard);
+                                if zone.place_from_host(record.id).is_none() {
+                                    held.push(record.id);
+                                }
+                            },
+                            &mut |_| {},
+                        );
+                        zone.enter_guest(slot);
+                    }
+                    let Some(switched) = zone.take_idle_work(slot) else {
+                        if zone.enter_idle(slot, true) {
+                            for _ in 0..16 {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        zone.leave_idle(slot);
+                        continue;
+                    };
+                    zone.leave_idle(slot);
+                    let record = switched.record;
+                    let roll = next();
+                    if roll % 2 == 0 {
+                        let uaddr = ADDRESSES[(roll >> 8) as usize % ADDRESSES.len()];
+                        let guard = zone
+                            .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
+                            .unwrap();
+                        let mut woken = [const { WakeRecord::Empty }; 4];
+                        let mut effects = WakeEffects::default();
+                        let n = zone.wake_placed(
+                            &guard,
+                            MM,
+                            uaddr,
+                            u32::MAX,
+                            1,
+                            Waker::El1 { slot },
+                            &mut woken,
+                            &mut effects,
+                        );
+                        drop(guard);
+                        for woken in woken[..n as usize].iter_mut() {
+                            if let Some(ready) = woken.take_ready(&HostWait, &|owned| {
+                                let _ = owned.into_parts();
+                            }) && matches!(zone.record(ready.id).claim(), Claim::Host { .. })
+                                && zone.place_from_host(ready.id).is_none()
+                            {
+                                held.push(ready.id);
+                            }
+                        }
+                    }
+                    // x86 migrates queued work before every resume.
+                    zone.migrate_queued(slot, &mut WakeEffects::default());
+                    if roll % 3 == 0 && zone.runnable_head(slot).is_some() {
+                        assert!(zone.requeue_preempted(slot, record).is_queued());
+                        continue;
+                    }
+                    let uaddr = ADDRESSES[(roll >> 16) as usize % ADDRESSES.len()];
+                    let guard = zone
+                        .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
+                        .unwrap();
+                    let seq = zone.next_seq(record);
+                    // Every park is timed (Go's timed futex sleeps), so the
+                    // population keeps running; a busy timer node keeps the
+                    // thread runnable instead.
+                    if zone.arm_timer(slot, record, seq).is_err() {
+                        drop(guard);
+                        assert!(zone.requeue_preempted(slot, record).is_queued());
+                        continue;
+                    }
+                    zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)
+                        .unwrap();
+                    zone.set_deadline(record, tick + 1 + (roll >> 24) % 64);
+                    if !zone.publish_guest_park(&guard, slot, record, seq) {
+                        // A host request closed park admission: hand the
+                        // running record back, as the exit path does.
+                        drop(guard);
+                        assert_eq!(
+                            zone.handback_current(slot, record),
+                            CurrentHandback::HandedBack
+                        );
+                        if zone.place_from_host(record).is_none() {
+                            held.push(record);
+                        }
+                        continue;
+                    }
+                    drop(guard);
+                    zone.clear_current(slot);
+                }
+                held
+            })
+        })
+        .collect();
+    let host = {
+        let zone = Arc::clone(&zone);
+        let records = records.clone();
+        std::thread::spawn(move || {
+            let mut rng = 0xc2b2_ae35_u64;
+            let mut held: Vec<RecordId> = Vec::new();
+            for _ in 0..STEPS / 8 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                held.retain(|record| zone.place_from_host(*record).is_none());
+                let record = records[rng as usize % records.len()];
+                if rng.is_multiple_of(4) {
+                    // A host futex wake that places in the guest.
+                    let uaddr = ADDRESSES[(rng >> 8) as usize % ADDRESSES.len()];
+                    let guard = zone
+                        .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
+                        .unwrap();
+                    let mut handed = Vec::new();
+                    zone.wake_host(
+                        &guard,
+                        MM,
+                        uaddr,
+                        u32::MAX,
+                        1,
+                        true,
+                        &mut |transfer| handed.push(transfer),
+                        &mut |_| {},
+                    );
+                    drop(guard);
+                    for transfer in handed {
+                        if let Some(ready) = transfer.finish(&HostWait, &|owned| {
+                            let _ = owned.into_parts();
+                        }) && zone.place_from_host(ready.id).is_none()
+                        {
+                            held.push(ready.id);
+                        }
+                    }
+                } else if rng % 4 == 1 {
+                    // A signal for a thread in the guest.
+                    let reference = zone.record_ref(record);
+                    if zone.claim_for_host(reference, None, Handback::Signal, &HostWait, &|owned| {
+                        let _ = owned.into_parts();
+                    }) == HostClaim::Claimed
+                        && zone.place_from_host(record).is_none()
+                    {
+                        held.push(record);
+                    }
+                }
+                std::thread::yield_now();
+            }
+            held
+        })
+    };
+    let mut held: Vec<RecordId> = cpus
+        .into_iter()
+        .flat_map(|cpu| cpu.join().unwrap())
+        .collect();
+    held.extend(host.join().unwrap());
+    let counters = &zone.counters;
+    std::eprintln!(
+        "switches={} steals={} migrations={} preemptions={} wakes={} cross={} timeouts={}",
+        counters.el1_switches.load(Ordering::Relaxed),
+        counters.el1_steals.load(Ordering::Relaxed),
+        counters.el1_migrations.load(Ordering::Relaxed),
+        counters.el1_preemptions.load(Ordering::Relaxed),
+        counters.el1_wakes.load(Ordering::Relaxed),
+        counters.el1_cross_wakes.load(Ordering::Relaxed),
+        counters.el1_timeouts.load(Ordering::Relaxed),
+    );
+    for record in &records {
+        match zone.record(*record).claim() {
+            Claim::Queued { slot, .. } => assert!(
+                linked_on(&zone, slot, *record),
+                "record {record:?} is Queued on {slot:?} but on no run queue: {}",
+                {
+                    let mut census = std::string::String::new();
+                    zone.write_census(&mut census).unwrap();
+                    census
+                }
+            ),
+            Claim::Parked { .. } => {}
+            Claim::Host { .. } => assert!(held.contains(record), "{record:?}"),
+            other => panic!("record {record:?}: {other:?}"),
+        }
+    }
+}

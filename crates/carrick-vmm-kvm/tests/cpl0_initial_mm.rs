@@ -188,6 +188,63 @@ fn serial_host_native_exec_successor_advisory_mmap_stays_in_ring() {
     );
 }
 
+/// #2706: the run root's free non-fixed hint outside the reservation arena
+/// (V8's cage reservation) is honoured exactly, in ring, as `mmap(2)` places
+/// a free hint. It was declined (`RootDeclined`), a counted ENOSYS.
+#[test]
+fn serial_host_native_root_out_of_arena_hint_is_exact() {
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &[]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_LOADED)
+        .expect("native root out-of-arena hint");
+    assert_root_hint_exact(&outcome, "root");
+}
+
+/// The same hint from a root that exec'd in place (`exec node -e`).
+#[test]
+fn serial_host_native_root_exec_successor_out_of_arena_hint_is_exact() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let image = native_exit_fixture_with_flags("native_root_mmap_hint.S", &[]);
+    carrick_test_support::executable::write_executable_mode(&successor, &image, 0o700);
+    let path = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &["-DROOT_EXEC", &path]);
+    let outcome = run_exec_fixture(&elf, 128);
+    assert_root_hint_exact(&outcome, "root exec successor");
+}
+
+/// The same hint from a forked child while its parent waits live: the
+/// descendant's ring placement honours a free outside-layout hint exactly
+/// too, rather than relocating it into the arena.
+#[test]
+fn serial_host_native_forked_child_out_of_arena_hint_is_exact() {
+    let elf = native_exit_fixture_with_flags("native_root_mmap_hint.S", &["-DFORKED_CHILD"]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_LOADED)
+        .expect("native forked child out-of-arena hint");
+    assert_root_hint_exact(&outcome, "forked child");
+}
+
+fn assert_root_hint_exact(outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome, who: &str) {
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "{who}: 38=mmap refused, 92=placed elsewhere, 91=later step, 100+=exec errno. \
+         mmap refused={}, anonymous leaves={:?}",
+        load(&counters.refused[9]),
+        counters.anonymous_leaves.each_ref().map(load),
+    );
+    assert_eq!(
+        load(&counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::RootDeclined as usize]),
+        0,
+        "{who}: the shared reservation owner served the hint"
+    );
+}
+
 /// #1846 (V8's `Check failed: 0 == ret`): a live native child's `madvise`
 /// is served in ring. Its inherited written page, a PROT_NONE guard page and
 /// a touched RW page each read zero after `MADV_DONTNEED`; the live parent's
@@ -7655,3 +7712,112 @@ reservation_shape_witness!(
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
      committed page and the child reserves 1 GiB more."
 );
+
+/// #2763: two threads of one forked child churn `mmap`, first touch,
+/// `mprotect` and `munmap` on their shared MM for every round, whatever a call
+/// returns. A fault that one cause refused, and whose probe then named
+/// another, parked rechecking the first cause: the recheck never matched, the
+/// CPU spun with interrupts masked and never acknowledged its sibling's TLB
+/// shootdown, and the sender's CPL0 kernel died at the fatal port (`0xcc`).
+///
+/// Scoped to that claim: the path must be taken (some fault parks on the key
+/// its probe named for another cause, counted by the ring as
+/// `fault_parks_on_probed_cause`), and each run must end without a CPL0
+/// kernel fatal. A run may still end on a host-owner refusal (#2766) or with
+/// a returned errno; the full contract is the ignored test below.
+#[test]
+fn native_child_threaded_mm_faults_acknowledge_every_shootdown() {
+    let elf = native_exit_fixture_with_flags("native_child_threaded_mm.S", &["-DKEEP_CHURNING"]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let cpl0_fatal = |text: &str| {
+        [
+            "port 0xcc",
+            "doorbell 0xcc",
+            "CPL0 kernel panic",
+            "CPL0 fatal exit",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    };
+    let probed_parks = |physical: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory| {
+        physical
+            .syscall_counters()
+            .expect("counters")
+            .fault_parks_on_probed_cause
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    let endings: Vec<(String, u64)> = (0..3)
+        .map(|_| {
+            match kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+                &program,
+                1 << 20,
+                kvm_pool_fixture::ROOT_AFFINITY_ANY,
+                |_| {},
+            ) {
+                Ok(outcome) => (
+                    format!(
+                        "exit {} signal {:?}",
+                        outcome.run.exit_code, outcome.run.terminating_signal
+                    ),
+                    probed_parks(&outcome.physical),
+                ),
+                Err(failure) => (
+                    format!("{:?}", failure.error),
+                    failure.physical.as_deref().map_or(0, probed_parks),
+                ),
+            }
+        })
+        .collect();
+    eprintln!("#2763 threaded mm endings (ending, probed-cause parks): {endings:?}");
+    assert!(
+        !endings.iter().any(|(ending, _)| cpl0_fatal(ending)),
+        "a run ended in a CPL0 kernel fatal (an unacknowledged shootdown is #2763): {endings:?}"
+    );
+    assert!(
+        endings.iter().map(|(_, parks)| parks).sum::<u64>() > 0,
+        "no fault parked on a probed cause other than its refusal's, so the #2763 path was \
+         never taken: {endings:?}"
+    );
+}
+
+/// #2749 fatal 1: two threads of one forked child run `mmap`, first touch,
+/// `mprotect` and `munmap` at once on their shared MM. They contend for the
+/// MM's reservation root and descriptor editor. Contention is "not now": no
+/// call may come back as an errno, and none may leave the ring.
+#[test]
+#[ignore = "#2766: a fault crossing races the sibling's ring edit and the host owner fails the run"]
+fn native_child_threaded_mm_calls_never_return_contention_as_an_errno() {
+    let elf = native_exit_fixture("native_child_threaded_mm.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome =
+        try_run_pool_fixture_with_root_affinity(&elf, 1 << 20, kvm_pool_fixture::ROOT_AFFINITY_ANY)
+            .expect("threaded mm run");
+    let counters = outcome.physical.syscall_counters().expect("counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    // x86 numbers: 9 mmap, 10 mprotect, 11 munmap.
+    let mm = |bucket: &[std::sync::atomic::AtomicU64]| [9, 10, 11].map(|nr| load(&bucket[nr]));
+    let leaves = counters.anonymous_leaves.each_ref().map(load);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "child exit (0 = Linux; else the first errno). mmap/mprotect/munmap served {:?} \
+         refused {:?} refused_child {:?}; anonymous leaves {leaves:?}",
+        mm(&counters.served),
+        mm(&counters.refused),
+        mm(&counters.refused_child),
+    );
+    assert_eq!(
+        [mm(&counters.refused), mm(&counters.refused_child)],
+        [[0; 3]; 2],
+        "mmap/mprotect/munmap refusals; anonymous leaves {leaves:?}"
+    );
+}

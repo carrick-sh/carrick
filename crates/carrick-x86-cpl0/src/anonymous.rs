@@ -464,11 +464,7 @@ impl X86AnonymousVenue<'_> {
                         *context = saved;
                         Ok((record, false))
                     },
-                    || {
-                        SpaceWaitCause::ALL.into_iter().any(|cause| {
-                            source.key(cause) == key && source.observe(cause) == snapshot.observed()
-                        })
-                    },
+                    || source.still_at(key, snapshot.observed()),
                 );
                 if result.is_err()
                     && let Some((record, previous)) = replaced
@@ -751,6 +747,8 @@ pub(super) fn park_contended_fault(
         return ContendedFault::Refused;
     }
     let access = space_access(zone, slot, crate::native_process::release);
+    // The key the probe named for the park that published, if any.
+    let parked_key = core::cell::Cell::new(None);
     let outcome = coordinate_anonymous_edit_wait(
         &lease,
         None,
@@ -801,13 +799,15 @@ pub(super) fn park_contended_fault(
                     *saved = *context;
                     Ok((record, false))
                 },
-                || lease.key(cause) == key && lease.observe(cause) == snapshot.observed(),
+                || lease.still_at(key, snapshot.observed()),
             );
             if result.is_err()
                 && let Some((record, previous)) = replaced
             {
                 // SAFETY: failed publication leaves this slot owning the record.
                 *unsafe { zone.record(record).ctx_mut() } = previous;
+            } else {
+                parked_key.set(Some(key));
             }
             result
         },
@@ -816,6 +816,16 @@ pub(super) fn park_contended_fault(
         EditWaitOutcome::Parked(_) => {
             #[cfg(feature = "test-support")]
             crate::test_support::publish_edit_park();
+            if parked_key.get().is_some_and(|key| key != lease.key(cause))
+                && let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding()
+            {
+                // SAFETY: this CPU's binding retains its initialized atomic counters.
+                let counters =
+                    unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
+                counters
+                    .fault_parks_on_probed_cause
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             ContendedFault::Parked
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => ContendedFault::Rerun,

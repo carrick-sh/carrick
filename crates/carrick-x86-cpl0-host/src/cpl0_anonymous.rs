@@ -278,16 +278,22 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
     }
     fn deliver(
         &self,
-        _: &X86Cpl0Zone,
+        zone: &X86Cpl0Zone,
         _: Waker,
         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
             carrick_sched_core::ParkedContextWords,
         >,
     ) {
-        let (_, effects) = owned.deliver_handbacks(&mut |_| {
-            self.error.borrow_mut().get_or_insert_with(|| {
-                fail("native COW release produced unsupported host-home completion custody")
+        // A waiter no guest slot could take (its CPUs stopped, one of them
+        // in this exit; for example a member parked on the gate this
+        // release lowers) goes back to its native ring owner's queue, as a
+        // host IPC release's does. A host thread never completes it.
+        let (_, effects) = owned.deliver_handbacks(&mut |record| {
+            zone.hand_back_to_owner(record, &mut |slot| {
+                if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
+                    self.error.borrow_mut().get_or_insert(error);
+                }
             });
         });
         if effects.owes_host_boundary() || effects.queued_own {
@@ -3111,6 +3117,195 @@ mod custody_tests {
         let pause = return_settlement::unsettled_pause_for_test(access, 77).unwrap();
         drop(pause);
         assert_eq!(zone.spaces.gate(index), 0);
+    }
+
+    /// The carrier's reschedule MSIs, as a host COW release sends them:
+    /// recorded, or (`refuse`) refused like a failed `KVM_SIGNAL_MSI`.
+    struct MsiLog {
+        sent: std::sync::Mutex<Vec<(u32, u32)>>,
+        refuse: bool,
+    }
+    impl CarrierMemoryIo for MsiLog {
+        fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError> {
+            Ok(0)
+        }
+        unsafe fn set_user_memory_region(
+            &self,
+            _: crate::carrier_memory::CarrierMemoryRegion,
+        ) -> Result<(), carrick_hal::OsError> {
+            Err(carrick_hal::OsError::new(
+                "no carrier memory in this witness",
+            ))
+        }
+        fn signal_msi(&self, address_lo: u32, data: u32) -> Result<(), carrick_hal::OsError> {
+            if self.refuse {
+                return Err(carrick_hal::OsError::new("refused witness MSI"));
+            }
+            self.sent.lock().unwrap().push((address_lo, data));
+            Ok(())
+        }
+    }
+
+    const UNPLACEABLE_MM: u64 = 302;
+    const OWNER_SLOT: SlotId = SlotId::new(1);
+    const OWNER_APIC: u8 = 7;
+
+    /// #2925's shape, VM-free: a native member of `UNPLACEABLE_MM` parks on
+    /// its MM's gate while two host COW exclusions hold it raised (a
+    /// settlement's nested pause). The only driven CPU that may run the
+    /// member is in the guest on another MM. The inner exclusion's release
+    /// lowers the gate 2 -> 1 and wakes the member, but the gate is still
+    /// raised, so no guest slot may take it: the release's
+    /// `HostCowWake::deliver` gets it as a handback. Returns what `finish`
+    /// reported, the member's claim after the release, and the MSIs sent.
+    fn release_gate_over_an_unplaceable_member(
+        refuse_msi: bool,
+    ) -> (
+        Result<(), TrapError>,
+        carrick_sched_core::Claim,
+        Vec<(u32, u32)>,
+    ) {
+        use carrick_sched_core::spaces::notification::{SpaceWaitCause, SpaceWakeDelivery};
+        let layout = std::alloc::Layout::new::<X86Cpl0Zone>();
+        // SAFETY: the atomic-only zone has a valid zero state and typed alignment.
+        let zone = unsafe {
+            let pointer = std::alloc::alloc_zeroed(layout).cast::<X86Cpl0Zone>();
+            assert!(!pointer.is_null());
+            Box::from_raw(pointer)
+        };
+        let routes = PublishedApicIds::new();
+        assert!(routes.publish(
+            carrick_guest_arch::CpuId::new(u32::from(OWNER_SLOT.raw())),
+            PublishedApicId(OWNER_APIC),
+        ));
+        let wake = HostCowWake {
+            routes: &routes,
+            vm: Arc::new(MsiLog {
+                sent: std::sync::Mutex::new(Vec::new()),
+                refuse: refuse_msi,
+            }),
+            error: std::cell::RefCell::new(None),
+        };
+        let delivery = |zone: &X86Cpl0Zone,
+                        waker: Waker,
+                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(zone, waker, owned);
+        // A queue's own completions (its publications outside a release).
+        let complete = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(&zone, Waker::Host, owned);
+        // The member's ring owner: driven, in the guest, running another MM.
+        zone.drive(OWNER_SLOT, 1);
+        zone.publish_slot(
+            OWNER_SLOT,
+            UNPLACEABLE_MM + 1,
+            Some(u32::from(OWNER_SLOT.raw())),
+            0,
+        );
+        zone.enter_guest(OWNER_SLOT);
+        let index = zone
+            .spaces
+            .publish_closed(UNPLACEABLE_MM, 0x7000, 0x7000)
+            .unwrap();
+        let entry = zone
+            .space_entry(NonZeroU64::new(UNPLACEABLE_MM).unwrap())
+            .unwrap();
+        entry
+            .admit_notifications(
+                NonZeroU64::MIN,
+                &carrick_sched_core::BoundedSpin(0),
+                &complete,
+            )
+            .unwrap();
+        let lease = entry.notifications(NonZeroU64::MIN).unwrap();
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone: &zone,
+            waker: Waker::Host,
+            deliver: SpaceWakeDelivery::Captured(&delivery),
+        });
+        access.open(index);
+        let outer = return_settlement::unsettled_pause_for_test(access, UNPLACEABLE_MM).unwrap();
+        let pause = return_settlement::unsettled_pause_for_test(access, UNPLACEABLE_MM).unwrap();
+        assert_eq!(zone.spaces.gate(index), 2);
+        let member = zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: UNPLACEABLE_MM,
+                file_table: 1,
+                generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1 << OWNER_SLOT.raw(),
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        assert!(zone.mark_native_owned(member));
+        let snapshot = lease.observe(SpaceWaitCause::Gate);
+        zone.object_wait_with_completion(
+            lease.key(SpaceWaitCause::Gate),
+            &carrick_sched_core::BoundedSpin(0),
+            &complete,
+        )
+        .unwrap()
+        .park_rechecked(
+            snapshot,
+            member,
+            carrick_sched_core::object_wait::OperationToken::new(77, 1).unwrap(),
+            || true,
+        )
+        .unwrap();
+        // The inner host COW release wakes the member under a raised gate.
+        drop(pause);
+        assert_eq!(zone.spaces.gate(index), 1);
+        let finished = wake.finish();
+        let claim = zone.record(member).claim();
+        drop(outer);
+        assert_eq!(zone.spaces.gate(index), 0);
+        let sent = std::mem::take(&mut *wake.vm.sent.lock().unwrap());
+        (finished, claim, sent)
+    }
+
+    /// #2925: a member the host COW release wakes but no guest slot can
+    /// take goes back to its ring owner's queue, with that CPU's reschedule
+    /// MSI, instead of failing the carrier with "native COW release produced
+    /// unsupported host-home completion custody".
+    #[test]
+    fn host_cow_release_hands_an_unplaceable_member_back_to_its_ring_owner() {
+        let (finished, claim, sent) = release_gate_over_an_unplaceable_member(false);
+        assert!(finished.is_ok(), "host COW release failed: {finished:?}");
+        assert!(
+            matches!(claim, carrick_sched_core::Claim::Queued { slot, .. } if slot == OWNER_SLOT),
+            "the member is queued on its ring owner: {claim:?}"
+        );
+        assert_eq!(
+            sent,
+            [(
+                0xfee0_0000 | (u32::from(OWNER_APIC) << 12),
+                u32::from(carrick_x86::interrupts::RESCHED_VECTOR),
+            )],
+            "one reschedule MSI to the owner's published APIC"
+        );
+    }
+
+    /// A reschedule the carrier cannot deliver fails the release, rather
+    /// than leaving the handed-back member behind a CPU nobody woke.
+    #[test]
+    fn host_cow_release_reports_a_failed_handback_msi() {
+        let (finished, claim, sent) = release_gate_over_an_unplaceable_member(true);
+        let error = finished.expect_err("a refused reschedule MSI is a carrier error");
+        assert!(
+            format!("{error:?}").contains("host wake MSI"),
+            "the MSI refusal is reported: {error:?}"
+        );
+        assert!(
+            matches!(claim, carrick_sched_core::Claim::Queued { slot, .. } if slot == OWNER_SLOT),
+            "the member is still queued on its ring owner: {claim:?}"
+        );
+        assert!(sent.is_empty());
     }
 
     fn execution() -> GrantExecution {

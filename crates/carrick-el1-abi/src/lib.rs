@@ -3137,10 +3137,59 @@ pub enum AnonymousLeave {
     RootUnavailableStale,
     /// The root's decision refused `MetadataRequired`.
     RootUnavailableMetadataRequired,
+    /// Provisioning a reservation-node bank for `MetadataRequired` refused
+    /// `Busy` with no pending edit: another publisher held the bank
+    /// publication, or published a bank after this caller's capacity read.
+    /// Split from `RootUnavailableBusy` so a census names the holder (#2783).
+    MetadataBankBusy,
 }
 
 impl AnonymousLeave {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
+
+    /// Every variant, in ordinal order.
+    pub const ALL: [AnonymousLeave; Self::COUNT] = [
+        Self::PendingHostWork,
+        Self::RootBusy,
+        Self::RootUnavailable,
+        Self::RootDeclined,
+        Self::NoGrant,
+        Self::EditorBusy,
+        Self::BackingHostOwnedLeaf,
+        Self::BackingBlock,
+        Self::BackingMultiRun,
+        Self::BackingMalformed,
+        Self::BackingRetired,
+        Self::EditRefused,
+        Self::JournalFull,
+        Self::RootUnavailableBusy,
+        Self::RootUnavailableStale,
+        Self::RootUnavailableMetadataRequired,
+        Self::MetadataBankBusy,
+    ];
+
+    /// The stable snake_case name reports key this variant by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PendingHostWork => "pending_host_work",
+            Self::RootBusy => "root_busy",
+            Self::RootUnavailable => "root_unavailable",
+            Self::RootDeclined => "root_declined",
+            Self::NoGrant => "no_grant",
+            Self::EditorBusy => "editor_busy",
+            Self::BackingHostOwnedLeaf => "backing_host_owned_leaf",
+            Self::BackingBlock => "backing_block",
+            Self::BackingMultiRun => "backing_multi_run",
+            Self::BackingMalformed => "backing_malformed",
+            Self::BackingRetired => "backing_retired",
+            Self::EditRefused => "edit_refused",
+            Self::JournalFull => "journal_full",
+            Self::RootUnavailableBusy => "root_unavailable_busy",
+            Self::RootUnavailableStale => "root_unavailable_stale",
+            Self::RootUnavailableMetadataRequired => "root_unavailable_metadata_required",
+            Self::MetadataBankBusy => "metadata_bank_busy",
+        }
+    }
 }
 
 /// Provenance only: permission faults do not establish COW ownership.
@@ -3290,6 +3339,10 @@ pub struct Counters {
     /// commit, source, ordinal, PC, slot, `binding[4]`, `arguments[6]`, syndrome.
     pub syscall_frames: [[AtomicU64; 16]; 32],
     pub syscall_frame_slots: AtomicU64,
+    /// Contended user faults that parked on the key their probe named when
+    /// that key belongs to another cause than the one that first refused the
+    /// fault: the holder changed between the refusal and the probe (#2763).
+    pub fault_parks_on_probed_cause: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3324,6 +3377,7 @@ impl Counters {
             copy_refusal_slots: AtomicU64::new(0),
             syscall_frames: [const { [const { AtomicU64::new(0) }; 16] }; 32],
             syscall_frame_slots: AtomicU64::new(0),
+            fault_parks_on_probed_cause: AtomicU64::new(0),
         }
     }
 
@@ -3395,6 +3449,10 @@ impl Counters {
                 }));
             }
         }
+        snapshot.fault_parks_on_probed_cause.store(
+            self.fault_parks_on_probed_cause.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         snapshot
     }
 
@@ -5677,6 +5735,7 @@ mod tests {
                 + 16 * 23
                 + 1
                 + 32 * 16
+                + 1
                 + 1)
                 * 8
         );
