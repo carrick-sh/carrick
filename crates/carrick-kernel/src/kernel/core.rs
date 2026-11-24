@@ -1409,6 +1409,15 @@ impl Kernel {
         }
     }
 
+    /// Settle the completions the ring deferred to this kernel's carrier
+    /// zone (x86 CPL0), at the host boundary that consumed their doorbell.
+    pub(crate) fn hand_back_carrier_completions(&self) {
+        let owner = self.ipc.lock().clone();
+        if let Some(owner) = owner {
+            owner.hand_back_carrier_completions();
+        }
+    }
+
     /// Shared IPC storage retained by this kernel and any runtime mapping.
     pub fn ipc(&self) -> Result<Arc<crate::el1_ipc::HostIpc>, crate::el1_ipc::AdmissionError> {
         let mut ipc = self.ipc.lock();
