@@ -1509,6 +1509,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             inherited_sources.bind_executable(executable);
                         }
                         let mut edges = Vec::new();
+                        let mut windows = Vec::new();
                         let mut spans = std::collections::BTreeSet::new();
                         for words in wire.chunks_exact(32) {
                             let selected = decode_fork_custody(words).ok_or_else(|| {
@@ -1517,11 +1518,35 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             })?;
                             if let PortalForkCustody::HostBacking { handle, generation } = selected {
                                 let identity = carrick_el1_abi::HostBackingIdentity::new(handle, generation, 0);
-                                let source = parent_sources
-                                    .as_ref()
+                                let parent = parent_sources.as_ref();
+                                let source = parent
                                     .and_then(|sources| sources.retain(identity, || None))
                                     .ok_or(ForkStockRefusal::Invalid)?;
-                                inherited_sources.inherit(source);
+                                // The child's later faults on an inherited
+                                // window must reach the file, never a copy.
+                                if parent.is_some_and(|sources| sources.is_window(identity)) {
+                                    inherited_sources.inherit_window(source);
+                                } else {
+                                    inherited_sources.inherit(source);
+                                }
+                                continue;
+                            }
+                            // A shared file window leaf has no frame
+                            // inventory: the child keeps it and joins the
+                            // window slot (#1338).
+                            let window = vm
+                                .select_inherited_window(execution.context, selected)
+                                .map_err(|error| {
+                                    trap_error = Some(fail(error.to_string()));
+                                    ForkStockRefusal::Invalid
+                                })?;
+                            if let Some(window) = window {
+                                if !spans.insert(window.span().va) {
+                                    trap_error =
+                                        Some(fail("physical fork duplicate inherited page"));
+                                    return Err(ForkStockRefusal::Invalid);
+                                }
+                                windows.push(window);
                                 continue;
                             }
                             let selected_edges = vm
@@ -1664,6 +1689,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             ForkStockRefusal::Inventory
                         })?;
                         root_installed.set(true);
+                        for window in &windows {
+                            vm.attach_inherited_window(child, window).map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Invalid
+                            })?;
+                        }
                         let mut resident_windows = std::collections::BTreeSet::new();
                         for edge in &edges {
                             let source = edge.identity();
