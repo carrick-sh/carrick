@@ -2222,3 +2222,229 @@ mod carrier_census_tests {
         }
     }
 }
+
+/// #2962: an interrupted `KVM_RUN` surfaces `Kicked` only for a kick into
+/// the run that is live now. These drive the production `HvVcpu::run` on a
+/// real KVM vCPU spinning in a real-mode counter loop.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod run_kick_tests {
+    use super::*;
+    use crate::KvmKickHandle;
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::AtomicU32;
+    use std::time::{Duration, Instant};
+
+    const CODE_GPA: u64 = 0x1000;
+    const COUNTER_GPA: u64 = 0x2000;
+    const IO_PORT: u16 = 0x10;
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// Guest RAM owned by the test thread, so it outlives the vCPU thread
+    /// and every counter read (the worker is joined before this drops).
+    struct GuestRam(usize);
+
+    impl GuestRam {
+        fn new() -> Self {
+            // SAFETY: fresh anonymous private mapping, owned by this value.
+            let memory = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    0x3000,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(memory, libc::MAP_FAILED);
+            Self(memory as usize)
+        }
+
+        fn counter(&self) -> Counter {
+            Counter(self.0 + COUNTER_GPA as usize)
+        }
+    }
+
+    impl Drop for GuestRam {
+        fn drop(&mut self) {
+            // SAFETY: mapped in `new` with this length; the VM using it was
+            // dropped on the joined worker thread.
+            unsafe { libc::munmap(self.0 as *mut libc::c_void, 0x3000) };
+        }
+    }
+
+    struct Spinner {
+        _vm: KvmVm,
+        vcpu: KvmVcpu,
+    }
+
+    /// A real-mode vCPU over `memory` that leaves once through
+    /// `out IO_PORT`, then spins incrementing a counter with no further exits.
+    fn spinner(memory: usize) -> Spinner {
+        let mut vm = KvmVm::create_empty().expect("create kvm vm");
+        let vcpu = vm.add_vcpu().expect("create kvm vcpu");
+        let memory = memory as *mut u8;
+        // out 0x10, al ; L: inc dword [0x2000] ; jmp L
+        let code = [
+            0xe6,
+            IO_PORT as u8,
+            0x66,
+            0xff,
+            0x06,
+            0x00,
+            0x20,
+            0xeb,
+            0xf9,
+        ];
+        // SAFETY: CODE_GPA + code.len() lies inside the 0x3000-byte mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), memory.add(CODE_GPA as usize), code.len())
+        };
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: 0x3000,
+            userspace_addr: memory as u64,
+        };
+        // SAFETY: the caller's GuestRam outlives this VM.
+        unsafe { vm.vm.set_user_memory_region(region) }.expect("map guest memory");
+        let mut sregs = vcpu.fd().get_sregs().expect("sregs");
+        for segment in [&mut sregs.cs, &mut sregs.ds] {
+            segment.base = 0;
+            segment.selector = 0;
+        }
+        vcpu.fd().set_sregs(&sregs).expect("set sregs");
+        let mut regs = vcpu.fd().get_regs().expect("regs");
+        regs.rip = CODE_GPA;
+        regs.rflags = 2;
+        vcpu.fd().set_regs(&regs).expect("set regs");
+        Spinner { _vm: vm, vcpu }
+    }
+
+    struct Counter(usize);
+
+    impl Counter {
+        fn read(&self) -> u32 {
+            // SAFETY: the guest counter is a live aligned word in the
+            // Spinner's mapping, which outlives every reader (joined first).
+            unsafe { &*(self.0 as *const AtomicU32) }.load(Ordering::SeqCst)
+        }
+
+        /// The guest is executing (so its thread is inside `KVM_RUN`) once
+        /// the counter moves. `false` if the run stopped spinning instead.
+        fn advances_while(&self, running: impl Fn() -> bool) -> bool {
+            let start = self.read();
+            let deadline = Instant::now() + BOUND;
+            while Instant::now() < deadline && running() {
+                if self.read() != start {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        }
+    }
+
+    fn external_stop(tid: libc::pthread_t) {
+        // An interruption Carrick did not request: the kick signal itself,
+        // sent without any kick handle, as a ptrace stop or job-control
+        // signal would interrupt KVM_RUN.
+        // SAFETY: live joinable thread; the kick handler is installed.
+        assert_eq!(
+            unsafe { libc::pthread_kill(tid, crate::kvm_kicker::kick_signal()) },
+            0
+        );
+    }
+
+    /// The review's race: a kick lands on an armed run after that run already
+    /// left through a successful I/O exit, then the owner disarms. The next
+    /// run's external interruption must re-enter, and only a fresh kick may
+    /// surface `Kicked`.
+    #[test]
+    fn a_kick_racing_a_completed_exit_does_not_surface_on_a_later_external_interrupt() {
+        carrick_test_support::require_kvm!();
+        crate::install_kvm_kick_handler();
+        let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let ram = GuestRam::new();
+        let memory = ram.0;
+        let worker = std::thread::spawn(move || {
+            let mut spinner = spinner(memory);
+            let kick = KvmKickHandle::for_current_thread();
+            // SAFETY: the calling thread's own id.
+            let tid = unsafe { libc::pthread_self() };
+            spinner.vcpu.arm_run_kick(&kick);
+            let first = HvVcpu::run(&mut spinner.vcpu).expect("first run");
+            setup_tx.send((kick.clone(), tid, first)).unwrap();
+            // The scheduler's kick lands here, before the owner disarms.
+            go_rx.recv().unwrap();
+            kick.disarm_run();
+            spinner.vcpu.arm_run_kick(&kick);
+            let second = HvVcpu::run(&mut spinner.vcpu);
+            kick.disarm_run();
+            second.expect("second run")
+        });
+        let (kick, tid, first) = setup_rx.recv().unwrap();
+        assert!(
+            matches!(&first, VcpuExit::IoOut { port, .. } if *port == IO_PORT),
+            "first run leaves through its I/O exit"
+        );
+        kick.kick();
+        go_tx.send(()).unwrap();
+        let counter = ram.counter();
+        assert!(
+            counter.advances_while(|| !worker.is_finished()),
+            "the re-armed run must enter the guest"
+        );
+        external_stop(tid);
+        assert!(
+            counter.advances_while(|| !worker.is_finished()),
+            "an external interruption after a stale kick must re-enter KVM_RUN, not surface Kicked"
+        );
+        kick.kick();
+        let second = worker.join().unwrap();
+        assert!(matches!(second, VcpuExit::Kicked));
+    }
+
+    /// A run nobody armed admits kicks on its own: an external interruption
+    /// re-enters, a kick that landed before the run records nothing, and a
+    /// kick into the live run surfaces `Kicked` instead of being absorbed by
+    /// the re-entry loop.
+    #[test]
+    fn an_unarmed_run_reenters_on_external_interrupts_and_surfaces_its_own_kick() {
+        carrick_test_support::require_kvm!();
+        crate::install_kvm_kick_handler();
+        let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let ram = GuestRam::new();
+        let memory = ram.0;
+        let worker = std::thread::spawn(move || {
+            let mut spinner = spinner(memory);
+            let kick = KvmKickHandle::for_current_thread();
+            // SAFETY: the calling thread's own id.
+            let tid = unsafe { libc::pthread_self() };
+            let first = HvVcpu::run(&mut spinner.vcpu).expect("first run");
+            setup_tx.send((kick, tid, first)).unwrap();
+            go_rx.recv().unwrap();
+            let second = HvVcpu::run(&mut spinner.vcpu);
+            second.expect("second run")
+        });
+        let (kick, tid, first) = setup_rx.recv().unwrap();
+        assert!(matches!(&first, VcpuExit::IoOut { port, .. } if *port == IO_PORT));
+        // Between runs: nothing is armed, so this kick records nothing.
+        kick.kick();
+        go_tx.send(()).unwrap();
+        let counter = ram.counter();
+        assert!(counter.advances_while(|| !worker.is_finished()));
+        external_stop(tid);
+        assert!(
+            counter.advances_while(|| !worker.is_finished()),
+            "an external interruption must re-enter KVM_RUN"
+        );
+        kick.kick();
+        let second = worker.join().unwrap();
+        assert!(matches!(second, VcpuExit::Kicked));
+    }
+}
