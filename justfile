@@ -281,6 +281,11 @@ clippy-linux *ARGS:
     set -euo pipefail
     pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-embed //g')"
     {{_admit}} {{_cargo}} clippy $pkgs -p carrick-x86-cpl0 -p carrick-x86-carrier -p carrick-conformance-next -p carrick-xtask {{_platform_features}} --features carrick-xtask/impact --all-targets --keep-going {{ARGS}} -- -D warnings
+    # The CPL0 ring image's own target, with and without its test-support
+    # injections. The image build inside carrick-vmm-kvm's build script runs
+    # without clippy-driver (#3005), so this pass is that code's lint.
+    {{_admit}} {{_cargo}} clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --keep-going {{ARGS}} -- -D warnings
+    {{_admit}} {{_cargo}} clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --features test-support --keep-going {{ARGS}} -- -D warnings
     exec {{_admit}} {{_cargo}} clippy -p carrick-embed {{_platform_features}} --lib --bins --examples --keep-going {{ARGS}} -- -D warnings
 
 # Lint all GitHub Actions workflow files with actionlint.
@@ -1235,7 +1240,7 @@ build-cpl0:
     set -euo pipefail
     case "$(uname -s):$(uname -m)" in
         Linux:x86_64|Linux:amd64)
-            cargo --locked build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            cargo --locked build -p carrick-x86-cpl0 --profile el1-image --target x86_64-unknown-none
             ;;
     esac
 
