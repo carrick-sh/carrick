@@ -5344,3 +5344,233 @@ fn arm_fork_waits_while_sibling_fork_holds_birth_reservation() {
 fn arm_vfork_waits_while_sibling_fork_holds_birth_reservation() {
     fork_while_sibling_holds_birth_reservation(true);
 }
+
+/// #2932: a ring-born member of a native fork child enters `SYS_exit` before
+/// `exit_group` sets `host_exit_requested` (so `resume_owned_continuation` sees
+/// nothing pending), and its leader closes the lifecycle gate in `exit_group(38)`
+/// before `serve_exit` runs while a third member keeps `page.live() == 2`.
+/// Neither ring-born member has a host thread, so the racing raw exit must
+/// retire in ring (`Suspended`, never `HostCustody`) and wake the closing
+/// leader for the parent's `wait4`.
+#[test]
+fn arm_ring_born_member_raw_exit_during_group_close_retires_in_ring() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let slot = SlotId::new(3);
+    h.env.init_guest_slot(slot);
+    let mut born_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        h.env.switch_in(slot, &mut born_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(h.env.fixture.zone.slot(slot).current(), Some(h.born_record));
+    assert_eq!(h.env.fixture.zone.slot(slot).host_record(), None);
+    assert!(h.env.fixture.zone.record(h.born_record).is_native_owned());
+    let counters = carrick_el1_abi::Counters::new();
+
+    struct ClosingRaceVenue<F> {
+        close_group: core::cell::RefCell<Option<F>>,
+        calls: core::cell::Cell<usize>,
+    }
+    impl<F: FnOnce()> crate::lifecycle::LifecycleVenue for ClosingRaceVenue<F> {
+        fn thread<'a>(
+            &'a self,
+            task: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            let seen = self.calls.get();
+            self.calls.set(seen + 1);
+            if seen == 1
+                && let Some(close) = self.close_group.borrow_mut().take()
+            {
+                close();
+            }
+            LoadedVenue.thread(task)
+        }
+        fn born_slot(
+            &self,
+            page: &ThreadLifecyclePage,
+            entry: carrick_el1_abi::EntryRef,
+        ) -> Option<&ThreadControlSlot> {
+            LoadedVenue.born_slot(page, entry)
+        }
+    }
+
+    let record = h.env.fixture.zone.slot(slot).current().unwrap();
+    // SAFETY: `slot` exclusively owns `record` while OnCpu.
+    let saved_native = unsafe { h.env.fixture.zone.record(record).ctx_mut().native };
+    let ttbr0 = born_cpu.ttbr.0;
+    let mut raw_exit = carrick_el1_abi::TrapFrame {
+        slot: u64::from(slot.raw()),
+        esr: 0x15 << 26,
+        ..Default::default()
+    };
+    raw_exit.x[8] = 93;
+    raw_exit.x[0] = 0;
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut born_service = h.env.service(slot);
+    let env = h.env;
+    let target_page = h.target_page;
+    let leader_control = h.leader_control;
+    let venue = ClosingRaceVenue {
+        close_group: core::cell::RefCell::new(Some(|| {
+            // `resume_owned_continuation` and the initial `raw_exit_is_process`
+            // check have already observed the open 3-thread group; now the
+            // leader on CPU 0 closes the group in `exit_group(38)`.
+            let mut exit_group = carrick_el1_abi::TrapFrame::default();
+            exit_group.x[8] = 94;
+            exit_group.x[0] = 38;
+            assert_eq!(
+                env.call(
+                    SlotId::new(0),
+                    target_page,
+                    leader_control,
+                    &counters,
+                    &mut exit_group,
+                    &mut h.leader_cpu,
+                ),
+                CompletionRoute::Suspended
+            );
+            assert_eq!(
+                carrick_el1_abi::Lifecycle::gate(target_page),
+                carrick_el1_abi::GateState::Closed
+            );
+            assert_eq!(carrick_el1_abi::Lifecycle::live(target_page), 2);
+        })),
+        calls: core::cell::Cell::new(0),
+    };
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut raw_exit,
+        &counters,
+        h.env.tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: h.env.fixture.zone,
+            cpu: &mut born_cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(&venue),
+        h.target_page,
+        h.born_control,
+        &saved_native,
+        ttbr0,
+        &mut born_service,
+        |_| core::ptr::null_mut(),
+    )
+    .expect("racing raw exit must dispatch cleanly");
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitGate as usize]
+            .load(Ordering::Acquire),
+        1
+    );
+    assert_ne!(
+        route,
+        CompletionRoute::HostCustody,
+        "closing-group raw exit left for an executor with no host task loaded"
+    );
+    assert_eq!(route, CompletionRoute::Suspended);
+    assert_eq!(h.env.fixture.zone.slot(slot).current(), None);
+    assert!(
+        h.env
+            .fixture
+            .zone
+            .live(h.env.fixture.zone.record_ref(record))
+            .is_none()
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(h.target_page), 1);
+    crate::dispatch::native_service_idle(h.env.fixture.zone, slot, &mut born_cpu);
+
+    // The remaining sibling retires through its raw exit too, waking the leader.
+    let sibling_slot = SlotId::new(1);
+    let sibling_record = h.env.fixture.zone.slot(sibling_slot).current().unwrap();
+    let mut sibling_exit = carrick_el1_abi::TrapFrame::default();
+    sibling_exit.x[8] = 93;
+    sibling_exit.x[0] = 0;
+    let sibling_route = h.env.call(
+        sibling_slot,
+        h.target_page,
+        h.sibling_control,
+        &counters,
+        &mut sibling_exit,
+        &mut h.sibling_cpu,
+    );
+    assert_eq!(sibling_route, CompletionRoute::Suspended);
+    assert_eq!(h.env.fixture.zone.slot(sibling_slot).current(), None);
+    assert!(
+        h.env
+            .fixture
+            .zone
+            .live(h.env.fixture.zone.record_ref(sibling_record))
+            .is_none()
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(h.target_page), 0);
+    crate::dispatch::native_service_idle(h.env.fixture.zone, sibling_slot, &mut h.sibling_cpu);
+
+    let woken_on = SlotId::new(1);
+    assert_eq!(h.env.fixture.zone.slot(woken_on).queued(), 1);
+    settle_boundary(&h.env.tasks[woken_on.index()]);
+    let leader_record = h.env.fixture.zone.runnable_head(woken_on).unwrap();
+    // SAFETY: the queued leader record retains its saved process context.
+    let leader_address = unsafe { *h.env.fixture.zone.record(leader_record).ctx_mut() }
+        .address_context()
+        .expect("leader address context");
+    *h.env.crossing.zone.lock().unwrap() = Some(h.env.fixture.zone);
+    *h.env.crossing.child.lock().unwrap() = Some((
+        super::super::common_entry::execution_binding(&h.env.tasks[0]),
+        leader_address,
+    ));
+    let mut leader_service = h.env.service(woken_on);
+    assert_eq!(
+        h.env
+            .switch_in_with(woken_on, &mut h.sibling_cpu, &mut leader_service),
+        carrick_el1_abi::Action::Idle
+    );
+    assert_eq!(h.env.fixture.zone.slot(woken_on).current(), None);
+
+    let f = h.env.fixture;
+    let root_slot = slot;
+    let root_cpu = host_load(
+        h.env,
+        root_slot,
+        f.leader.tid,
+        f.leader.generation,
+        f.leader.serial,
+        f.control,
+        1,
+    );
+    let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let mut root_service = h.env.service(root_slot);
+    let reaped = super::super::aarch64_process::with_process_entry(
+        BornInZoneSource {
+            zone: f.zone,
+            slot: root_slot,
+        },
+        &h.env.tasks[root_slot.index()],
+        &ThreadCtx::ZERO,
+        root_cpu.ttbr.0,
+        f.page,
+        f.control,
+        &mut root_service,
+        |process| {
+            process.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::from(h.target_pid)),
+                status.va(),
+                LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
+            )
+        },
+    )
+    .unwrap();
+    let LifecycleOutcome::Returned { result, .. } = reaped else {
+        panic!("WNOHANG wait4 of an exited group must not park");
+    };
+    assert_eq!(result.raw(), i64::from(h.target_pid));
+    assert_eq!(
+        status.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(38 << 8).raw()
+    );
+}
