@@ -463,7 +463,15 @@ fn x86_owner_fork_arm_and_abort(shape: X86ForkLeaf) {
     let arenas = [&parent_tables, &child, &supply];
     let words = X86ForkWords { arenas: &arenas };
     let scratch = ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap();
-    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(
+            request,
+            scratch,
+            &words,
+            &carrick_el1_abi::CowGrantPool::new(),
+            0,
+        )
+        .unwrap();
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
     if shape != X86ForkLeaf::MixedLarge {
         assert_eq!(unpublished.completion().parent_tables_used, 0, "{shape:?}");

@@ -2372,8 +2372,47 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 ));
             }
         };
-        let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
+        // A parent COW completion the carrier has not settled refuses as
+        // `CowUnsettled` (#2890, #2947); see the arm below.
+        let cow = match crate::mm_portal::carrier_cow_pool() {
+            Ok(cow) => cow,
+            Err(e) => {
+                child_space.release();
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    refused(NativeForkStage::Prepare, e),
+                ));
+            }
+        };
+        let plan = match owner.prepare_fork(loan.request, scratch, &*live, cow, self.worker()) {
             Ok(plan) => plan,
+            Err(carrick_core::mm::transaction::MmError::CowUnsettled) => {
+                child_space.release();
+                // The fork released the parent's editor. A sibling holding it
+                // now may complete more: wait for its release, observed
+                // first. Otherwise this is carrier work, whose answer settles
+                // the MM under the carrier's own exclusion, or answers at
+                // once when an editor was admitted since; the rerun decides
+                // again (Busy once, then success).
+                let error = match owner.fork_parent_editor(
+                    loan.request.operation.mm,
+                    loan.request.operation.incarnation,
+                    self.worker(),
+                ) {
+                    Some((editor, true)) => NativeProcessError::OwnerWait(editor),
+                    _ => NativeProcessError::Busy,
+                };
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    error,
+                ));
+            }
             Err(e) => {
                 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
                 let alias = {

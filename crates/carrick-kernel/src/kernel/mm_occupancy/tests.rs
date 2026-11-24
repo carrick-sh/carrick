@@ -746,6 +746,10 @@ fn a_zone_vcpu_moved_off_the_mm_is_drained_while_it_stays_in_guest() {
     vcpu.flag.leave_guest();
 }
 
+/// The process-global guest COW settlement is one slot: tests that install
+/// a recorder hold this for as long as they read it (#2947 review).
+static GUEST_COW_RECORDER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Records every settlement: the MM key, and whether its EL1 editor was
 /// already gone and the gate raised in `spaces` when it ran.
 struct RecordingSettlement {
@@ -770,6 +774,7 @@ impl carrick_el1_abi::CowGrantSettlement for RecordingSettlement {
 /// settlement after the admitted editor left and with the gate raised.
 #[test]
 fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
+    let _serial = GUEST_COW_RECORDER.lock();
     let (spaces, occupancy) = space_tables();
     let recorder = Arc::new(RecordingSettlement {
         spaces,
@@ -821,6 +826,115 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
     .expect("published");
     assert_eq!(ours(), vec![(42_301, true), (42_301, true)]);
     drop(exclusion);
+    drop(publication);
+}
+
+/// #2947: a fork whose parent has an unsettled guest COW completion is
+/// retained as carrier work, and the answer to that work settles the MM
+/// itself. With no completion it excludes nothing. With one, and the MM's
+/// EL1 editor held on another vCPU, the answer must not wait for that
+/// editor (the carrier would spin in its acknowledgement for as long as the
+/// sibling holds it): it leaves the completion unsettled, lowers the gate it
+/// raised, and answers at once, so the fork parks on the editor's release.
+/// After the release, the next answer settles under its own exclusion.
+#[test]
+fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
+    static POOL: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
+    const KEY: u64 = 42_311;
+    let _serial = GUEST_COW_RECORDER.lock();
+    let (spaces, occupancy) = space_tables();
+    let recorder = Arc::new(RecordingSettlement {
+        spaces,
+        runs: parking_lot::Mutex::new(Vec::new()),
+    });
+    install_guest_cow_settlement(recorder.clone());
+    let ours = || -> Vec<(u64, bool)> {
+        recorder
+            .runs
+            .lock()
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key == KEY)
+            .collect()
+    };
+    let tables = move || SpaceTables {
+        spaces,
+        occupancy,
+        zone: None,
+        backing: None,
+    };
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(KEY), &mm_fence, 0x3c00).unwrap();
+
+    assert_eq!(
+        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)),
+        GuestCowSettlement::Nothing
+    );
+    assert!(ours().is_empty(), "nothing unsettled: no exclusion");
+
+    let nz = |v| std::num::NonZeroU64::new(v).unwrap();
+    POOL.publish(
+        KEY,
+        0x8_0000_4000,
+        carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            frame_id: nz(10),
+            mapping_id: nz(11),
+            owner_generation: nz(12),
+            inventory_revision: nz(13),
+        },
+    )
+    .unwrap();
+    let grant = POOL.claim(KEY, 0).unwrap();
+    assert!(POOL.complete(&carrick_core_abi::CowGrantCompletion {
+        purpose: carrick_core_abi::CowGrantPurpose::UserWrite,
+        grant,
+        span_va: 0x4000_1000,
+        span_len: 0x3000,
+        old_ipa: 0x9_0000_1000,
+        new_ipa: grant.physical_ipa + 0x1000,
+        tables_linked: 0,
+    }));
+    assert!(POOL.has_completions_for(KEY));
+
+    let index = spaces.find(KEY).unwrap();
+    let editor = spaces
+        .try_begin_edit(index, KEY, nz(9))
+        .expect("a sibling's EL1 edit holds the editor");
+    let answer =
+        std::thread::spawn(move || settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !answer.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let answered = answer.is_finished();
+    // Let a waiting answer finish before asserting, so a failure joins it.
+    drop(editor);
+    let held = answer.join().unwrap();
+    assert!(
+        answered,
+        "the carrier-work answer waited for the sibling's EL1 editor"
+    );
+    assert!(
+        ours().is_empty(),
+        "no settlement while the sibling's editor may still complete a COW"
+    );
+    assert!(POOL.has_completions_for(KEY), "the completion stays owed");
+    assert_eq!(
+        spaces.gate(index),
+        0,
+        "the answer lowered the gate it raised"
+    );
+    assert_eq!(held, GuestCowSettlement::EditorHeld);
+
+    assert_eq!(
+        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)),
+        GuestCowSettlement::Settled
+    );
+    assert_eq!(
+        ours(),
+        vec![(KEY, true)],
+        "after the release, the answer settled the requester's MM under its own exclusion"
+    );
     drop(publication);
 }
 

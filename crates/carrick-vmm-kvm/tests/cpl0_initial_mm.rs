@@ -3792,6 +3792,53 @@ fn production_sibling_copy_leaves_another_cpus_cow_settlement_alone() {
     );
 }
 
+/// #2947 (review P0): a native fork whose parent has a guest COW completion
+/// the carrier has not settled waits for that settlement through the
+/// production path, end to end: the fork refuses "not now" and rings the
+/// settlement crossing; the carrier meets the parent's editor held and
+/// settles nothing; the fork parks on the editor's release through the
+/// shared native service; the release wakes it; its rerun rings the crossing
+/// again, the carrier settles, and the fork completes and is reaped. The
+/// fixture image holds a sibling's COW before its own settlement crossing
+/// and holds the parent's real editor across the fork's first crossing,
+/// released through the editor's own release once the fork has parked.
+#[test]
+fn production_fork_parks_on_a_held_parent_editor_and_forks_once_the_carrier_settles() {
+    // The guest orders every step on events and its hold has no time bound,
+    // so a regression parks the run forever. The production pool waits on
+    // its completion without a deadline; this reporting bound turns that
+    // hang into a failure with the step named. It changes no ordering.
+    const REPORT_HANG_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+    let elf = native_exit_fixture("native_fork_cow_settle_editor_wait.S");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fork-cow-settle-editor-wait".into())
+        .spawn(move || {
+            let _ = done_tx.send(
+                kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+                    .map_err(|failure| failure.error),
+            );
+        })
+        .expect("spawn the fixture run");
+    let outcome = match done_rx.recv_timeout(REPORT_HANG_AFTER) {
+        Ok(run) => run.expect("fork beside an unsettled parent COW completion run"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the fork beside a held parent editor never finished in {REPORT_HANG_AFTER:?}: \
+             it did not park on the editor's release, or the release never woke it \
+             (see native_fork_cow_settle_editor_wait.S)"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the fixture run panicked before reporting an outcome")
+        }
+    };
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_fork_cow_settle_editor_wait.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
