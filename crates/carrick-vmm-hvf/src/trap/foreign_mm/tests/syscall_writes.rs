@@ -3,16 +3,18 @@ use crate::trap::host_writes::HostWrites;
 use carrick_guest_mem::{GuestMemory, HostVa, HostWriteGuard, HostWriteRange, MemoryError};
 
 struct WriteFixture {
-    custody: Arc<CarrierVmCustody>,
     task: HvfTaskState,
     writes: HostWrites,
     installed: InstalledMm,
+    // Declared last so it drops last: the VM teardown runs after the task
+    // and the installed mm that reference it, as a test's first local does.
+    custody: crate::trap::TestCarrierCustody,
 }
 
 impl WriteFixture {
     fn new() -> Self {
-        let transport = CarrierForeignMmTransport::live_fixture();
-        let custody = Arc::clone(&transport.custody);
+        let custody = crate::trap::test_carrier_custody();
+        let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
             &transport,
             201,
@@ -36,10 +38,10 @@ impl WriteFixture {
         row.owner_generation = owner.generation();
         task.stage2.mappings = TaskMappingIndex::from_region(row);
         Self {
-            custody,
             task,
             writes: HostWrites::default(),
             installed,
+            custody,
         }
     }
 
@@ -252,13 +254,14 @@ fn native_code_content_host_write_rejects_changed_second_leaf_and_releases_pin()
 
 #[test]
 fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read() {
-    let custody = crate::trap::test_carrier_custody();
     use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let _aliases = ExternalAliasStateRestore::capture();
     let mut fixture = WriteFixture::new();
     let owner = fixture.owner();
-    let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
+    // The fixture's owners and translations live in its own custody; the
+    // read must resolve them there, not in a second carrier's.
+    let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&fixture.custody));
     transport.register(&fixture.installed.snapshot, &fixture.installed.state);
     let mut bytes = [0; 4];
     let receipt = read_instructions_installed(&transport, &fixture.installed, &mut bytes).unwrap();
@@ -509,10 +512,11 @@ fn syscall_code_write_cost_contract() {
 
 #[test]
 fn native_code_content_syscall_copy_after_cow_preserves_source_dependency() {
-    let custody = crate::trap::test_carrier_custody();
     let _lock = FOREIGN_MM_TEST_LOCK.lock();
     let _aliases = ExternalAliasStateRestore::capture();
     let mut fixture = WriteFixture::new();
+    // The COW source owner and its copy live in the fixture's own custody.
+    let custody = Arc::clone(&fixture.custody);
     let old_owner = fixture.owner();
     let unchanged = old_owner.mapping.code_content.observe(0, 4).unwrap();
     let (_authority, lease, mut invalidator) = prepare_foreign_cow(&custody, &fixture.installed);
