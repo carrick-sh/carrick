@@ -1640,3 +1640,156 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
         })?;
     Ok(())
 }
+
+/// A one-chunk host-file window extent at `base` (#1338), with the open
+/// file that keeps its fixture alive.
+fn window_backing(base: u64, tag: u64) -> (std::fs::File, PreparedBacking) {
+    use std::os::fd::AsFd;
+    let path = std::env::temp_dir().join(format!(
+        "carrick-window-fork-{}-{:?}-{tag}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file.set_len(PAGE).unwrap();
+    let extent =
+        BackingExtent::host_file_window(FrameGpa::new(base), file.as_fd(), 0, PAGE as usize)
+            .unwrap();
+    (
+        file,
+        PreparedBacking {
+            extent: Arc::new(extent),
+            identity: BackingIdentity {
+                frame_id: nz(tag),
+                mapping_id: nz(tag),
+                owner_generation: nz(tag),
+                inventory_revision: nz(tag),
+            },
+        },
+    )
+}
+
+/// #1338: a shared file window slot is kept for the run (one slot per file
+/// chunk, reused by every later fault), so retiring the last MM admitted to
+/// it leaves the slot installed rather than revoking it under the window's
+/// slot table.
+pub fn retire_child_keeps_a_shared_file_window_slot_for_the_run(_make: fn() -> MemoryTestIo) {
+    let mut fixture = RetireFixture::new(2, _make);
+    let (_file, prepared) = window_backing(0x3_0000_0000, 93);
+    let window = fixture.slot_with(prepared, &[2]);
+    fixture.alias(2, window, 0x4000, None);
+    let slots = fixture.memory.slot_count();
+
+    let retired = fixture.retire(2).unwrap();
+
+    assert_eq!(
+        retired,
+        RetiredChild {
+            aliases: 1,
+            revoked_slots: 0
+        },
+        "a window slot outlives the MMs that mapped it"
+    );
+    let kept = fixture.memory.record(window).unwrap();
+    assert!(kept.allowed.is_empty());
+    assert_eq!(kept.alias_count, 0);
+    assert_eq!(fixture.memory.slot_count(), slots);
+    fixture.assert_admitted_exact();
+    assert!(!fixture.memory.is_quarantined());
+}
+
+/// #1338: fork keeps a parent's shared file window leaf in the child. The
+/// guest's custody row names the window slot's GPA with `shared`, and a
+/// window page has no frame-inventory row, so selecting it as an
+/// inventoried frame answered `MappingGone`. The fork stock refused that
+/// as `Inventory`, the guest reran the fork as `Busy`, and the fork never
+/// finished (the KVM witness spun ~28k reruns until its deadline).
+pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() -> MemoryTestIo) {
+    use carrick_kernel::kernel::ObjectIdRegistry;
+    use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
+    let authority = Arc::new(FrameInventoryAuthority::new());
+    let ids = Arc::new(ObjectIdRegistry::new());
+    let parent_mm = ids.mm_id().unwrap();
+    let child_mm = ids.mm_id().unwrap();
+    let base = 0x3_0000_0000;
+    let (_file, prepared) = window_backing(base, 94);
+    let identity = prepared.identity;
+    let mut memory = CarrierMemory::new(_make()).unwrap();
+    memory.install(&[backing(0x1000, 0x8000, 90)]).unwrap();
+    let window = memory.install(&[prepared]).unwrap()[0];
+    let contexts = [parent_mm, child_mm].map(|mm| AddressContext {
+        root: root(if mm == parent_mm { 0x1000 } else { 0x5000 }),
+        mm: MmGeneration::new(nz(mm.raw())),
+        generation: ContextGeneration::new(nz(1)),
+    });
+    for context in contexts {
+        memory.install_root(context.mm.raw(), context).unwrap();
+    }
+    let edge = memory.share(window).unwrap();
+    memory.attach_shared(contexts[0].mm.raw(), &edge).unwrap();
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    // The parent's window fault (a MapAlias, a resident host Map leaf), and
+    // the child's copy of that leaf, as the guest's fork walk keeps it.
+    for (index, context) in contexts.into_iter().enumerate() {
+        let tables = if index == 0 {
+            [root(0x2000), root(0x3000), root(0x4000)]
+        } else {
+            [root(0x6000), root(0x7000), root(0x8000)]
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: context.mm.raw(),
+                generation: nz(1),
+            },
+            root: context.root,
+            tables: &tables,
+            op: DescriptorOp::Map {
+                span: PageSpan::new(0x4000, PAGE),
+                output: FrameGpa::new(base),
+                permissions: Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+                size: LeafSize::Page,
+                resident: true,
+                backing: identity,
+            },
+        };
+        let receipt = execute_descriptor_txn(
+            &memory.words(),
+            &txn,
+            context.root,
+            &mut InlineJournal::new(),
+        );
+        let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
+        if index == 0 {
+            memory.publish(&txn, publication, &mut inventory).unwrap();
+        }
+    }
+    assert_eq!(memory.slots[&window.slot].alias_count, 1);
+    let selection = carrick_el1_abi::PortalForkCustody::Frame {
+        va: 0x4000,
+        ipa: base,
+        len: PAGE,
+        shared: true,
+    };
+    let projection = authority.physical_projection(Arc::clone(&ids));
+    let selected = memory.select_inherited_frames(contexts[0], selection, &*projection);
+    assert!(
+        matches!(selected, Err(InheritedFrameSelectionError::Invariant(_))),
+        "a window page is never selected as an inventoried frame (a \
+         `MappingGone` here reruns the fork forever)"
+    );
+}
