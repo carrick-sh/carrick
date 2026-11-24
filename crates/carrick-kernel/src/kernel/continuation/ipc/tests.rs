@@ -39,8 +39,12 @@ fn serial_host_zone_operation_slot_release_reaches_bound_source() {
         };
         // Mirror the carrier's pre-publication binding, then exercise the
         // real host completion owner, rather than a mock callback counter.
-        zone.bind_ipc_operation_slots(region.operation_slot_generation(), &HostIpcWait, &complete)
-            .unwrap();
+        zone.bind_ipc_operation_slots(
+            region.operation_slot_generation(),
+            &crate::el1_zone::HostLockWait,
+            &complete,
+        )
+        .unwrap();
         let source = zone
             .ipc_operation_slot_source(region.operation_slot_generation(), &complete)
             .unwrap();
@@ -701,11 +705,16 @@ fn continue_pipe_write(vectored: bool) {
         ];
         assert_eq!(
             w.region
-                .import_vectors(&token, headers.len(), |index, header| {
-                    header[..8].copy_from_slice(&headers[index].0.to_ne_bytes());
-                    header[8..].copy_from_slice(&headers[index].1.to_ne_bytes());
-                    true
-                })
+                .import_vectors(
+                    &token,
+                    headers.len(),
+                    &crate::el1_zone::TestRegionWait,
+                    |index, header| {
+                        header[..8].copy_from_slice(&headers[index].0.to_ne_bytes());
+                        header[8..].copy_from_slice(&headers[index].1.to_ne_bytes());
+                        true
+                    }
+                )
                 .unwrap(),
             source.len() as u64
         );
@@ -1525,12 +1534,17 @@ fn el1_ipc_vector_handback_preserves_short_prefix_at_vector_boundary() {
     let (_reader, writer, object) = w.pipe();
     let token = w.operation(writer, IpcOpKind::PipeWrite, 6, 66);
     w.region
-        .import_vectors(&token, 2, |index, header| {
-            let base = if index == 0 { BUF + 4095 } else { BUF + 8192 };
-            header[..8].copy_from_slice(&base.to_ne_bytes());
-            header[8..].copy_from_slice(&3u64.to_ne_bytes());
-            true
-        })
+        .import_vectors(
+            &token,
+            2,
+            &crate::el1_zone::TestRegionWait,
+            |index, header| {
+                let base = if index == 0 { BUF + 4095 } else { BUF + 8192 };
+                header[..8].copy_from_slice(&base.to_ne_bytes());
+                header[8..].copy_from_slice(&3u64.to_ne_bytes());
+                true
+            },
+        )
         .unwrap();
     w.hand_back(&token, IpcHandback::Continue, 0, 0);
     let mut memory = LinearMemory::new(BUF, vec![b'x'; 4096]);
@@ -1923,12 +1937,17 @@ fn el1_ipc_readv_handback_scatters_retained_headers_without_overwriting_them() {
         let baseline = w.region.descriptor_allocations();
         let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
         w.region
-            .import_vectors(&token, 2, |index, header| {
-                let base = BUF + 128 + index as u64 * 128;
-                header[..8].copy_from_slice(&base.to_ne_bytes());
-                header[8..].copy_from_slice(&2u64.to_ne_bytes());
-                true
-            })
+            .import_vectors(
+                &token,
+                2,
+                &crate::el1_zone::TestRegionWait,
+                |index, header| {
+                    let base = BUF + 128 + index as u64 * 128;
+                    header[..8].copy_from_slice(&base.to_ne_bytes());
+                    header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                    true
+                },
+            )
             .unwrap();
         {
             let mut guard = w
@@ -1979,12 +1998,17 @@ fn el1_ipc_readv_handback_prepares_the_actual_vector_destination() {
         let (reader, _writer, object) = w.pipe();
         let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
         w.region
-            .import_vectors(&token, 2, |index, header| {
-                let base = BUF + 128 + index as u64 * 128;
-                header[..8].copy_from_slice(&base.to_ne_bytes());
-                header[8..].copy_from_slice(&2u64.to_ne_bytes());
-                true
-            })
+            .import_vectors(
+                &token,
+                2,
+                &crate::el1_zone::TestRegionWait,
+                |index, header| {
+                    let base = BUF + 128 + index as u64 * 128;
+                    header[..8].copy_from_slice(&base.to_ne_bytes());
+                    header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                    true
+                },
+            )
             .unwrap();
         {
             let mut guard = w
@@ -2054,12 +2078,17 @@ fn el1_ipc_readv_handback_prepares_tiny_vectors_once_and_reads_them_atomically()
         let (reader, _writer, object) = w.pipe();
         let token = w.operation(reader, IpcOpKind::PipeRead, count as u64, 65);
         w.region
-            .import_vectors(&token, count, |index, header| {
-                let base = BUF + 128 + index as u64 * 8;
-                header[..8].copy_from_slice(&base.to_ne_bytes());
-                header[8..].copy_from_slice(&1u64.to_ne_bytes());
-                true
-            })
+            .import_vectors(
+                &token,
+                count,
+                &crate::el1_zone::TestRegionWait,
+                |index, header| {
+                    let base = BUF + 128 + index as u64 * 8;
+                    header[..8].copy_from_slice(&base.to_ne_bytes());
+                    header[8..].copy_from_slice(&1u64.to_ne_bytes());
+                    true
+                },
+            )
             .unwrap();
         let source: Vec<_> = (0..count).map(|n| (n % 251) as u8).collect();
         {
@@ -2119,13 +2148,18 @@ fn el1_ipc_readv_handback_fault_preserves_only_the_secured_prefix() {
         let baseline = w.region.descriptor_allocations();
         let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
         w.region
-            .import_vectors(&token, 2, |index, header| {
-                let bad = (index == 0) == bad_first;
-                let base = if bad { BUF + 4096 } else { BUF + 128 };
-                header[..8].copy_from_slice(&base.to_ne_bytes());
-                header[8..].copy_from_slice(&2u64.to_ne_bytes());
-                true
-            })
+            .import_vectors(
+                &token,
+                2,
+                &crate::el1_zone::TestRegionWait,
+                |index, header| {
+                    let bad = (index == 0) == bad_first;
+                    let base = if bad { BUF + 4096 } else { BUF + 128 };
+                    header[..8].copy_from_slice(&base.to_ne_bytes());
+                    header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                    true
+                },
+            )
             .unwrap();
         {
             let mut guard = w

@@ -240,12 +240,14 @@ impl Drop for PendingPipeCreate {
         let Some(object) = self.object.take() else {
             return;
         };
-        if let Err(error) =
-            self.owner
-                .rollback_unpublished_pipe(Some(self.zone), object, self.bound)
+        if let Err(error) = self
+            .owner
+            .rollback_unpublished_pipe(Some(self.zone), object, self.bound)
+            .or_else(|error| self.owner.quarantine_cut_off(error))
         {
             // A failed rollback is an authority invariant: the one
-            // admission classifier fails closed (never an errno).
+            // admission classifier fails closed (never an errno). A lock
+            // a stopped vCPU holds leaves the object quarantined (#2988).
             let _ = CreateError::from_admission(error);
         }
     }
@@ -595,6 +597,43 @@ struct GuestExecution {
     quarantined: AtomicU64,
 }
 
+/// A live host step met a lock that a cut-off ring section holds, after
+/// guest execution stopped ([`HostIpc::cut_off`]): the carrier is exiting,
+/// no vCPU runs again, and no guest observes how the step ends. A parked
+/// operation that meets it completes as owner-cancelled by the carrier.
+/// Only `cut_off` constructs it, so holding one proves the stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CarrierGone(());
+
+impl CarrierGone {
+    /// A guest step on an executor met it: the pool stops guest execution
+    /// only after every executor has joined, so this is a broken invariant.
+    pub(crate) fn on_an_executor(self) -> ! {
+        carrick_fatal::carrick_fatal!(
+            "ipc::region",
+            "an executor ran a guest step after guest execution stopped"
+        )
+    }
+}
+
+/// How a live object step a parked operation drives can end: a Linux
+/// result, or the carrier gone ([`CarrierGone`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveStepError {
+    Errno(carrick_abi::LinuxErrno),
+    CarrierGone(CarrierGone),
+}
+impl From<carrick_abi::LinuxErrno> for LiveStepError {
+    fn from(errno: carrick_abi::LinuxErrno) -> Self {
+        Self::Errno(errno)
+    }
+}
+impl From<CarrierGone> for LiveStepError {
+    fn from(gone: CarrierGone) -> Self {
+        Self::CarrierGone(gone)
+    }
+}
+
 /// The host's wait on its own region's locks. While guests can run it is
 /// [`HostLockWait`]: the holder is a host thread or a vCPU that its executor
 /// resumes. Once guest execution has stopped, the first contention refuses
@@ -835,14 +874,14 @@ impl HostIpc {
     /// configured ceiling. O(segment), under the growth lock only.
     fn grow_objects(&self, seen: usize) -> Result<(), AdmissionError> {
         let mut growth = self.growth.lock();
-        growth.object_records += self.region().grow_objects(seen)?;
+        growth.object_records += self.region().grow_objects(seen, &self.wait())?;
         Ok(())
     }
 
     /// As `grow_objects`, for the one shared OFD publication owner.
     fn grow_descriptions(&self, seen: usize) -> Result<(), AdmissionError> {
         let mut growth = self.growth.lock();
-        growth.description_records += self.region().grow_ofds(seen)?;
+        growth.description_records += self.region().grow_ofds(seen, &self.wait())?;
         Ok(())
     }
 
@@ -1030,9 +1069,18 @@ impl HostIpc {
     /// it, and teardown goes on. Any other refusal, or a contention while
     /// guests can still run, stays the caller's error.
     pub(crate) fn quarantine_cut_off(&self, error: AdmissionError) -> Result<(), AdmissionError> {
+        // A region wait refuses only once guest execution has stopped
+        // (before it, it waits as `HostLockWait` does): on an object, table
+        // or storage lock, or a zone object-wait queue it was handed.
         let contended = matches!(
             error,
             AdmissionError::Shared(IpcError::Contended | IpcError::Fd(fd::Error::Contended))
+                | AdmissionError::ObjectRollbackInvariant(
+                    IpcError::Contended | IpcError::Fd(fd::Error::Contended)
+                )
+                | AdmissionError::ObjectWaitInvariant(
+                    carrick_sched_core::object_wait::ObjectWaitError::Busy
+                )
         );
         if contended && self.guest.stopped.load(Ordering::Acquire) {
             self.guest.quarantined.fetch_add(1, Ordering::Relaxed);
@@ -1043,6 +1091,18 @@ impl HostIpc {
             return Ok(());
         }
         Err(error)
+    }
+
+    /// Settle a live host step (the carrier's reactor, a dormant
+    /// cancellation) whose region wait refused: after guest execution has
+    /// stopped, that lock's holder is a cut-off ring section and nothing
+    /// will release it. The object is left as it is, the step is counted
+    /// with the quarantined teardowns, and the step ends as [`CarrierGone`]:
+    /// never a spin, a fatal or a guest errno. Any other refusal is returned.
+    pub(crate) fn cut_off(&self, error: IpcError) -> Result<CarrierGone, IpcError> {
+        self.quarantine_cut_off(AdmissionError::Shared(error))
+            .map(|()| CarrierGone(()))
+            .map_err(|_| error)
     }
 
     /// Teardown steps quarantined behind a lock a stopped vCPU held.
@@ -1175,11 +1235,13 @@ impl HostIpc {
     /// `pipe2` dispatcher when its `pipefd` output is owner-refused. In the
     /// last case the executor still runs it, but holds no output permit, no
     /// descriptor and no IPC lock: each lane bind released its lock before
-    /// returning. It keeps the short-section [`HostLockWait`]: a lane or
+    /// returning. It takes the region wait: while guests run, a lane or
     /// object lock holder is a host thread in a short section or an EL1 vCPU
-    /// its executor resumes to completion, and a rollback that refused would
-    /// leak the object (witness: `carrick-runtime`
+    /// its executor resumes to completion, so it waits (witness:
+    /// `carrick-runtime`
     /// `serial_host_pipe2_lane_resume_output_refusal_rolls_back_and_reruns_once`).
+    /// After guest execution stops it refuses, and a carrier-exit drop
+    /// leaves the object quarantined ([`HostIpc::quarantine_cut_off`]).
     fn rollback_unpublished_pipe(
         &self,
         zone: Option<&carrick_el1_abi::ZoneTables>,
@@ -1289,7 +1351,7 @@ impl HostIpc {
         let region = self.region();
         let mut guard = region.lock(object, &self.wait())?;
         guard
-            .ensure_pipe_storage()
+            .ensure_pipe_storage(&self.wait())
             .map(|_| ())
             .map_err(|error| match error {
                 IpcError::Fd(fd::Error::NoMemory) => AdmissionError::NoMemory,

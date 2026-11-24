@@ -3179,7 +3179,10 @@ fn write_eventfd(_this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) 
     };
     match state.write_value(value.value) {
         Ok(()) => DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>()),
-        Err(errno) => DispatchOutcome::errno(errno),
+        Err(crate::el1_ipc::LiveStepError::Errno(errno)) => DispatchOutcome::errno(errno),
+        Err(crate::el1_ipc::LiveStepError::CarrierGone(_)) => DispatchOutcome::OwnerCancelled(
+            crate::kernel::continuation::OwnerWaitCancellation::Carrier,
+        ),
     }
 }
 

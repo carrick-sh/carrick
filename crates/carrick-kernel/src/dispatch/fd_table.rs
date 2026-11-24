@@ -236,10 +236,29 @@ impl EventFdState {
     }
     pub(super) fn counter_value(&self) -> u64 {
         let region = self.owner.region();
+        // After the stop, a lock a cut-off ring section holds observes the
+        // counter as retired (`CarrierGone`): no guest reads the answer.
         match region.lock(self.object, &self.owner.wait()) {
             Ok(mut guard) => guard.eventfd().map(|event| event.value()).unwrap_or(0),
             Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
-            Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter observation"),
+            Err(error) => match self.owner.cut_off(error) {
+                Ok(_gone) => 0,
+                Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter observation"),
+            },
+        }
+    }
+    /// The counter's object lock: a refusal is the carrier gone, and a
+    /// retired counter is EBADF.
+    fn lock(
+        &self,
+    ) -> Result<carrick_el1_abi::ipc::IpcObjectGuard<'_>, crate::el1_ipc::LiveStepError> {
+        match self.owner.region().lock(self.object, &self.owner.wait()) {
+            Ok(guard) => Ok(guard),
+            Err(carrick_el1_abi::ipc::IpcError::Stale) => Err(carrick_abi::LINUX_EBADF.into()),
+            Err(error) => match self.owner.cut_off(error) {
+                Ok(gone) => Err(gone.into()),
+                Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter lock"),
+            },
         }
     }
     fn finish<T>(
@@ -261,10 +280,11 @@ impl EventFdState {
         })
     }
     pub(crate) fn read_with(&self, copy: impl FnOnce(u64) -> bool) -> Result<u64, LinuxErrno> {
-        let region = self.owner.region();
-        let mut guard = region
-            .lock(self.object, &self.owner.wait())
-            .map_err(|_| carrick_abi::LINUX_EBADF)?;
+        let mut guard = match self.lock() {
+            Ok(guard) => guard,
+            Err(crate::el1_ipc::LiveStepError::Errno(errno)) => return Err(errno),
+            Err(crate::el1_ipc::LiveStepError::CarrierGone(gone)) => gone.on_an_executor(),
+        };
         let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
         let before = event.value();
         let step = event.read_with(copy);
@@ -279,11 +299,11 @@ impl EventFdState {
         }
         self.finish(guard, step)
     }
-    pub(crate) fn write_value(&self, value: u64) -> Result<(), LinuxErrno> {
-        let region = self.owner.region();
-        let mut guard = region
-            .lock(self.object, &self.owner.wait())
-            .map_err(|_| carrick_abi::LINUX_EBADF)?;
+    /// One counter write, from a guest `write` on an executor or a parked
+    /// blocking write the carrier's reactor drives (which can meet the
+    /// carrier gone).
+    pub(crate) fn write_value(&self, value: u64) -> Result<(), crate::el1_ipc::LiveStepError> {
+        let mut guard = self.lock()?;
         let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
         let before = event.value();
         let step = event.try_write(value);
@@ -296,7 +316,7 @@ impl EventFdState {
                 after as u32 as i32,
             );
         }
-        self.finish(guard, step)
+        Ok(self.finish(guard, step)?)
     }
 }
 

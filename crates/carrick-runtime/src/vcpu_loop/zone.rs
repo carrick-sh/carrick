@@ -2330,7 +2330,9 @@ mod ipc_tests {
         let host_ipc::IpcHostOutcome::Blocked { token, .. } = outcome else {
             unreachable!()
         };
-        region.finish_operation(token, || {}).unwrap();
+        region
+            .finish_operation(token, &carrick_kernel::el1_zone::TestRegionWait, || {})
+            .unwrap();
     }
 
     #[test]

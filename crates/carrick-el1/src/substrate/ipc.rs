@@ -8,7 +8,7 @@ use crate::substrate::file::UserCopy;
 use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcCallFlags, IpcError, IpcObjectGuard, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
-    RawIpcOpToken,
+    RawIpcOpToken, RegionLockWait,
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationKind, OperationToken};
 
@@ -123,9 +123,10 @@ pub fn transfer<U: UserCopy>(
     guard: &mut IpcObjectGuard<'_>,
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
+    wait: &impl RegionLockWait,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
-    transfer_with_input(guard, op, copy, |copy, at, dst| {
+    transfer_with_input(guard, op, copy, wait, |copy, at, dst| {
         copy.copy_in(dst, buf.wrapping_add(at))
     })
 }
@@ -136,20 +137,24 @@ pub fn transfer_with_input<U: UserCopy>(
     guard: &mut IpcObjectGuard<'_>,
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
+    wait: &impl RegionLockWait,
     input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
-    transfer_with_io(guard, op, copy, input, |copy, at, src| {
+    transfer_with_io(guard, op, copy, wait, input, |copy, at, src| {
         copy.copy_out(buf.wrapping_add(at), src)
     })
 }
 
 /// One transaction with retained logical input and output ranges. Object
 /// progress advances only by the delivered prefix in either direction.
+/// A first write's ring supply waits on the shared storage lock with the
+/// venue's `wait`.
 pub fn transfer_with_io<U: UserCopy>(
     guard: &mut IpcObjectGuard<'_>,
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
+    wait: &impl RegionLockWait,
     mut input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
     mut output: impl FnMut(&mut PrefixCopy<'_, U>, u64, &[u8]) -> usize,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
@@ -181,7 +186,7 @@ pub fn transfer_with_io<U: UserCopy>(
         IpcOpKind::PipeWrite => {
             // Lazy supply uses stock or the same shared extent allocator.
             // An empty cache cannot change the write into a host crossing.
-            guard.ensure_pipe_storage()?;
+            guard.ensure_pipe_storage(wait)?;
             let mut p = guard.pipe()?;
             loop {
                 let step =
@@ -282,7 +287,7 @@ pub fn transfer_with_io<U: UserCopy>(
             } else if op.progress.is_complete() {
                 StepStatus::Complete
             } else {
-                guard.ensure_stream_storage(end)?;
+                guard.ensure_stream_storage(end, wait)?;
                 let mut p = guard.stream_lane(end)?;
                 loop {
                     let step =

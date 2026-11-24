@@ -129,6 +129,7 @@ impl IpcRegion<'_> {
         &self,
         token: &IpcOpToken,
         count: usize,
+        wait: &impl super::RegionLockWait,
         mut read: impl FnMut(usize, &mut [u8; 16]) -> bool,
     ) -> Result<u64, VectorImportError> {
         if count > IPC_MAX_IOVECS {
@@ -147,10 +148,7 @@ impl IpcRegion<'_> {
         }
         let mut allocation = self
             .descriptor_storage()
-            .allocate(
-                (count * core::mem::size_of::<Vector>()) as u64,
-                &carrick_sched_core::ShortLockSpin,
-            )
+            .allocate((count * core::mem::size_of::<Vector>()) as u64, wait)
             .map_err(|error| match error {
                 fd::storage::StorageError::Exhausted => VectorImportError::NoMemory,
                 fd::storage::StorageError::Contended => {
@@ -165,8 +163,8 @@ impl IpcRegion<'_> {
         };
         if let Err(error) = slot.custody.publish_vectors(storage) {
             self.descriptor_storage()
-                .release(&mut allocation, &carrick_sched_core::ShortLockSpin)
-                .map_err(|_| VectorImportError::Storage(IpcError::Corrupt))?;
+                .release(&mut allocation, wait)
+                .map_err(|error| VectorImportError::Storage(super::storage_refusal(error)))?;
             return Err(VectorImportError::Storage(error));
         }
         let mut total = 0u64;
@@ -322,7 +320,11 @@ impl IpcRegion<'_> {
     }
 
     #[inline(never)]
-    pub(super) fn reclaim_vectors(&self, slot: &IpcOperationSlot) -> Result<(), IpcError> {
+    pub(super) fn reclaim_vectors(
+        &self,
+        slot: &IpcOperationSlot,
+        wait: &impl super::RegionLockWait,
+    ) -> Result<(), IpcError> {
         let storage = slot.custody.live_vectors()?;
         if storage.bytes != 0 {
             self.descriptor_storage()
@@ -331,9 +333,9 @@ impl IpcRegion<'_> {
                         offset: storage.offset - ipc_descriptor_area(self.pool_len).start,
                         bytes: storage.bytes,
                     },
-                    &carrick_sched_core::ShortLockSpin,
+                    wait,
                 )
-                .map_err(|_| IpcError::Corrupt)?;
+                .map_err(super::storage_refusal)?;
             slot.custody.clear_live();
         }
         Ok(())

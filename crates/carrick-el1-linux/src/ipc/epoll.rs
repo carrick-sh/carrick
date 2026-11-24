@@ -540,7 +540,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             // Readiness moved before the park: retire the record (the pin
             // stays with `op`) and harvest again, still under the mask.
             Parked::Retry(token) => {
-                match region.finish_operation(token, || {
+                match region.finish_operation(token, &Finish, || {
                     notify_operation_release(region, sched.zone(), sched.slot())
                 }) {
                     Ok(back) => op = back,
@@ -764,7 +764,7 @@ fn prepare_output<E: IpcExecution, M: UserCopy>(
         user.prepare_copyout(request, operation)
     };
     let ipc_token = |operation| from_sched_token(operation).unwrap_or_else(invalid);
-    let rerun = |sched: &mut E, token, ready| match region.finish_operation(token, || {
+    let rerun = |sched: &mut E, token, ready| match region.finish_operation(token, &Finish, || {
         notify_operation_release(region, sched.zone(), sched.slot())
     }) {
         Ok(op) => Output::Rerun(op, ready),

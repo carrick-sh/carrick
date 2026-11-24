@@ -301,8 +301,15 @@ pub fn drive_blocking_write(
                 };
                 match endpoint.state.write_value(u64::from_ne_bytes(bytes)) {
                     Ok(()) => write.offset += 8,
-                    Err(LINUX_EAGAIN) => return BlockingWriteStep::Wait,
-                    Err(errno) => {
+                    Err(crate::el1_ipc::LiveStepError::CarrierGone(_)) => {
+                        return BlockingWriteStep::Done(DispatchOutcome::OwnerCancelled(
+                            crate::kernel::continuation::OwnerWaitCancellation::Carrier,
+                        ));
+                    }
+                    Err(crate::el1_ipc::LiveStepError::Errno(LINUX_EAGAIN)) => {
+                        return BlockingWriteStep::Wait;
+                    }
+                    Err(crate::el1_ipc::LiveStepError::Errno(errno)) => {
                         return BlockingWriteStep::Done(if write.offset() == 0 {
                             DispatchOutcome::errno(errno)
                         } else {
@@ -382,8 +389,16 @@ fn drive_in_memory_pipe_write(
     let pipe = endpoint.pipe();
     let chunk = match pipe.write_bytes(&write.bytes[write.offset..]) {
         Ok(chunk) => chunk,
-        Err(carrick_abi::LINUX_EAGAIN) => return BlockingWriteStep::Wait,
-        Err(errno) => {
+        // The reactor drives a parked write while the carrier exits (#2988).
+        Err(crate::el1_ipc::LiveStepError::CarrierGone(_)) => {
+            return BlockingWriteStep::Done(DispatchOutcome::OwnerCancelled(
+                crate::kernel::continuation::OwnerWaitCancellation::Carrier,
+            ));
+        }
+        Err(crate::el1_ipc::LiveStepError::Errno(carrick_abi::LINUX_EAGAIN)) => {
+            return BlockingWriteStep::Wait;
+        }
+        Err(crate::el1_ipc::LiveStepError::Errno(errno)) => {
             return BlockingWriteStep::Done(if write.offset() == 0 {
                 DispatchOutcome::errno(errno)
             } else {

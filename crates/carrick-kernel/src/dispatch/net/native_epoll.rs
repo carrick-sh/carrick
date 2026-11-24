@@ -141,7 +141,13 @@ impl State {
             Ok(wake) => wake,
             Err(IpcError::Stale) => None,
             Err(error) => {
-                let _ = ctl_errno(error.into());
+                // The reactor samples a host socket event after guest
+                // execution stopped, under an epoll lock a cut-off ring
+                // section holds: the carrier is gone and no waiter runs
+                // again, so nothing is published (#2988).
+                if let Err(error) = owner.cut_off(error) {
+                    let _ = ctl_errno(error.into());
+                }
                 None
             }
         }

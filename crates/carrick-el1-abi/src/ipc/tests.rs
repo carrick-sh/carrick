@@ -888,14 +888,14 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
     let mut current = fx.region.operation(&token).unwrap();
     current.progress.written = 4;
     fx.region.update_operation(&token, current).unwrap();
-    let done = fx.region.finish_operation(token, || {}).unwrap();
+    let done = fx.region.finish_operation(token, &Spin, || {}).unwrap();
     assert_eq!(done.progress.written, 4);
     assert_eq!(fx.el1().unpin(OfdPin::from_raw(done.pin)), Ok(None));
     // A copied raw token is not a second owner.
     let stale = IpcOpToken::from_raw(raw);
     assert_eq!(fx.region.operation(&stale), Err(IpcError::Stale));
     assert_eq!(
-        fx.region.finish_operation(stale, || {}),
+        fx.region.finish_operation(stale, &Spin, || {}),
         Err(IpcError::Stale)
     );
     let reused = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
@@ -916,7 +916,7 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
         Err(IpcError::NoOperations)
     );
     for t in held {
-        fx.region.finish_operation(t, || {}).unwrap();
+        fx.region.finish_operation(t, &Spin, || {}).unwrap();
     }
 }
 
@@ -928,7 +928,7 @@ fn el1_ipc_operation_release_only_follows_a_reusable_slot_push() {
     let raw = token.into_raw();
     let notices = Cell::new(0);
     fx.region
-        .finish_operation(IpcOpToken::from_raw(raw), || {
+        .finish_operation(IpcOpToken::from_raw(raw), &Spin, || {
             notices.set(notices.get() + 1);
             // The release observer can immediately claim the slot it announces.
             let next = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
@@ -938,7 +938,7 @@ fn el1_ipc_operation_release_only_follows_a_reusable_slot_push() {
     assert_eq!(notices.get(), 1);
     assert_eq!(
         fx.region
-            .finish_operation(IpcOpToken::from_raw(raw), || notices.set(99)),
+            .finish_operation(IpcOpToken::from_raw(raw), &Spin, || notices.set(99)),
         Err(IpcError::Stale)
     );
     assert_eq!(notices.get(), 1);
@@ -951,7 +951,7 @@ fn el1_ipc_operation_release_only_follows_a_reusable_slot_push() {
         .generation
         .store(raw.generation, Ordering::Release);
     fx.region
-        .finish_operation(IpcOpToken::from_raw(raw), || notices.set(99))
+        .finish_operation(IpcOpToken::from_raw(raw), &Spin, || notices.set(99))
         .unwrap();
     assert_eq!(notices.get(), 1, "quarantine is not an availability edge");
 }
@@ -1216,7 +1216,7 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         Err(IpcError::NoObjects)
     );
     assert_eq!(
-        fx.region.grow_objects(fx.region.object_count()),
+        fx.region.grow_objects(fx.region.object_count(), &Spin),
         Ok(IPC_OBJECT_SEGMENT)
     );
     let grown = fx
@@ -1264,7 +1264,7 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         Err(fd::Error::NeedsOfds)
     );
     assert_eq!(
-        fx.region.grow_ofds(fx.region.ofd_count()),
+        fx.region.grow_ofds(fx.region.ofd_count(), &Spin),
         Ok(IPC_OFD_SEGMENT)
     );
     let fd = fx.host().open(t, Fd(0), desc(grown), false).unwrap();
@@ -1272,22 +1272,22 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
     // Only the zone-wide ceiling refuses.
     while fx.region.object_count() < IPC_MAX_OBJECTS {
         assert_eq!(
-            fx.region.grow_objects(fx.region.object_count()),
+            fx.region.grow_objects(fx.region.object_count(), &Spin),
             Ok(IPC_OBJECT_SEGMENT)
         );
     }
     assert_eq!(
-        fx.region.grow_objects(fx.region.object_count()),
+        fx.region.grow_objects(fx.region.object_count(), &Spin),
         Err(IpcError::ZoneLimit)
     );
     while fx.region.ofd_count() < IPC_MAX_OFDS {
         assert_eq!(
-            fx.region.grow_ofds(fx.region.ofd_count()),
+            fx.region.grow_ofds(fx.region.ofd_count(), &Spin),
             Ok(IPC_OFD_SEGMENT)
         );
     }
     assert_eq!(
-        fx.region.grow_ofds(fx.region.ofd_count()),
+        fx.region.grow_ofds(fx.region.ofd_count(), &Spin),
         Err(IpcError::ZoneLimit)
     );
     // The last record of the zone is an ordinary record.
@@ -1317,7 +1317,9 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
 fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
     let fx = fixture(1 << 20);
     while fx.region.object_count() < 5 * IPC_OBJECT_SEGMENT {
-        fx.region.grow_objects(fx.region.object_count()).unwrap();
+        fx.region
+            .grow_objects(fx.region.object_count(), &Spin)
+            .unwrap();
     }
     let objects: Vec<_> = (0..5 * IPC_OBJECT_SEGMENT)
         .map(|_| {
@@ -1509,7 +1511,7 @@ fn vector_input_copy_fault_is_a_prefix_not_an_invariant() {
     let fx = fixture(1 << 20);
     let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
     fx.region
-        .import_vectors(&token, 1, |_, header| {
+        .import_vectors(&token, 1, &Spin, |_, header| {
             header[..8].copy_from_slice(&4096u64.to_ne_bytes());
             header[8..].copy_from_slice(&4u64.to_ne_bytes());
             true
@@ -1531,7 +1533,7 @@ fn vector_input_copy_fault_is_a_prefix_not_an_invariant() {
             )),
         Err(VectorInputInvariant::Token(IpcError::Stale)),
     );
-    fx.region.finish_operation(token, || {}).unwrap();
+    fx.region.finish_operation(token, &Spin, || {}).unwrap();
 }
 
 #[test]
@@ -1546,7 +1548,7 @@ fn imported_vectors_scale_and_reclaim_with_the_operation_slot() {
         }
         let total = fx
             .region
-            .import_vectors(&token, count, |index, header| {
+            .import_vectors(&token, count, &Spin, |index, header| {
                 reads += 1;
                 header[..8].copy_from_slice(&(index as u64 * 4096).to_ne_bytes());
                 header[8..].copy_from_slice(&((index % 4) as u64).to_ne_bytes());
@@ -1579,11 +1581,11 @@ fn imported_vectors_scale_and_reclaim_with_the_operation_slot() {
                 .unwrap();
             assert_eq!(suffix, expected[1..]);
         }
-        fx.region.finish_operation(token, || {}).unwrap();
+        fx.region.finish_operation(token, &Spin, || {}).unwrap();
         assert_eq!(fx.region.descriptor_allocations(), 0);
         let reused = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
         assert!(!fx.region.has_vectors(&reused).unwrap());
-        fx.region.finish_operation(reused, || {}).unwrap();
+        fx.region.finish_operation(reused, &Spin, || {}).unwrap();
     }
 }
 
@@ -1613,7 +1615,7 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
         });
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
         region
-            .import_vectors(&token, 1, |_, header| {
+            .import_vectors(&token, 1, &Spin, |_, header| {
                 header[..8].copy_from_slice(&4096u64.to_ne_bytes());
                 header[8..].copy_from_slice(&4u64.to_ne_bytes());
                 true
@@ -1634,12 +1636,12 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
             4
         );
         assert_eq!(&bytes, b"pipe");
-        region.finish_operation(token, || {}).unwrap();
+        region.finish_operation(token, &Spin, || {}).unwrap();
         // Reuse the retired extent as headers while its atomic view remains
         // valid. No allocator zero-fill or plain Vector writes are permitted.
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
         region
-            .import_vectors(&token, 1, |_, header| {
+            .import_vectors(&token, 1, &Spin, |_, header| {
                 header.fill(0);
                 true
             })
@@ -1647,7 +1649,7 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
         for word in retired_words {
             let _ = word.load(Ordering::Relaxed);
         }
-        region.finish_operation(token, || {}).unwrap();
+        region.finish_operation(token, &Spin, || {}).unwrap();
     });
 }
 
@@ -1658,13 +1660,13 @@ fn shared_pipe_supply_without_stock_reuses_and_replaces_owned_extents() {
     let second = fx.region.create_pipe(65536, &Spin).unwrap();
     let old = {
         let mut guard = fx.region.lock(first, &Spin).unwrap();
-        assert!(guard.ensure_pipe_storage().unwrap());
+        assert!(guard.ensure_pipe_storage(&Spin).unwrap());
         assert_eq!(guard.pipe().unwrap().try_write(b"first").result, Ok(5));
         guard.storage()
     };
     let peer = {
         let mut guard = fx.region.lock(second, &Spin).unwrap();
-        assert!(guard.ensure_pipe_storage().unwrap());
+        assert!(guard.ensure_pipe_storage(&Spin).unwrap());
         assert_eq!(guard.pipe().unwrap().try_write(b"second").result, Ok(6));
         guard.storage()
     };
@@ -1681,9 +1683,9 @@ fn shared_pipe_supply_without_stock_reuses_and_replaces_owned_extents() {
         let mut guard = fx.region.lock(reused, &Spin).unwrap();
         assert_eq!(guard.storage(), old);
         assert!(!guard.pipe().unwrap().is_backed());
-        assert!(guard.ensure_pipe_storage().unwrap());
+        assert!(guard.ensure_pipe_storage(&Spin).unwrap());
         assert_ne!(guard.storage().offset, old.offset);
-        assert!(guard.ensure_pipe_storage().unwrap());
+        assert!(guard.ensure_pipe_storage(&Spin).unwrap());
     }
     assert_eq!(
         fx.region.pipe_allocations(),
@@ -1707,16 +1709,19 @@ fn shared_growth_reprobes_a_peer_publication_even_at_the_ceiling() {
     );
     let objects = fx.region.object_count();
     let ofds = fx.region.ofd_count();
-    assert_eq!(fx.region.grow_objects(objects), Ok(IPC_OBJECT_SEGMENT));
-    assert_eq!(fx.region.grow_objects(objects), Ok(0));
     assert_eq!(
-        fx.region.grow_objects(fx.region.object_count()),
+        fx.region.grow_objects(objects, &Spin),
+        Ok(IPC_OBJECT_SEGMENT)
+    );
+    assert_eq!(fx.region.grow_objects(objects, &Spin), Ok(0));
+    assert_eq!(
+        fx.region.grow_objects(fx.region.object_count(), &Spin),
         Err(IpcError::ZoneLimit)
     );
-    assert_eq!(fx.region.grow_ofds(ofds), Ok(IPC_OFD_SEGMENT));
-    assert_eq!(fx.region.grow_ofds(ofds), Ok(0));
+    assert_eq!(fx.region.grow_ofds(ofds, &Spin), Ok(IPC_OFD_SEGMENT));
+    assert_eq!(fx.region.grow_ofds(ofds, &Spin), Ok(0));
     assert_eq!(
-        fx.region.grow_ofds(fx.region.ofd_count()),
+        fx.region.grow_ofds(fx.region.ofd_count(), &Spin),
         Err(IpcError::ZoneLimit)
     );
 }
@@ -1734,9 +1739,9 @@ fn object_growth_observation_excludes_the_segment_still_being_linked() {
     let fx = fixture(1 << 20);
     let seen = fx.region.object_count();
     OBJECT_PUBLICATION_PROBE.set(true);
-    assert_eq!(fx.region.grow_objects(seen), Ok(IPC_OBJECT_SEGMENT));
+    assert_eq!(fx.region.grow_objects(seen, &Spin), Ok(IPC_OBJECT_SEGMENT));
     OBJECT_PUBLICATION_PROBE.set(false);
-    assert_eq!(fx.region.grow_objects(seen), Ok(0));
+    assert_eq!(fx.region.grow_objects(seen, &Spin), Ok(0));
 }
 
 mod lock_release;
@@ -1757,7 +1762,7 @@ fn stream_pair_lanes_carry_each_direction_and_free_with_both_ends() {
         assert_eq!(g.kind(), Some(IpcObjectKind::Stream));
         assert!(!g.stream_lane(StreamEnd::First).unwrap().is_backed());
         assert_eq!(g.storage(), IpcPipeStorage::default());
-        assert!(g.ensure_stream_storage(StreamEnd::First).unwrap());
+        assert!(g.ensure_stream_storage(StreamEnd::First, &Spin).unwrap());
         assert_eq!(g.storage(), stocked, "one stocked ring backs both lanes");
         for end in [StreamEnd::First, StreamEnd::Second] {
             let lane = g.stream_lane(end).unwrap();

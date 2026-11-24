@@ -9112,7 +9112,13 @@ fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
         progress: WriteProgress::new(8),
         ..IpcOperation::EMPTY
     };
-    let result = transfer(&mut guard, &mut op, &mut PrefixCopy::new(&mut user)).unwrap();
+    let result = transfer(
+        &mut guard,
+        &mut op,
+        &mut PrefixCopy::new(&mut user),
+        &carrick_kernel::el1_zone::TestRegionWait,
+    )
+    .unwrap();
     assert_eq!(result.0, StepStatus::Fault);
     assert_eq!(
         guard.eventfd().unwrap().value(),
@@ -9570,6 +9576,7 @@ fn retained_ipc_supply_for<
             &mut object_guard,
             &mut active,
             &mut carrick_el1::substrate::ipc::PrefixCopy::new(&mut copy),
+            &carrick_kernel::el1_zone::TestRegionWait,
         )
         .unwrap();
         assert_eq!(status, carrick_el1::substrate::ipc::StepStatus::Complete);
@@ -9577,7 +9584,9 @@ fn retained_ipc_supply_for<
         assert_eq!(object_guard.eventfd().unwrap().value(), 0);
         drop(object_guard);
         assert_eq!(copy.0, 7u64.to_ne_bytes());
-        let op = region.finish_operation(token, || {}).unwrap();
+        let op = region
+            .finish_operation(token, &carrick_kernel::el1_zone::TestRegionWait, || {})
+            .unwrap();
         let release = region
             .fd(carrick_kernel::el1_zone::TestRegionWait)
             .unpin_filtered(
@@ -14231,8 +14240,7 @@ fn native_arm_pselect6_handback(
     };
     use carrick_guest_mem::GuestMemory;
     use carrick_kernel::kernel::continuation::ipc::{
-        self, CounterClock, HostIpcWait, IpcCause, IpcHostOutcome, IpcHostServices,
-        ZoneHostServices,
+        self, CounterClock, IpcCause, IpcHostOutcome, IpcHostServices, ZoneHostServices,
     };
     use carrick_personality_linux::dispatch::CompletionRoute;
     use carrick_sched_core::{Handback, HostClaim};
@@ -14329,7 +14337,7 @@ fn native_arm_pselect6_handback(
     let key = ipc::wait_key(object, carrick_el1_abi::ipc::pipe::WaitFor::Readable).unwrap();
     fixture
         .zone
-        .bind_object_wait(key, &HostIpcWait, &completion)
+        .bind_object_wait(key, &carrick_kernel::el1_zone::HostLockWait, &completion)
         .unwrap();
 
     // This scope owns the only table mapping used by the call.
@@ -14417,22 +14425,28 @@ fn native_arm_pselect6_handback(
             IpcCause::Control => unreachable!(),
         };
         assert!(matches!(
-            fixture
-                .zone
-                .claim_for_host(record, None, handback, &HostIpcWait, &completion),
+            fixture.zone.claim_for_host(
+                record,
+                None,
+                handback,
+                &carrick_kernel::el1_zone::HostLockWait,
+                &completion
+            ),
             HostClaim::Claimed
         ));
     } else {
         if eof {
             table.close(Fd(1)).unwrap();
         }
-        fixture.zone.leave_guest(fixture.slot, &HostIpcWait);
+        fixture
+            .zone
+            .leave_guest(fixture.slot, &carrick_kernel::el1_zone::HostLockWait);
         let object = region
             .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap();
         let queue = fixture
             .zone
-            .object_wait(key, &HostIpcWait, &completion)
+            .object_wait(key, &carrick_kernel::el1_zone::HostLockWait, &completion)
             .unwrap();
         let mut handed = None;
         let report = queue

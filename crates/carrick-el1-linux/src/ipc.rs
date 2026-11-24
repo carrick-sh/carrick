@@ -2083,6 +2083,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
                 let imported = region.import_vectors(
                     &token,
                     argument_word(frame, 2) as usize,
+                    &EL1_WAIT,
                     |index, header| {
                         let copied = argument_word(frame, 1)
                             .checked_add(index as u64 * 16)
@@ -2280,6 +2281,7 @@ fn run<E: IpcExecution, M: UserCopy>(
             &mut guard,
             &mut op,
             &mut copy,
+            &EL1_WAIT,
             |copy, at, dst| {
                 if vectored_io {
                     match venue
@@ -2861,7 +2863,7 @@ fn notify_operation_release<C: carrick_el1_abi::EntryContext>(
 
 /// Retire the operation record and drop its pin.
 fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
-    if let Ok(op) = region.finish_operation(token, || {
+    if let Ok(op) = region.finish_operation(token, &Finish, || {
         notify_operation_release(region, sched.zone(), sched.slot())
     }) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
@@ -2891,7 +2893,9 @@ pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         ));
     }
     let op = region
-        .finish_operation(token, || notify_operation_release(region, zone, slot))
+        .finish_operation(token, &Finish, || {
+            notify_operation_release(region, zone, slot)
+        })
         .map_err(|_| NativeProcessError::Stale)?;
     let release = unpin_in_ring(region, OfdPin::from_raw(op.pin)).map_err(|_| {
         NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationUnpin)
@@ -3030,7 +3034,7 @@ fn retain_native_operation<E: IpcExecution>(sched: &E, token: IpcOpToken) {
 
 fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     let op = region
-        .finish_operation(token, || {
+        .finish_operation(token, &Finish, || {
             notify_operation_release(region, sched.zone(), sched.slot())
         })
         .unwrap_or_else(|_| {

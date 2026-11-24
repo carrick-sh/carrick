@@ -5030,7 +5030,7 @@ fn serve_ring_pair_constructor<'ipc, Context: DispatchContext>(
         match created {
             Ok(object) => break object,
             Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                if let Err(error) = region.grow_objects(seen) {
+                if let Err(error) = region.grow_objects(seen, &NativeFdWait) {
                     let _ = region.fd(NativeFdWait).cancel_pair(&mut claims);
                     return map_ipc_error(error);
                 }
@@ -5302,7 +5302,7 @@ fn serve_ring_object_create(
         match created {
             Ok(object) => break object,
             Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                if let Err(error) = region.grow_objects(seen) {
+                if let Err(error) = region.grow_objects(seen, &NativeFdWait) {
                     return map_ipc_error(error);
                 }
             }
@@ -5430,7 +5430,9 @@ fn run_with_table_growth<T>(
                     .map_err(map_ipc_error)?;
             }
             Err(carrick_el1_abi::ipc::fd::Error::NeedsOfds) => {
-                region.grow_ofds(seen).map_err(map_ipc_error)?;
+                region
+                    .grow_ofds(seen, &NativeFdWait)
+                    .map_err(map_ipc_error)?;
             }
             Err(err) => return Err(map_fd_error(err)),
         }

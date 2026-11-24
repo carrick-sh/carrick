@@ -29,11 +29,6 @@ use carrick_el1_abi::ipc::{
 };
 pub use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 
-/// The host's wait on the zone's queue locks (the zone's host lock policy).
-/// It is not a region wait: object and descriptor-table locks take
-/// [`IpcHostServices::region_wait`] (#2988).
-pub use crate::el1_zone::HostLockWait as HostIpcWait;
-
 /// Host services for one completion owner: authenticate its mapping, retire
 /// host tokens, and deliver object wakes. Callbacks run with no IPC lock held.
 pub trait IpcHostServices {
@@ -166,7 +161,7 @@ impl IpcHostServices for ZoneHostServices {
             let mut placed = Vec::new();
             {
                 // A queue never bound to this incarnation has no waiters.
-                let Ok(guard) = zone.object_wait(key, &HostIpcWait, &|owned| {
+                let Ok(guard) = zone.object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
                     crate::el1_zone::complete_object_wake(owned.zone(), owned)
                 }) else {
                     continue;
@@ -248,10 +243,10 @@ pub fn lane_snapshots(
 ) -> [Option<ObjectWaitSnapshot>; 2] {
     [WaitFor::Readable, WaitFor::Writable].map(|lane| {
         let key = wait_key(object, lane)?;
-        let _ = zone.bind_object_wait(key, &HostIpcWait, &|owned| {
+        let _ = zone.bind_object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
             crate::el1_zone::complete_object_wake(owned.zone(), owned)
         });
-        zone.object_wait(key, &HostIpcWait, &|owned| {
+        zone.object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
             crate::el1_zone::complete_object_wake(owned.zone(), owned)
         })
         .ok()
@@ -466,7 +461,9 @@ pub fn finish(
     wake: &impl IpcHostServices,
 ) -> Result<IpcOperation, IpcError> {
     wake.validate_region(region)?;
-    let op = region.finish_operation(token, || wake.operation_slot_released(region))?;
+    let op = region.finish_operation(token, &wake.region_wait(), || {
+        wake.operation_slot_released(region)
+    })?;
     if op.pin.authority != 0 {
         let fd = region.fd(wake.region_wait());
         if let Some(description) = fd.unpin(OfdPin::from_raw(op.pin)).map_err(IpcError::Fd)? {
@@ -1059,6 +1056,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 &mut guard,
                 &mut op,
                 &mut copy,
+                &wake.region_wait(),
                 |copy, at, dst| copy.user.copy_prefetched_prefix(dst, at),
                 |copy, at, src| match region.copy_vector_output(
                     &token,
@@ -1088,7 +1086,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 },
             )?
         } else {
-            transfer(&mut guard, &mut op, &mut copy)?
+            transfer(&mut guard, &mut op, &mut copy, &wake.region_wait())?
         };
         (status, guard.publish(wake_set))
     };

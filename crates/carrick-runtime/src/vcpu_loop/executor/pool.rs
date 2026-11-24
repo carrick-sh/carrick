@@ -1332,6 +1332,10 @@ where
                 }
             }
         }
+        // Every executor has joined: no vCPU resumes a ring section, so a
+        // shared-region lock still held now was cut off and is never released.
+        // Stop before any teardown step below can contend on one (#2955).
+        self.scheduler.kernel().stop_guest_execution();
         // A task can cross Running -> Blocked after the pre-join cancellation
         // snapshot while its worker is completing save/settlement. Joined
         // workers make the generation set stable; cancel that exact successor
@@ -1352,9 +1356,6 @@ where
                 .kernel()
                 .release_thread_birth_capacity_after_executors_stop();
         }
-        // No vCPU resumes a ring section either: a shared-region lock still
-        // held now was cut off, and teardown must not wait for it (#2955).
-        self.scheduler.kernel().stop_guest_execution();
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
         let (created, destroyed) = self.receipts.lifecycle_counts();

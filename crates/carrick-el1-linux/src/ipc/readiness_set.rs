@@ -315,7 +315,7 @@ fn build<E: IpcExecution>(
         match region.create_epoll(&EL1_WAIT) {
             Ok(object) => break object,
             Err(IpcError::NoObjects) => {
-                if region.grow_objects(seen).is_err() {
+                if region.grow_objects(seen, &EL1_WAIT).is_err() {
                     return Err(Build::Errno(carrick_abi::LINUX_ENOMEM));
                 }
             }

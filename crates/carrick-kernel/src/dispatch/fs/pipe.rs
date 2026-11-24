@@ -346,7 +346,7 @@ impl PipeInner {
     #[cfg(test)]
     pub(crate) fn guest_write_for_test(&self, bytes: &[u8]) {
         self.ensure_ring().unwrap();
-        let mut guard = self.lock();
+        let mut guard = self.guest_lock();
         let step = guard.pipe().unwrap().try_write(bytes);
         assert_eq!(step.result, Ok(bytes.len()));
         guard.publish(step.wake);
@@ -354,13 +354,21 @@ impl PipeInner {
     pub(crate) fn ipc_object(&self) -> IpcObjectHandle {
         self.object
     }
-    fn lock(&self) -> IpcObjectGuard<'_> {
-        self.owner
-            .region()
-            .lock(self.object, &self.owner.wait())
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::pipe", "stale live pipe binding")
-            })
+    /// The pipe's object lock. A refusal is the carrier gone (a lock a
+    /// cut-off ring section holds, after guest execution stopped); a live
+    /// binding is never stale.
+    fn lock(&self) -> Result<IpcObjectGuard<'_>, crate::el1_ipc::CarrierGone> {
+        match self.owner.region().lock(self.object, &self.owner.wait()) {
+            Ok(guard) => Ok(guard),
+            Err(error) => match self.owner.cut_off(error) {
+                Ok(gone) => Err(gone),
+                Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "stale live pipe binding"),
+            },
+        }
+    }
+    /// The object lock on an executor's guest step.
+    fn guest_lock(&self) -> IpcObjectGuard<'_> {
+        self.lock().unwrap_or_else(|gone| gone.on_an_executor())
     }
     fn snapshot_locked(guard: &mut IpcObjectGuard<'_>) -> PipeSnapshot {
         let pipe = guard
@@ -375,7 +383,7 @@ impl PipeInner {
         }
     }
     pub(crate) fn snapshot(&self) -> PipeSnapshot {
-        Self::snapshot_locked(&mut self.lock())
+        Self::snapshot_locked(&mut self.guest_lock())
     }
     pub(crate) fn pipe_id(&self) -> u64 {
         self.pipe_id
@@ -395,10 +403,15 @@ impl PipeInner {
         // Epoll can retain an observation after the last functional endpoint
         // closes. Authenticate the incarnation without retaining it or reading
         // the successor's bytes after this directory slot is reused.
+        // A lock a cut-off ring section holds after the stop observes the
+        // object as retired (`CarrierGone`): no guest reads the answer.
         match self.owner.region().lock(self.object, &self.owner.wait()) {
             Ok(mut guard) => Self::snapshot_locked(&mut guard).unread,
             Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
-            Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid observation"),
+            Err(error) => match self.owner.cut_off(error) {
+                Ok(_gone) => 0,
+                Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid observation"),
+            },
         }
     }
     pub(crate) fn get_capacity(&self) -> usize {
@@ -427,9 +440,12 @@ impl PipeInner {
             Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "live pipe ring provision"),
         }
     }
-    pub(crate) fn write_bytes(&self, bytes: &[u8]) -> Result<usize, LinuxErrno> {
+    /// One write step, from a guest `write` on an executor or a parked
+    /// blocking write the carrier's reactor drives: the latter can meet
+    /// the carrier gone.
+    pub(crate) fn write_bytes(&self, bytes: &[u8]) -> Result<usize, crate::el1_ipc::LiveStepError> {
         loop {
-            let mut guard = self.lock();
+            let mut guard = self.lock()?;
             let step = guard
                 .pipe()
                 .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
@@ -441,7 +457,7 @@ impl PipeInner {
                 self.ensure_ring()?;
                 continue;
             }
-            return self.finish(guard, step);
+            return Ok(self.finish(guard, step)?);
         }
     }
     pub(crate) fn read_with(
@@ -449,7 +465,7 @@ impl PipeInner {
         count: usize,
         copy: impl FnMut(&[u8]) -> usize,
     ) -> Result<usize, LinuxErrno> {
-        let mut guard = self.lock();
+        let mut guard = self.guest_lock();
         let step = guard
             .pipe()
             .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("ipc::pipe", "wrong object kind"))
@@ -964,7 +980,7 @@ pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain<'_> {
     // Staging allocation precedes the shared object lock. Another reader can
     // consume this snapshot; peek rechecks the same authoritative record.
     let mut bytes = vec![0; length.min(snapshot.unread)];
-    let mut guard = pipe.lock();
+    let mut guard = pipe.guest_lock();
     let mut copied = 0;
     let result = guard
         .pipe()
@@ -1028,11 +1044,11 @@ pub(crate) fn transfer_in_memory_pipes(
     }
     // One stable order for every host operation touching two pipe objects.
     let (mut src, mut dst) = if Arc::as_ptr(source) < Arc::as_ptr(dest) {
-        let src = source.lock();
-        (src, dest.lock())
+        let src = source.guest_lock();
+        (src, dest.guest_lock())
     } else {
-        let dst = dest.lock();
-        (source.lock(), dst)
+        let dst = dest.guest_lock();
+        (source.guest_lock(), dst)
     };
     if PipeInner::snapshot_locked(&mut dst).readers == 0 {
         return InMemoryTeeOutcome::BrokenPipe;
@@ -1114,7 +1130,12 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
 
     let written = match pipe.write_bytes(bytes) {
         Ok(written) => written,
-        Err(LINUX_EAGAIN) => {
+        Err(crate::el1_ipc::LiveStepError::CarrierGone(_)) => {
+            return DispatchOutcome::OwnerCancelled(
+                crate::kernel::continuation::OwnerWaitCancellation::Carrier,
+            );
+        }
+        Err(crate::el1_ipc::LiveStepError::Errno(LINUX_EAGAIN)) => {
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
@@ -1134,7 +1155,7 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
                 },
             };
         }
-        Err(errno) => return DispatchOutcome::errno(errno),
+        Err(crate::el1_ipc::LiveStepError::Errno(errno)) => return DispatchOutcome::errno(errno),
     };
 
     if written == bytes.len() || nonblocking || (operation.is_interrupted)() {
@@ -1615,7 +1636,7 @@ mod tests {
     #[test]
     fn serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease() {
         let pipe = PipeInner::new_connected(next_pipe_id(), DEFAULT_PIPE_CAPACITY);
-        let subscribers = || pipe.lock().host_subscribers();
+        let subscribers = || pipe.guest_lock().host_subscribers();
         assert_eq!(subscribers(), 0);
         let lease = pipe.read_poll_fd().unwrap();
         assert_eq!(subscribers(), 1);
@@ -1626,7 +1647,7 @@ mod tests {
             "cached proxy is not a live host subscriber"
         );
         pipe.ensure_ring().unwrap();
-        let mut guard = pipe.lock();
+        let mut guard = pipe.guest_lock();
         let step = guard.pipe().unwrap().try_write(b"guest");
         assert!(!guard.publish(step.wake).host_owed);
         drop(guard);
