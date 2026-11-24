@@ -126,6 +126,11 @@ mod test_support {
     pub const INJECT_RELEASE_HELD_COW_SETTLE: u64 = 0xffff_ffff_ffff_fe24;
     /// 1 if the hold reached its bound before the sibling released it.
     pub const INJECT_COW_SETTLE_TIMED_OUT: u64 = 0xffff_ffff_ffff_fe25;
+    /// As [`INJECT_HOLD_NEXT_COW_SETTLE`], with no spin bound: the hold ends
+    /// only on [`INJECT_RELEASE_HELD_COW_SETTLE`], so a fixture's ordering
+    /// never depends on vCPU scheduling; the test's own timeout bounds a
+    /// hung run (#2947 review).
+    pub const INJECT_HOLD_NEXT_COW_SETTLE_UNTIL_RELEASED: u64 = 0xffff_ffff_ffff_fe36;
     /// The calling member's CPU slot, so the fixture can keep the held
     /// member off its poller's CPU.
     pub const INJECT_CURRENT_CPU: u64 = 0xffff_ffff_ffff_fe26;
@@ -535,6 +540,9 @@ mod test_support {
     /// settlement crossing.
     static COW_HOLD_AT_SUPPLY: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    /// The armed hold has no spin bound.
+    static COW_HOLD_UNBOUNDED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     /// Called by the user-fault owner between a COW completion and its
     /// settlement crossing, on the faulting member's CPU. While held it
@@ -559,10 +567,11 @@ mod test_support {
         {
             return;
         }
+        let bounded = !COW_HOLD_UNBOUNDED.swap(false, Ordering::AcqRel);
         let mut spins = 0_u64;
         while COW_SETTLE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
             spins += 1;
-            if spins > COW_SETTLE_HOLD_SPINS {
+            if bounded && spins > COW_SETTLE_HOLD_SPINS {
                 // The sibling never released: let the crossing run and
                 // report the hold's bound to the fixture.
                 COW_SETTLE_TIMED_OUT.store(true, Ordering::Release);
@@ -1035,6 +1044,16 @@ mod test_support {
                 .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_HOLD_NEXT_COW_SETTLE_UNTIL_RELEASED => {
+                if COW_SETTLE_HOLD
+                    .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return None;
+                }
+                COW_HOLD_UNBOUNDED.store(true, Ordering::Release);
+                Some(0)
+            }
             INJECT_HOLD_NEXT_COW_SUPPLY => {
                 if COW_SETTLE_HOLD
                     .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
@@ -1114,6 +1133,7 @@ mod test_support {
                     )
                     .or_else(|_| {
                         COW_HOLD_AT_SUPPLY.store(false, Ordering::Release);
+                        COW_HOLD_UNBOUNDED.store(false, Ordering::Release);
                         COW_SETTLE_HOLD.compare_exchange(
                             BIRTH_ARMED,
                             0,

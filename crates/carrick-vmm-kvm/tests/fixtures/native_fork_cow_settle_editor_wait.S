@@ -3,41 +3,42 @@
  * the fork refuses "not now", rings the MM's settlement crossing, and when
  * the carrier meets the parent's editor held it parks on that editor's
  * release; the release wakes it, its rerun rings the crossing again, the
- * carrier settles, and the fork completes. The fixture image holds the
- * worker's user-fault COW in the ring after its guest copy and repoint and
- * before its settlement crossing (INJECT_HOLD_NEXT_COW_SETTLE), so the
- * leader's fork deterministically finds the completion unsettled, and holds
- * the parent's real editor across the fork's first settlement crossing
- * (INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE), released through the editor's own
- * release once the forking leader has parked. No sleeps.
+ * carrier settles, and the fork completes.
+ *
+ * Every step is ordered on an event, never on timing (#2947 review): the
+ * worker's user-fault COW is held in the ring after its guest copy and
+ * repoint and before its settlement crossing until the leader releases it
+ * (INJECT_HOLD_NEXT_COW_SETTLE_UNTIL_RELEASED has no spin bound), so the
+ * leader's fork finds the completion unsettled; the image holds the
+ * parent's real editor across the fork's first settlement crossing
+ * (INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE) and releases it through the
+ * editor's own release only once the forking leader is parked. Polls and
+ * futex waits have no bound and no deadline: the test's watchdog bounds a
+ * run that hangs. No sleeps.
  *
  * Leader: make two private pages P and Q resident; fork a child that blocks
  * on a pipe (so both stay copy-on-write, two live processes); clone a
  * worker, which parks on its go word (two live threads); arm the COW hold;
  * wake the worker; poll INJECT_COW_SETTLE_HELD; arm the editor hold; fork a
  * second child, which exits 0 at once; reap it; read the census; release
- * the COW hold.
- * Worker: write P (COW fault, held), then settle its own grant.
+ * the COW hold; join the worker; reap the first child.
+ * Worker: leave the leader's CPU, write P (COW fault, held), then settle its
+ * own grant.
  *
- * Exit 7: every step held. 91: the worker's write did not land; 92: the
- * worker's go wait timed out; 93: the worker never left the leader's CPU;
- * 100: the COW hold never engaged; 120: the editor hold could not be armed;
- * 121: the fork never met its parent's unsettled completion (it forked
- * without waiting for the settlement); 122: the held editor was not released
- * with the fork parked on it; 123: no rerun found its parent settled; 124:
- * the second fork failed; 125: its reap failed or its status was not 0;
- * 151: the COW hold reached its bound before the release; 160 + n: the
- * worker exited before the hold engaged, with result n. Other codes name a
- * failed setup step.
+ * Exit 7: every step held. 91: the worker's write did not land; 120: the
+ * editor hold could not be armed; 121: the fork never met its parent's
+ * unsettled completion (it forked without waiting for the settlement); 122:
+ * the held editor was not released with the fork parked on it; 123: no
+ * rerun found its parent settled; 124: the second fork failed; 125: its
+ * reap failed or its status was not 0; 160 + n: the worker exited before
+ * the hold engaged, with result n. Other codes name a failed setup step.
  */
 #define INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE 0xfffffffffffffe34
 #define INJECT_FORK_COW_SETTLE_CENSUS  0xfffffffffffffe35
-#define INJECT_HOLD_NEXT_COW_SETTLE    0xfffffffffffffe22
+#define INJECT_HOLD_NEXT_COW_SETTLE_UNTIL_RELEASED 0xfffffffffffffe36
 #define INJECT_COW_SETTLE_HELD         0xfffffffffffffe23
 #define INJECT_RELEASE_HELD_COW_SETTLE 0xfffffffffffffe24
-#define INJECT_COW_SETTLE_TIMED_OUT    0xfffffffffffffe25
 #define INJECT_CURRENT_CPU             0xfffffffffffffe26
-#define POLL_LIMIT                     0x1000000
 
 .global _start
 .text
@@ -123,7 +124,7 @@ _start:
     syscall
     mov %eax, 0x34(%r12)
 
-    mov $INJECT_HOLD_NEXT_COW_SETTLE, %rax
+    mov $INJECT_HOLD_NEXT_COW_SETTLE_UNTIL_RELEASED, %rax
     syscall
     test %rax, %rax
     jnz fail_arm
@@ -138,7 +139,7 @@ _start:
     test %rax, %rax
     js fail_wake
 
-    mov $POLL_LIMIT, %r13
+    /* No poll bound: the test's watchdog bounds a run that never holds. */
 held_loop:
     mov $INJECT_COW_SETTLE_HELD, %rax
     syscall
@@ -146,8 +147,6 @@ held_loop:
     je held
     cmpl $0, (%r12)             /* the worker exited unheld: report it */
     je worker_gone
-    dec %r13
-    jz never_held
     pause
     jmp held_loop
 held:
@@ -190,10 +189,6 @@ held:
     test $0xffff, %eax
     jz fail_never_settled
 
-    mov $INJECT_COW_SETTLE_TIMED_OUT, %rax
-    syscall
-    test %rax, %rax
-    jnz fail_hold_bound
     mov $INJECT_RELEASE_HELD_COW_SETTLE, %rax
     syscall
 
@@ -207,9 +202,7 @@ join_loop:
     lea 0x40(%r12), %r10
     mov $202, %eax
     syscall
-    cmp $-110, %rax
-    je fail_join
-    jmp join_loop
+    jmp join_loop               /* a timeout only re-checks the word */
 joined:
     mov 0x30(%r12), %r13d
     cmp $22, %r13d
@@ -244,22 +237,17 @@ go_loop:
     lea 0x40(%r12), %r10
     mov $202, %eax
     syscall
-    cmp $-110, %rax
-    je worker_go_timeout
-    jmp go_loop
+    jmp go_loop                 /* a timeout only re-checks the word */
 go:
     /* Leave the leader's CPU first: the held COW spins where it runs, and
      * the leader polls on its own CPU. A bounded park (sched_yield does not
      * switch back to a CPU's queued home thread, see followup) lets the
      * leader run on; this worker's wake then goes to the idle CPU. */
-    mov $0x1000, %r13
 off_loop:
     mov $INJECT_CURRENT_CPU, %rax
     syscall
     cmp 0x34(%r12), %eax
     jne off
-    dec %r13
-    jz worker_stuck
     lea 0x38(%r12), %rdi        /* futex(&never, FUTEX_WAIT_PRIVATE, 0, 1 ms) */
     mov $128, %esi
     xor %edx, %edx
@@ -277,11 +265,6 @@ off:
 worker_bad_write:
     movl $91, 0x30(%r12)
     jmp worker_exit
-worker_go_timeout:
-    movl $92, 0x30(%r12)
-    jmp worker_exit
-worker_stuck:
-    movl $93, 0x30(%r12)
 worker_exit:
     xor %edi, %edi
     mov $60, %eax
@@ -314,11 +297,6 @@ worker_gone:
     mov 0x30(%r12), %edi
     add $160, %edi
     jmp die
-never_held:
-    mov $INJECT_RELEASE_HELD_COW_SETTLE, %rax
-    syscall
-    mov $100, %edi
-    jmp die
 fail_arm_editor:
     mov $120, %edi
     jmp release_and_die
@@ -337,8 +315,6 @@ fail_second_fork:
 fail_second_reap:
     mov $125, %edi
     jmp release_and_die
-fail_hold_bound:
-    mov $151, %edi
 release_and_die:
     mov $INJECT_RELEASE_HELD_COW_SETTLE, %rax
     syscall
@@ -363,9 +339,6 @@ fail_clone:
     jmp die
 fail_wake:
     mov $87, %edi
-    jmp die
-fail_join:
-    mov $88, %edi
     jmp die
 fail_wait:
     mov $89, %edi
