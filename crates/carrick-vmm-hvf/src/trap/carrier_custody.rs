@@ -10,7 +10,7 @@
 
 use super::*;
 use carrick_aarch64::stage2::custody::{
-    Stage2Custody, Stage2CustodyError, Stage2CustodyState, Stage2Lifecycle,
+    Stage2Custody, Stage2CustodyError, Stage2CustodyState, Stage2Gone, Stage2Lifecycle,
 };
 use carrick_aarch64::vmm::VcpuDestroyError;
 
@@ -1517,26 +1517,46 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
-        let (ipa, len) = {
-            let mut state = self.stage2.lock();
-            let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-                return CarrierStage2RetireOutcome::NotFound;
-            };
-            match carrick_core::mm::retirement::prepare_record_retirement(record, identity) {
-                carrick_core::mm::retirement::RecordRetirement::Complete(outcome) => {
-                    return outcome;
-                }
-                carrick_core::mm::retirement::RecordRetirement::Unmap { ipa, len } => (ipa, len),
+        use carrick_core::mm::retirement::{
+            RecordRetirement, prepare_record_retirement, settle_record_retirement,
+        };
+        // The decision to unmap, the backend unmap and its settlement run
+        // under one guard of the record's own generation: no raw destroy, and
+        // so no successor VM, can run between them. `unmap` must not re-enter
+        // the custody.
+        let mut stage2 = match self.stage2.stage2_in(identity.vm_generation) {
+            Ok(stage2) => stage2,
+            Err(Stage2Gone) => {
+                // No stage 2 is left to unmap: the generation's raw destroy
+                // terminalized its records under the same lock.
+                let mut state = self.stage2.lock();
+                let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+                    return CarrierStage2RetireOutcome::NotFound;
+                };
+                return match prepare_record_retirement(record, identity) {
+                    RecordRetirement::Complete(outcome) => outcome,
+                    RecordRetirement::Unmap { ipa, len } => carrick_fatal::carrick_fatal!(
+                        "hvpatch::stage2_custody",
+                        "record {:?} at IPA {ipa:#x}/{len:#x} still owes an unmap, but its \
+                         generation's stage 2 is gone and was not terminalized",
+                        identity.record_id
+                    ),
+                };
             }
         };
-
-        self.stage2.at_client_point(RECORD_UNMAP_PREPARED);
-        let backend_result = unmap(ipa, len);
-        let mut state = self.stage2.lock();
-        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+        let Some(record) = stage2.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
-        carrick_core::mm::retirement::settle_record_retirement(record, identity, backend_result)
+        let (ipa, len) = match prepare_record_retirement(record, identity) {
+            RecordRetirement::Complete(outcome) => return outcome,
+            RecordRetirement::Unmap { ipa, len } => (ipa, len),
+        };
+        self.stage2.at_client_point(RECORD_UNMAP_PREPARED);
+        let backend_result = unmap(ipa, len);
+        let Some(record) = stage2.stage2_records.get_mut(&identity.record_id) else {
+            return CarrierStage2RetireOutcome::NotFound;
+        };
+        settle_record_retirement(record, identity, backend_result)
     }
 }
 
