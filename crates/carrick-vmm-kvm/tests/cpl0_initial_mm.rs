@@ -3735,6 +3735,30 @@ fn production_sibling_copy_leaves_another_cpus_cow_settlement_alone() {
     );
 }
 
+/// #2947 (review P0): a native fork whose parent has a guest COW completion
+/// the carrier has not settled waits for that settlement through the
+/// production path, end to end: the fork refuses "not now" and rings the
+/// settlement crossing; the carrier meets the parent's editor held and
+/// settles nothing; the fork parks on the editor's release through the
+/// shared native service; the release wakes it; its rerun rings the crossing
+/// again, the carrier settles, and the fork completes and is reaped. The
+/// fixture image holds a sibling's COW before its own settlement crossing
+/// and holds the parent's real editor across the fork's first crossing,
+/// released through the editor's own release once the fork has parked.
+#[test]
+fn production_fork_parks_on_a_held_parent_editor_and_forks_once_the_carrier_settles() {
+    let elf = native_exit_fixture("native_fork_cow_settle_editor_wait.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("fork beside an unsettled parent COW completion run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_fork_cow_settle_editor_wait.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno

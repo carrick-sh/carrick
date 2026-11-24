@@ -40,6 +40,8 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::release_birth_on_park(source);
     #[cfg(feature = "test-support")]
     crate::test_support::release_fork_commit_on_park(source);
+    #[cfg(feature = "test-support")]
+    crate::test_support::release_fork_cow_editor_on_park(source);
     settle_current_work(current);
     'schedule: loop {
         #[cfg(feature = "test-support")]
