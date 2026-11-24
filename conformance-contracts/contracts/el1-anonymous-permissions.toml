@@ -43,6 +43,7 @@ vm_free = [
   "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
   "carrick-el1::memory::tests::invalid_arm_slot_refuses_mprotect_before_editing",
   "carrick-mmu-core::x86::descriptor_txn::tests::guest_protect_grants_execute_within_the_mapping_ceiling (#2874: an x86 execute grant within the mapping's ceiling applies and tags MAY_EXEC; write widening stays refused)",
+  "carrick-el1::memory::tests::delegated::two_isa_parked_reprobe_refuses_a_closed_space_and_waits_out_a_counted_pause (#2986: mprotect shares the delegated admission and the parked reprobe; a closed space is a NoGrant refusal, a counted pause is Contended(Gate))",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",

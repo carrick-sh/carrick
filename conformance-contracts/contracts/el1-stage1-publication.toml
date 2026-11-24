@@ -91,6 +91,7 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
+  "carrick-sched-core::edit_admission_closure::{editor_admission_classifies_closure_apart_from_a_counted_pause,source_free_admission_classifies_closure_apart_from_a_counted_pause} (#2986: a closed space refuses a stage-1 editor as Closed; only a counted pause of an open space is a gate wait)",
 ]
 
 [bindings.unresolved]
