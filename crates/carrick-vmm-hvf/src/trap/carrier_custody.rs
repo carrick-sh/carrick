@@ -2409,6 +2409,240 @@ mod carrier_vm_custody_tests {
         );
     }
 
+    /// A lease handed to its mapper after that mapper's VM is destroyed
+    /// settles on arrival (#2968 confirming review at `4e791dc5c`, P0 1).
+    /// The destroy already drained the mapper's list, and the stage 2 the
+    /// lease was mapped in is gone, so nothing would ever unmap or settle it
+    /// there. Before the fix the late handoff queued it with its backing
+    /// onto the destroyed VM's list, where it stayed.
+    #[test]
+    fn serial_host_a_lease_handed_to_its_mapper_after_that_vm_is_destroyed_settles_at_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let receiver = crate::trap::test_carrier_custody();
+        let recorder = std::sync::Arc::new(RecordingStage2::default());
+        recorder
+            .fail_unmaps
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mapper = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+            std::sync::Arc::clone(&recorder) as _,
+        ));
+        let length = 0x4000_u64;
+        let mut lease = super::GlobalFrameStage2Lease::reserve(length, length)
+            .expect("reserve the lease's IPA");
+        let base = lease.key().0;
+        lease.mark_mapped(mapper.stage2_backend_handle());
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            length as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate the lease's backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let destroyed = super::destroy_vm_with_custody_target_using(
+            &mapper,
+            "mapper destroy before the handoff",
+            super::CarrierVmDestroyTarget::Live,
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        );
+        assert!(destroyed.is_ok(), "{destroyed:?}");
+
+        assert!(
+            super::register_global_frame_host_owner_in(
+                &receiver,
+                lease,
+                mapping,
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            )
+            .is_err(),
+            "the receiver refuses a lease the mapper's backend mapped"
+        );
+
+        assert_eq!(
+            recorder.unmaps.lock().len(),
+            1,
+            "the refused lease tried one rollback unmap"
+        );
+        assert_eq!(
+            mapper.stage2_backend_handle().unretired_lease_count(),
+            0,
+            "nothing is queued onto the destroyed VM's list"
+        );
+        assert!(
+            !super::alias_backing_is_live(host_addr),
+            "the lease settles on arrival and frees its backing"
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .live
+                .contains_key(&base),
+            "the lease's IPA is released"
+        );
+    }
+
+    /// A lease mapped in a destroyed VM generation is never admitted as a
+    /// record of its successor, by a batch or by a single transfer (#2968
+    /// confirming review at `4e791dc5c`, P0 1). Its stage 2 went with the
+    /// destroy, so a mapped record of it in the successor would name a
+    /// translation that does not exist. Before the fix both paths compared
+    /// only the backend, which the successor shares, and admitted it.
+    #[test]
+    fn a_lease_mapped_in_a_destroyed_generation_is_refused_by_its_successor() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let recorder = std::sync::Arc::new(RecordingStage2::default());
+        let custody = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+            std::sync::Arc::clone(&recorder) as _,
+        ));
+        let g1 = custody.live_generation().expect("g1 is live");
+        let batch_key = (0xa087_0000_0000_u64, 0x4000_u64);
+        let single_key = (0xa088_0000_0000_u64, 0x4000_u64);
+        let mut batch_lease = super::GlobalFrameStage2Lease::fixed(batch_key.0, batch_key.1);
+        batch_lease.mark_mapped(custody.stage2_backend_handle());
+        let mut single_lease = super::GlobalFrameStage2Lease::fixed(single_key.0, single_key.1);
+        single_lease.mark_mapped(custody.stage2_backend_handle());
+        let destroyed = super::destroy_vm_with_custody_target_using(
+            &custody,
+            "destroy g1",
+            super::CarrierVmDestroyTarget::Live,
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        );
+        assert!(destroyed.is_ok(), "{destroyed:?}");
+        let g2 = custody.begin_create().expect("begin g2");
+        custody.commit_create(g2).expect("commit g2");
+        assert_ne!(g1, g2);
+
+        let owners = std::collections::BTreeMap::from([(batch_key, 0x1000)]);
+        let batch = super::register_carrier_stage2_leases(
+            &custody,
+            &mut vec![batch_lease],
+            &owners,
+            &mut |_| None,
+        );
+        let single = super::transfer_global_frame_stage2_lease_to_custody(
+            &custody,
+            single_lease,
+            0x1000,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            None,
+        );
+
+        assert!(
+            batch.is_err(),
+            "the batch refuses a g1 lease in g2: {batch:?}"
+        );
+        assert!(
+            single.is_err(),
+            "a single transfer refuses a g1 lease in g2: {single:?}"
+        );
+        for key in [batch_key, single_key] {
+            assert!(
+                custody
+                    .stage2_record_covering(key.0, key.1 as usize)
+                    .is_none(),
+                "g2 holds no record of the g1 extent {key:?}"
+            );
+        }
+        assert!(
+            recorder.unmaps.lock().is_empty(),
+            "no rollback of a g1 lease unmaps through g2's stage 2"
+        );
+    }
+
+    /// A lease batch and a VM destroy racing on two threads leave the batch
+    /// all or nothing (#2968 confirming review at `4e791dc5c`, P0 1): either
+    /// every lease became a record the destroy then terminalized, or the
+    /// batch was refused with no record made and each lease rolled back
+    /// through its backend. Before the fix a destroy between two of the
+    /// batch's transfers refused the rest midway and fail-stopped the
+    /// process. The race is chance-ordered, so this witness proves the
+    /// outcome set, not that the old window was hit.
+    #[test]
+    fn a_lease_batch_racing_a_vm_destroy_is_admitted_whole_or_not_at_all() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        const ROUNDS: usize = 200;
+        const LEASES: u64 = 3;
+        let (mut admitted, mut refused) = (0, 0);
+        for round in 0..ROUNDS as u64 {
+            let recorder = std::sync::Arc::new(RecordingStage2::default());
+            let custody = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+                std::sync::Arc::clone(&recorder) as _,
+            ));
+            let keys: Vec<_> = (0..LEASES)
+                .map(|lease| {
+                    (
+                        0xa090_0000_0000_u64 + (round * LEASES + lease) * 0x10_0000,
+                        0x4000,
+                    )
+                })
+                .collect();
+            let mut leases: Vec<_> = keys
+                .iter()
+                .map(|&(base, length)| {
+                    let mut lease = super::GlobalFrameStage2Lease::fixed(base, length);
+                    lease.mark_mapped(custody.stage2_backend_handle());
+                    lease
+                })
+                .collect();
+            let owners: std::collections::BTreeMap<_, _> =
+                keys.iter().map(|&key| (key, 0x1000_usize)).collect();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let destroyer = {
+                let custody = std::sync::Arc::clone(&custody);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    super::destroy_vm_with_custody_target_using(
+                        &custody,
+                        "racing destroy",
+                        super::CarrierVmDestroyTarget::Live,
+                        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                        || {},
+                    )
+                })
+            };
+            start.wait();
+            let batch =
+                super::register_carrier_stage2_leases(&custody, &mut leases, &owners, &mut |_| {
+                    None
+                });
+            let destroyed = destroyer.join().expect("the destroy thread");
+            assert!(destroyed.is_ok(), "round {round}: {destroyed:?}");
+            assert!(leases.is_empty());
+            match batch {
+                Ok(identities) => {
+                    admitted += 1;
+                    assert_eq!(identities.len(), LEASES as usize);
+                    for identity in identities {
+                        let record = custody
+                            .stage2_record_snapshot(identity.record_id)
+                            .expect("the admitted record");
+                        assert!(
+                            record.terminalized_by_vm_destroy,
+                            "round {round}: the destroy terminalized {record:?}"
+                        );
+                    }
+                    assert!(recorder.unmaps.lock().is_empty(), "round {round}");
+                }
+                Err(_) => {
+                    refused += 1;
+                    assert!(
+                        custody.stage2_record_identities().is_empty(),
+                        "round {round}: a refused batch made no record"
+                    );
+                    // A lease refused after the destroy settled has nothing
+                    // to unmap; one refused while it was in flight unmaps
+                    // through the same VM.
+                    assert!(
+                        recorder.unmaps.lock().len() <= LEASES as usize,
+                        "round {round}: each refused lease rolled back at most once"
+                    );
+                }
+            }
+        }
+        assert_eq!(admitted + refused, ROUNDS);
+    }
+
     /// A test carrier's custody tears down through the production sequence
     /// (#2968 review, P0 2): a failed backend destroy restores the exact live
     /// custody with its records untouched, and a successful one terminalizes
