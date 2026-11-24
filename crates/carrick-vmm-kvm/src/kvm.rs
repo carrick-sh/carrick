@@ -1757,11 +1757,17 @@ impl HvVm for KvmVm {
     }
 }
 
+impl KvmVcpu {
+    fn should_surface_interrupted_run(&mut self) -> bool {
+        carrick_hal::posix_signal_kick::take_current_thread_kick_pending()
+            || self.fd_mut().get_kvm_run().immediate_exit != 0
+            || carrick_hal::vcpu_run::current_shutdown_requested()
+            || !carrick_signal_linux::proc_pending_mask().is_empty()
+    }
+}
+
 impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
-        // EINTR from the ioctl means a signal (KICK_SIGNAL via pthread_kill) interrupted
-        // KVM_RUN before any guest exit — this is the cross-thread kick path.
-        record_kvm_stat(KvmStat::Run);
         // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell can
         // read the frame without a KVM_GET_REGS ioctl. Read-only mirror: we set
         // kvm_valid_regs (sync-out) but never kvm_dirty_regs, so kernel registers
@@ -1778,89 +1784,101 @@ impl HvVcpu for KvmVcpu {
         // valid for the whole call (the slot is an Arc field of `self`).
         #[cfg(target_arch = "x86_64")]
         let sync_stale_cell: *mut bool = self.slot.sync_regs_stale.get();
-        let exit = match self.fd_mut().run() {
-            Ok(e) => e,
-            Err(e) if e.errno() == libc::EINTR => {
-                // KVM_RUN was interrupted (kick) BEFORE entering the guest — the
-                // kernel did NOT repopulate s.regs, so leave any staleness intact.
-                record_kvm_stat(KvmStat::RunEintr);
-                return Ok(VcpuExit::Kicked);
-            }
-            Err(e) => {
-                let mut msg = "KVM_RUN".to_string();
-                self.append_debug_state(&mut msg);
-                return Err(os_err(&msg, e));
-            }
-        };
-        // A genuine guest exit repopulated kvm_run.s.regs from the live registers
-        // — the sync-out mirror is fresh again (clears any reclaim staleness).
-        // SAFETY: single-thread-owned scalar write through the pre-captured cell
-        // pointer (avoids re-borrowing `self`, which `exit` holds via the slice).
-        #[cfg(target_arch = "x86_64")]
-        if sync_regs_supported() {
-            unsafe { *sync_stale_cell = false }
-        }
-        match exit {
-            KvmExit::MmioWrite(gpa, data) => {
-                record_kvm_stat(KvmStat::ExitMmio);
-                // KVM hands us the bytes written and the length via the slice.
-                let len = data.len() as u8;
-                let mut buf = [0u8; 8];
-                buf[..data.len()].copy_from_slice(data);
-                Ok(VcpuExit::MmioWrite {
-                    gpa,
-                    data: u64::from_le_bytes(buf),
-                    len,
-                })
-            }
-            // x86-64 KVM backend: `OUT port, al` (KVM_EXIT_IO) — the SYSCALL
-            // doorbell vehicle.  Port 0xC5 is the SYSCALL trap; the
-            // `KvmX86TrapEngine` in `trap_engine_x86.rs` dispatches on it.
-            // KVM auto-advances RIP past the OUT instruction on KVM_EXIT_IO
-            // (Linux KVM API §4.35), so no RIP fixup is needed in complete_syscall.
-            // Source: kvm-ioctls 0.22.1 `VcpuExit::IoOut(port, data_slice)`.
-            KvmExit::IoOut(port, data) => {
-                if port == carrick_hal::SYSCALL_DOORBELL_PORT {
-                    record_kvm_stat(KvmStat::ExitIoSyscall);
-                } else if port == carrick_x86::FAULT_DOORBELL_PORT {
-                    record_kvm_stat(KvmStat::ExitIoFault);
-                } else {
-                    record_kvm_stat(KvmStat::ExitIoOther);
+        loop {
+            record_kvm_stat(KvmStat::Run);
+            match self.fd_mut().run() {
+                Ok(KvmExit::Intr) => {
+                    record_kvm_stat(KvmStat::ExitKicked);
                 }
-                Ok(VcpuExit::IoOut {
-                    port,
-                    data: data.to_vec(),
-                })
+                Ok(exit) => {
+                    // A genuine guest exit repopulated kvm_run.s.regs from the live
+                    // registers — the sync-out mirror is fresh again (clears any
+                    // reclaim staleness).
+                    // SAFETY: single-thread-owned scalar write through the
+                    // pre-captured cell pointer (avoids re-borrowing `self`, which
+                    // `exit` holds via the slice).
+                    #[cfg(target_arch = "x86_64")]
+                    if sync_regs_supported() {
+                        unsafe { *sync_stale_cell = false }
+                    }
+                    return match exit {
+                        KvmExit::MmioWrite(gpa, data) => {
+                            record_kvm_stat(KvmStat::ExitMmio);
+                            // KVM hands us the bytes written and the length via the slice.
+                            let len = data.len() as u8;
+                            let mut buf = [0u8; 8];
+                            buf[..data.len()].copy_from_slice(data);
+                            Ok(VcpuExit::MmioWrite {
+                                gpa,
+                                data: u64::from_le_bytes(buf),
+                                len,
+                            })
+                        }
+                        // x86-64 KVM backend: `OUT port, al` (KVM_EXIT_IO) — the SYSCALL
+                        // doorbell vehicle.  Port 0xC5 is the SYSCALL trap; the
+                        // `KvmX86TrapEngine` in `trap_engine_x86.rs` dispatches on it.
+                        // KVM auto-advances RIP past the OUT instruction on KVM_EXIT_IO
+                        // (Linux KVM API §4.35), so no RIP fixup is needed in complete_syscall.
+                        // Source: kvm-ioctls 0.22.1 `VcpuExit::IoOut(port, data_slice)`.
+                        KvmExit::IoOut(port, data) => {
+                            if port == carrick_hal::SYSCALL_DOORBELL_PORT {
+                                record_kvm_stat(KvmStat::ExitIoSyscall);
+                            } else if port == carrick_x86::FAULT_DOORBELL_PORT {
+                                record_kvm_stat(KvmStat::ExitIoFault);
+                            } else {
+                                record_kvm_stat(KvmStat::ExitIoOther);
+                            }
+                            Ok(VcpuExit::IoOut {
+                                port,
+                                data: data.to_vec(),
+                            })
+                        }
+                        KvmExit::SystemEvent(_, _) => {
+                            record_kvm_stat(KvmStat::ExitHalt);
+                            Ok(VcpuExit::Halt)
+                        }
+                        KvmExit::Shutdown | KvmExit::Hlt => {
+                            record_kvm_stat(KvmStat::ExitHalt);
+                            Ok(VcpuExit::Halt)
+                        }
+                        KvmExit::Intr => Ok(VcpuExit::Kicked),
+                        KvmExit::Debug(debug) => {
+                            record_kvm_stat(KvmStat::ExitDebug);
+                            Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}")))
+                        }
+                        KvmExit::InternalError => {
+                            record_kvm_stat(KvmStat::ExitInternal);
+                            let mut msg = "InternalError".to_string();
+                            self.append_debug_state(&mut msg);
+                            #[cfg(target_arch = "x86_64")]
+                            self.append_kvm_internal_state(&mut msg);
+                            Err(os_err("unexpected KVM_RUN exit", msg))
+                        }
+                        other => {
+                            record_kvm_stat(KvmStat::ExitOther);
+                            let mut msg = format!("{other:?}");
+                            self.append_debug_state(&mut msg);
+                            Err(os_err("unexpected KVM_RUN exit", msg))
+                        }
+                    };
+                }
+                Err(e) if e.errno() == libc::EINTR => {
+                    // KVM_RUN was interrupted BEFORE entering the guest — the
+                    // kernel did NOT repopulate s.regs, so leave any staleness intact.
+                    record_kvm_stat(KvmStat::RunEintr);
+                }
+                Err(e) => {
+                    let mut msg = "KVM_RUN".to_string();
+                    self.append_debug_state(&mut msg);
+                    return Err(os_err(&msg, e));
+                }
             }
-            KvmExit::SystemEvent(_, _) => {
-                record_kvm_stat(KvmStat::ExitHalt);
-                Ok(VcpuExit::Halt)
-            }
-            KvmExit::Shutdown | KvmExit::Hlt => {
-                record_kvm_stat(KvmStat::ExitHalt);
-                Ok(VcpuExit::Halt)
-            }
-            KvmExit::Intr => {
-                record_kvm_stat(KvmStat::ExitKicked);
-                Ok(VcpuExit::Kicked)
-            }
-            KvmExit::Debug(debug) => {
-                record_kvm_stat(KvmStat::ExitDebug);
-                Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}")))
-            }
-            KvmExit::InternalError => {
-                record_kvm_stat(KvmStat::ExitInternal);
-                let mut msg = "InternalError".to_string();
-                self.append_debug_state(&mut msg);
-                #[cfg(target_arch = "x86_64")]
-                self.append_kvm_internal_state(&mut msg);
-                Err(os_err("unexpected KVM_RUN exit", msg))
-            }
-            other => {
-                record_kvm_stat(KvmStat::ExitOther);
-                let mut msg = format!("{other:?}");
-                self.append_debug_state(&mut msg);
-                Err(os_err("unexpected KVM_RUN exit", msg))
+            // Only surface `Kicked` when Carrick requested an interruption (a
+            // vCPU kick, immediate_exit, carrier shutdown, or pending host
+            // signal). External ptrace stops (gdb attach) and job-control stops
+            // (SIGSTOP/SIGCONT) re-enter KVM_RUN transparently (#2962).
+            if self.should_surface_interrupted_run() {
+                return Ok(VcpuExit::Kicked);
             }
         }
     }

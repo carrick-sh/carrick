@@ -1071,12 +1071,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         need_resched: &AtomicBool,
         submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
-        if need_resched.load(Ordering::Acquire)
-            || carrick_hal::vcpu_run::current_shutdown_requested()
+        let task = self.task()?;
+        if carrick_hal::vcpu_run::current_shutdown_requested()
+            || (need_resched.load(Ordering::Acquire)
+                && self.physical.cpu_mut().can_save_loaded(task)?)
         {
             return Ok(ExecutorExit::Preempted);
         }
-        let task = self.task()?;
         let binding = self
             .binding
             .as_ref()
@@ -1237,10 +1238,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         if let Some(hook) = self.loaded_pre_entry_hook.take() {
             hook(need_resched, &self.idle_kick);
         }
-        if need_resched.load(Ordering::Acquire)
-            || carrick_hal::vcpu_run::current_shutdown_requested()
+        if carrick_hal::vcpu_run::current_shutdown_requested()
+            || (need_resched.load(Ordering::Acquire)
+                && self.physical.cpu_mut().can_save_loaded(task)?)
         {
             M::disarm_run_kick(&self.idle_kick);
+            let _ = carrick_hal::posix_signal_kick::take_current_thread_kick_pending();
             return Ok(ExecutorExit::Preempted);
         }
         let stopped = self.physical.cpu_mut().run_loaded(task);
@@ -1332,7 +1335,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     .map_or(task, |state| state.binding().task());
                 self.service_syscall_trap(forward_task, exited, Some(submission))
             }
-            CarrierRunExit::Kick => Ok(ExecutorExit::Preempted),
+            CarrierRunExit::Kick => {
+                if carrick_hal::vcpu_run::current_shutdown_requested()
+                    || (need_resched.load(Ordering::Acquire)
+                        && self.physical.cpu_mut().can_save_loaded(task)?)
+                {
+                    Ok(ExecutorExit::Preempted)
+                } else {
+                    Ok(ExecutorExit::ResumeEl1)
+                }
+            }
             CarrierRunExit::FaultDoorbellWord(first) => {
                 let record = self.physical.capture_fault_record(task, *first)?;
                 self.publish_exit(InitialProcessExit::Fault {
@@ -1577,6 +1589,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutor for Cpl0Persisten
             }
         };
         self.loaded_generation = None;
+        if carrick_hal::vcpu_run::current_shutdown_requested() {
+            if let Err(error) = self.physical.cpu_mut().reset_for_shutdown(task) {
+                return Err(ExecutorSaveError::new(
+                    TrapError::Hypervisor(format!("KVM shutdown detach: {error}")),
+                    lease,
+                ));
+            }
+            self.binding = None;
+            return Ok(SavedRunnable::new(lease));
+        }
         let stack = match self.physical.save_kernel_stack(task) {
             Ok(stack) => stack,
             Err(error) => return Err(ExecutorSaveError::new(error, lease)),
