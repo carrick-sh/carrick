@@ -320,8 +320,8 @@ impl carrick_kernel::kernel::ExecutorDeathObserver for Cpl0ExecutorDeathCompleti
     }
 }
 
-/// Loaded-lane pre-entry hook for test control; it receives the backend kick
-/// handle armed for the loaded task's next guest entry.
+/// Loaded-lane pre-entry hook for test control; it runs before every loaded
+/// entry and receives the backend kick handle armed for that entry.
 #[cfg(feature = "kvm-pool-test-control")]
 pub(crate) type LoadedPreEntryHook<K> =
     Arc<dyn Fn(&std::sync::atomic::AtomicBool, &K) + Send + Sync + 'static>;
@@ -1235,7 +1235,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
         self.physical.arm_loaded_kick(task, &self.idle_kick)?;
         #[cfg(feature = "kvm-pool-test-control")]
-        if let Some(hook) = self.loaded_pre_entry_hook.take() {
+        if let Some(hook) = self.loaded_pre_entry_hook.clone() {
             hook(need_resched, &self.idle_kick);
         }
         if carrick_hal::vcpu_run::current_shutdown_requested()

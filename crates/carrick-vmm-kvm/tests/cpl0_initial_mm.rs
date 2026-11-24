@@ -4608,6 +4608,85 @@ fn loaded_lane_shutdown_kick_between_check_and_entry_is_sticky() {
     assert_eq!(outcome.run.exit_code, 7);
 }
 
+/// #2962: a real reschedule whose kick stopped the loaded CPU inside CPL0
+/// supervisor code (after a crossing, before the guest returned to user
+/// space) must preempt there, not wait for the guest's next voluntary
+/// crossing. The guest then spins in user space with no host crossing for
+/// most of the run, so a reschedule left owed at that stop has no boundary
+/// until the spin ends.
+///
+/// Call 2 kicks the run at its armed entry (an immediate exit inside CPL0);
+/// call 3 publishes the reschedule at that stop. The lease must be saved,
+/// which clears `need_resched` through unbind, so call 4 must see it clear,
+/// and call 4 must come before the spin ends rather than after the second
+/// write: the gap to call 4 is under half the gap to the run's end. Both gaps
+/// stretch together under load; only a boundary taken after the spin makes
+/// them equal. Red on the PR head: the reschedule was never honoured, not
+/// even at the guest's later crossings.
+#[test]
+fn reschedule_owed_inside_cpl0_preempts_inside_a_crossing_free_user_spin() {
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let elf = native_exit_fixture("owed_reschedule_spin.S");
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (hook_calls, hook_seen) = (std::sync::Arc::clone(&calls), std::sync::Arc::clone(&seen));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = try_run_pool_fixture_with_loaded_pre_entry_hook(
+            &elf,
+            256,
+            256,
+            ROOT_AFFINITY_LOADED,
+            move |need_resched, kick| {
+                let call = hook_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                hook_seen
+                    .lock()
+                    .expect("hook record")
+                    .push((need_resched.load(Ordering::Acquire), Instant::now()));
+                match call {
+                    2 => kick.kick(),
+                    3 => need_resched.store(true, Ordering::Release),
+                    _ => {}
+                }
+            },
+        );
+        let _ = tx.send(result);
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("owed reschedule run must complete")
+        .expect("owed reschedule run");
+    let ended = Instant::now();
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"A\nB\n");
+    let seen = seen.lock().expect("hook record").clone();
+    let owed: Vec<bool> = seen.iter().map(|(owed, _)| *owed).collect();
+    assert!(
+        seen.len() >= 4,
+        "the hook ran only {} times: {owed:?}",
+        seen.len()
+    );
+    assert_eq!(
+        &owed[..3],
+        &[false, false, false],
+        "nothing was owed before the injected reschedule"
+    );
+    assert!(
+        !owed[3],
+        "the reschedule published inside CPL0 was still owed at the next entry: {owed:?}"
+    );
+    let published = seen[2].1;
+    let honoured = seen[3].1.duration_since(published);
+    let run_rest = ended.duration_since(published);
+    assert!(
+        honoured * 2 < run_rest,
+        "the reschedule waited for the guest's next crossing instead of a boundary inside the spin: honoured after {honoured:?} of {run_rest:?}"
+    );
+}
+
 fn forward_authority_fixture(variant: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(
         "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",
