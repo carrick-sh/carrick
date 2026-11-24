@@ -461,17 +461,9 @@ impl Service {
             return refusal;
         }
         let mm = request.operation.mm;
-        let editor = owner
-            .admitted_handle(mm, self.worker())
-            .ok()
-            .filter(|handle| handle.incarnation() == request.operation.incarnation)
-            .and_then(|handle| {
-                owner
-                    .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
-                    .ok()
-                    .flatten()
-            });
-        let Some(editor) = editor else {
+        let Some((editor, _)) =
+            owner.fork_parent_editor(mm, request.operation.incarnation, self.worker())
+        else {
             // The parent was retired or replaced: the rerun refuses it.
             return NativeProcessError::Busy;
         };

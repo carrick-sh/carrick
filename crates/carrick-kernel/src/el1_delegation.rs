@@ -115,13 +115,14 @@ pub fn settle_carrier_work(
 /// `CarrierWork` answer. A retained operation that found them unsettled (a
 /// fork arming its parent, #2947) reruns only after this acknowledgement,
 /// and nothing else promises that the carrier will exclude that MM's editor
-/// first, so the request settles them itself: excluding the editor waits
-/// out an admitted EL1 editor and settles the MM's completions under the
-/// exclusion. One completed after this is a later round, which settles the
-/// same way, so the rerun makes progress.
+/// first, so the request settles them itself, under its own exclusion of
+/// the editor. It never waits for an admitted editor: the answer goes back
+/// at once, and the fork's rerun parks on that editor's release. One
+/// completed after this is a later round, which settles the same way, so
+/// the rerun makes progress.
 fn settle_requester_guest_cow(request: &carrick_core_abi::service::ServiceRequest) {
     if let Some(mm) = crate::kernel::MmId::from_raw_u64(request.identity.birth.mm.mm().raw()) {
-        crate::kernel::mm_occupancy::settle_unsettled_guest_cow(
+        let _ = crate::kernel::mm_occupancy::settle_unsettled_guest_cow(
             carrick_el1_abi::cow_grant_pool_host(),
             mm,
         );

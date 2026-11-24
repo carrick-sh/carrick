@@ -866,7 +866,10 @@ fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
     let mm_fence = fence();
     let publication = publish_for_test(spaces, occupancy, mm(KEY), &mm_fence, 0x3c00).unwrap();
 
-    let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+    assert_eq!(
+        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)),
+        GuestCowSettlement::Nothing
+    );
     assert!(ours().is_empty(), "nothing unsettled: no exclusion");
 
     let nz = |v| std::num::NonZeroU64::new(v).unwrap();
@@ -897,9 +900,8 @@ fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
     let editor = spaces
         .try_begin_edit(index, KEY, nz(9))
         .expect("a sibling's EL1 edit holds the editor");
-    let answer = std::thread::spawn(move || {
-        let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
-    });
+    let answer =
+        std::thread::spawn(move || settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !answer.is_finished() && std::time::Instant::now() < deadline {
         std::thread::yield_now();
@@ -907,7 +909,7 @@ fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
     let answered = answer.is_finished();
     // Let a waiting answer finish before asserting, so a failure joins it.
     drop(editor);
-    answer.join().unwrap();
+    let held = answer.join().unwrap();
     assert!(
         answered,
         "the carrier-work answer waited for the sibling's EL1 editor"
@@ -922,8 +924,12 @@ fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
         0,
         "the answer lowered the gate it raised"
     );
+    assert_eq!(held, GuestCowSettlement::EditorHeld);
 
-    let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+    assert_eq!(
+        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY)),
+        GuestCowSettlement::Settled
+    );
     assert_eq!(
         ours(),
         vec![(KEY, true)],
