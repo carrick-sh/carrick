@@ -17,7 +17,7 @@
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
-guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:fstat", "syscall:newfstatat", "syscall:ioctl", "syscall:lseek", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
+guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:close_range", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:fstat", "syscall:newfstatat", "syscall:ioctl", "syscall:lseek", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
 semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap", "man 2 pipe2", "man 2 fstat", "man 2 ioctl", "man 2 lseek", "man 2 eventfd", "man 2 epoll_create1", "man 2 timerfd_create"]
 fixture = "fd-core:two-live-table owners and incarnation pins"
 scale_points = [65, 4096, 65536]
@@ -72,11 +72,13 @@ vm_free = [
   "carrick-fd-core::tests::{pipe_pair_claims_keep_two_tables_private_and_settle_once,pipe_pair_refusal_preserves_claims_and_cancel_restores_lowest_holes,growth_observation_excludes_the_segment_still_being_linked}",
   "carrick-el1-linux::native_process_runtime::host_test_support::{pipe_constructor_output_retains_both_claims_across_owner_wait,pipe_constructor_output_cancellation_reclaims_both_claims_and_endpoints}",
   "carrick-el1-linux::ipc::tests::el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem",
+  "carrick-el1-linux::aarch64_process_tests::arm_two_live_processes_dup_and_close_isolate_tables (#2904: production close_range in two live processes; each closes only its own table)",
 ]
 
 embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::root_fcntl_redirect_restore_preserves_one_description_owner",
   "carrick-cli::x86_kvm_run::mounted_root_fcntl_redirect_restore_preserves_host_description_owner",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_close_range_matches_native (#2904, #2949: close_range in the x86 root, a fork child, a CLONE_FILES thread and a worker left alone by its leader's raw exit, against native)",
   "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_root_legacy_ipc_syscalls_match_linux",
   "KVM production: carrick-vmm-kvm::cpl0_entry::serial_host_fork_child_legacy_ipc_syscalls_match_linux",
 ]

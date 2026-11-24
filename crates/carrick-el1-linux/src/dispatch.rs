@@ -5492,6 +5492,13 @@ impl<
         // same constructor and zone-description owner for the live root.
         let table = venue.tables.table_of(task);
         let ordinal = self.frame.canonical_ordinal();
+        // close_range names a range, not a descriptor: its first argument
+        // classifies nothing, and a borrowed table may mix host slots with
+        // ring objects across the range (#2949 review P0-3). It keeps the
+        // borrowed table's own route.
+        if matches!(ordinal, carrick_personality_linux::crossing::nr::CLOSE_RANGE) {
+            return NativeDescriptorNamespace::Legacy;
+        }
         let constructor = matches!(
             ordinal,
             carrick_personality_linux::crossing::nr::PIPE2
@@ -5593,33 +5600,35 @@ impl<
         Ok(Some(!close_effects.is_empty()))
     }
 
-    /// `CLOSE_RANGE_UNSHARE` (#2904). On a table no other thread shares,
-    /// the private copy Linux makes would be this same table, so the call
-    /// is a plain range (`None`: serve it). It stays unrouted
-    /// (`Some(Forward)`: a fork child's counted ENOSYS, the root's host
-    /// route) in two cases, before anything changes:
-    /// - another thread shares the table: the caller needs a successor
-    ///   table published for it alone, and the ring has no per-thread
-    ///   descriptor table yet (unshare(CLONE_FILES) is unrouted too, #2930);
-    /// - an open descriptor of the range owes host close effects: a
-    ///   `CommitOwed` replay would rerun the call with its UNSHARE flag on
-    ///   the host, which splits the host's table under the ring's.
-    fn close_range_unshare_route(
+    /// Whether the ring serves `close_range` whole (#2904): `None` serves
+    /// it; `Some(Forward)` leaves it unrouted (a counted ENOSYS for a ring
+    /// caller), decided before anything changes, in two cases:
+    /// - `CLOSE_RANGE_UNSHARE` while another thread shares the table: the
+    ///   caller needs a successor table published for it alone, and the
+    ///   ring has no per-thread descriptor table yet (unshare(CLONE_FILES)
+    ///   is unrouted too, #2930). Alone, the private copy Linux makes would
+    ///   be this same table, so the call is a plain range;
+    /// - a closing range holding an open descriptor that owes host close
+    ///   effects (record locks, an epoll registration, an inotify watch):
+    ///   only a host replay runs them, and no venue replays a range
+    ///   (#2949 review P0-4), so nothing closes.
+    fn close_range_route(
         &self,
         venue: &ipc::IpcVenue<'_>,
         table: carrick_el1_abi::ipc::fd::TableId,
         first: u32,
         last: u32,
-        cloexec: bool,
+        flags: u32,
     ) -> Option<FamilyCompletion> {
-        if self
-            .process
-            .as_deref()
-            .is_none_or(|process| process.shares_descriptor_namespace())
+        if flags & carrick_abi::LINUX_CLOSE_RANGE_UNSHARE != 0
+            && self
+                .process
+                .as_deref()
+                .is_none_or(|process| process.shares_descriptor_namespace())
         {
             return Some(FamilyCompletion::Forward);
         }
-        if cloexec {
+        if flags & carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC != 0 {
             return None;
         }
         let fds = venue.region.fd(NativeFdWait);
@@ -5661,11 +5670,12 @@ impl<
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
         }
         let cloexec = flags & carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC != 0;
-        if flags & carrick_abi::LINUX_CLOSE_RANGE_UNSHARE != 0
-            && let Some(done) = self.close_range_unshare_route(venue, table, first, last, cloexec)
-        {
+        if let Some(done) = self.close_range_route(venue, table, first, last, flags) {
             return done;
         }
+        // `owed` is only a close effect a sharer of a description added
+        // after the route's scan: the race a plain `close` answers with
+        // its replay too.
         let mut owed = false;
         let mut cursor = first;
         loop {
