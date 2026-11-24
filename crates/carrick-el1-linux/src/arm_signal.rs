@@ -262,7 +262,9 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     }
     let saved = process.resume_context();
     let Some(position) = saved.saved_syscall_pc() else {
-        return Err(super::native_process_runtime::NativeFailure::Quarantined.run_failure_reason());
+        return Err(super::native_process_runtime::NativeFailure::Quarantined
+            .run_failure_reason()
+            .at_caller());
     };
     let mut frame = alloc::boxed::Box::new(TrapFrame::default());
     frame.x = saved.native.x;

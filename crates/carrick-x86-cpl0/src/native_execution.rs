@@ -176,7 +176,9 @@ pub fn schedule(slot: SlotId) -> ! {
                                         native.gs_base,
                                         &native.xsave,
                                     )
-                                    .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?,
+                                    .map_err(|_| {
+                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
+                                    })?,
                                     carrick_guest_arch::SyscallReturnFrame::syscall_position(
                                         &frame,
                                     )
