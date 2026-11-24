@@ -948,6 +948,38 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     })
 }
 
+/// Settle `mm`'s guest COW completions now if `pool` holds any: exclude the
+/// MM's EL1 editor (waiting out an admitted one), which settles them under
+/// the exclusion, and release it. An answer to carrier work runs this for
+/// its requester's MM, so an operation retained until its MM is settled (a
+/// fork arming its parent, #2947) reruns after a settlement rather than
+/// after a bare acknowledgement.
+pub fn settle_unsettled_guest_cow(pool: Option<&carrick_el1_abi::CowGrantPool>, mm: MmId) {
+    let Some(zone) = crate::el1_zone::zone() else {
+        return;
+    };
+    settle_unsettled_guest_cow_in(
+        SpaceTables {
+            spaces: &zone.spaces,
+            occupancy: &zone.occupancy,
+            zone: Some(zone),
+            backing: None,
+        },
+        pool,
+        mm,
+    );
+}
+
+fn settle_unsettled_guest_cow_in(
+    tables: SpaceTables,
+    pool: Option<&carrick_el1_abi::CowGrantPool>,
+    mm: MmId,
+) {
+    if pool.is_some_and(|pool| pool.has_completions_for(mm.raw())) {
+        drop(exclude_el1_editor_in(tables, mm));
+    }
+}
+
 /// Run `f` under a proof that no EL1 editor of `mm` runs: `held` (the
 /// caller's own exclusion), else the proof that no published space names
 /// `mm`, else a fresh exclusion held for `f`'s duration. `None`: no proof

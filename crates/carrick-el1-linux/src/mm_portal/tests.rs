@@ -3886,7 +3886,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                     1
                 )
                 .err(),
-            Some(MmError::Busy),
+            Some(MmError::CowUnsettled),
             "an unsettled parent COW completion refuses the fork as contention"
         );
         let mut transfer = portal

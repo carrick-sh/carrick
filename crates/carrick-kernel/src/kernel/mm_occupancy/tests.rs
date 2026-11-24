@@ -824,6 +824,94 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
     drop(publication);
 }
 
+/// #2947: a fork whose parent has an unsettled guest COW completion is
+/// retained as carrier work, and the answer to that work settles the MM
+/// itself. With no completion it excludes nothing. With one, and the MM's
+/// EL1 editor held on another vCPU, the answer waits for that editor to
+/// leave and then settles under the raised gate: "not now" once, then the
+/// settlement the fork's rerun needs, with no other exclusion of the MM.
+#[test]
+fn carrier_work_answer_settles_the_requesters_unsettled_guest_cow() {
+    static POOL: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
+    const KEY: u64 = 42_311;
+    let (spaces, occupancy) = space_tables();
+    let recorder = Arc::new(RecordingSettlement {
+        spaces,
+        runs: parking_lot::Mutex::new(Vec::new()),
+    });
+    install_guest_cow_settlement(recorder.clone());
+    let ours = || -> Vec<(u64, bool)> {
+        recorder
+            .runs
+            .lock()
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key == KEY)
+            .collect()
+    };
+    let tables = move || SpaceTables {
+        spaces,
+        occupancy,
+        zone: None,
+        backing: None,
+    };
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(KEY), &mm_fence, 0x3c00).unwrap();
+
+    settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+    assert!(ours().is_empty(), "nothing unsettled: no exclusion");
+
+    let nz = |v| std::num::NonZeroU64::new(v).unwrap();
+    POOL.publish(
+        KEY,
+        0x8_0000_4000,
+        carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            frame_id: nz(10),
+            mapping_id: nz(11),
+            owner_generation: nz(12),
+            inventory_revision: nz(13),
+        },
+    )
+    .unwrap();
+    let grant = POOL.claim(KEY, 0).unwrap();
+    assert!(POOL.complete(&carrick_core_abi::CowGrantCompletion {
+        purpose: carrick_core_abi::CowGrantPurpose::UserWrite,
+        grant,
+        span_va: 0x4000_1000,
+        span_len: 0x3000,
+        old_ipa: 0x9_0000_1000,
+        new_ipa: grant.physical_ipa + 0x1000,
+        tables_linked: 0,
+    }));
+    assert!(POOL.has_completions_for(KEY));
+
+    let index = spaces.find(KEY).unwrap();
+    let editor = spaces
+        .try_begin_edit(index, KEY, nz(9))
+        .expect("a sibling's EL1 edit holds the editor");
+    let answer = std::thread::spawn(move || {
+        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+    });
+    for _ in 0..1_000_000 {
+        if spaces.gate(index) != 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        ours().is_empty(),
+        "no settlement while the sibling's editor may still complete a COW"
+    );
+    drop(editor);
+    answer.join().unwrap();
+    assert_eq!(
+        ours(),
+        vec![(KEY, true)],
+        "the answer settled the requester's MM under its own exclusion"
+    );
+    drop(publication);
+}
+
 #[test]
 fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
     let (spaces, occupancy) = space_tables();

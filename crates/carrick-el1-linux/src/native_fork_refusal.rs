@@ -100,6 +100,12 @@ impl NativeForkRefusal {
             // fresh snapshot, never EFAULT.
             NativeForkCause::Mm(MmError::ParentChanged)
             | NativeForkCause::Fork(ForkError::ParentChanged) => E::Busy,
+            // The parent's guest COW completions wait for their carrier's
+            // settlement. Retained as carrier work, whose acknowledgement
+            // settles the requester's MM first (ARM); the x86 venue rings
+            // the settlement itself and returns its editor wait instead
+            // when it met that editor held (#2947).
+            NativeForkCause::Mm(MmError::CowUnsettled) => E::Busy,
             NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
             NativeForkCause::StockReservation(R::Stale) => E::Stale,
             NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
@@ -303,6 +309,12 @@ mod tests {
             (
                 NativeForkStage::Publish,
                 NativeForkCause::Fork(ForkError::ParentChanged),
+            ),
+            // #2947: an unsettled parent COW completion is retained as
+            // carrier work, whose answer settles it.
+            (
+                NativeForkStage::Prepare,
+                NativeForkCause::Mm(MmError::CowUnsettled),
             ),
         ] {
             let error = NativeForkRefusal { stage, cause }.error();
