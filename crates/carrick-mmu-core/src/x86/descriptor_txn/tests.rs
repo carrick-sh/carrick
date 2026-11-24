@@ -625,6 +625,62 @@ fn guest_retire_refuses_host_map_leaf() {
     assert_eq!(*words.words.borrow(), before);
 }
 
+/// #1338: the unlink a shared file window munmap takes clears a host-mapped
+/// leaf and refuses a private one, which only ever retires.
+#[test]
+fn guest_unlink_clears_host_map_leaf_and_refuses_private_leaf() {
+    let words = Words::new();
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let host = PageSpan::new(0x4000, PAGE);
+    let private = PageSpan::new(0x5000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(host.va, 0x800000, PAGE, LeafSize::Page),
+            &tables
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(
+                private,
+                0x900000,
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+            ),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, DescriptorOp::Unmap(private), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(&words, DescriptorOp::Unmap(host), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(host.va))
+            .unwrap()
+            .0,
+        0
+    );
+    assert_ne!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(private.va))
+            .unwrap()
+            .0,
+        0
+    );
+}
+
 #[test]
 fn cow_classifier_names_only_the_faulting_armed_user_page() {
     let words = Words::new();
