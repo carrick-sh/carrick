@@ -1299,24 +1299,49 @@ const ZONEDUMP_SECS: u64 = 60;
 /// `census`. Best effort: a dump that fails leaves its error there, and
 /// `hang_findings` reports a dump that read no zone; a capture without a
 /// census leaves no census file, and the run reads `no_census`.
+///
+/// A carrier that predates `--census-out` (plain main before the harness
+/// lands) refuses the flag as a usage error; the dump is then retried
+/// without it, so a hung plain carrier still leaves its zone shape.
 fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path, census: &Path) {
-    let Ok(file) = std::fs::File::create(path) else {
-        return;
-    };
-    let Ok(err) = file.try_clone() else {
-        return;
-    };
-    let Ok(child) = std::process::Command::new(carrick)
-        .args(["debug", "zonedump", "--run-id", run_id, "--census-out"])
-        .arg(census)
+    let ending = zonedump_once(carrick, run_id, path, Some(census));
+    if ending.is_some_and(|ending| ending.exit_code == Some(CLAP_USAGE_EXIT))
+        && std::fs::read(path).is_ok_and(|text| refuses_census_out(&text))
+    {
+        let _ = zonedump_once(carrick, run_id, path, None);
+    }
+}
+
+/// clap's exit status for a usage error, such as an unknown argument.
+const CLAP_USAGE_EXIT: i32 = 2;
+
+/// Whether a zonedump's output is clap refusing `--census-out`.
+fn refuses_census_out(text: &[u8]) -> bool {
+    String::from_utf8_lossy(text).contains("unexpected argument '--census-out'")
+}
+
+/// One bounded `<carrick> debug zonedump --run-id <run_id> [--census-out
+/// <census>]` into `path` (truncated first); `None` if it could not start.
+fn zonedump_once(
+    carrick: &Path,
+    run_id: &str,
+    path: &Path,
+    census: Option<&Path>,
+) -> Option<Ending> {
+    let file = std::fs::File::create(path).ok()?;
+    let err = file.try_clone().ok()?;
+    let mut command = std::process::Command::new(carrick);
+    command.args(["debug", "zonedump", "--run-id", run_id]);
+    if let Some(census) = census {
+        command.arg("--census-out").arg(census);
+    }
+    let child = command
         .stdin(std::process::Stdio::null())
         .stdout(file)
         .stderr(err)
         .spawn()
-    else {
-        return;
-    };
-    let _ = wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {});
+        .ok()?;
+    wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {}).ok()
 }
 
 /// The pids of `root` and every live descendant, read from `/proc/*/stat`
