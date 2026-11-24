@@ -1134,6 +1134,7 @@ fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
     assert_eq!(access.region().unwrap().as_ptr(), address);
     let generation = custody.live_generation().unwrap();
     custody.begin_destroy(generation).unwrap();
+    custody.destroy_stage2_for_test(generation);
     custody.commit_destroy(generation).unwrap();
     assert!(matches!(
         access.region(),
@@ -1225,6 +1226,7 @@ fn cow_settlement_observes_two_exact_carrier_pools() {
     );
     let generation = a.live_generation().unwrap();
     a.begin_destroy(generation).unwrap();
+    a.destroy_stage2_for_test(generation);
     a.commit_destroy(generation).unwrap();
     assert!(first.with_pool(|_| ()).is_none());
     assert_eq!(
@@ -1237,6 +1239,7 @@ fn cow_settlement_observes_two_exact_carrier_pools() {
     assert!(first.with_pool(|_| ()).is_none());
     let generation = b.live_generation().unwrap();
     b.begin_destroy(generation).unwrap();
+    b.destroy_stage2_for_test(generation);
     b.commit_destroy(generation).unwrap();
     drop(cb);
     assert!(wb.upgrade().is_none());

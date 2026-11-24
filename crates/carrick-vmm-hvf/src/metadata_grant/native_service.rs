@@ -2269,8 +2269,8 @@ mod intake_tests {
             assert_eq!(fixture.custody.live_generation(), None);
             assert!(fixture.custody.begin_create().is_err());
             assert!(matches!(
-                fixture.custody.state.lock().lifecycle,
-                crate::trap::CarrierVmLifecycle::Destroying(_)
+                fixture.custody.stage2.lifecycle(),
+                carrick_aarch64::stage2::custody::Stage2Lifecycle::Gone(_)
             ));
         }
     }

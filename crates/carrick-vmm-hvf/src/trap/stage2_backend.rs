@@ -484,14 +484,83 @@ pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Stat
     result
 }
 
+/// The carrier's stage-2 backend, owned by its
+/// [`carrick_aarch64::stage2::custody::Stage2Custody`]: the raw destroy is
+/// reachable only through the custody's generation guard.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_destroy() -> Stage2Status {
-    // SAFETY: forwarded from this function's contract.
-    let result = unsafe { HvfStage2.destroy() };
-    if result.is_success() {
-        clear_replay_mappings();
+pub(crate) struct HvfCarrierStage2 {
+    _owned_by_custody: (),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfCarrierStage2 {
+    /// The backend for one carrier's custody; `CarrierVmCustody::new` is its
+    /// only caller.
+    pub(crate) fn custody_backend() -> Box<dyn carrick_aarch64::stage2::Stage2Backend + Send> {
+        Box::new(Self {
+            _owned_by_custody: (),
+        })
     }
-    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_aarch64::stage2::Stage2Backend for HvfCarrierStage2 {
+    unsafe fn map(
+        &self,
+        host: *mut std::ffi::c_void,
+        ipa: u64,
+        size: usize,
+        perms: carrick_hal::MemPerms,
+    ) -> Stage2Status {
+        // SAFETY: forwarded from the trait's contract.
+        unsafe {
+            inventory_stage2_map(
+                host,
+                ipa,
+                size,
+                carrick_aarch64::stage2::stage2_perms_bits(perms),
+            )
+        }
+    }
+
+    unsafe fn unmap(&self, ipa: u64, size: usize) -> Stage2Status {
+        // SAFETY: forwarded from the trait's contract.
+        unsafe { inventory_stage2_unmap(ipa, size) }
+    }
+
+    unsafe fn destroy(&self) -> Stage2Status {
+        #[cfg(test)]
+        if let Some(scripted) = SCRIPTED_STAGE2_DESTROY.with(|cell| cell.take()) {
+            if scripted.is_success() {
+                clear_replay_mappings();
+            }
+            return scripted;
+        }
+        // SAFETY: forwarded from the trait's contract.
+        let result = unsafe { HvfStage2.destroy() };
+        if result.is_success() {
+            clear_replay_mappings();
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The status the next raw destroy on this thread reports instead of
+    /// calling the hypervisor (test double for a lifecycle test's VM).
+    static SCRIPTED_STAGE2_DESTROY: std::cell::Cell<Option<Stage2Status>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn script_next_stage2_destroy(status: Stage2Status) {
+    SCRIPTED_STAGE2_DESTROY.with(|cell| cell.set(Some(status)));
+}
+
+#[cfg(test)]
+pub(crate) fn script_next_stage2_destroy_clear() {
+    SCRIPTED_STAGE2_DESTROY.with(|cell| cell.set(None));
 }
 
 #[cfg(test)]

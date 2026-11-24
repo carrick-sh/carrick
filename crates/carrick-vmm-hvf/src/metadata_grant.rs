@@ -2030,7 +2030,7 @@ fn retained_dynamic_metadata(
     len: usize,
 ) -> Option<(core::ptr::NonNull<u8>, u64, usize)> {
     let identity = custody.stage2_record_covering(address.raw(), len)?;
-    let state = custody.state.lock();
+    let state = custody.stage2.lock();
     let record = state.stage2_records.get(&identity.record_id)?;
     if record.snapshot.ipa < EL1_DYNAMIC_METADATA_BASE
         || record
@@ -3458,6 +3458,7 @@ mod tests {
         assert_eq!(unsafe { ptr.read() }, 0x5a);
         assert!(metadata_aperture(&custody).lock().is_slot_occupied(0));
         custody.begin_destroy(first).expect("retry destroy");
+        custody.destroy_stage2_for_test(first);
         custody
             .commit_destroy(first)
             .expect("successful raw VM destroy");
@@ -3747,6 +3748,7 @@ mod tests {
             .pin_extent(other_extent, b.0)
             .unwrap();
         second.begin_destroy(b).unwrap();
+        second.destroy_stage2_for_test(b);
         second.commit_destroy(b).unwrap();
         assert!(other_weak.upgrade().is_some());
         drop(surviving_pin);
@@ -3773,6 +3775,7 @@ mod tests {
         let claimed = mailbox.claim_request().unwrap();
         let incarnation = mailbox.request_generation();
         custody.begin_destroy(generation).unwrap();
+        custody.destroy_stage2_for_test(generation);
         custody.commit_destroy(generation).unwrap();
         assert!(
             complete_metadata_request(&custody, Some(generation), &mailbox, incarnation, claimed,)
@@ -3853,8 +3856,8 @@ impl carrick_hal::birth_serial::RetainedBirthZone for CarrierBirthSource {
         &self,
         op: impl FnOnce(&carrick_el1_abi::ZoneTables) -> T,
     ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
-        let state = self.custody.state.lock();
-        if !matches!(state.lifecycle, crate::trap::CarrierVmLifecycle::Live(g) if g == self.generation)
+        let state = self.custody.stage2.lock();
+        if !matches!(state.lifecycle(), carrick_aarch64::stage2::custody::Stage2Lifecycle::Live(g) if g == self.generation)
             || !self.backing.live.load(Ordering::Acquire)
         {
             return Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner);
@@ -3999,6 +4002,7 @@ mod birth_source_tests {
             .unwrap();
         assert_eq!(first.allocate(first.identity()).unwrap().get(), 104);
         first.custody.begin_destroy(first.generation).unwrap();
+        first.custody.destroy_stage2_for_test(first.generation);
         first.custody.commit_destroy(first.generation).unwrap();
         assert_eq!(
             first.allocate_mm(first.identity()),

@@ -376,8 +376,8 @@ impl PersistentCarrierMappings {
 
     pub(crate) fn mark_vm_destroyed_after_custody_commit(&self) -> Result<(), TrapError> {
         let committed = ::std::matches!(
-            self.custody.state.lock().lifecycle,
-            CarrierVmLifecycle::Vacant
+            self.custody.stage2.lifecycle(),
+            carrick_aarch64::stage2::custody::Stage2Lifecycle::Vacant
         );
         if !committed {
             return Err(TrapError::Hypervisor(
@@ -1311,10 +1311,10 @@ mod tests {
         );
         assert_eq!(
             crate_sources
-                .matches(concat!("inventory_stage2_", "destroy()"))
+                .matches(concat!("inventory_stage2_", "destroy"))
                 .count(),
-            1,
-            "inventory_stage2_destroy appears only in the custody wrapper"
+            0,
+            "the raw destroy is reached only through Stage2Custody"
         );
     }
 }
