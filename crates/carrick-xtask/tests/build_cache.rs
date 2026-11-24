@@ -646,7 +646,7 @@ esac
     passed(run("good"));
     let calls = fs::read_to_string(&log).unwrap();
     let lines: Vec<_> = calls.lines().collect();
-    assert_eq!(lines.len(), 6, "{calls}");
+    assert_eq!(lines.len(), 8, "{calls}");
     assert_eq!(
         lines[0],
         "clippy -p carrick-cli --no-default-features --features syscall-shim,platform-linux --all-targets --keep-going -- -D warnings"
@@ -669,8 +669,18 @@ esac
         lines[4],
         "clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --features test-support --keep-going -- -D warnings"
     );
+    // The EL1 ring image's own target, with and without its allocator test
+    // control: its nested image build runs without clippy-driver (#3013).
     assert_eq!(
         lines[5],
+        "clippy -p carrick-el1-linux --target aarch64-unknown-none-softfloat --bins --keep-going -- -D warnings"
+    );
+    assert_eq!(
+        lines[6],
+        "clippy -p carrick-el1-linux --target aarch64-unknown-none-softfloat --bins --features allocator-test-control --keep-going -- -D warnings"
+    );
+    assert_eq!(
+        lines[7],
         "clippy -p carrick-embed --no-default-features --features syscall-shim,platform-linux --lib --bins --examples --keep-going -- -D warnings"
     );
     for mode in ["failed", "empty", "missing"] {

@@ -286,6 +286,11 @@ clippy-linux *ARGS:
     # without clippy-driver (#3005), so this pass is that code's lint.
     {{_admit}} {{_cargo}} clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --keep-going {{ARGS}} -- -D warnings
     {{_admit}} {{_cargo}} clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --features test-support --keep-going {{ARGS}} -- -D warnings
+    # The EL1 ring image's own target, with and without its allocator test
+    # control. The image build inside carrick-el1-image's build script runs
+    # without clippy-driver (#3013), so this pass is that code's lint.
+    {{_admit}} {{_cargo}} clippy -p carrick-el1-linux --target aarch64-unknown-none-softfloat --bins --keep-going {{ARGS}} -- -D warnings
+    {{_admit}} {{_cargo}} clippy -p carrick-el1-linux --target aarch64-unknown-none-softfloat --bins --features allocator-test-control --keep-going {{ARGS}} -- -D warnings
     exec {{_admit}} {{_cargo}} clippy -p carrick-embed {{_platform_features}} --lib --bins --examples --keep-going {{ARGS}} -- -D warnings
 
 # Lint all GitHub Actions workflow files with actionlint.
