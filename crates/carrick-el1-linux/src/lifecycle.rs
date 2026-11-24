@@ -254,8 +254,11 @@ impl<
         self.clock_venue()?.realtime_counter()
     }
 
-    fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
-        self.clock_venue()?.cputime_nanos(per_thread)
+    fn cpu_clock_nanos(
+        &mut self,
+        clock: carrick_syscall_abi::LinuxCpuClock,
+    ) -> Option<Result<u64, carrick_syscall_abi::LinuxErrno>> {
+        self.clock_venue()?.cpu_clock_nanos(clock)
     }
 
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {

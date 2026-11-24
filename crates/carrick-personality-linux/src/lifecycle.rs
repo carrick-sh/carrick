@@ -280,7 +280,15 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
-    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+    /// Read one CPU-time clock through the task owner: the caller's, or the
+    /// process or thread its dynamic id names, sampled as it asks. `None`:
+    /// this venue has no CPU ledger (the call stays unrouted). `Err`: Linux's
+    /// errno for a target the caller cannot read (EINVAL for no such process,
+    /// or a thread outside the caller's thread group).
+    fn cpu_clock_nanos(
+        &mut self,
+        _clock: carrick_syscall_abi::LinuxCpuClock,
+    ) -> Option<Result<u64, carrick_syscall_abi::LinuxErrno>> {
         None
     }
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
@@ -667,7 +675,15 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn realtime_counter(&mut self) -> Option<RealtimeCounter> {
         None
     }
-    fn cputime_nanos(&mut self, _per_thread: bool) -> Option<u64> {
+    /// Read one CPU-time clock through the task owner: the caller's, or the
+    /// process or thread its dynamic id names, sampled as it asks. `None`:
+    /// this venue has no CPU ledger (the call stays unrouted). `Err`: Linux's
+    /// errno for a target the caller cannot read (EINVAL for no such process,
+    /// or a thread outside the caller's thread group).
+    fn cpu_clock_nanos(
+        &mut self,
+        _clock: carrick_syscall_abi::LinuxCpuClock,
+    ) -> Option<Result<u64, carrick_syscall_abi::LinuxErrno>> {
         None
     }
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {

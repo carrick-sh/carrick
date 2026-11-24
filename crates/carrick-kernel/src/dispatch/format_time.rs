@@ -307,7 +307,8 @@ pub(crate) fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
 
 /// The host dispatcher's reading of one clock id, classified by the shared
 /// [`carrick_abi::linux_clock_read`] the ring entries also use. A CPU clock
-/// reads the calling thread's or process's time whatever task it names.
+/// reads the task it names, sampled as it asks ([`time::cpu_clock_ns`]);
+/// `None` (EINVAL) for an id naming no task the caller can read.
 pub(crate) fn linux_clock_duration(
     clock: &crate::kernel::container::ClockDomain,
     clock_id: u64,
@@ -320,8 +321,7 @@ pub(crate) fn linux_clock_duration(
         Read::MonotonicCoarse => linux_coarse_duration(clock.monotonic_now()),
         // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
         Read::Boottime => clock.boottime_now(),
-        Read::Cpu(cpu) if cpu.per_thread => Duration::from_nanos(time::task_thread_cpu_ns()),
-        Read::Cpu(_) => Duration::from_nanos(time::task_process_cpu_ns()),
+        Read::Cpu(cpu) => Duration::from_nanos(time::cpu_clock_ns(cpu)?),
     })
 }
 

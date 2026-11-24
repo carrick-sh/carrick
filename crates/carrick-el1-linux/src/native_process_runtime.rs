@@ -9801,27 +9801,87 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         let now = self.service.signal_now().ok()?;
         Some((now, frequency))
     }
-    fn cputime_nanos(&mut self, per_thread: bool) -> Option<u64> {
+    fn cpu_clock_nanos(
+        &mut self,
+        clock: carrick_syscall_abi::LinuxCpuClock,
+    ) -> Option<Result<u64, carrick_syscall_abi::LinuxErrno>> {
+        use carrick_syscall_abi::{LINUX_EINVAL, LinuxCpuSample};
         let (frequency, now) = self.cpu_clock()?;
-        if per_thread {
-            let ticks = self
-                .source
-                .zone
-                .sample_record_cpu_ticks(self.record, Some(now));
-            let nanos = ticks.total_nanos(frequency);
-            return Some(self.source.zone.ratchet_record_cpu_ns(self.record, nanos));
-        }
         let graph = self.runtime.graph.lock();
-        let resources = graph.owner.task(self.key).ok()?.native().resources();
-        let (user, system) = resources.process_cpu_nanos(frequency, now);
-        let nanos = user.saturating_add(system);
-        Some(
-            resources
-                .cpu
-                .last_process_cpu_ns
-                .fetch_max(nanos, Ordering::AcqRel)
-                .max(nanos),
-        )
+        if clock.per_thread {
+            // A thread clock reads the caller, or a live thread of the
+            // caller's own thread group; any other tid is EINVAL natively.
+            let record = match clock.target {
+                None => self.record,
+                Some(tid) => {
+                    let caller = graph.owner.task(self.key).ok()?;
+                    match caller.native().resources().live_signal_member(
+                        self.key,
+                        caller.metadata().namespace_pid,
+                        self.source.zone,
+                        tid.get(),
+                    ) {
+                        Some((record, _)) => record,
+                        None => return Some(Err(LINUX_EINVAL)),
+                    }
+                }
+            };
+            drop(graph);
+            let zone = self.source.zone;
+            let ticks = zone.sample_record_cpu_ticks(record, Some(now));
+            return Some(Ok(match clock.sample {
+                LinuxCpuSample::Virt => ticks.user_nanos(frequency),
+                LinuxCpuSample::Prof | LinuxCpuSample::Sched => {
+                    zone.ratchet_record_cpu_ns(record, ticks.total_nanos(frequency))
+                }
+            }));
+        }
+        // A process clock names a process by its pid (a thread-group leader,
+        // live or a zombie not yet reaped); a non-leader tid is EINVAL.
+        let key = match clock.target {
+            None => self.key,
+            Some(pid) => match graph.owner.namespace_key(self.key, pid.get()).ok()? {
+                Some(key) => key,
+                None => return Some(Err(LINUX_EINVAL)),
+            },
+        };
+        let (user, system) = if let Some(task) = graph
+            .owner
+            .tasks()
+            .get(&key.id)
+            .filter(|task| task.key() == key)
+        {
+            let resources = task.native().resources();
+            let (user, system) = resources.process_cpu_nanos(frequency, now);
+            if clock.sample != LinuxCpuSample::Virt {
+                let nanos = user.saturating_add(system);
+                let nanos = resources
+                    .cpu
+                    .last_process_cpu_ns
+                    .fetch_max(nanos, Ordering::AcqRel)
+                    .max(nanos);
+                return Some(Ok(nanos));
+            }
+            (user, system)
+        } else if let Some(zombie) = graph
+            .owner
+            .zombies()
+            .get(&key.id)
+            .filter(|zombie| zombie.receipt.key == key)
+        {
+            let nanos =
+                |time: core::time::Duration| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+            (
+                nanos(zombie.receipt.rusage.user_time),
+                nanos(zombie.receipt.rusage.system_time),
+            )
+        } else {
+            return Some(Err(LINUX_EINVAL));
+        };
+        Some(Ok(match clock.sample {
+            LinuxCpuSample::Virt => user,
+            LinuxCpuSample::Prof | LinuxCpuSample::Sched => user.saturating_add(system),
+        }))
     }
     fn process_tms(&mut self) -> Option<carrick_syscall_abi::LinuxTms> {
         let (frequency, now) = self.cpu_clock()?;

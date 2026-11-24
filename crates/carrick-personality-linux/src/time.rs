@@ -4,8 +4,8 @@ use crate::abi::entry::SyscallResult;
 use crate::lifecycle::{LifecycleNative, LifecycleOutcome};
 use carrick_guest_arch::{CounterFrequency, CounterTick, UserVa};
 use carrick_syscall_abi::{
-    LINUX_CLOCK_RESOLUTION_NSEC, LINUX_EINVAL, LinuxClockRead, LinuxCpuClock, LinuxCpuSample,
-    linux_clock_read, linux_clock_resolution_ns,
+    LINUX_CLOCK_RESOLUTION_NSEC, LINUX_EINVAL, LinuxClockRead, linux_clock_read,
+    linux_clock_resolution_ns,
 };
 
 #[inline(never)]
@@ -28,80 +28,47 @@ pub(crate) fn clock_getres(native: &mut dyn LifecycleNative<'_>) -> LifecycleOut
     }
 }
 
-/// Whether the ring serves `clock_gettime` for this clock id, classified by
-/// the shared [`linux_clock_read`]. An unknown id is served (EINVAL). Only a
-/// user-time-only CPU clock is unserved: the ring accounts total CPU time.
-/// A CPU clock naming another task is decided against the caller in
-/// [`clock_gettime`].
-pub(crate) const fn serves_clock_gettime(clock: u64) -> bool {
-    !matches!(
-        linux_clock_read(clock),
-        Some(LinuxClockRead::Cpu(LinuxCpuClock {
-            sample: LinuxCpuSample::Virt,
-            ..
-        }))
-    )
-}
-
 #[inline(never)]
 fn counter_nanos(sample: CounterTick, frequency: CounterFrequency) -> u64 {
     (u128::from(sample.raw()) * 1_000_000_000 / u128::from(frequency.raw().get())) as u64
 }
 
-/// Whether a CPU clock names the caller. A dynamic id may name the calling
-/// thread by tid, or its process by pid; any other task's clock (or a task
-/// that does not exist, EINVAL natively) is not the ring's to read yet.
-fn names_caller(native: &dyn LifecycleNative<'_>, cpu: LinuxCpuClock) -> bool {
-    let Some(target) = cpu.target else {
-        return true;
-    };
-    let own = if cpu.per_thread {
-        native.visible_tid()
-    } else {
-        native.process_pid()
-    };
-    own == Some(target.get())
-}
-
 /// `clock_gettime(2)` for every clock id, in ring. Linux rejects an unknown
-/// id with EINVAL before it touches the output, then faults a bad output
-/// with EFAULT. The counter clocks read the guest counter (the epoch the
-/// vDSO uses); BOOTTIME reads it too, since a guest never suspends apart from
-/// its counter. The wall clocks add the carrier's ring-published realtime
-/// calibration, the same word the vDSO adds.
+/// id, and a CPU clock naming no task it can read, with EINVAL before it
+/// touches the output, then faults a bad output with EFAULT. The counter
+/// clocks read the guest counter (the epoch the vDSO uses); BOOTTIME reads it
+/// too, since a guest never suspends apart from its counter. The wall clocks
+/// add the carrier's ring-published realtime calibration, the same word the
+/// vDSO adds. A CPU clock is resolved by the venue's task owner
+/// ([`LifecycleNative::cpu_clock_nanos`]).
 #[inline(never)]
 pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<LifecycleOutcome> {
     use carrick_syscall_abi::LINUX_EFAULT;
 
     let [clock, output, ..] = native.arguments();
-    if !serves_clock_gettime(clock) {
-        return None;
-    }
-    let Some(read) = linux_clock_read(clock) else {
-        return Some(LifecycleOutcome::Returned {
-            result: SyscallResult::from_errno(LINUX_EINVAL),
+    let refuse = |errno| {
+        Some(LifecycleOutcome::Returned {
+            result: SyscallResult::from_errno(errno),
             work: false,
-        });
+        })
     };
-    if let LinuxClockRead::Cpu(cpu) = read
-        && !names_caller(native, cpu)
-    {
-        return None;
-    }
-    if output == 0 {
-        return Some(LifecycleOutcome::Returned {
-            result: SyscallResult::from_errno(LINUX_EFAULT),
-            work: false,
-        });
-    }
+    let Some(read) = linux_clock_read(clock) else {
+        return refuse(LINUX_EINVAL);
+    };
     let coarse = |nanos: u64| nanos - nanos % LINUX_CLOCK_RESOLUTION_NSEC as u64;
     let nanos = match read {
         LinuxClockRead::Realtime => realtime_nanos(native)?,
         LinuxClockRead::RealtimeCoarse => coarse(realtime_nanos(native)?),
         LinuxClockRead::Monotonic | LinuxClockRead::Boottime => monotonic_nanos(native)?,
         LinuxClockRead::MonotonicCoarse => coarse(monotonic_nanos(native)?),
-        LinuxClockRead::Cpu(cpu) => native.cputime_nanos(cpu.per_thread)?,
+        LinuxClockRead::Cpu(cpu) => match native.cpu_clock_nanos(cpu)? {
+            Ok(nanos) => nanos,
+            Err(errno) => return refuse(errno),
+        },
     };
+    if output == 0 {
+        return refuse(LINUX_EFAULT);
+    }
     Some(native.finish_signal_output(
         UserVa::new(output),
         crate::sleep::timespec_bytes(nanos).to_vec(),

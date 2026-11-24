@@ -2067,9 +2067,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     let owned_yield = family == Family::Sched(SchedCall::Yield);
     let owned_clock = matches!(
         family,
-        Family::ClockGetres | Family::RealtimeAlias | Family::Times
-    ) || (family == Family::ClockGettime
-        && crate::time::serves_clock_gettime(original_argument0));
+        Family::ClockGetres | Family::ClockGettime | Family::RealtimeAlias | Family::Times
+    );
     // Allocator control has no host implementation: replaying it on the host
     // returns ENOSYS. Serve it in ring so a metadata capacity miss enrolls on
     // the request wait queue and a completed step settles pending work via
