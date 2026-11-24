@@ -4729,6 +4729,13 @@
     {
       "family": "global_carrier_infra",
       "operation": "global:static",
+      "owner": "carrick_vfs::host_size::WINDOWED",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "global_carrier_infra",
+      "operation": "global:static",
       "owner": "carrick_vfs::layer_cache::reflink_or_copy_file::FALLBACK_FLAGGED",
       "lane": "shared",
       "ceiling": 1
@@ -5241,6 +5248,13 @@
       "family": "global_carrier_infra",
       "operation": "global:thread_local",
       "owner": "carrick_vfs::fs_backend::EXCLUSIVE_ARCHIVE_GATES",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "global_carrier_infra",
+      "operation": "global:thread_local",
+      "owner": "carrick_vfs::host_size::REFUSED",
       "lane": "shared",
       "ceiling": 1
     },
@@ -34082,7 +34096,7 @@
       "operation": "write_for_io",
       "owner": "carrick_kernel::dispatch::fs::proc_synthetic::FsView<'a>::reopen_proc_self_fd",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 2
     },
     {
       "family": "k1_create_install",
