@@ -3339,6 +3339,10 @@ pub struct Counters {
     /// commit, source, ordinal, PC, slot, `binding[4]`, `arguments[6]`, syndrome.
     pub syscall_frames: [[AtomicU64; 16]; 32],
     pub syscall_frame_slots: AtomicU64,
+    /// Contended user faults that parked on the key their probe named when
+    /// that key belongs to another cause than the one that first refused the
+    /// fault: the holder changed between the refusal and the probe (#2763).
+    pub fault_parks_on_probed_cause: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3373,6 +3377,7 @@ impl Counters {
             copy_refusal_slots: AtomicU64::new(0),
             syscall_frames: [const { [const { AtomicU64::new(0) }; 16] }; 32],
             syscall_frame_slots: AtomicU64::new(0),
+            fault_parks_on_probed_cause: AtomicU64::new(0),
         }
     }
 
@@ -3444,6 +3449,10 @@ impl Counters {
                 }));
             }
         }
+        snapshot.fault_parks_on_probed_cause.store(
+            self.fault_parks_on_probed_cause.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         snapshot
     }
 

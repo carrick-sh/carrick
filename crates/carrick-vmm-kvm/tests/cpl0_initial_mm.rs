@@ -7681,12 +7681,15 @@ reservation_shape_witness!(
 /// CPU spun with interrupts masked and never acknowledged its sibling's TLB
 /// shootdown, and the sender's CPL0 kernel died at the fatal port (`0xcc`).
 ///
-/// Scoped to that claim: each run must end without a CPL0 kernel fatal. A run
-/// may still end on a host-owner refusal (#2766) or with a returned errno;
-/// the full contract is the ignored test below.
+/// Scoped to that claim: the path must be taken (some fault parks on the key
+/// its probe named for another cause, counted by the ring as
+/// `fault_parks_on_probed_cause`), and each run must end without a CPL0
+/// kernel fatal. A run may still end on a host-owner refusal (#2766) or with
+/// a returned errno; the full contract is the ignored test below.
 #[test]
 fn native_child_threaded_mm_faults_acknowledge_every_shootdown() {
     let elf = native_exit_fixture_with_flags("native_child_threaded_mm.S", &["-DKEEP_CHURNING"]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
     let cpl0_fatal = |text: &str| {
         [
             "port 0xcc",
@@ -7697,25 +7700,44 @@ fn native_child_threaded_mm_faults_acknowledge_every_shootdown() {
         .iter()
         .any(|needle| text.contains(needle))
     };
-    let endings: Vec<String> = (0..3)
+    let probed_parks = |physical: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory| {
+        physical
+            .syscall_counters()
+            .expect("counters")
+            .fault_parks_on_probed_cause
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    let endings: Vec<(String, u64)> = (0..3)
         .map(|_| {
-            match try_run_pool_fixture_with_root_affinity(
-                &elf,
+            match kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+                &program,
                 1 << 20,
                 kvm_pool_fixture::ROOT_AFFINITY_ANY,
+                |_| {},
             ) {
-                Ok(outcome) => format!(
-                    "exit {} signal {:?}",
-                    outcome.run.exit_code, outcome.run.terminating_signal
+                Ok(outcome) => (
+                    format!(
+                        "exit {} signal {:?}",
+                        outcome.run.exit_code, outcome.run.terminating_signal
+                    ),
+                    probed_parks(&outcome.physical),
                 ),
-                Err(error) => format!("{error:?}"),
+                Err(failure) => (
+                    format!("{:?}", failure.error),
+                    failure.physical.as_deref().map_or(0, probed_parks),
+                ),
             }
         })
         .collect();
-    eprintln!("#2763 threaded mm endings: {endings:?}");
+    eprintln!("#2763 threaded mm endings (ending, probed-cause parks): {endings:?}");
     assert!(
-        !endings.iter().any(|ending| cpl0_fatal(ending)),
+        !endings.iter().any(|(ending, _)| cpl0_fatal(ending)),
         "a run ended in a CPL0 kernel fatal (an unacknowledged shootdown is #2763): {endings:?}"
+    );
+    assert!(
+        endings.iter().map(|(_, parks)| parks).sum::<u64>() > 0,
+        "no fault parked on a probed cause other than its refusal's, so the #2763 path was \
+         never taken: {endings:?}"
     );
 }
 
