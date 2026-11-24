@@ -99,3 +99,13 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     )
     .unwrap();
 }
+#[test]
+fn retire_child_keeps_a_shared_file_window_slot_for_the_run() {
+    carrick_test_support::require_kvm!();
+    test_support::retire_child_keeps_a_shared_file_window_slot_for_the_run(real_memory_io);
+}
+#[test]
+fn forked_shared_file_window_leaf_is_never_an_inventoried_frame() {
+    carrick_test_support::require_kvm!();
+    test_support::forked_shared_file_window_leaf_is_never_an_inventoried_frame(real_memory_io);
+}

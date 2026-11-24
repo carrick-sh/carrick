@@ -441,6 +441,11 @@ impl Vfs for BindVfs {
         (rc == 0).then(|| real_stat_from_host(&host, &st, !follow))
     }
 
+    fn host_inode_identity(&self, path: &str) -> Option<super::InodeIdentity> {
+        let meta = std::fs::metadata(self.to_host(path).ok()?).ok()?;
+        Some(super::InodeIdentity::new(meta.dev(), meta.ino()))
+    }
+
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
         let host = self.to_host(path)?;
         std::fs::read_link(&host).map_err(map_io_error)
@@ -571,7 +576,10 @@ impl Vfs for BindVfs {
         let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
         let cpath = CString::new(host.to_string_lossy().as_ref()).map_err(|_| LINUX_EINVAL)?;
         // SAFETY: host path as NUL-terminated string
-        let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int) };
+        // An O_TRUNC open goes through the host size door (#1338 A1).
+        let host_fd = crate::host_size::open_truncating(host_flags, |host_flags| unsafe {
+            libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int)
+        });
         if host_fd < 0 {
             return Err(host_open_errno());
         }
@@ -786,9 +794,13 @@ impl Vfs for BindVfs {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .open(&host)
             .map_err(map_io_error)?;
+        // Emptied through the host size door (#1338 A1).
+        if crate::host_size::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&file), 0) != 0 {
+            return Err(map_io_error(std::io::Error::last_os_error()));
+        }
         self.publish_namespace();
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
@@ -883,7 +895,12 @@ impl Vfs for BindVfs {
             .write(true)
             .open(&host)
             .map_err(map_io_error)?;
-        file.set_len(len).map_err(map_io_error)
+        // Through the host size door, on the object opened (#1338 A1).
+        let len = libc::off_t::try_from(len).map_err(|_| carrick_abi::LINUX_EFBIG)?;
+        if crate::host_size::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&file), len) != 0 {
+            return Err(map_io_error(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

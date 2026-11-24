@@ -1678,7 +1678,10 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
         .overlay
         .set_file_contents(PATH, Vec::new())
         .expect("create shared overlay inode");
-    let install_snapshot = |fd| {
+    // The mapper's description is read-only: a writable shared mapping of a
+    // file with no live host view is fenced (#1338 C1), while a read-only
+    // one keeps the snapshot this test pins.
+    let install_snapshot = |fd, access| {
         dispatcher
             .captured_file_table()
             .write_open_files(None)
@@ -1686,7 +1689,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
                 fd,
                 OpenFile::from_open_description_with_status_flags(
                     std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                        base: OpenDescriptionBase::new(access),
                         path: PATH.into(),
                         metadata: RootFsMetadata {
                             path: PATH.into(),
@@ -1696,15 +1699,15 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
                         },
                         contents: FileContents::dense(Vec::new()),
                         offset: 0,
-                        writable: true,
+                        writable: access == crate::linux_abi::LINUX_O_RDWR,
                     })),
-                    crate::linux_abi::LINUX_O_RDWR,
+                    access,
                     0,
                 ),
             );
     };
-    install_snapshot(WRITER_FD);
-    install_snapshot(MAPPER_FD);
+    install_snapshot(WRITER_FD, crate::linux_abi::LINUX_O_RDWR);
+    install_snapshot(MAPPER_FD, crate::linux_abi::LINUX_O_RDONLY);
 
     let registry =
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1299));
@@ -1773,7 +1776,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
             SyscallArgs([
                 0,
                 FILE_LEN,
-                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_PROT_READ,
                 LINUX_MAP_SHARED,
                 MAPPER_FD as u64,
                 0,
@@ -8332,4 +8335,209 @@ fn private_file_mmap_self_held_gate_is_an_invariant_only_with_custody() {
     assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
     drop(held);
     spaces.lower(index);
+}
+
+/// #1338 C1: a `MAP_SHARED` mapping of a regular file that the live host-file
+/// alias does not take must never become a private snapshot while its
+/// description can store to the file: the snapshot drops every write at
+/// munmap. Driven through the dispatcher's own syscall entry, one row per
+/// description kind and shape. A file the mapping can never write, and the
+/// devices and rings whose snapshot is their whole contract, keep today's
+/// route; the live alias keeps serving the in-EOF shape.
+#[test]
+fn shared_file_mmap_without_a_live_view_is_fenced_by_description_kind() {
+    use std::os::fd::IntoRawFd;
+    const SYS_MMAP: u64 = 222;
+    const PAGE: u64 = 16 * 1024;
+    const FD: i32 = 31;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        HostFile,
+        OverlayFile,
+        DevZero,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        Fenced,
+        Snapshot,
+        LiveAlias,
+    }
+    // (row, kind, guest access mode, mmap flags, prot, map length, expected)
+    let rw = LINUX_PROT_READ | LINUX_PROT_WRITE;
+    let rows = [
+        (
+            "host file, MAP_FIXED, writable",
+            Kind::HostFile,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED | LINUX_MAP_FIXED,
+            rw,
+            PAGE,
+            Expect::Fenced,
+        ),
+        (
+            "host file, MAP_POPULATE|MAP_FIXED, read on an O_RDWR fd",
+            Kind::HostFile,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED | crate::linux_abi::LINUX_MAP_POPULATE | LINUX_MAP_FIXED,
+            LINUX_PROT_READ,
+            PAGE,
+            Expect::Fenced,
+        ),
+        (
+            "host file, past EOF, writable",
+            Kind::HostFile,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED,
+            rw,
+            2 * PAGE,
+            Expect::Fenced,
+        ),
+        (
+            "overlay file with no host view, writable",
+            Kind::OverlayFile,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED,
+            rw,
+            PAGE,
+            Expect::Fenced,
+        ),
+        (
+            "host file, MAP_FIXED, read-only description",
+            Kind::HostFile,
+            crate::linux_abi::LINUX_O_RDONLY,
+            LINUX_MAP_SHARED | LINUX_MAP_FIXED,
+            LINUX_PROT_READ,
+            PAGE,
+            Expect::Snapshot,
+        ),
+        (
+            "/dev/zero, writable",
+            Kind::DevZero,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED,
+            rw,
+            PAGE,
+            Expect::Snapshot,
+        ),
+        (
+            "host file, in EOF, writable",
+            Kind::HostFile,
+            crate::linux_abi::LINUX_O_RDWR,
+            LINUX_MAP_SHARED,
+            rw,
+            PAGE,
+            Expect::LiveAlias,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, kind, access, flags, prot, length, expect) in rows {
+        let dispatcher = native16k_dispatcher();
+        let description = match kind {
+            Kind::HostFile => {
+                let host_file = tempfile::tempfile().expect("host file");
+                host_file.set_len(PAGE).expect("host file length");
+                let host_fd = host_file.into_raw_fd();
+                assert!(host_fd >= 0);
+                OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(access),
+                    host_fd: HostFdRef::with_private_file_source(
+                        host_fd,
+                        carrick_guest_mem::PrivateFileSource::Mutable,
+                    ),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/shared-window"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: PAGE as usize,
+                    },
+                    writable: access == crate::linux_abi::LINUX_O_RDWR,
+                }
+            }
+            Kind::OverlayFile => OpenDescription::File {
+                base: OpenDescriptionBase::new(access),
+                path: "/overlay-window".into(),
+                metadata: RootFsMetadata {
+                    path: "/overlay-window".into(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o600,
+                    size: PAGE as usize,
+                },
+                contents: FileContents::dense(vec![0; PAGE as usize]),
+                offset: 0,
+                writable: access == crate::linux_abi::LINUX_O_RDWR,
+            },
+            Kind::DevZero => OpenDescription::SyntheticDevice {
+                base: OpenDescriptionBase::new(access),
+                kind: carrick_vfs::SyntheticDeviceKind::Zero,
+            },
+        };
+        let open_file = OpenFile::from_open_description_with_status_flags(
+            std::sync::Arc::new(parking_lot::RwLock::new(description)),
+            access,
+            0,
+        );
+        open_file.description.retain_fd_ref();
+        dispatcher
+            .captured_file_table()
+            .write_open_files(None)
+            .insert(FD, open_file);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1338));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(crate::memory::LINUX_MMAP_BASE, 8 * PAGE as usize);
+        let address = if flags & LINUX_MAP_FIXED != 0 {
+            crate::memory::LINUX_MMAP_BASE + 2 * PAGE
+        } else {
+            0
+        };
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([address, length, prot, flags, FD as u64, 0]),
+            ),
+        );
+        let reason_recorded = reporter
+            .snapshot()
+            .partial_syscalls
+            .iter()
+            .any(|entry| entry.name == "mmap" && entry.reason.contains("no live host view"));
+        let held = match expect {
+            Expect::Fenced => {
+                outcome
+                    == DispatchOutcome::Errno {
+                        errno: LINUX_ENOSYS,
+                    }
+                    && reason_recorded
+            }
+            Expect::Snapshot => matches!(
+                outcome,
+                DispatchOutcome::Returned { .. }
+                    | DispatchOutcome::MapHostAlias {
+                        backing: HostAliasBacking::Anonymous { .. },
+                        ..
+                    }
+            ),
+            Expect::LiveAlias => matches!(
+                outcome,
+                DispatchOutcome::MapHostAlias {
+                    backing: HostAliasBacking::File { .. },
+                    ..
+                }
+            ),
+        };
+        if !held {
+            failures.push(format!(
+                "{row}: expected {expect:?} (counted: {reason_recorded}), got {outcome:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "shared file mmap routes by description kind:\n{}",
+        failures.join("\n")
+    );
 }

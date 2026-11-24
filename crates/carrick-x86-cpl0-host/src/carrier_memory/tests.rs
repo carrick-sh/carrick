@@ -181,3 +181,94 @@ fn ipc_memslots_retain_original_authority_without_copying() {
         "VM destruction releases authority"
     );
 }
+
+/// #1338 step 2: a host-file window extent is the file's page cache, not a
+/// copy. A store through the carrier's view is the file's byte at once (no
+/// write-back), a host write is visible through the view, the memslot
+/// projects the mapping itself, and the extent refuses private
+/// initialization.
+#[test]
+fn host_file_window_extent_shares_the_file_page_cache() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+    let path = std::env::temp_dir().join(format!(
+        "carrick-host-file-window-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file.set_len(2 * PAGE).unwrap();
+    file.write_all_at(b"from-the-host", PAGE).unwrap();
+
+    let base = FrameGpa::new(0x3_0000_0000);
+    let mut extent =
+        BackingExtent::host_file_window(base, file.as_fd(), PAGE, PAGE as usize).unwrap();
+    assert_eq!(
+        extent.read_unpublished(base.raw(), 13).unwrap(),
+        b"from-the-host",
+        "the window starts at its file offset"
+    );
+    let view = extent.ptr(base.raw() + 64, 5).unwrap();
+    // SAFETY: the extent owns this live shared mapping of 5 bytes at +64.
+    unsafe { core::ptr::copy_nonoverlapping(b"guest".as_ptr(), view, 5) };
+    let mut stored = [0; 5];
+    file.read_exact_at(&mut stored, PAGE + 64).unwrap();
+    assert_eq!(
+        &stored, b"guest",
+        "a store is the file's byte, with no write-back"
+    );
+    file.write_all_at(b"again", PAGE + 128).unwrap();
+    assert_eq!(
+        extent.read_unpublished(base.raw() + 128, 5).unwrap(),
+        b"again"
+    );
+    assert!(
+        extent.initialize(0, b"x").is_err(),
+        "a host-file window is never private RAM"
+    );
+    assert!(BackingExtent::host_file_window(base, file.as_fd(), 1, PAGE as usize).is_err());
+
+    let host = extent.host_base().unwrap();
+    let serial = NonZeroU64::new(7).unwrap();
+    let backing = PreparedBacking {
+        extent: Arc::new(extent),
+        identity: BackingIdentity {
+            frame_id: serial,
+            mapping_id: serial,
+            owner_generation: serial,
+            inventory_revision: serial,
+        },
+    };
+    let mut memory = CarrierMemory::new(TestMemoryIo::default()).unwrap();
+    let handle = memory.install(std::slice::from_ref(&backing)).unwrap()[0];
+    let region = memory.vm.regions.lock().unwrap()[&handle.slot_index()];
+    assert_eq!(region.guest_phys_addr, base.raw());
+    assert_eq!(region.memory_size, PAGE);
+    assert_eq!(
+        region.userspace_addr,
+        host.raw() as u64,
+        "the slot is the mapping"
+    );
+    assert!(
+        memory.share(handle).is_ok(),
+        "a window is shareable guest data"
+    );
+}
+#[test]
+fn retire_child_keeps_a_shared_file_window_slot_for_the_run() {
+    test_support::retire_child_keeps_a_shared_file_window_slot_for_the_run(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
+fn forked_shared_file_window_leaf_is_never_an_inventoried_frame() {
+    test_support::forked_shared_file_window_leaf_is_never_an_inventoried_frame(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}

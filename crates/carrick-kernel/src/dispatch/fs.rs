@@ -1682,6 +1682,8 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(errno));
         }
+        // A shrink of a file a shared file window maps is refused by the
+        // host size door on the descriptor the rootfs truncates (#1338 A1).
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
         // is materialised on the cap-std scratch under --fs host, so this
         // works for both rootfs and guest-created files. MemoryBackend has no
@@ -1689,6 +1691,24 @@ impl<'a> FsView<'a> {
         match self.fs.rootfs_vfs.truncate_path(&resolved, length as u64) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
+        }
+    }
+
+    /// Whether a materialized description's writeback by `path` must be
+    /// refused (#1338 A1): it rewrites the host file from its own copy,
+    /// truncating it first, so it is refused whenever a shared file window
+    /// maps the file, whatever the new size. The writeback goes to the
+    /// rootfs, so the identity is the rootfs object at `path`, the one it
+    /// would rewrite; the host size door refuses the rewrite itself as
+    /// well, on the descriptor it opens. Checked first so neither copy
+    /// changes. An unreadable identity is refused while any window exists.
+    pub(in crate::dispatch) fn materialized_writeback_fenced(&self, path: &str) -> bool {
+        if !carrick_vfs::host_size::any_window() {
+            return false;
+        }
+        match self.fs.rootfs_vfs.path_inode_identity(path) {
+            Some(identity) => carrick_vfs::host_size::maps(identity),
+            None => !matches!(self.layered_metadata(path), Err(LINUX_ENOENT)),
         }
     }
 
@@ -2256,6 +2276,12 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    // Its writeback rewrites the host file by path from this
+                    // copy: refused while a shared file window maps the file
+                    // (#1338 A1).
+                    if !is_anon_overlay_path(path) && this.materialized_writeback_fenced(path) {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                    }
                     // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
                     // blocked only by F_SEAL_GROW when it extends the file —
                     // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
@@ -2348,10 +2374,43 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    // A hole punch or a collapse discards a window's pages
+                    // under its live leaves: the host size door refuses it on
+                    // this descriptor before the host applies it (#1338 A1).
+                    let discard = if mode
+                        & (LINUX_FALLOC_FL_PUNCH_HOLE | carrick_abi::LINUX_FALLOC_FL_COLLAPSE_RANGE)
+                        != 0
+                    {
+                        use std::os::fd::AsFd as _;
+                        match carrick_vfs::host_size::admit(
+                            host_fd.as_fd(),
+                            carrick_vfs::host_size::Change::Discard,
+                        ) {
+                            Ok(change) => Some(change),
+                            Err(carrick_vfs::host_size::Fenced) => {
+                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
-                        if let Err(errno) =
-                            rw::punch_host_file_hole(host_fd.raw(), offset as u64, length as u64)
-                        {
+                        let punched = match discard {
+                            Some(change) => change.apply(|fd| {
+                                use std::os::fd::AsRawFd as _;
+                                rw::punch_host_file_hole(
+                                    fd.as_raw_fd(),
+                                    offset as u64,
+                                    length as u64,
+                                )
+                            }),
+                            None => rw::punch_host_file_hole(
+                                host_fd.raw(),
+                                offset as u64,
+                                length as u64,
+                            ),
+                        };
+                        if let Err(errno) = punched {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                     } else if grow {
@@ -2362,9 +2421,11 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                         if new_size > st.st_size as u64 {
-                            if let Err(errno) =
-                                (unsafe { libc::ftruncate(host_fd.raw(), new_size as libc::off_t) })
-                                    .host_syscall_errno()
+                            if let Err(errno) = carrick_vfs::host_size::ftruncate(
+                                host_fd.raw(),
+                                new_size as libc::off_t,
+                            )
+                            .host_syscall_errno()
                             {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
@@ -2460,6 +2521,12 @@ impl<'a> FsView<'a> {
                         // (handled by open_file→None above).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
+                    // Its writeback rewrites the host file by path from this
+                    // copy: refused while a shared file window maps the file
+                    // (#1338 A1).
+                    if !is_anon_overlay_path(path) && this.materialized_writeback_fenced(path) {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                    }
                     if !contents.accepts_len(length as u64) {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
@@ -2532,9 +2599,11 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     // Real fd: ftruncate the kernel file directly (the
-                    // change is visible across fork).
+                    // change is visible across fork), through the host size
+                    // door: a shrink of a file a shared file window maps is
+                    // a counted ENOSYS before the host applies it (#1338 A1).
                     if let Err(errno) =
-                        (unsafe { libc::ftruncate(host_fd.raw(), length as libc::off_t) })
+                        carrick_vfs::host_size::ftruncate(host_fd.raw(), length as libc::off_t)
                             .host_syscall_errno()
                     {
                         return Ok(DispatchOutcome::errno(errno));

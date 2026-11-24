@@ -178,6 +178,20 @@ impl carrick_hal::fork_stock::HostBackingRetention for HostBackingLease {
         }
         Ok(snapshot.bytes)
     }
+    fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+        let PrivateFileBacking::Description(reference) = &self.0.source else {
+            return None;
+        };
+        reference
+            .description()
+            .inspect_kind(|open| match open {
+                crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
+                    std::os::fd::AsFd::as_fd(host_fd).try_clone_to_owned().ok()
+                }
+                _ => None,
+            })
+            .flatten()
+    }
 }
 impl Drop for Record {
     fn drop(&mut self) {

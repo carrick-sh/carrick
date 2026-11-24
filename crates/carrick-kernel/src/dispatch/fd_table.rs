@@ -1032,7 +1032,8 @@ impl FileContents {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
                 let off = libc::off_t::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
-                let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), off) };
+                // Through the host size door (#1338 A1).
+                let ret = carrick_vfs::host_size::ftruncate(fd.as_raw_fd(), off);
                 if ret != 0 {
                     let errno = std::io::Error::last_os_error()
                         .raw_os_error()
@@ -1801,7 +1802,7 @@ impl HostFdRef {
         self.owner.private_file_source
     }
 
-    pub(super) fn inode_identity(&self) -> Option<carrick_vfs::vfs::InodeIdentity> {
+    pub(crate) fn inode_identity(&self) -> Option<carrick_vfs::vfs::InodeIdentity> {
         if let Some(identity) = self.owner.inode_identity.get() {
             return Some(*identity);
         }
@@ -4693,6 +4694,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trunc_outcome, DispatchOutcome::errno(LINUX_EINVAL));
+    }
+
+    /// #1338 A1 / #2978: a materialized description writes its own copy
+    /// back over the file by path (truncating it first), so while a shared
+    /// file window maps the file, its ftruncate and its allocating
+    /// fallocate are a counted ENOSYS before either copy changes, whatever
+    /// the new size. A description of a file no window maps resizes as
+    /// before. Red before: both were served and the writeback rewrote the
+    /// windowed file.
+    #[test]
+    fn materialized_writeback_of_a_windowed_file_is_fenced() {
+        const SYS_FALLOCATE: u64 = 47;
+        // `--fs host`: the files are host inodes, as a window's are.
+        let scratch = tempfile::tempdir().unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap(),
+        ));
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let reporter = CompatReporter::default();
+        let install = |dispatcher: &mut SyscallDispatcher, path: &str| {
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .set_file_contents(path, vec![0x42; 8192])
+                .unwrap();
+            let desc = OpenDescription::File {
+                path: path.to_string(),
+                contents: FileContents::dense(vec![0x42; 8192]),
+                offset: 0,
+                writable: true,
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(path),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 8192,
+                },
+                base: OpenDescriptionBase::new(0),
+            };
+            match dispatcher.install_fd(desc, 0) {
+                DispatchOutcome::Returned { value } => value as u64,
+                other => panic!("install_fd failed: {other:?}"),
+            }
+        };
+        let windowed = install(&mut dispatcher, "/windowed");
+        let plain = install(&mut dispatcher, "/plain");
+        let identity = dispatcher
+            .fs
+            .rootfs_vfs
+            .path_inode_identity("/windowed")
+            .expect("rootfs inode");
+        assert_ne!(
+            Some(identity),
+            dispatcher.fs.rootfs_vfs.path_inode_identity("/plain")
+        );
+        let pin = std::fs::File::open(scratch.path().join("windowed")).unwrap();
+        assert_eq!(
+            carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)),
+            Some(identity)
+        );
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let mut call = |nr: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(nr, SyscallArgs(args)),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+        };
+        for length in [4096, 8192, 12288] {
+            assert_eq!(
+                call(SYS_FTRUNCATE, [windowed, length, 0, 0, 0, 0]),
+                DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS),
+                "ftruncate to {length}"
+            );
+        }
+        assert_eq!(
+            call(SYS_FALLOCATE, [windowed, 0, 0, 16384, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_eq!(
+            call(SYS_FTRUNCATE, [plain, 4096, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path().join("windowed"))
+                .unwrap()
+                .len(),
+            8192,
+            "the windowed file keeps its size"
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path().join("plain"))
+                .unwrap()
+                .len(),
+            4096
+        );
     }
 
     #[test]

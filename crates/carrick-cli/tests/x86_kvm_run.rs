@@ -876,6 +876,377 @@ fn mounted_static_x86_exec_child_member_reads_a_host_file() {
     );
 }
 
+/// Rows of the shared file write oracle that belong to another mechanism,
+/// each with its own ignored witness: `MAP_SHARED` of `/dev/zero` (#2958),
+/// `msync` of a window (#1338 A3, with the shrink revoke) and the window's
+/// `/proc/self/maps` line (the open itself is ENOSYS on x86, #2808).
+const SHARED_FILE_WRITE_GAPS: [&str; 3] = [" dev_zero_", "_msync ", "_maps_rw_s "];
+
+/// The shared file write oracle's rows, native and guest.
+struct SharedFileWriteRows {
+    native: String,
+    guest: String,
+    guest_status: Option<i32>,
+    guest_stderr: String,
+}
+
+impl SharedFileWriteRows {
+    /// The rows of `rows` that `gap` names, or with `None` the rows no gap
+    /// names.
+    fn select(rows: &str, gap: Option<&str>) -> String {
+        rows.lines()
+            .filter(|line| match gap {
+                Some(gap) => line.contains(gap),
+                None => !SHARED_FILE_WRITE_GAPS.iter().any(|gap| line.contains(gap)),
+            })
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+    fn assert_matches(&self, gap: Option<&str>) {
+        assert_eq!(
+            Self::select(&self.guest, gap),
+            Self::select(&self.native, gap),
+            "exit {:?} (95: the child failed). Stderr: {}",
+            self.guest_status,
+            self.guest_stderr
+        );
+    }
+}
+
+fn shared_file_write_rows() -> Option<SharedFileWriteRows> {
+    if skip_without_kvm() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("shared-file-write");
+    compile_assembly_with_flags(
+        "x86_shared_file_write.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native shared-file-write oracle");
+    let native_rows = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        native.status.code(),
+        Some(7),
+        "native oracle: {native_rows}"
+    );
+    assert!(
+        native_rows.lines().count() == 62 && !native_rows.contains("BAD"),
+        "native Linux keeps every written byte: {native_rows}"
+    );
+    let guest = run_mounted_binary(&elf, "shared-file-write", false);
+    Some(SharedFileWriteRows {
+        native: native_rows,
+        guest: String::from_utf8_lossy(&guest.stdout).into_owned(),
+        guest_status: guest.status.code(),
+        guest_stderr: String::from_utf8_lossy(&guest.stderr).into_owned(),
+    })
+}
+
+/// #1338 step 2: the Go linker maps its output file `PROT_READ|PROT_WRITE`
+/// `MAP_SHARED`, writes it in place, unmaps it with no `msync`, grows it and
+/// maps it again; another description then reads the file. A parent and a
+/// forked child also share one writable file mapping while both live. The
+/// root and a forked child must report the native rows: every byte written
+/// through a mapping is in the file and in the other process's mapping.
+/// The rows [`SHARED_FILE_WRITE_GAPS`] names have their own witnesses.
+#[test]
+fn mounted_static_x86_writable_shared_file_mapping_matches_native() {
+    let Some(rows) = shared_file_write_rows() else {
+        return;
+    };
+    rows.assert_matches(None);
+    assert_eq!(rows.guest_status, Some(7));
+}
+
+/// #2958: a `MAP_SHARED` mapping of `/dev/zero` is shared anonymous memory
+/// a forked child writes and its parent reads. A known gap, outside the
+/// shared file window (#1338).
+#[test]
+#[ignore = "MAP_SHARED of /dev/zero is unserved on x86, see #2958"]
+fn mounted_static_x86_shared_dev_zero_mapping_matches_native() {
+    if let Some(rows) = shared_file_write_rows() {
+        rows.assert_matches(Some(SHARED_FILE_WRITE_GAPS[0]));
+    }
+}
+
+/// #1338 A3: `msync` of a shared file window answers as on Linux. A known
+/// gap until A3 lands it with the shrink revoke.
+#[test]
+#[ignore = "msync of a shared file window is #1338 A3"]
+fn mounted_static_x86_shared_file_window_msync_matches_native() {
+    if let Some(rows) = shared_file_write_rows() {
+        rows.assert_matches(Some(SHARED_FILE_WRITE_GAPS[1]));
+    }
+}
+
+/// #2808: a shared file window is `rw-s` in `/proc/self/maps`. A known gap
+/// until x86 serves the open of `/proc/self/maps` (ENOSYS today).
+#[test]
+#[ignore = "open of /proc/self/maps is ENOSYS on x86, see #2808"]
+fn mounted_static_x86_shared_file_window_maps_line_matches_native() {
+    if let Some(rows) = shared_file_write_rows() {
+        rows.assert_matches(Some(SHARED_FILE_WRITE_GAPS[2]));
+    }
+}
+
+/// #1338 v3 C5 (A1 fence): a non-private futex WAIT and WAKE on a shared
+/// file window. Until shared futex keys for file pages land (#1338 B), both
+/// are a counted ENOSYS (-38) on x86, never a hang: the root WAITs on a
+/// window word while a forked child stores to it and WAKEs it.
+#[test]
+fn mounted_static_x86_shared_file_window_futex_is_fenced_never_hangs() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-futex");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_futex.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-futex oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let guest = run_mounted_binary(&elf, "window-futex", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec!["child_wake=ffffffffffffffda", "root_wait=ffffffffffffffda"]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// #1338 A1 interim shrink fence: a shrink of a host file a shared file
+/// window maps would pull the host's pages out from under live window
+/// leaves. Until the revoke path lands (#1338 A3), every shrink of such a
+/// file is a counted ENOSYS (-38) before the host applies it: a forked
+/// child's ftruncate, hole punch and collapse on its inherited descriptor,
+/// and the root's truncate and O_TRUNC open by name. The file keeps its
+/// size (both processes still read their byte on the second page, where
+/// native Linux kills the child with SIGBUS); growth of the mapped file and
+/// a shrink of an unmapped one are served. Red before the fence: the host
+/// shrink pulled the page out from under a live window leaf, and the
+/// child's touch hung the run until the KVM deadline.
+#[test]
+fn mounted_static_x86_shared_file_window_shrink_is_fenced_before_the_host() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-shrink");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_shrink.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let guest = run_mounted_binary(&elf, "window-shrink", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec![
+                "child_collapse=ffffffffffffffda",
+                "child_ftruncate=ffffffffffffffda",
+                "child_punch=ffffffffffffffda",
+                "child_status=0000000000000000",
+                "child_touch=0000000000000042",
+                "plain_shrink=0000000000000000",
+                "root_grow=0000000000000000",
+                "root_otrunc=ffffffffffffffda",
+                "root_page2=0000000000000042",
+                "root_truncate=ffffffffffffffda",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// #1338 A1: the served surface of a range edit over shared file window
+/// pages. A munmap of a private page and a window page is served while at
+/// most one of them is faulted; with both faulted no one edit step covers
+/// both, so it is a counted ENOSYS (-38) that leaves both pages mapped, and
+/// each page then unmaps alone. PROT_NONE over a faulted window page is a
+/// counted ENOSYS, as over a faulted private page on x86 (no present
+/// inaccessible user leaf); over an unfaulted one it is served, and the
+/// restored page reads the file. Native Linux serves every row; the two
+/// refusals are the known gaps of this surface, pinned so a change to
+/// either is seen.
+#[test]
+fn mounted_static_x86_shared_file_window_mixed_range_edits_are_served_or_counted() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-mixed");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_mixed.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-mixed oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(
+        native_stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "mixed_both_faulted_munmap=0000000000000000",
+            "mixed_window_faulted_munmap=0000000000000000",
+            "mixed_private_faulted_munmap=0000000000000000",
+            "protnone_faulted=0000000000000000",
+            "protnone_unfaulted=0000000000000000",
+            "protnone_unfaulted_restore=0000000000000000",
+            "protnone_unfaulted_reads=0000000000000043",
+        ],
+        "native oracle"
+    );
+    let guest = run_mounted_binary(&elf, "window-mixed", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        (guest.status.code(), stdout.lines().collect::<Vec<_>>()),
+        (
+            Some(7),
+            vec![
+                "mixed_both_faulted_munmap=ffffffffffffffda",
+                "mixed_both_faulted_kept=0000000000000001",
+                "mixed_both_faulted_split=0000000000000000",
+                "mixed_window_faulted_munmap=0000000000000000",
+                "mixed_private_faulted_munmap=0000000000000000",
+                "protnone_faulted=ffffffffffffffda",
+                "protnone_unfaulted=0000000000000000",
+                "protnone_unfaulted_restore=0000000000000000",
+                "protnone_unfaulted_reads=0000000000000043",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// #1338 A1 / #2977: the shrink fence keys on the host inode a path routes
+/// to, so a shrink by name through a bind mount is fenced as well. A forked
+/// child truncates a windowed file by name, with truncate(2) and an O_TRUNC
+/// open, where the name is a bind mount of the host directory. The O_TRUNC
+/// open is a counted ENOSYS (-38): the host size door refuses it on the
+/// descriptor the bind mount opened, before anything is truncated. Path
+/// truncate(2) never reaches the mount on main (#3000) and answers EROFS
+/// (-30); it is pinned here so a fix of #3000 must keep it fenced. The
+/// child still reads its byte on the second page (native Linux kills it
+/// with SIGBUS). Red before #2977: the fence asked the rootfs for the
+/// name's inode, found none, and admitted the bind mount's host shrink
+/// under the live window leaf.
+#[test]
+fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-bind-shrink");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_bind_shrink.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir(work.path().join("data")).unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-bind-shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("child_status=0000000000000007"),
+        "native oracle: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+    let data = tempfile::tempdir().unwrap();
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "window-bind-shrink",
+        false,
+        &empty_image_archive(),
+        None,
+        Duration::from_secs(5),
+        &[format!("{}:/data", data.path().display())],
+    );
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec![
+                "child_otrunc=ffffffffffffffda",
+                "child_status=0000000000000000",
+                "child_touch=0000000000000042",
+                "child_truncate=ffffffffffffffe2",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(data.path().join("win")).unwrap().len(),
+        8192,
+        "the host file keeps its size"
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
@@ -1200,6 +1571,7 @@ fn mounted_static_x86_munmap_split_keeps_residency_when_the_table_is_full() {
         &empty_image_archive(),
         None,
         Duration::from_secs(90),
+        &[],
     );
     assert_eq!(
         (guest.status.code(), guest.stdout.as_slice()),
@@ -2651,6 +3023,7 @@ fn run_mounted_binary_in_archive_with_census(
         image_archive,
         census_dir,
         Duration::from_secs(5),
+        &[],
     )
 }
 
@@ -2711,6 +3084,7 @@ fn run_mounted_binary_within(
     image_archive: &[u8],
     census_dir: Option<&std::path::Path>,
     deadline: Duration,
+    volumes: &[String],
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
@@ -2748,8 +3122,11 @@ fn run_mounted_binary_within(
         "never",
         "--volume",
         &format!("{}:/hello:ro", elf.display()),
-        "x86-kvm-hello:latest",
     ]);
+    for volume in volumes {
+        command.args(["--volume", volume]);
+    }
+    command.arg("x86-kvm-hello:latest");
     command
         .process_group(0)
         .stdout(Stdio::piped())

@@ -1527,6 +1527,16 @@ fn delegate_transaction(
     if description.has_active_mappings() {
         return Err(NotEligible::Mapped);
     }
+    // A shared file window maps this inode through another description: an
+    // in-zone copy's writeback would rewrite the window's pages from older
+    // bytes (#1338 A1).
+    if let OpenDescription::HostFile { host_fd, .. } = &*open
+        && host_fd
+            .inode_identity()
+            .is_some_and(carrick_vfs::host_size::maps)
+    {
+        return Err(NotEligible::Mapped);
+    }
     let Some(identity) = description.el1_identity() else {
         return Err(NotEligible::Unregistered);
     };

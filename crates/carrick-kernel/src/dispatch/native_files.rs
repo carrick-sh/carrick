@@ -256,6 +256,16 @@ enum NativePoll {
     Wait(u64),
 }
 
+/// Which mapping a native map request retains a source for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMapRoute {
+    /// [`HostFileOp::MapPrivate`]: bytes copied on first touch.
+    Private,
+    /// [`HostFileOp::MapShared`]: the carrier maps the host file's own
+    /// pages, so only a host file opened read-write is served.
+    Window,
+}
+
 enum Served {
     Reply(i64, Vec<u8>),
     Source(
@@ -965,8 +975,15 @@ impl SyscallDispatcher {
         }
         if let Some(file) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>() {
             return match header.op {
-                HostFileOp::MapPrivate => match file.retain_mapping() {
-                    Some(reference) => self.native_map_reference(reference),
+                HostFileOp::MapPrivate | HostFileOp::MapShared => match file.retain_mapping() {
+                    Some(reference) => self.native_map_reference(
+                        reference,
+                        if header.op == HostFileOp::MapShared {
+                            NativeMapRoute::Window
+                        } else {
+                            NativeMapRoute::Private
+                        },
+                    ),
                     None => Served::Refused,
                 },
                 // A root that saved and restored a stdio stream through the
@@ -1077,7 +1094,8 @@ impl SyscallDispatcher {
                         Err(errno) => return Served::errno(errno),
                     };
                 match self.fs_view().fallocate(description, mode, range) {
-                    Ok(outcome) => served_outcome(outcome, Vec::new()),
+                    // ENOSYS is the window shrink fence: a counted refusal.
+                    Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
                 }
@@ -1160,7 +1178,8 @@ impl SyscallDispatcher {
                     Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
                 }
             }
-            HostFileOp::MapPrivate => self.native_map_source(description),
+            HostFileOp::MapPrivate => self.native_map_source(description, NativeMapRoute::Private),
+            HostFileOp::MapShared => self.native_map_source(description, NativeMapRoute::Window),
             HostFileOp::Openat
             | HostFileOp::GetXattr
             | HostFileOp::ListXattr
@@ -1861,29 +1880,43 @@ impl SyscallDispatcher {
 
     /// Retain a carrier-opened regular file as a private-mapping byte source.
     /// A directory has no mmap operation (ENODEV, as Linux).
-    fn native_map_source(&self, description: &Arc<crate::kernel::FileDescription>) -> Served {
+    fn native_map_source(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        route: NativeMapRoute,
+    ) -> Served {
         let Some(reference) =
             description.retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
         else {
             return Served::errno(carrick_abi::LINUX_EBADF);
         };
-        self.native_map_reference(reference)
+        self.native_map_reference(reference, route)
     }
 
     fn native_map_reference(
         &self,
         reference: Arc<crate::kernel::objects::MappedFileReference>,
+        route: NativeMapRoute,
     ) -> Served {
         let description = reference.description();
         if description.common().status_flags() & carrick_abi::LINUX_O_PATH != 0 {
             return Served::errno(carrick_abi::LINUX_EBADF);
         }
-        if description.common().status_flags() & carrick_abi::LINUX_O_ACCMODE
-            == carrick_abi::LINUX_O_WRONLY
-        {
+        let access = description.common().status_flags() & carrick_abi::LINUX_O_ACCMODE;
+        if access == carrick_abi::LINUX_O_WRONLY {
+            return Served::errno(carrick_abi::LINUX_EACCES);
+        }
+        // mmap(2): EACCES for a MAP_SHARED, PROT_WRITE mapping of a
+        // description that is not open read-write.
+        if route == NativeMapRoute::Window && access != carrick_abi::LINUX_O_RDWR {
             return Served::errno(carrick_abi::LINUX_EACCES);
         }
         let label = match description.inspect_kind(|open| match open {
+            // A window maps the host file's own pages: only a host file has
+            // them. Any other kind is unrouted, never a private snapshot.
+            crate::dispatch::OpenDescription::File { .. } if route == NativeMapRoute::Window => {
+                None
+            }
             crate::dispatch::OpenDescription::File { path, .. } => Some(Some(path.clone())),
             crate::dispatch::OpenDescription::HostFile { metadata, .. } => {
                 Some(Some(metadata.path.to_string_lossy().into_owned()))
@@ -1895,6 +1928,27 @@ impl SyscallDispatcher {
             Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
             _ => return Served::Refused,
         };
+        // A window maps the host file's own pages: record its inode before
+        // the source exists, so every later shrink of it, by any process of
+        // the run, is fenced (#1338 A1). An inode the fence cannot name is
+        // never windowed.
+        if route == NativeMapRoute::Window {
+            let identity = description
+                .inspect_kind(|open| match open {
+                    crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
+                        carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(host_fd))
+                    }
+                    _ => None,
+                })
+                .flatten();
+            let Some(identity) = identity else {
+                return Served::Refused;
+            };
+            // An in-zone copy of the inode leaves the zone first: its later
+            // writeback would rewrite the window's pages from older bytes.
+            // Delegation refuses a windowed inode from now on.
+            crate::el1_delegation::recall_inode(identity);
+        }
         match self.mem().retain_native_private_source(reference, label) {
             Some((source, identity)) => Served::Source(
                 source,
@@ -6171,6 +6225,127 @@ mod tests {
             .unwrap();
         assert_eq!(&bytes[..15], b"\x7fELF-libc-bytes");
         assert!(bytes[15..].iter().all(|byte| *byte == 0));
+    }
+
+    /// `HostFileOp::MapShared` (#1338) retains a source only for a host file
+    /// the carrier can map, opened read-write, and that source lends the
+    /// file's host fd. A read-only description is EACCES (mmap(2)); a file
+    /// with no host fd (the rootfs overlay) is refused, so it stays a counted ENOSYS rather than a
+    /// private snapshot.
+    #[test]
+    fn native_shared_map_serves_only_a_read_write_host_file() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window");
+        std::fs::write(&path, vec![0x5a; 5000]).unwrap();
+        let mut dispatcher = SyscallDispatcher::default();
+        dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/")).unwrap(),
+        ));
+        let mut fixture = fixture_with(dispatcher, None);
+        let context = fixture.dispatcher.capture_one_task_context().unwrap();
+        let open = |fixture: &mut Fixture, flags: u64| {
+            let mut memory = super::super::outcome::LinearMemory::new(
+                0x4000,
+                [path.to_str().unwrap().as_bytes(), &[0]].concat(),
+            );
+            let opened = fixture
+                .dispatcher
+                .dispatch(
+                    &context,
+                    super::super::SyscallRequest::new(
+                        56,
+                        crate::compat::SyscallArgs::from([
+                            (-100_i64) as u64,
+                            0x4000,
+                            flags,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &crate::compat::CompatReporter::default(),
+                )
+                .unwrap();
+            let DispatchOutcome::Returned { value } = opened else {
+                panic!("host open: {opened:?}");
+            };
+            value as i32
+        };
+        let read_write = open(&mut fixture, carrick_abi::LINUX_O_RDWR as u64);
+        let read_only = open(&mut fixture, carrick_abi::LINUX_O_RDONLY as u64);
+        let shared = |fd: i32| {
+            let mut map = record(
+                fixture.table,
+                HostFileOp::MapShared,
+                fd,
+                [0, 8192, 0, 0],
+                &[],
+                carrick_core_abi::host_file::MapSourceReply::BYTES,
+            );
+            let served =
+                fixture
+                    .dispatcher
+                    .serve_native_host_file_in(&fixture.owner, &mut map, None);
+            (served, map)
+        };
+        // A host file the root opened (inherited by the child as a physical
+        // hold): the window's source lends the same host inode.
+        let (served, map) = shared(read_write);
+        let source = served
+            .unwrap()
+            .retained_source
+            .expect("a window retains its source");
+        let reply = host_file::reply(&map).unwrap();
+        assert_eq!(reply.result, 0);
+        let named = carrick_core_abi::host_file::MapSourceReply::decode(reply.output).unwrap();
+        assert_eq!(
+            (named.handle, named.generation),
+            (source.identity().handle(), source.identity().generation())
+        );
+        let lent = std::fs::File::from(source.host_file().expect("a host file to map"))
+            .metadata()
+            .unwrap();
+        let real = std::fs::metadata(&path).unwrap();
+        assert_eq!((lent.dev(), lent.ino()), (real.dev(), real.ino()));
+        assert_eq!(lent.len(), 5000);
+
+        let (served, map) = shared(read_only);
+        assert!(served.unwrap().retained_source.is_none());
+        assert_eq!(
+            host_file::reply(&map).unwrap().result,
+            carrick_abi::LINUX_EACCES.guest_retval()
+        );
+
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let mut open = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [carrick_abi::LINUX_O_RDWR as u64, 0, 0, 0],
+            b"/lib/libc.so.6",
+            0,
+        );
+        fixture.serve(Some(&authority), &mut open).unwrap();
+        let fd = host_file::reply(&open).unwrap().result as i32;
+        assert!(fd >= 0, "rootfs open: {fd}");
+        let mut map = record(
+            fixture.table,
+            HostFileOp::MapShared,
+            fd,
+            [0, 4096, 0, 0],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        assert!(
+            fixture
+                .dispatcher
+                .serve_native_host_file_in(&fixture.owner, &mut map, None)
+                .is_err(),
+            "an overlay file has no host pages to share"
+        );
     }
 
     #[test]

@@ -324,6 +324,12 @@ pub enum HostFileCall {
     /// never write the file, so it needs no shared pages). Never
     /// `MAP_ANONYMOUS`.
     MapPrivate(NativeMapKey),
+    /// `MAP_SHARED` of a description open for writing, served as a shared
+    /// file window: the carrier maps the host file's own pages, so stores
+    /// reach the file (#1338). [`HostFileCall::decode`] never yields it: a
+    /// venue whose carrier installs windows asks for it explicitly when
+    /// [`HostFileCall::MapPrivate`] leaves the mapping unrouted.
+    MapShared(NativeMapKey),
     /// `chdir(2)`: one chdir lookup crossing, then the ring updates the
     /// caller's task row (#1392).
     Chdir {
@@ -2510,31 +2516,29 @@ fn stage_call(
                 errno(carrick_syscall_abi::LINUX_EINVAL)
             }
             NativeDescriptor::HostBacked { .. } => {
-                let releases = staging.releases();
-                let staged = staging.request_with_reply(
-                    HostFileOp::MapPrivate,
-                    key.fd,
-                    0,
-                    [key.offset, key.length, 0, 0],
-                    &releases,
-                    None,
-                    host_file::MapSourceReply::BYTES,
-                );
-                match staged {
-                    HostFileStage::Request {
-                        record,
-                        output,
-                        resolves_path,
-                        ..
-                    } => HostFileStage::Request {
-                        record,
-                        output,
-                        resolves_path,
-                        map: Some(key),
-                        chdir: false,
-                    },
-                    other => other,
-                }
+                stage_map_source(&mut staging, HostFileOp::MapPrivate, key)
+            }
+        },
+        HostFileCall::MapShared(key) => match staging.descriptor(key.fd)? {
+            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENODEV),
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            // Only a shared mapping of a readable and writable description is
+            // a window; anything else keeps the [`HostFileCall::MapPrivate`]
+            // route, which already answered it.
+            NativeDescriptor::HostBacked { access }
+                if key.flags & LINUX_MAP_SHARED == 0
+                    || !access.readable()
+                    || !access.writable() =>
+            {
+                return None;
+            }
+            NativeDescriptor::HostBacked { .. }
+                if key.length == 0 || key.offset % PAGE_BYTES != 0 =>
+            {
+                errno(carrick_syscall_abi::LINUX_EINVAL)
+            }
+            NativeDescriptor::HostBacked { .. } => {
+                stage_map_source(&mut staging, HostFileOp::MapShared, key)
             }
         },
         HostFileCall::Ppoll {
@@ -2927,6 +2931,41 @@ pub fn stamp_access_context(record: &[u8], access: &[u8]) -> Option<Box<[u8]>> {
     let mut restaged = vec![0u8; len].into_boxed_slice();
     host_file::encode(&mut restaged, header, &staged, output_cap).ok()?;
     Some(restaged)
+}
+
+/// One [`HostFileOp::MapPrivate`] or [`HostFileOp::MapShared`] request:
+/// the mapped range, the caller's retired sources as input, and room for
+/// the retained source's identity.
+fn stage_map_source(
+    staging: &mut Staging<'_, '_>,
+    op: HostFileOp,
+    key: NativeMapKey,
+) -> HostFileStage {
+    let releases = staging.releases();
+    let staged = staging.request_with_reply(
+        op,
+        key.fd,
+        0,
+        [key.offset, key.length, 0, 0],
+        &releases,
+        None,
+        host_file::MapSourceReply::BYTES,
+    );
+    match staged {
+        HostFileStage::Request {
+            record,
+            output,
+            resolves_path,
+            ..
+        } => HostFileStage::Request {
+            record,
+            output,
+            resolves_path,
+            map: Some(key),
+            chdir: false,
+        },
+        other => other,
+    }
 }
 
 /// The byte source a private-mapping reply carries, or the syscall result

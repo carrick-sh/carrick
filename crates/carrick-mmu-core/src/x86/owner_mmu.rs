@@ -1,6 +1,7 @@
 //! Four-level x86 hardware projection for the shared production MM owner.
 use super::descriptor_txn::*;
 use crate::aarch64::LeafAccess;
+use crate::aarch64::descriptor_txn::AliasAccess;
 use crate::owner_mmu::{OwnerForkMmu, OwnerMmu, OwnerMmuRefusal, OwnerTranslation};
 use carrick_guest_arch::{
     EditBacking, EditIntent, EditOperation, EditOwner, EditPermissions, FrameGpa, GuestLen,
@@ -184,6 +185,12 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
                             resident, ..
                         } => resident,
                         crate::aarch64::descriptor_txn::DescriptorOp::Publish { span, .. } => span,
+                        // A window page takes no residency row: the shared
+                        // receipt rule (`verify_receipt`) names no resident
+                        // span for an alias.
+                        crate::aarch64::descriptor_txn::DescriptorOp::MapAlias { .. } => {
+                            PageSpan::EMPTY
+                        }
                         _ => return WireOutcome::Refused(DescriptorRefusal::BadEncoding),
                     },
                     tables_linked,
@@ -235,6 +242,65 @@ impl X86Mmu {
                     },
                 },
                 &[],
+            )
+            .ok_or(DescriptorRefusal::BadRange)?;
+            return Ok(consume(&DescriptorTxn::from_intent(&intent)?));
+        }
+        // A shared file window page (#1338): the carrier's window slot is
+        // already the file's bytes, so the leaf maps it resident with no
+        // copy. It is a host `Map` leaf: never `PRIVATE`, never retired into
+        // a private lease, and it never takes a table grant (the fault's
+        // tables already exist or come from the same grant stock as Prepare).
+        if let WireOp::MapAlias {
+            access:
+                AliasAccess::User {
+                    writable,
+                    executable,
+                },
+            span,
+            target_ipa,
+            backing,
+        } = txn.op
+        {
+            let root = Self::root(register).map_err(|_| DescriptorRefusal::StaleRoot)?;
+            if root.address().raw() != txn.root.raw() {
+                return Err(DescriptorRefusal::StaleRoot);
+            }
+            let Some(tables) = txn
+                .tables
+                .as_slice()
+                .iter()
+                .map(|&pa| RootGpa::page_aligned(FrameGpa::new(pa)))
+                .collect::<Option<alloc::vec::Vec<_>>>()
+            else {
+                return Err(DescriptorRefusal::BadTableGrant);
+            };
+            let range = UserRange::checked(UserVa::new(span.va), GuestLen::new(span.len))
+                .ok_or(DescriptorRefusal::BadRange)?;
+            // SAFETY: the shared grant owner retains the exact-MM editor and
+            // authenticated mapping window through descriptor execution.
+            let owner = unsafe { EditOwner::issue(root, txn.id.mm_key, txn.id.generation) };
+            let intent = EditIntent::checked(
+                owner,
+                range,
+                EditOperation::Map {
+                    output: FrameGpa::new(target_ipa.raw()),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable,
+                        executable,
+                        user: true,
+                    },
+                    size: carrick_guest_arch::EditLeafSize::Page,
+                    resident: true,
+                    backing: EditBacking {
+                        frame_id: backing.frame_id,
+                        mapping_id: backing.mapping_id,
+                        owner_generation: backing.owner_generation,
+                        inventory_revision: backing.inventory_revision,
+                    },
+                },
+                &tables,
             )
             .ok_or(DescriptorRefusal::BadRange)?;
             return Ok(consume(&DescriptorTxn::from_intent(&intent)?));

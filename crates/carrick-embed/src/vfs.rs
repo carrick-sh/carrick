@@ -870,7 +870,8 @@ impl Vfs for InMemoryFileVfs {
                 Ok(())
             }
             Some(InMemNode::HostFd { fd, size: _, .. }) => {
-                let rc = unsafe { libc::ftruncate(*fd, len as i64) };
+                // Through the host size door (#1338 A1).
+                let rc = carrick_vfs::host_size::ftruncate(*fd, len as libc::off_t);
                 if rc == 0 { Ok(()) } else { Err(LINUX_EINVAL) }
             }
             Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),
@@ -1004,6 +1005,12 @@ impl Vfs for LayeredVfs {
             }
         }
         None
+    }
+
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        self.layers
+            .iter()
+            .find_map(|layer| layer.host_inode_identity(path))
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
@@ -1293,6 +1300,11 @@ impl Vfs for FilterVfs {
     fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         let mapped = self.map_path(path).ok()?;
         self.inner.real_stat(&mapped, follow)
+    }
+
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        let mapped = self.map_path(path).ok()?;
+        self.inner.host_inode_identity(&mapped)
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
@@ -1601,6 +1613,10 @@ impl Vfs for RecordingVfs {
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         self.inner.real_stat(path, follow)
+    }
+
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        self.inner.host_inode_identity(path)
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {

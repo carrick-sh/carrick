@@ -1846,7 +1846,10 @@ impl<'a> FsView<'a> {
             nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
-        let opened = vfs.open(full_path, vfs_flags, ctx);
+        // A mount's ENOSYS means "not mine, fall through"; one the host size
+        // door answered is the call's own refusal (#1338 A1).
+        let (opened, fenced) =
+            carrick_vfs::host_size::fenced_during(|| vfs.open(full_path, vfs_flags, ctx));
         // The render observed a busy memory owner: whatever it produced is
         // not an answer. Install nothing; the open reruns on the release.
         if let Some(busy) = memory_busy.and_then(std::cell::Cell::take) {
@@ -1858,7 +1861,7 @@ impl<'a> FsView<'a> {
         }
         let handle = match opened {
             Ok(h) => h,
-            Err(errno) if errno == LINUX_ENOSYS => {
+            Err(errno) if errno == LINUX_ENOSYS && !fenced => {
                 return VfsOpenAttempt::FallThrough;
             }
             Err(errno) => {

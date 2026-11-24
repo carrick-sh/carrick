@@ -178,12 +178,61 @@ pub(super) enum BackingPreparation {
     Raced(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
 }
 
+/// What an owner grant publishes (#1338).
+pub(super) enum GrantBacking {
+    /// Fresh private frames, owned by this grant until it settles or is
+    /// cancelled.
+    Private {
+        inventory: Box<InitialInventory>,
+        handle: BackingHandle,
+    },
+    /// One page of a shared file window slot. The carrier keeps the slot for
+    /// the run, so the grant owns nothing to cancel.
+    Window,
+}
+
+impl GrantBacking {
+    /// The guest may now name this backing: keep it through teardown unless
+    /// an exact receipt proves otherwise.
+    fn submitted(&mut self) {
+        if let Self::Private { inventory, .. } = self {
+            inventory.expected = 1;
+            inventory.guest_exposed = true;
+        }
+    }
+
+    /// An exact withdrawn or refused receipt proved no guest descriptor
+    /// names this backing.
+    fn unexposed(&mut self) {
+        if let Self::Private { inventory, .. } = self {
+            inventory.guest_exposed = false;
+        }
+    }
+}
+
+/// A shared file window page has no frame inventory: its bytes are the
+/// file's, held by the window slot's host mapping.
+struct WindowInventory;
+impl crate::carrier_memory::InventoryTransaction for WindowInventory {
+    fn publish(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        Ok(())
+    }
+    fn commit(
+        &mut self,
+        _publication: &GuestMmuPublication,
+    ) -> Result<(), crate::carrier_memory::MemoryError> {
+        Ok(())
+    }
+    fn rollback(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        Ok(())
+    }
+}
+
 pub(super) struct PendingPrepare {
     peer: crate::cpl0_private_witness::PeerActivity,
     window: PortalGrantWindow,
     txn: WireTxn,
-    inventory: InitialInventory,
-    handle: BackingHandle,
+    backing: GrantBacking,
     execution: GrantExecution,
     owner: carrick_el1_abi::El1MmHandle,
 }
@@ -1392,6 +1441,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             inherited_sources.bind_executable(executable);
                         }
                         let mut edges = Vec::new();
+                        let mut windows = Vec::new();
                         let mut spans = std::collections::BTreeSet::new();
                         for words in wire.chunks_exact(32) {
                             let selected = decode_fork_custody(words).ok_or_else(|| {
@@ -1400,11 +1450,35 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             })?;
                             if let PortalForkCustody::HostBacking { handle, generation } = selected {
                                 let identity = carrick_el1_abi::HostBackingIdentity::new(handle, generation, 0);
-                                let source = parent_sources
-                                    .as_ref()
+                                let parent = parent_sources.as_ref();
+                                let source = parent
                                     .and_then(|sources| sources.retain(identity, || None))
                                     .ok_or(ForkStockRefusal::Invalid)?;
-                                inherited_sources.inherit(source);
+                                // The child's later faults on an inherited
+                                // window must reach the file, never a copy.
+                                if parent.is_some_and(|sources| sources.is_window(identity)) {
+                                    inherited_sources.inherit_window(source);
+                                } else {
+                                    inherited_sources.inherit(source);
+                                }
+                                continue;
+                            }
+                            // A shared file window leaf has no frame
+                            // inventory: the child keeps it and joins the
+                            // window slot (#1338).
+                            let window = vm
+                                .select_inherited_window(execution.context, selected)
+                                .map_err(|error| {
+                                    trap_error = Some(fail(error.to_string()));
+                                    ForkStockRefusal::Invalid
+                                })?;
+                            if let Some(window) = window {
+                                if !spans.insert(window.span().va) {
+                                    trap_error =
+                                        Some(fail("physical fork duplicate inherited page"));
+                                    return Err(ForkStockRefusal::Invalid);
+                                }
+                                windows.push(window);
                                 continue;
                             }
                             let selected_edges = vm
@@ -1547,6 +1621,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             ForkStockRefusal::Inventory
                         })?;
                         root_installed.set(true);
+                        for window in &windows {
+                            vm.attach_inherited_window(child, window).map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Invalid
+                            })?;
+                        }
                         let mut resident_windows = std::collections::BTreeSet::new();
                         for edge in &edges {
                             let source = edge.identity();
@@ -2220,14 +2300,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let Some(identity) = window.host_backing else {
             return Ok(None);
         };
-        let source = self
-            .sources_mut(execution.context)?
+        let sources = self.sources_mut(execution.context)?;
+        // A shared file window's fault must reach the file's own pages; a
+        // private copy here would drop every store (#1338).
+        let shared = sources.is_window(identity);
+        let source = sources
             .retain(identity, || None)
             .ok_or_else(|| fail("file fault source identity"))?;
         Ok(Some(FileSupplyRequest {
             execution,
             window,
             source,
+            shared,
         }))
     }
 
@@ -2468,7 +2552,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if undo {
             // The exact withdrawn or rolled-back receipt proves that none of
             // these fresh bytes are named by a guest descriptor.
-            pending.inventory.guest_exposed = false;
+            pending.backing.unexposed();
             if let Some(receipt) = &receipt {
                 self.fork_stock
                     .settle_native_descriptor_tables(
@@ -2506,13 +2590,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 };
                 fail(format!("owner grant refused: {:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} offered_tables={} receipt_tables_linked={linked:?}", receipt.outcome, pending.execution.cpu.raw(), pending.execution.context.mm.raw(), pending.execution.context.root.address().raw(), pending.window.range.start(), pending.window.range.len(), pending.txn.tables.len()))
             })?;
-        X86Mmu::project_grant(pending.txn.root.raw(), &pending.txn, |native| {
-            self._vm
-                .publish(native, publication, &mut pending.inventory)
-        })
+        X86Mmu::project_grant(
+            pending.txn.root.raw(),
+            &pending.txn,
+            |native| match &mut pending.backing {
+                GrantBacking::Private { inventory, .. } => {
+                    self._vm.publish(native, publication, &mut **inventory)
+                }
+                GrantBacking::Window => self._vm.publish(native, publication, &mut WindowInventory),
+            },
+        )
         .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
         .map_err(|error| fail(error.to_string()))?;
-        pending.inventory.finish()?;
+        if let GrantBacking::Private { inventory, .. } = &mut pending.backing {
+            inventory.finish()?;
+        }
         // File grants settle through the same publisher, but are outside
         // the anonymous-leaf evidence population.
         if pending.window.host_backing.is_none() {
@@ -2543,7 +2635,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             )
             .map_err(|error| fail(format!("Prepare table settlement: {error:?}")))?;
         // Retained stage-2 custody now belongs to the live guest graph.
-        let _retained = pending.handle;
+        let _retained = pending.backing;
         Ok(true)
     }
 
@@ -2556,15 +2648,30 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if excluded.key() != pending.window.operation.mm.raw() {
             return Err(fail("withdrawn backing exclusion MM mismatch"));
         }
-        pending.inventory.guest_exposed = false;
+        pending.backing.unexposed();
         // SAFETY: `excluded` proves no guest editor of this MM is active, and
         // the exact withdrawn or refused receipt proved no guest descriptor
-        // ever named `pending.handle`.
-        unsafe {
-            self._vm
-                .cancel_prepared(&[pending.handle], &mut pending.inventory)
+        // ever named the pending backing.
+        unsafe { self.cancel_unexposed_backing(&mut pending.backing) }
+    }
+
+    /// Cancel a grant's backing that no guest descriptor names.
+    ///
+    /// # Safety
+    /// No guest descriptor may name a private backing's frames, and none
+    /// may come to before this returns.
+    unsafe fn cancel_unexposed_backing(
+        &mut self,
+        backing: &mut GrantBacking,
+    ) -> Result<(), TrapError> {
+        match backing {
+            // SAFETY: the caller's contract.
+            GrantBacking::Private { inventory, handle } => {
+                unsafe { self._vm.cancel_prepared(&[*handle], &mut **inventory) }
+                    .map_err(|error| fail(error.to_string()))
+            }
+            GrantBacking::Window => Ok(()),
         }
-        .map_err(|error| fail(error.to_string()))
     }
 
     /// Cancel every refused or withdrawn backing of the excluded MM that
@@ -2658,7 +2765,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
     ) -> Result<BackingPreparation, TrapError> {
-        let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();
         if self.grant_portal()?.carrier() != Some(window.operation.carrier)
@@ -2683,7 +2789,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         let bytes = match (window.host_backing, file) {
             (Some(_), Some(file)) if file.execution.matches(execution) && file.window == window => {
-                file.bytes
+                match file.contents {
+                    FileContents::Copied(bytes) => bytes,
+                    FileContents::Window(shared) => {
+                        return self.prepare_window_grant(execution, window, owner, shared, reply);
+                    }
+                }
             }
             (None, None) => None,
             _ => return Err(fail("file supply changed while custody was released")),
@@ -2710,7 +2821,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // normal backing-fault signal; EOF is not a carrier invariant.
             return Ok(BackingPreparation::Prepared(None));
         }
-        let root = context.root;
         let gpa = self.anonymous_next_gpa;
         let len = publication_len.next_multiple_of(4096);
         self.anonymous_next_gpa = FrameGpa::new(
@@ -2750,6 +2860,130 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
+        let op = WireOp::Prepare {
+            publication: GuestLeafPublication {
+                va: window.range.start(),
+                ipa: grant.gpa,
+                len: publication_len,
+                writable: window
+                    .protection
+                    .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                executable: window
+                    .protection
+                    .permits(carrick_el1_abi::ReservationProtection::EXECUTE),
+            },
+            resident: PageSpan::new(window.fault_page, 4096),
+            backing: identity,
+        };
+        self.submit_backing_grant(
+            execution,
+            window,
+            owner,
+            op,
+            GrantBacking::Private {
+                inventory: Box::new(inventory),
+                handle,
+            },
+            reply,
+        )
+    }
+
+    /// Serve one page of a shared file window (#1338): map the carrier's
+    /// slot for the file's chunk, never a private copy, so the guest's
+    /// stores are the file's bytes. The slot is a host `mmap(MAP_SHARED)` of
+    /// the chunk, made at the chunk's first fault in this carrier and kept
+    /// for the run; each MM that faults it is admitted to it.
+    fn prepare_window_grant(
+        &mut self,
+        execution: GrantExecution,
+        window: PortalGrantWindow,
+        owner: carrick_el1_abi::El1MmHandle,
+        file: WindowFile,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<BackingPreparation, TrapError> {
+        use carrick_core::mm::window::{WINDOW_CHUNK_BYTES, WindowChunk};
+        use std::os::fd::AsFd;
+        let source = window
+            .host_backing
+            .ok_or_else(|| fail("window fault source absent"))?;
+        let offset = source
+            .offset()
+            .checked_add(window.fault_page - window.range.start())
+            .ok_or_else(|| fail("window fault offset overflow"))?;
+        if offset >= file.len {
+            // Past the file's end. Leave the authenticated selection pending,
+            // as a private file fault past EOF does: the guest cancels it and
+            // delivers its backing-fault signal (SIGBUS).
+            return Ok(BackingPreparation::Prepared(None));
+        }
+        let chunk = WindowChunk::of_offset(offset);
+        let key = (file.device, file.inode, chunk.index());
+        let (handle, base, identity) = match self.window_slots.get(&key) {
+            Some(slot) => *slot,
+            None => {
+                let base = self.anonymous_next_gpa;
+                self.anonymous_next_gpa = FrameGpa::new(
+                    base.raw()
+                        .checked_add(WINDOW_CHUNK_BYTES)
+                        .ok_or_else(|| fail("window slot GPA exhausted"))?,
+                );
+                let extent = BackingExtent::host_file_window(
+                    base,
+                    file.fd.as_fd(),
+                    chunk.start(),
+                    WINDOW_CHUNK_BYTES as usize,
+                )
+                .map_err(|error| fail(error.to_string()))?;
+                let identity = crate::cpl0_boot::backing_identity(&*self.frame_inventory)?;
+                let handle = self
+                    ._vm
+                    .install(&[PreparedBacking {
+                        extent: Arc::new(extent),
+                        identity,
+                    }])
+                    .map_err(|error| fail(error.to_string()))?[0];
+                self.window_slots.insert(key, (handle, base, identity));
+                (handle, base, identity)
+            }
+        };
+        let edge = self
+            ._vm
+            .share(handle)
+            .map_err(|error| fail(error.to_string()))?;
+        self._vm
+            .attach_shared(execution.context.mm.raw(), &edge)
+            .map_err(|error| fail(error.to_string()))?;
+        let op = WireOp::MapAlias {
+            access: carrick_mmu_core::aarch64::descriptor_txn::AliasAccess::User {
+                writable: window
+                    .protection
+                    .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                executable: window
+                    .protection
+                    .permits(carrick_el1_abi::ReservationProtection::EXECUTE),
+            },
+            span: PageSpan::new(window.fault_page, 4096),
+            target_ipa: SubstrateGpa(base.raw() + (offset - chunk.start())),
+            backing: identity,
+        };
+        self.submit_backing_grant(execution, window, owner, op, GrantBacking::Window, reply)
+    }
+
+    /// Plan, admit and submit one owner grant's descriptor transaction. Every
+    /// refusal before the guest may see it cancels the grant's backing.
+    fn submit_backing_grant(
+        &mut self,
+        execution: GrantExecution,
+        window: PortalGrantWindow,
+        owner: carrick_el1_abi::El1MmHandle,
+        op: WireOp,
+        mut backing: GrantBacking,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<BackingPreparation, TrapError> {
+        let index = execution.cpu.raw() as usize;
+        let context = execution.context;
+        let mm = context.mm.raw();
+        let root = context.root;
         let tables = prepare_table_candidates(self.fork_stock.table_stock());
         let mut txn = WireTxn {
             id: DescriptorTxnId {
@@ -2757,21 +2991,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 generation: window.operation.sequence,
             },
             root: SubstrateGpa(root.address().raw()),
-            op: WireOp::Prepare {
-                publication: GuestLeafPublication {
-                    va: window.range.start(),
-                    ipa: grant.gpa,
-                    len: publication_len,
-                    writable: window
-                        .protection
-                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
-                    executable: window
-                        .protection
-                        .permits(carrick_el1_abi::ReservationProtection::EXECUTE),
-                },
-                resident: PageSpan::new(window.fault_page, 4096),
-                backing: identity,
-            },
+            op,
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
         let ram = Arc::clone(&self.ram);
@@ -2811,8 +3031,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             Ok(Err(refusal)) => {
                 // Neither the read-only planner nor the release venue made
                 // this fresh backing guest-visible.
-                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                    .map_err(|error| fail(error.to_string()))?;
+                unsafe { self.cancel_unexposed_backing(&mut backing) }?;
                 use carrick_core::mm::frames::{PublicationDecline, PublicationNotNow};
                 return match PublicationDecline::from_descriptor(refusal) {
                     // The other CPU published into this window after it was
@@ -2829,7 +3048,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         mm,
                         root.address().raw(),
                         window.range.start(),
-                        len,
+                        window.range.len(),
                         tables.len()
                     ))),
                 };
@@ -2837,8 +3056,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             Err(error) => {
                 // Neither the read-only planner nor the release venue made
                 // this fresh backing guest-visible.
-                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                    .map_err(|error| fail(error.to_string()))?;
+                unsafe { self.cancel_unexposed_backing(&mut backing) }?;
                 return Err(error);
             }
         };
@@ -2850,8 +3068,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         ) {
             Ok(owned) => owned,
             Err(error) => {
-                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                    .map_err(|error| fail(error.to_string()))?;
+                unsafe { self.cancel_unexposed_backing(&mut backing) }?;
                 return Err(fail(format!(
                     "owner grant physical table credit refused: {error:?}; cpu={} mm={} required={required} available={}",
                     execution.cpu.raw(),
@@ -2867,8 +3084,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if !matches!(admission, Ok(Ok(()))) {
             // SAFETY: the vCPU is stopped, and no descriptor submission was
             // admitted. The fresh extent has never been guest-visible.
-            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                .map_err(|error| fail(error.to_string()))?;
+            unsafe { self.cancel_unexposed_backing(&mut backing) }?;
             self.fork_stock
                 .cancel_native_descriptor_tables(&mut NoTableLedger, owned_tables);
             return Err(fail("owner grant admission refused"));
@@ -2877,8 +3093,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             self.fork_stock
                 .track_native_descriptor_tables(&mut NoTableLedger, owned_tables, txn)
         {
-            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                .map_err(|error| fail(error.to_string()))?;
+            unsafe { self.cancel_unexposed_backing(&mut backing) }?;
             return Err(fail(format!(
                 "Prepare table transaction tracking: {error:?}"
             )));
@@ -2888,8 +3103,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             &txn,
             carrick_hal::diagnostic_capture::trace_grant_refusals(),
         ) {
-            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                .map_err(|error| fail(error.to_string()))?;
+            unsafe { self.cancel_unexposed_backing(&mut backing) }?;
             self.fork_stock
                 .cancel_submitted_native_descriptor_tables(
                     &mut NoTableLedger,
@@ -2900,11 +3114,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .map_err(|error| fail(format!("Prepare table submit cancellation: {error:?}")))?;
             return Err(fail("owner grant submission refused"));
         }
-        inventory.expected = 1;
         // Once submitted, guest descriptor publication may have happened even
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
-        inventory.guest_exposed = true;
+        backing.submitted();
         Ok(BackingPreparation::Prepared(Some(Box::new(
             PendingPrepare {
                 peer: crate::cpl0_private_witness::PeerActivity::observe(
@@ -2912,8 +3125,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 ),
                 window,
                 txn,
-                inventory,
-                handle,
+                backing,
                 execution,
                 owner,
             },
@@ -2937,7 +3149,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
                 .read_kernel_pod_bytes(self.execution.context, address, len, 1)?;
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
             .map_err(|_| fail("host file record encoding"))?;
-        if view.header().op != carrick_core_abi::host_file::HostFileOp::MapPrivate {
+        if !matches!(
+            view.header().op,
+            carrick_core_abi::host_file::HostFileOp::MapPrivate
+                | carrick_core_abi::host_file::HostFileOp::MapShared
+        ) {
             return Err(fail("unsupported synchronous host file operation"));
         }
         self.custody
@@ -2958,9 +3174,13 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         self.custody
             .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
         if let Some(source) = source {
-            self.custody
-                .sources_mut(self.execution.context)?
-                .inherit(source);
+            let window = replied_map_source_is_window(bytes)?;
+            let sources = self.custody.sources_mut(self.execution.context)?;
+            if window {
+                sources.inherit_window(source);
+            } else {
+                sources.inherit(source);
+            }
         }
         let physical =
             kernel_pod_physical(&self.custody.kernel_pod_storage, address, bytes.len(), 1)
@@ -2972,15 +3192,47 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
     }
 }
 
+/// Whether the source a map-source record retained is a shared file window
+/// ([`carrick_core_abi::host_file::HostFileOp::MapShared`], #1338). The host
+/// service has written its reply by now, so the record must read as replied.
+/// Any other record is a broken invariant: retaining a window's source as a
+/// byte copy would drop every store the guest makes through the mapping.
+fn replied_map_source_is_window(bytes: &[u8]) -> Result<bool, TrapError> {
+    use carrick_core_abi::host_file::{HostFileOp, replied_parts};
+    match replied_parts(bytes) {
+        Some((header, _, _)) if header.op == HostFileOp::MapShared => Ok(true),
+        Some((header, _, _)) if header.op == HostFileOp::MapPrivate => Ok(false),
+        _ => Err(fail("retained map source without a replied map record")),
+    }
+}
+
 struct FileSupplyRequest {
     execution: GrantExecution,
     window: PortalGrantWindow,
     source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+    /// The source is a shared file window (#1338).
+    shared: bool,
 }
 pub(super) struct FileSupply {
     execution: GrantExecution,
     window: PortalGrantWindow,
-    bytes: Option<Vec<u8>>,
+    contents: FileContents,
+}
+/// What a file fault publishes.
+pub(super) enum FileContents {
+    /// A private copy of the file's bytes from the window's start (`None`:
+    /// the source could not be read).
+    Copied(Option<Vec<u8>>),
+    /// A shared file window: the fault maps the file's own pages.
+    Window(WindowFile),
+}
+/// The host file behind a shared file window, read outside carrier custody.
+pub(super) struct WindowFile {
+    fd: std::os::fd::OwnedFd,
+    device: u64,
+    inode: u64,
+    /// The file's size when the fault was served.
+    len: u64,
 }
 impl FileSupplyRequest {
     fn read(self) -> Result<FileSupply, TrapError> {
@@ -2988,6 +3240,27 @@ impl FileSupplyRequest {
             .window
             .host_backing
             .ok_or_else(|| fail("file source absent"))?;
+        if self.shared {
+            use std::os::unix::fs::MetadataExt;
+            let file = std::fs::File::from(
+                self.source
+                    .host_file()
+                    .ok_or_else(|| fail("shared file window source has no host file"))?,
+            );
+            let metadata = file
+                .metadata()
+                .map_err(|error| fail(format!("shared file window stat: {error}")))?;
+            return Ok(FileSupply {
+                execution: self.execution,
+                window: self.window,
+                contents: FileContents::Window(WindowFile {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    len: metadata.len(),
+                    fd: file.into(),
+                }),
+            });
+        }
         let request = carrick_hal::fork_stock::HostBackingRead::new(
             identity,
             self.window.range.len() as usize,
@@ -3010,7 +3283,7 @@ impl FileSupplyRequest {
         Ok(FileSupply {
             execution: self.execution,
             window: self.window,
-            bytes,
+            contents: FileContents::Copied(bytes),
         })
     }
 }
@@ -3057,6 +3330,63 @@ mod custody_tests {
     use carrick_el1_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
+
+    /// One map-source record as `complete_host_file` sees it: the host
+    /// service has replied.
+    fn replied_map_record(op: carrick_core_abi::host_file::HostFileOp) -> Vec<u8> {
+        map_record(op, true)
+    }
+
+    fn map_record(op: carrick_core_abi::host_file::HostFileOp, replied: bool) -> Vec<u8> {
+        use carrick_core_abi::host_file::{
+            HostFileHeader, HostFileRequestView, MapSourceReply, encode, record_len,
+        };
+        let mut bytes = vec![0; record_len(0, MapSourceReply::BYTES).unwrap()];
+        encode(
+            &mut bytes,
+            HostFileHeader {
+                op,
+                table: [1, 2, 3],
+                fd: 3,
+                flags: 0,
+                args: [0, 0x2000, 0, 0],
+            },
+            &[],
+            MapSourceReply::BYTES,
+        )
+        .unwrap();
+        let reply = MapSourceReply {
+            handle: NonZeroU64::new(9).unwrap(),
+            generation: NonZeroU64::MIN,
+        }
+        .encode();
+        if replied {
+            HostFileRequestView::parse(&mut bytes)
+                .unwrap()
+                .reply(0, &reply)
+                .unwrap();
+        }
+        bytes
+    }
+
+    /// #1338: a source the host retained for a `MapShared` record is a
+    /// shared file window once its reply is written, so its faults never
+    /// copy bytes. Reading the replied record as a pending request answered
+    /// "not a window" and retained it as a private copy: every store through
+    /// the mapping was lost (KVM witness rows `linker_read_back`,
+    /// `shared_child_write_in_pread`).
+    #[test]
+    fn replied_map_shared_record_retains_a_window_source() {
+        use carrick_core_abi::host_file::HostFileOp;
+        assert!(replied_map_source_is_window(&replied_map_record(HostFileOp::MapShared)).unwrap());
+        assert!(
+            !replied_map_source_is_window(&replied_map_record(HostFileOp::MapPrivate)).unwrap()
+        );
+        // A record with no reply, or of another operation, retains nothing.
+        assert!(replied_map_source_is_window(&map_record(HostFileOp::MapShared, false)).is_err());
+        assert!(replied_map_source_is_window(&replied_map_record(HostFileOp::Ftruncate)).is_err());
+    }
+
     #[test]
     fn x86_prepare_candidates_continue_after_twelve_root_table_loans() {
         use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
