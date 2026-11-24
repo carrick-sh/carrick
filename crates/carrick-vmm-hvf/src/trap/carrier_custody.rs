@@ -374,6 +374,24 @@ impl CarrierStage2Backend {
     pub(crate) fn as_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
         self.0.as_ref()
     }
+
+    /// Whether `other` is this exact handle: the same carrier VM's backend,
+    /// not merely a backend of the same kind.
+    pub(crate) fn is_same_backend(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(
+            std::sync::Arc::as_ptr(&self.0),
+            std::sync::Arc::as_ptr(&other.0),
+        )
+    }
+
+    /// A handle over a test's own backend, so a test can map a lease through
+    /// a carrier other than the one it hands the lease to.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
+    ) -> Self {
+        Self(backend)
+    }
 }
 
 /// Carrier-owned VM lifecycle authority.
@@ -780,6 +798,12 @@ impl CarrierVmCustody {
 
     pub(crate) fn stage2_backend_handle(&self) -> CarrierStage2Backend {
         self.stage2_backend.clone()
+    }
+
+    /// Whether `backend` is this carrier VM's own backend. A stage-2 extent
+    /// mapped through another carrier's backend is never this custody's.
+    pub(crate) fn holds_stage2_backend(&self, backend: &CarrierStage2Backend) -> bool {
+        self.stage2_backend.is_same_backend(backend)
     }
 
     pub fn new() -> Self {
@@ -1969,6 +1993,77 @@ mod carrier_vm_custody_tests {
 
         assert!(first.global_frame_host_owners.lock().contains_key(&key));
         assert!(second.global_frame_host_owners.lock().is_empty());
+    }
+
+    /// A stage-2 backend that records every unmap it is asked for.
+    #[derive(Default)]
+    struct RecordingStage2 {
+        unmaps: parking_lot::Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl carrick_aarch64::stage2::Stage2Backend for RecordingStage2 {
+        unsafe fn map(
+            &self,
+            _host: *mut core::ffi::c_void,
+            _ipa: u64,
+            _size: usize,
+            _perms: carrick_hal::MemPerms,
+        ) -> carrick_aarch64::stage2::Stage2Status {
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        }
+
+        unsafe fn unmap(&self, ipa: u64, size: usize) -> carrick_aarch64::stage2::Stage2Status {
+            self.unmaps.lock().push((ipa, size));
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        }
+
+        unsafe fn destroy(&self) -> carrick_aarch64::stage2::Stage2Status {
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        }
+    }
+
+    /// A lease mapped through one carrier VM's backend never becomes another
+    /// custody's record: the receiving custody refuses it, and the lease
+    /// rolls back through the backend that mapped it (#2968 review, P0 1).
+    #[test]
+    fn a_lease_mapped_by_another_carrier_is_refused_and_unmapped_by_its_mapper() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let receiver = crate::trap::test_carrier_custody();
+        let mapper = std::sync::Arc::new(RecordingStage2::default());
+        let key = (0xa083_0000_0000_u64, 0x4000_u64);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate the lease's backing");
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped(super::CarrierStage2Backend::for_test(
+            std::sync::Arc::clone(&mapper) as _,
+        ));
+
+        let transferred = super::transfer_global_frame_stage2_lease_to_custody(
+            &receiver,
+            lease,
+            mapping.as_ptr() as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            None,
+        );
+
+        assert!(
+            transferred.is_err(),
+            "a custody must refuse a lease another carrier's backend mapped: {transferred:?}"
+        );
+        assert_eq!(
+            *mapper.unmaps.lock(),
+            vec![(key.0, key.1 as usize)],
+            "the refused lease unmaps through the backend that mapped it"
+        );
+        assert!(
+            receiver
+                .stage2_record_covering(key.0, key.1 as usize)
+                .is_none(),
+            "the receiving custody holds no record of the foreign mapping"
+        );
     }
 
     /// Two live threads, each with its own test task, publish an owner at the
