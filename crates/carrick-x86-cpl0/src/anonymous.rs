@@ -637,6 +637,21 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
             len,
         )
     }
+    fn window_backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+        windows: &[(u64, u64)],
+    ) -> carrick_el1::memory::Stage1Backing {
+        carrick_el1::memory::classify_window_range::<X86AnonymousDecode>(
+            &|pa| self.words.load(pa).ok(),
+            root.raw(),
+            va.raw(),
+            len.raw(),
+            windows,
+        )
+    }
     fn stock_span(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -706,6 +721,42 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
             return Err(carrick_mmu_core::aarch64::GuestRetirementError::RollbackFailed);
         }
         Ok(())
+    }
+    fn unmap_window_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        use carrick_mmu_core::aarch64::GuestRetirementError;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+        let register = RootGpa::page_aligned(FrameGpa::new(root.raw()))
+            .ok_or(GuestRetirementError::BadRange)?;
+        let range = UserRange::checked(va, len).ok_or(GuestRetirementError::BadRange)?;
+        let context = self
+            .words
+            .context
+            .filter(|context| context.root == register)
+            .ok_or(GuestRetirementError::BadRange)?;
+        let generation = self
+            .sequence
+            .as_ref()
+            .ok_or(GuestRetirementError::BadRange)?;
+        // A window page has no residency row (its `MapAlias` publication
+        // names none), so there is nothing to retire beside the leaf.
+        match carrick_el1::memory::unmap_x86_window(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+        ) {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {
+                Err(GuestRetirementError::NotPrivateAnonymous)
+            }
+            DescriptorOutcome::Indeterminate(_) => fatal_reservation(),
+        }
     }
     fn grow_residency(&mut self) -> bool {
         carrick_el1::memory::grow_guest_residency()

@@ -1399,6 +1399,7 @@ fn shared_read_only_file_mapping_renders_as_shared_in_proc_maps() {
     assert!(flags.contains(ReservationNodeFlags::FILE));
     assert!(!flags.contains(ReservationNodeFlags::PRIVATE));
     assert!(!flags.contains(ReservationNodeFlags::SHARED_READ_ONLY));
+    assert!(flags.contains(ReservationNodeFlags::SHARED_WINDOW));
 }
 
 /// The proc-executable description must use the same owner source custody as

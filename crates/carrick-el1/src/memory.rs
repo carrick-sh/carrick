@@ -49,6 +49,36 @@ pub fn edit_x86_anonymous(
     Ok(execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome)
 }
 
+/// Unlink the shared file window leaves of `range` on x86 (#1338): a window
+/// page is the file's own page behind a carrier slot kept for the run, so
+/// the leaf is cleared, never retired into a private lease. The descriptor
+/// step refuses a `PRIVATE` terminal, so this never drops private custody.
+/// The caller classified the range as [`RangeBacking::Window`] under the
+/// same exact-MM editor and journals it as an owed return, whose settlement
+/// drops the carrier's alias edges for the span.
+pub fn unmap_x86_window(
+    words: &impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords,
+    root: carrick_guest_arch::RootGpa,
+    mm: NonZeroU64,
+    generation: &AnonymousEditGeneration,
+    range: carrick_guest_arch::UserRange,
+) -> carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome {
+    use carrick_mmu_core::x86::descriptor_txn::{
+        DescriptorOp, DescriptorTxn, DescriptorTxnId, InlineJournal, PageSpan,
+        execute_descriptor_txn,
+    };
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: mm,
+            generation: generation.nonzero(),
+        },
+        root,
+        op: DescriptorOp::Unmap(PageSpan::new(range.start().raw(), range.len().raw())),
+        tables: &[],
+    };
+    execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome
+}
+
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
@@ -64,6 +94,7 @@ const MAP_ANONYMOUS: u64 = 0x20;
 #[cfg(test)]
 const MAP_GROWSDOWN: u64 = 0x0100;
 const MAP_NORESERVE: u64 = 0x4000;
+const MAP_POPULATE: u64 = 0x8000;
 const MAP_STACK: u64 = 0x20000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 
@@ -318,8 +349,17 @@ pub fn decide_reservation_syscall_for_origin<
                     (NativeFileSource::Window(_), MAP_SHARED) => FileMapSharing::Shared,
                     _ => return None,
                 };
+                // MAP_POPULATE only prefaults (mmap(2)): a window page is the
+                // file's page whenever it is touched, so a lazy window is
+                // the same mapping. A copied source keeps the byte snapshot
+                // a prefault would take at map time, so it leaves the ring.
+                let populate = match sharing {
+                    FileMapSharing::Shared => MAP_POPULATE,
+                    _ => 0,
+                };
                 let source = source.identity();
-                (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED) == 0).then_some((source, sharing))
+                (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED | populate) == 0)
+                    .then_some((source, sharing))
             });
             if file.is_none() && !private_anonymous_mmap(flags) {
                 return ReservationDisposition::Forward;
@@ -677,6 +717,19 @@ pub trait AnonymousRetirementEditor {
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError>;
+
+    /// Clear the shared file window leaves of `[address, address + len)`
+    /// (a [`RangeBacking::Window`] range) and invalidate them (#1338). Only
+    /// a carrier that installs windows serves this; the others refuse, and
+    /// the call leaves the ring (ARM's window installs are the A2 seam).
+    fn unmap_window_and_invalidate(
+        &mut self,
+        _ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        _address: carrick_guest_arch::UserVa,
+        _len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), GuestRetirementError> {
+        Err(GuestRetirementError::NotPrivateAnonymous)
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -809,6 +862,10 @@ pub enum RangeBacking {
     Prepared,
     /// Some terminal is a retired lease whose inventory return is owed.
     Retired,
+    /// Only shared file window leaves and holes, every leaf inside a window
+    /// node the caller named (#1338): host-mapped pages of the file (never
+    /// `PRIVATE`) that an edit unlinks rather than retires.
+    Window,
     /// A host-owned terminal, a malformed one, a table outside the primary
     /// arena, or more backed runs than one edit step takes.
     Foreign,
@@ -959,7 +1016,23 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
     va: u64,
     len: u64,
 ) -> Stage1Backing {
+    classify_window_range::<A>(read, root, va, len, &[])
+}
+
+/// [`classify_anonymous_range`], where a host-owned page leaf inside one of
+/// `windows` (`[start, end)` spans of shared file window nodes, #1338) is a
+/// window page rather than foreign. A range of window pages and holes is
+/// [`RangeBacking::Window`]; window pages beside private terminals are
+/// foreign, since no one edit step covers both.
+pub fn classify_window_range<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+    windows: &[(u64, u64)],
+) -> Stage1Backing {
     use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    let mut window = false;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
     let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
     let Some(end) = va.checked_add(len) else {
@@ -998,10 +1071,20 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
                 El1PrivateLeafState::Unowned if level < 3 => {
                     return Stage1Backing::foreign(ForeignBacking::Block);
                 }
+                El1PrivateLeafState::Unowned
+                    if windows
+                        .iter()
+                        .any(|&(start, stop)| start <= cursor && next <= stop) =>
+                {
+                    window = true;
+                }
                 El1PrivateLeafState::Unowned => {
                     return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
                 }
                 El1PrivateLeafState::Malformed => return malformed,
+            }
+            if window && private {
+                return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
             }
             backing.push(cursor, next.min(end));
             if backing.summary == RangeBacking::Foreign {
@@ -1013,9 +1096,10 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
         }
         cursor = next;
     }
-    backing.summary = match (private, resident) {
-        (true, true) => RangeBacking::Private,
-        (true, false) => RangeBacking::Prepared,
+    backing.summary = match (private, resident, window) {
+        (_, _, true) => RangeBacking::Window,
+        (true, true, _) => RangeBacking::Private,
+        (true, false, _) => RangeBacking::Prepared,
         _ => RangeBacking::Empty,
     };
     backing
@@ -1233,6 +1317,19 @@ pub trait AnonymousBackingProbe {
         va: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Stage1Backing;
+    /// [`Self::backing`], with the host-owned leaves inside `windows` (the
+    /// shared file window nodes over the range, #1338) read as window pages
+    /// ([`classify_window_range`]). A carrier that installs no windows keeps
+    /// them foreign.
+    fn window_backing(
+        &mut self,
+        _ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        _va: carrick_guest_arch::UserVa,
+        _len: carrick_guest_arch::GuestLen,
+        _windows: &[(u64, u64)],
+    ) -> Stage1Backing {
+        Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf)
+    }
     /// `[start, end)` of the live first-touch grant of exactly `mm_key`
     /// that prepared `va`, if any: stock this MM may hand to a new mapping.
     fn stock_span(
@@ -1892,13 +1989,50 @@ fn serve_delegated_anonymous_attempt<
         frame.set_result(carrick_guest_arch::NativeReturnWord(0));
         return DelegatedAnonymous::Served;
     }
+    // A munmap or a replacing map over shared file window pages (#1338):
+    // the host-owned leaves inside the window nodes of the range are the
+    // file's pages, which the edit unlinks. Any other host-owned leaf stays
+    // foreign.
+    let backing = if backing.summary == RangeBacking::Foreign
+        && backing.foreign == ForeignBacking::HostOwnedLeaf
+        && matches!(request.operation, Retire | Prepare)
+    {
+        let mut windows = [(0u64, 0u64); MAX_BACKED_RUNS];
+        let mut count = 0usize;
+        let observed = model.observe_range(request.range, &mut |mapping| {
+            use carrick_el1_abi::ReservationNodeFlags as F;
+            let flags = mapping.flags;
+            if flags.contains(F::SHARED_WINDOW)
+                && !flags.intersects(F::PRIVATE.union(F::SHARED_ANONYMOUS))
+                && let Some(slot) = windows.get_mut(count)
+            {
+                *slot = (mapping.range.start(), mapping.range.end());
+                count += 1;
+            }
+        });
+        if observed.is_ok() && count > 0 {
+            editor.window_backing(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                carrick_guest_arch::UserVa::new(va),
+                carrick_guest_arch::GuestLen::new(len),
+                &windows[..count],
+            )
+        } else {
+            backing
+        }
+    } else {
+        backing
+    };
     // A discard can retire sparse residency in one descriptor transaction:
     // the retirement planners skip absent entries and validate every
-    // populated terminal before publishing the edit.
+    // populated terminal before publishing the edit. So does a window
+    // unlink, which skips holes alike.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
-        _ if request.operation == Discard => Some((va, len)),
+        _ if request.operation == Discard || backing.summary == RangeBacking::Window => {
+            Some((va, len))
+        }
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
     // A fresh mapping into a root hole over this MM's first-touch stock
@@ -1940,6 +2074,33 @@ fn serve_delegated_anonymous_attempt<
             return DelegatedAnonymous::Settle(SettlementNeed::after_release(model, _editor_guard));
         }
         (_, RangeBacking::Empty, _) | (_, _, None) => None,
+        // Shared file window pages (#1338): unlink the leaves now and owe
+        // the range, so the carrier's settlement drops its alias edges for
+        // it before any overlapping proposal or fault reuses the range. No
+        // frame or residency row is returned: the slot is the file's.
+        (Retire | Prepare, RangeBacking::Window, Some((start, run_len))) => {
+            let Ok(slot) = model.reserve_return(request.range) else {
+                let _ = pending.cancel(&mut model);
+                return DelegatedAnonymous::Settle(SettlementNeed::after_release(
+                    model,
+                    _editor_guard,
+                ));
+            };
+            match editor.unmap_window_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                carrick_guest_arch::UserVa::new(start),
+                carrick_guest_arch::GuestLen::new(run_len),
+            ) {
+                Ok(()) => Some(slot),
+                Err(GuestRetirementError::RollbackFailed) => {
+                    panic!("EL1 shared file window unlink rollback failed")
+                }
+                Err(_) => {
+                    model.release_return(slot);
+                    return refuse(pending, &mut model, Leave::EditRefused);
+                }
+            }
+        }
         // The permission editor is the descriptor step of an mprotect and
         // of a stock adoption alike (prepared leaves stay invalid).
         (Protect, RangeBacking::Private | RangeBacking::Prepared, Some((start, run_len)))
@@ -2276,6 +2437,51 @@ mod tests {
                 classify_anonymous_range::<X86AnonymousDecode>(&read, root, 0, 4096).summary,
                 expected
             );
+        }
+    }
+
+    /// #1338: a host-mapped leaf is a window page only inside a window node
+    /// the caller named; anywhere else, or beside a private terminal, it
+    /// stays foreign, so a munmap never unlinks a leaf it cannot account.
+    #[test]
+    fn x86_window_classifier_names_only_window_node_leaves() {
+        use carrick_mmu_core::x86::descriptor_txn::{PRESENT, PRIVATE, WRITE};
+        let root = 0x1000;
+        let window_leaf = 0x9000 | PRESENT | WRITE;
+        for (leaves, windows, expected) in [
+            (
+                [window_leaf, 0],
+                &[(0u64, 0x2000u64)][..],
+                RangeBacking::Window,
+            ),
+            (
+                [window_leaf, window_leaf],
+                &[(0, 0x2000)][..],
+                RangeBacking::Window,
+            ),
+            ([window_leaf, 0], &[][..], RangeBacking::Foreign),
+            ([0, window_leaf], &[(0, 0x1000)][..], RangeBacking::Foreign),
+            (
+                [window_leaf, 0x5000 | PRIVATE | PRESENT],
+                &[(0, 0x1000)][..],
+                RangeBacking::Foreign,
+            ),
+            ([0, 0], &[(0, 0x2000)][..], RangeBacking::Empty),
+        ] {
+            let read = |pa| match pa {
+                0x1000 => Some(0x2000 | 7),
+                0x2000 => Some(0x3000 | 7),
+                0x3000 => Some(0x4000 | 7),
+                0x4000 => Some(leaves[0]),
+                0x4008 => Some(leaves[1]),
+                _ => None,
+            };
+            let backing =
+                classify_window_range::<X86AnonymousDecode>(&read, root, 0, 0x2000, windows);
+            assert_eq!(backing.summary, expected, "{leaves:x?} in {windows:x?}");
+            if expected == RangeBacking::Foreign {
+                assert_eq!(backing.foreign, ForeignBacking::HostOwnedLeaf);
+            }
         }
     }
 
@@ -3598,7 +3804,6 @@ mod tests {
         /// (`shared_file_mmap_without_a_live_view_is_fenced_by_description_kind`).
         #[test]
         fn writable_shared_file_mmap_leaves_the_ring_on_every_route() {
-            const MAP_POPULATE: u64 = 0x8000;
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let admitted = mm(&spaces, &table, 17, true);
             let unadmitted = mm(&spaces, &table, 18, false);
