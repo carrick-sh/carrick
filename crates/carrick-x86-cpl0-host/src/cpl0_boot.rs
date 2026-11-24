@@ -2736,6 +2736,34 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         Ok(binding.task())
     }
 
+    /// Whether the loaded CPU currently stands at a user-mode boundary of the
+    /// host root lease's own leader thread (not on `maintenance_root`, an
+    /// in-zone forked child, a `CLONE_THREAD` member sharing the root CR3, or
+    /// CPL0 supervisor code).
+    pub fn can_save_loaded_leader(
+        &self,
+        task: carrick_guest_arch::TaskIdentity,
+    ) -> Result<bool, TrapError> {
+        if !self.cpu.can_save_loaded(task)? {
+            return Ok(false);
+        }
+        let Some(slot) = self.physical_slot() else {
+            return Ok(true);
+        };
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let Some(initial) = custody.initial_task else {
+            return Ok(true);
+        };
+        let current = custody.task(slot);
+        let binding = carrick_core::entry::binding(&current.execution, &current.mm);
+        Ok(binding.issued()
+            && binding.task == carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
+            && binding.mm.raw() == initial.mm.raw().get())
+    }
+
     pub fn save_kernel_stack(
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
