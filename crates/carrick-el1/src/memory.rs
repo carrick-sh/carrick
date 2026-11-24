@@ -73,7 +73,7 @@ pub fn unmap_x86_window(
             generation: generation.nonzero(),
         },
         root,
-        op: DescriptorOp::Unmap(PageSpan::new(range.start().raw(), range.len().raw())),
+        op: DescriptorOp::UnmapWindow(PageSpan::new(range.start().raw(), range.len().raw())),
         tables: &[],
     };
     execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome

@@ -659,12 +659,12 @@ fn guest_unlink_clears_host_map_leaf_and_refuses_private_leaf() {
     ));
     let before = words.words.borrow().clone();
     assert_eq!(
-        apply(&words, DescriptorOp::Unmap(private), &[]),
+        apply(&words, DescriptorOp::UnmapWindow(private), &[]),
         DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
     );
     assert_eq!(*words.words.borrow(), before);
     assert!(matches!(
-        apply(&words, DescriptorOp::Unmap(host), &[]),
+        apply(&words, DescriptorOp::UnmapWindow(host), &[]),
         DescriptorOutcome::Applied { .. }
     ));
     assert_eq!(

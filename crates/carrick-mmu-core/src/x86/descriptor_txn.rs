@@ -95,6 +95,10 @@ pub enum DescriptorOp {
     /// Owner retirement retains an inaccessible physical predecessor for scrub.
     Retire(PageSpan),
     Unmap(PageSpan),
+    /// munmap(2) over shared file window pages (#1338): an unlink of
+    /// host-mapped leaves, holes skipped. A private leaf is refused, so a
+    /// window unmap never drops private custody (that only ever retires).
+    UnmapWindow(PageSpan),
     /// mprotect(2) over shared file window pages (#1338): a permission edit
     /// of host-mapped leaves, holes skipped. The caller checked the
     /// mapping's ceiling; a private leaf is refused (it takes `Protect`).
@@ -121,6 +125,7 @@ impl DescriptorOp {
             Self::Prepare { .. } => 8,
             Self::Retire(_) => 9,
             Self::ProtectWindow { .. } => 10,
+            Self::UnmapWindow(_) => 11,
         }
     }
 
@@ -135,7 +140,8 @@ impl DescriptorOp {
             | Self::Coalesce { span, .. }
             | Self::ArmCow(span)
             | Self::Retire(span)
-            | Self::Unmap(span) => span,
+            | Self::Unmap(span)
+            | Self::UnmapWindow(span) => span,
         }
     }
 }
@@ -590,6 +596,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             && matches!(
                 self.txn.op,
                 DescriptorOp::Unmap(_)
+                    | DescriptorOp::UnmapWindow(_)
                     | DescriptorOp::Retire(_)
                     | DescriptorOp::ProtectWindow { .. }
             )
@@ -607,6 +614,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 | DescriptorOp::ArmCow(_)
                 | DescriptorOp::Retire(_)
                 | DescriptorOp::Unmap(_)
+                | DescriptorOp::UnmapWindow(_)
                 | DescriptorOp::Publish { .. } => true,
                 DescriptorOp::CowRepoint { new, .. } => (new.raw() + offset).is_multiple_of(bytes),
                 _ => false,
@@ -755,12 +763,13 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 (entry & !(PRESENT | PREPARED | COW)) | RETIRED
             }
-            // An unlink drops a host-mapped leaf (a shared file window page,
-            // #1338, or a host alias). Private custody only ever retires.
-            DescriptorOp::Unmap(_) if entry & PRIVATE != 0 => {
+            DescriptorOp::Unmap(_) => 0,
+            // A window unlink drops only a host-mapped leaf (a shared file
+            // window page, #1338). Private custody only ever retires.
+            DescriptorOp::UnmapWindow(_) if entry & PRIVATE != 0 => {
                 return Err(DescriptorRefusal::WrongBacking);
             }
-            DescriptorOp::Unmap(_) => 0,
+            DescriptorOp::UnmapWindow(_) => 0,
             // A window page is the file's own page, resident for the run:
             // only its access bits change. Private custody takes `Protect`.
             DescriptorOp::ProtectWindow { permissions: p, .. } => {
@@ -884,7 +893,7 @@ impl DescriptorTxn<'_> {
             DescriptorOp::CowRepoint {
                 old, new, backing, ..
             } => (old.raw(), new.raw(), 0, Some(backing)),
-            DescriptorOp::Unmap(_) => (0, 0, 0, None),
+            DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) => (0, 0, 0, None),
             DescriptorOp::ProtectWindow { permissions: p, .. } => (0, 0, permissions(p), None),
             DescriptorOp::Retire(_) => (0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (size.bytes(), 0, 0, None),
