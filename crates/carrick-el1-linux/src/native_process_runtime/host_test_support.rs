@@ -141,12 +141,15 @@ pub(crate) fn fail_signal_copies(errors: &[NativeProcessError]) {
 }
 
 #[cfg(test)]
+type BeforeSignalCopyHook = Box<dyn FnOnce(UserVa)>;
+
+#[cfg(test)]
 std::thread_local! {
-    static BEFORE_SIGNAL_COPY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(UserVa)>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_SIGNAL_COPY_HOOK: std::cell::RefCell<Option<BeforeSignalCopyHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-pub(crate) fn set_before_signal_copy_hook(hook: Box<dyn FnOnce(UserVa)>) {
+pub(crate) fn set_before_signal_copy_hook(hook: BeforeSignalCopyHook) {
     BEFORE_SIGNAL_COPY_HOOK.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
 }
 
