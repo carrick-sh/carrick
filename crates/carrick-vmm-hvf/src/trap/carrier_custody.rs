@@ -354,11 +354,16 @@ pub(crate) type NativeExecOwner =
     carrick_hal::exec_owner::ExecPreparations<crate::trap::PreparedNativeExecSuccessor>;
 
 /// Backend handle retained by extents that retire outside carrier custody.
+///
+/// Every clone shares the backend and its unretired leases: extents this
+/// backend mapped whose pre-custody rollback unmap failed, kept with their
+/// backing until a later unmap or the VM's destroy (#2968 confirming review).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::clone::Clone)]
-pub(crate) struct CarrierStage2Backend(
-    std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
-);
+pub(crate) struct CarrierStage2Backend {
+    backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
+    pub(crate) unretired: std::sync::Arc<parking_lot::Mutex<Vec<super::UnretiredStage2Lease>>>,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::fmt::Debug for CarrierStage2Backend {
@@ -371,16 +376,23 @@ impl std::fmt::Debug for CarrierStage2Backend {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierStage2Backend {
+    fn new(backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>) -> Self {
+        Self {
+            backend,
+            unretired: std::sync::Arc::default(),
+        }
+    }
+
     pub(crate) fn as_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
-        self.0.as_ref()
+        self.backend.as_ref()
     }
 
     /// Whether `other` is this exact handle: the same carrier VM's backend,
     /// not merely a backend of the same kind.
     pub(crate) fn is_same_backend(&self, other: &Self) -> bool {
         std::ptr::addr_eq(
-            std::sync::Arc::as_ptr(&self.0),
-            std::sync::Arc::as_ptr(&other.0),
+            std::sync::Arc::as_ptr(&self.backend),
+            std::sync::Arc::as_ptr(&other.backend),
         )
     }
 
@@ -390,7 +402,7 @@ impl CarrierStage2Backend {
     pub(crate) fn for_test(
         backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
     ) -> Self {
-        Self(backend)
+        Self::new(backend)
     }
 }
 
@@ -822,7 +834,7 @@ impl CarrierVmCustody {
         });
         let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
-            stage2_backend: CarrierStage2Backend(std::sync::Arc::new(
+            stage2_backend: CarrierStage2Backend::new(std::sync::Arc::new(
                 super::stage2_backend::HvfStage2,
             )),
             transfer_carrier,
@@ -994,6 +1006,7 @@ impl CarrierVmCustody {
                 {
                     carrick_core::mm::retirement::terminalize_record(record);
                 }
+                self.stage2_backend.release_unretired_after_vm_destroy();
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -1086,6 +1099,7 @@ impl CarrierVmCustody {
                     ) {
                         pool.forget_backend_mapping();
                     }
+                    self.stage2_backend.release_unretired_after_vm_destroy();
                     metadata.release_destroyed_vm(generation.0, |identity| {
                         let _ = state.remove_record(identity.record_id);
                     });
@@ -2131,6 +2145,69 @@ mod carrier_vm_custody_tests {
             super::alias_backing_is_live(host_addr),
             "the backing of a still-mapped foreign lease must stay live"
         );
+        assert_eq!(
+            mapper_handle.unretired_lease_count(),
+            1,
+            "the mapper keeps the lease and its backing"
+        );
+
+        // A refused retry keeps them; the first unmap that succeeds settles
+        // the lease and only then frees the backing.
+        assert_eq!(mapper_handle.retry_unretired_unmaps(), 1);
+        assert!(super::alias_backing_is_live(host_addr));
+        mapper
+            .fail_unmaps
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(mapper_handle.retry_unretired_unmaps(), 0);
+        assert_eq!(mapper.unmaps.lock().len(), 3);
+        assert!(
+            !super::alias_backing_is_live(host_addr),
+            "an unmapped lease frees its backing"
+        );
+    }
+
+    /// The mapping carrier's VM destroy takes its stage 2 with it, so an
+    /// unretired lease settles there without another unmap.
+    #[test]
+    fn a_mapper_vm_destroy_settles_its_unretired_leases_without_an_unmap() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let receiver = crate::trap::test_carrier_custody();
+        let mapper = std::sync::Arc::new(RecordingStage2::default());
+        mapper
+            .fail_unmaps
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mapper_handle =
+            super::CarrierStage2Backend::for_test(std::sync::Arc::clone(&mapper) as _);
+        let key = (0xa085_0000_0000_u64, 0x4000_u64);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate the lease's backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped(mapper_handle.clone());
+        assert!(
+            super::register_global_frame_host_owner_in(
+                &receiver,
+                lease,
+                mapping,
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            )
+            .is_err()
+        );
+        assert_eq!(mapper_handle.unretired_lease_count(), 1);
+        assert!(super::alias_backing_is_live(host_addr));
+
+        mapper_handle.release_unretired_after_vm_destroy();
+
+        assert_eq!(mapper_handle.unretired_lease_count(), 0);
+        assert_eq!(
+            mapper.unmaps.lock().len(),
+            1,
+            "the destroy settles without another unmap"
+        );
+        assert!(!super::alias_backing_is_live(host_addr));
     }
 
     /// A test carrier's custody tears down through the production sequence

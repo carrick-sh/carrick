@@ -1282,6 +1282,141 @@ impl GlobalFrameStage2Lease {
     }
 }
 
+/// A lease its mapper still holds in stage 2 because its pre-custody
+/// rollback unmap failed, kept with the backing it translates to. Only the
+/// backend that mapped it may retire it: by a later successful unmap, or by
+/// that carrier VM's destroy, which takes the whole stage 2 with it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct UnretiredStage2Lease {
+    /// Active and mapped; its backend handle is taken out, so the mapper's
+    /// list never holds a handle to itself.
+    lease: GlobalFrameStage2Lease,
+    backing: Option<RetainedStage2Backing>,
+}
+
+/// The backing an unretired lease translates to, held only to keep it alive
+/// and dropped only after the lease's mapping is gone.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct RetainedStage2Backing(#[allow(dead_code)] GlobalFrameBacking);
+
+// SAFETY: nothing reads or writes through a retained backing; it is only kept
+// alive and, once its stage-2 mapping is gone, dropped (an munmap or a pool
+// return, both safe from any thread).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for RetainedStage2Backing {}
+
+/// A backing a lease transfer hands back on success and gives to the mapper
+/// with an unretired lease on failure.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) trait LeaseTransferBacking: Sized {
+    fn split_for_retention(self) -> Option<GlobalFrameBacking>;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl LeaseTransferBacking for () {
+    fn split_for_retention(self) -> Option<GlobalFrameBacking> {
+        None
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl LeaseTransferBacking for crate::host_mapping::OwnedHostMapping {
+    fn split_for_retention(self) -> Option<GlobalFrameBacking> {
+        Some(GlobalFrameBacking::Owned(self))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl LeaseTransferBacking for crate::frame_pool::PooledRootSlotHandle {
+    fn split_for_retention(self) -> Option<GlobalFrameBacking> {
+        Some(GlobalFrameBacking::PooledRoot(self))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl UnretiredStage2Lease {
+    /// The stage-2 mapping is gone: the lease's `Drop` releases its IPA
+    /// reservation, and only then is the backing freed.
+    fn settle_unmapped(mut self) {
+        self.lease.forget_backend_mapping();
+        drop(self);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for UnretiredStage2Lease {
+    fn drop(&mut self) {
+        if self.lease.active && self.lease.mapped {
+            // Never free memory a live stage 2 may still translate to. This
+            // runs only if the mapper's handle goes without its VM's destroy.
+            eprintln!(
+                "carrick: retaining the backing of unretired stage-2 lease {:?}",
+                self.lease.key()
+            );
+            if let Some(backing) = self.backing.take() {
+                std::mem::forget(backing);
+            }
+            self.lease.active = false;
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierStage2Backend {
+    /// Keep a lease this backend mapped, and its backing, until this backend
+    /// unmaps it or its VM is destroyed.
+    fn retain_unretired(
+        &self,
+        mut lease: GlobalFrameStage2Lease,
+        backing: Option<GlobalFrameBacking>,
+    ) {
+        lease.backend = None;
+        self.unretired.lock().push(UnretiredStage2Lease {
+            lease,
+            backing: backing.map(RetainedStage2Backing),
+        });
+    }
+
+    /// Retry the unmap of every unretired lease once. A lease that unmaps
+    /// settles; the rest stay for the next turn or the VM's destroy.
+    /// Returns how many remain.
+    pub(crate) fn retry_unretired_unmaps(&self) -> usize {
+        let pending = std::mem::take(&mut *self.unretired.lock());
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut remaining = Vec::new();
+        for entry in pending {
+            let (base, length) = entry.lease.key();
+            let unmapped = usize::try_from(length).is_ok_and(|size| {
+                unsafe { inventory_stage2_unmap(self.as_backend(), base, size) }.is_success()
+            });
+            if unmapped {
+                entry.settle_unmapped();
+            } else {
+                remaining.push(entry);
+            }
+        }
+        let mut unretired = self.unretired.lock();
+        unretired.extend(remaining);
+        unretired.len()
+    }
+
+    /// This backend's VM is destroyed, and its stage 2 with it: every
+    /// unretired lease settles without an unmap.
+    pub(crate) fn release_unretired_after_vm_destroy(&self) {
+        let released = std::mem::take(&mut *self.unretired.lock());
+        for entry in released {
+            entry.settle_unmapped();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unretired_lease_count(&self) -> usize {
+        self.unretired.lock().len()
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GlobalFrameStage2Lease {
     fn drop(&mut self) {
@@ -2089,11 +2224,36 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     custody: &std::sync::Arc<CarrierVmCustody>,
-    mut lease: GlobalFrameStage2Lease,
+    lease: GlobalFrameStage2Lease,
     host_addr: usize,
     perms: u64,
     logical_owner: Option<CarrierLogicalOwner>,
 ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+    transfer_global_frame_stage2_lease_with_backing(
+        custody,
+        lease,
+        (),
+        host_addr,
+        perms,
+        logical_owner,
+    )
+    .map(|(identity, ())| identity)
+}
+
+/// Transfer `lease` into `custody` as a record of `backing`, and hand the
+/// backing back. If the custody refuses the lease and the rollback unmap
+/// fails, the lease is still mapped: it and its backing stay with the
+/// backend that mapped it until that backend unmaps it or its VM is
+/// destroyed, never dropped.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn transfer_global_frame_stage2_lease_with_backing<B: LeaseTransferBacking>(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    mut lease: GlobalFrameStage2Lease,
+    backing: B,
+    host_addr: usize,
+    perms: u64,
+    logical_owner: Option<CarrierLogicalOwner>,
+) -> Result<(CarrierStage2RecordIdentity, B), TrapError> {
     if !lease.active || !lease.mapped || host_addr == 0 {
         return Err(TrapError::Hypervisor(format!(
             "global frame host owner lease is not active and mapped: key={:?} active={} mapped={} host=0x{host_addr:x}",
@@ -2150,11 +2310,14 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     let identity = match registration {
         Ok(identity) => identity,
         Err(registration_error) => {
-            lease.try_retire().map_err(|rollback_error| {
-                TrapError::Hypervisor(format!(
-                    "{registration_error}; explicit pre-custody rollback failed: {rollback_error}"
-                ))
-            })?;
+            if let Err(rollback_error) = lease.try_retire() {
+                if let Some(mapper) = lease.backend.take() {
+                    mapper.retain_unretired(lease, backing.split_for_retention());
+                }
+                return Err(TrapError::Hypervisor(format!(
+                    "{registration_error}; explicit pre-custody rollback failed, so the mapper keeps the lease and its backing: {rollback_error}"
+                )));
+            }
             return Err(registration_error);
         }
     };
@@ -2166,7 +2329,7 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     {
         lease.drop_backing_audit = None;
     }
-    Ok(identity)
+    Ok((identity, backing))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2223,12 +2386,9 @@ pub(crate) fn register_global_frame_host_owner_in_using(
             std::backtrace::Backtrace::force_capture(),
         );
     }
-    let record_identity = transfer_global_frame_stage2_lease_to_custody(
-        custody,
-        lease,
-        mapping.as_ptr() as usize,
-        perms,
-        None,
+    let host_addr = mapping.as_ptr() as usize;
+    let (record_identity, mapping) = transfer_global_frame_stage2_lease_with_backing(
+        custody, lease, mapping, host_addr, perms, None,
     )?;
     let generation = record_identity
         .logical_owner
@@ -2747,10 +2907,12 @@ impl StructuralBackingOwner {
                 "structural stage-2 lease ({lease_base:#x}, {lease_len:#x}) does not match physical extent ({physical_ipa:#x}, {physical_size:#x})"
             )));
         }
-        let identity = transfer_global_frame_stage2_lease_to_custody(
+        let host_addr = mapping.as_ptr() as usize;
+        let (identity, mapping) = transfer_global_frame_stage2_lease_with_backing(
             custody,
             stage2_lease,
-            mapping.as_ptr() as usize,
+            mapping,
+            host_addr,
             perms,
             Some(CarrierLogicalOwner {
                 id: epoch.raw(),
@@ -2812,9 +2974,10 @@ impl StructuralBackingOwner {
             )));
         }
         let host_addr = handle.as_mut_ptr() as usize;
-        let identity = transfer_global_frame_stage2_lease_to_custody(
+        let (identity, handle) = transfer_global_frame_stage2_lease_with_backing(
             custody,
             stage2_lease,
+            handle,
             host_addr,
             perms,
             Some(CarrierLogicalOwner {
@@ -4187,6 +4350,9 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     custody: &CarrierVmCustody,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> PendingGlobalFrameRetirementTurnReport {
+    // Leases this carrier mapped whose rollback unmap failed retry here,
+    // at the same idle safe point, whether or not a record asked.
+    let _ = custody.stage2_backend_handle().retry_unretired_unmaps();
     if !custody.take_global_frame_retirement_retry_request() {
         return PendingGlobalFrameRetirementTurnReport::default();
     }
