@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 22;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 23;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -1485,7 +1485,7 @@ pub enum ReadinessBlocker {
 #[derive(::core::fmt::Debug)]
 pub struct ThreadLifecyclePage {
     gate: AtomicU32,
-    live: AtomicU32,
+    live: AtomicU64,
     pending: PendingSummary,
     entries: [PoolEntry; THREAD_POOL_ENTRIES],
     /// [`LifecycleHatches`] bits, fixed when the page is built.
@@ -1506,6 +1506,8 @@ pub struct ThreadLifecyclePage {
     extension_guest: AtomicU64,
     /// Linked segments, published after the link that reaches the newest.
     extension_segments: AtomicU32,
+    exit_reservation_wait_mm: AtomicU64,
+    exit_reservation_wait_address: AtomicU64,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -1709,7 +1711,7 @@ impl ThreadLifecyclePage {
     pub const fn with_hatches(hatches: LifecycleHatches) -> Self {
         Self {
             gate: AtomicU32::new(GateState::Open as u32),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
             pending: PendingSummary::new(),
             entries: [const { PoolEntry::new() }; THREAD_POOL_ENTRIES],
             serving: AtomicU32::new(hatches.bits()),
@@ -1725,6 +1727,8 @@ impl ThreadLifecyclePage {
             extension_host: AtomicU64::new(0),
             extension_guest: AtomicU64::new(0),
             extension_segments: AtomicU32::new(0),
+            exit_reservation_wait_mm: AtomicU64::new(0),
+            exit_reservation_wait_address: AtomicU64::new(0),
         }
     }
 
@@ -2184,6 +2188,34 @@ impl ThreadLifecyclePage {
     pub fn clear_exit_wait(&self) {
         self.exit_wait_address.store(0, Ordering::SeqCst);
     }
+
+    pub fn publish_exit_reservation_wait(
+        &self,
+        mm: carrick_core_abi::entry::EntryMmKey,
+        address: u64,
+    ) {
+        self.exit_reservation_wait_mm
+            .store(mm.raw(), Ordering::Relaxed);
+        self.exit_reservation_wait_address
+            .store(address, Ordering::SeqCst);
+    }
+
+    pub fn exit_reservation_wait(&self) -> Option<(carrick_core_abi::entry::EntryMmKey, u64)> {
+        let address = self.exit_reservation_wait_address.load(Ordering::SeqCst);
+        (address != 0).then(|| {
+            (
+                carrick_core_abi::entry::EntryMmKey::from_raw(
+                    self.exit_reservation_wait_mm.load(Ordering::Relaxed),
+                ),
+                address,
+            )
+        })
+    }
+
+    pub fn clear_exit_reservation_wait(&self) {
+        self.exit_reservation_wait_address
+            .store(0, Ordering::SeqCst);
+    }
     fn activity(&self) -> Option<&ThreadLedgerActivity> {
         #[cfg(target_os = "none")]
         let address = self.ledger_guest.load(Ordering::Acquire);
@@ -2371,6 +2403,15 @@ impl Lifecycle for ThreadLifecyclePage {
             address: core::num::NonZeroU64::new(address)?,
         })
     }
+    fn exit_reservation_notification(
+        &self,
+    ) -> Option<carrick_core::terminal::TerminalNotification> {
+        let (mm, address) = self.exit_reservation_wait()?;
+        Some(carrick_core::terminal::TerminalNotification {
+            mm,
+            address: core::num::NonZeroU64::new(address)?,
+        })
+    }
     fn process_exit_custody(&self) -> &carrick_core::terminal::ProcessExitCustody {
         &self.terminal
     }
@@ -2387,7 +2428,7 @@ impl Lifecycle for ThreadLifecyclePage {
     fn gate_word(&self) -> &AtomicU32 {
         &self.gate
     }
-    fn live_word(&self) -> &AtomicU32 {
+    fn live_word(&self) -> &AtomicU64 {
         &self.live
     }
     fn entry_count(&self) -> usize {
@@ -2407,7 +2448,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 53] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 55] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -2461,6 +2502,8 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 53] = [
     THREAD_POOL_SEGMENT_ENTRIES as u64,
     ::core::mem::size_of::<ThreadLifecycleSegment>() as u64,
     ::core::mem::offset_of!(ThreadLifecycleSegment, controls) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, exit_reservation_wait_mm) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, exit_reservation_wait_address) as u64,
 ];
 
 #[cfg(test)]
@@ -3629,36 +3672,38 @@ mod layout_manifest {
                      extension_host: _,
                      extension_guest: _,
                      extension_segments: _,
+                     exit_reservation_wait_mm: _,
+                     exit_reservation_wait_address: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
-        field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
-        field!(ThreadLifecyclePage, pending, PendingSummary, 8, 8, 8);
+        field!(ThreadLifecyclePage, live, AtomicU64, 8, 8, 8);
+        field!(ThreadLifecyclePage, pending, PendingSummary, 16, 8, 8);
         field!(
             ThreadLifecyclePage,
             entries,
             [PoolEntry; THREAD_POOL_ENTRIES],
-            16,
+            32,
             640,
             16
         );
-        field!(ThreadLifecyclePage, serving, AtomicU32, 656, 4, 4);
-        field!(ThreadLifecyclePage, ledger_host, AtomicU64, 664, 8, 8);
-        field!(ThreadLifecyclePage, ledger_guest, AtomicU64, 672, 8, 8);
+        field!(ThreadLifecyclePage, serving, AtomicU32, 672, 4, 4);
+        field!(ThreadLifecyclePage, ledger_host, AtomicU64, 680, 8, 8);
+        field!(ThreadLifecyclePage, ledger_guest, AtomicU64, 688, 8, 8);
         field!(
             ThreadLifecyclePage,
             controls,
             [AtomicU64; THREAD_POOL_ENTRIES],
-            680,
+            696,
             64,
             8
         );
-        field!(ThreadLifecyclePage, exit_wait_mm, AtomicU64, 744, 8, 8);
-        field!(ThreadLifecyclePage, exit_wait_address, AtomicU64, 752, 8, 8);
+        field!(ThreadLifecyclePage, exit_wait_mm, AtomicU64, 760, 8, 8);
+        field!(ThreadLifecyclePage, exit_wait_address, AtomicU64, 768, 8, 8);
         field!(
             ThreadLifecyclePage,
             host_born,
             [HostBornMember; THREAD_POOL_ENTRIES],
-            760,
+            776,
             256,
             8
         );
@@ -3666,7 +3711,7 @@ mod layout_manifest {
             ThreadLifecyclePage,
             host_birth_mutations,
             AtomicU32,
-            1016,
+            1032,
             4,
             4
         );
@@ -3674,7 +3719,7 @@ mod layout_manifest {
             ThreadLifecyclePage,
             terminal,
             carrick_core::terminal::ProcessExitCustody,
-            1020,
+            1036,
             12,
             4
         );
@@ -3682,19 +3727,35 @@ mod layout_manifest {
             ThreadLifecyclePage,
             closing_verdict,
             ClosingVerdictRecord,
-            1032,
+            1048,
             88,
             8
         );
-        field!(ThreadLifecyclePage, extension_host, AtomicU64, 1120, 8, 8);
-        field!(ThreadLifecyclePage, extension_guest, AtomicU64, 1128, 8, 8);
+        field!(ThreadLifecyclePage, extension_host, AtomicU64, 1136, 8, 8);
+        field!(ThreadLifecyclePage, extension_guest, AtomicU64, 1144, 8, 8);
         field!(
             ThreadLifecyclePage,
             extension_segments,
             AtomicU32,
-            1136,
+            1152,
             4,
             4
+        );
+        field!(
+            ThreadLifecyclePage,
+            exit_reservation_wait_mm,
+            AtomicU64,
+            1160,
+            8,
+            8
+        );
+        field!(
+            ThreadLifecyclePage,
+            exit_reservation_wait_address,
+            AtomicU64,
+            1168,
+            8,
+            8
         );
     }
 }

@@ -546,8 +546,14 @@ impl Kernel {
             &mut state,
             ThreadRetirementLane::Host,
             failpoint,
-        )?;
+        );
         drop(state);
+        if let Some(notification) = carrick_core::lifecycle::Lifecycle::take_exit_reservation_wake(
+            &*context.lifecycle_page(),
+        ) {
+            let _ = crate::el1_zone::wake_exit_wait_channel(notification.mm, notification.address);
+        }
+        let next = next?;
         self.finish_thread_retirement(context, &files);
         Ok(next)
     }

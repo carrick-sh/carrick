@@ -609,9 +609,16 @@ impl HostThreadRetirementReceipt {
 }
 
 /// A raw thread exit at the page's last live membership becomes a process
-/// exit. The process owner then closes admission and fixes the group status.
+/// exit only when no peer holds a refundable exit reservation that could
+/// still restore membership.
 pub fn raw_exit_is_process(page: &impl Lifecycle) -> bool {
-    page.live() == 1
+    page.live_is_sole_uncontested()
+}
+
+/// Whether the page sits at the one-member floor only because a peer holds an
+/// uncommitted refundable exit reservation.
+pub fn raw_exit_contended_at_floor(page: &impl Lifecycle) -> bool {
+    page.live_is_contended_floor()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1192,15 +1199,31 @@ impl HostThreadExitMembership<'_> {
         member: &dyn MemberControl,
         registry: &crate::lifecycle::RegistryWriteHeld<'_>,
     ) -> Result<Option<NativeAbiReap>, NativeAbiReapError> {
+        let mut wake = None;
+        self.retire_published_with_wake(entry, member, registry, &mut wake)
+    }
+
+    pub fn retire_published_with_wake(
+        self,
+        entry: EntryRef,
+        member: &dyn MemberControl,
+        registry: &crate::lifecycle::RegistryWriteHeld<'_>,
+        wake: &mut Option<TerminalNotification>,
+    ) -> Result<Option<NativeAbiReap>, NativeAbiReapError> {
         use crate::lifecycle::{EntryState, TransitionError};
         if !core::ptr::addr_eq(self.member.control(), member)
             || self.entry != Some(entry)
             || member.member_entry() != self.entry
         {
+            if let Some(reserved) = self.reserved {
+                *wake = reserved.rollback_with_wake();
+            }
             return Err(TransitionError::StaleGeneration.into());
         }
         if let Some(reserved) = self.reserved {
-            crate::lifecycle::retire_host_member(self.page, entry, member, reserved, registry)?;
+            crate::lifecycle::retire_host_member_with_wake(
+                self.page, entry, member, reserved, registry, wake,
+            )?;
             return Ok(None);
         }
         if member.exit_custody().abi_exit_pending()
@@ -1220,9 +1243,18 @@ impl HostThreadExitMembership<'_> {
     }
 
     pub fn publish(self) {
-        if let Some(reserved) = self.reserved {
-            reserved.publish();
-        }
+        let _ = self.publish_with_wake();
+    }
+
+    pub fn publish_with_wake(self) -> Option<TerminalNotification> {
+        self.reserved
+            .and_then(NonfinalExitMembership::publish_with_wake)
+    }
+
+    pub fn rollback_with_wake(mut self) -> Option<TerminalNotification> {
+        self.reserved
+            .take()
+            .and_then(NonfinalExitMembership::rollback_with_wake)
     }
 }
 
@@ -1512,7 +1544,7 @@ mod tests {
     use crate::lifecycle::AtomicEntry;
     use carrick_core_abi::entry::SnapshotGeneration;
     use carrick_sched_core::process::TaskSerial;
-    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::{AtomicU32, AtomicU64};
 
     fn birth_receipt(task: u64, birth: u64, thread: u64) -> ThreadBirthIdentity {
         ThreadBirthIdentity::from_parts(
@@ -1526,7 +1558,7 @@ mod tests {
     struct Page {
         terminal: crate::terminal::ProcessExitCustody,
         gate: AtomicU32,
-        live: AtomicU32,
+        live: AtomicU64,
     }
     impl Lifecycle for Page {
         fn process_exit_custody(&self) -> &crate::terminal::ProcessExitCustody {
@@ -1539,7 +1571,7 @@ mod tests {
         fn gate_word(&self) -> &AtomicU32 {
             &self.gate
         }
-        fn live_word(&self) -> &AtomicU32 {
+        fn live_word(&self) -> &AtomicU64 {
             &self.live
         }
         fn entry_count(&self) -> usize {
@@ -1558,7 +1590,7 @@ mod tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(0),
+            live: AtomicU64::new(0),
         };
         let identity = ProcessTerminalIdentity::from_exit(
             TaskKey {
@@ -1589,7 +1621,7 @@ mod tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
         };
         let task = TaskKey {
             id: TaskId::from_registry_allocation(NonZeroI32::new(43).unwrap()),
@@ -1626,7 +1658,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
         };
         let task = TaskKey {
             id: TaskId::from_registry_allocation(NonZeroI32::new(44).unwrap()),
@@ -1662,7 +1694,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
         };
         let task = TaskKey {
             id: TaskId::from_registry_allocation(NonZeroI32::new(45).unwrap()),
@@ -1704,12 +1736,12 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
         };
         let peer = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
         };
         page.decline_to_host();
         assert_eq!(page.gate(), GateState::HostOnly);
@@ -1735,7 +1767,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         let first = NativeServiceClaim::acquire(&page).unwrap();
         let second = NativeServiceClaim::acquire(&page).unwrap();
@@ -1761,7 +1793,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(GateState::ForkClosing as u32),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         {
             let _admission = TerminalCustody::<Process, Live>::close_admission(&page);
@@ -1777,7 +1809,7 @@ mod tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         let task = TaskKey {
             id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
@@ -1812,7 +1844,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         let task = TaskKey {
             id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
@@ -1894,7 +1926,7 @@ mod tests {
         let page = Page {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         let at_observation = std::sync::Barrier::new(2);
         let after_close = std::sync::Barrier::new(2);
@@ -1954,7 +1986,7 @@ mod tests {
         struct OneEntryPage {
             terminal: ProcessExitCustody,
             gate: AtomicU32,
-            live: AtomicU32,
+            live: AtomicU64,
             entry: AtomicEntry,
         }
         impl Lifecycle for OneEntryPage {
@@ -1967,7 +1999,7 @@ mod tests {
             fn gate_word(&self) -> &AtomicU32 {
                 &self.gate
             }
-            fn live_word(&self) -> &AtomicU32 {
+            fn live_word(&self) -> &AtomicU64 {
                 &self.live
             }
             fn entry_count(&self) -> usize {
@@ -1999,7 +2031,7 @@ mod tests {
         let page = OneEntryPage {
             terminal: ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
             entry: AtomicEntry::new(pack(0, EntryState::Vacant)),
         };
         let entry = page.reserve_stock(0).unwrap();
@@ -2095,7 +2127,7 @@ mod tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(0),
+            live: AtomicU64::new(0),
         };
         let identity = ProcessTerminalIdentity::from_exit(
             TaskKey {
