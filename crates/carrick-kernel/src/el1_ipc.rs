@@ -1947,6 +1947,86 @@ mod tests {
             assert_eq!(carrier.zone.slot(slot).queued(), 1);
         }
 
+        /// #2928: the x86 ring defers an object-wake completion it could not
+        /// place (the waiter's affinity excludes the waker's CPU) to the
+        /// carrier's completion chain and rings only the waker's doorbell, as
+        /// `carrick_el1::substrate::sched::object_wait::deliver_completion`
+        /// does. The host boundary that consumes that doorbell
+        /// (`settle_host_work_boundary`, the x86 executor's `WORK_PORT` step)
+        /// must settle the chain: the waiter goes to Held custody, and the
+        /// CPU it may run on takes it when published. Left on the chain it
+        /// stays `Transferring` while both CPUs idle.
+        #[test]
+        fn work_boundary_settles_the_carrier_completion_chain() {
+            let carrier = carrier();
+            let dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
+            let owner = kernel.ipc().expect("kernel IPC owner");
+            owner
+                .bind_carrier_zone(carrier.clone())
+                .unwrap_or_else(|_| panic!("first binding"));
+            let object = owner.create_pipe(65536).expect("pipe");
+            let record = park_reader(&carrier, object);
+            let key = carrick_el1_abi::ipc::object_wait_key(object, pipe::WaitFor::Readable)
+                .expect("lane key");
+            // The waker is the ring on CPU 0, running another process; the
+            // waiter's affinity excludes CPU 0 and no executor drives CPU 1.
+            let here = SlotId::new(0);
+            carrier.zone.drive(here, 1);
+            carrier.zone.publish_slot(here, MM + 1, Some(0), 1);
+            carrier.zone.enter_guest(here);
+            let waker = carrick_el1_abi::CurrentTask::new();
+            let deferred = std::cell::Cell::new(false);
+            let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                ParkedContextWords,
+            >| {
+                let (_, _, chained) = owned.defer_handbacks();
+                if chained {
+                    deferred.set(true);
+                    waker.linux.mark_pending_host_work();
+                }
+            };
+            let queue = carrier
+                .zone
+                .object_wait(key, &ShortLockSpin, &completion)
+                .expect("lane");
+            let mut effects = carrick_sched_core::WakeEffects::default();
+            queue.notify_object(here, &mut effects).expect("notify");
+            drop(queue);
+            // As `deliver_effects_with` does for the ring: a waiter handed
+            // to the host owes the waker's boundary, its only doorbell.
+            if effects.owes_host_boundary() || deferred.get() {
+                waker.linux.mark_pending_host_work();
+            }
+            assert!(effects.handed_to_host, "{effects:?}");
+            assert!(matches!(
+                carrier.zone.record(record).claim(),
+                carrick_sched_core::Claim::Transferring { .. }
+            ));
+            let doorbell = waker.linux.take_host_work_doorbell();
+            assert!(doorbell.is_some());
+            crate::el1_delegation::settle_host_work_boundary(&kernel, false, doorbell);
+            assert!(
+                matches!(
+                    carrier.zone.record(record).claim(),
+                    carrick_sched_core::Claim::Held { .. }
+                ),
+                "the boundary left the waiter {:?}",
+                carrier.zone.record(record).claim()
+            );
+            // Held custody places it exactly once when CPU 1 is published.
+            let peer = SlotId::new(1);
+            carrier.zone.drive_and_publish(
+                peer,
+                1,
+                MM,
+                Some(1),
+                carrick_sched_core::AffinitySource::UNBOUND,
+            );
+            assert_eq!(queued_on(&carrier, record), Some(peer));
+        }
+
         /// A carrier binds its zone once; a second binding is refused.
         #[test]
         fn carrier_zone_binds_once() {
