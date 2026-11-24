@@ -15690,6 +15690,21 @@ fn native_descriptor_argument_witness(
         (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64,
         "child 1 shares the writer OFD flags mutated by child 0"
     );
+    // #2949 review P0-4: a close_range over fd 5, which owes host close
+    // effects. The host replays a numeric close, never a range, so the
+    // ring leaves the call unrouted before it closes anything: no replay
+    // owed, and fd 5 still open for the plain close below.
+    let sys_close_range = carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw();
+    assert_eq!(
+        run_in_child(1, sys_close_range, [5, 5, 0]).0,
+        CompletionRoute::Forward,
+        "a range owing host close effects is unrouted"
+    );
+    assert_eq!(task.linux.take_served_boundary(), None);
+    assert!(
+        run_in_child(1, sys_fcntl, [5, LINUX_F_GETFD, 0]).1 >= 0,
+        "an unrouted close_range closes nothing"
+    );
     let (close_effect_route, close_effect_result) = run_in_child(1, sys_close, [5, 0, 0]);
     assert_eq!(close_effect_result, 0);
     assert_eq!(close_effect_route, CompletionRoute::WithWork);
@@ -22220,6 +22235,76 @@ fn arm_root_ring_epoll_takes_a_host_socket_member() {
         mismatches.is_empty(),
         "a ring epoll's host member left libuv's contract:\n{}",
         mismatches.join("\n")
+    );
+}
+
+/// The host-loaded ARM root's `close_range(reader, file, 0)` over a ring
+/// pipe (reader, writer) and a host file opened after it: the call's route
+/// and result, then `F_GETFD` of the reader, the writer and the file.
+#[cfg(test)]
+fn arm_root_close_range_over_a_ring_pipe_and_a_host_file() -> (
+    carrick_personality_linux::dispatch::CompletionRoute,
+    i64,
+    [i64; 3],
+) {
+    use carrick_abi::{LINUX_AT_FDCWD, LINUX_F_GETFD, LINUX_O_RDONLY};
+    use carrick_personality_linux::crossing::nr as sys;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+
+    with_arm_root_host_dispatch(|call_root| {
+        let pipe = GuestUserBuffer::zeroed(8);
+        let (route, made) = call_root(sys::PIPE2.raw(), [pipe.arg(), 0, 0, 0, 0, 0]);
+        assert_eq!((route, made), (CompletionRoute::Served, 0), "pipe2");
+        let [reader, writer] = fd_pair_of(&pipe);
+        let path = GuestUserBuffer::from_bytes(b"/dev/null\0");
+        let (route, file) = call_root(
+            sys::OPENAT.raw(),
+            [LINUX_AT_FDCWD, path.arg(), LINUX_O_RDONLY, 0, 0, 0],
+        );
+        assert_eq!(route, CompletionRoute::Forward, "openat: {file}");
+        assert!(file >= 0, "openat: {file}");
+        let fds = [reader, writer, file as u64];
+        let first = *fds.iter().min().unwrap();
+        let last = *fds.iter().max().unwrap();
+        assert_eq!(first, reader, "the range starts at the ring pipe end");
+        let (route, closed) = call_root(sys::CLOSE_RANGE.raw(), [first, last, 0, 0, 0, 0]);
+        let after = fds.map(|fd| call_root(sys::FCNTL.raw(), [fd, LINUX_F_GETFD, 0, 0, 0, 0]).1);
+        (route, closed, after)
+    })
+    .0
+}
+
+/// #2949 review P0-3: the host-loaded ARM root's table is borrowed, with
+/// host slots and ring objects side by side. Its `close_range` keeps that
+/// table's one route (the host's, as on main), whatever the range's first
+/// number names: a range starting at a ring pipe end is never served by the
+/// ring alone because of that one number. The host closes the file.
+#[test]
+fn arm_root_close_range_keeps_the_borrowed_tables_route() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_syscall_abi::LINUX_EBADF;
+
+    let (route, closed, after) = arm_root_close_range_over_a_ring_pipe_and_a_host_file();
+    assert_eq!(
+        (route, closed, after[2]),
+        (CompletionRoute::Forward, 0, LINUX_EBADF.guest_retval()),
+        "the root's close_range (route, result, F_GETFD of the host file)"
+    );
+}
+
+/// The same range must also close the root's ring pipe, as Linux does. The
+/// host route walks only its FileTable and leaves both ends open (#2963).
+#[test]
+#[ignore = "#2963: the ARM root's host close_range leaves its ring descriptors open"]
+fn arm_root_close_range_over_a_ring_pipe_and_a_host_file_closes_all_three() {
+    use carrick_syscall_abi::LINUX_EBADF;
+
+    let (_, closed, after) = arm_root_close_range_over_a_ring_pipe_and_a_host_file();
+    assert_eq!(
+        (closed, after),
+        (0, [LINUX_EBADF.guest_retval(); 3]),
+        "the root's close_range (result, F_GETFD of the pipe ends and the host file)"
     );
 }
 

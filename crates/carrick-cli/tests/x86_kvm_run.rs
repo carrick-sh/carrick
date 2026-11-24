@@ -931,7 +931,11 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
 /// nothing closed) until #2930; every other line must match Linux. Last, a
 /// fork child's leader raw-exits beside its one worker thread, whose
 /// `CLOSE_RANGE_UNSHARE` is then a plain range (#2949 review P0-1: the
-/// leader's credential row outlives it, the live count does not).
+/// leader's credential row outlives it, the live count does not). Then a
+/// fork child's plain `close_range` over a host file it holds a record
+/// lock on (#2949 review P0-4): Linux closes it, and a second process's
+/// lock then succeeds. An x86 fork child's record locks are the ring's, so
+/// the range owes no host close effect and must match Linux exactly.
 #[test]
 fn mounted_static_x86_close_range_matches_native() {
     if skip_without_kvm() {
@@ -948,7 +952,9 @@ fn mounted_static_x86_close_range_matches_native() {
             "-O1",
         ],
     );
+    // The fixture makes `cr_work` in its working directory.
     let native = Command::new(&elf)
+        .current_dir(dir.path())
         .timeout(Duration::from_secs(10))
         .output()
         .expect("run native close-range oracle");
@@ -957,10 +963,10 @@ fn mounted_static_x86_close_range_matches_native() {
     let guest = run_mounted_binary(&elf, "close-range", false);
     let native_out = String::from_utf8_lossy(&native.stdout);
     let shared_native = "t shared=0 unshare=0 own=-9 root=0 -9\n";
-    assert!(
-        native_out.contains(shared_native),
-        "native oracle: {native_out}"
-    );
+    let effects_native = "e lock=0 range=0 fd=-9 peer=0\n";
+    for line in [shared_native, effects_native] {
+        assert!(native_out.contains(line), "native oracle: {native_out}");
+    }
     // The thread's UNSHARE needs a table published for it alone (#2930):
     // unrouted, it must leave the shared table as it was.
     let shared_unrouted = "t shared=0 unshare=-38 own=0 root=0 -9\n";
@@ -968,7 +974,8 @@ fn mounted_static_x86_close_range_matches_native() {
     let guest_out = String::from_utf8_lossy(&guest.stdout);
     assert!(
         guest_out == native_out || guest_out == expected_unrouted,
-        "c is the fork child, r the root, t the root's CLONE_FILES thread; each \
+        "c is the fork child, r the root, t the root's CLONE_FILES thread, l a \
+         lone worker, e the record-lock child; each \
          c/r line is a call's return value, then F_GETFD of the four fds (-9 \
          EBADF, 1 FD_CLOEXEC).\n  left: {guest_out:?}\n right: {native_out:?}\nStderr: {}",
         String::from_utf8_lossy(&guest.stderr)
