@@ -835,12 +835,12 @@ impl CarrierVmCustody {
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn new_live_fixture() -> Self {
         let custody = Self::new();
-        let generation = custody.begin_create().unwrap_or_else(|error| {
-            carrick_fatal::carrick_fatal!("hvf::custody", "live fixture begin_create: {error:?}")
-        });
-        custody.commit_create(generation).unwrap_or_else(|error| {
-            carrick_fatal::carrick_fatal!("hvf::custody", "live fixture commit_create: {error:?}")
-        });
+        // A fresh custody is Vacant, so both transitions hold; a failure would
+        // leave no live generation, which every fixture user then reports.
+        let live = custody
+            .begin_create()
+            .and_then(|generation| custody.commit_create(generation));
+        debug_assert!(live.is_ok(), "live fixture: {live:?}");
         custody
     }
 
