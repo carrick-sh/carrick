@@ -2657,7 +2657,11 @@ impl<
         let range = ReservationRange::new(hint, hint.checked_add(len)?)?;
         let layout = self.state().layout;
         (!self.in_layout(range)
-            && Policy::external_anonymous_aperture(layout, range, user_end.min(Geometry::USER_VA_END)))
+            && Policy::external_anonymous_aperture(
+                layout,
+                range,
+                user_end.min(Geometry::USER_VA_END),
+            ))
         .then_some(ExternalAnonymousHint(range))
     }
     /// Settle a private anonymous hint through this MM's allocation owner.

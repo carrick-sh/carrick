@@ -143,9 +143,7 @@ const _: () = {
     assert!(LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE <= LINUX_MMAP_BASE);
     assert!(crate::vdso::LINUX_VDSO_BASE + crate::vdso::LINUX_VDSO_SIZE <= LINUX_MMAP_BASE);
     assert!(crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE <= LINUX_MMAP_BASE);
-    assert!(
-        carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_REGION_SIZE <= LINUX_MMAP_BASE
-    );
+    assert!(carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_REGION_SIZE <= LINUX_MMAP_BASE);
 };
 /// Reserved identity-page word; zero means no EL1 clock admission.
 pub const IDENTITY_OFF_CLOCK_GATE: u64 = el1_clock::CLOCK_GATE_OFFSET;
