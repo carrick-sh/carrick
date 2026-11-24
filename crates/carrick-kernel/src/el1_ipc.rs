@@ -561,7 +561,18 @@ pub struct HostIpc {
     /// The deadlines of native members' poll waits (#231).
     poll_deadlines: crate::host_readiness::PollDeadlines,
     native_epolls: Mutex<Option<Arc<crate::dispatch::net::native_epoll::NativeSocketEpolls>>>,
+    /// Whether an executor can still run the ring over this region (#2955).
+    guest: GuestExecution,
 }
+
+/// Whether any vCPU can still run ring code over a region (#2955).
+#[derive(Debug, Default)]
+struct GuestExecution {
+    stopped: std::sync::atomic::AtomicBool,
+    /// Tables and extents left in place because a cut-off section held them.
+    quarantined: AtomicU64,
+}
+
 struct SocketEpollLockWait<'a>(&'a crate::el1_zone::CarrierZone);
 
 impl SocketEpollLockWait<'_> {
@@ -715,6 +726,7 @@ impl HostIpc {
             carrier_zone: std::sync::OnceLock::new(),
             poll_deadlines: crate::host_readiness::PollDeadlines::default(),
             native_epolls: Mutex::new(None),
+            guest: GuestExecution::default(),
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -924,6 +936,17 @@ impl HostIpc {
     }
     pub fn pool_len(&self) -> usize {
         self.bytes.len
+    }
+
+    /// No executor can run ring code over this region again: the executor
+    /// pool has joined every worker (#2955).
+    pub fn stop_guest_execution(&self) {
+        self.guest.stopped.store(true, Ordering::Release);
+    }
+
+    /// Teardown steps quarantined behind a lock a stopped vCPU held.
+    pub fn quarantined_teardowns(&self) -> u64 {
+        self.guest.quarantined.load(Ordering::Relaxed)
     }
 
     /// A view cannot outlive the mappings it borrows.

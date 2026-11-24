@@ -288,6 +288,83 @@ mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, pipe::EventMode};
 
+    /// #2955: a ring section cut off when its vCPU stopped keeps its table
+    /// lock forever. Once the executor pool has stopped, the table's
+    /// teardown (the carrier-exit `FileTable` drop) quarantines what that
+    /// lock guards and returns; it spun at 100% CPU for hours before.
+    #[test]
+    fn serial_host_table_teardown_quarantines_a_lock_a_stopped_vcpu_holds() {
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let parent = HostTable::create(owner.clone(), 64, 4).unwrap();
+        let id = parent.id();
+        // The frozen holder: a fork's publisher runs under the parent's
+        // table lock and never returns, as a vCPU stopped inside it.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let region_owner = owner.clone();
+        std::thread::spawn(move || {
+            let _ = region_owner
+                .region()
+                .fork_descriptors(id, &HostLockWait, |_| {
+                    held_tx.send(()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                });
+        });
+        held_rx.recv().unwrap();
+        // ExecutorPool::shutdown after joining every worker.
+        owner.stop_guest_execution();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(parent);
+            done_tx.send(()).unwrap();
+        });
+        // The bound only reports a spinning teardown; a quarantining one
+        // answers at once.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "HostTable teardown spins on a lock a stopped vCPU holds"
+        );
+        assert_eq!(owner.quarantined_teardowns(), 1);
+    }
+
+    /// #2955: the last close of a description whose object lock a stopped
+    /// vCPU holds (a ring section on that eventfd, cut off mid-update) is
+    /// quarantined too: the description drop returns and counts it.
+    #[test]
+    fn serial_host_description_close_quarantines_an_object_lock_a_stopped_vcpu_holds() {
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let object = owner.create_eventfd(7, EventMode::Counter).unwrap();
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::EventFd { object }.encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        // The frozen holder: the object's lock is taken and never released,
+        // as by a vCPU stopped inside the ring's eventfd section.
+        std::mem::forget(owner.region().lock(object, &HostLockWait).unwrap());
+        // ExecutorPool::shutdown after joining every worker.
+        owner.stop_guest_execution();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(description);
+            done_tx.send(()).unwrap();
+        });
+        // The bound only reports a spinning close; a quarantining one
+        // answers at once.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "description close spins on an object lock a stopped vCPU holds"
+        );
+        assert_eq!(owner.quarantined_teardowns(), 1);
+    }
+
     #[test]
     fn serial_host_el1_ipc_reservations_cancel_commit_and_retire_once() {
         let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
