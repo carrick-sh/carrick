@@ -125,7 +125,7 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
             }
             // The shared service owner retains its reply across MM waits and
             // CPU migration; a per-CPU physical reply cannot survive that park.
-            Err(NativeProcessError::Unsupported)
+            Err(NativeProcessError::SupplySelected)
         })())
     }
     fn copy(

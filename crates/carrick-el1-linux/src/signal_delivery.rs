@@ -238,6 +238,7 @@ where
             }
         });
         let mut deferred = None;
+        let mut supply = None;
         let mut invariant_failure = false;
         let setup = machine.backend().setup_signal_frame(
             frame,
@@ -266,6 +267,18 @@ where
                         },
                     )
                 }
+                // A valid stack page Linux would make resident on this
+                // write (an untouched alternate stack, #3004): prepare the
+                // range below, outside the frame builder.
+                Err(NativeProcessError::NeedsSupply) => {
+                    let request = carrick_core::user_copy::GuestCopyRequest {
+                        address: va,
+                        len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    };
+                    supply = Some(request);
+                    carrick_core::user_copy::CopyOutcome::NotYet(request)
+                }
                 Err(NativeProcessError::Stale | NativeProcessError::Quarantined) => {
                     invariant_failure = true;
                     carrick_core::user_copy::CopyOutcome::Fault
@@ -281,8 +294,35 @@ where
                 machine.published_stack(published_sp);
             }
             Ok(SignalFrameSetup::NotYet(_)) => {
-                let Some(deferral) = deferred else {
-                    return Some(CompletionRoute::InvalidCompletion);
+                let deferral = match (deferred, supply) {
+                    (Some(deferral), None) => deferral,
+                    (None, Some(request)) => match process.prepare_signal_frame(request) {
+                        Ok(deferral) => deferral,
+                        Err(
+                            NativeProcessError::Stale
+                            | NativeProcessError::Quarantined
+                            | NativeProcessError::Invalid
+                            | NativeProcessError::ServiceQuarantined(_),
+                        ) => return Some(CompletionRoute::InvalidCompletion),
+                        // The owner refuses the range (no mapping, no
+                        // write permission, executable COW): Linux cannot
+                        // write the frame either and forces SIGSEGV.
+                        Err(_) => {
+                            return force_delivery_fault(
+                                task,
+                                slot,
+                                process,
+                                frame,
+                                fpstate,
+                                machine,
+                                SignalDeliveryFailure {
+                                    original: sig,
+                                    blocked: thread_blocked,
+                                },
+                            );
+                        }
+                    },
+                    _ => return Some(CompletionRoute::InvalidCompletion),
                 };
                 machine.sync_parked_context(frame, process.resume_context_mut());
                 match process.retain_and_defer_signal_delivery(
