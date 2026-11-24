@@ -1772,7 +1772,7 @@ fn serve_exit<'a>(
     // its reservation since the entry check without changing the live count.
     let entry = slot.entry().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoEntry);
-        if page.live() == 1 {
+        if carrick_core::terminal::raw_exit_at_floor(page) {
             ServeExitDecline::Floor
         } else {
             ServeExitDecline::Other

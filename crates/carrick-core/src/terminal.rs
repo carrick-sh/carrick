@@ -615,6 +615,12 @@ pub fn raw_exit_is_process(page: &impl Lifecycle) -> bool {
     page.live_is_sole_uncontested()
 }
 
+/// A raw exit at the membership floor needs a terminal ownership decision.
+/// The peer reservation may have settled since the syscall's entry check.
+pub fn raw_exit_at_floor(page: &impl Lifecycle) -> bool {
+    page.live() == 1
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadTerminalIdentity {
     binding: ExecutionBinding,
