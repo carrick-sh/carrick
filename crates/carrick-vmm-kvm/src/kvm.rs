@@ -2475,15 +2475,62 @@ mod run_kick_tests {
         }
     }
 
+    /// The external interruption's signal: one Carrick claims for nothing
+    /// (the kick is `SIGRTMIN`, the nudge `SIGRTMIN + 1`), with a handler
+    /// that only counts, installed without `SA_RESTART` so it interrupts
+    /// `KVM_RUN` as a ptrace or job-control stop does.
+    fn external_signal() -> libc::c_int {
+        libc::SIGRTMIN() + 4
+    }
+
+    /// Times [`external_signal`]'s handler ran. Each test holds
+    /// [`serial`] for its whole body, so a test reads only its own signals.
+    static EXTERNAL_HANDLED: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn count_external(_signum: libc::c_int) {
+        EXTERNAL_HANDLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Serialize the tests that count [`external_signal`] and install its
+    /// handler once.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            // SAFETY: a zeroed sigaction with an async-signal-safe handler
+            // (one atomic add) and no flags; the signal is otherwise unused.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = count_external as *const () as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                assert_eq!(
+                    libc::sigaction(external_signal(), &action, std::ptr::null_mut()),
+                    0
+                );
+            }
+        });
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Interrupt `tid`'s live `KVM_RUN` with a signal no kick handle sent, and
+    /// return once its handler has run on that thread. The vCPU only leaves
+    /// `KVM_RUN` for an interruption here (the spinning guest makes no
+    /// exits), so the handler running proves the ioctl was interrupted; a
+    /// counter that moves after this returns proves the run re-entered.
     fn external_stop(tid: libc::pthread_t) {
-        // An interruption Carrick did not request: the kick signal itself,
-        // sent without any kick handle, as a ptrace stop or job-control
-        // signal would interrupt KVM_RUN.
-        // SAFETY: live joinable thread; the kick handler is installed.
-        assert_eq!(
-            unsafe { libc::pthread_kill(tid, crate::kvm_kicker::kick_signal()) },
-            0
-        );
+        let before = EXTERNAL_HANDLED.load(Ordering::SeqCst);
+        // SAFETY: live joinable thread; `serial` installed the handler.
+        assert_eq!(unsafe { libc::pthread_kill(tid, external_signal()) }, 0);
+        let deadline = Instant::now() + BOUND;
+        while EXTERNAL_HANDLED.load(Ordering::SeqCst) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the external signal never reached the vCPU thread"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// The review's race: a kick lands on an armed run after that run already
@@ -2493,6 +2540,7 @@ mod run_kick_tests {
     #[test]
     fn a_kick_racing_a_completed_exit_does_not_surface_on_a_later_external_interrupt() {
         carrick_test_support::require_kvm!();
+        let _serial = serial();
         crate::install_kvm_kick_handler();
         let (setup_tx, setup_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -2543,6 +2591,7 @@ mod run_kick_tests {
     #[test]
     fn an_unarmed_run_reenters_on_external_interrupts_and_surfaces_its_own_kick() {
         carrick_test_support::require_kvm!();
+        let _serial = serial();
         crate::install_kvm_kick_handler();
         let (setup_tx, setup_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
