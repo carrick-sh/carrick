@@ -1208,14 +1208,7 @@ impl GlobalFrameStage2Lease {
         // Once the record exists it is the sole retirement authority even if
         // its snapshot exposes an internal mismatch. Disarm before reporting
         // that invariant failure so unwinding cannot unmap/release twice.
-        self.active = false;
-        self.mapped = false;
-        self.backend = None;
-        self.release_ipa = false;
-        #[cfg(any(test, feature = "foreign-cow-test-support"))]
-        {
-            self.drop_backing_audit = None;
-        }
+        self.disarm_into_record();
         if mismatch {
             Err(TrapError::Hypervisor(format!(
                 "stage-2 lease/record transfer mismatch: lease={:?} record={record:?}",
@@ -1223,6 +1216,19 @@ impl GlobalFrameStage2Lease {
             )))
         } else {
             Ok(())
+        }
+    }
+
+    /// A record now owns this lease's unmap and IPA release: `Drop` repeats
+    /// neither.
+    fn disarm_into_record(&mut self) {
+        self.active = false;
+        self.mapped = false;
+        self.backend = None;
+        self.release_ipa = false;
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
+        {
+            self.drop_backing_audit = None;
         }
     }
 
@@ -1258,6 +1264,16 @@ impl GlobalFrameStage2Lease {
                 alias_backing_is_live(*host_addr),
                 std::sync::atomic::Ordering::SeqCst,
             );
+        }
+        if self
+            .backend
+            .as_ref()
+            .is_some_and(CarrierStage2Backend::mapped_generation_is_destroyed)
+        {
+            // The VM this lease was mapped in is gone, and its stage 2 with
+            // it: there is nothing to unmap, and an unmap now would reach a
+            // successor's stage 2 (#2968 confirming review at `4e791dc5c`).
+            self.forget_backend_mapping();
         }
         if let Some(backend) = &self.backend {
             let size = usize::try_from(self.length).map_err(|_| {
@@ -1304,6 +1320,54 @@ pub(crate) struct RetainedStage2Backing(#[allow(dead_code)] GlobalFrameBacking);
 // return, both safe from any thread).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for RetainedStage2Backing {}
+
+/// The leases one carrier backend still maps after a failed rollback, and
+/// the newest VM generation whose destroy has settled them. Every handle of
+/// the backend shares one list.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+pub(crate) struct UnretiredStage2LeaseList {
+    state: parking_lot::Mutex<UnretiredStage2LeaseState>,
+    /// Test-only: reports how a VM destroy found the list.
+    #[cfg(test)]
+    pub(crate) drain_probe:
+        parking_lot::Mutex<Option<std::sync::mpsc::Sender<UnretiredDrainProbe>>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct UnretiredStage2LeaseState {
+    leases: Vec<UnretiredStage2Lease>,
+    /// The newest generation whose VM destroy drained the list. A lease
+    /// mapped in it or an older one arrives after its stage 2 is gone.
+    destroyed_through: Option<CarrierVmGeneration>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl UnretiredStage2LeaseState {
+    /// Whether `mapped`'s VM is already destroyed. Generations only grow.
+    fn has_destroyed(&self, mapped: Option<CarrierVmGeneration>) -> bool {
+        mapped
+            .zip(self.destroyed_through)
+            .is_some_and(|(mapped, destroyed)| mapped.0 <= destroyed.0)
+    }
+}
+
+/// How a VM destroy found its backend's unretired list (test-only probe).
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) enum UnretiredDrainProbe {
+    /// An idle retry turn held the list, so the destroy waited for it.
+    WaitedForRetry,
+    /// The list was free, and the destroy drained it at once.
+    DrainedAtOnce,
+}
 
 /// A backing a lease transfer hands back on success and gives to the mapper
 /// with an unretired lease on failure.
@@ -1380,16 +1444,38 @@ impl Drop for UnretiredStage2Lease {
 impl CarrierStage2Backend {
     /// Keep a lease this backend mapped, and its backing, until this backend
     /// unmaps it or its VM is destroyed.
+    ///
+    /// The handoff is judged against the generation the lease was mapped in,
+    /// under the list's lock (#2968 confirming review at `4e791dc5c`, P0 1):
+    /// if that generation's destroy already drained the list, its stage 2 is
+    /// gone and the lease settles here, never queued onto a later VM.
     fn retain_unretired(
         &self,
         mut lease: GlobalFrameStage2Lease,
         backing: Option<GlobalFrameBacking>,
     ) {
         lease.backend = None;
-        self.unretired.lock().push(UnretiredStage2Lease {
+        let entry = UnretiredStage2Lease {
             lease,
             backing: backing.map(RetainedStage2Backing),
-        });
+        };
+        let mut unretired = self.unretired.state.lock();
+        if !unretired.has_destroyed(self.mapped_generation()) {
+            unretired.leases.push(entry);
+            return;
+        }
+        drop(unretired);
+        entry.settle_unmapped();
+    }
+
+    /// Whether the VM generation this handle names is destroyed: an extent
+    /// mapped through it is in no stage 2 any more, and an unmap through
+    /// this backend would reach a successor VM's stage 2 instead.
+    pub(crate) fn mapped_generation_is_destroyed(&self) -> bool {
+        self.unretired
+            .state
+            .lock()
+            .has_destroyed(self.mapped_generation())
     }
 
     /// Retry the unmap of every unretired lease once. A lease that unmaps
@@ -1403,13 +1489,13 @@ impl CarrierStage2Backend {
     /// state lock (`commit_destroy`) and is held only across backend unmaps,
     /// which take no custody lock; settling happens after it is released.
     pub(crate) fn retry_unretired_unmaps(&self) -> usize {
-        let mut unretired = self.unretired.lock();
-        if unretired.is_empty() {
+        let mut unretired = self.unretired.state.lock();
+        if unretired.leases.is_empty() {
             return 0;
         }
-        let mut remaining = Vec::with_capacity(unretired.len());
+        let mut remaining = Vec::with_capacity(unretired.leases.len());
         let mut unmapped = Vec::new();
-        for entry in unretired.drain(..) {
+        for entry in unretired.leases.drain(..) {
             let (base, length) = entry.lease.key();
             let gone = usize::try_from(length).is_ok_and(|size| {
                 unsafe { inventory_stage2_unmap(self.as_backend(), base, size) }.is_success()
@@ -1420,8 +1506,8 @@ impl CarrierStage2Backend {
                 remaining.push(entry);
             }
         }
-        *unretired = remaining;
-        let left = unretired.len();
+        unretired.leases = remaining;
+        let left = unretired.leases.len();
         // Their mappings are gone: release the IPAs, then the backings,
         // outside the list's lock.
         drop(unretired);
@@ -1431,19 +1517,56 @@ impl CarrierStage2Backend {
         left
     }
 
-    /// This backend's VM is destroyed, and its stage 2 with it: every
-    /// unretired lease settles without an unmap. An idle retry turn in
-    /// flight holds the list, so this waits for it.
-    pub(crate) fn release_unretired_after_vm_destroy(&self) {
-        let released = std::mem::take(&mut *self.unretired.lock());
+    /// This backend's VM of `generation` is destroyed, and its stage 2 with
+    /// it: every unretired lease settles without an unmap, and a lease of
+    /// that generation handed off later settles on arrival. An idle retry
+    /// turn in flight holds the list, so this waits for it.
+    pub(crate) fn release_unretired_after_vm_destroy(&self, generation: CarrierVmGeneration) {
+        let mut unretired = self.lock_unretired_for_destroy();
+        if unretired
+            .destroyed_through
+            .is_none_or(|destroyed| destroyed.0 < generation.0)
+        {
+            unretired.destroyed_through = Some(generation);
+        }
+        let released = std::mem::take(&mut unretired.leases);
+        drop(unretired);
         for entry in released {
             entry.settle_unmapped();
         }
     }
 
+    #[cfg(not(test))]
+    fn lock_unretired_for_destroy(&self) -> parking_lot::MutexGuard<'_, UnretiredStage2LeaseState> {
+        self.unretired.state.lock()
+    }
+
+    /// As in production, plus a report of whether the list was held.
+    #[cfg(test)]
+    fn lock_unretired_for_destroy(&self) -> parking_lot::MutexGuard<'_, UnretiredStage2LeaseState> {
+        let (guard, probe) = match self.unretired.state.try_lock() {
+            Some(guard) => (guard, UnretiredDrainProbe::DrainedAtOnce),
+            None => {
+                if let Some(probe) = self.unretired.drain_probe.lock().as_ref() {
+                    let _ = probe.send(UnretiredDrainProbe::WaitedForRetry);
+                }
+                (
+                    self.unretired.state.lock(),
+                    UnretiredDrainProbe::WaitedForRetry,
+                )
+            }
+        };
+        if probe == UnretiredDrainProbe::DrainedAtOnce
+            && let Some(probe) = self.unretired.drain_probe.lock().as_ref()
+        {
+            let _ = probe.send(UnretiredDrainProbe::DrainedAtOnce);
+        }
+        guard
+    }
+
     #[cfg(test)]
     pub(crate) fn unretired_lease_count(&self) -> usize {
-        self.unretired.lock().len()
+        self.unretired.state.lock().leases.len()
     }
 }
 
@@ -2084,6 +2207,15 @@ pub(crate) fn carrier_frame_cow_owner_inventory_in(
 /// carrier. Keying them here makes the owner findable, so the extent is
 /// released exactly once, by whichever of retirement or carrier teardown
 /// reaches it first.
+///
+/// The batch is one transaction (#2968 confirming review at `4e791dc5c`,
+/// P0 1 and 2). The key index stays locked from the collision check through
+/// the last insertion, so no other batch can publish a checked key in
+/// between. Every record is admitted in one lifecycle-locked step that reads
+/// the VM generation once and refuses an extent mapped in another one, so a
+/// destroy either precedes the whole batch, which is then refused and rolled
+/// back with no record made, or follows it and terminalizes every record.
+/// Nothing can refuse the batch once its records exist.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn register_carrier_stage2_leases(
     custody: &std::sync::Arc<CarrierVmCustody>,
@@ -2092,115 +2224,92 @@ pub(crate) fn register_carrier_stage2_leases(
     take_backing: &mut dyn FnMut((u64, u64)) -> Option<GlobalFrameBacking>,
 ) -> Result<Vec<CarrierStage2RecordIdentity>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
+    let mut registered = custody.carrier_stage2_records.lock();
+    let admitted = validate_carrier_stage2_batch(custody, &registered, &keys, leases, owner_hosts)
+        .and_then(|extents| {
+            custody
+                .register_stage2_records_atomically(&extents)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "carrier stage-2 lease batch admission: {error:?}"
+                    ))
+                })
+        });
+    let identities = match admitted {
+        Ok(identities) => identities,
+        Err(error) => {
+            drop(registered);
+            for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
+                roll_back_unregistered_carrier_lease(
+                    custody,
+                    lease,
+                    key,
+                    owner_hosts.get(&key).copied().unwrap_or(1),
+                    take_backing,
+                );
+            }
+            return Err(error);
+        }
+    };
+    // Every record exists: each now owns its lease's unmap and IPA release,
+    // and the task mapping keeps its backing.
+    for ((key, mut lease), &identity) in keys.iter().copied().zip(leases.drain(..)).zip(&identities)
+    {
+        lease.disarm_into_record();
+        registered.insert(key, identity);
+    }
+    Ok(identities)
+}
+
+/// Decide every refusal of a carrier stage-2 lease batch before any lease
+/// becomes a record, with the key index `registered` held by the caller.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn validate_carrier_stage2_batch(
+    custody: &CarrierVmCustody,
+    registered: &std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>,
+    keys: &[(u64, u64)],
+    leases: &[GlobalFrameStage2Lease],
+    owner_hosts: &std::collections::BTreeMap<(u64, u64), usize>,
+) -> Result<Vec<CarrierStage2BatchExtent>, TrapError> {
     let mut distinct = std::collections::BTreeSet::new();
-    let registered = custody.carrier_stage2_records.lock();
-    let mut validation_error = None;
-    for (&key, lease) in keys.iter().zip(leases.iter()) {
+    let mut extents = Vec::with_capacity(keys.len());
+    for (&key, lease) in keys.iter().zip(leases) {
         if !distinct.insert(key) || registered.contains_key(&key) {
-            validation_error = Some(TrapError::Hypervisor(format!(
+            return Err(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease collision at IPA 0x{:x} size {}",
                 key.0, key.1
             )));
-            break;
         }
         let host_addr = owner_hosts.get(&key).copied().unwrap_or_default();
-        if host_addr == 0 || !lease.active || !lease.mapped || key.1 == 0 {
-            validation_error = Some(TrapError::Hypervisor(format!(
+        let len = usize::try_from(key.1).unwrap_or_default();
+        if host_addr == 0 || !lease.active || !lease.mapped || len == 0 {
+            return Err(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease {key:?} has no exact active mapped host owner: host=0x{host_addr:x} active={} mapped={}",
                 lease.active, lease.mapped
             )));
-            break;
         }
-        // Every refusal the transfer could make is decided here, before any
-        // lease of the batch becomes a record.
         if let Some(backend) = &lease.backend
             && !custody.holds_stage2_backend(backend)
         {
-            validation_error = Some(TrapError::Hypervisor(format!(
+            return Err(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease {key:?} was mapped by another carrier VM's stage-2 backend"
             )));
-            break;
         }
+        extents.push(CarrierStage2BatchExtent {
+            ipa: key.0,
+            len,
+            host_addr,
+            backend_map_installed: lease.backend.is_some(),
+            release_ipa: lease.release_ipa,
+            perms: 0,
+            logical_owner: None,
+            mapped_in: lease
+                .backend
+                .as_ref()
+                .and_then(CarrierStage2Backend::mapped_generation),
+        });
     }
-    if validation_error.is_none() && custody.setup_generation().is_none() {
-        validation_error = Some(TrapError::Hypervisor(
-            "carrier stage-2 lease registration has no creating/live carrier VM".to_owned(),
-        ));
-    }
-    drop(registered);
-    if let Some(error) = validation_error {
-        for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
-            roll_back_unregistered_carrier_lease(
-                custody,
-                lease,
-                key,
-                owner_hosts.get(&key).copied().unwrap_or(1),
-                take_backing,
-            );
-        }
-        return Err(error);
-    }
-    let mut registered = custody.carrier_stage2_records.lock();
-    let mut identities = Vec::with_capacity(keys.len());
-    let mut pending = keys.iter().copied().zip(leases.drain(..));
-    let mut failure = None;
-    for (key, lease) in pending.by_ref() {
-        // The task mapping keeps the backing on success. Only a refused lease
-        // that is still mapped takes it, to its mapper (#2968 confirming
-        // review, P0 1).
-        let backing = BackingTakenOnRetention(|| take_backing(key));
-        match transfer_global_frame_stage2_lease_with_backing(
-            custody,
-            lease,
-            backing,
-            owner_hosts[&key],
-            0,
-            None,
-        ) {
-            Ok((identity, _)) => {
-                registered.insert(key, identity);
-                identities.push(identity);
-            }
-            Err(error) => {
-                failure = Some(error);
-                break;
-            }
-        }
-    }
-    let Some(error) = failure else {
-        return Ok(identities);
-    };
-    // A validated batch was refused midway: only a teardown that raced the
-    // registration does that. Roll back the rest, and unwind the records
-    // already made, whose backings the caller's task still owns.
-    for (key, lease) in pending {
-        roll_back_unregistered_carrier_lease(
-            custody,
-            lease,
-            key,
-            owner_hosts.get(&key).copied().unwrap_or(1),
-            take_backing,
-        );
-    }
-    for identity in identities {
-        let snapshot = custody.stage2_record_snapshot(identity.record_id);
-        if snapshot
-            .as_ref()
-            .is_some_and(|record| record.mapped && !record.terminalized_by_vm_destroy)
-        {
-            // The VM is still live and its stage 2 still maps this record,
-            // whose backing the caller is about to drop.
-            carrick_fatal!(
-                "hvpatch::frame_inventory",
-                "carrier stage-2 batch registration refused midway with record {identity:?} still mapped: {error}"
-            );
-        }
-        if let Some(record) = snapshot {
-            registered.remove(&(record.ipa, record.len as u64));
-        }
-        let _ = custody.request_stage2_record_retirement(identity);
-    }
-    Err(error)
+    Ok(extents)
 }
 
 /// Roll back a batch lease that never became a record. If its unmap fails it
@@ -2398,34 +2507,27 @@ pub(crate) fn transfer_global_frame_stage2_lease_with_backing<B: LeaseTransferBa
                 lease.key()
             )));
         }
-        let vm_generation = custody.setup_generation().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "global frame owner registration has no creating/live carrier VM".to_owned(),
-            )
-        })?;
-        let logical_owner = match logical_owner {
-            Some(owner) => owner,
-            None => custody.allocate_logical_owner().map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "allocate carrier-local global frame owner identity: {error:?}"
-                ))
+        // One admission path for every lease (#2968 confirming review at
+        // `4e791dc5c`): the lifecycle lock reads the generation once and
+        // refuses an extent mapped in another one, whose stage 2 is gone.
+        let extent = CarrierStage2BatchExtent {
+            ipa: lease.base,
+            len: usize::try_from(lease.length).map_err(|_| {
+                TrapError::Hypervisor("global frame owner lease is too large".to_owned())
             })?,
+            host_addr,
+            backend_map_installed: lease.backend.is_some(),
+            release_ipa: lease.release_ipa,
+            perms,
+            logical_owner,
+            mapped_in: lease
+                .backend
+                .as_ref()
+                .and_then(CarrierStage2Backend::mapped_generation),
         };
-        let backend_map_installed = lease.backend.is_some();
         custody
-            .register_stage2_record(CarrierStage2RecordSpec {
-                vm_generation,
-                ipa: lease.base,
-                len: usize::try_from(lease.length).map_err(|_| {
-                    TrapError::Hypervisor("global frame owner lease is too large".to_owned())
-                })?,
-                host_addr,
-                mapped: lease.mapped,
-                backend_map_installed,
-                release_ipa: lease.release_ipa,
-                perms,
-                logical_owner: Some(logical_owner),
-            })
+            .register_stage2_records_atomically(&[extent])
+            .map(|identities| identities[0])
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
                     "transfer global frame lease into carrier custody: {error:?}"
@@ -2446,14 +2548,7 @@ pub(crate) fn transfer_global_frame_stage2_lease_with_backing<B: LeaseTransferBa
             return Err(registration_error);
         }
     };
-    lease.active = false;
-    lease.mapped = false;
-    lease.release_ipa = false;
-    lease.backend = None;
-    #[cfg(any(test, feature = "foreign-cow-test-support"))]
-    {
-        lease.drop_backing_audit = None;
-    }
+    lease.disarm_into_record();
     Ok((identity, backing))
 }
 

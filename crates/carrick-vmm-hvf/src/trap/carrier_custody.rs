@@ -358,11 +358,18 @@ pub(crate) type NativeExecOwner =
 /// Every clone shares the backend and its unretired leases: extents this
 /// backend mapped whose pre-custody rollback unmap failed, kept with their
 /// backing until a later unmap or the VM's destroy (#2968 confirming review).
+///
+/// A handle taken from a custody names the VM generation it was taken in:
+/// an extent mapped through it belongs to that generation's stage 2, and
+/// both its record admission and its unretired handoff are judged against
+/// that generation, never the backend's current one (#2968 confirming
+/// review at `4e791dc5c`, P0 1).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::clone::Clone)]
 pub(crate) struct CarrierStage2Backend {
     backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
-    pub(crate) unretired: std::sync::Arc<parking_lot::Mutex<Vec<super::UnretiredStage2Lease>>>,
+    generation: Option<CarrierVmGeneration>,
+    pub(crate) unretired: std::sync::Arc<super::UnretiredStage2LeaseList>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -379,8 +386,24 @@ impl CarrierStage2Backend {
     fn new(backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>) -> Self {
         Self {
             backend,
+            generation: None,
             unretired: std::sync::Arc::default(),
         }
+    }
+
+    /// This handle, naming the VM generation an extent mapped through it
+    /// belongs to.
+    fn in_generation(&self, generation: Option<CarrierVmGeneration>) -> Self {
+        Self {
+            generation,
+            ..self.clone()
+        }
+    }
+
+    /// The VM generation whose stage 2 an extent mapped through this handle
+    /// lives in; `None` for a handle taken with no creating or live VM.
+    pub(crate) fn mapped_generation(&self) -> Option<CarrierVmGeneration> {
+        self.generation
     }
 
     pub(crate) fn as_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
@@ -404,6 +427,23 @@ impl CarrierStage2Backend {
     ) -> Self {
         Self::new(backend)
     }
+}
+
+/// One mapped extent of an all-or-nothing batch admission
+/// ([`CarrierVmCustody::register_stage2_records_atomically`]).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub(crate) struct CarrierStage2BatchExtent {
+    pub(crate) ipa: u64,
+    pub(crate) len: usize,
+    pub(crate) host_addr: usize,
+    pub(crate) backend_map_installed: bool,
+    pub(crate) release_ipa: bool,
+    pub(crate) perms: u64,
+    /// The record's logical owner; `None` allocates a fresh one.
+    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
+    /// The VM generation whose stage 2 a backend mapped the extent into.
+    pub(crate) mapped_in: Option<CarrierVmGeneration>,
 }
 
 /// Carrier-owned VM lifecycle authority.
@@ -808,8 +848,10 @@ impl CarrierVmCustody {
         self.stage2_backend.as_backend()
     }
 
+    /// This carrier's backend, naming the VM generation that is creating or
+    /// live now. Takes the custody lock: never call it with that lock held.
     pub(crate) fn stage2_backend_handle(&self) -> CarrierStage2Backend {
-        self.stage2_backend.clone()
+        self.stage2_backend.in_generation(self.setup_generation())
     }
 
     /// Whether `backend` is this carrier VM's own backend. A stage-2 extent
@@ -1017,7 +1059,8 @@ impl CarrierVmCustody {
                 {
                     carrick_core::mm::retirement::terminalize_record(record);
                 }
-                self.stage2_backend.release_unretired_after_vm_destroy();
+                self.stage2_backend
+                    .release_unretired_after_vm_destroy(generation);
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -1110,7 +1153,8 @@ impl CarrierVmCustody {
                     ) {
                         pool.forget_backend_mapping();
                     }
-                    self.stage2_backend.release_unretired_after_vm_destroy();
+                    self.stage2_backend
+                        .release_unretired_after_vm_destroy(generation);
                     metadata.release_destroyed_vm(generation.0, |identity| {
                         let _ = state.remove_record(identity.record_id);
                     });
@@ -1300,7 +1344,12 @@ impl CarrierVmCustody {
     pub(crate) fn allocate_logical_owner(
         &self,
     ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
+        Self::allocate_logical_owner_locked(&mut self.state.lock())
+    }
+
+    fn allocate_logical_owner_locked(
+        state: &mut CarrierVmCustodyState,
+    ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
         let next_id = state
             .next_logical_owner_id
             .checked_add(1)
@@ -1418,6 +1467,68 @@ impl CarrierVmCustody {
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
         Self::register_stage2_record_locked(&mut self.state.lock(), spec)
+    }
+
+    /// Admit every extent of one batch as a mapped record of one VM
+    /// generation, all or none, under one lifecycle lock (#2968 confirming
+    /// review at `4e791dc5c`, P0 1). Every lease transfer, of one lease or
+    /// of a batch, is admitted here. The generation is read once, so a
+    /// destroy either precedes the whole batch, which is then refused with
+    /// no record made, or follows it and terminalizes every record. An
+    /// extent a backend mapped in any other generation is refused: that
+    /// generation's stage 2 is not this VM's.
+    pub(crate) fn register_stage2_records_atomically(
+        &self,
+        extents: &[CarrierStage2BatchExtent],
+    ) -> Result<Vec<CarrierStage2RecordIdentity>, CarrierStage2RecordError> {
+        let mut state = self.state.lock();
+        let generation = match state.lifecycle {
+            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
+                generation
+            }
+            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+                return Err(CarrierStage2RecordError::NoLiveVm);
+            }
+        };
+        if extents
+            .iter()
+            .any(|extent| extent.backend_map_installed && extent.mapped_in != Some(generation))
+        {
+            return Err(CarrierStage2RecordError::VmGenerationMismatch);
+        }
+        let mut identities = Vec::with_capacity(extents.len());
+        for extent in extents {
+            let owner = match extent.logical_owner {
+                Some(owner) => Ok(owner),
+                None => Self::allocate_logical_owner_locked(&mut state),
+            };
+            let admitted = owner.and_then(|owner| {
+                Self::register_stage2_record_locked(
+                    &mut state,
+                    CarrierStage2RecordSpec {
+                        vm_generation: generation,
+                        ipa: extent.ipa,
+                        len: extent.len,
+                        host_addr: extent.host_addr,
+                        mapped: true,
+                        backend_map_installed: extent.backend_map_installed,
+                        release_ipa: extent.release_ipa,
+                        perms: extent.perms,
+                        logical_owner: Some(owner),
+                    },
+                )
+            });
+            match admitted {
+                Ok(identity) => identities.push(identity),
+                Err(error) => {
+                    for identity in identities {
+                        let _ = state.remove_record(identity.record_id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(identities)
     }
 
     /// Commit backend mapping and its exact record under one lifecycle lock.
@@ -2189,12 +2300,14 @@ mod carrier_vm_custody_tests {
     fn serial_host_a_mapper_vm_destroy_settles_its_unretired_leases_without_an_unmap() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let receiver = crate::trap::test_carrier_custody();
-        let mapper = std::sync::Arc::new(RecordingStage2::default());
-        mapper
+        let recorder = std::sync::Arc::new(RecordingStage2::default());
+        recorder
             .fail_unmaps
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let mapper_handle =
-            super::CarrierStage2Backend::for_test(std::sync::Arc::clone(&mapper) as _);
+        let mapper_custody = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+            std::sync::Arc::clone(&recorder) as _,
+        ));
+        let mapper_handle = mapper_custody.stage2_backend_handle();
         let key = (0xa085_0000_0000_u64, 0x4000_u64);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             key.1 as usize,
@@ -2216,11 +2329,18 @@ mod carrier_vm_custody_tests {
         assert_eq!(mapper_handle.unretired_lease_count(), 1);
         assert!(super::alias_backing_is_live(host_addr));
 
-        mapper_handle.release_unretired_after_vm_destroy();
+        let destroyed = super::destroy_vm_with_custody_target_using(
+            &mapper_custody,
+            "mapper destroy",
+            super::CarrierVmDestroyTarget::Live,
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        );
 
+        assert!(destroyed.is_ok(), "{destroyed:?}");
         assert_eq!(mapper_handle.unretired_lease_count(), 0);
         assert_eq!(
-            mapper.unmaps.lock().len(),
+            recorder.unmaps.lock().len(),
             1,
             "the destroy settles without another unmap"
         );
@@ -2234,12 +2354,15 @@ mod carrier_vm_custody_tests {
     /// and backing are each released once. Both halves run through the
     /// production entry points: the carrier's idle turn and its VM destroy.
     ///
-    /// The destroy starts on a second thread from inside the retry's unmap.
-    /// The unmap waits a bounded time for it, then fails. Before the fix the
-    /// destroy finished inside that window, found the list empty, and the
-    /// failed retry requeued the lease onto a destroyed VM. After it, the
-    /// destroy waits for the retry turn and then settles the lease; the bound
-    /// only decides how soon the unmap gives up, never the verdict.
+    /// The destroy starts on a second thread from inside the retry's unmap,
+    /// and the unmap does not return until the destroy has reached the list
+    /// and reported how it found it (a probe event, not a sleep). Before the
+    /// fix the retry drained the list before its unmaps, so the destroy
+    /// found it free, drained nothing, and the failed retry requeued the
+    /// lease onto a destroyed VM: the probe reads `DrainedAtOnce`. After it,
+    /// the retry holds the list, so the destroy reports `WaitedForRetry`,
+    /// then settles the lease once the turn ends. Every wait is bounded and
+    /// its result asserted (#2968 confirming review at `4e791dc5c`, P0 3).
     #[test]
     fn serial_host_a_destroy_overlapping_an_idle_unmap_retry_settles_the_lease_once() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -2274,24 +2397,27 @@ mod carrier_vm_custody_tests {
         );
         assert_eq!(mapper.stage2_backend_handle().unretired_lease_count(), 1);
 
-        let destroyer = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        *mapper.stage2_backend_handle().unretired.drain_probe.lock() = Some(probe_tx);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let observed = std::sync::Arc::new(parking_lot::Mutex::new(None));
         {
             let mapper = std::sync::Arc::clone(&mapper);
-            let destroyer = std::sync::Arc::clone(&destroyer);
+            let observed = std::sync::Arc::clone(&observed);
             *recorder.on_unmap.lock() = Some(Box::new(move || {
-                let (done, finished) = std::sync::mpsc::sync_channel(1);
-                *destroyer.lock() = Some(std::thread::spawn(move || {
-                    let destroyed = super::destroy_vm_with_custody_target_using(
+                std::thread::spawn(move || {
+                    let _ = result_tx.send(super::destroy_vm_with_custody_target_using(
                         &mapper,
                         "overlapping destroy",
                         super::CarrierVmDestroyTarget::Live,
                         || carrick_aarch64::stage2::Stage2Status::SUCCESS,
                         || {},
-                    );
-                    let _ = done.send(());
-                    destroyed
-                }));
-                let _ = finished.recv_timeout(std::time::Duration::from_secs(1));
+                    ));
+                });
+                // The retry's unmap is in flight: wait until the destroy has
+                // reached the unretired list and said how it found it.
+                *observed.lock() = Some(probe_rx.recv_timeout(BOUND));
             }));
         }
 
@@ -2299,12 +2425,18 @@ mod carrier_vm_custody_tests {
             super::retry_pending_global_frame_retirements_at_idle_in_using(&mapper, &mut |_, _| {
                 Ok(())
             });
-        let destroyed = destroyer
+        let observed = observed
             .lock()
             .take()
-            .expect("the retry's unmap started the destroy")
-            .join()
-            .expect("the destroy thread");
+            .expect("the retry's unmap started the destroy");
+        assert_eq!(
+            observed,
+            Ok(super::UnretiredDrainProbe::WaitedForRetry),
+            "the destroy reached the list while the retry turn held it"
+        );
+        let destroyed = result_rx
+            .recv_timeout(BOUND)
+            .expect("the destroy finishes once the retry turn ends");
 
         assert!(destroyed.is_ok(), "the mapper's VM destroy: {destroyed:?}");
         assert_eq!(mapper.live_generation(), None);
