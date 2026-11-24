@@ -160,6 +160,31 @@
       "from": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_create1",
       "to": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_description",
       "issue": 1671
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::code_content::ContentObservation::begin_execution_with_hook",
+      "to": "carrick_aarch64::code_content::ContentObservation::begin_execution_with_hook",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::code_content::ContentPage::leave",
+      "to": "carrick_aarch64::code_content::ContentPage::leave",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::code_content::ContentPage::publish_completion",
+      "to": "carrick_aarch64::code_content::ContentPage::publish_completion",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::code_content::ContentWrite<O>::new",
+      "to": "carrick_aarch64::code_content::ContentWrite<O>::new",
+      "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::code_content::PendingContentWrite<O>::new",
+      "to": "carrick_aarch64::code_content::PendingContentWrite<O>::new",
+      "issue": 1236
     }
   ],
   "authority_debt_admissions": [
