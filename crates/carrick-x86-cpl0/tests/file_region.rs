@@ -139,7 +139,7 @@ fn file_region_stdio_parity_and_closed_descriptor_stays_closed() {
     assert!(change.release.is_some());
     assert_eq!(
         StdioDescriptions::admit(tables.fd_map(), tables.opens(), tables.objects(), 51),
-        Err(StdioAdmissionError::Occupied),
+        Err(StdioAdmissionError::TableHasStdio),
         "stdin and stderr are still open"
     );
     assert!(fd_map_lookup(tables.fd_map(), 51, 1).is_none());

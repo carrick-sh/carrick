@@ -469,7 +469,7 @@ pub enum StdioAdmissionError {
     /// No table id: table 0 names no process.
     NoTable,
     /// The table already holds a descriptor 0..2: it is not a fresh table.
-    Occupied,
+    TableHasStdio,
     /// A stdio description of this zone is still live: the zone has one.
     AlreadyAdmitted,
     /// The descriptor map or the open-description table is full.
@@ -515,7 +515,7 @@ impl StdioDescriptions {
         }
         let _guard = lock_fd_map(fd_map);
         if (0..3).any(|fd| fd_map_lookup(fd_map, boot_table, fd).is_some()) {
-            return Err(StdioAdmissionError::Occupied);
+            return Err(StdioAdmissionError::TableHasStdio);
         }
         if open_table.iter().any(|record| {
             let generation = record.generation.load(Ordering::Acquire);
@@ -595,7 +595,7 @@ impl StdioDescriptions {
         }
         let _guard = lock_fd_map(fd_map);
         if (0..3).any(|fd| fd_map_lookup(fd_map, table, fd).is_some()) {
-            return Err(StdioAdmissionError::Occupied);
+            return Err(StdioAdmissionError::TableHasStdio);
         }
         let mut claimed = Vec::with_capacity(3);
         for _ in 0..3 {
@@ -639,15 +639,15 @@ pub fn rename_unstarted_table(fd_map: &[FdMapSlot], from: u64, to: u64) -> bool 
         return true;
     }
     let _guard = lock_fd_map(fd_map);
-    let live = |slot: &FdMapSlot, table: u64| {
-        let inc = slot.incarnation.load(Ordering::Acquire);
-        inc != 0 && slot.file_table.load(Ordering::Relaxed) == table
+    let names = |slot: &FdMapSlot, table: u64| {
+        slot.incarnation.load(Ordering::Acquire) != 0
+            && slot.file_table.load(Ordering::Relaxed) == table
     };
     let slots = fd_map.iter().take(FD_MAP_CAPACITY);
-    if slots.clone().any(|slot| live(slot, to)) {
+    if slots.clone().any(|slot| names(slot, to)) {
         return false;
     }
-    for slot in slots.filter(|slot| live(slot, from)) {
+    for slot in slots.filter(|slot| names(slot, from)) {
         slot.file_table.store(to, Ordering::Release);
     }
     true
@@ -1501,7 +1501,7 @@ mod tests {
         let stdio = StdioDescriptions::admit(&fd_map, &open_table, &object_table, 10).unwrap();
         assert_eq!(
             StdioDescriptions::admit(&fd_map, &open_table, &object_table, 10),
-            Err(StdioAdmissionError::Occupied)
+            Err(StdioAdmissionError::TableHasStdio)
         );
         assert_eq!(
             StdioDescriptions::admit(&fd_map, &open_table, &object_table, 12),
@@ -1510,7 +1510,7 @@ mod tests {
         assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 12, fd).is_none()));
         assert_eq!(
             stdio.share_into(&fd_map, &open_table, 10),
-            Err(StdioAdmissionError::Occupied)
+            Err(StdioAdmissionError::TableHasStdio)
         );
         assert_eq!(
             stdio.share_into(&fd_map, &open_table, 0),
