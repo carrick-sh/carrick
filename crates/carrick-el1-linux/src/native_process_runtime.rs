@@ -461,6 +461,14 @@ pub enum NativeProcessError {
     OwnerWait(carrick_core_abi::PortalOwnerWait),
     ForkRefused(super::native_fork_refusal::NativeForkRefusal),
     Unsupported,
+    /// A copy met a page with no backing yet. A copy may not select a page
+    /// for the fault service (nothing would take the selection): its owner
+    /// prepares the range, which answers [`Self::SupplySelected`] (#3004).
+    NeedsSupply,
+    /// A preparation published this CPU's fault selection for the range.
+    /// The caller runs `ServiceOperation::Fault` with that selection
+    /// (`copyout_fault`) and reruns its operation once supply lands.
+    SupplySelected,
     GroupExitCustody,
     Busy,
     Quarantined,
@@ -481,8 +489,10 @@ impl NativeProcessError {
             UserWriteError::Owner(MmError::Core) => {
                 NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::UserWriteMmCore)
             }
-            UserWriteError::Owner(MmError::UnsupportedExecutableCow)
-            | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+            UserWriteError::Owner(MmError::UnsupportedExecutableCow) => {
+                NativeProcessError::Unsupported
+            }
+            UserWriteError::UnsupportedSupply => NativeProcessError::NeedsSupply,
             UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
             UserWriteError::Mechanics(error) => error,
             UserWriteError::InvalidSource => NativeProcessError::Invalid,
@@ -499,7 +509,11 @@ impl NativeProcessError {
             Self::Exhausted => Ok(NativeFailure::Exhausted),
             Self::Fault => Ok(NativeFailure::Fault),
             Self::ForkRefused(refusal) => refusal.error().failure(),
-            Self::Unsupported => Ok(NativeFailure::Unsupported),
+            // A supply request that reaches a refusal answer has no owner
+            // left to serve it: the operation is unsupported where it ran.
+            Self::Unsupported | Self::NeedsSupply | Self::SupplySelected => {
+                Ok(NativeFailure::Unsupported)
+            }
             Self::GroupExitCustody => Ok(NativeFailure::GroupExitCustody),
             Self::Quarantined => Ok(NativeFailure::Quarantined),
             Self::ServiceQuarantined(reason) => Ok(NativeFailure::ServiceQuarantined(reason)),
@@ -1324,6 +1338,13 @@ impl Drop for PendingSignalDelivery {
 pub(crate) enum SignalCopyDeferral {
     Portal(carrick_core_abi::PortalOwnerWait),
     Service,
+    /// The frame range was prepared and this CPU's fault selection names
+    /// its first unbacked page: the fault service supplies it, then the
+    /// retained delivery reruns (#3004).
+    Supply {
+        fault: carrick_guest_arch::FaultInfo,
+        sequence: NonZeroU64,
+    },
 }
 
 /// One record's retained private-mapping byte sources: the one its next
@@ -6399,7 +6420,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service
             .copy_signal_frame_bytes(&mm, address, bytes)
             .inspect_err(|error| {
-                if !matches!(error, NativeProcessError::OwnerWait(_)) {
+                if !matches!(
+                    error,
+                    NativeProcessError::OwnerWait(_) | NativeProcessError::NeedsSupply
+                ) {
                     super::native_diagnostic::emit(format_args!(
                         "signal-copy-refused record={:?} address={:#x}+{:#x} error={error:?}",
                         self.record,
@@ -6408,6 +6432,49 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ));
                 }
             })
+    }
+
+    /// Prepare a signal frame range a copy found unbacked, as Linux makes a
+    /// valid (alternate) stack page resident when it writes the frame. The
+    /// answer says how the retained delivery waits before its rerun: the
+    /// fault service for the selected page, the owner's release, or carrier
+    /// work. A range the owner refuses is the delivery's own fault.
+    pub(crate) fn prepare_signal_frame(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+    ) -> Result<SignalCopyDeferral, NativeProcessError> {
+        // A selection names one page, so prepare a page at a time: the
+        // frame may start on a resident page and end on an untouched one.
+        let end = request
+            .address
+            .raw()
+            .checked_add(request.len.raw())
+            .ok_or(NativeProcessError::Fault)?;
+        let mut next = request.address.raw();
+        while next < end {
+            let page_end = (next | 4095).saturating_add(1).min(end);
+            let address = UserVa::new(next);
+            match self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(page_end - next),
+            }) {
+                Ok(()) => next = page_end,
+                Err(NativeProcessError::Busy) => return Ok(SignalCopyDeferral::Service),
+                Err(NativeProcessError::OwnerWait(wait)) => {
+                    return Ok(SignalCopyDeferral::Portal(wait));
+                }
+                Err(NativeProcessError::SupplySelected) => {
+                    let (fault, sequence) = self
+                        .service
+                        .copyout_fault(address)
+                        .ok_or(NativeProcessError::Stale)?;
+                    return Ok(SignalCopyDeferral::Supply { fault, sequence });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // A sibling supplied the range since the copy: rerun at once.
+        Ok(SignalCopyDeferral::Service)
     }
     #[inline(never)]
     fn suspend_adapter_operation(
@@ -9991,7 +10058,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             }
             Err(NativeProcessError::Fault) => return CopyoutPreparation::Fault(operation),
             Err(NativeProcessError::Busy) => return CopyoutPreparation::Busy(operation),
-            Err(NativeProcessError::Unsupported) => {}
+            Err(NativeProcessError::SupplySelected) => {}
             Err(_) => {
                 // Invalid execution has no user-memory errno authority.
                 // Busy is distinct: the caller keeps custody and yields.

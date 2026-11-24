@@ -481,6 +481,9 @@ struct RefusedStagePrefix<'a> {
 enum ServicePayload<'a> {
     None,
     Copyin,
+    /// A retained signal delivery waits for its frame's memory; it reruns
+    /// at its syscall-return checkpoint, never as a retried call (#3004).
+    SignalFrame,
     EntropyPreparation(EntropyPreparation),
     StagePrefix(RefusedStagePrefix<'a>),
     Copyout(OwnedCopyout<'a>),
@@ -512,6 +515,8 @@ pub(super) struct PendingService<'a> {
     clock_sample: Option<PendingClockSample>,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
+    /// The service supplies a retained signal delivery's frame memory.
+    signal_frame: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
@@ -533,6 +538,13 @@ impl PendingService<'_> {
     fn waited_on_host_readiness(&self) -> bool {
         self.wait
             .is_some_and(|wait| wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness)
+    }
+
+    /// The member's owner continuation re-enters at its syscall: a retried
+    /// call, or a signal delivery waiting at its syscall-return checkpoint
+    /// (whose supply is a `Fault`, but no faulting instruction reruns).
+    fn reenters_at_syscall(&self) -> bool {
+        self.retry_syscall_after_supply || self.signal_frame
     }
 
     fn signal_interruptible(&self) -> bool {
@@ -1139,7 +1151,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceCompletion::Inline,
                     );
                 }
-                Err(NativeProcessError::Unsupported) => {
+                Err(NativeProcessError::NeedsSupply) => {
                     if previous_prepared_offset == Some(output.offset) {
                         return Err(NativeProcessError::Unsupported);
                     }
@@ -1177,7 +1189,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::Inline,
                             );
                         }
-                        Err(NativeProcessError::Unsupported) => {
+                        Err(NativeProcessError::SupplySelected) => {
                             let (fault, sequence) = self
                                 .service
                                 .copyout_fault(address)
@@ -1275,9 +1287,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.yield_service_checkpoint()?
             }
             Err(NativeProcessError::Fault) => self.retire_adapter_failure(NativeFailure::Fault)?,
-            Err(NativeProcessError::Unsupported) => {
-                self.retire_adapter_failure(NativeFailure::Unsupported)?
-            }
+            Err(
+                NativeProcessError::Unsupported
+                | NativeProcessError::NeedsSupply
+                | NativeProcessError::SupplySelected,
+            ) => self.retire_adapter_failure(NativeFailure::Unsupported)?,
             Err(NativeProcessError::NoChild) => {
                 self.retire_adapter_failure(NativeFailure::NoChild)?
             }
@@ -1410,18 +1424,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .pending_signal_deliveries
                 .insert(self.record, retained);
         }
-        let owner_wait = match deferral {
-            SignalCopyDeferral::Portal(wait) => Some(wait),
-            SignalCopyDeferral::Service => None,
+        let carrier_work = ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Syscall,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        };
+        let (operation, sequence, owner_wait) = match deferral {
+            SignalCopyDeferral::Portal(wait) => (carrier_work, None, Some(wait)),
+            SignalCopyDeferral::Service => (carrier_work, None, None),
+            SignalCopyDeferral::Supply { fault, sequence } => {
+                (ServiceOperation::Fault(fault), Some(sequence), None)
+            }
         };
         let result = self.begin_service_inner(
-            ServiceOperation::CarrierWork {
-                entry: OwnerEntry::Syscall,
-                demand: carrick_core_abi::service::CarrierDemand::Work,
-            },
-            None,
+            operation,
+            sequence,
             owner_wait,
-            ServicePayload::Copyin,
+            ServicePayload::SignalFrame,
             ServiceCompletion::Inline,
         );
         match self.finish_service_handoff(result) {
@@ -1455,6 +1473,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error)
             }
         }
+    }
+
+    /// The owner refused the memory a retained signal frame needs. As Linux
+    /// does when it cannot write a frame, the delivery is dropped and the
+    /// thread gets SIGSEGV; a SIGSEGV frame that cannot be written kills the
+    /// group with it. Without this the retained delivery would rerun into
+    /// the same refusal forever.
+    #[inline(never)]
+    fn refuse_signal_frame_supply(&mut self) -> Result<NativeResume, NativeProcessError> {
+        let Some(retained) = self.take_pending_signal_delivery() else {
+            return Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::SignalDeferralOutcome,
+            ));
+        };
+        let segv = carrick_signal_core::policy::Signal::SEGV;
+        if retained.sig == segv {
+            return match self.exit_with_signal(segv) {
+                Ok(_) => Ok(NativeResume::Left(None)),
+                Err(NativeFailure::GroupExitCustody) => Ok(NativeResume::NoPending),
+                Err(_) => Err(NativeProcessError::Quarantined),
+            };
+        }
+        self.force_sigsegv_info(
+            retained.thread_blocked,
+            carrick_syscall_abi::LinuxSiginfo::kernel(segv.number()),
+        )
+        .map_err(|_| NativeProcessError::Stale)?;
+        Ok(NativeResume::NoPending)
     }
 
     pub(super) fn begin_adapter_service(
@@ -1552,7 +1598,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     None,
                 )
             }
-            Err(NativeProcessError::Unsupported) => {
+            Err(NativeProcessError::SupplySelected) => {
                 let (mut fault, sequence) = self
                     .service
                     .copyout_fault(request.address)
@@ -2086,7 +2132,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(()) => Some(bytes),
                 // A sibling unmapped the rest of the buffer since staging:
                 // the call answers what it moved, as Linux's send does.
-                Err(NativeProcessError::Fault | NativeProcessError::Unsupported) => {
+                Err(
+                    NativeProcessError::Fault
+                    | NativeProcessError::Unsupported
+                    | NativeProcessError::NeedsSupply,
+                ) => {
                     return Ok(Some(HostFileContinuation::Returned(SyscallResult::new(
                         transfer.done() as i64,
                     ))));
@@ -2189,7 +2239,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceCompletion::RetrySyscall,
                     );
                 }
-                Err(NativeProcessError::Unsupported) => {
+                Err(NativeProcessError::SupplySelected) => {
                     let (fault, sequence) = self
                         .service
                         .copyout_fault(target)
@@ -2419,9 +2469,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::StagePrefix(prefix) => (ServicePayload::None, None, Some(prefix)),
             payload => (payload, None, None),
         };
-        let copyin = matches!(&payload, ServicePayload::Copyin);
+        let signal_frame = matches!(&payload, ServicePayload::SignalFrame);
+        let copyin = matches!(
+            &payload,
+            ServicePayload::Copyin | ServicePayload::SignalFrame
+        );
         let (payload, copyout, adapter) = match payload {
-            ServicePayload::Copyin => (ServicePayload::None, None, false),
+            ServicePayload::Copyin | ServicePayload::SignalFrame => {
+                (ServicePayload::None, None, false)
+            }
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
@@ -2479,6 +2535,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _,
                 ServicePayload::Copyout(_)
                 | ServicePayload::Copyin
+                | ServicePayload::SignalFrame
                 | ServicePayload::Adapter
                 | ServicePayload::EntropyPreparation(_)
                 | ServicePayload::ClockSample(_)
@@ -2756,6 +2813,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 clock_sample,
                 copyout,
                 copyin,
+                signal_frame,
                 adapter,
                 exec_successor,
                 retry_syscall_after_supply,
@@ -2772,7 +2830,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Intake can run before park enrollment. Publish the exact temporary
         // continuation before its notice, preserving a host member's permanent
         // execution ownership. The service cell authenticates this record/MM.
-        let entry = if retry_syscall_after_supply {
+        let entry = if retry_syscall_after_supply || signal_frame {
             OwnerEntry::Syscall
         } else {
             match operation {
@@ -3012,7 +3070,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .graph
                 .lock()
                 .service_wait(&self.record)
-                .is_some_and(|pending| pending.retry_syscall_after_supply) =>
+                .is_some_and(|pending| pending.reenters_at_syscall()) =>
             {
                 OwnerEntry::Syscall
             }
@@ -3594,7 +3652,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .graph
                 .lock()
                 .service_wait(&self.record)
-                .is_some_and(|pending| pending.retry_syscall_after_supply) =>
+                .is_some_and(|pending| pending.reenters_at_syscall()) =>
             {
                 OwnerEntry::Syscall
             }
@@ -4631,21 +4689,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source
                     .zone
                     .record(self.record.id)
-                    .publish_owner_continuation(if retry_syscall_after_supply {
-                        OwnerEntry::Syscall
-                    } else {
-                        match request.operation {
-                            ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
-                                OwnerEntry::Exception
+                    .publish_owner_continuation(
+                        if retry_syscall_after_supply || pending.signal_frame {
+                            OwnerEntry::Syscall
+                        } else {
+                            match request.operation {
+                                ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
+                                    OwnerEntry::Exception
+                                }
+                                ServiceOperation::Crossing { .. }
+                                | ServiceOperation::Exec { .. }
+                                | ServiceOperation::HostFile { .. }
+                                | ServiceOperation::Entropy { .. }
+                                | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
+                                ServiceOperation::CarrierWork { entry, .. } => entry,
                             }
-                            ServiceOperation::Crossing { .. }
-                            | ServiceOperation::Exec { .. }
-                            | ServiceOperation::HostFile { .. }
-                            | ServiceOperation::Entropy { .. }
-                            | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
-                            ServiceOperation::CarrierWork { entry, .. } => entry,
-                        }
-                    });
+                        },
+                    );
             }
             self.release_service_claim(pending.claim)?;
             return Ok(NativeResume::NoPending);
@@ -4761,6 +4821,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .zone
                 .record(self.record.id)
                 .consume_owner_continuation();
+        }
+        if pending.signal_frame
+            && matches!(request.operation, ServiceOperation::Fault(_))
+            && matches!(
+                result,
+                ServiceResult::Refused | ServiceResult::BackingFault | ServiceResult::Failed(_)
+            )
+        {
+            self.release_service_claim(pending.claim)?;
+            return self.refuse_signal_frame_supply();
         }
         if retry_syscall_after_supply
             && matches!(

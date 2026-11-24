@@ -589,7 +589,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         &self,
         address: UserVa,
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
-        matches!(self.child_copy_error, Some(NativeProcessError::Unsupported)).then_some((
+        matches!(self.child_copy_error, Some(NativeProcessError::NeedsSupply)).then_some((
             carrick_guest_arch::FaultInfo {
                 address,
                 access: carrick_guest_arch::Access::Write,
@@ -644,7 +644,13 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
                 .child_copy_error_at
                 .is_none_or(|at| request.address.raw() == at)
         {
-            return Err(error);
+            // As the production venues do, a preparation selects the page a
+            // copy could not supply and answers with that selection.
+            return Err(if error == NativeProcessError::NeedsSupply {
+                NativeProcessError::SupplySelected
+            } else {
+                error
+            });
         }
         if let Some(hook) = &mut self.on_copy_complete {
             hook(request.address);
@@ -8470,7 +8476,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
     };
     let mut service = fixture.service();
     service.child_copy_error = Some(if in_preparation {
-        NativeProcessError::Unsupported
+        NativeProcessError::NeedsSupply
     } else {
         NativeProcessError::Busy
     });
@@ -9164,6 +9170,7 @@ fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
     for error in [
         NativeProcessError::Busy,
         NativeProcessError::Unsupported,
+        NativeProcessError::NeedsSupply,
         NativeProcessError::Stale,
         NativeProcessError::Quarantined,
         NativeProcessError::Fault,
@@ -11925,7 +11932,7 @@ fn entropy_fault_completion(cancel_wait: bool) {
     let mut service = fixture.service();
     let address = UserVa::new(if cancel_wait { 0x10000 } else { 0x10ff8 });
     let length = if cancel_wait { 8 } else { 16 };
-    service.child_copy_error = Some(NativeProcessError::Unsupported);
+    service.child_copy_error = Some(NativeProcessError::NeedsSupply);
     service.child_copy_error_at = Some(if cancel_wait { address.raw() } else { 0x11000 });
     take_signal_copies();
     FAULT_REPLY_CALLS.with(|calls| calls.set(0));
