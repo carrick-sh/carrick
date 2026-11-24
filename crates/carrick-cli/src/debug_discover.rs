@@ -23,7 +23,9 @@
 //!   tasks holding unserved host work) and its syscall census so far
 //!   (`zonedump --census-out`), both read before the kill, since a killed
 //!   carrier publishes no census: a hung stage keeps its refusals and their
-//!   arguments;
+//!   arguments; and every host thread's backtrace of the carrier and its
+//!   descendants (`<stage>.host-stacks`, gdb), plus a core with
+//!   `CARRICK_DISCOVER_CORE=1`;
 //! - with `--oracle`, each stage that passes at 5x the native Docker
 //!   oracle's time or more (`pathological_time`);
 //! - with `--venue-profile <row>=<file>`, each call shape the row makes on
@@ -1317,6 +1319,93 @@ fn capture_zonedump(carrick: &Path, run_id: &str, path: &Path, census: &Path) {
     let _ = wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {});
 }
 
+/// The pids of `root` and every live descendant, read from `/proc/*/stat`
+/// (Linux hosts; empty elsewhere but for `root`).
+fn process_tree(root: u32) -> Vec<u32> {
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // `pid (comm) state ppid ...`: comm may hold spaces, so split
+            // after its closing parenthesis.
+            let Some(rest) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+                continue;
+            };
+            if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
+                parents.push((pid, ppid));
+            }
+        }
+    }
+    let mut tree = vec![root];
+    let mut at = 0;
+    while at < tree.len() {
+        let parent = tree[at];
+        tree.extend(
+            parents
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        at += 1;
+    }
+    tree
+}
+
+/// Write every host thread's backtrace of a hung carrier and its
+/// descendants (`gdb -p <pid> -batch -ex 'thread apply all bt'`) into
+/// `path`, before the kill; with `CARRICK_DISCOVER_CORE=1`, also a core of
+/// the carrier (`gcore`, `<core>.<pid>`). Best effort, bounded like the
+/// zonedump: a missing gdb or a refused attach leaves its error in `path`.
+fn capture_host_stacks(carrier: u32, path: &Path, core: &Path) {
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return;
+    };
+    for pid in process_tree(carrier) {
+        use std::io::Write;
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let _ = writeln!(file, "=== pid {pid} {}", comm.trim());
+        let Ok(out) = file.try_clone() else {
+            return;
+        };
+        let Ok(err) = file.try_clone() else {
+            return;
+        };
+        let Ok(child) = std::process::Command::new("gdb")
+            .args(["-nx", "-batch", "-p", &pid.to_string()])
+            .args(["-ex", "info threads", "-ex", "thread apply all bt"])
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+        else {
+            let _ = writeln!(file, "gdb did not start");
+            continue;
+        };
+        let _ = wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {});
+    }
+    if std::env::var_os("CARRICK_DISCOVER_CORE").is_some_and(|v| v == "1")
+        && let Ok(child) = std::process::Command::new("gcore")
+            .arg("-o")
+            .arg(core)
+            .arg(carrier.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    {
+        let _ = wait_bounded(child, Duration::from_secs(5 * ZONEDUMP_SECS), &mut || {});
+    }
+}
+
 /// Options for one discovery run.
 pub(crate) struct DiscoverOptions<'a> {
     pub(crate) rows: &'a Path,
@@ -1622,8 +1711,14 @@ pub(crate) fn discover(options: DiscoverOptions<'_>) -> Result<()> {
                 // exits by itself during the capture publishes its own.
                 let kill_census_path = base.with_extension("census-at-kill.json");
                 let _ = std::fs::remove_file(&kill_census_path);
-                let mut dump_zone =
-                    || capture_zonedump(&carrick, &run_id, &zonedump_path, &kill_census_path);
+                let stacks_path = base.with_extension("host-stacks");
+                let _ = std::fs::remove_file(&stacks_path);
+                let core_path = base.with_extension("core");
+                let carrier_pid = child.id();
+                let mut dump_zone = || {
+                    capture_zonedump(&carrick, &run_id, &zonedump_path, &kill_census_path);
+                    capture_host_stacks(carrier_pid, &stacks_path, &core_path);
+                };
                 let ending = wait_bounded(child, timeout, &mut dump_zone)?;
                 let secs = started.elapsed().as_secs_f64();
                 if let Some(reap) = options.reap {
