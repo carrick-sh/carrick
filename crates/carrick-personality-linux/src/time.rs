@@ -55,20 +55,27 @@ pub(crate) fn clock_gettime(native: &mut dyn LifecycleNative<'_>) -> Option<Life
     let Some(read) = linux_clock_read(clock) else {
         return refuse(LINUX_EINVAL);
     };
-    let coarse = |nanos: u64| nanos - nanos % LINUX_CLOCK_RESOLUTION_NSEC as u64;
-    let nanos = match read {
-        LinuxClockRead::Realtime => realtime_nanos(native)?,
-        LinuxClockRead::RealtimeCoarse => coarse(realtime_nanos(native)?),
-        LinuxClockRead::Monotonic | LinuxClockRead::Boottime => monotonic_nanos(native)?,
-        LinuxClockRead::MonotonicCoarse => coarse(monotonic_nanos(native)?),
+    // A CPU clock's target is checked before the output (EINVAL, then
+    // EFAULT); every other valid clock faults a null output unread.
+    let cpu = match read {
         LinuxClockRead::Cpu(cpu) => match native.cpu_clock_nanos(cpu)? {
-            Ok(nanos) => nanos,
+            Ok(nanos) => Some(nanos),
             Err(errno) => return refuse(errno),
         },
+        _ => None,
     };
     if output == 0 {
         return refuse(LINUX_EFAULT);
     }
+    let coarse = |nanos: u64| nanos - nanos % LINUX_CLOCK_RESOLUTION_NSEC as u64;
+    let nanos = match (read, cpu) {
+        (_, Some(nanos)) => nanos,
+        (LinuxClockRead::Realtime, _) => realtime_nanos(native)?,
+        (LinuxClockRead::RealtimeCoarse, _) => coarse(realtime_nanos(native)?),
+        (LinuxClockRead::Monotonic | LinuxClockRead::Boottime, _) => monotonic_nanos(native)?,
+        (LinuxClockRead::MonotonicCoarse, _) => coarse(monotonic_nanos(native)?),
+        (LinuxClockRead::Cpu(_), None) => return None,
+    };
     Some(native.finish_signal_output(
         UserVa::new(output),
         crate::sleep::timespec_bytes(nanos).to_vec(),
