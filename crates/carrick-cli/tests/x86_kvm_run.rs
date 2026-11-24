@@ -3115,7 +3115,7 @@ enum ChildCrossingGapKind {
 /// entry is the live ceiling. Lowering is automatic: the witness fails while
 /// the table is shorter than the ceiling, so the same change that serves a
 /// crossing removes its row and lowers the ceiling.
-const CHILD_CROSSING_GAP_CEILING: usize = 30;
+const CHILD_CROSSING_GAP_CEILING: usize = 29;
 const CHILD_CROSSING_GAP_ADMISSIONS: &[(usize, IssueNumber, &str)] = &[(
     CHILD_CROSSING_GAP_CEILING,
     IssueNumber(2581),

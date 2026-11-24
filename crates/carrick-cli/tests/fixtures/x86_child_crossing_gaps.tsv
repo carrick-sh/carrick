@@ -22,7 +22,6 @@
 231	munlockall	#2605	refusal
 232	mincore	#2605	refusal
 284	mlock2	#2605	refusal
-436	close_range	#1678	refusal
 33	mknodat	#2709	refusal
 75	vmsplice	#2711	refusal
 76	splice	#2711	refusal
