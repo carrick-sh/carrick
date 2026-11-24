@@ -40,6 +40,20 @@ extern "C" fn posix_kick_noop(_signum: libc::c_int) {}
 
 static INSTALLED_SIGNALS: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
 
+thread_local! {
+    static CURRENT_THREAD_KICK_PENDING: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+}
+
+/// Consume whether a [`PosixSignalKick`] targeted the current host thread.
+///
+/// External host stops (`ptrace` attach/interrupt, `SIGSTOP`/`SIGCONT`) and
+/// unrelated signals (`SIGCHLD`, `SIGWINCH`) also make hypervisor run ioctls
+/// return `EINTR`, without setting this flag.
+#[inline]
+pub fn take_current_thread_kick_pending() -> bool {
+    CURRENT_THREAD_KICK_PENDING.with(|pending| pending.swap(false, Ordering::SeqCst))
+}
+
 /// Process-wide idempotent installation of the POSIX kick signal handler.
 /// Installed with `sa_flags = 0` (NO `SA_RESTART`).
 pub fn install_posix_kick_handler<const SIG: i32>() {
@@ -67,6 +81,7 @@ pub fn install_posix_kick_handler<const SIG: i32>() {
 pub struct PosixSignalKick<const SIG: i32> {
     tid: libc::pthread_t,
     run_exit: Arc<Mutex<Option<RunExitByte>>>,
+    thread_pending: Arc<AtomicBool>,
     kick_pending: Option<Arc<AtomicBool>>,
 }
 
@@ -78,6 +93,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         Self {
             tid,
             run_exit: Arc::new(Mutex::new(None)),
+            thread_pending: CURRENT_THREAD_KICK_PENDING.with(Arc::clone),
             kick_pending: None,
         }
     }
@@ -89,6 +105,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         Self {
             tid,
             run_exit: Arc::new(Mutex::new(None)),
+            thread_pending: CURRENT_THREAD_KICK_PENDING.with(Arc::clone),
             kick_pending: Some(kick_pending),
         }
     }
@@ -140,6 +157,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
 
 impl<const SIG: i32> crate::VcpuKick for PosixSignalKick<SIG> {
     fn kick(&self) {
+        self.thread_pending.store(true, Ordering::SeqCst);
         if let Some(ref pending) = self.kick_pending {
             pending.store(true, Ordering::SeqCst);
         }
@@ -156,5 +174,44 @@ impl<const SIG: i32> crate::VcpuKick for PosixSignalKick<SIG> {
         unsafe {
             libc::pthread_kill(self.tid, resolve_kick_signal::<SIG>());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::VcpuKick;
+
+    #[test]
+    fn unrequested_signal_leaves_current_thread_kick_pending_clear_while_kick_sets_only_target_thread()
+     {
+        let _ = take_current_thread_kick_pending();
+        // SAFETY: SIGCONT's POSIX default action is ignore when not stopped.
+        assert_eq!(unsafe { libc::raise(libc::SIGCONT) }, 0);
+        assert!(
+            !take_current_thread_kick_pending(),
+            "an external signal must not manufacture a pending vCPU kick"
+        );
+
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let (kicked_tx, kicked_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = take_current_thread_kick_pending();
+            let handle = PosixSignalKick::<0>::for_current_thread();
+            handle_tx.send(handle).unwrap();
+            kicked_rx.recv().unwrap();
+            let first = take_current_thread_kick_pending();
+            let second = take_current_thread_kick_pending();
+            (first, second)
+        });
+        let handle = handle_rx.recv().unwrap();
+        handle.kick();
+        assert!(
+            !take_current_thread_kick_pending(),
+            "kicking a target thread must not mark the sender thread kicked"
+        );
+        kicked_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), (true, false));
     }
 }
