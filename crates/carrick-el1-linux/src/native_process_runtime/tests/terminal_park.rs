@@ -1119,3 +1119,477 @@ fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process_aarch64() {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
     );
 }
+
+/// The one-thread lifecycle venue a raw-exit witness dispatches through.
+#[cfg(test)]
+struct RawExitVenue<'a> {
+    page: &'a carrick_el1_abi::ThreadLifecyclePage,
+    control: &'a carrick_el1_abi::ThreadControlSlot,
+}
+
+#[cfg(test)]
+impl crate::thread_setup::LifecycleVenue for RawExitVenue<'_> {
+    fn thread<'a>(
+        &'a self,
+        _: &'a carrick_el1_abi::CurrentTask,
+    ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+        Some(carrick_personality_linux::thread::LifecycleThread {
+            page: self.page,
+            slot: self.control,
+        })
+    }
+    fn born_slot(
+        &self,
+        _: &carrick_el1_abi::ThreadLifecyclePage,
+        _: carrick_el1_abi::EntryRef,
+    ) -> Option<&carrick_el1_abi::ThreadControlSlot> {
+        None
+    }
+}
+
+/// Dispatch one raw `exit(status)` through the production personality
+/// dispatch, with `process` as the member's native process venue.
+#[cfg(test)]
+fn dispatch_raw_exit<'ipc, C>(
+    zone: &'static carrick_sched_core::ZoneTables<C>,
+    task: &'static carrick_el1_abi::CurrentTask,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    slot: carrick_sched_core::SlotId,
+    process: &mut dyn ProcessNative<'ipc, C>,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+    status: u64,
+) -> carrick_personality_linux::dispatch::CompletionRoute
+where
+    C: super::ProcessContext + crate::dispatch::DispatchContext + 'static,
+{
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let venue = RawExitVenue { page, control };
+    let mut frame = RawExitStatusFrame(isa, slot, status);
+    let mut pending: crate::dispatch::El1PendingFamilies<
+        '_,
+        'ipc,
+        _,
+        crate::sched::FakeCpu,
+        crate::sched::HardwareUserWord,
+        _,
+        C,
+    > = crate::dispatch::El1PendingFamilies {
+        futex_argument0: None,
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &counters,
+        current_tasks: core::slice::from_ref(task),
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: None,
+        ipc: None,
+        lifecycle: Some(&venue),
+        process: Some(process),
+        source: Some(BornInZoneSource { zone, slot }),
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    carrick_personality_linux::dispatch::dispatch(
+        carrick_syscall_abi::CanonicalNr::new(
+            carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+        )
+        .raw(),
+        u64::MAX,
+        &mut pending,
+    )
+}
+
+/// #2974 review P0-2: a nonfinal raw exit whose `release_current` refuses
+/// before any scheduler rollback restores its refundable live unit. A peer
+/// raw exit parked on that reservation must be woken by that restoration:
+/// a deferred wake that nothing drains leaves the peer parked with the
+/// lifecycle gate open forever.
+#[cfg(test)]
+fn refused_nonfinal_release_wakes_parked_raw_exit<C, B>(
+    make_words: fn(super::AddressContext<super::RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: super::ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture: &'static super::NativeSignalFixture<C> =
+        Box::leak(Box::new(super::native_exec_fixture_for::<C, B>(make_words)));
+    let (sibling_task, sibling_control, sibling_slot, sibling_record) =
+        spawn_born_sibling(fixture, make_words);
+    assert!(fixture.zone.mark_native_owned(fixture.record.id));
+    sibling_control.set_clear_child_tid(0x4000);
+    assert_eq!(fixture.page.live(), 2);
+
+    let leader_parked = std::sync::Arc::new(AtomicBool::new(false));
+    let leader_parked_hook = leader_parked.clone();
+    super::set_before_signal_copy_hook(Box::new(move |address| {
+        assert_eq!(address, super::UserVa::new(0x4000));
+        // The sibling holds the refundable live unit: the leader is at the
+        // floor and parks on the reservation's release.
+        assert_eq!(fixture.page.live(), 1);
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_raw_exit(
+                fixture.zone,
+                fixture.task,
+                fixture.page,
+                fixture.control,
+                fixture.slot,
+                entry.as_mut(),
+                isa,
+                38,
+            ),
+            CompletionRoute::Suspended
+        );
+        assert!(entry.take_run_failure().is_none());
+        assert!(matches!(
+            fixture.zone.record(fixture.record.id).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        // The sibling's exact record stops being its lane's current one
+        // before release: `retire_current` refuses ahead of the scheduler's
+        // commit or rollback, with its membership still reserved.
+        fixture.zone.clear_current(sibling_slot);
+        leader_parked_hook.store(true, Ordering::Release);
+    }));
+
+    let mut service_a = fixture.service();
+    service_a.waker_slot = sibling_slot;
+    service_a.tid_words.insert((1, 0x4000), 42);
+    let mut entry_a = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling_slot,
+            },
+            sibling_task,
+            fixture.address,
+            &make_words(fixture.address),
+            &mut service_a,
+        )
+        .unwrap();
+    let _ = dispatch_raw_exit(
+        fixture.zone,
+        sibling_task,
+        fixture.page,
+        sibling_control,
+        sibling_slot,
+        entry_a.as_mut(),
+        isa,
+        0,
+    );
+    assert!(leader_parked.load(Ordering::Acquire));
+    assert!(entry_a.take_run_failure().is_none());
+    drop(entry_a);
+    assert!(
+        fixture.zone.live(sibling_record).is_some(),
+        "the refused release keeps the sibling's record"
+    );
+    assert_eq!(
+        fixture.page.live(),
+        2,
+        "the refused release restores the sibling's live unit"
+    );
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).queued(),
+        1,
+        "a refused nonfinal release must wake the raw exit parked on its reservation"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn refused_nonfinal_release_wakes_parked_raw_exit_x86() {
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::Ring));
+    refused_nonfinal_release_wakes_parked_raw_exit::<
+        super::ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::HostThread));
+}
+
+#[cfg(test)]
+#[test]
+fn refused_nonfinal_release_wakes_parked_raw_exit_aarch64() {
+    refused_nonfinal_release_wakes_parked_raw_exit::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_syscall_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}
+
+/// #2974 review P0-1: a raw `exit` never returns to user mode (`_exit(2)`),
+/// so a raw exit woken from its reservation park is still exiting. A caught
+/// signal pending when it resumes must not run its handler there: a
+/// detached thread may already have unmapped its own stack. The shared
+/// user-return gate both ISAs run after a resumed retry leaves the saved
+/// `exit` untouched, and the rerun `exit` retires the process with its own
+/// status rather than the handler running in the middle of exit.
+#[cfg(test)]
+fn resumed_raw_exit_runs_no_pending_signal_handler<C, B>(
+    make_words: fn(super::AddressContext<super::RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: super::ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+    super::HostArmSignalMachine:
+        crate::signal_delivery::SignalMachine<C, Backend = super::HostArmBackend>,
+{
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use zerocopy::IntoBytes;
+
+    let fixture: &'static super::NativeSignalFixture<C> =
+        Box::leak(Box::new(super::native_exec_fixture_for::<C, B>(make_words)));
+    let (sibling_task, sibling_control, sibling_slot, sibling_record) =
+        spawn_born_sibling(fixture, make_words);
+    assert!(fixture.zone.mark_native_owned(fixture.record.id));
+    sibling_control.set_clear_child_tid(0x4000);
+    assert_eq!(fixture.page.live(), 2);
+
+    let leader_parked = std::sync::Arc::new(AtomicBool::new(false));
+    let leader_parked_hook = leader_parked.clone();
+    super::set_before_signal_copy_hook(Box::new(move |address| {
+        assert_eq!(address, super::UserVa::new(0x4000));
+        assert_eq!(fixture.page.live(), 1);
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_raw_exit(
+                fixture.zone,
+                fixture.task,
+                fixture.page,
+                fixture.control,
+                fixture.slot,
+                entry.as_mut(),
+                isa,
+                38,
+            ),
+            CompletionRoute::Suspended
+        );
+        assert!(entry.take_run_failure().is_none());
+        leader_parked_hook.store(true, Ordering::Release);
+    }));
+
+    let mut service_a = fixture.service();
+    service_a.waker_slot = sibling_slot;
+    service_a.tid_words.insert((1, 0x4000), 42);
+    let mut entry_a = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling_slot,
+            },
+            sibling_task,
+            fixture.address,
+            &make_words(fixture.address),
+            &mut service_a,
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_raw_exit(
+            fixture.zone,
+            sibling_task,
+            fixture.page,
+            sibling_control,
+            sibling_slot,
+            entry_a.as_mut(),
+            isa,
+            0,
+        ),
+        CompletionRoute::Suspended
+    );
+    assert!(leader_parked.load(Ordering::Acquire));
+    assert!(entry_a.take_run_failure().is_none());
+    drop(entry_a);
+    assert!(fixture.zone.live(sibling_record).is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 1);
+
+    fixture.zone.install_space(fixture.slot, 1).unwrap();
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    // SAFETY: `fixture.record` was just selected on `fixture.slot`.
+    let saved_leader = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut service_leader = fixture.service();
+    let mut entry_leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved_leader,
+            &mut service_leader,
+        )
+        .unwrap();
+    // A caught SIGUSR1 is pending for the parked exit's thread when it
+    // resumes, as Go's preemption signal or a SIGCHLD can be.
+    let usr1 = Signal::from_number(10).unwrap();
+    let handler = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+        ..Default::default()
+    };
+    carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
+        &mut *entry_leader,
+        usr1,
+        Some(handler),
+    )
+    .unwrap();
+    fixture
+        .runtime
+        .current_signals(fixture.task)
+        .unwrap()
+        .enqueue_thread(fixture.record, usr1, None);
+
+    let resumed = entry_leader.resume_checkpoint(|_| Ok(None)).unwrap();
+    assert!(matches!(
+        resumed,
+        NativeResume::RetrySyscall | NativeResume::RetrySavedSyscall
+    ));
+    // The user-return gate a resumed retry passes through on x86 CPL0 and on
+    // ARM EL1 before the saved `exit` instruction runs again.
+    assert!(
+        !entry_leader.signal_checkpoint_needed(),
+        "an exiting thread owes no signal checkpoint"
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.elr = 0x40_0000;
+    frame.x[0] = 38;
+    frame.x[8] = 93;
+    let before = frame;
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let route = crate::signal_delivery::deliver_signal_on_syscall_return(
+        fixture.task,
+        fixture.control,
+        &mut entry_leader,
+        &mut frame,
+        fp.as_bytes(),
+        &mut super::HostArmSignalMachine {
+            backend: super::HostArmBackend,
+        },
+    );
+    assert_eq!(route, None);
+    assert_eq!(
+        (frame.elr, frame.x[0], frame.x[8]),
+        (before.elr, before.x[0], before.x[8]),
+        "a resumed raw exit must rerun as exit, never enter a signal handler"
+    );
+    assert!(entry_leader.take_run_failure().is_none());
+    drop(entry_leader);
+
+    let mut entry_leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved_leader,
+            &mut service_leader,
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_raw_exit(
+            fixture.zone,
+            fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.slot,
+            entry_leader.as_mut(),
+            isa,
+            38,
+        ),
+        CompletionRoute::Suspended
+    );
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
+    assert_eq!(
+        entry_leader.take_root_exit(),
+        Some(LinuxWaitStatus::exited(38)),
+        "the rerun exit retires the process with its own status"
+    );
+    assert!(entry_leader.take_run_failure().is_none());
+    assert_eq!(fixture.page.live(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn resumed_raw_exit_runs_no_pending_signal_handler_x86() {
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::Ring));
+    resumed_raw_exit_runs_no_pending_signal_handler::<
+        super::ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::HostThread));
+}
+
+#[cfg(test)]
+#[test]
+fn resumed_raw_exit_runs_no_pending_signal_handler_aarch64() {
+    resumed_raw_exit_runs_no_pending_signal_handler::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_syscall_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}

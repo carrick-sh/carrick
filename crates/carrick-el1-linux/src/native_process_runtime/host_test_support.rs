@@ -1237,6 +1237,38 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     }
 }
 
+/// The same host frame machine for an ARM parked context, so a VM-free
+/// witness drives the shared user-return gate on both ISAs' contexts.
+#[cfg(test)]
+impl crate::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
+    for HostArmSignalMachine
+{
+    type Backend = HostArmBackend;
+
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.backend
+    }
+    fn user_sp(&self, _: &carrick_el1_abi::TrapFrame) -> UserVa {
+        UserVa::new(0x400000)
+    }
+    fn restart(
+        &mut self,
+        _: &mut carrick_el1_abi::TrapFrame,
+        _: &carrick_sched_core::Aarch64ParkedContext,
+    ) -> bool {
+        false
+    }
+    fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
+        crate::arm_signal::restart_forwarded_frame(frame)
+    }
+    fn group_exit_custody(
+        &self,
+        _: &CurrentTask,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    }
+}
+
 struct HostArmBackend;
 impl carrick_guest_arch::ArchTypes for HostArmBackend {
     type Error = carrick_el1::isa::ArchError;
