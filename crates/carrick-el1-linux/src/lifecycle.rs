@@ -467,6 +467,9 @@ impl<
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
     }
+    fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
+        self.process_venue()?.retire_closing_thread_exit()
+    }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
         if !binding.issued() {
