@@ -447,7 +447,7 @@ impl<
             )
         }))
     }
-    /// Take the exact admitted MM's editor. A held editor or raised gate
+    /// Take the exact admitted MM's editor. A held editor, raised gate or closed target
     /// returns [`MmError::Wait`] carrying the observed release, so the caller
     /// enrols on the holder instead of retrying a bare `Busy`.
     pub fn editor_for(
@@ -470,8 +470,13 @@ impl<
             )
             .map_err(|cause| match cause {
                 EditAdmissionRefusal::Editor => editor.map_or(MmError::Busy, MmError::Wait),
-                EditAdmissionRefusal::Gate => gate.map_or(MmError::Busy, MmError::Wait),
-                EditAdmissionRefusal::Stale | EditAdmissionRefusal::Closed => MmError::Stale,
+                // An owned transfer suspends on a closed target too: its
+                // gate key is published when the entry opens, and the
+                // source's terminal publication ends the wait at retirement.
+                EditAdmissionRefusal::Gate | EditAdmissionRefusal::Closed => {
+                    gate.map_or(MmError::Busy, MmError::Wait)
+                }
+                EditAdmissionRefusal::Stale => MmError::Stale,
             })
     }
     /// Acquire the root of an already authenticated MM handle, observing its

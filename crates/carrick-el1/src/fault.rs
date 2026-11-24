@@ -1303,6 +1303,7 @@ impl<'s> FaultSupply<'s> {
         {
             return Some(editor);
         }
+        use carrick_sched_core::spaces::{EditAdmissionRefusal, notification::SpaceWaitCause};
         self.owner()?;
         self.contend(spaces, mm, || {
             match spaces
@@ -1310,7 +1311,15 @@ impl<'s> FaultSupply<'s> {
                 .try_begin_edit_cause(index, mm, owner, spaces.venue())
             {
                 Ok(editor) => Ok(Some(editor)),
-                Err(refusal) => refusal.wait_cause().map_or(Ok(None), Err),
+                Err(EditAdmissionRefusal::Editor) => Err(SpaceWaitCause::Editor),
+                // An owner fault waits out a closed target like the owner
+                // portal's transfers: the gate key is published when the
+                // entry opens, and the source's terminal publication ends
+                // the wait at retirement.
+                Err(EditAdmissionRefusal::Gate | EditAdmissionRefusal::Closed) => {
+                    Err(SpaceWaitCause::Gate)
+                }
+                Err(EditAdmissionRefusal::Stale) => Ok(None),
             }
         })
         .flatten()
