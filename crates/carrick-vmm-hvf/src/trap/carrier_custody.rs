@@ -2005,10 +2005,12 @@ mod carrier_vm_custody_tests {
         assert!(second.global_frame_host_owners.lock().is_empty());
     }
 
-    /// A stage-2 backend that records every unmap it is asked for.
+    /// A stage-2 backend that records every unmap it is asked for, and
+    /// refuses them while `fail_unmaps` is set.
     #[derive(Default)]
     struct RecordingStage2 {
         unmaps: parking_lot::Mutex<Vec<(u64, usize)>>,
+        fail_unmaps: std::sync::atomic::AtomicBool,
     }
 
     impl carrick_aarch64::stage2::Stage2Backend for RecordingStage2 {
@@ -2024,6 +2026,9 @@ mod carrier_vm_custody_tests {
 
         unsafe fn unmap(&self, ipa: u64, size: usize) -> carrick_aarch64::stage2::Stage2Status {
             self.unmaps.lock().push((ipa, size));
+            if self.fail_unmaps.load(std::sync::atomic::Ordering::SeqCst) {
+                return carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001);
+            }
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         }
 
@@ -2073,6 +2078,58 @@ mod carrier_vm_custody_tests {
                 .stage2_record_covering(key.0, key.1 as usize)
                 .is_none(),
             "the receiving custody holds no record of the foreign mapping"
+        );
+    }
+
+    /// A refused foreign lease whose rollback unmap fails stays mapped, so
+    /// its backing must stay owned with it under the mapping carrier's
+    /// retirement authority: never dropped while that carrier's stage 2 may
+    /// still translate to it (#2968 confirming review, P0).
+    #[test]
+    fn a_refused_foreign_lease_whose_unmap_fails_keeps_its_mapping_and_backing() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let receiver = crate::trap::test_carrier_custody();
+        let mapper = std::sync::Arc::new(RecordingStage2::default());
+        mapper
+            .fail_unmaps
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mapper_handle =
+            super::CarrierStage2Backend::for_test(std::sync::Arc::clone(&mapper) as _);
+        let key = (0xa084_0000_0000_u64, 0x4000_u64);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate the lease's backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+        lease.mark_mapped(mapper_handle.clone());
+
+        let registered = super::register_global_frame_host_owner_in(
+            &receiver,
+            lease,
+            mapping,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+
+        assert!(
+            registered.is_err(),
+            "a custody must refuse a lease another carrier's backend mapped: {registered:?}"
+        );
+        assert_eq!(
+            *mapper.unmaps.lock(),
+            vec![(key.0, key.1 as usize)],
+            "the refusal tries one rollback unmap through the mapper"
+        );
+        assert!(
+            receiver
+                .stage2_record_covering(key.0, key.1 as usize)
+                .is_none(),
+            "the receiving custody holds no record of the foreign mapping"
+        );
+        assert!(
+            super::alias_backing_is_live(host_addr),
+            "the backing of a still-mapped foreign lease must stay live"
         );
     }
 
