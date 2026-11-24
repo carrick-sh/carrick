@@ -4607,6 +4607,109 @@ fn retirement_follows_a_sibling_crate_path_module() {
     );
     assert!(!tree_has_test(dir.path(), "example", "gone").unwrap());
     assert!(tree_has_test(dir.path(), "example", "mailbox_tests::tests::kept").unwrap());
+    // The inventory files the followed file's tests under the declaring
+    // module, not under the sibling crate.
+    let krate = example_inventory(dir.path());
+    assert_eq!(krate.unresolved, None, "{krate:?}");
+    assert!(
+        krate
+            .tests
+            .contains_key(&("example".into(), "mailbox_tests::tests::kept".into())),
+        "{krate:?}"
+    );
+}
+
+fn example_inventory(root: &Path) -> carrick_xtask::ci_receipt::CrateTestInventory {
+    carrick_xtask::ci_receipt::tree_test_inventory(root)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.crate_name == "example")
+        .unwrap()
+}
+
+#[test]
+fn retirement_refuses_path_modules_into_the_repository_outside_sibling_crate_sources() {
+    // Only a sibling workspace crate's own `src/` or `tests/` may be
+    // followed: a file under `fixtures/`, a crate's other directories, or a
+    // directory without a package manifest is refused even though it exists
+    // inside the tree.
+    for (declared, existing, manifest) in [
+        ("../../../fixtures/mailbox.rs", "fixtures/mailbox.rs", None),
+        (
+            "../../shared/fixtures/mailbox.rs",
+            "crates/shared/fixtures/mailbox.rs",
+            Some("[package]\nname = 'shared'\n"),
+        ),
+        (
+            "../../loose/src/mailbox.rs",
+            "crates/loose/src/mailbox.rs",
+            None,
+        ),
+        (
+            "../../virtual/src/mailbox.rs",
+            "crates/virtual/src/mailbox.rs",
+            Some("[workspace]\n"),
+        ),
+    ] {
+        let dir = include_fixture(&format!("#[path = \"{declared}\"] mod mailbox;"), "");
+        write_source(dir.path(), existing, "#[test] fn gone() {}");
+        if let Some(manifest) = manifest {
+            let krate = Path::new(existing).iter().take(2).collect::<PathBuf>();
+            write_source(
+                dir.path(),
+                &format!("{}/Cargo.toml", krate.display()),
+                manifest,
+            );
+        }
+        let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot resolve #[path] module"),
+            "{declared}: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_inventory_stops_a_path_module_cycle() {
+    let dir = path_module_fixture(SIBLING_PATH_MOD, "#[path = \"leaf.rs\"] mod leaf;");
+    write_source(
+        dir.path(),
+        "crates/shared/src/leaf.rs",
+        "#[path = \"mailbox.rs\"] mod back; #[test] fn kept() {}",
+    );
+    let krate = example_inventory(dir.path());
+    assert_eq!(krate.unresolved, None, "{krate:?}");
+    assert!(
+        krate
+            .tests
+            .contains_key(&("example".into(), "mailbox_tests::leaf::kept".into())),
+        "{krate:?}"
+    );
+}
+
+#[test]
+fn test_inventory_bounds_a_path_module_chain_discovery_did_not() {
+    // Every link is declared from lib.rs too, so discovery reaches each file
+    // in one hop; the module walk through the chain is still bounded.
+    let links = 10;
+    let mut lib = String::new();
+    for n in 0..links {
+        lib.push_str(&format!(
+            "#[path = \"../../shared/src/c{n}.rs\"] mod c{n};\n"
+        ));
+    }
+    let dir = path_module_fixture(&lib, "");
+    for n in 0..links {
+        let next = if n + 1 < links {
+            format!("#[path = \"c{}.rs\"] mod next;", n + 1)
+        } else {
+            String::new()
+        };
+        write_source(dir.path(), &format!("crates/shared/src/c{n}.rs"), &next);
+    }
+    let krate = example_inventory(dir.path());
+    let reason = krate.unresolved.expect("an over-limit chain resolved");
+    assert!(reason.contains("#[path] module depth limit"), "{reason}");
 }
 
 #[test]
@@ -4617,6 +4720,11 @@ fn retirement_applies_across_a_sibling_crate_path_module() {
     write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
     write_source(&cand, "crates/example/tests/foo.rs", "");
     write_source(&cand, "crates/example/src/lib.rs", SIBLING_PATH_MOD);
+    write_source(
+        &cand,
+        "crates/shared/Cargo.toml",
+        "[package]\nname = 'shared'\n",
+    );
     write_source(&cand, "crates/shared/src/mailbox.rs", "pub fn helper() {}");
     let diff = diff_with_retired(
         &cpl0_receipt(&["foo::gone"], &[]),
@@ -4640,6 +4748,11 @@ fn retirement_refuses_when_the_path_module_target_still_has_the_test() {
     write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
     write_source(&cand, "crates/example/tests/foo.rs", "");
     write_source(&cand, "crates/example/src/lib.rs", SIBLING_PATH_MOD);
+    write_source(
+        &cand,
+        "crates/shared/Cargo.toml",
+        "[package]\nname = 'shared'\n",
+    );
     write_source(
         &cand,
         "crates/shared/src/mailbox.rs",
