@@ -1702,9 +1702,9 @@ fn dispatch_classified_fault<
         return Action::Forward;
     }
 
-    if let Some(page) = prepared
+    if prepared
         .as_ref()
-        .and_then(|path| path.residency.lookup(mm_key, far))
+        .is_some_and(|path| path.residency.lookup(mm_key, far).is_some())
     {
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
@@ -1763,39 +1763,47 @@ fn dispatch_classified_fault<
         };
         let grant = _editor.grant();
         let path = prepared.as_mut().expect("prepared grant path");
-        match path.resolver.commit_prepared(
-            grant.ttbr0,
-            far & !4095,
-            page.expected_ipa,
-            prepared_access,
-        ) {
-            Ok(GuestPreparedCommit::Committed) => {
-                assert!(path.residency.record_commit(page));
-                if let FaultSupply::Mailbox { mailboxes, .. } = supply {
-                    consume_served_refusals(mailboxes, mm_key, far, access);
+        // The lookup that chose this path ran before the editor. A sibling's
+        // edit of another page of the same grant may since have retired the
+        // row and republished its other pages in fresh slots (#2948). Rows
+        // change only under this editor, so only a lookup made now names the
+        // row the commit records into. With no row left the page has no
+        // prepared backing: fresh selection below serves it.
+        if let Some(page) = path.residency.lookup(mm_key, far) {
+            match path.resolver.commit_prepared(
+                grant.ttbr0,
+                far & !4095,
+                page.expected_ipa,
+                prepared_access,
+            ) {
+                Ok(GuestPreparedCommit::Committed) => {
+                    assert!(path.residency.record_commit(page));
+                    if let FaultSupply::Mailbox { mailboxes, .. } = supply {
+                        consume_served_refusals(mailboxes, mm_key, far, access);
+                    }
+                    return Action::Served;
                 }
-                return Action::Served;
-            }
-            Ok(GuestPreparedCommit::AlreadyResident) => {
-                if let FaultSupply::Mailbox { mailboxes, .. } = supply {
-                    consume_served_refusals(mailboxes, mm_key, far, access);
+                Ok(GuestPreparedCommit::AlreadyResident) => {
+                    if let FaultSupply::Mailbox { mailboxes, .. } = supply {
+                        consume_served_refusals(mailboxes, mm_key, far, access);
+                    }
+                    return Action::Served;
                 }
-                return Action::Served;
+                Err(GuestPreparedCommitError::RollbackFailed) => {
+                    panic!("EL1 prepared-page commit rollback failed")
+                }
+                // Retirement can invalidate the descriptor before its residency
+                // row is reclaimed. The admitted owner mapping remains the
+                // authority: continue into fresh backing selection instead of
+                // turning the stale lookup into a terminal fault.
+                Err(GuestPreparedCommitError::NotPrepared)
+                    if matches!(supply, FaultSupply::Owner(_)) => {}
+                Err(_) if matches!(supply, FaultSupply::Owner(_)) => {
+                    supply.note(FaultVerdict::PreparedCommitRefused);
+                    return Action::Forward;
+                }
+                Err(_) => {}
             }
-            Err(GuestPreparedCommitError::RollbackFailed) => {
-                panic!("EL1 prepared-page commit rollback failed")
-            }
-            // Retirement can invalidate the descriptor before its residency
-            // row is reclaimed. The admitted owner mapping remains the
-            // authority: continue into fresh backing selection instead of
-            // turning the stale lookup into a terminal fault.
-            Err(GuestPreparedCommitError::NotPrepared)
-                if matches!(supply, FaultSupply::Owner(_)) => {}
-            Err(_) if matches!(supply, FaultSupply::Owner(_)) => {
-                supply.note(FaultVerdict::PreparedCommitRefused);
-                return Action::Forward;
-            }
-            Err(_) => {}
         }
     }
 
