@@ -581,3 +581,540 @@ fn retiring_host_issued_sibling_refuses_tgkill_with_esrch() {
         Err(carrick_syscall_abi::LINUX_ESRCH),
     );
 }
+
+#[cfg(test)]
+struct RawExitStatusFrame(
+    carrick_personality_linux::crossing::HostCrossingSet,
+    carrick_sched_core::SlotId,
+    u64,
+);
+
+#[cfg(test)]
+impl carrick_personality_linux::dispatch::SyscallFrame for RawExitStatusFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_syscall_abi::CanonicalNr::new(carrick_personality_linux::lifecycle::SYS_EXIT as u64)
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        Some(if index == 0 { self.2 } else { 0 })
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::NativeReturnWord(0)
+    }
+    fn set_result(&mut self, _: carrick_guest_arch::NativeReturnWord) {}
+    fn slot(&self) -> Option<carrick_sched_core::SlotId> {
+        Some(self.1)
+    }
+    fn task_index(&self) -> usize {
+        0
+    }
+    fn user_sp(&self) -> Option<super::UserVa> {
+        Some(super::UserVa::new(0x8000))
+    }
+}
+
+#[cfg(test)]
+impl crate::dispatch::GuestDispatchFrame for RawExitStatusFrame {
+    fn restart_syscall(&mut self) {}
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(match self.0 {
+            carrick_personality_linux::crossing::HostCrossingSet::X86 => 60,
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => 93,
+        })
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        self.0
+    }
+    fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+#[cfg(test)]
+fn arm_syscall_words(
+    address: super::AddressContext<super::RootGpa>,
+) -> carrick_sched_core::Aarch64ParkedContext {
+    let mut native = carrick_el1_abi::ThreadCtx::ZERO;
+    native.pc = 0x40_0004;
+    native.sp_el0 = 0x80_0000;
+    carrick_sched_core::Aarch64ParkedContext::from_parts(native, address)
+}
+
+#[cfg(test)]
+fn spawn_born_sibling<C: super::ProcessContext + 'static>(
+    fixture: &super::NativeSignalFixture<C>,
+    make_words: fn(super::AddressContext<super::RootGpa>) -> C,
+) -> (
+    &'static carrick_el1_abi::CurrentTask,
+    &'static carrick_el1_abi::ThreadControlSlot,
+    carrick_sched_core::SlotId,
+    carrick_sched_core::RecordRef,
+) {
+    use carrick_el1_abi::{BornRecord, EntryIdentity, Lifecycle, ThreadIdentity};
+    use core::sync::atomic::Ordering;
+
+    let slot = carrick_sched_core::SlotId::new(1);
+    let tid = 42_u32;
+    let serial = 102_u64;
+    let affinity = 1_u64 << 1;
+    let zone = fixture.zone;
+    zone.drive(slot, 2);
+    zone.publish_slot(slot, 1, Some(1), affinity);
+    zone.enter_guest(slot);
+    zone.install_space(slot, 1).unwrap();
+
+    let control = Box::leak(Box::new(carrick_el1_abi::ThreadControlSlot::new()));
+    let birth =
+        carrick_core_abi::BirthSerial::of_task(super::TaskSerial::from_raw_u64(serial).unwrap());
+    let entry = fixture
+        .page
+        .stock(
+            0,
+            EntryIdentity {
+                tid,
+                visible_tid: tid,
+                thread_serial: serial,
+                birth,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+        .unwrap();
+    assert!(control.publish_visible_tid(tid));
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(u64::from(tid)),
+            birth,
+            carrick_core_abi::EntryThreadGeneration::from_raw(serial),
+        )
+        .unwrap(),
+    );
+    let claim = fixture.page.claim(entry).unwrap();
+    fixture
+        .page
+        .record_born(
+            claim,
+            BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture.page.publish(entry).unwrap();
+
+    let task = Box::leak(Box::new(carrick_el1_abi::CurrentTask::new()));
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
+        carrick_core_abi::SnapshotGeneration::from_raw(serial),
+        5,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(serial, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_root_generation(fixture.address.generation);
+    task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    zone.namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            ns.reserve_exact(tid as i32, super::ClaimKind::Thread)
+                .unwrap();
+        });
+
+    let record_id = zone
+        .alloc_record(ThreadIdentity {
+            tid: u64::from(tid),
+            serial,
+            mm: 1,
+            file_table: 5,
+            generation: serial,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity,
+            lifecycle_page: fixture.page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        })
+        .unwrap();
+    assert!(zone.mark_native_owned(record_id));
+    // SAFETY: newly allocated unpublished fixture record.
+    unsafe {
+        *zone.record(record_id).ctx_mut() = make_words(fixture.address);
+    }
+    assert!(zone.requeue_preempted(slot, record_id).is_queued());
+    assert_eq!(zone.switch_in_full(slot).unwrap().record, record_id);
+    let record = zone.record_ref(record_id);
+    control.bind_zone_record(record);
+    fixture
+        .registry
+        .register_thread(
+            BornInZoneSource { zone, slot },
+            task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    assert!(zone.mark_native_owned(record_id));
+    (task, control, slot, record)
+}
+
+/// #2932: when peer A holds a refundable reservation inside `serve_exit`'s
+/// `clear_child_tid` copy, the leader's raw `SYS_exit(38)` must not promote to
+/// `exit_group` while peer A's reservation can still roll back. Instead it
+/// parks on reservation release; once peer A commits its exit, the woken
+/// leader reruns `SYS_exit(38)` and retires the process as the sole survivor.
+#[cfg(test)]
+fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process<C, B>(
+    make_words: fn(super::AddressContext<super::RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: super::ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture: &'static super::NativeSignalFixture<C> =
+        Box::leak(Box::new(super::native_exec_fixture_for::<C, B>(make_words)));
+    let (sibling_task, sibling_control, sibling_slot, sibling_record) =
+        spawn_born_sibling(fixture, make_words);
+    assert!(fixture.zone.mark_native_owned(fixture.record.id));
+    sibling_control.set_clear_child_tid(0x4000);
+    assert_eq!(fixture.page.live(), 2);
+
+    struct SingleVenue<'a> {
+        page: &'a carrick_el1_abi::ThreadLifecyclePage,
+        control: &'a carrick_el1_abi::ThreadControlSlot,
+    }
+    impl crate::thread_setup::LifecycleVenue for SingleVenue<'_> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a carrick_el1_abi::CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(
+            &self,
+            _: &carrick_el1_abi::ThreadLifecyclePage,
+            _: carrick_el1_abi::EntryRef,
+        ) -> Option<&carrick_el1_abi::ThreadControlSlot> {
+            None
+        }
+    }
+
+    let leader_parked = std::sync::Arc::new(AtomicBool::new(false));
+    let leader_parked_hook = leader_parked.clone();
+    super::set_before_signal_copy_hook(Box::new(move |address| {
+        assert_eq!(address, super::UserVa::new(0x4000));
+        assert_eq!(fixture.page.live(), 1);
+
+        let counters = carrick_el1_abi::Counters::new();
+        let names = carrick_el1_abi::InotifyNameCache::new();
+        let venue = SingleVenue {
+            page: fixture.page,
+            control: fixture.control,
+        };
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let route = {
+            let mut frame = RawExitStatusFrame(isa, fixture.slot, 38);
+            let mut pending: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame,
+                counters: &counters,
+                current_tasks: core::slice::from_ref(fixture.task),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue),
+                process: Some(entry.as_mut()),
+                source: Some(BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                }),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending,
+            )
+        };
+        assert_eq!(route, CompletionRoute::Suspended);
+        assert_eq!(
+            fixture.page.gate(),
+            carrick_el1_abi::GateState::Open,
+            "leader raw exit promoted to exit_group while sibling's reservation was refundable"
+        );
+        assert!(entry.take_root_exit().is_none());
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_run_failure().is_none());
+        assert!(matches!(
+            fixture.zone.record(fixture.record.id).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        leader_parked_hook.store(true, Ordering::Release);
+    }));
+
+    let counters_a = carrick_el1_abi::Counters::new();
+    let names_a = carrick_el1_abi::InotifyNameCache::new();
+    let venue_a = SingleVenue {
+        page: fixture.page,
+        control: sibling_control,
+    };
+    let mut service_a = fixture.service();
+    service_a.waker_slot = sibling_slot;
+    service_a.tid_words.insert((1, 0x4000), 42);
+    let mut entry_a = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling_slot,
+            },
+            sibling_task,
+            fixture.address,
+            &make_words(fixture.address),
+            &mut service_a,
+        )
+        .unwrap();
+    {
+        let mut frame_a = RawExitStatusFrame(isa, sibling_slot, 0);
+        let mut pending_a: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            futex_argument0: None,
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame_a,
+            counters: &counters_a,
+            current_tasks: core::slice::from_ref(sibling_task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names_a,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue_a),
+            process: Some(entry_a.as_mut()),
+            source: Some(BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling_slot,
+            }),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending_a,
+            ),
+            CompletionRoute::Suspended,
+        );
+    }
+    assert!(leader_parked.load(Ordering::Acquire));
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    assert!(entry_a.take_root_exit().is_none());
+    assert!(entry_a.take_run_failure().is_none());
+    drop(entry_a);
+    assert!(fixture.zone.live(sibling_record).is_none());
+    assert_eq!(fixture.page.live(), 1);
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).queued(),
+        1,
+        "sibling reservation commit must wake parked leader raw exit"
+    );
+
+    fixture.zone.install_space(fixture.slot, 1).unwrap();
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    // SAFETY: `fixture.record` was just selected on `fixture.slot`.
+    let saved_leader = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut service_leader = fixture.service();
+    let mut entry_leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved_leader,
+            &mut service_leader,
+        )
+        .unwrap();
+    let resumed = entry_leader.resume_checkpoint(|_| Ok(None)).unwrap();
+    assert!(matches!(
+        resumed,
+        NativeResume::RetrySyscall | NativeResume::RetrySavedSyscall
+    ));
+    drop(entry_leader);
+
+    let counters_final = carrick_el1_abi::Counters::new();
+    let names_final = carrick_el1_abi::InotifyNameCache::new();
+    let venue_final = SingleVenue {
+        page: fixture.page,
+        control: fixture.control,
+    };
+    let mut entry_leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved_leader,
+            &mut service_leader,
+        )
+        .unwrap();
+    {
+        let mut frame_final = RawExitStatusFrame(isa, fixture.slot, 38);
+        let mut pending_final: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            futex_argument0: None,
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame_final,
+            counters: &counters_final,
+            current_tasks: core::slice::from_ref(fixture.task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names_final,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue_final),
+            process: Some(entry_leader.as_mut()),
+            source: Some(BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            }),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending_final,
+            ),
+            CompletionRoute::Suspended,
+        );
+    }
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
+    assert_eq!(
+        entry_leader.take_root_exit(),
+        Some(LinuxWaitStatus::exited(38))
+    );
+    assert!(entry_leader.take_handoff_receipt().is_some());
+    assert!(entry_leader.take_run_failure().is_none());
+    assert!(fixture.zone.live(fixture.record).is_none());
+    assert_eq!(fixture.page.live(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process_x86() {
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::Ring));
+    refundable_peer_commit_wakes_parked_raw_exit_to_retire_process::<
+        super::ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    super::ENTRYLESS_RETIREMENT.with(|owner| owner.set(super::EntrylessRetirement::HostThread));
+}
+
+#[cfg(test)]
+#[test]
+fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process_aarch64() {
+    refundable_peer_commit_wakes_parked_raw_exit_to_retire_process::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_syscall_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}

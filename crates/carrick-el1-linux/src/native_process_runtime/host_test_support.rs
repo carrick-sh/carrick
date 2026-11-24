@@ -140,6 +140,16 @@ pub(crate) fn fail_signal_copies(errors: &[NativeProcessError]) {
     SIGNAL_COPY_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_SIGNAL_COPY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(UserVa)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_signal_copy_hook(hook: Box<dyn FnOnce(UserVa)>) {
+    BEFORE_SIGNAL_COPY_HOOK.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+}
+
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
 }
@@ -503,6 +513,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     ) -> Result<(), NativeProcessError> {
         if address.raw() == 1 {
             return Err(NativeProcessError::Fault);
+        }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_SIGNAL_COPY_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(address);
         }
         if let Some(error) = SIGNAL_COPY_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
             return Err(error);
