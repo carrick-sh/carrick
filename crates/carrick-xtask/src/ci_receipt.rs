@@ -11,7 +11,7 @@ use crate::accept::AcceptReceipt;
 use crate::ci_scaler::{KERNEL_RUNTIME_WORKFLOW, REPOSITORY};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -759,7 +759,13 @@ fn sibling_crate_source(tree_root: &Path, target: &Path) -> bool {
         && std::fs::read_to_string(crate_dir.join("Cargo.toml"))
             .ok()
             .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
-            .is_some_and(|manifest| manifest.get("package").is_some())
+            .is_some_and(|manifest| {
+                manifest
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("name"))
+                    .is_some_and(toml::Value::is_str)
+            })
 }
 
 fn meta_has_path(meta: &syn::Meta) -> bool {
@@ -905,7 +911,6 @@ fn scan_crate_sources(
     manifest: &toml::Value,
     test_name: Option<&str>,
 ) -> Result<BTreeMap<PathBuf, TestSourceScan>, ReceiptError> {
-    use syn::visit::Visit;
     let tree_root = tree_root
         .canonicalize()
         .map_err(|e| source_io(tree_root, e))?;
@@ -919,46 +924,103 @@ fn scan_crate_sources(
         &crate_dir,
         &mut files,
     )?;
-    let scanned = Rc::new(files.iter().cloned().collect());
-    let mut pending: VecDeque<_> = files.into_iter().map(|file| (file, 0)).collect();
-    let mut scans = BTreeMap::new();
-    while let Some((file, depth)) = pending.pop_front() {
-        if scans.contains_key(&file) {
-            continue;
+    let mut chains = SourceChains {
+        scanned: Rc::new(files.iter().cloned().collect()),
+        crate_dir,
+        tree_root,
+        test_name,
+        scans: BTreeMap::new(),
+        explored: BTreeMap::new(),
+        stack: Vec::new(),
+    };
+    for file in &files {
+        chains.walk(file, 0)?;
+    }
+    Ok(chains.scans)
+}
+
+/// Discovery of every source an include! or `#[path]` chain reaches from a
+/// crate's own files. The depth bound holds along each chain a file is
+/// actually reached through: a shortcut that reaches a file in one hop does
+/// not lift the bound on a longer chain through it.
+struct SourceChains<'a> {
+    scanned: Rc<BTreeSet<PathBuf>>,
+    crate_dir: PathBuf,
+    tree_root: PathBuf,
+    test_name: Option<&'a str>,
+    scans: BTreeMap<PathBuf, TestSourceScan>,
+    /// The deepest chain depth at which a file's whole sub-chain was walked.
+    /// A walk at that depth or shallower reaches nothing deeper.
+    explored: BTreeMap<PathBuf, usize>,
+    /// The chain being walked, so a cycle stops instead of looping.
+    stack: Vec<PathBuf>,
+}
+
+impl SourceChains<'_> {
+    /// Scan `file` (once) and walk its chain children at `depth + 1`.
+    /// Returns whether the walk below `file` was complete, that is, it cut no
+    /// cycle short: only a complete walk may be reused for a later chain.
+    fn walk(&mut self, file: &Path, depth: usize) -> Result<bool, ReceiptError> {
+        if self.stack.iter().any(|on_chain| on_chain == file) {
+            return Ok(false);
         }
-        let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+        if self.explored.get(file).is_some_and(|&seen| seen >= depth) {
+            return Ok(true);
+        }
+        if !self.scans.contains_key(file) {
+            let scan = self.scan(file)?;
+            self.scans.insert(file.to_path_buf(), scan);
+        }
+        let scan = &self.scans[file];
+        let children: Vec<PathBuf> = scan
+            .includes
+            .iter()
+            .map(|include| include.file.clone())
+            .chain(scan.path_modules.iter().cloned())
+            .collect();
+        let mut complete = true;
+        if depth < MAX_INCLUDE_DEPTH {
+            self.stack.push(file.to_path_buf());
+            for child in &children {
+                complete &= self.walk(child, depth + 1)?;
+            }
+            self.stack.pop();
+        } else if let Some(scan) = self
+            .scans
+            .get_mut(file)
+            .filter(|scan| !scan.path_modules.is_empty())
+        {
+            scan.unresolved.get_or_insert("#[path] module depth limit");
+        }
+        if complete {
+            self.explored.insert(file.to_path_buf(), depth);
+        }
+        Ok(complete)
+    }
+
+    fn scan(&self, file: &Path) -> Result<TestSourceScan, ReceiptError> {
+        use syn::visit::Visit;
+        let source = std::fs::read_to_string(file).map_err(|e| source_io(file, e))?;
         let syntax = syn::parse_file(&source).map_err(|e| {
             ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
         })?;
         let mut scan = TestSourceScan {
-            scanned: Rc::clone(&scanned),
-            crate_dir: crate_dir.clone(),
-            tree_root: tree_root.clone(),
+            scanned: Rc::clone(&self.scanned),
+            crate_dir: self.crate_dir.clone(),
+            tree_root: self.tree_root.clone(),
             file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
-            name_mentioned: test_name.is_some_and(|name| source.contains(name)),
+            name_mentioned: self.test_name.is_some_and(|name| source.contains(name)),
             ..Default::default()
         };
         scan.visit_file(&syntax);
         // A followed out-of-crate `#[path]` file's plain `mod x;` children
         // live outside the scanned files: refuse rather than guess.
-        scan.followed = !scanned.contains(&file);
+        scan.followed = !self.scanned.contains(file);
         if scan.followed && scan.mod_decls.iter().any(|decl| decl.path.is_none()) {
             scan.unresolved = Some("#[path] module declaring out-of-line modules");
         }
-        if depth < MAX_INCLUDE_DEPTH {
-            pending.extend(
-                scan.includes
-                    .iter()
-                    .map(|include| include.file.clone())
-                    .chain(scan.path_modules.iter().cloned())
-                    .map(|file| (file, depth + 1)),
-            );
-        } else if !scan.path_modules.is_empty() {
-            scan.unresolved = Some("#[path] module depth limit");
-        }
-        scans.insert(file, scan);
+        Ok(scan)
     }
-    Ok(scans)
 }
 
 /// Visit tests spliced into the includer's module. Inline modules contribute
