@@ -646,7 +646,7 @@ esac
     passed(run("good"));
     let calls = fs::read_to_string(&log).unwrap();
     let lines: Vec<_> = calls.lines().collect();
-    assert_eq!(lines.len(), 4, "{calls}");
+    assert_eq!(lines.len(), 6, "{calls}");
     assert_eq!(
         lines[0],
         "clippy -p carrick-cli --no-default-features --features syscall-shim,platform-linux --all-targets --keep-going -- -D warnings"
@@ -659,8 +659,18 @@ esac
     assert!(lines[2].contains("-p carrick-xtask"));
     assert!(lines[2].contains("--features carrick-xtask/impact --all-targets"));
     assert!(!lines[2].contains("-p carrick-embed"));
+    // The CPL0 ring image's own target, with and without test-support: its
+    // nested image build runs without clippy-driver (#3005).
     assert_eq!(
         lines[3],
+        "clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --keep-going -- -D warnings"
+    );
+    assert_eq!(
+        lines[4],
+        "clippy -p carrick-x86-cpl0 --target x86_64-unknown-none --bins --features test-support --keep-going -- -D warnings"
+    );
+    assert_eq!(
+        lines[5],
         "clippy -p carrick-embed --no-default-features --features syscall-shim,platform-linux --lib --bins --examples --keep-going -- -D warnings"
     );
     for mode in ["failed", "empty", "missing"] {
