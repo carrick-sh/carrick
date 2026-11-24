@@ -940,7 +940,7 @@ fn shared_file_write_rows() -> Option<SharedFileWriteRows> {
         "native oracle: {native_rows}"
     );
     assert!(
-        native_rows.lines().count() == 50 && !native_rows.contains("BAD"),
+        native_rows.lines().count() == 62 && !native_rows.contains("BAD"),
         "native Linux keeps every written byte: {native_rows}"
     );
     let guest = run_mounted_binary(&elf, "shared-file-write", false);

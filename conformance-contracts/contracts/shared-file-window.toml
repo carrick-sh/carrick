@@ -10,6 +10,7 @@ title = "A shared file mapping is a live view of the file in every process"
 guest_surfaces = [
   "syscall:mmap",
   "syscall:munmap",
+  "syscall:mprotect",
   "syscall:msync",
   "syscall:ftruncate",
   "syscall:truncate",
@@ -20,6 +21,8 @@ semantic_authority = [
   "man 2 mmap: MAP_SHARED updates are visible to other processes mapping the same region and are carried through to the underlying file; access past the end of the file is SIGBUS",
   "man 2 msync: MS_SYNC requests an update and waits for it to complete",
   "man 2 truncate: if the file shrinks, the extra data is lost",
+  "man 2 mprotect: changes the access protections of the calling process's pages in the range",
+  "man 5 proc: /proc/pid/maps shows a shared mapping's permissions as rw-s",
   "man 2 fork: the child inherits MAP_SHARED mappings, shared with the parent",
 ]
 fixture = "embed:carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native"
@@ -39,8 +42,10 @@ second size change is Busy until the host result returns the file to Live
 at the new size, or the old one if the host refused. The KVM fixture runs
 the Go linker's sequence, two live processes sharing one writable file
 mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED with msync and a read by path,
-a chunk mapped twice, and a /dev/zero mapping shared with a child, as the
-root and as a forked child, and compares every row with native Linux.
+a chunk mapped twice, a /dev/zero mapping shared with a child, mprotect
+read-only and back over faulted window pages, the window's rw-s maps line
+and SIGBUS past the end of the file, as the root and as a forked child, and
+compares every row with native Linux.
 """
 
 [bindings]
