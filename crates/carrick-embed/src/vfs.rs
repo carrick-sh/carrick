@@ -1006,6 +1006,12 @@ impl Vfs for LayeredVfs {
         None
     }
 
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        self.layers
+            .iter()
+            .find_map(|layer| layer.host_inode_identity(path))
+    }
+
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
         for layer in &self.layers {
             match layer.readlink(path) {
@@ -1293,6 +1299,11 @@ impl Vfs for FilterVfs {
     fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         let mapped = self.map_path(path).ok()?;
         self.inner.real_stat(&mapped, follow)
+    }
+
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        let mapped = self.map_path(path).ok()?;
+        self.inner.host_inode_identity(&mapped)
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
@@ -1601,6 +1612,10 @@ impl Vfs for RecordingVfs {
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<carrick_vfs::fs_backend::RealStat> {
         self.inner.real_stat(path, follow)
+    }
+
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        self.inner.host_inode_identity(path)
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {

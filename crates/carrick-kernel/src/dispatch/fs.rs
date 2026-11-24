@@ -1699,23 +1699,57 @@ impl<'a> FsView<'a> {
 
     /// [`WindowInodes::fence`] for a size change of the file at the
     /// absolute, resolved `path` to `new_len` (a `truncate`, an `O_TRUNC`
-    /// open). A path naming no rootfs inode names no window.
+    /// open, a materialized description's writeback). The fence keys on
+    /// the host inode the path routes to: through the mount that claims it
+    /// (a bind mount reaches the host file itself), else through the
+    /// rootfs. Only a path that names nothing (ENOENT) is admitted
+    /// unnamed; any other path whose host inode can't be read is refused
+    /// while a window exists, never guessed.
     pub(in crate::dispatch) fn path_shrink_fence(&self, path: &str, new_len: u64) -> ShrinkFence {
+        self.path_fence(path, Some(new_len))
+    }
+
+    /// [`Self::path_shrink_fence`] for a materialized description's
+    /// writeback by path: it rewrites the host file from its own copy
+    /// (truncating it first), so it is refused whenever a window maps the
+    /// file, whatever the new size (#1338 A1).
+    pub(in crate::dispatch) fn path_writeback_fence(&self, path: &str) -> ShrinkFence {
+        self.path_fence(path, None)
+    }
+
+    /// `new_len: None` is a change that discards the file's bytes.
+    fn path_fence(&self, path: &str, new_len: Option<u64>) -> ShrinkFence {
         let windows = &self.fs.window_inodes;
         if !windows.any_window() {
             return ShrinkFence::Admit;
         }
-        let Some(identity) = self.fs.rootfs_vfs.path_inode_identity(path) else {
+        if let Some(mount) = self.fs.vfs_mounts.resolve(path) {
+            let size = match mount.vfs.lookup(&mount.full_path) {
+                Ok(md) => md.size,
+                Err(LINUX_ENOENT) => return ShrinkFence::Admit,
+                Err(_) => return ShrinkFence::Refuse,
+            };
+            return match mount.vfs.host_inode_identity(&mount.full_path) {
+                identity @ Some(_) => {
+                    windows.fence(identity, || new_len.map(|_| size), new_len.unwrap_or(0))
+                }
+                // A mount with no host objects (/proc, /dev, /sys) never
+                // backs a window: only a host file description is windowed.
+                None if mount.vfs.bind_source().is_none() => ShrinkFence::Admit,
+                None => ShrinkFence::Refuse,
+            };
+        }
+        let metadata = self.layered_metadata(path);
+        if matches!(metadata, Err(LINUX_ENOENT)) {
             return ShrinkFence::Admit;
-        };
+        }
         windows.fence(
-            Some(identity),
+            self.fs.rootfs_vfs.path_inode_identity(path),
             || {
-                self.layered_metadata(path)
-                    .ok()
-                    .and_then(|md| u64::try_from(md.size).ok())
+                new_len?;
+                metadata.ok().and_then(|md| u64::try_from(md.size).ok())
             },
-            new_len,
+            new_len.unwrap_or(0),
         )
     }
 
@@ -2283,6 +2317,14 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    // Its writeback rewrites the host file by path from this
+                    // copy: refused while a shared file window maps the file
+                    // (#1338 A1).
+                    if !is_anon_overlay_path(path)
+                        && this.path_writeback_fence(path) == ShrinkFence::Refuse
+                    {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                    }
                     // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
                     // blocked only by F_SEAL_GROW when it extends the file —
                     // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
@@ -2497,6 +2539,14 @@ impl<'a> FsView<'a> {
                         // not EBADF (ftruncate03). EBADF is for an invalid fd
                         // (handled by open_file→None above).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    // Its writeback rewrites the host file by path from this
+                    // copy: refused while a shared file window maps the file
+                    // (#1338 A1).
+                    if !is_anon_overlay_path(path)
+                        && this.path_writeback_fence(path) == ShrinkFence::Refuse
+                    {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
                     }
                     if !contents.accepts_len(length as u64) {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
