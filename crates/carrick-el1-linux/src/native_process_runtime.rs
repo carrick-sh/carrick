@@ -1145,6 +1145,9 @@ impl WaitChannel {
     fn address(this: &Arc<Self>) -> u64 {
         Arc::as_ptr(this) as u64
     }
+    fn exit_reservation_address(this: &Arc<Self>) -> u64 {
+        (Arc::as_ptr(this) as u64) | 1
+    }
 }
 /// One issued execution: a task id at an exact snapshot generation. This is
 /// an execution key, never a process incarnation; a [`TaskKey`] and the birth
@@ -1764,6 +1767,9 @@ enum PendingChildContinuation {
     /// A fork parked on a sibling's birth reservation release. Its owned
     /// operation is the saved clone SVC itself, which reruns on resume.
     Fork,
+    /// A raw `exit` parked on a sibling's refundable exit reservation release.
+    /// Its owned operation is the saved `exit` syscall, which reruns on resume.
+    ExitReservation,
 }
 
 enum PendingContinuation {
@@ -3960,6 +3966,10 @@ fn custody<'a, M: Clone, C: ProcessContext>(
         generation: custody.wake(),
         mm: custody.resources().record_identity_mm(),
     });
+    custody.resources().page.publish_exit_reservation_wait(
+        carrick_core_abi::EntryMmKey::from_raw(channel.mm),
+        WaitChannel::exit_reservation_address(&channel),
+    );
     custody.resources_mut().channel = Some(channel);
     custody
 }
@@ -6768,9 +6778,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Err(error) => self.fail(error),
                     })
                 }
-                // A contended fork's owned operation is its saved clone SVC:
-                // the execution lane re-enters it with every argument.
-                PendingChildContinuation::Fork => Some(LifecycleOutcome::Redispatch),
+                // A contended fork or floor-contended raw exit owns its saved
+                // syscall instruction: the execution lane re-enters it with
+                // every original argument.
+                PendingChildContinuation::Fork | PendingChildContinuation::ExitReservation => {
+                    Some(LifecycleOutcome::Redispatch)
+                }
             };
         }
         let pending = {
@@ -7593,6 +7606,163 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.run_failed(error.run_failure_reason()),
             },
         })
+    }
+
+    #[inline(never)]
+    fn await_exit_reservation_inner(
+        &mut self,
+    ) -> Result<carrick_personality_linux::lifecycle::ExitReservationWait, NativeFailure> {
+        use carrick_personality_linux::lifecycle::ExitReservationWait;
+        let (page, channel) = {
+            let graph = self.runtime.graph.lock();
+            if graph.pending.has_exit(&self.key) {
+                return Ok(ExitReservationWait::ProbeOnce);
+            }
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Stale)?
+                .native()
+                .resources();
+            (
+                resources.page,
+                resources.channel.clone().ok_or(NativeFailure::Stale)?,
+            )
+        };
+        if page.gate() != carrick_el1_abi::GateState::Open {
+            return Ok(ExitReservationWait::ProbeOnce);
+        }
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeFailure::Stale)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeFailure::Stale)?;
+        let address = WaitChannel::exit_reservation_address(&channel);
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
+        let owner = self.continuation_owner();
+        {
+            let graph = self.runtime.graph.lock();
+            if graph.pending.has_exit(&self.key) {
+                drop(guard);
+                return Ok(ExitReservationWait::ProbeOnce);
+            }
+            if graph.pending.has_child_wait(&self.key, owner) {
+                return Err(NativeFailure::Stale);
+            }
+        }
+        if page.gate() != carrick_el1_abi::GateState::Open
+            || !carrick_el1_abi::Lifecycle::arm_exit_reservation_waiter(page)
+        {
+            drop(guard);
+            return Ok(ExitReservationWait::ProbeOnce);
+        }
+        let sequence = zone.next_seq(record);
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| NativeFailure::Exhausted)?;
+        // SAFETY: the prepared handoff still owns this exact running record.
+        unsafe {
+            *zone.record(record).ctx_mut() = *self.words;
+            zone.record(record)
+                .publish_owner_continuation(OwnerEntry::Syscall);
+        }
+        self.runtime.graph.lock().pending.insert_child_wait(
+            self.key,
+            owner,
+            PendingChildContinuation::ExitReservation,
+        );
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        );
+        if receipt.is_none() {
+            drop(guard);
+            if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
+                self.yield_retained_wait(record)?;
+                return Ok(ExitReservationWait::Parked(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                }));
+            }
+            self.runtime
+                .graph
+                .lock()
+                .pending
+                .remove_child_wait(&self.key, owner);
+            // SAFETY: no handoff was published; this entry retains the record.
+            unsafe {
+                zone.record(record).consume_owner_continuation();
+            }
+            return Err(NativeFailure::Stale);
+        }
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = receipt;
+        Ok(ExitReservationWait::Parked(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        }))
+    }
+
+    #[inline(never)]
+    fn retire_sole_surviving_raw_exit_inner(
+        &mut self,
+        status: u8,
+    ) -> Result<Option<LifecycleOutcome>, NativeFailure> {
+        {
+            let graph = self.runtime.graph.lock();
+            if graph.pending.has_exit(&self.key) {
+                return Ok(None);
+            }
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Stale)?
+                .native()
+                .resources();
+            let page = resources.page;
+            if page.gate() != carrick_el1_abi::GateState::Open
+                || !carrick_core::terminal::raw_exit_is_process(page)
+            {
+                return Ok(None);
+            }
+            for member in &resources.members {
+                if core::ptr::eq(member.control.control(), self.control) {
+                    continue;
+                }
+                if let Some(entry) = member.control.entry()
+                    && carrick_el1_abi::Lifecycle::expected_exit_receipt(
+                        page,
+                        member.control.control(),
+                        Some(entry),
+                    ) != carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
+                {
+                    return Ok(None);
+                }
+            }
+            for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+                let Some(identity) = page.host_birth_identity(index) else {
+                    continue;
+                };
+                if self.control.host_birth_identity() == Some(identity) {
+                    continue;
+                }
+                if !page.host_birth_receipt_returned(index) {
+                    return Ok(None);
+                }
+            }
+        }
+        self.exit_owned(status).map(Some)
     }
 
     /// A member that enters new native work after its process's terminal
@@ -8641,6 +8811,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
             page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
+            if let Some(notification) =
+                carrick_el1_abi::Lifecycle::exit_reservation_notification(page)
+            {
+                let effects = notification.publish(
+                    self.source.zone,
+                    self.source.slot,
+                    &NativeBucketWait {
+                        lifetime: core::marker::PhantomData,
+                        #[cfg(test)]
+                        probe: self.publication_wait_probe,
+                    },
+                );
+                self.service.wake_effects(effects);
+            }
             // Closing requests host retirement; it does not retire live zone
             // records. A deferred control wake is owned by that record's vCPU
             // or producer until its handback reaches the host continuation.
@@ -8874,6 +9058,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeFailure::Quarantined)?;
         }
         page.clear_exit_wait();
+        page.clear_exit_reservation_wait();
         let permit = published
             .effects
             .cancel_members(|member| {
@@ -10420,6 +10605,39 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
         self.retire_closing_raw_exit()
+    }
+    fn await_exit_reservation(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::ExitReservationWait> {
+        match self.await_exit_reservation_inner() {
+            Ok(wait) => Some(wait),
+            Err(error) => Some(
+                carrick_personality_linux::lifecycle::ExitReservationWait::Parked(
+                    self.run_failed(error.run_failure_reason()),
+                ),
+            ),
+        }
+    }
+    fn retire_sole_surviving_raw_exit(&mut self, status: u8) -> Option<LifecycleOutcome> {
+        match self.retire_sole_surviving_raw_exit_inner(status) {
+            Ok(outcome) => outcome,
+            Err(error) => Some(self.run_failed(error.run_failure_reason())),
+        }
+    }
+    fn publish_exit_reservation_notification(
+        &mut self,
+        notification: carrick_core::terminal::TerminalNotification,
+    ) {
+        let effects = notification.publish(
+            self.source.zone,
+            self.source.slot,
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
+        self.service.wake_effects(effects);
     }
     fn as_identity_venue(
         &mut self,

@@ -675,13 +675,29 @@ pub fn retire_host_member(
     entry: EntryRef,
     member: &dyn MemberControl,
     membership: NonfinalExitMembership<'_>,
-    _registry: &RegistryWriteHeld<'_>,
+    registry: &RegistryWriteHeld<'_>,
 ) -> Result<(), TransitionError> {
-    let _pin = MemberControlCustody::retain(member)?;
-    if !core::ptr::addr_eq(page, membership.page) {
-        return Err(TransitionError::StaleGeneration);
-    }
-    if member.member_entry() != Some(entry) {
+    let mut wake = None;
+    retire_host_member_with_wake(page, entry, member, membership, registry, &mut wake)
+}
+
+pub fn retire_host_member_with_wake(
+    page: &dyn Lifecycle,
+    entry: EntryRef,
+    member: &dyn MemberControl,
+    membership: NonfinalExitMembership<'_>,
+    _registry: &RegistryWriteHeld<'_>,
+    wake: &mut Option<crate::terminal::TerminalNotification>,
+) -> Result<(), TransitionError> {
+    let _pin = match MemberControlCustody::retain(member) {
+        Ok(pin) => pin,
+        Err(error) => {
+            *wake = membership.rollback_with_wake();
+            return Err(error);
+        }
+    };
+    if !core::ptr::addr_eq(page, membership.page) || member.member_entry() != Some(entry) {
+        *wake = membership.rollback_with_wake();
         return Err(TransitionError::StaleGeneration);
     }
     let _waiter = finish_member_word(
@@ -697,9 +713,10 @@ pub fn retire_host_member(
                 .word
                 .fetch_and(!HOST_RETIRING, Ordering::SeqCst);
         }
+        *wake = membership.rollback_with_wake();
         return Err(error);
     }
-    membership.publish();
+    *wake = membership.publish_with_wake();
     Ok(())
 }
 
@@ -743,10 +760,20 @@ fn accepts_stock(state: EntryState) -> bool {
     )
 }
 
+const LIVE_COUNT_MASK: u64 = 0xffff_ffff;
+const REFUNDABLE_EXIT_SHIFT: u32 = 32;
+const REFUNDABLE_EXIT_MAX: u64 = 0x3fff_ffff;
+const REFUNDABLE_EXIT_MASK: u64 = REFUNDABLE_EXIT_MAX << REFUNDABLE_EXIT_SHIFT;
+const EXIT_RESERVATION_WAKE_OWED: u64 = 1 << 62;
+const EXIT_RESERVATION_WAITER: u64 = 1 << 63;
+
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
     fn terminal_notification(&self) -> Option<crate::terminal::TerminalNotification> {
+        None
+    }
+    fn exit_reservation_notification(&self) -> Option<crate::terminal::TerminalNotification> {
         None
     }
     fn pool_control_disposition(&self, entry: EntryRef) -> PoolControlDisposition {
@@ -775,7 +802,7 @@ pub trait Lifecycle {
         identity: crate::terminal::ThreadBirthIdentity,
     ) -> bool;
     fn gate_word(&self) -> &AtomicU32;
-    fn live_word(&self) -> &AtomicU32;
+    fn live_word(&self) -> &AtomicU64;
     fn entry_count(&self) -> usize;
     fn entry_word(&self, index: usize) -> Option<&AtomicEntry>;
     fn activity(&self) -> Option<&ThreadLedgerActivity>;
@@ -872,39 +899,100 @@ pub trait Lifecycle {
     // ---- live count ----
 
     fn live(&self) -> u32 {
-        self.live_word().load(Ordering::SeqCst)
+        (self.live_word().load(Ordering::SeqCst) & LIVE_COUNT_MASK) as u32
+    }
+    /// Whether any peer currently holds an uncommitted refundable exit reservation.
+    fn has_refundable_exit(&self) -> bool {
+        (self.live_word().load(Ordering::SeqCst) & REFUNDABLE_EXIT_MASK) != 0
+    }
+    /// Single-word atomic check that one live member remains and no peer holds
+    /// a refundable exit reservation that could still restore membership.
+    fn live_is_sole_uncontested(&self) -> bool {
+        let word = self.live_word().load(Ordering::SeqCst);
+        (word & LIVE_COUNT_MASK) == 1 && (word & REFUNDABLE_EXIT_MASK) == 0
+    }
+    /// Single-word atomic check that `live == 1` only because at least one peer
+    /// holds an uncommitted refundable exit reservation.
+    fn live_is_contended_floor(&self) -> bool {
+        let word = self.live_word().load(Ordering::SeqCst);
+        (word & LIVE_COUNT_MASK) == 1 && (word & REFUNDABLE_EXIT_MASK) != 0
+    }
+    /// Consume a deferred reservation-release wake recorded by a host exit or
+    /// drop path before its registry lock was released.
+    fn take_exit_reservation_wake(&self) -> Option<crate::terminal::TerminalNotification> {
+        let previous = self
+            .live_word()
+            .fetch_and(!EXIT_RESERVATION_WAKE_OWED, Ordering::SeqCst);
+        (previous & EXIT_RESERVATION_WAKE_OWED != 0)
+            .then(|| self.exit_reservation_notification())
+            .flatten()
+    }
+    /// Arm the reservation-release waiter bit while at least one refundable
+    /// reservation is active. Returns `false` if no refundable reservation
+    /// remains so the caller probes once without parking.
+    fn arm_exit_reservation_waiter(&self) -> bool {
+        self.live_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                (word & REFUNDABLE_EXIT_MASK != 0).then_some(word | EXIT_RESERVATION_WAITER)
+            })
+            .is_ok()
     }
     /// A thread was born: `n -> n+1`. Returns the new count, `None` on
     /// overflow.
     fn thread_born(&self) -> Option<u32> {
         self.live_word()
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let live = (word & LIVE_COUNT_MASK) as u32;
+                live.checked_add(1)
+                    .map(|next| (word & !LIVE_COUNT_MASK) | u64::from(next))
+            })
             .ok()
-            .map(|n| n + 1)
+            .map(|prev| (prev & LIVE_COUNT_MASK) as u32 + 1)
     }
     /// Release one live membership only above the caller-selected floor.
     /// Returns the new count; the owner never chooses terminal-exit policy.
     fn release_live(&self, minimum: u32) -> Result<u32, MembershipFloor> {
         self.live_word()
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                if n > minimum { Some(n - 1) } else { None }
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let live = (word & LIVE_COUNT_MASK) as u32;
+                if live > minimum {
+                    Some((word & !LIVE_COUNT_MASK) | u64::from(live - 1))
+                } else {
+                    None
+                }
             })
-            .map(|n| n - 1)
+            .map(|prev| (prev & LIVE_COUNT_MASK) as u32 - 1)
             .map_err(|_| MembershipFloor)
     }
 
-    /// Atomically reserve a nonfinal host exit before its graph publication.
-    /// The page word, rather than a potentially lagging graph census, decides
-    /// whether this member is last. Dropping an unpublished reservation puts
-    /// its membership back.
+    /// Atomically reserve a nonfinal host or ring exit before publication.
+    /// The single 64-bit word both decrements `live` and records the active
+    /// refundable reservation so no peer raw `exit` can mistake `live == 1`
+    /// for sole surviving process ownership while this reservation can refund.
     fn reserve_nonfinal_exit(&self) -> Result<NonfinalExitMembership<'_>, MembershipFloor>
     where
         Self: Sized,
     {
-        self.release_live(1)?;
+        self.live_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let live = (word & LIVE_COUNT_MASK) as u32;
+                let refundable = (word & REFUNDABLE_EXIT_MASK) >> REFUNDABLE_EXIT_SHIFT;
+                if live > 1 && refundable < REFUNDABLE_EXIT_MAX {
+                    Some(
+                        (word & (EXIT_RESERVATION_WAITER | EXIT_RESERVATION_WAKE_OWED))
+                            | ((refundable + 1) << REFUNDABLE_EXIT_SHIFT)
+                            | u64::from(live - 1),
+                    )
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| MembershipFloor)?;
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            refundable: true,
+            owed_wake: false,
             member: None,
         })
     }
@@ -920,6 +1008,8 @@ pub trait Lifecycle {
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            refundable: false,
+            owed_wake: false,
             member: None,
         })
     }
@@ -934,6 +1024,8 @@ pub trait Lifecycle {
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            refundable: false,
+            owed_wake: false,
             member: None,
         })
     }
@@ -943,13 +1035,14 @@ pub trait Lifecycle {
     fn restore_reserved(&self, _unit: ReservedLiveUnit) {
         let _ = self
             .live_word()
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let live = (word & LIVE_COUNT_MASK) as u32;
                 // A reserved unit was removed from this page before this
                 // non-cloneable token existed, and concurrent births hold
                 // distinct bounded pool or registry slots (far fewer than
                 // u32::MAX), so this add cannot overflow. Saturate rather
                 // than assume: a broken invariant must never become UB.
-                Some(n.saturating_add(1))
+                Some((word & !LIVE_COUNT_MASK) | u64::from(live.saturating_add(1)))
             });
     }
 
@@ -1246,6 +1339,8 @@ pub trait Lifecycle {
 pub struct NonfinalExitMembership<'a> {
     page: &'a dyn Lifecycle,
     reserved: Option<ReservedLiveUnit>,
+    refundable: bool,
+    owed_wake: bool,
     member: Option<MemberExitClaim<'a, AtomicU32>>,
 }
 
@@ -1269,13 +1364,68 @@ impl NonfinalExitMembership<'_> {
             .as_ref()
             .is_some_and(|claim| core::ptr::eq(claim.word, &member.exit_custody().word))
     }
+
+    fn release_refundable(&mut self, restore_live: bool, defer_wake: bool) {
+        if !self.refundable {
+            return;
+        }
+        self.refundable = false;
+        let previous = self
+            .page
+            .live_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                let live = (word & LIVE_COUNT_MASK) as u32;
+                let refundable = (word & REFUNDABLE_EXIT_MASK) >> REFUNDABLE_EXIT_SHIFT;
+                debug_assert!(refundable > 0);
+                let next_live = if restore_live {
+                    live.saturating_add(1)
+                } else {
+                    live
+                };
+                let carry_owed = if defer_wake && (word & EXIT_RESERVATION_WAITER != 0) {
+                    EXIT_RESERVATION_WAKE_OWED
+                } else {
+                    word & EXIT_RESERVATION_WAKE_OWED
+                };
+                Some(
+                    carry_owed
+                        | (refundable.saturating_sub(1) << REFUNDABLE_EXIT_SHIFT)
+                        | u64::from(next_live),
+                )
+            })
+            .unwrap_or(0);
+        if !defer_wake {
+            self.owed_wake |= previous & EXIT_RESERVATION_WAITER != 0;
+        }
+    }
+
     pub(crate) fn rollback(&mut self) {
+        self.rollback_inner(true);
+    }
+
+    fn rollback_inner(&mut self, defer_wake: bool) {
         if let Some(unit) = self.reserved.take() {
-            self.page.restore_reserved(unit);
+            if self.refundable {
+                self.release_refundable(true, defer_wake);
+            } else {
+                self.page.restore_reserved(unit);
+            }
+        } else if self.refundable {
+            self.release_refundable(false, defer_wake);
         }
         // A committed reservation has no refund and keeps terminal provenance.
         self.member.take();
     }
+
+    /// Roll back an uncommitted reservation and return any owed waiter wake.
+    pub fn rollback_with_wake(mut self) -> Option<crate::terminal::TerminalNotification> {
+        self.rollback_inner(false);
+        core::mem::take(&mut self.owed_wake)
+            .then(|| self.page.exit_reservation_notification())
+            .flatten()
+            .or_else(|| self.page.take_exit_reservation_wake())
+    }
+
     /// The exact terminal owner crossed its irreversible publication point.
     /// Dropping this token can no longer restore a terminated member's unit.
     pub(crate) fn commit_irrevocable(&mut self) {
@@ -1285,9 +1435,29 @@ impl NonfinalExitMembership<'_> {
         }
     }
 
+    /// Settle the refundable reservation count after terminal publication (or
+    /// after an earlier slot-lock rollback) and return any owed waiter wake.
+    pub fn finish_reservation_wake(&mut self) -> Option<crate::terminal::TerminalNotification> {
+        if self.reserved.is_none() && self.refundable {
+            self.release_refundable(false, false);
+        }
+        core::mem::take(&mut self.owed_wake)
+            .then(|| self.page.exit_reservation_notification())
+            .flatten()
+            .or_else(|| self.page.take_exit_reservation_wake())
+    }
+
     /// The graph's exact-thread retirement and ledger publication completed.
     pub fn publish(mut self) {
         self.commit_irrevocable();
+        if self.refundable {
+            self.release_refundable(false, true);
+        }
+    }
+
+    pub fn publish_with_wake(mut self) -> Option<crate::terminal::TerminalNotification> {
+        self.commit_irrevocable();
+        self.finish_reservation_wake()
     }
 }
 
@@ -1469,7 +1639,7 @@ mod membership_tests {
     struct Page {
         terminal: crate::terminal::ProcessExitCustody,
         gate: AtomicU32,
-        live: AtomicU32,
+        live: AtomicU64,
     }
 
     impl Lifecycle for Page {
@@ -1487,7 +1657,7 @@ mod membership_tests {
         fn gate_word(&self) -> &AtomicU32 {
             &self.gate
         }
-        fn live_word(&self) -> &AtomicU32 {
+        fn live_word(&self) -> &AtomicU64 {
             &self.live
         }
         fn entry_count(&self) -> usize {
@@ -1653,7 +1823,7 @@ mod membership_tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(GateState::Open as u32),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         drop(page.reserve_nonfinal_exit().unwrap());
         assert_eq!(page.live(), 2);
@@ -1685,7 +1855,7 @@ mod membership_tests {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(GateState::Open as u32),
-            live: AtomicU32::new(2),
+            live: AtomicU64::new(2),
         };
         let member = Member {
             custody: MemberExitCustody::new(),

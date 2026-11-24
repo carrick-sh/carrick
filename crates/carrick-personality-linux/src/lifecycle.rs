@@ -272,6 +272,17 @@ pub struct RealtimeCounter {
     pub offset_ns: u64,
 }
 
+/// Outcome of enrolling a floor-declined raw `exit` on a peer's refundable
+/// exit reservation release.
+pub enum ExitReservationWait {
+    /// Enrolled on the reservation release queue and parked; the saved `exit`
+    /// syscall reruns when the reservation settles.
+    Parked(LifecycleOutcome),
+    /// No refundable reservation remained under the wait-bucket guard; the
+    /// caller probes once without spinning.
+    ProbeOnce,
+}
+
 pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     fn monotonic_counter(&mut self) -> Option<(CounterTick, CounterFrequency)> {
         None
@@ -548,6 +559,21 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
         None
     }
+    /// Enrol on an active refundable peer exit reservation's release, or
+    /// report `ProbeOnce` when none remains under the wait-bucket guard.
+    fn await_exit_reservation(&mut self) -> Option<ExitReservationWait> {
+        None
+    }
+    /// Retire the process when a raw `exit` caller is the authenticated sole
+    /// surviving thread and zero refundable reservations remain.
+    fn retire_sole_surviving_raw_exit(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn publish_exit_reservation_notification(
+        &mut self,
+        _notification: carrick_core::terminal::TerminalNotification,
+    ) {
+    }
     fn route_host_thread_exit(
         &mut self,
         _verdict: carrick_core::terminal::RetirementVerdict,
@@ -792,6 +818,26 @@ pub trait LifecycleNative<'a>: UserCopy {
     /// Retire a thread whose raw `exit` raced its group's terminal close.
     fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
         None
+    }
+    /// Enrol on an active refundable peer exit reservation's release, or
+    /// report `ProbeOnce` when none remains under the wait-bucket guard.
+    fn await_exit_reservation(&mut self) -> Option<ExitReservationWait> {
+        None
+    }
+    /// Retire the process when a raw `exit` caller is the authenticated sole
+    /// surviving thread and zero refundable reservations remain.
+    fn retire_sole_surviving_raw_exit(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
+    /// Redispatch the caller's saved raw `exit` syscall when a new contended
+    /// reservation resolved ahead of a fallback park.
+    fn redispatch_raw_exit(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn exit_reservation_released(
+        &mut self,
+        _notification: carrick_core::terminal::TerminalNotification,
+    ) {
     }
     /// Exact retained process owner for an adopted thread's terminal handoff.
     fn process_exit_binding(&self) -> Option<ExecutionBinding> {
@@ -1077,22 +1123,47 @@ pub fn invoke<'a>(
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            loop {
-                match serve_exit(thread, native) {
-                    Ok(outcome) => return Some(outcome),
-                    Err(decline) => {
-                        if let Some(outcome) = native.retire_closing_thread_exit() {
-                            return Some(outcome);
-                        }
-                        if carrick_core::terminal::raw_exit_is_process(thread.page)
-                            && let Some(outcome) = native.process_exit_group(args[0] as u8)
-                        {
-                            return Some(outcome);
-                        }
-                        if !matches!(decline, ServeExitDecline::Floor)
-                            || native.process_exit_binding().is_none()
-                        {
-                            break;
+            match serve_exit(thread, native) {
+                Ok(outcome) => return Some(outcome),
+                Err(decline) => {
+                    if let Some(outcome) = native.retire_closing_thread_exit() {
+                        return Some(outcome);
+                    }
+                    if matches!(decline, ServeExitDecline::Floor) {
+                        match native.await_exit_reservation() {
+                            Some(ExitReservationWait::Parked(outcome)) => return Some(outcome),
+                            Some(ExitReservationWait::ProbeOnce) => {
+                                if let Some(outcome) = native.retire_closing_thread_exit() {
+                                    return Some(outcome);
+                                }
+                                if let Some(outcome) =
+                                    native.retire_sole_surviving_raw_exit(args[0] as u8)
+                                {
+                                    return Some(outcome);
+                                }
+                                match serve_exit(thread, native) {
+                                    Ok(outcome) => return Some(outcome),
+                                    Err(ServeExitDecline::Floor) => {
+                                        if let Some(outcome) = native.retire_closing_thread_exit() {
+                                            return Some(outcome);
+                                        }
+                                        if let Some(ExitReservationWait::Parked(outcome)) =
+                                            native.await_exit_reservation()
+                                        {
+                                            return Some(outcome);
+                                        }
+                                        if let Some(outcome) = native.redispatch_raw_exit() {
+                                            return Some(outcome);
+                                        }
+                                    }
+                                    Err(ServeExitDecline::Other) => {
+                                        if let Some(outcome) = native.retire_closing_thread_exit() {
+                                            return Some(outcome);
+                                        }
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -1696,10 +1767,16 @@ fn serve_exit<'a>(
     if page.gate() != GateState::Open {
         return decline!(LifecycleDecline::ExitGate);
     }
-    // The leader holds no pool entry.
+    // The leader holds no pool entry, but if a peer holds a refundable exit
+    // reservation at the live floor, the leader's raw exit must enrol on that
+    // reservation's release rather than routing to host or promoting early.
     let entry = slot.entry().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoEntry);
-        ServeExitDecline::Other
+        if carrick_core::terminal::raw_exit_contended_at_floor(page) {
+            ServeExitDecline::Floor
+        } else {
+            ServeExitDecline::Other
+        }
     })?;
     if !matches!(
         page.state(entry.index()),
@@ -1767,10 +1844,16 @@ fn serve_exit<'a>(
     })?;
     // The member claim precedes ABI admission, so a host retirement which
     // already owns the live unit never encounters a new Exiting state.
-    let mut admission = page.begin_exit(entry).map_err(|_| {
-        native.record_decline(LifecycleDecline::ExitAdmission);
-        ServeExitDecline::Other
-    })?;
+    let mut admission = match page.begin_exit(entry) {
+        Ok(admission) => admission,
+        Err(_) => {
+            if let Some(notification) = membership.rollback_with_wake() {
+                native.exit_reservation_released(notification);
+            }
+            native.record_decline(LifecycleDecline::ExitAdmission);
+            return Err(ServeExitDecline::Other);
+        }
+    };
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
@@ -1787,7 +1870,9 @@ fn serve_exit<'a>(
                 // thread has no host task to take the exit instead.
                 native.set_result(status);
                 drop(admission);
-                drop(membership);
+                if let Some(notification) = membership.rollback_with_wake() {
+                    native.exit_reservation_released(notification);
+                }
                 return match native.wait_guest_copy(request) {
                     // The owner found a real fault: the host lane keeps it.
                     LifecycleOutcome::Returned { .. } => {
@@ -1803,6 +1888,10 @@ fn serve_exit<'a>(
             // The host exits the thread instead: clearing the word again
             // and waking are idempotent.
             native.set_result(status);
+            drop(admission);
+            if let Some(notification) = membership.rollback_with_wake() {
+                native.exit_reservation_released(notification);
+            }
             return decline!(if copied {
                 LifecycleDecline::ExitClearTidWake
             } else {
@@ -1814,12 +1903,21 @@ fn serve_exit<'a>(
         // exact-address CAS preserves a newer set_tid_address if one won.
         slot.mark_child_tid_cleared_in_zone(clear_child_tid);
     }
-    let retirement = custody
-        .zone_retirement(slot, &mut membership, Some(&mut admission))
-        .ok_or(ServeExitDecline::Other)?;
+    let Some(retirement) = custody.zone_retirement(slot, &mut membership, Some(&mut admission))
+    else {
+        drop(admission);
+        if let Some(notification) = membership.rollback_with_wake() {
+            native.exit_reservation_released(notification);
+        }
+        return Err(ServeExitDecline::Other);
+    };
     if !native.release_current(record.reference, retirement) {
         // Requeue/refusal retains the progress already published above, so
         // the next lane cannot clear and wake the joiner a second time.
+        drop(admission);
+        if let Some(notification) = membership.finish_reservation_wake() {
+            native.exit_reservation_released(notification);
+        }
         return Err(ServeExitDecline::Other);
     }
     if admission.commit_with_member(slot).is_err() {
@@ -1827,7 +1925,10 @@ fn serve_exit<'a>(
         // Published that way): the host must look at this process.
         native.fail_lifecycle(NativeRunFailureReason::NativeQuarantined);
     }
-    membership.publish();
+    let reservation_wake = membership.publish_with_wake();
+    if let Some(notification) = reservation_wake {
+        native.exit_reservation_released(notification);
+    }
     native.thread_exited(custody.into_verdict(page));
     let (progress, result) = if record.unadopted {
         native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64))
