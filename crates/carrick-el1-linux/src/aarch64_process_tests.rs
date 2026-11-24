@@ -2679,8 +2679,16 @@ fn native_fork_child_clock_gettime_serves_every_clock_id() {
         // A valid clock faults a null output.
         assert_eq!(read(clock, 0), (-14, 0), "clock_gettime({clock}, NULL)");
     }
-    // The caller's own CPU clocks by a dynamic id with pid 0, PROF or SCHED.
-    for clock in [dynamic(0, 0b000), dynamic(0, 0b010), dynamic(0, 0b110)] {
+    // The caller's own CPU clocks by a dynamic id with pid 0: PROF, VIRT
+    // (user time only) and SCHED, per process and per thread.
+    for clock in [
+        dynamic(0, 0b000),
+        dynamic(0, 0b001),
+        dynamic(0, 0b010),
+        dynamic(0, 0b100),
+        dynamic(0, 0b101),
+        dynamic(0, 0b110),
+    ] {
         let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
         assert_eq!(read(clock, ts.arg()), (0, 0), "clock_gettime({clock:#x})");
         assert!(
@@ -2688,24 +2696,27 @@ fn native_fork_child_clock_gettime_serves_every_clock_id() {
             "clock {clock:#x}: {:?}",
             ts.get()
         );
+        // A valid caller-relative clock faults a null output.
+        assert_eq!(read(clock, 0), (-14, 0), "clock_gettime({clock:#x}, NULL)");
     }
-    // Unknown ids, CLOCKFD (carrick has no posix-clock device) and an invalid
-    // per-thread CPUCLOCK_WHICH are EINVAL before the output is touched.
-    for clock in [10, 12, 16, dynamic(3, 0b011), u64::from(u32::MAX)] {
+    // Unknown ids, CLOCKFD (carrick has no posix-clock device), an invalid
+    // per-thread CPUCLOCK_WHICH, and a CPU clock naming no task (pid 4242
+    // does not exist) are EINVAL before the output is touched.
+    for clock in [
+        10,
+        12,
+        16,
+        dynamic(3, 0b011),
+        u64::from(u32::MAX),
+        dynamic(4242, 0b000),
+        dynamic(4242, 0b001),
+        dynamic(4242, 0b010),
+        dynamic(4242, 0b110),
+    ] {
         let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
         assert_eq!(read(clock, ts.arg()), (-22, 0), "clock_gettime({clock:#x})");
         assert_eq!(ts.get(), [u64::MAX; 2], "clock {clock:#x} left its output");
         assert_eq!(read(clock, 0), (-22, 0), "clock_gettime({clock:#x}, NULL)");
-    }
-    // Another task's CPU clock, and a user-time-only one, have no ring
-    // authority yet: a counted refusal, never a wrong value.
-    for clock in [
-        dynamic(4242, 0b010),
-        dynamic(4242, 0b110),
-        dynamic(0, 0b001),
-    ] {
-        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
-        assert_eq!(read(clock, ts.arg()), (-38, 1), "clock_gettime({clock:#x})");
     }
 }
 
@@ -2732,6 +2743,12 @@ fn native_fork_child_cputime_and_times_reach_time_handler() {
     );
 }
 
+/// The caller's static CPU clocks and `times` account its own user and system
+/// time (and its reaped children's). #2028: a dynamic CPU clock reads the task
+/// it names, sampled as it asks: the live parent's process clock is the
+/// parent's 80 ms (70 ms VIRT), never the caller's 57 ms (35 ms VIRT); a reaped
+/// child's pid, and another process's thread, are EINVAL (a native Linux 6.12
+/// probe: clock_getcpuclockid(3), pthread_getcpuclockid(3)).
 #[test]
 fn native_fork_child_cputime_and_times_account_user_system_and_children() {
     use carrick_guest_arch::CounterTick;
@@ -2826,6 +2843,21 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
 
     let hz = carrick_guest_arch::CounterFrequency::new(NonZeroU64::new(1_000_000_000).unwrap());
     fixture.zone.publish_counter_frequency(hz);
+    // Charge the parent 70 ms user + 10 ms system: a live peer whose clock
+    // differs from every one the child owns.
+    fixture.zone.cpu_enter_user(
+        fixture.slot,
+        Some(parent.record),
+        CounterTick::new(10_000_000),
+    );
+    fixture.zone.cpu_enter_ring(
+        fixture.slot,
+        Some(parent.record),
+        CounterTick::new(80_000_000),
+    );
+    fixture
+        .zone
+        .cpu_leave_slot(fixture.slot, CounterTick::new(90_000_000));
     let activate_target = |target: &super::native_process_runtime::NativeRecordBinding<
         AddressContext<RootGpa>,
         Aarch64ParkedContext,
@@ -3015,6 +3047,74 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
     assert_eq!({ tms.tms_stime }, 2);
     assert_eq!({ tms.tms_cutime }, 4);
     assert_eq!({ tms.tms_cstime }, 1);
+
+    // `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+    let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
+    let mut gettime = |clock: u64, output: u64| {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            slot: fixture.slot.index() as u64,
+            ..Default::default()
+        };
+        frame.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+        frame.x[0] = clock;
+        frame.x[1] = output;
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert!(
+            matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+            "clock_gettime({clock:#x}) was not served in ring: {route:?}"
+        );
+        frame.x[0] as i64
+    };
+    let child_pid = result.raw() as u32;
+    let parent_pid = 41;
+    for (clock, expected) in [
+        // The caller, by pid 0 and by its own pid or tid.
+        (dynamic(0, 0b000), 57_000_000),
+        (dynamic(0, 0b001), 35_000_000),
+        (dynamic(0, 0b101), 35_000_000),
+        (dynamic(child_pid, 0b010), 57_000_000),
+        (dynamic(child_pid, 0b001), 35_000_000),
+        (dynamic(child_pid, 0b110), 57_000_000),
+        // The live parent's process clock: its time, not the caller's.
+        (dynamic(parent_pid, 0b000), 80_000_000),
+        (dynamic(parent_pid, 0b001), 70_000_000),
+        (dynamic(parent_pid, 0b010), 80_000_000),
+    ] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(gettime(clock, ts.arg()), 0, "clock_gettime({clock:#x})");
+        assert_eq!(ts.get(), [0, expected], "clock {clock:#x}");
+    }
+    for clock in [
+        // The reaped grandchild names no process.
+        dynamic(grandchild_pid.raw() as u32, 0b010),
+        // The parent is not a thread of the caller's thread group.
+        dynamic(parent_pid, 0b110),
+        dynamic(parent_pid, 0b101),
+    ] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(gettime(clock, ts.arg()), -22, "clock_gettime({clock:#x})");
+        assert_eq!(ts.get(), [u64::MAX; 2], "clock {clock:#x} left its output");
+    }
+    // Linux checks the target before the output.
+    assert_eq!(gettime(dynamic(parent_pid, 0b010), 0), -14);
+    assert_eq!(gettime(dynamic(parent_pid, 0b110), 0), -22);
 }
 
 #[test]
