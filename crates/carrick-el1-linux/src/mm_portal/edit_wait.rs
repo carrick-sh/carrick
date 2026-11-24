@@ -22,7 +22,19 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     frame: &mut TrapFrame,
     table: &SharedReservations,
 ) -> Option<Served> {
-    let nr = frame.x[8];
+    let mut frame = carrick_guest_arch::PositionedFrame {
+        frame,
+        position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+    };
+    park_prepared_edit_positioned(sched, &mut frame, table)
+}
+
+pub fn park_prepared_edit_positioned<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    table: &SharedReservations,
+) -> Option<Served> {
+    let nr = frame.frame.x[8];
     let call = AnonymousCall::from_canonical(CanonicalNr::new(nr))?;
     let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
@@ -30,7 +42,8 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         return None;
     }
     let resumed = sched.take_object_operation().ok().flatten();
-    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let resume =
+        OperationResumePc::new(carrick_guest_arch::SyscallReturnFrame::syscall_pc(frame)?)?;
     let rounded = |start: u64, len: u64| {
         let end = start.checked_add(len)?.checked_add(4095)? & !4095;
         ReservationRange::new(start & !4095, end)
@@ -43,19 +56,19 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             AnonymousCall::Munmap
             | AnonymousCall::Mremap
             | AnonymousCall::Mprotect
-            | AnonymousCall::Madvise => rounded(frame.x[0], frame.x[1]),
-            AnonymousCall::Mmap if frame.x[3] & (0x10 | 0x100000) != 0 => {
-                rounded(frame.x[0], frame.x[1])
+            | AnonymousCall::Madvise => rounded(frame.frame.x[0], frame.frame.x[1]),
+            AnonymousCall::Mmap if frame.frame.x[3] & (0x10 | 0x100000) != 0 => {
+                rounded(frame.frame.x[0], frame.frame.x[1])
             }
             AnonymousCall::Brk => {
                 let old = root.brk_current().checked_add(4095)? & !4095;
-                let new = frame.x[0].checked_add(4095)? & !4095;
+                let new = frame.frame.x[0].checked_add(4095)? & !4095;
                 ReservationRange::new(old.min(new), old.max(new))
             }
             _ => None,
         };
-        let second = (call == AnonymousCall::Mremap && frame.x[3] & 2 != 0)
-            .then(|| rounded(frame.x[4], frame.x[2]))
+        let second = (call == AnonymousCall::Mremap && frame.frame.x[3] & 2 != 0)
+            .then(|| rounded(frame.frame.x[4], frame.frame.x[2]))
             .flatten();
         Some(
             first.is_some_and(|range| root.prepared_overlaps(range))
@@ -81,7 +94,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         resumed,
         observe,
         check_conflict,
-        |key, snapshot, token| sched.park_object(frame, key, snapshot, resume, token, None),
+        |key, snapshot, token| sched.park_object(frame.frame, key, snapshot, resume, token, None),
     );
 
     match outcome {
@@ -90,15 +103,15 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
                 .task
                 .linux
                 .orig_arg0
-                .store(frame.x[0], Ordering::Relaxed);
-            frame.elr = resume.raw();
+                .store(frame.frame.x[0], Ordering::Relaxed);
+            carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame)?;
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Parked(parked) => {
             if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
-                sched.resume_after_object_park(frame, parked, 0)
+                sched.resume_after_object_park_positioned(frame, parked, 0)
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::Refused => None,
@@ -115,7 +128,21 @@ pub fn park_anonymous_edit<C: ThreadCpu, U: UserWord>(
     initial_cause: SpaceWaitCause,
     origin: ServiceOrigin,
 ) -> Option<Served> {
-    park_anonymous_edit_with_allocator(
+    let mut frame = carrick_guest_arch::PositionedFrame {
+        frame,
+        position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+    };
+    park_anonymous_edit_positioned(sched, &mut frame, table, initial_cause, origin)
+}
+
+pub fn park_anonymous_edit_positioned<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    table: &SharedReservations,
+    initial_cause: SpaceWaitCause,
+    origin: ServiceOrigin,
+) -> Option<Served> {
+    park_anonymous_edit_with_allocator_positioned(
         sched,
         frame,
         table,
@@ -137,7 +164,20 @@ pub fn park_settling_anonymous_edit<C: ThreadCpu, U: UserWord>(
     table: &SharedReservations,
     ring: &dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell),
 ) -> Option<Served> {
-    park_anonymous_edit_with_allocator(
+    let mut frame = carrick_guest_arch::PositionedFrame {
+        frame,
+        position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+    };
+    park_settling_anonymous_edit_positioned(sched, &mut frame, table, ring)
+}
+
+pub fn park_settling_anonymous_edit_positioned<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    table: &SharedReservations,
+    ring: &dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell),
+) -> Option<Served> {
+    park_anonymous_edit_with_allocator_positioned(
         sched,
         frame,
         table,
@@ -148,9 +188,34 @@ pub fn park_settling_anonymous_edit<C: ThreadCpu, U: UserWord>(
     )
 }
 
+#[cfg(test)]
 pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
+    table: &SharedReservations,
+    initial_cause: SpaceWaitCause,
+    origin: ServiceOrigin,
+    metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+    settle: Option<&dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell)>,
+) -> Option<Served> {
+    let mut frame = carrick_guest_arch::PositionedFrame {
+        frame,
+        position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+    };
+    park_anonymous_edit_with_allocator_positioned(
+        sched,
+        &mut frame,
+        table,
+        initial_cause,
+        origin,
+        metadata,
+        settle,
+    )
+}
+
+pub(super) fn park_anonymous_edit_with_allocator_positioned<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     table: &SharedReservations,
     _initial_cause: SpaceWaitCause,
     origin: ServiceOrigin,
@@ -167,13 +232,14 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
         .space_entry(NonZeroU64::new(mm.raw())?)?
         .live_notifications()
         .ok()?;
-    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let resume =
+        OperationResumePc::new(carrick_guest_arch::SyscallReturnFrame::syscall_pc(frame)?)?;
     let resumed = sched.take_object_operation().ok().flatten();
     let slot = sched.slot;
     let access = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
     let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
     let task = sched.task;
-    AnonymousCall::from_canonical(CanonicalNr::new(frame.x[8]))?;
+    AnonymousCall::from_canonical(CanonicalNr::new(frame.frame.x[8]))?;
     let zone = sched.zone;
     let mut settle = settle;
     let mut holder = None;
@@ -202,7 +268,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 ReservationDisposition, decide_reservation_syscall_for_origin,
             };
             let decision =
-                decide_reservation_syscall_for_origin(frame, task, &mut root, None, origin);
+                decide_reservation_syscall_for_origin(frame.frame, task, &mut root, None, origin);
             match decision {
                 ReservationDisposition::Unavailable(
                     carrick_el1::memory::reservations::Refusal::PreparedConflict,
@@ -251,7 +317,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
             }
         },
         |key, snapshot, token| {
-            sched.park_object_rechecked(frame, key, snapshot, resume, token, || {
+            sched.park_object_rechecked(frame.frame, key, snapshot, resume, token, || {
                 SpaceWaitCause::ALL.into_iter().any(|cause| {
                     source.key(cause) == key && source.observe(cause) == snapshot.observed()
                 })
@@ -266,7 +332,14 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 zone,
                 wait,
                 |key, snapshot, token, still_blocked| {
-                    sched.park_object_rechecked(frame, key, snapshot, resume, token, still_blocked)
+                    sched.park_object_rechecked(
+                        frame.frame,
+                        key,
+                        snapshot,
+                        resume,
+                        token,
+                        still_blocked,
+                    )
                 },
             )
         }
@@ -277,11 +350,11 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
             if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
-                sched.resume_after_object_park(frame, parked, 0)
+                sched.resume_after_object_park_positioned(frame, parked, 0)
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => {
-            frame.elr = resume.raw();
+            carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame)?;
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Refused => None,

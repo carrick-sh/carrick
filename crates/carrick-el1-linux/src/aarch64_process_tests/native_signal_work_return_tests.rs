@@ -294,8 +294,9 @@ fn resident_signal_work_return(
             }
             action
         };
+        let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
         let operation = crate::dispatch::native_service_operation(
-            &mut frame,
+            &mut trap,
             &fixture.task.linux,
             service_action,
         )
@@ -309,9 +310,9 @@ fn resident_signal_work_return(
         let mut service_context = words;
         crate::sched::ThreadCpu::save(
             &mut cpu,
-            &frame,
+            trap.frame,
             &mut service_context,
-            crate::sched::CpuExitCause::Svc,
+            crate::sched::CpuExitCause::from(trap.position),
         );
         let mut entry = runtime
             .enter_registered(
@@ -416,53 +417,55 @@ fn resident_signal_work_return(
     let mut publications = 0;
     let mut published_frames = Vec::new();
     for _ in 0..2 {
-        let checkpoint = |frame: &mut carrick_el1_abi::TrapFrame| {
-            let mut checkpoint_context = words;
-            crate::sched::ThreadCpu::save(
-                &mut cpu,
-                frame,
-                &mut checkpoint_context,
-                crate::sched::CpuExitCause::Svc,
-            );
-            let mut entry = runtime
-                .enter_registered(
-                    registry(),
-                    source,
-                    &fixture.task,
-                    fixture.address,
-                    &checkpoint_context,
-                    &mut physical,
-                )
-                .unwrap();
-            let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-            assert_eq!(
-                crate::signal_delivery::deliver_signal_on_syscall_return(
-                    &fixture.task,
-                    control,
-                    &mut entry,
-                    frame,
-                    fp.as_bytes(),
-                    &mut ArmWaitSignalMachine {
-                        user_sp: stack.va_at(stack.len()),
-                        backend: ArmWaitSignalBackend
-                    },
-                ),
-                None
-            );
-            let copies = take_signal_copies();
-            publications += copies.len();
-            published_frames.extend(copies);
-            carrick_el1_abi::Action::Served
-        };
+        let checkpoint =
+            |frame: &mut carrick_guest_arch::PositionedFrame<'_, carrick_el1_abi::TrapFrame>| {
+                let mut checkpoint_context = words;
+                crate::sched::ThreadCpu::save(
+                    &mut cpu,
+                    frame.frame,
+                    &mut checkpoint_context,
+                    crate::sched::CpuExitCause::from(frame.position),
+                );
+                let mut entry = runtime
+                    .enter_registered(
+                        registry(),
+                        source,
+                        &fixture.task,
+                        fixture.address,
+                        &checkpoint_context,
+                        &mut physical,
+                    )
+                    .unwrap();
+                let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+                assert_eq!(
+                    crate::signal_delivery::deliver_signal_on_syscall_return(
+                        &fixture.task,
+                        control,
+                        &mut entry,
+                        frame.frame,
+                        fp.as_bytes(),
+                        &mut ArmWaitSignalMachine {
+                            user_sp: stack.va_at(stack.len()),
+                            backend: ArmWaitSignalBackend
+                        },
+                    ),
+                    None
+                );
+                let copies = take_signal_copies();
+                publications += copies.len();
+                published_frames.extend(copies);
+                carrick_el1_abi::Action::Served
+            };
+        let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
         if let Some((operation, result)) = completion.take() {
             crate::dispatch::native_service_user_return(
-                &mut frame,
+                &mut trap,
                 Some(operation),
                 result,
                 checkpoint,
             );
         } else {
-            crate::dispatch::final_user_return(&mut frame, action, checkpoint);
+            crate::dispatch::final_user_return(&mut trap, action, checkpoint);
         }
         assert_eq!(
             frame.elr, 0x700000,

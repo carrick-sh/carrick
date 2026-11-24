@@ -497,6 +497,7 @@ pub(super) fn process_record_for_call(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_sched_core::SavedSyscallPc,
     ttbr0: u64,
     control: &ThreadControlSlot,
 ) -> Result<RecordId, NativeProcessError> {
@@ -509,7 +510,7 @@ pub(super) fn process_record_for_call(
     {
         return Ok(record);
     }
-    init_process_record(source, task, native, ttbr0, existing, control)
+    init_process_record(source, task, native, position, ttbr0, existing, control)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -518,6 +519,7 @@ fn init_process_record(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_sched_core::SavedSyscallPc,
     ttbr0: u64,
     host_record: Option<RecordId>,
     control: &ThreadControlSlot,
@@ -544,7 +546,8 @@ fn init_process_record(
     };
     // SAFETY: the current host lane owns its unpublished home record.
     unsafe {
-        *source.zone.record(record).ctx_mut() = Aarch64ParkedContext::from_parts(*native, address);
+        *source.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts_at(*native, address, position);
     }
     // Only the task's own published control slot names this home record.
     if task.owns_control_slot(control) {
@@ -560,42 +563,54 @@ pub fn admit_entry(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_sched_core::SavedSyscallPc,
     ttbr0: u64,
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
-    let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+    let entry = EntryFrame {
+        native,
+        position,
+        ttbr0,
+        page,
+        control,
+    };
+    let (runtime, address) = admit_entry_runtime(source, task, record, &entry)?;
     let words = Aarch64ParkedContext::from_register(
         *native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
+        position,
     );
     Ok((runtime, address, words))
 }
 
+struct EntryFrame<'a> {
+    native: &'a carrick_sched_core::ThreadCtx,
+    position: carrick_sched_core::SavedSyscallPc,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+}
+
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn admit_entry_runtime(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
-    ttbr0: u64,
     record: RecordId,
-    page: &'static ThreadLifecyclePage,
-    control: &'static ThreadControlSlot,
+    entry: &EntryFrame<'_>,
 ) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
-    let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
-    let address = if control.entry().is_some() {
+    let observed = unsafe { observed_entry_address(source, task, entry.ttbr0, record)? };
+    let address = if entry.control.entry().is_some() {
         REGISTRY
             .group_address(
                 source.zone,
                 observed,
-                page,
+                entry.page,
                 task.visible_pid().ok_or(NativeProcessError::Stale)?,
             )
             .filter(|address| *address == observed)
@@ -610,30 +625,40 @@ fn admit_entry_runtime(
     {
         return Ok((runtime, address));
     }
-    if control.entry().is_some()
+    if entry.control.entry().is_some()
         || REGISTRY
             .group_address(
                 source.zone,
                 address,
-                page,
+                entry.page,
                 task.visible_pid().ok_or(NativeProcessError::Stale)?,
             )
             .is_some()
     {
-        let runtime = match REGISTRY.rehome_entry(source, task, address, page, control)? {
-            Some(runtime) => runtime,
-            None => REGISTRY.register_thread(source, task, address, page, control)?,
-        };
+        let runtime =
+            match REGISTRY.rehome_entry(source, task, address, entry.page, entry.control)? {
+                Some(runtime) => runtime,
+                None => {
+                    REGISTRY.register_thread(source, task, address, entry.page, entry.control)?
+                }
+            };
         return Ok((runtime, address));
     }
     let words = Aarch64ParkedContext::from_register(
-        *native,
-        ttbr0,
+        *entry.native,
+        entry.ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
+        entry.position,
     );
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source, task, page, control, address, address, words,
+        source,
+        task,
+        entry.page,
+        entry.control,
+        address,
+        address,
+        words,
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
@@ -673,6 +698,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_sched_core::SavedSyscallPc,
     ttbr0: u64,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
@@ -687,13 +713,21 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         >,
     ) -> R,
 ) -> Result<R, NativeProcessError> {
-    let record = process_record_for_call(source, task, native, ttbr0, control)?;
+    let record = process_record_for_call(source, task, native, position, ttbr0, control)?;
     let _home = AdmissionHome {
         source,
         record: source.zone.record_ref(record),
     };
-    let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+    let (runtime, address) = {
+        let entry = EntryFrame {
+            native,
+            position,
+            ttbr0,
+            page,
+            control,
+        };
+        admit_entry_runtime(source, task, record, &entry)?
+    };
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
         let mut process = {
@@ -702,6 +736,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
                 ttbr0,
                 address.mm.raw().get(),
                 address.generation.raw().get(),
+                position,
             ));
             #[cfg(target_os = "none")]
             drain_native_signal_ingress(registry(), source, service);
@@ -763,6 +798,7 @@ where
         source,
         task,
         native,
+        carrick_sched_core::SavedSyscallPc::AtSyscall,
         ttbr0,
         page,
         control,
@@ -1835,7 +1871,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         Ok(NativeExecSuccessor {
             mm: address,
             address,
-            words: Box::new(Aarch64ParkedContext::from_parts(native, address)),
+            words: Box::new(Aarch64ParkedContext::from_parts_at(
+                native,
+                address,
+                carrick_sched_core::SavedSyscallPc::AtSyscall,
+            )),
         })
     }
     #[inline(never)]

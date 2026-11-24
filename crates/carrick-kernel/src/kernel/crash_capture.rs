@@ -521,7 +521,13 @@ mod tests {
             // it before `publish_park` makes it claimable.
             unsafe {
                 *zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, mm, 0);
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(
+                        ctx,
+                        0,
+                        mm,
+                        0,
+                        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+                    );
             }
             const UADDR: u64 = 0x1000;
             let guard = zone

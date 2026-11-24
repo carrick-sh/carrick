@@ -699,7 +699,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
             assert_eq!(
                 native_unstaged_exit(
-                    &mut frame,
+                    &mut super::super::dispatch::positioned_trap_frame(&mut frame),
                     &fixture.task.linux,
                     Action::Forward,
                     || arm_thread_group_owner(fixture.zone, &fixture.task, page),
@@ -3252,7 +3252,10 @@ fn composed_native_supply_with_prepared(
     frame.x[8] = 172;
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(&fixture.task),
         &[],
@@ -4040,7 +4043,10 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                     fixture.slot,
                     &mut cpu,
                     &crate::sched::HardwareUserWord,
-                    &mut frame,
+                    &mut carrick_guest_arch::PositionedFrame {
+                        frame: &mut frame,
+                        position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                    },
                     wait,
                 ),
                 None,
@@ -4132,7 +4138,10 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                         fixture.slot,
                         &mut cpu,
                         &crate::sched::HardwareUserWord,
-                        &mut frame,
+                        &mut carrick_guest_arch::PositionedFrame {
+                            frame: &mut frame,
+                            position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                        },
                         wait,
                     ),
                     Some(carrick_el1_abi::Action::Idle)
@@ -4583,7 +4592,10 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                     waiter_slot,
                     &mut waiter_cpu,
                     &crate::sched::HardwareUserWord,
-                    &mut waiter_frame,
+                    &mut carrick_guest_arch::PositionedFrame {
+                        frame: &mut waiter_frame,
+                        position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                    },
                     wait,
                 ),
                 Some(carrick_el1_abi::Action::Idle)
@@ -5286,7 +5298,10 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
                 fixture.slot,
                 &mut cpu,
                 &crate::sched::HardwareUserWord,
-                &mut clone_frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut clone_frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                },
                 wait,
             ),
             Some(carrick_el1_abi::Action::Idle)
@@ -5802,7 +5817,10 @@ fn declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault() {
                 fixture.slot,
                 &mut cpu,
                 &crate::sched::HardwareUserWord,
-                &mut frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+                },
                 declined_wait.take().unwrap(),
             ),
             Some(carrick_el1_abi::Action::Idle),
@@ -5892,8 +5910,13 @@ fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
         })
         .unwrap();
     unsafe {
-        *fixture.zone.record(stale_record).ctx_mut() =
-            Aarch64ParkedContext::from_register(ThreadCtx::ZERO, 0x90000, 99, 7);
+        *fixture.zone.record(stale_record).ctx_mut() = Aarch64ParkedContext::from_register(
+            ThreadCtx::ZERO,
+            0x90000,
+            99,
+            7,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
     fixture.zone.free_record(stale_record);
 

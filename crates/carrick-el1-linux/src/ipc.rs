@@ -84,7 +84,7 @@ pub use linux::{SYS_READ, SYS_WRITE};
 mod epoll;
 pub use epoll::{SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2};
 mod execution;
-pub use execution::{IpcExecution, NativeIpcExecution};
+pub use execution::{IpcExecution, NativeIpcExecution, PositionedSchedIpc};
 mod file_lock;
 pub mod readiness_set;
 pub(crate) use file_lock::{LockCall, serve_file_lock};
@@ -3457,7 +3457,13 @@ mod tests {
             // SAFETY: freshly allocated and unpublished.
             unsafe {
                 *self.zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, mm, 1)
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(
+                        ctx,
+                        0,
+                        mm,
+                        1,
+                        carrick_sched_core::SavedSyscallPc::AtSyscall,
+                    )
             };
             let seq = self.zone.next_seq(record);
             self.zone

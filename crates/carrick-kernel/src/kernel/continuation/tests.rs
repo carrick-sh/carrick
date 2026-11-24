@@ -4939,8 +4939,13 @@ mod serial_host {
             frame.x[30] = 0x7000;
             // SAFETY: the test has exclusive custody of the unpublished record.
             unsafe {
-                *zone.record(record).ctx_mut() =
-                    Aarch64ParkedContext::from_register(frame, 0x1000, 3, 1);
+                *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+                    frame,
+                    0x1000,
+                    3,
+                    1,
+                    carrick_sched_core::SavedSyscallPc::AfterSyscall,
+                );
             }
             let seq = zone.next_seq(record);
             let guard = zone

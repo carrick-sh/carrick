@@ -9245,7 +9245,13 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
             handoff: None,
         };
         assert_eq!(
-            sched.idle(&mut carrick_el1_abi::TrapFrame::default(), u64::MAX),
+            sched.idle(
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut carrick_el1_abi::TrapFrame::default(),
+                    position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+                },
+                u64::MAX,
+            ),
             carrick_core::Served::Idle
         );
         assert_eq!(

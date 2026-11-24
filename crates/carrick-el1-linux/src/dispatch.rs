@@ -145,6 +145,17 @@ pub trait GuestDispatchFrame: SyscallFrame {
     }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
+    fn with_arm_positioned_frame<R>(
+        &mut self,
+        f: impl FnOnce(&mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>) -> R,
+    ) -> Option<R> {
+        let frame = self.arm_frame()?;
+        let mut positioned = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        };
+        Some(f(&mut positioned))
+    }
     fn arm_scheduler(&self) -> bool;
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
@@ -226,6 +237,91 @@ impl GuestDispatchFrame for TrapFrame {
         carrick_personality_linux::signal::RestoredSignalFrame,
         carrick_syscall_abi::LinuxErrno,
     > {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame: self,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        };
+        super::arm_signal::restore_live_arm_signal_frame(&mut frame, copy_in)
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+/// Syscall-instruction position of a fresh EL1 vector trap entry. Only an
+/// `SVC #0` (`EC == 0x15`) or a completed host syscall return checkpoint
+/// (`0xfffd` / `0xfffe`) enters EL1 with `ELR_EL1` one instruction past the
+/// `svc #0`; every interrupt, fault, synchronous exception and
+/// `NativeOwnerCancel` (`0xfffc`) enters at the interrupted or faulting PC.
+pub const fn trap_entry_syscall_pc(esr: u64) -> carrick_guest_arch::SavedSyscallPc {
+    if matches!(esr, 0xfffd | 0xfffe) || ((esr >> 26) & 0x3f) == 0x15 {
+        carrick_guest_arch::SavedSyscallPc::AfterSyscall
+    } else {
+        carrick_guest_arch::SavedSyscallPc::AtSyscall
+    }
+}
+
+/// Bind a fresh EL1 vector [`TrapFrame`] with its entry producer's
+/// [`carrick_guest_arch::SavedSyscallPc`]. Subsequent rewinds, switches and
+/// signal frame restorations mutate the returned [`PositionedFrame::position`]
+/// in place rather than re-inferring it.
+pub fn positioned_trap_frame(
+    frame: &mut TrapFrame,
+) -> carrick_guest_arch::PositionedFrame<'_, TrapFrame> {
+    let position = trap_entry_syscall_pc(frame.esr);
+    carrick_guest_arch::PositionedFrame { frame, position }
+}
+
+impl GuestDispatchFrame for carrick_guest_arch::PositionedFrame<'_, TrapFrame> {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(self.frame.x[8])
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+    }
+    fn may_serve_poll(&self) -> bool {
+        self.frame.x[8] == carrick_syscall_abi::nr::PPOLL.raw()
+    }
+    fn restart_syscall(&mut self) {
+        if carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(self).is_none() {
+            invalid_completion(NativeInvariant::EntryBinding);
+        }
+    }
+    fn operation_resume_pc(
+        &self,
+    ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+        carrick_guest_arch::SyscallReturnFrame::syscall_pc(self)
+            .and_then(carrick_el1::substrate::sched::object_wait::OperationResumePc::new)
+    }
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+        Some(self.frame)
+    }
+    fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+        Some(self.frame)
+    }
+    fn with_arm_positioned_frame<R>(
+        &mut self,
+        f: impl FnOnce(&mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>) -> R,
+    ) -> Option<R> {
+        let mut reborrowed = carrick_guest_arch::PositionedFrame {
+            frame: &mut *self.frame,
+            position: self.position,
+        };
+        let out = f(&mut reborrowed);
+        self.position = reborrowed.position;
+        Some(out)
+    }
+    fn arm_scheduler(&self) -> bool {
+        true
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    fn restore_signal_frame(
+        &mut self,
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_syscall_abi::LinuxErrno,
+    > {
         super::arm_signal::restore_live_arm_signal_frame(self, copy_in)
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
@@ -287,15 +383,18 @@ pub fn dispatch_anonymous_with_reservations(
 pub static CARRICK_EL1_ABI_HASH: u64 = carrick_el1_abi::EL1_ABI_LAYOUT_HASH;
 
 /// Dispatch an in-guest Linux syscall at EL1.
-pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
+pub fn dispatch_syscall(
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    counters: &Counters,
+) -> Action {
     #[cfg(target_os = "none")]
     {
         let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
             unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
-        if let Some(task) = current_tasks.get(frame.slot as usize) {
+        if let Some(task) = current_tasks.get(frame.frame.slot as usize) {
             counters.record_syscall_frame(
                 carrick_el1_abi::SyscallFrameSource::FreshTrap,
-                frame,
+                frame.frame,
                 crate::common_entry::execution_binding(task),
             );
         }
@@ -312,18 +411,20 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
         let cache_lookup = |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8;
         #[cfg(target_arch = "aarch64")]
-        let slot = SlotId::from_index(frame.slot as usize);
+        let slot = SlotId::from_index(frame.frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
         {
             use super::native_process_runtime::NativeThreadGroupOwner;
 
-            let (nr, flags) = (frame.x[8], frame.x[0]);
+            let (nr, flags) = (frame.frame.x[8], frame.frame.x[0]);
             // Without a published lifecycle no owner can retain this thread.
             let unowned = arm_process_call_claimed(nr, flags, || NativeThreadGroupOwner::Unowned);
-            let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) else {
-                return refuse_owner_process_call(frame, counters, current_tasks);
+            let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.frame.slot as usize))
+            else {
+                return refuse_owner_process_call(frame.frame, counters, current_tasks);
             };
             let Some((page, control)) = task.lifecycle_refs() else {
+                let ipc_slot = frame.frame.slot as u32;
                 return fallback_or_refuse_arm_process_call(
                     frame,
                     counters,
@@ -338,7 +439,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         cpu: &mut sched::HardwareCpu,
                         user: &sched::HardwareUserWord,
                     }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    ipc::guest_venue(ipc_slot).as_ref(),
                     cache_lookup,
                     unowned,
                 );
@@ -354,15 +455,16 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
             sched::ThreadCpu::save(
                 &mut sched::HardwareCpu,
-                frame,
+                frame.frame,
                 &mut saved,
-                sched::CpuExitCause::Svc,
+                sched::CpuExitCause::from(frame.position),
             );
             let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let mut service =
                 match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
                     Ok(service) => service,
                     Err(_) => {
+                        let ipc_slot = frame.frame.slot as u32;
                         return fallback_or_refuse_arm_process_call(
                             frame,
                             counters,
@@ -377,12 +479,13 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 cpu: &mut sched::HardwareCpu,
                                 user: &sched::HardwareUserWord,
                             }),
-                            ipc::guest_venue(frame.slot as u32).as_ref(),
+                            ipc::guest_venue(ipc_slot).as_ref(),
                             cache_lookup,
                             refused(),
                         );
                     }
                 };
+            let ipc_slot = frame.frame.slot as u32;
             let route = dispatch_arm_syscall_with_native_process(
                 frame,
                 counters,
@@ -397,7 +500,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::guest_venue(ipc_slot).as_ref(),
                 lifecycle::guest_venue(),
                 page,
                 control,
@@ -408,31 +511,35 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             );
             match route {
                 Ok(route) => {
-                    resolve_arm_process_route(route, frame, counters, current_tasks, refused)
+                    resolve_arm_process_route(route, frame.frame, counters, current_tasks, refused)
                 }
-                Err(_) => fallback_or_refuse_arm_process_call(
-                    frame,
-                    counters,
-                    current_tasks,
-                    fd_map,
-                    object_table,
-                    open_table,
-                    inotify_table,
-                    name_cache,
-                    Some(Zone {
-                        tables: zone,
-                        cpu: &mut sched::HardwareCpu,
-                        user: &sched::HardwareUserWord,
-                    }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
-                    cache_lookup,
-                    refused(),
-                ),
+                Err(_) => {
+                    let ipc_slot = frame.frame.slot as u32;
+                    fallback_or_refuse_arm_process_call(
+                        frame,
+                        counters,
+                        current_tasks,
+                        fd_map,
+                        object_table,
+                        open_table,
+                        inotify_table,
+                        name_cache,
+                        Some(Zone {
+                            tables: zone,
+                            cpu: &mut sched::HardwareCpu,
+                            user: &sched::HardwareUserWord,
+                        }),
+                        ipc::guest_venue(ipc_slot).as_ref(),
+                        cache_lookup,
+                        refused(),
+                    )
+                }
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            dispatch_syscall_with_ipc(
+            let ipc_slot = frame.frame.slot as u32;
+            dispatch_syscall_with_lifecycle(
                 frame,
                 counters,
                 current_tasks,
@@ -446,25 +553,30 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::guest_venue(ipc_slot).as_ref(),
+                lifecycle::guest_venue(),
+                None,
                 cache_lookup,
             )
         }
     }
     #[cfg(not(target_os = "none"))]
     {
-        let nr = frame.x[8] as usize;
+        let nr = frame.frame.x[8] as usize;
         // SAFETY: entry retains the registered EL1 region, or no mapping is registered.
         let is_strict =
             unsafe { carrick_el1_abi::host_aperture_control() }.is_none_or(|ctrl| ctrl.is_strict());
-        let canonical = carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]);
+        let canonical =
+            carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.frame.x[8]);
         let decision = carrick_personality_linux::crossing::evaluate_host_crossing(
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
             is_strict,
             Some(canonical),
-            Some(carrick_personality_linux::crossing::NativeNr(frame.x[8])),
+            Some(carrick_personality_linux::crossing::NativeNr(
+                frame.frame.x[8],
+            )),
             Some(&counters.refused),
-            |ret| frame.x[0] = ret.raw() as u64,
+            |ret| frame.frame.x[0] = ret.raw() as u64,
         );
         match decision {
             carrick_personality_linux::crossing::HostCrossingDecision::Refused => Action::Served,
@@ -483,7 +595,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_arm_syscall_with_native_process<F, C, U, X>(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     counters: &Counters,
     current_tasks: &'static [CurrentTask],
     fd_map: &[FdMapSlot],
@@ -518,6 +630,7 @@ where
         source,
         service.task,
         native,
+        frame.position,
         ttbr0,
         page,
         control,
@@ -689,7 +802,7 @@ pub(super) fn arm_thread_group_owner(
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fallback_or_refuse_arm_process_call<F, C, U>(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
@@ -708,9 +821,9 @@ where
     U: sched::UserWord,
 {
     if refused {
-        refuse_owner_process_call(frame, counters, current_tasks)
+        refuse_owner_process_call(frame.frame, counters, current_tasks)
     } else {
-        dispatch_syscall_with_ipc(
+        dispatch_syscall_with_lifecycle(
             frame,
             counters,
             current_tasks,
@@ -721,6 +834,8 @@ where
             name_cache,
             zone,
             ipc,
+            lifecycle::guest_venue(),
+            None,
             cache_lookup,
         )
     }
@@ -751,7 +866,10 @@ fn refuse_owner_process_call(
 /// Handle an interrupt taken while EL0 ran (the vector's EL0 IRQ hook marks
 /// such a frame with `esr == 0`). `Served` returns to EL0, possibly as
 /// another thread; `Forward` leaves through the host at this EL0 boundary.
-pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
+pub fn dispatch_irq(
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    counters: &Counters,
+) -> Action {
     #[cfg(target_os = "none")]
     {
         let current_tasks =
@@ -777,18 +895,18 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
 pub fn dispatch_entry(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     counters: &Counters,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    if matches!(frame.esr, 0xfffc..=0xfffe) {
+    if matches!(frame.frame.esr, 0xfffc..=0xfffe) {
         return arm_signal_user_return(frame);
     }
-    let action = if frame.esr == 0 {
+    let action = if frame.frame.esr == 0 {
         dispatch_irq(frame, counters)
     } else {
-        match (frame.esr >> 26) & 0x3f {
+        match (frame.frame.esr >> 26) & 0x3f {
             0x20 | 0x24 => dispatch_fault(frame, counters, owner_wait),
             0x15 => dispatch_syscall(frame, counters),
             // Any other EL0 synchronous exception (BRK, step, undefined
@@ -807,12 +925,12 @@ pub fn dispatch_entry(
 /// Re-enter the selected owner after dispatch and scheduler continuation settle.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn final_user_return(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     action: Action,
-    checkpoint: impl FnOnce(&mut TrapFrame) -> Action,
+    checkpoint: impl FnOnce(&mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>) -> Action,
 ) -> Action {
     if matches!(action, Action::Served | Action::ServedWithWork)
-        && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x15 | 0x20 | 0x24))
+        && (frame.frame.esr == 0 || matches!((frame.frame.esr >> 26) & 0x3f, 0x15 | 0x20 | 0x24))
     {
         return match checkpoint(frame) {
             // Signal publication must not erase an already committed entry's
@@ -827,7 +945,7 @@ pub(super) fn final_user_return(
 /// Capture only after the final descriptor drain has selected its boundary.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn capture_native_service_exit(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
     counters: &Counters,
@@ -895,10 +1013,13 @@ pub fn count_unclaimed_native_refusal(
 
 /// Answer an unclaimed native syscall with a counted ENOSYS in ring.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    counters.record_futex_refusal(frame);
-    frame.x[0] = count_unclaimed_native_refusal(
-        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+fn refuse_unclaimed_native_syscall(
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    counters: &Counters,
+) -> Action {
+    counters.record_futex_refusal(frame.frame);
+    frame.frame.x[0] = count_unclaimed_native_refusal(
+        carrick_guest_arch::NativeOrdinal::new(frame.frame.x[8]),
         counters,
     )
     .0;
@@ -935,14 +1056,14 @@ pub(super) enum NativeUnstagedExit {
 /// unclaimed call and is counted once, never also as a carrier refusal.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn native_unstaged_exit(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,
     owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
     counters: &Counters,
 ) -> NativeUnstagedExit {
     if action == Action::Forward
-        && (frame.esr >> 26) & 0x3f == 0x15
+        && (frame.frame.esr >> 26) & 0x3f == 0x15
         && unclaimed_native_syscall(owner()) == UnclaimedNativeSyscall::CountedEnosys
     {
         // The counted ENOSYS answers an unported call or a declined one. An
@@ -950,9 +1071,9 @@ pub(super) fn native_unstaged_exit(
         // would lose the wake (#1941). A futex wait may decline and keeps
         // the counted refusal.
         let mut args = [0; 6];
-        args.copy_from_slice(&frame.x[..6]);
+        args.copy_from_slice(&frame.frame.x[..6]);
         if carrick_personality_linux::sched::ring_owned_futex(
-            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+            carrick_guest_arch::NativeOrdinal::new(frame.frame.x[8]),
             args,
         ) {
             return NativeUnstagedExit::OwnedFamilyForward;
@@ -988,7 +1109,7 @@ pub fn seal_entry_exit(frame: &TrapFrame, action: Action) -> sched::El1Exit {
 /// authenticated native owner below may publish the resulting operation.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn native_service_operation(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,
 ) -> Option<carrick_core_abi::service::ServiceOperation> {
@@ -1006,8 +1127,8 @@ pub(super) fn native_service_operation(
         match state.take_served_boundary()? {
             carrick_el1_abi::ServedBoundary::Completed => {}
             carrick_el1_abi::ServedBoundary::ForwardOriginal { x0 } => {
-                frame.x[0] = x0;
-                frame.elr = frame.elr.checked_sub(4)?;
+                frame.frame.x[0] = x0;
+                carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame)?;
             }
             carrick_el1_abi::ServedBoundary::ReplayOriginal { .. } => return None,
         }
@@ -1022,7 +1143,7 @@ pub(super) fn native_service_operation(
     if action != Action::Forward {
         return None;
     }
-    if frame.esr == 0 {
+    if frame.frame.esr == 0 {
         return state
             .has_pending_host_work()
             .then_some(ServiceOperation::CarrierWork {
@@ -1030,44 +1151,44 @@ pub(super) fn native_service_operation(
                 demand: carrick_core_abi::service::CarrierDemand::Work,
             });
     }
-    match (frame.esr >> 26) & 0x3f {
+    match (frame.frame.esr >> 26) & 0x3f {
         kind @ (0x20 | 0x24) => Some(ServiceOperation::Fault(FaultInfo {
-            address: UserVa::new(frame.far),
+            address: UserVa::new(frame.frame.far),
             access: if kind == 0x20 {
                 Access::Execute
-            } else if frame.esr & (1 << 6) != 0 {
+            } else if frame.frame.esr & (1 << 6) != 0 {
                 Access::Write
             } else {
                 Access::Read
             },
-            present: !(0x04..=0x07).contains(&(frame.esr & 0x3f)),
+            present: !(0x04..=0x07).contains(&(frame.frame.esr & 0x3f)),
         })),
         0x15 => Some(ServiceOperation::Crossing {
-            ordinal: NativeOrdinal::new(frame.x[8]),
+            ordinal: NativeOrdinal::new(frame.frame.x[8]),
         }),
         0x3c => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::Breakpoint,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
         0x32 | 0x33 => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::SingleStep,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
         0x30 | 0x31 | 0x34 | 0x35 => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::HardwareBreakpoint,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
         0x00 | 0x0e => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::UndefinedInstruction,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
         0x22 | 0x26 => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::Alignment,
-            address: UserVa::new(frame.far),
+            address: UserVa::new(frame.frame.far),
         })),
         0x07 | 0x2c => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::FloatingPoint,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
         // Every other EL0 synchronous exception the vector delivers (a
         // trapped `wfi`/`wfe`, SVE/SME access, PAC, BTI, FPAC, ...): Linux
@@ -1076,7 +1197,7 @@ pub(super) fn native_service_operation(
         // task, so a host exit would kill its executor (#1502).
         _ => Some(ServiceOperation::Exception(NativeException {
             kind: NativeExceptionKind::UndefinedInstruction,
-            address: UserVa::new(frame.elr),
+            address: UserVa::new(frame.frame.elr),
         })),
     }
 }
@@ -1538,7 +1659,7 @@ pub(super) enum NativeServiceDecision {
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
 pub(super) fn native_service_decision(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     task: &CurrentTask,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
@@ -1550,7 +1671,7 @@ pub(super) fn native_service_decision(
 ) -> NativeServiceDecision {
     let child = || owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild;
     let mut service_wait = wait;
-    let staged = match native_exec_stage(frame, task) {
+    let staged = match native_exec_stage(frame.frame, task) {
         Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
         Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
         Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault {
@@ -1561,8 +1682,8 @@ pub(super) fn native_service_decision(
         // work first settles that work (CarrierWork) and is replayed;
         // staging it here would pre-empt the settlement forever.
         None if action != Action::Forward => NativeServiceStage::Operation,
-        None if frame.x[8] == 278 => {
-            let (address, capacity, flags, requested) = native_entropy_stage(frame);
+        None if frame.frame.x[8] == 278 => {
+            let (address, capacity, flags, requested) = native_entropy_stage(frame.frame);
             NativeServiceStage::Entropy {
                 address,
                 capacity,
@@ -1570,7 +1691,7 @@ pub(super) fn native_service_decision(
                 requested,
             }
         }
-        None => match host_file(frame) {
+        None => match host_file(frame.frame) {
             Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
                 record,
                 output,
@@ -1587,7 +1708,7 @@ pub(super) fn native_service_decision(
             Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(result)) => {
                 NativeServiceStage::Return(native_host_file_return(
                     result.raw(),
-                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    carrick_guest_arch::NativeOrdinal::new(frame.frame.x[8]),
                     counters,
                     child,
                 ))
@@ -1644,7 +1765,7 @@ pub(super) fn native_service_decision(
                 // exits to the host: counted ENOSYS here, in ring.
                 NativeServiceStage::Return(native_host_file_return(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    carrick_guest_arch::NativeOrdinal::new(frame.frame.x[8]),
                     counters,
                     child,
                 ))
@@ -1676,16 +1797,26 @@ pub(super) fn native_service_decision(
             // `AT S1E0R` reports an inherited sparse page without taking
             // an EL0 abort. Feed that exact read through the ordinary
             // owner fault selector, retaining the syscall frame for retry.
-            let mut synthetic = *frame;
+            let mut synthetic = *frame.frame;
             synthetic.esr = native_stage_fault_syndrome(fault);
             synthetic.far = fault.address.raw();
+            let mut synthetic_frame = carrick_guest_arch::PositionedFrame {
+                frame: &mut synthetic,
+                position: carrick_guest_arch::SavedSyscallPc::AtSyscall,
+            };
             let mut fault_wait = None;
-            match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait) {
+            match super::cow_resolver::dispatch_fault(
+                &mut synthetic_frame,
+                counters,
+                &mut fault_wait,
+            ) {
                 Action::Served => {
                     // Staging made no descriptor/IPC effect. Re-enter the
                     // ring at the same SVC rather than staging InRing into
                     // ENOSYS after the owner resolved its destination.
-                    frame.elr = frame.elr.wrapping_sub(4);
+                    if carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame).is_none() {
+                        invalid_completion(NativeInvariant::EntryBinding);
+                    }
                     return NativeServiceDecision::Action(Action::Served);
                 }
                 Action::Forward | Action::ServedWithWork => {
@@ -1869,17 +2000,17 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 fn arm_native_service_exit(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
     counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
-    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
-    let slot = SlotId::from_index(frame.slot as usize)?;
+    let task = carrick_el1_abi::current_task_guest(frame.frame.slot as usize)?;
+    let slot = SlotId::from_index(frame.frame.slot as usize)?;
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let (page, control) = task.lifecycle_refs()?;
-    let entry = if (frame.esr >> 26) & 0x3f == 0x15 {
+    let entry = if (frame.frame.esr >> 26) & 0x3f == 0x15 {
         carrick_sched_core::object_wait::OwnerEntry::Syscall
     } else {
         carrick_sched_core::object_wait::OwnerEntry::Exception
@@ -1895,9 +2026,11 @@ fn arm_native_service_exit(
     }
     // A host-served root retains its exec and executable-link dispatcher.
     // Descendants use their own MM custody through the native services.
-    if (frame.esr >> 26) & 0x3f == 0x15
-        && matches!(frame.x[8], 221 | 281)
-        && !arm_process_call_claimed(frame.x[8], 0, || arm_thread_group_owner(zone, task, page))
+    if (frame.frame.esr >> 26) & 0x3f == 0x15
+        && matches!(frame.frame.x[8], 221 | 281)
+        && !arm_process_call_claimed(frame.frame.x[8], 0, || {
+            arm_thread_group_owner(zone, task, page)
+        })
     {
         return match unclaimed_native_syscall(arm_thread_group_owner(zone, task, page)) {
             UnclaimedNativeSyscall::HostRoute => None,
@@ -1906,8 +2039,8 @@ fn arm_native_service_exit(
             }
         };
     }
-    if (frame.esr >> 26) & 0x3f == 0x15
-        && frame.x[8] == carrick_personality_linux::crossing::nr::READLINKAT.raw()
+    if (frame.frame.esr >> 26) & 0x3f == 0x15
+        && frame.frame.x[8] == carrick_personality_linux::crossing::nr::READLINKAT.raw()
         && unclaimed_native_syscall(arm_thread_group_owner(zone, task, page))
             == UnclaimedNativeSyscall::HostRoute
     {
@@ -1917,7 +2050,7 @@ fn arm_native_service_exit(
         arm_thread_group_owner(zone, task, page)
             == super::native_process_runtime::NativeThreadGroupOwner::ForkChild
     };
-    if refuse_traced_native_exec(frame, task, counters, child) {
+    if refuse_traced_native_exec(frame.frame, task, counters, child) {
         return Some(arm_signal_user_return(frame));
     }
     let begin = match native_service_decision(
@@ -1949,7 +2082,7 @@ fn arm_native_service_exit(
     ) {
         NativeServiceDecision::Decline => return None,
         NativeServiceDecision::Reply(result) => {
-            frame.x[0] = result as u64;
+            frame.frame.x[0] = result as u64;
             return Some(arm_signal_user_return(frame));
         }
         NativeServiceDecision::Action(action) => return Some(action),
@@ -1965,7 +2098,7 @@ fn arm_native_service_exit(
                 &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
             };
             portal
-                .grant(frame.slot as usize)?
+                .grant(frame.frame.slot as usize)?
                 .native_fault_sequence(task.mm.key.load(Ordering::Acquire), fault.address.raw())
         } else {
             None
@@ -1973,9 +2106,9 @@ fn arm_native_service_exit(
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(
         &mut sched::HardwareCpu,
-        frame,
+        frame.frame,
         &mut saved,
-        sched::CpuExitCause::Svc,
+        sched::CpuExitCause::from(frame.position),
     );
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
@@ -1983,6 +2116,7 @@ fn arm_native_service_exit(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
         &saved.native,
+        frame.position,
         carrick_el1::isa::aarch64::hardware_live_ttbr(),
         page,
         control,
@@ -1990,7 +2124,7 @@ fn arm_native_service_exit(
         |process| {
             begin_native_service(
                 process,
-                frame.x[8],
+                frame.frame.x[8],
                 begin,
                 fault_sequence,
                 counters,
@@ -2001,7 +2135,7 @@ fn arm_native_service_exit(
                     // The exec service resolves a descriptor `execveat` names
                     // in the caller's own ring table (#1530), read through the
                     // stable owned-table authority.
-                    ipc::guest_venue(frame.slot as u32)
+                    ipc::guest_venue(frame.frame.slot as u32)
                         .and_then(|venue| ipc::native_exec_table(venue.tables, task))
                 },
             )
@@ -2023,10 +2157,10 @@ fn arm_native_service_exit(
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
 pub(super) fn native_service_user_return(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
     result: super::native_process_runtime::NativeResume,
-    checkpoint: impl FnOnce(&mut TrapFrame) -> Action,
+    checkpoint: impl FnOnce(&mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>) -> Action,
 ) -> Action {
     use super::native_process_runtime::NativeResume;
     match result {
@@ -2040,13 +2174,13 @@ pub(super) fn native_service_user_return(
             if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
                 && matches!(operation,
                     Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal })
-                    if ordinal.raw() == frame.x[8]
+                    if ordinal.raw() == frame.frame.x[8]
                         && carrick_signal_core::is_native_restartable_syscall(ordinal.raw()))
             {
-                frame.far = frame.x[0];
-                frame.esr = 0xfffe;
+                frame.frame.far = frame.frame.x[0];
+                frame.frame.esr = 0xfffe;
             }
-            frame.x[0] = result.raw() as u64;
+            frame.frame.x[0] = result.raw() as u64;
             checkpoint(frame)
         }
         // The service settled before it parked: a supply the carrier
@@ -2054,7 +2188,9 @@ pub(super) fn native_service_user_return(
         // with no effect, or a retained map source. Re-enter the SVC with
         // every original argument, as the scheduler's owner replay does.
         NativeResume::RetrySyscall => {
-            frame.elr = frame.elr.wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+            if carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame).is_none() {
+                invalid_completion(NativeInvariant::EntryBinding);
+            }
             checkpoint(frame)
         }
         // Only a resumed checkpoint names a saved SVC, and a departure parks
@@ -2091,7 +2227,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_with<
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
-    frame: &mut carrick_el1_abi::TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
@@ -2104,10 +2240,10 @@ where
             carrick_el1_abi::Aarch64ParkedContext,
             super::aarch64_process::Aarch64NativeProcessService<'static, X>,
         >,
-        &mut TrapFrame,
+        &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
-    if control.synchronous_fault().is_some() && !classified_fault_entry_permitted(frame.esr) {
+    if control.synchronous_fault().is_some() && !classified_fault_entry_permitted(frame.frame.esr) {
         return Err(super::native_process_runtime::NativeProcessError::Invalid);
     }
     if carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
@@ -2130,10 +2266,10 @@ where
     }
     // A host-classified fault returns through the durable signal checkpoint.
     // It is a fault return, never fatal-owner cancellation or syscall restart.
-    let entry_syndrome = (frame.esr, frame.far);
+    let entry_syndrome = (frame.frame.esr, frame.frame.far);
     if let Some((_, _, address, _)) = control.synchronous_fault() {
-        frame.esr = HOST_CLASSIFIED_DATA_ABORT_ESR;
-        frame.far = address;
+        frame.frame.esr = HOST_CLASSIFIED_DATA_ABORT_ESR;
+        frame.frame.far = address;
     }
     let action = declined_fault_admission_result(
         super::aarch64_process::deliver_declined_fault_signal_with(
@@ -2144,7 +2280,7 @@ where
             page,
             control,
             service,
-            frame.far,
+            frame.frame.far,
             |process| deliver(process, frame),
         ),
         owner_wait,
@@ -2162,13 +2298,13 @@ where
     if owner_wait.is_some() {
         // Nothing was delivered. The parked thread resumes at the faulting
         // instruction, so the entry syndrome must survive for that rerun.
-        (frame.esr, frame.far) = entry_syndrome;
+        (frame.frame.esr, frame.frame.far) = entry_syndrome;
     }
     if control
         .synchronous_fault()
         .is_some_and(|(_, _, _, default)| default)
     {
-        super::native_diagnostic::signal_terminal(frame, control, entry_syndrome);
+        super::native_diagnostic::signal_terminal(frame.frame, control, entry_syndrome);
     }
     Ok(action)
 }
@@ -2255,7 +2391,7 @@ pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkS
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
-    frame: &mut carrick_el1_abi::TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
@@ -2268,7 +2404,7 @@ where
             carrick_el1_abi::Aarch64ParkedContext,
             super::aarch64_process::Aarch64NativeProcessService<'static, X>,
         >,
-        &mut TrapFrame,
+        &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
     arm_deliver_declined_fault_signal_with(
@@ -2281,27 +2417,27 @@ where
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 pub(crate) fn arm_deliver_declined_fault_signal_current(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let Some(task) = current_tasks.get(frame.frame.slot as usize) else {
         return Action::Forward;
     };
     let Some((page, control)) = task.lifecycle_refs() else {
         return Action::Forward;
     };
-    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+    let Some(slot) = SlotId::from_index(frame.frame.slot as usize) else {
         return Action::Forward;
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(
         &mut sched::HardwareCpu,
-        frame,
+        frame.frame,
         &mut saved,
-        sched::CpuExitCause::Svc,
+        sched::CpuExitCause::from(frame.position),
     );
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
@@ -2342,26 +2478,28 @@ fn classified_fault_entry_permitted(esr: u64) -> bool {
 /// IRQ, fault and SVC returns all pass through the same owner.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
+fn arm_signal_user_return(
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     if current_tasks
-        .get(frame.slot as usize)
+        .get(frame.frame.slot as usize)
         .and_then(|task| task.lifecycle_refs())
         .is_some_and(|(_, control)| control.synchronous_fault().is_some())
     {
         // A retained fault on a syscall/IRQ return is a broken entry binding.
         // Reject before the declined-fault prefix can rewrite the syndrome or
         // consume the syscall's unbudgeted service-exit stack envelope.
-        if !classified_fault_entry_permitted(frame.esr) {
+        if !classified_fault_entry_permitted(frame.frame.esr) {
             invalid_completion(NativeInvariant::EntryBinding);
         }
         // This checkpoint has no fault rerun venue to park: an owner wait
         // stays Forward with the host-retained payload, as Busy does (#1083).
         return arm_deliver_declined_fault_signal_current(frame, &mut None);
     }
-    let fatal_owner_cancel = frame.esr == 0xfffc;
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let fatal_owner_cancel = frame.frame.esr == 0xfffc;
+    let Some(task) = current_tasks.get(frame.frame.slot as usize) else {
         if fatal_owner_cancel {
             invalid_completion(NativeInvariant::EntryBinding)
         }
@@ -2375,7 +2513,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let Some(source) = arm_signal_user_return_check(
-        frame,
+        frame.frame,
         task,
         page,
         control,
@@ -2402,7 +2540,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn arm_signal_user_return_with_cpu<C, X>(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     task: &'static CurrentTask,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2417,7 +2555,7 @@ where
     X: super::aarch64_process::ForkStockCrossing,
 {
     let Some(source) =
-        arm_signal_user_return_check(frame, task, page, control, zone, ingress_empty)
+        arm_signal_user_return_check(frame.frame, task, page, control, zone, ingress_empty)
     else {
         return Action::Served;
     };
@@ -2464,7 +2602,7 @@ fn arm_signal_user_return_check(
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn arm_signal_user_return_admitted_with_cpu<C, X>(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
@@ -2478,11 +2616,17 @@ where
     X: super::aarch64_process::ForkStockCrossing,
 {
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(cpu, frame, &mut saved, sched::CpuExitCause::Svc);
+    sched::ThreadCpu::save(
+        cpu,
+        frame.frame,
+        &mut saved,
+        sched::CpuExitCause::from(frame.position),
+    );
     let (action, _) = arm_signal_user_return_admitted_entry(
         source,
         task,
         &saved.native,
+        frame.position,
         ttbr0,
         page,
         control,
@@ -2595,6 +2739,7 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_guest_arch::SavedSyscallPc,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2618,7 +2763,7 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
         return Ok(Action::Served);
     };
     let (action, terminal_owed) = arm_signal_user_return_admitted_entry(
-        source, task, native, ttbr0, page, control, service, deliver,
+        source, task, native, position, ttbr0, page, control, service, deliver,
     )?;
     assert!(
         admission || !terminal_owed,
@@ -2635,6 +2780,7 @@ pub(super) fn arm_signal_user_return_admitted_entry<
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
+    position: carrick_guest_arch::SavedSyscallPc,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2655,6 +2801,7 @@ pub(super) fn arm_signal_user_return_admitted_entry<
         source,
         task,
         native,
+        position,
         ttbr0,
         page,
         control,
@@ -2678,7 +2825,7 @@ pub(super) fn arm_signal_user_return_admitted_entry<
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
 pub fn dispatch_irq_with_regions<C, U>(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     zone: Zone<'_, C, U>,
@@ -2688,8 +2835,8 @@ where
     U: sched::UserWord,
 {
     let (Some(task), Some(slot)) = (
-        current_tasks.get(frame.slot as usize),
-        SlotId::from_index(frame.slot as usize),
+        current_tasks.get(frame.frame.slot as usize),
+        SlotId::from_index(frame.frame.slot as usize),
     ) else {
         return Action::Forward;
     };
@@ -2705,10 +2852,10 @@ where
     // The idle entry: the host started this vCPU in the scheduler with no
     // thread (a frame with no EL0 return address, which an interrupt taken
     // at EL0 never has).
-    if frame.elr == 0 {
-        return sched.serve_idle_entry(frame);
+    if frame.frame.elr == 0 {
+        return sched.serve_idle_entry_positioned(frame);
     }
-    sched.serve_irq(frame)
+    sched.serve_irq_positioned(frame)
 }
 
 /// The in-guest scheduler's tables and the CPU and user-memory access an
@@ -4341,39 +4488,42 @@ impl<
                 .process
                 .as_deref_mut()
                 .and_then(|process| process.take_relative_futex_wait());
-            let Some(frame) = self.frame.arm_frame() else {
-                self.frame.record_isa_unsupported_forward();
-                return FamilyCompletion::Forward;
-            };
             let counters = self.counters;
             let zone = &mut self.zone;
             let current_tasks = self.current_tasks;
-            let slot = frame.slot as usize;
-            let cur_task = current_tasks.get(slot);
-            if let (Some(zone), Some(task), Some(zslot)) =
-                (zone.as_mut(), cur_task, SlotId::from_index(slot))
-            {
-                let orig_x0 = frame.x[0];
-                let served = {
-                    // The admitted process owns the shared-private rule (#2124),
-                    // as for x86's native entry: a shared word keys
-                    // shared-private only on its MM's private anonymous memory.
-                    let process = self.process.as_deref_mut().filter(|process| {
-                        process.binding() == super::common_entry::execution_binding(task)
-                    });
-                    let mut authenticate = process.map(|process| {
-                        move |address, retained| process.futex_shared_private(address, retained)
-                    });
-                    let mut sched =
-                        native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-                    sched.serve_futex_operation(
-                        frame,
-                        &mut operation,
-                        authenticate
-                            .as_mut()
-                            .map(|authenticate| authenticate as &mut sched::SharedFutexMapping<'_>),
-                    )
-                };
+            let handoff = &mut self.handoff;
+            let process = &mut self.process;
+            let Some(outcome) = self.frame.with_arm_positioned_frame(|frame| {
+                let slot = frame.frame.slot as usize;
+                let (zone, task, zslot) = (
+                    zone.as_mut()?,
+                    current_tasks.get(slot)?,
+                    SlotId::from_index(slot)?,
+                );
+                let orig_x0 = frame.frame.x[0];
+                // The admitted process owns the shared-private rule (#2124),
+                // as for x86's native entry: a shared word keys
+                // shared-private only on its MM's private anonymous memory.
+                let process = process.as_deref_mut().filter(|process| {
+                    process.binding() == super::common_entry::execution_binding(task)
+                });
+                let mut authenticate = process.map(|process| {
+                    move |address, retained| process.futex_shared_private(address, retained)
+                });
+                let mut sched = native_scheduler(zone, task, counters, zslot, handoff);
+                let served = sched.serve_futex_operation_positioned(
+                    frame,
+                    &mut operation,
+                    authenticate
+                        .as_mut()
+                        .map(|authenticate| authenticate as &mut sched::SharedFutexMapping<'_>),
+                );
+                Some((task, orig_x0, frame.frame.x[0] as i64, served))
+            }) else {
+                self.frame.record_isa_unsupported_forward();
+                return FamilyCompletion::Forward;
+            };
+            if let Some((task, orig_x0, result, served)) = outcome {
                 let disposition = match served {
                     Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
                     Err(sched::FutexRefusal::Mapping(outcome)) => {
@@ -4411,7 +4561,7 @@ impl<
                 return carrick_personality_linux::dispatch::transfer_effect(
                     &task.linux,
                     orig_x0,
-                    frame.x[0] as i64,
+                    result,
                     disposition,
                 );
             }
@@ -4660,15 +4810,20 @@ impl<
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
-        let served = {
-            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
-            super::mm_portal::park_settling_anonymous_edit(
-                &mut sched,
-                self.frame.arm_frame()?,
-                memory::reservations::shared_guest(),
-                &carrick_el1::isa::aarch64::cross_hvc_return_settlement,
-            )?
-        };
+        let counters = self.counters;
+        let handoff = &mut self.handoff;
+        let served = self
+            .frame
+            .with_arm_positioned_frame(|frame| {
+                let mut sched = native_scheduler(zone, task, counters, slot, handoff);
+                super::mm_portal::park_settling_anonymous_edit_positioned(
+                    &mut sched,
+                    frame,
+                    memory::reservations::shared_guest(),
+                    &carrick_el1::isa::aarch64::cross_hvc_return_settlement,
+                )
+            })
+            .flatten()?;
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
@@ -4680,14 +4835,19 @@ impl<
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
-        let served = {
-            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
-            super::mm_portal::park_prepared_edit(
-                &mut sched,
-                self.frame.arm_frame()?,
-                memory::reservations::shared_guest(),
-            )?
-        };
+        let counters = self.counters;
+        let handoff = &mut self.handoff;
+        let served = self
+            .frame
+            .with_arm_positioned_frame(|frame| {
+                let mut sched = native_scheduler(zone, task, counters, slot, handoff);
+                super::mm_portal::park_prepared_edit_positioned(
+                    &mut sched,
+                    frame,
+                    memory::reservations::shared_guest(),
+                )
+            })
+            .flatten()?;
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
@@ -4703,16 +4863,21 @@ impl<
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
-        let served = {
-            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
-            super::mm_portal::park_anonymous_edit(
-                &mut sched,
-                self.frame.arm_frame()?,
-                memory::reservations::shared_guest(),
-                cause,
-                origin,
-            )?
-        };
+        let counters = self.counters;
+        let handoff = &mut self.handoff;
+        let served = self
+            .frame
+            .with_arm_positioned_frame(|frame| {
+                let mut sched = native_scheduler(zone, task, counters, slot, handoff);
+                super::mm_portal::park_anonymous_edit_positioned(
+                    &mut sched,
+                    frame,
+                    memory::reservations::shared_guest(),
+                    cause,
+                    origin,
+                )
+            })
+            .flatten()?;
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
@@ -4792,26 +4957,6 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
         user: zone.user,
         counters,
     }
-}
-
-/// ARM scheduler transport for the shared IPC transfer engine. Source-backed
-/// native entries use NativeIpcExecution through ipc_transfer_native instead;
-/// neither transport changes the descriptor or operation owner.
-#[allow(clippy::type_complexity)]
-fn ipc_execution<'s, 'z: 's, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>(
-    frame: &'s mut G,
-    zone: &'s mut Option<Zone<'z, C, U>>,
-    current_tasks: &'s [CurrentTask],
-    counters: &'s Counters,
-    handoff: &'s mut Option<
-        carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
-    >,
-) -> Option<(sched::Sched<'s, C, U>, &'s mut TrapFrame, &'s CurrentTask)> {
-    let frame = frame.arm_frame()?;
-    let task = current_tasks.get(frame.slot as usize)?;
-    let slot = SlotId::from_index(frame.slot as usize)?;
-    let sched = native_scheduler(zone.as_mut()?, task, counters, slot, handoff);
-    Some((sched, frame, task))
 }
 
 // An unavailable publication cannot select the legacy numeric namespace.
@@ -6580,21 +6725,23 @@ impl<
         }
         let native_signals = self.process.is_some();
         let counters = self.counters;
-        let Some((mut sched, frame, task)) = ipc_execution(
-            &mut *self.frame,
-            &mut self.zone,
-            self.current_tasks,
-            counters,
-            &mut self.handoff,
-        ) else {
-            // No execution binding for this entry: an explicit, counted
-            // refusal rather than a transfer without a park boundary.
-            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoExecution);
-            self.frame.record_isa_unsupported_forward();
-            return FamilyCompletion::Forward;
-        };
-        {
-            let orig_x0 = frame.x[0];
+        let current_tasks = self.current_tasks;
+        let zone = &mut self.zone;
+        let handoff = &mut self.handoff;
+        let process = &mut self.process;
+        let outcome = self.frame.with_arm_positioned_frame(|frame| {
+            let slot_idx = frame.frame.slot as usize;
+            let (Some(zone), Some(task), Some(slot)) = (
+                zone.as_mut(),
+                current_tasks.get(slot_idx),
+                SlotId::from_index(slot_idx),
+            ) else {
+                return None;
+            };
+            let sched = native_scheduler(zone, task, counters, slot, handoff);
+            let mut exec = ipc::PositionedSchedIpc(sched, core::marker::PhantomData);
+            let orig_x0 = frame.frame.x[0];
+            let presented = process.as_deref().map(|owner| owner.binding());
             let mut user = file::OwnerCopy {
                 inner: file::DiagnosedCopy {
                     inner: file::ValidatedCopy {
@@ -6603,45 +6750,68 @@ impl<
                     },
                     diagnostic: file::CopyDiagnostic {
                         counters,
-                        ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
-                        arguments: core::array::from_fn(|i| frame.x[i]),
-                        pc: frame.elr,
-                        presented: self.process.as_deref().map(|owner| owner.binding()),
+                        ordinal: carrick_syscall_abi::CanonicalNr::new(frame.frame.x[8]),
+                        arguments: core::array::from_fn(|i| frame.frame.x[i]),
+                        pc: frame.frame.elr,
+                        presented,
                         expected: Some(crate::common_entry::execution_binding(task)),
                     },
                 },
-                owner: self.process.as_deref_mut(),
+                owner: process.as_deref_mut(),
                 wait: None,
                 input_wait: None,
             };
             let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
-                &mut sched,
+                &mut exec,
                 frame,
                 venue,
                 &mut user,
                 native_signals,
                 &mut || false,
             );
-            // Admission (eventfd value / iovec headers) has no effects when
-            // it leaves for an input fault. Keep the refusal in the same
-            // native owner instead of sending an in-zone object to the host.
-            if disposition == ipc::IpcServed::Forward
-                && let Some(request) = user.input_wait.take()
-            {
-                frame.x[0] = orig_x0;
-                return self.ipc_input_wait(request);
-            }
-            let result = frame.x[0] as i64;
-            if sigpipe_owed {
-                raise_native_sigpipe(self.process.as_deref_mut());
-            }
-            carrick_personality_linux::dispatch::transfer_effect(
-                &task.linux,
+            let input_wait = if disposition == ipc::IpcServed::Forward {
+                let wait = user.input_wait.take();
+                if wait.is_some() {
+                    frame.frame.x[0] = orig_x0;
+                }
+                wait
+            } else {
+                None
+            };
+            Some((
+                task,
                 orig_x0,
-                result,
+                frame.frame.x[0] as i64,
                 disposition,
-            )
+                sigpipe_owed,
+                input_wait,
+            ))
+        });
+        let Some(Some((task, orig_x0, result, disposition, sigpipe_owed, input_wait))) = outcome
+        else {
+            // No execution binding for this entry: an explicit, counted
+            // refusal rather than a transfer without a park boundary.
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoExecution);
+            if outcome.is_none() {
+                self.frame.record_isa_unsupported_forward();
+            }
+            return FamilyCompletion::Forward;
+        };
+        // Admission (eventfd value / iovec headers) has no effects when
+        // it leaves for an input fault. Keep the refusal in the same
+        // native owner instead of sending an in-zone object to the host.
+        if let Some(request) = input_wait {
+            return self.ipc_input_wait(request);
         }
+        if sigpipe_owed {
+            raise_native_sigpipe(self.process.as_deref_mut());
+        }
+        carrick_personality_linux::dispatch::transfer_effect(
+            &task.linux,
+            orig_x0,
+            result,
+            disposition,
+        )
     }
 
     /// fcntl(2) record and OFD locks and flock(2) on a native table's file
@@ -6661,40 +6831,44 @@ impl<
         let mut output = None;
         let (task, disposition, input_wait) = if self.frame.arm_scheduler() {
             let current_tasks = self.current_tasks;
-            let Some(frame) = self.frame.arm_frame() else {
+            let zone = &mut self.zone;
+            let handoff = &mut self.handoff;
+            let process = &mut self.process;
+            let Some(Some(result)) = self.frame.with_arm_positioned_frame(|frame| {
+                let slot = frame.frame.slot as usize;
+                let (zone, task, zslot) = (
+                    zone.as_mut()?,
+                    current_tasks.get(slot)?,
+                    SlotId::from_index(slot)?,
+                );
+                let sched = native_scheduler(zone, task, counters, zslot, handoff);
+                let mut exec = ipc::PositionedSchedIpc(sched, core::marker::PhantomData);
+                let mut user = file::OwnerCopy {
+                    inner: file::DiagnosedCopy {
+                        inner: file::ValidatedCopy {
+                            task,
+                            validator: &file::HardwareValidator,
+                        },
+                        diagnostic: file::CopyDiagnostic {
+                            counters,
+                            ordinal,
+                            arguments,
+                            pc,
+                            presented,
+                            expected: Some(crate::common_entry::execution_binding(task)),
+                        },
+                    },
+                    owner: process.as_deref_mut(),
+                    wait: None,
+                    input_wait: None,
+                };
+                let disposition =
+                    ipc::serve_file_lock(&mut exec, frame, venue, &mut user, table, &mut output);
+                Some((task, disposition, user.input_wait.take()))
+            }) else {
                 return FamilyCompletion::Forward;
             };
-            let slot = frame.slot as usize;
-            let (Some(zone), Some(task), Some(zslot)) = (
-                self.zone.as_mut(),
-                current_tasks.get(slot),
-                SlotId::from_index(slot),
-            ) else {
-                return FamilyCompletion::Forward;
-            };
-            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let mut user = file::OwnerCopy {
-                inner: file::DiagnosedCopy {
-                    inner: file::ValidatedCopy {
-                        task,
-                        validator: &file::HardwareValidator,
-                    },
-                    diagnostic: file::CopyDiagnostic {
-                        counters,
-                        ordinal,
-                        arguments,
-                        pc,
-                        presented,
-                        expected: Some(crate::common_entry::execution_binding(task)),
-                    },
-                },
-                owner: self.process.as_deref_mut(),
-                wait: None,
-                input_wait: None,
-            };
-            let disposition =
-                ipc::serve_file_lock(&mut sched, frame, venue, &mut user, table, &mut output);
-            (task, disposition, user.input_wait.take())
+            result
         } else {
             let (Some(source), Some(task)) = (
                 self.record_source(),
@@ -6781,68 +6955,90 @@ impl<
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
-        let Some(frame) = self.frame.arm_frame() else {
-            return FamilyCompletion::Forward;
-        };
         let counters = self.counters;
         let zone = &mut self.zone;
         let current_tasks = self.current_tasks;
-        let slot = frame.slot as usize;
-        let cur_task = current_tasks.get(slot);
-        if let (Some(zone), Some(task), Some(zslot)) =
-            (zone.as_mut(), cur_task, SlotId::from_index(slot))
-        {
-            let orig_x0 = frame.x[0];
-            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let mut user = file::OwnerCopy {
-                inner: file::DiagnosedCopy {
-                    inner: file::ValidatedCopy {
-                        task,
-                        validator: &file::HardwareValidator,
-                    },
-                    diagnostic: file::CopyDiagnostic {
-                        counters,
-                        ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
-                        arguments: core::array::from_fn(|i| frame.x[i]),
-                        pc: frame.elr,
-                        presented: self.process.as_deref().map(|owner| owner.binding()),
-                        expected: Some(crate::common_entry::execution_binding(task)),
-                    },
-                },
-                owner: self.process.as_deref_mut(),
-                wait: None,
-                input_wait: None,
-            };
-            let mut output = None;
-            let disposition =
-                ipc::serve_single_zone_ppoll(&mut sched, frame, venue, &mut user, &mut output);
-            if let Some(request) = user.input_wait.take() {
-                let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
-                return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
-            }
-            if let Some(output) = output {
-                return complete_ring_poll_output(
-                    self.process.as_deref_mut(),
-                    task,
-                    output,
-                    (
-                        self.counters,
-                        carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
-                        [
-                            orig_x0, frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-                        ],
-                        frame.elr,
-                    ),
+        let handoff = &mut self.handoff;
+        let process = &mut self.process;
+        let Some(Some((task, orig_x0, nr, result, diag_args, pc, disposition, input_wait, output))) =
+            self.frame.with_arm_positioned_frame(|frame| {
+                let slot = frame.frame.slot as usize;
+                let (zone, task, zslot) = (
+                    zone.as_mut()?,
+                    current_tasks.get(slot)?,
+                    SlotId::from_index(slot)?,
                 );
-            }
-            return carrick_personality_linux::dispatch::transfer_effect(
-                &task.linux,
-                orig_x0,
-                frame.x[0] as i64,
-                disposition,
+                let orig_x0 = frame.frame.x[0];
+                let sched = native_scheduler(zone, task, counters, zslot, handoff);
+                let mut exec = ipc::PositionedSchedIpc(sched, core::marker::PhantomData);
+                let presented = process.as_deref().map(|owner| owner.binding());
+                let mut user = file::OwnerCopy {
+                    inner: file::DiagnosedCopy {
+                        inner: file::ValidatedCopy {
+                            task,
+                            validator: &file::HardwareValidator,
+                        },
+                        diagnostic: file::CopyDiagnostic {
+                            counters,
+                            ordinal: carrick_syscall_abi::CanonicalNr::new(frame.frame.x[8]),
+                            arguments: core::array::from_fn(|i| frame.frame.x[i]),
+                            pc: frame.frame.elr,
+                            presented,
+                            expected: Some(crate::common_entry::execution_binding(task)),
+                        },
+                    },
+                    owner: process.as_deref_mut(),
+                    wait: None,
+                    input_wait: None,
+                };
+                let mut output = None;
+                let disposition =
+                    ipc::serve_single_zone_ppoll(&mut exec, frame, venue, &mut user, &mut output);
+                Some((
+                    task,
+                    orig_x0,
+                    frame.frame.x[8],
+                    frame.frame.x[0] as i64,
+                    [
+                        orig_x0,
+                        frame.frame.x[1],
+                        frame.frame.x[2],
+                        frame.frame.x[3],
+                        frame.frame.x[4],
+                        frame.frame.x[5],
+                    ],
+                    frame.frame.elr,
+                    disposition,
+                    user.input_wait.take(),
+                    output,
+                ))
+            })
+        else {
+            return FamilyCompletion::Forward;
+        };
+        if let Some(request) = input_wait {
+            let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+            return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+        }
+        if let Some(output) = output {
+            return complete_ring_poll_output(
+                self.process.as_deref_mut(),
+                task,
+                output,
+                (
+                    self.counters,
+                    carrick_syscall_abi::CanonicalNr::new(nr),
+                    diag_args,
+                    pc,
+                ),
             );
         }
-        FamilyCompletion::Forward
+        carrick_personality_linux::dispatch::transfer_effect(
+            &task.linux,
+            orig_x0,
+            result,
+            disposition,
+        )
     }
     fn task(&self) -> Option<&CurrentTask> {
         self.current_tasks.get(self.frame.task_index())
@@ -6889,15 +7085,17 @@ impl<
         let Some(zone) = &mut self.zone else {
             return FamilyCompletion::Complete(0);
         };
-        let Some(frame) = self.frame.arm_frame() else {
-            return FamilyCompletion::Complete(0);
-        };
         if zone.tables.yield_turn(slot) == carrick_sched_core::YieldTurn::Keep {
             return FamilyCompletion::Complete(0);
         }
-        match native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-            .yield_queued(frame)
-        {
+        let counters = self.counters;
+        let handoff = &mut self.handoff;
+        let Some(served) = self.frame.with_arm_positioned_frame(|frame| {
+            native_scheduler(zone, task, counters, slot, handoff).yield_queued_positioned(frame)
+        }) else {
+            return FamilyCompletion::Complete(0);
+        };
+        match served {
             Some(carrick_core::Served::Returned { switched: true }) => {
                 FamilyCompletion::Switched(0)
             }
@@ -8622,7 +8820,7 @@ mod tests {
         }
         let counters = Counters::new();
         assert_eq!(
-            refuse_unclaimed_native_syscall(&mut frame, &counters),
+            refuse_unclaimed_native_syscall(&mut positioned_trap_frame(&mut frame), &counters),
             Action::Served
         );
         assert_eq!(frame.x[0] as i64, -38);
@@ -8661,17 +8859,17 @@ mod tests {
             futex(FUTEX_WAKE_BITSET_PRIVATE, 1, u64::from(u32::MAX)),
         ] {
             let counters = Counters::new();
+            let op = frame.x[1];
             assert_eq!(
                 native_unstaged_exit(
-                    &mut frame,
+                    &mut positioned_trap_frame(&mut frame),
                     &task.linux,
                     Action::Forward,
                     || NativeThreadGroupOwner::ForkChild,
                     &counters,
                 ),
                 NativeUnstagedExit::OwnedFamilyForward,
-                "op {:#x}",
-                frame.x[1]
+                "op {op:#x}"
             );
             assert_eq!(frame.x[0], 0x2d9e18, "no errno written");
             assert_eq!(counters.refused[98].load(Ordering::Relaxed), 0);
@@ -8695,7 +8893,7 @@ mod tests {
             let mut frame = futex(op, 1, 0);
             assert_eq!(
                 native_unstaged_exit(
-                    &mut frame,
+                    &mut positioned_trap_frame(&mut frame),
                     &task.linux,
                     Action::Forward,
                     || NativeThreadGroupOwner::ForkChild,
@@ -8713,7 +8911,7 @@ mod tests {
         let mut frame = futex(FUTEX_WAKE_PRIVATE, 1, 0);
         assert!(matches!(
             native_unstaged_exit(
-                &mut frame,
+                &mut positioned_trap_frame(&mut frame),
                 &task.linux,
                 Action::Forward,
                 || NativeThreadGroupOwner::Root,
@@ -8751,7 +8949,7 @@ mod tests {
         let mut frame = svc(451);
         assert_eq!(
             native_unstaged_exit(
-                &mut frame,
+                &mut positioned_trap_frame(&mut frame),
                 &task.linux,
                 Action::Forward,
                 || NativeThreadGroupOwner::ForkChild,
@@ -8774,7 +8972,7 @@ mod tests {
             let mut frame = svc(451);
             assert_eq!(
                 native_unstaged_exit(
-                    &mut frame,
+                    &mut positioned_trap_frame(&mut frame),
                     &task.linux,
                     Action::Forward,
                     || owner,
@@ -8797,7 +8995,7 @@ mod tests {
         };
         assert!(matches!(
             native_unstaged_exit(
-                &mut frame,
+                &mut positioned_trap_frame(&mut frame),
                 &task.linux,
                 Action::Forward,
                 || panic!("an exception asks no syscall route"),
@@ -9162,13 +9360,13 @@ mod tests {
         let counters = Counters::default();
 
         frame.x[8] = 64; // write
-        let action = dispatch_syscall(&mut frame, &counters);
+        let action = dispatch_syscall(&mut positioned_trap_frame(&mut frame), &counters);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.forwarded[64].load(Ordering::Relaxed), 1);
         assert_eq!(counters.served[64].load(Ordering::Relaxed), 0);
 
         frame.x[8] = 172; // getpid
-        let action = dispatch_syscall(&mut frame, &counters);
+        let action = dispatch_syscall(&mut positioned_trap_frame(&mut frame), &counters);
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0] as i64, -38);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
@@ -9177,7 +9375,7 @@ mod tests {
 
         // Out-of-bounds syscall nr
         frame.x[8] = 999;
-        let action = dispatch_syscall(&mut frame, &counters);
+        let action = dispatch_syscall(&mut positioned_trap_frame(&mut frame), &counters);
         assert_eq!(action, Action::Served);
         assert_eq!(counters.refused[512].load(Ordering::Relaxed), 1);
     }
@@ -9192,7 +9390,8 @@ mod tests {
                     let mut frame = TrapFrame::default();
                     frame.x[8] = 64; // write
                     for _ in 0..1000 {
-                        let action = dispatch_syscall(&mut frame, &counters);
+                        let action =
+                            dispatch_syscall(&mut positioned_trap_frame(&mut frame), &counters);
                         assert_eq!(action, Action::Forward);
                     }
                 });
@@ -9216,7 +9415,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(&mut positioned_trap_frame(&mut frame), &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Arbitrary x8 is not treated as a syscall
@@ -9233,7 +9432,7 @@ mod tests {
             ..TrapFrame::default()
         };
         assert_eq!(
-            dispatch_entry(&mut frame, &counters, &mut None),
+            dispatch_entry(&mut positioned_trap_frame(&mut frame), &counters, &mut None),
             Action::Forward
         );
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
@@ -9269,7 +9468,8 @@ mod tests {
                 },
                 ..TrapFrame::default()
             };
-            let action = dispatch_entry(&mut frame, &counters, &mut None);
+            let action =
+                dispatch_entry(&mut positioned_trap_frame(&mut frame), &counters, &mut None);
             assert_eq!(action, Action::Forward, "esr={esr:#x}");
             assert_eq!(frame.x[0], 0, "esr={esr:#x}: no call result");
             assert_eq!(frame.elr, 0x40_1000, "esr={esr:#x}: no replay");
@@ -9287,7 +9487,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(&mut positioned_trap_frame(&mut frame), &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
     }
@@ -9306,7 +9506,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(&mut positioned_trap_frame(&mut frame), &counters, &mut None);
         assert_eq!(action, Action::Served);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);

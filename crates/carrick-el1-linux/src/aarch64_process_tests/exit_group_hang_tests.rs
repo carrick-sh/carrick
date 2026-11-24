@@ -324,6 +324,7 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             slot: u64::from(slot.raw()),
             ..Default::default()
         };
+        let mut return_frame = crate::dispatch::positioned_trap_frame(&mut return_frame);
         let stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
         let action = crate::dispatch::arm_signal_user_return_entry(
             BornInZoneSource {
@@ -332,6 +333,7 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
             },
             &fixture.task,
             &ThreadCtx::ZERO,
+            return_frame.position,
             fixture_ttbr0(fixture),
             page,
             control,
@@ -410,7 +412,13 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
                 user: &crate::sched::HardwareUserWord,
                 counters: &counters,
             })
-            .interrupt(&mut irq, 0),
+            .interrupt(
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut irq,
+                    position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+                },
+                0,
+            ),
             carrick_el1_abi::Action::Forward
         );
         assert_eq!(
@@ -779,12 +787,14 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
         ..Default::default()
     };
     return_frame.x[0] = x0;
+    let mut return_frame = crate::dispatch::positioned_trap_frame(&mut return_frame);
     let action = if mode == EntrylessReturn::GateBeforeClose {
         // The vector's admitted half, after its gate already said yes.
         let (action, terminal_owed) = crate::dispatch::arm_signal_user_return_admitted_entry(
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
+            return_frame.position,
             fixture_ttbr0(fixture),
             page,
             control,
@@ -816,6 +826,7 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
+            return_frame.position,
             fixture_ttbr0(fixture),
             page,
             control,
@@ -862,7 +873,13 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
             user: &crate::sched::HardwareUserWord,
             counters: &counters,
         })
-        .interrupt(&mut irq, 0),
+        .interrupt(
+            &mut carrick_guest_arch::PositionedFrame {
+                frame: &mut irq,
+                position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+            },
+            0,
+        ),
         carrick_el1_abi::Action::Forward,
         "the kick leaves through the host with the member loaded"
     );

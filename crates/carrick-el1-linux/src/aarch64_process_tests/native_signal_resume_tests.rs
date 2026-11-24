@@ -290,7 +290,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
             let mut checkpoints = 0;
             assert_eq!(
                 crate::dispatch::final_user_return(
-                    &mut frame,
+                    &mut crate::dispatch::positioned_trap_frame(&mut frame),
                     carrick_el1_abi::Action::Served,
                     |frame| {
                         checkpoints += 1;
@@ -309,7 +309,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
                                 &fixture.task,
                                 peer_control,
                                 &mut peer_entry,
-                                frame,
+                                frame.frame,
                                 fp.as_bytes(),
                                 &mut ArmWaitSignalMachine {
                                     user_sp: peer_stack.va_at(peer_stack.len()),
@@ -392,13 +392,13 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
     for _ in 0..2 {
         assert_eq!(
             crate::dispatch::final_user_return(
-                &mut frame,
+                &mut crate::dispatch::positioned_trap_frame(&mut frame),
                 carrick_el1_abi::Action::Served,
                 |frame| {
                     let mut checkpoint_context = resumed_context;
                     crate::sched::ThreadCpu::save(
                         &mut cpu,
-                        frame,
+                        frame.frame,
                         &mut checkpoint_context,
                         crate::sched::CpuExitCause::Svc,
                     );
@@ -417,7 +417,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
                         &fixture.task,
                         control,
                         &mut entry,
-                        frame,
+                        frame.frame,
                         fp.as_bytes(),
                         &mut ArmWaitSignalMachine {
                             user_sp: stack.va_at(stack.len()),
@@ -663,40 +663,43 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
     frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     let sp_top = stack.va_at(stack.len());
 
-    let run_checkpoint = |service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
-                          frame: &mut carrick_el1_abi::TrapFrame| {
-        let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-        crate::sched::ThreadCpu::save(
-            &mut crate::sched::FakeCpu::default(),
-            frame,
-            &mut saved,
-            crate::sched::CpuExitCause::Svc,
-        );
-        saved.native.sp_el0 = sp_top.raw();
-        crate::dispatch::arm_signal_user_return_entry(
-            source,
-            task,
-            &saved.native,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            (frame.esr, frame.x[0]),
-            true,
-            service,
-            |process| {
-                crate::arm_signal::deliver_on_user_return_at(
-                    task,
-                    fixture.control,
-                    process,
-                    frame,
-                    |_, _| sp_top,
-                )
-            },
-        )
-        .unwrap()
-    };
+    let run_checkpoint =
+        |service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+         frame: &mut carrick_guest_arch::PositionedFrame<'_, carrick_el1_abi::TrapFrame>| {
+            let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+            crate::sched::ThreadCpu::save(
+                &mut crate::sched::FakeCpu::default(),
+                frame.frame,
+                &mut saved,
+                crate::sched::CpuExitCause::from(frame.position),
+            );
+            saved.native.sp_el0 = sp_top.raw();
+            crate::dispatch::arm_signal_user_return_entry(
+                source,
+                task,
+                &saved.native,
+                frame.position,
+                ttbr0,
+                fixture.page,
+                fixture.control,
+                (frame.frame.esr, frame.frame.x[0]),
+                true,
+                service,
+                |process| {
+                    crate::arm_signal::deliver_on_user_return_at(
+                        task,
+                        fixture.control,
+                        process,
+                        frame,
+                        |_, _| sp_top,
+                    )
+                },
+            )
+            .unwrap()
+        };
 
-    let first_action = run_checkpoint(&mut service, &mut frame);
+    let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
+    let first_action = run_checkpoint(&mut service, &mut positioned);
     match mode {
         SignalFrameWaitMode::OwnerWaitReleasedBeforeProbe => {
             // Each checkpoint makes one frame-copy attempt, then returns its
@@ -714,7 +717,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                     action,
                     carrick_el1_abi::Action::Idle,
                     "released holder must park the checkpoint (elr={:#x})",
-                    frame.elr
+                    positioned.frame.elr
                 );
                 assert_eq!(
                     frame_copy_attempts.get(),
@@ -781,10 +784,10 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                         user: &crate::sched::HardwareUserWord,
                         counters: &counters,
                     })
-                    .run_next(&mut frame, 0),
+                    .run_next_positioned(&mut positioned, 0),
                     Served::Returned { switched: true }
                 );
-                action = run_checkpoint(&mut service, &mut frame);
+                action = run_checkpoint(&mut service, &mut positioned);
                 checkpoints += 1;
             }
             assert_eq!(
@@ -798,7 +801,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                 first_action,
                 carrick_el1_abi::Action::Idle,
                 "owner contention on signal frame write must park instead of forcing SIGSEGV (elr={:#x})",
-                frame.elr
+                positioned.frame.elr
             );
             assert!(
                 fixture.zone.slot(fixture.slot).current().is_none(),
@@ -836,11 +839,11 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                     user: &crate::sched::HardwareUserWord,
                     counters: &counters,
                 })
-                .run_next(&mut frame, 0),
+                .run_next_positioned(&mut positioned, 0),
                 Served::Returned { switched: true }
             );
             assert_eq!(
-                run_checkpoint(&mut service, &mut frame),
+                run_checkpoint(&mut service, &mut positioned),
                 carrick_el1_abi::Action::Served
             );
         }
@@ -849,7 +852,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                 first_action,
                 carrick_el1_abi::Action::Idle,
                 "transient Busy on signal frame write must park instead of forcing SIGSEGV (elr={:#x})",
-                frame.elr
+                positioned.frame.elr
             );
             assert!(fixture.zone.slot(fixture.slot).current().is_none());
             let notice = fixture
@@ -904,11 +907,11 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                     user: &crate::sched::HardwareUserWord,
                     counters: &counters,
                 })
-                .run_next(&mut frame, 0),
+                .run_next_positioned(&mut positioned, 0),
                 Served::Returned { switched: true }
             );
             assert_eq!(
-                run_checkpoint(&mut service, &mut frame),
+                run_checkpoint(&mut service, &mut positioned),
                 carrick_el1_abi::Action::Served
             );
         }
@@ -959,8 +962,9 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
         assert_eq!(old.disposition, Disposition::Default);
     }
     frame.esr = 0x5600_0000;
+    let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
     assert_eq!(
-        run_checkpoint(&mut service, &mut frame),
+        run_checkpoint(&mut service, &mut positioned),
         carrick_el1_abi::Action::Served
     );
     assert_eq!(frame.elr, 0x70_0000, "signal must not be delivered twice");
@@ -1138,14 +1142,16 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
             crate::sched::CpuExitCause::Svc,
         );
         saved.native.sp_el0 = bad_sp.raw();
+        let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
         let action = crate::dispatch::arm_signal_user_return_entry(
             source,
             task,
             &saved.native,
+            positioned.position,
             ttbr0,
             fixture.page,
             fixture.control,
-            (frame.esr, frame.x[0]),
+            (positioned.frame.esr, positioned.frame.x[0]),
             true,
             &mut service,
             |process| {
@@ -1153,7 +1159,7 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
                     task,
                     fixture.control,
                     process,
-                    &mut frame,
+                    &mut positioned,
                     |_, _| bad_sp,
                 )
             },
@@ -1597,15 +1603,17 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                         crate::sched::CpuExitCause::Svc,
                     );
                     peer_saved.native.sp_el0 = peer_sp_top.raw();
+                    let mut positioned_map = crate::dispatch::positioned_trap_frame(&mut map_frame);
                     assert_eq!(
                         crate::dispatch::arm_signal_user_return_entry(
                             sibling_source,
                             sibling_task,
                             &peer_saved.native,
+                            positioned_map.position,
                             ttbr0,
                             mapper_page,
                             peer_control,
-                            (map_frame.esr, map_frame.x[0]),
+                            (positioned_map.frame.esr, positioned_map.frame.x[0]),
                             true,
                             &mut sibling_service,
                             |process| {
@@ -1613,7 +1621,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                     sibling_task,
                                     peer_control,
                                     process,
-                                    &mut map_frame,
+                                    &mut positioned_map,
                                     |_, _| peer_sp_top,
                                 )
                             },
@@ -1654,15 +1662,18 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                     crate::sched::CpuExitCause::Svc,
                                 );
                                 peer_saved.native.sp_el0 = peer_sp_top.raw();
+                                let mut positioned_unmap =
+                                    crate::dispatch::positioned_trap_frame(&mut unmap_frame);
                                 assert_eq!(
                                     crate::dispatch::arm_signal_user_return_entry(
                                         sibling_source,
                                         sibling_task,
                                         &peer_saved.native,
+                                        positioned_unmap.position,
                                         ttbr0,
                                         mapper_page,
                                         peer_control,
-                                        (unmap_frame.esr, unmap_frame.x[0]),
+                                        (positioned_unmap.frame.esr, positioned_unmap.frame.x[0]),
                                         true,
                                         &mut sibling_service,
                                         |process| {
@@ -1670,7 +1681,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                                 sibling_task,
                                                 peer_control,
                                                 process,
-                                                &mut unmap_frame,
+                                                &mut positioned_unmap,
                                                 |_, _| peer_sp_top,
                                             )
                                         },
@@ -1801,23 +1812,25 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 slot: u64::from(fixture.slot.raw()),
                 ..Default::default()
             };
+            let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
             loop {
                 *saved = Aarch64ParkedContext::ZERO;
                 crate::sched::ThreadCpu::save(
                     &mut crate::sched::FakeCpu::default(),
-                    &frame,
+                    positioned.frame,
                     &mut saved,
-                    crate::sched::CpuExitCause::Svc,
+                    crate::sched::CpuExitCause::from(positioned.position),
                 );
                 saved.native.sp_el0 = sp_top.raw();
                 let action = crate::dispatch::arm_signal_user_return_entry(
                     source,
                     task,
                     &saved.native,
+                    positioned.position,
                     ttbr0,
                     fixture.page,
                     fixture.control,
-                    (frame.esr, frame.x[0]),
+                    (positioned.frame.esr, positioned.frame.x[0]),
                     true,
                     &mut service,
                     |process| {
@@ -1825,7 +1838,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                             task,
                             fixture.control,
                             process,
-                            &mut frame,
+                            &mut positioned,
                             |_, _| sp_top,
                         )
                     },
@@ -1903,7 +1916,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                 user: &crate::sched::HardwareUserWord,
                                 counters: &counters,
                             })
-                            .run_next(&mut frame, 0),
+                            .run_next_positioned(&mut positioned, 0),
                             Served::Returned { switched: true }
                         );
                     }
@@ -2216,7 +2229,7 @@ fn new_live_position_fixture() -> LivePositionFixture {
 fn wake_and_resume_deferred_signal_copy(
     env: &mut LivePositionFixture,
     cpu: &mut crate::sched::FakeCpu,
-    frame: &mut carrick_el1_abi::TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, carrick_el1_abi::TrapFrame>,
 ) {
     let notice = env
         .fixture
@@ -2267,7 +2280,7 @@ fn wake_and_resume_deferred_signal_copy(
             user: &crate::sched::HardwareUserWord,
             counters: &counters,
         })
-        .run_next(frame, 0),
+        .run_next_positioned(frame, 0),
         Served::Returned { switched: true }
     );
     *cpu = resume_cpu.inner;
@@ -2378,15 +2391,16 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
     frame.x[8] = 135; // SYS_rt_sigprocmask
 
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+    let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
     crate::sched::ThreadCpu::save(
         &mut cpu,
-        &frame,
+        trap.frame,
         &mut saved,
-        crate::sched::CpuExitCause::Svc,
+        crate::sched::CpuExitCause::from(trap.position),
     );
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut trap,
         &counters,
         core::slice::from_ref(&env.fixture.task),
         &[],
@@ -2412,20 +2426,20 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     let action = crate::dispatch::resolve_arm_process_route(
         route,
-        &mut frame,
+        trap.frame,
         &counters,
         core::slice::from_ref(&env.fixture.task),
         || false,
     );
     assert_eq!(action, carrick_el1_abi::Action::Served);
     assert_eq!(
-        frame.elr, SVC,
+        trap.frame.elr, SVC,
         "in-place input preparation must rewind ELR onto the SVC once"
     );
 
-    let checkpoint_action = crate::dispatch::final_user_return(&mut frame, action, |frame| {
+    let checkpoint_action = crate::dispatch::final_user_return(&mut trap, action, |trap| {
         crate::dispatch::arm_signal_user_return_with_cpu(
-            frame,
+            trap,
             &env.fixture.task,
             env.fixture.page,
             env.fixture.control,
@@ -2470,10 +2484,10 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
         "host syscall continuation resume must not rewind a second time to SVC - 4"
     );
 
-    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
-    assert_eq!(frame.elr, SVC);
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut trap);
+    assert_eq!(trap.frame.elr, SVC);
     let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
-        &mut frame,
+        &mut trap,
         &env.fixture.task,
         env.fixture.page,
         env.fixture.control,
@@ -2484,7 +2498,7 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
         &mut env.service,
     );
     assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
-    assert_eq!(frame.elr, 0x70_0000);
+    assert_eq!(trap.frame.elr, 0x70_0000);
     let sigframe = read_delivered_sigframe(&stack, sp_top);
     let delivered_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
     assert_eq!(
@@ -2589,16 +2603,17 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
         ..Default::default()
     };
     frame.x[8] = 260;
+    let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
     // Dispatch rewinds the live frame onto the SVC before the return checkpoint;
     // the interrupted call answers EINTR for SA_RESTART inspection.
-    crate::dispatch::GuestDispatchFrame::restart_syscall(&mut frame);
-    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
-    assert_eq!(frame.elr, SVC);
+    crate::dispatch::GuestDispatchFrame::restart_syscall(&mut trap);
+    trap.frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    assert_eq!(trap.frame.elr, SVC);
 
     let first =
-        crate::dispatch::final_user_return(&mut frame, carrick_el1_abi::Action::Served, |frame| {
+        crate::dispatch::final_user_return(&mut trap, carrick_el1_abi::Action::Served, |trap| {
             crate::dispatch::arm_signal_user_return_with_cpu(
-                frame,
+                trap,
                 &env.fixture.task,
                 env.fixture.page,
                 env.fixture.control,
@@ -2621,9 +2636,9 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
         Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
     );
 
-    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut trap);
     let second = crate::dispatch::arm_signal_user_return_with_cpu(
-        &mut frame,
+        &mut trap,
         &env.fixture.task,
         env.fixture.page,
         env.fixture.control,
@@ -2634,7 +2649,7 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
         &mut env.service,
     );
     assert_eq!(second, carrick_el1_abi::Action::Served);
-    assert_eq!(frame.elr, 0x70_0000);
+    assert_eq!(trap.frame.elr, 0x70_0000);
     let sigframe = read_delivered_sigframe(&stack, sp_top);
     let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
     let saved_x0 = { sigframe.rt.ucontext.uc_mcontext.regs[0] };
@@ -2721,9 +2736,10 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
         slot: u64::from(env.fixture.slot.raw()),
         ..Default::default()
     };
+    let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
     let task_slice = core::slice::from_ref(&env.fixture.task);
     let irq_action = crate::dispatch::dispatch_irq_with_regions(
-        &mut frame,
+        &mut trap,
         &counters,
         task_slice,
         crate::dispatch::Zone {
@@ -2733,9 +2749,9 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
         },
     );
     assert_eq!(irq_action, carrick_el1_abi::Action::Served);
-    let checkpoint_action = crate::dispatch::final_user_return(&mut frame, irq_action, |frame| {
+    let checkpoint_action = crate::dispatch::final_user_return(&mut trap, irq_action, |trap| {
         crate::dispatch::arm_signal_user_return_with_cpu(
-            frame,
+            trap,
             &env.fixture.task,
             env.fixture.page,
             env.fixture.control,
@@ -2760,9 +2776,9 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
     carrick_guest_arch::ProcessContext::restart_syscall(&mut retried);
     assert_eq!(retried.native.pc, IRQ_PC);
 
-    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut trap);
     let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
-        &mut frame,
+        &mut trap,
         &env.fixture.task,
         env.fixture.page,
         env.fixture.control,
@@ -2773,7 +2789,7 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
         &mut env.service,
     );
     assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
-    assert_eq!(frame.elr, 0x70_0000);
+    assert_eq!(trap.frame.elr, 0x70_0000);
     let sigframe = read_delivered_sigframe(&stack, sp_top);
     let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
     assert_eq!(saved_pc, IRQ_PC);
@@ -2855,20 +2871,23 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
         slot: u64::from(env.fixture.slot.raw()),
         ..Default::default()
     };
-    assert_eq!(
-        crate::dispatch::arm_signal_user_return_with_cpu(
-            &mut frame,
-            &env.fixture.task,
-            env.fixture.page,
-            env.fixture.control,
-            env.fixture.zone,
-            &mut cpu,
-            env.ttbr0,
-            true,
-            &mut env.service,
-        ),
-        carrick_el1_abi::Action::Served
-    );
+    {
+        let mut irq_trap = crate::dispatch::positioned_trap_frame(&mut frame);
+        assert_eq!(
+            crate::dispatch::arm_signal_user_return_with_cpu(
+                &mut irq_trap,
+                &env.fixture.task,
+                env.fixture.page,
+                env.fixture.control,
+                env.fixture.zone,
+                &mut cpu,
+                env.ttbr0,
+                true,
+                &mut env.service,
+            ),
+            carrick_el1_abi::Action::Served
+        );
+    }
     assert_eq!(frame.elr, 0x70_0000);
     assert_ne!(cpu.regs.sp_el0, sp_top.raw());
 
@@ -2925,14 +2944,15 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
     frame.x[8] = 139; // SYS_rt_sigreturn
 
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+    let mut trap = crate::dispatch::positioned_trap_frame(&mut frame);
     crate::sched::ThreadCpu::save(
         &mut cpu,
-        &frame,
+        trap.frame,
         &mut saved,
-        crate::sched::CpuExitCause::Svc,
+        crate::sched::CpuExitCause::from(trap.position),
     );
     let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut trap,
         &counters,
         task_slice,
         &[],
@@ -2957,19 +2977,19 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
     .unwrap();
     let sigreturn_action = crate::dispatch::resolve_arm_process_route(
         route,
-        &mut frame,
+        trap.frame,
         &counters,
         task_slice,
         || false,
     );
     assert_eq!(sigreturn_action, carrick_el1_abi::Action::Served);
-    assert_eq!(frame.elr, RESTORED_PC);
+    assert_eq!(trap.frame.elr, RESTORED_PC);
     assert_eq!(cpu.regs.sp_el0, sp_top.raw());
 
     let checkpoint_action =
-        crate::dispatch::final_user_return(&mut frame, sigreturn_action, |frame| {
+        crate::dispatch::final_user_return(&mut trap, sigreturn_action, |trap| {
             crate::dispatch::arm_signal_user_return_with_cpu(
-                frame,
+                trap,
                 &env.fixture.task,
                 env.fixture.page,
                 env.fixture.control,
@@ -2994,9 +3014,9 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
     carrick_guest_arch::ProcessContext::restart_syscall(&mut retried);
     assert_eq!(retried.native.pc, RESTORED_PC);
 
-    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut frame);
+    wake_and_resume_deferred_signal_copy(&mut env, &mut cpu, &mut trap);
     let resumed_action = crate::dispatch::arm_signal_user_return_with_cpu(
-        &mut frame,
+        &mut trap,
         &env.fixture.task,
         env.fixture.page,
         env.fixture.control,
@@ -3007,7 +3027,7 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
         &mut env.service,
     );
     assert_eq!(resumed_action, carrick_el1_abi::Action::Served);
-    assert_eq!(frame.elr, 0x74_0000);
+    assert_eq!(trap.frame.elr, 0x74_0000);
     let sigframe = read_delivered_sigframe(&stack, sp_top);
     let saved_pc = { sigframe.rt.ucontext.uc_mcontext.pc };
     assert_eq!(saved_pc, RESTORED_PC);

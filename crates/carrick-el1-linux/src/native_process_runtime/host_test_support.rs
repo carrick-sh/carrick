@@ -7276,7 +7276,7 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
                 );
                 assert_eq!(
                     crate::dispatch::native_unstaged_exit(
-                        &mut frame,
+                        &mut crate::dispatch::positioned_trap_frame(&mut frame),
                         &fixture.task.linux,
                         carrick_el1_abi::Action::Forward,
                         || if child.is_root_process() {

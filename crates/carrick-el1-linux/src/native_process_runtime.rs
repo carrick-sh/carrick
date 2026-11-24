@@ -14382,6 +14382,7 @@ mod tests {
                 0x1000,
                 1,
                 saved_generation,
+                carrick_sched_core::SavedSyscallPc::AfterSyscall,
             );
             let source = BornInZoneSource { zone: &zone, slot };
             let admitted = if arm {

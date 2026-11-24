@@ -400,7 +400,13 @@ mod tests {
             // SAFETY: this newly allocated record has not been published.
             unsafe {
                 *zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(
+                        ctx,
+                        0,
+                        1,
+                        1,
+                        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+                    )
             };
             {
                 let guard = zone
@@ -510,8 +516,13 @@ mod tests {
         .unwrap();
         // SAFETY: the freshly allocated record has not been published.
         unsafe {
-            *zone.record(record).ctx_mut() =
-                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0x4000, 1, 1)
+            *zone.record(record).ctx_mut() = carrick_el1_abi::Aarch64ParkedContext::from_register(
+                ctx,
+                0x4000,
+                1,
+                1,
+                carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            )
         };
         let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
             panic!("AArch64 fixture");

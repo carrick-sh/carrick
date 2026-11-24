@@ -24,6 +24,30 @@ pub trait SyscallFrame {
     fn user_sp(&self) -> Option<UserVa>;
 }
 
+impl<F: SyscallFrame> SyscallFrame for carrick_guest_arch::PositionedFrame<'_, F> {
+    fn canonical_ordinal(&self) -> CanonicalNr {
+        self.frame.canonical_ordinal()
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        self.frame.argument(index)
+    }
+    fn result(&self) -> NativeReturnWord {
+        self.frame.result()
+    }
+    fn set_result(&mut self, result: NativeReturnWord) {
+        self.frame.set_result(result);
+    }
+    fn slot(&self) -> Option<SlotId> {
+        self.frame.slot()
+    }
+    fn task_index(&self) -> usize {
+        self.frame.task_index()
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        self.frame.user_sp()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnonymousCall {
     Brk,

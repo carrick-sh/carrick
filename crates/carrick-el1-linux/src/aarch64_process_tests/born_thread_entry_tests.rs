@@ -135,7 +135,12 @@ fn loaded_call(
     let saved = unsafe { *fixture.zone.record(current).ctx_mut() };
     let ttbr0 = cpu.ttbr.0;
     super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame,
+            position: saved
+                .saved_syscall_pc()
+                .unwrap_or(carrick_guest_arch::SavedSyscallPc::AfterSyscall),
+        },
         &counters,
         core::slice::from_ref(task),
         &[],
@@ -433,6 +438,8 @@ fn signal_checkpoint(
         &mut saved,
         crate::sched::CpuExitCause::Svc,
     );
+    let syndrome = (frame.esr, frame.x[0]);
+    let mut frame = super::super::dispatch::positioned_trap_frame(frame);
     super::super::dispatch::arm_signal_user_return_entry(
         BornInZoneSource {
             zone: fixture.zone,
@@ -440,10 +447,11 @@ fn signal_checkpoint(
         },
         task,
         &saved.native,
+        frame.position,
         ttbr0,
         fixture.page,
         fixture.control,
-        (frame.esr, frame.x[0]),
+        syndrome,
         true,
         &mut service,
         |process| {
@@ -451,7 +459,7 @@ fn signal_checkpoint(
                 task,
                 fixture.control,
                 process,
-                frame,
+                &mut frame,
                 |_, _| {
                     *delivered += 1;
                     stack.va_at(stack.len())
@@ -770,7 +778,7 @@ fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::super::dispatch::positioned_trap_frame(&mut frame),
             &mut owner_wait,
             |_, _| Some(carrick_personality_linux::dispatch::CompletionRoute::Forward),
         ),
@@ -819,7 +827,7 @@ fn call_on_slot(
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
+        &mut super::super::dispatch::positioned_trap_frame(frame),
         &counters,
         tasks,
         &[],
@@ -1106,6 +1114,7 @@ impl ProductionProcessHarness {
             source,
             self.task,
             &saved.native,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
             ttbr0,
             page,
             control,
@@ -2238,7 +2247,7 @@ impl MultiSlotEnv {
         frame.esr = 0x15 << 26;
         let mut service = self.service(slot);
         super::super::dispatch::dispatch_arm_syscall_with_native_process(
-            frame,
+            &mut super::super::dispatch::positioned_trap_frame(frame),
             counters,
             self.tasks,
             &[],
@@ -2660,10 +2669,12 @@ fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
         };
         // SAFETY: `member_slot` exclusively owns its OnCpu record.
         let native = unsafe { h.env.fixture.zone.record(record).ctx_mut().native };
+        let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
         let action = crate::dispatch::arm_signal_user_return_entry(
             source,
             task,
             &native,
+            positioned.position,
             cpu.ttbr.0,
             h.target_page,
             control,
@@ -2675,7 +2686,7 @@ fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
                     task,
                     control,
                     process,
-                    &mut frame,
+                    &mut positioned,
                     |_, _| stack.va_at(stack.len()),
                 )
             },
@@ -2738,6 +2749,7 @@ fn arm_ring_born_sibling_returns_through_closed_group_checkpoint() {
         },
         &h.env.tasks[root_slot.index()],
         &ThreadCtx::ZERO,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
         root_cpu.ttbr.0,
         f.page,
         f.control,
@@ -2881,6 +2893,7 @@ fn adopt_host_sibling_on_slot(
             fixture_ttbr0(fixture),
             fixture.address.mm.raw().get(),
             fixture.address.generation.raw().get(),
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
         );
     }
     let mut sib_cpu = crate::sched::FakeCpu {
@@ -3021,6 +3034,7 @@ fn setup_arm_root_two_live_threads_and_peer() -> ArmRootTwoThreadHarness {
             fixture_ttbr0(fixture),
             fixture.address.mm.raw().get(),
             fixture.address.generation.raw().get(),
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
         );
     }
     assert!(
@@ -4504,6 +4518,8 @@ fn env_signal_checkpoint(
         &mut saved,
         crate::sched::CpuExitCause::Svc,
     );
+    let syndrome = (frame.esr, frame.x[0]);
+    let mut frame = super::super::dispatch::positioned_trap_frame(frame);
     super::super::dispatch::arm_signal_user_return_entry(
         BornInZoneSource {
             zone: env.fixture.zone,
@@ -4511,10 +4527,11 @@ fn env_signal_checkpoint(
         },
         task,
         &saved.native,
+        frame.position,
         cpu.ttbr.0,
         env.fixture.page,
         control,
-        (frame.esr, frame.x[0]),
+        syndrome,
         true,
         &mut service,
         |process| {
@@ -4522,7 +4539,7 @@ fn env_signal_checkpoint(
                 task,
                 control,
                 process,
-                frame,
+                &mut frame,
                 |_, _| {
                     *delivered += 1;
                     stack.va_at(stack.len())

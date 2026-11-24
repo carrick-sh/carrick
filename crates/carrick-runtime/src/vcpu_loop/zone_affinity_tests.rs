@@ -647,8 +647,13 @@ fn remote_affinity_migration(host_route: bool) {
                             counters: &counters,
                             handoff: None,
                         };
-                        let action =
-                            sched.interrupt(&mut carrick_el1_abi::TrapFrame::default(), u64::MAX);
+                        let action = sched.interrupt(
+                            &mut carrick_guest_arch::PositionedFrame {
+                                frame: &mut carrick_el1_abi::TrapFrame::default(),
+                                position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+                            },
+                            u64::MAX,
+                        );
                         assert_eq!(
                             action,
                             carrick_el1_abi::Action::Forward,

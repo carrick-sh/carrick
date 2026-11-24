@@ -26,10 +26,88 @@ mod pipe_metadata_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
-use super::aarch64_process::{
-    Mm, admit_entry, map_resume, observed_entry_address, process_record_for_call, registry,
-    resume_selected, with_process_entry,
-};
+use super::aarch64_process::{Mm, map_resume, observed_entry_address, registry, resume_selected};
+
+#[cfg(test)]
+fn process_record_for_call(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    control: &ThreadControlSlot,
+) -> Result<carrick_el1_abi::RecordId, NativeProcessError> {
+    super::aarch64_process::process_record_for_call(
+        source,
+        task,
+        native,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        ttbr0,
+        control,
+    )
+}
+
+#[cfg(test)]
+type AdmittedEntry = (
+    std::sync::Arc<NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>>,
+    Mm,
+    Aarch64ParkedContext,
+);
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn admit_entry(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    record: carrick_el1_abi::RecordId,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+) -> Result<AdmittedEntry, NativeProcessError> {
+    super::aarch64_process::admit_entry(
+        source,
+        task,
+        native,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        ttbr0,
+        record,
+        page,
+        control,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn with_process_entry<X: ForkStockCrossing, R>(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, X>,
+    dispatch: impl FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            Mm,
+            Aarch64ParkedContext,
+            Aarch64NativeProcessService<'static, X>,
+        >,
+    ) -> R,
+) -> Result<R, NativeProcessError> {
+    super::aarch64_process::with_process_entry(
+        source,
+        task,
+        native,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        ttbr0,
+        page,
+        control,
+        service,
+        dispatch,
+    )
+}
 #[cfg(test)]
 use super::native_process_runtime::{NativeContention, NativeFailure, NativeServiceQuarantine};
 use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
@@ -2476,7 +2554,7 @@ fn native_fork_child_time_result_with(
     if route == CompletionRoute::Forward {
         assert_eq!(
             super::dispatch::native_unstaged_exit(
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &task.linux,
                 carrick_el1_abi::Action::Forward,
                 || owner,
@@ -3065,6 +3143,7 @@ fn plain_fork_owns_an_independent_fd_table() {
         parent_ttbr,
         fixture.address.mm.raw().get(),
         fixture.address.generation.raw().get(),
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
     );
     let words = fixture.tables.live(&fixture.maintenance);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
@@ -4889,7 +4968,10 @@ fn arm_root_setup_enters_production_process_venue() {
         carrick_test_support::assert_guest_args(&frame.x[..6]);
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+                },
                 &counters,
                 core::slice::from_ref(&fixture.task),
                 &[],
@@ -5201,7 +5283,10 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
         carrick_test_support::assert_guest_args(&frame.x[..6]);
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+                },
                 &counters,
                 core::slice::from_ref(&fixture.task),
                 &[],
@@ -5269,7 +5354,10 @@ fn arm_sigprocmask_nonresident_input_is_not_efault() {
         carrick_test_support::assert_guest_args(&frame.x[..6]);
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+                },
                 &counters,
                 core::slice::from_ref(&fixture.task),
                 &[],
@@ -5876,7 +5964,10 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(&fixture.task),
         &[],
@@ -5986,7 +6077,10 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     let mut cpu = crate::sched::FakeCpu::default();
     let user = crate::sched::HardwareUserWord;
     let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(&fixture.task),
         &[],
@@ -6078,7 +6172,10 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(&fixture.task),
         &[],
@@ -6258,7 +6355,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     let mut cpu = crate::sched::FakeCpu::default();
     assert_eq!(
         crate::dispatch::dispatch_irq_with_regions(
-            &mut irq_frame,
+            &mut crate::dispatch::positioned_trap_frame(&mut irq_frame),
             counters,
             core::slice::from_ref(&fixture.task),
             crate::dispatch::Zone {
@@ -6493,7 +6590,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         fixture.page,
         fixture.control,
         &mut service,
-        &mut frame,
+        &mut super::dispatch::positioned_trap_frame(&mut frame),
         &mut None,
         |_, _| panic!("Busy admission must not publish or deliver a signal"),
     );
@@ -6534,14 +6631,14 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
                 fixture.page,
                 fixture.control,
                 &mut service,
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &mut None,
                 |process, frame| {
                     super::arm_signal::deliver_on_user_return_with(
                         &fixture.task,
                         fixture.control,
                         process,
-                        frame,
+                        frame.frame,
                         fp.as_bytes(),
                         &mut machine,
                     )
@@ -6628,13 +6725,13 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::dispatch::positioned_trap_frame(&mut frame),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
                 process,
-                frame,
+                frame.frame,
                 fp.as_bytes(),
                 &mut machine,
             ),
@@ -6706,13 +6803,13 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::dispatch::positioned_trap_frame(&mut frame),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
                 process,
-                frame,
+                frame.frame,
                 fp.as_bytes(),
                 &mut machine,
             ),
@@ -6748,13 +6845,13 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::dispatch::positioned_trap_frame(&mut frame),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
                 process,
-                frame,
+                frame.frame,
                 fp.as_bytes(),
                 &mut machine,
             ),
@@ -10124,7 +10221,7 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     let fallback = |frame: &mut carrick_el1_abi::TrapFrame, refused| {
         super::dispatch::fallback_or_refuse_arm_process_call(
-            frame,
+            &mut super::dispatch::positioned_trap_frame(frame),
             &counters,
             core::slice::from_ref(&fixture.task),
             &[],
@@ -16703,13 +16800,13 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
                 fixture.page,
                 fixture.control,
                 &mut service,
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &mut None,
                 |process, frame| super::arm_signal::deliver_on_user_return_with(
                     &fixture.task,
                     fixture.control,
                     process,
-                    frame,
+                    frame.frame,
                     fp.as_bytes(),
                     &mut machine,
                 ),
@@ -16801,7 +16898,7 @@ fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
                 fixture.page,
                 fixture.control,
                 &mut service,
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &mut None,
                 |process, frame| {
                     // A sibling changes disposition after fault publication, before
@@ -16819,7 +16916,7 @@ fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
                         &fixture.task,
                         fixture.control,
                         process,
-                        frame,
+                        frame.frame,
                         fp.as_bytes(),
                         &mut ArmWaitSignalMachine {
                             user_sp: UserVa::new(0x7000),
@@ -16907,13 +17004,13 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::dispatch::positioned_trap_frame(&mut frame),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
                 process,
-                frame,
+                frame.frame,
                 fp.as_bytes(),
                 &mut ArmWaitSignalMachine {
                     user_sp: UserVa::new(0),
@@ -17011,7 +17108,7 @@ fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
                 fixture.page,
                 control,
                 &mut service,
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &mut None,
                 |_, _| panic!("closed owner must not select a signal action")
             )
@@ -17061,7 +17158,7 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
             fixture.page,
             fixture.control,
             &mut service,
-            &mut frame,
+            &mut super::dispatch::positioned_trap_frame(&mut frame),
             &mut None,
             |_, _| panic!("non-fault entry must fail before delivery"),
         );
@@ -18408,7 +18505,12 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[8] = nr;
         super::dispatch::dispatch_arm_syscall_with_native_process(
-            &mut frame, &counters, core::slice::from_ref(child_task), &[], &[], &[], &[],
+            &mut carrick_guest_arch::PositionedFrame {
+                frame: &mut frame,
+                position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+            },
+            &counters,
+            core::slice::from_ref(child_task), &[], &[], &[], &[],
             &cache, None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
             None, Some(&ChildLifecycle), child_task.lifecycle_refs().unwrap().0, child_control,
             &ThreadCtx::ZERO, fixture.zone.spaces.grant(fixture.zone.spaces.find(child_binding.address.mm.raw().get()).unwrap(), child_binding.address.mm.raw().get()).unwrap().ttbr0,
@@ -18908,7 +19010,7 @@ fn with_arm_process_host_files_on<R>(
         frame.x[8] = nr;
         let ArmCaller::Child(pid) = caller else {
             let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut super::dispatch::positioned_trap_frame(&mut frame),
                 &counters,
                 core::slice::from_ref(&fixture.task),
                 crossing.fd_map(),
@@ -23985,7 +24087,10 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
         frame.x[8] = nr;
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+                },
                 &counters,
                 core::slice::from_ref(&fixture.task),
                 crossing.fd_map(),
@@ -24252,7 +24357,7 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
     clone_frame.x[0] = 17;
     clone_frame.x[8] = 220;
     let clone_route = super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut clone_frame,
+        &mut super::dispatch::positioned_trap_frame(&mut clone_frame),
         &counters,
         core::slice::from_ref(&fixture.task),
         crossing.fd_map(),

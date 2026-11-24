@@ -106,21 +106,24 @@ impl<
         {
             let task_index = self.frame.task_index();
             let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                let slot = slot.unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
+            if let Some(zone) = self.zone.as_mut() {
+                let current_tasks = self.current_tasks;
+                let counters = self.counters;
+                let handoff = &mut self.handoff;
+                if let Some(Some(ready)) = self.frame.with_arm_positioned_frame(|frame| {
+                    let task = current_tasks.get(task_index).unwrap_or_else(|| {
+                        super::dispatch::invalid_completion(
+                            super::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                    let slot = slot.unwrap_or_else(|| {
+                        super::dispatch::invalid_completion(
+                            super::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                    native_scheduler(zone, task, counters, slot, handoff)
+                        .run_ready_positioned(frame)
+                }) {
                     *progress = ready;
                 }
             }
@@ -433,30 +436,7 @@ impl<
         options: LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         let mut outcome = self.process_venue()?.waitid(id, info, options);
-        if let LifecycleOutcome::Transferred { progress, .. } = &mut outcome
-            && matches!(progress, carrick_core::Served::Idle)
-        {
-            let task_index = self.frame.task_index();
-            let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                let slot = slot.unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
-                    *progress = ready;
-                }
-            }
-        }
+        self.run_ready_after_native_transfer(&mut outcome);
         Some(outcome)
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
@@ -619,11 +599,13 @@ impl<
         }
         let zone = self.zone.as_mut()?;
         let mut scratch = Aarch64ParkedContext::ZERO;
-        zone.cpu.save(
-            self.frame.arm_frame()?,
-            &mut scratch,
-            carrick_el1::substrate::sched::CpuExitCause::Svc,
-        );
+        self.frame.with_arm_positioned_frame(|frame| {
+            zone.cpu.save(
+                frame.frame,
+                &mut scratch,
+                carrick_el1::substrate::sched::CpuExitCause::from(frame.position),
+            );
+        })?;
         Some(UserVa::new(scratch.native.sp_el0))
     }
     fn affinity(&self) -> Option<u64> {
@@ -779,13 +761,17 @@ impl<
             }
             None => Aarch64ParkedContext::ZERO,
         };
-        let Some(frame) = self.frame.arm_frame() else {
+        let Some(()) = self.frame.with_arm_positioned_frame(|frame| {
+            zone.cpu.save(
+                frame.frame,
+                ctx,
+                carrick_el1::substrate::sched::CpuExitCause::from(frame.position),
+            );
+        }) else {
             super::dispatch::invalid_completion(
                 super::dispatch::NativeInvariant::MissingNativeFrame,
             );
         };
-        zone.cpu
-            .save(frame, ctx, carrick_el1::substrate::sched::CpuExitCause::Svc);
         ctx.native.x[0] = context.result.raw() as u64;
         ctx.native.sp_el0 = context.stack.raw();
         if let Some(tls) = context.tls {
@@ -976,15 +962,19 @@ impl<
                 SyscallResult::new(self.frame.result().0 as i64),
             );
         };
-        let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
-            match self.frame.arm_frame() {
-                Some(frame) => frame,
-                None => super::dispatch::invalid_completion(
+        let counters = self.counters;
+        let handoff = &mut self.handoff;
+        let served = self
+            .frame
+            .with_arm_positioned_frame(|frame| {
+                native_scheduler(zone, task, counters, slot, handoff)
+                    .run_next_positioned(frame, timeout_result.raw() as u64)
+            })
+            .unwrap_or_else(|| {
+                super::dispatch::invalid_completion(
                     super::dispatch::NativeInvariant::MissingNativeFrame,
-                ),
-            },
-            timeout_result.raw() as u64,
-        );
+                )
+            });
         (served, SyscallResult::new(self.frame.result().0 as i64))
     }
     fn result(&self) -> SyscallResult {
@@ -1265,10 +1255,14 @@ impl<
             validator: &crate::file::HardwareValidator,
         });
         #[cfg(test)]
-        if let (Some(zone), Some(arm_frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-            return crate::arm_signal::restore_live_arm_signal_frame_with_cpu(
-                zone.cpu, arm_frame, &mut copy,
-            );
+        if let Some(zone) = self.zone.as_mut()
+            && let Some(restored) = self.frame.with_arm_positioned_frame(|arm_frame| {
+                crate::arm_signal::restore_live_arm_signal_frame_with_cpu(
+                    zone.cpu, arm_frame, &mut copy,
+                )
+            })
+        {
+            return restored;
         }
         self.frame.restore_signal_frame(&mut copy)
     }

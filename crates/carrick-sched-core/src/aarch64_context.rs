@@ -57,23 +57,40 @@ impl Aarch64ParkedContext {
         saved_syscall_pc: 0,
     };
 
+    #[inline]
     pub fn from_parts(native: ThreadCtx, address: AddressContext<RootGpa>) -> Self {
+        Self::from_parts_at(native, address, SavedSyscallPc::AfterSyscall)
+    }
+
+    #[inline]
+    pub fn from_parts_at(
+        native: ThreadCtx,
+        address: AddressContext<RootGpa>,
+        position: SavedSyscallPc,
+    ) -> Self {
         Self {
             native,
             root: address.root.address().raw(),
             mm: address.mm.raw().get(),
             generation: address.generation.raw().get(),
-            saved_syscall_pc: 0,
+            saved_syscall_pc: position.word(),
         }
     }
 
-    pub fn from_register(native: ThreadCtx, register: u64, mm: u64, generation: u64) -> Self {
+    #[inline]
+    pub fn from_register(
+        native: ThreadCtx,
+        register: u64,
+        mm: u64,
+        generation: u64,
+        position: SavedSyscallPc,
+    ) -> Self {
         Self {
             native,
             root: register,
             mm,
             generation,
-            saved_syscall_pc: 0,
+            saved_syscall_pc: position.word(),
         }
     }
 
@@ -137,7 +154,9 @@ impl Aarch64ParkedContext {
             ResumeDisposition::UserReturn => {}
             ResumeDisposition::OwnerContinuation(OwnerEntry::Exception) => return None,
             ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall) => {
-                native.pc = native.pc.checked_sub(4)?;
+                native.pc = self
+                    .saved_syscall_pc()?
+                    .syscall_instruction(native.pc, carrick_guest_arch::AARCH64_SVC_LEN)?;
                 if native.pc == 0 || !native.pc.is_multiple_of(4) || native.pstate & 0xf != 0 {
                     return None;
                 }
@@ -263,8 +282,13 @@ mod tests {
         assert!(!ctx.authenticates(diff_gen));
 
         // ASID in upper register bits authenticates against clean page-aligned GPA
-        let asid_ctx =
-            Aarch64ParkedContext::from_register(ThreadCtx::ZERO, 0xabcd_0000_0000_1000, 1, 1);
+        let asid_ctx = Aarch64ParkedContext::from_register(
+            ThreadCtx::ZERO,
+            0xabcd_0000_0000_1000,
+            1,
+            1,
+            SavedSyscallPc::AfterSyscall,
+        );
         assert!(asid_ctx.authenticates(binding));
         assert!(!asid_ctx.authenticates(diff_root));
 
@@ -319,7 +343,13 @@ mod tests {
         let binding = test_address(0x3000, 7, 11);
         let initial_contexts = [
             Aarch64ParkedContext::from_parts(native, binding),
-            Aarch64ParkedContext::from_register(native, 0xabcd_0000_0000_3000, 7, 11),
+            Aarch64ParkedContext::from_register(
+                native,
+                0xabcd_0000_0000_3000,
+                7,
+                11,
+                SavedSyscallPc::AfterSyscall,
+            ),
         ];
 
         for mut ctx in initial_contexts {

@@ -137,7 +137,7 @@ pub trait ThreadCpu {
         _task: &CurrentTask,
         _slot: SlotId,
         _record: RecordId,
-        _frame: &mut TrapFrame,
+        _frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         _counters: &Counters,
     ) -> carrick_el1_abi::Action {
         carrick_el1_abi::Action::Forward
@@ -217,6 +217,15 @@ impl CpuExitCause {
         match self {
             Self::Svc => carrick_sched_core::SavedSyscallPc::AfterSyscall,
             Self::Interrupted => carrick_sched_core::SavedSyscallPc::AtSyscall,
+        }
+    }
+}
+
+impl From<carrick_sched_core::SavedSyscallPc> for CpuExitCause {
+    fn from(position: carrick_sched_core::SavedSyscallPc) -> Self {
+        match position {
+            carrick_sched_core::SavedSyscallPc::AfterSyscall => Self::Svc,
+            carrick_sched_core::SavedSyscallPc::AtSyscall => Self::Interrupted,
         }
     }
 }
@@ -425,6 +434,44 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             u64,
         ) -> Result<u32, carrick_core::user_copy::CopyOutcome>,
     ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.wait_word_with_positioned(
+            &mut frame,
+            mm,
+            uaddr,
+            bitset,
+            expected,
+            deadline,
+            mismatch_result,
+            timeout_result,
+            interrupt,
+            read_word,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_word_with_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        mm: u64,
+        uaddr: u64,
+        bitset: u32,
+        expected: u32,
+        deadline: Option<u64>,
+        mismatch_result: u64,
+        timeout_result: u64,
+        interrupt: impl FnOnce(
+            carrick_sched_core::RecordRef,
+        ) -> Option<carrick_guest_arch::NativeReturnWord>,
+        read_word: impl FnOnce(
+            &U,
+            &CurrentTask,
+            u64,
+        ) -> Result<u32, carrick_core::user_copy::CopyOutcome>,
+    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
         let (zone, slot) = (self.zone, self.slot);
         let guard = zone.short_lock(
             ZoneTables::bucket_of_with_context(mm, uaddr),
@@ -439,7 +486,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         };
         if word != expected {
             drop(guard);
-            frame.x[0] = mismatch_result;
+            frame.frame.x[0] = mismatch_result;
             return Ok(Some(Served::Returned { switched: false }));
         }
         let fresh = zone.slot(slot).current().is_none();
@@ -461,9 +508,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // record, or the switched-in `OnCpu` one); nobody else may touch it
         // until the park below is published.
         self.cpu.save(
-            frame,
+            frame.frame,
             unsafe { zone.record(record).ctx_mut() },
-            CpuExitCause::Svc,
+            CpuExitCause::from(frame.position),
         );
         let seq = zone.next_seq(record);
         // Reserve one exact record lease before publishing its timed park.
@@ -509,7 +556,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if let Some(result) = interrupt(zone.record_ref(record)) {
             zone.withdraw_guest_park(&guard, record);
             drop(guard);
-            frame.x[0] = result.0;
+            frame.frame.x[0] = result.0;
             return Ok(Some(Served::Returned { switched: false }));
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
@@ -529,14 +576,26 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.record_handoff(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(self.run_next(frame, timeout_result)))
+        Ok(Some(self.run_next_positioned(frame, timeout_result)))
     }
 
     /// The running thread parked (or exited in the zone): run the next
     /// runnable thread, or leave for the host when that thread needs its
     /// executor, or idle.
     pub fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
-        match self.run_ready(frame) {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.run_next_positioned(&mut frame, timeout_result)
+    }
+
+    pub fn run_next_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        timeout_result: u64,
+    ) -> Served {
+        match self.run_ready_positioned(frame) {
             Some(progress) => progress,
             None => self.idle(frame, timeout_result),
         }
@@ -546,7 +605,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// leaves the caller's host handoff intact, so its execution capacity can
     /// be released without sending a native child to a host-task adopter.
     pub fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        if let Some(served) = self.enforce_affinity(frame, CpuExitCause::Svc) {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.run_ready_positioned(&mut frame)
+    }
+
+    pub fn run_ready_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> Option<Served> {
+        if let Some(served) = self.enforce_affinity(frame.frame, CpuExitCause::from(frame.position))
+        {
             return Some(served);
         }
         loop {
@@ -618,6 +689,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// by this EL1 zone. Save the caller's zero result before switching: the
     /// frame after the switch belongs to the sibling's suspended syscall.
     pub fn yield_queued(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.yield_queued_positioned(&mut frame)
+    }
+
+    pub fn yield_queued_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> Option<Served> {
         if self.zone.yield_turn(self.slot) == YieldTurn::Keep
             || self.task.linux.has_pending_host_work()
             || self.task.lifecycle_refs().is_some_and(|(page, control)| {
@@ -635,8 +717,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             },
             record,
         )?;
-        frame.x[0] = 0;
-        let (loaded, requeue) = self.preempt_record(frame, record, CpuExitCause::Svc);
+        frame.frame.x[0] = 0;
+        let (loaded, requeue) =
+            self.preempt_record(frame, record, CpuExitCause::from(frame.position));
         if self.zone.slot(self.slot).current() == Some(record) {
             return Some(Served::Returned { switched: false });
         }
@@ -666,7 +749,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// raised, or it is unpublished or retiring); the thread went back to
     /// the head of the run queue and the vCPU must leave for its executor
     /// ([`Self::service_exit`]), which loads it.
-    fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
+    fn load(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        switched: SwitchedIn,
+    ) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
         // Paired with the affinity writer's claim inspection: no admission
@@ -717,12 +804,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 return LoadResult::Left;
             }
         };
-        self.cpu.load(frame, ctx);
         if retry_syscall {
-            // The typed continuation is created only while handling an AArch64
-            // SVC, whose saved ELR names the following aligned instruction.
-            frame.elr = frame.elr.wrapping_sub(4);
+            carrick_guest_arch::ProcessContext::restart_syscall(ctx);
         }
+        self.cpu.load(frame.frame, ctx);
+        frame.position = ctx
+            .saved_syscall_pc()
+            .unwrap_or(carrick_sched_core::SavedSyscallPc::AfterSyscall);
         self.counters.record_syscall_frame(
             if rec.has_object_operation() {
                 carrick_el1_abi::SyscallFrameSource::SchedulerObjectReplay
@@ -737,7 +825,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     _ => carrick_el1_abi::SyscallFrameSource::SchedulerSavedReturn,
                 }
             },
-            frame,
+            frame.frame,
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
         );
         self.task
@@ -745,7 +833,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             .orig_arg0
             .store(ctx.native.x[0], Ordering::Relaxed);
         if let Some(result) = result {
-            frame.x[0] = result;
+            frame.frame.x[0] = result;
         }
         if zone.slot(slot).queued() != 0 {
             zone.slot(slot).restart_slice(self.cpu.now());
@@ -817,7 +905,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
     /// thread is queued here (by another vCPU, or this vCPU's timer ending
     /// its timed park) or host work arrives.
-    pub fn idle(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
+    pub fn idle(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        timeout_result: u64,
+    ) -> Served {
         let (zone, slot) = (self.zone, self.slot);
         zone.counters
             .el1_idle_entries
@@ -921,7 +1013,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// is pending, the vCPU leaves through the host at this EL0 boundary.
     pub fn interrupt(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
@@ -935,7 +1027,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// after it re-enters through another IRQ frame.
     fn finish_interrupt(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         action: carrick_el1_abi::Action,
     ) -> carrick_el1_abi::Action {
         // `Idle` already parked the running thread (an affinity park, a
@@ -977,7 +1069,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
 
     fn interrupt_decision(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         // A RESCHED receipt is only a prompt to inspect the CURRENT loaded
@@ -986,7 +1078,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return carrick_el1_abi::Action::Forward;
         }
         if self
-            .enforce_affinity(frame, CpuExitCause::Interrupted)
+            .enforce_affinity(frame.frame, CpuExitCause::from(frame.position))
             .is_some()
         {
             return carrick_el1_abi::Action::Idle;
@@ -1017,7 +1109,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     // The next thread needs its executor: the running one
                     // goes to the tail of the run queue with its registers,
                     // and the vCPU leaves for the host with no thread on it.
-                    if self.park_preempted(frame, CpuExitCause::Interrupted) {
+                    if self.park_preempted(frame.frame, CpuExitCause::from(frame.position)) {
                         self.service_exit();
                         return carrick_el1_abi::Action::Idle;
                     }
@@ -1044,7 +1136,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         frame: &mut TrapFrame,
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
-        self.interrupt_decision(frame, timeout_result)
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        };
+        self.interrupt_decision(&mut frame, timeout_result)
     }
 
     #[cfg(feature = "host-test")]
@@ -1053,7 +1149,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         frame: &mut TrapFrame,
         action: carrick_el1_abi::Action,
     ) -> carrick_el1_abi::Action {
-        self.finish_interrupt(frame, action)
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        };
+        self.finish_interrupt(&mut frame, action)
     }
 
     /// The idle entry (EL1 plan 1d): the executor of this vCPU has no thread
@@ -1063,6 +1163,18 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     pub fn idle_entry(
         &mut self,
         frame: &mut TrapFrame,
+        timeout_result: u64,
+    ) -> carrick_el1_abi::Action {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        };
+        self.idle_entry_positioned(&mut frame, timeout_result)
+    }
+
+    pub fn idle_entry_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
@@ -1098,14 +1210,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// queue with its registers, and the head runs. False: the head's
     /// address space could not be installed; the vCPU must leave for its
     /// executor (both threads are queued).
-    fn preempt(&mut self, frame: &mut TrapFrame) -> bool {
+    fn preempt(&mut self, frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>) -> bool {
         if self.zone.runnable_head(self.slot).is_none() {
             return true;
         }
         let Ok(prev) = self.current_record() else {
             return true;
         };
-        self.preempt_record(frame, prev, CpuExitCause::Interrupted)
+        self.preempt_record(frame, prev, CpuExitCause::from(frame.position))
             .0
     }
 
@@ -1113,7 +1225,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// is loaded, and the exact requeue of `prev` that licenses its receipt.
     fn preempt_record(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         prev: carrick_el1_abi::RecordId,
         exit: CpuExitCause,
     ) -> (bool, carrick_sched_core::Requeue) {
@@ -1122,7 +1234,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu
-            .save(frame, unsafe { zone.record(prev).ctx_mut() }, exit);
+            .save(frame.frame, unsafe { zone.record(prev).ctx_mut() }, exit);
         match zone.switch_in_full(slot) {
             Some(switched) => {
                 if !requeue_owned(zone, slot, prev) {
@@ -1136,7 +1248,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     LoadResult::Running => true,
                     LoadResult::NeedsHost => false,
                     LoadResult::Left => {
-                        matches!(self.run_next(frame, 0), Served::Returned { switched: true })
+                        matches!(
+                            self.run_next_positioned(frame, 0),
+                            Served::Returned { switched: true }
+                        )
                     }
                 };
                 (loaded, carrick_sched_core::Requeue::Queued)
@@ -1517,7 +1632,7 @@ impl ThreadCpu for FakeCpu {
         _: &CurrentTask,
         _: SlotId,
         record: RecordId,
-        _: &mut TrapFrame,
+        _: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         _: &Counters,
     ) -> carrick_el1_abi::Action {
         self.host_work_boundaries.push(record);

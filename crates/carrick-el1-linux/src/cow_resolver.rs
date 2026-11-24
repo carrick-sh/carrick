@@ -265,13 +265,14 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
     slot: carrick_sched_core::SlotId,
     cpu: &mut C,
     user: &U,
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     wait: carrick_el1_abi::PortalOwnerWait,
 ) -> Option<Action> {
     use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
     let enrollment =
         carrick_core_abi::wait::PortalWaitEnrollment::for_owner(zone, wait.handle(), wait).ok()?;
-    let resume = carrick_el1::substrate::sched::object_wait::OperationResumePc::new(frame.elr)?;
+    let resume =
+        carrick_el1::substrate::sched::object_wait::OperationResumePc::new(frame.frame.elr)?;
     let operation = OperationToken::metadata_request(wait.revision().max(1))?;
     let mut handoff = None;
     let mut sched_zone = crate::dispatch::Zone {
@@ -282,7 +283,7 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
     let mut sched =
         crate::dispatch::native_scheduler(&mut sched_zone, task, counters, slot, &mut handoff);
     match sched.park_object(
-        frame,
+        frame.frame,
         enrollment.key(),
         enrollment.observed_snapshot(),
         resume,
@@ -293,7 +294,7 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
             let served = if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
-                sched.resume_after_object_park(frame, parked, 0)
+                sched.resume_after_object_park_positioned(frame, parked, 0)
             };
             Some(match served {
                 Some(carrick_el1::substrate::sched::Served::Returned { .. }) => Action::Served,
@@ -313,7 +314,7 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
 /// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
 pub fn dispatch_fault(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     counters: &Counters,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Action {
@@ -326,7 +327,7 @@ pub fn dispatch_fault(
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let Some(mailbox) =
-            carrick_el1_abi::frame_grant_mailbox_guest_for_slot(frame.slot as usize)
+            carrick_el1_abi::frame_grant_mailbox_guest_for_slot(frame.frame.slot as usize)
         else {
             counters.fault_taken.fetch_add(1, Ordering::Relaxed);
             return Action::Forward;
@@ -335,8 +336,8 @@ pub fn dispatch_fault(
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
         let roots = carrick_el1::memory::reservations::shared_guest();
-        let slot = carrick_sched_core::SlotId::new(frame.slot as u8);
-        let task = &current_tasks[frame.slot as usize];
+        let slot = carrick_sched_core::SlotId::new(frame.frame.slot as u8);
+        let task = &current_tasks[frame.frame.slot as usize];
         let venue = carrick_el1::substrate::sched::NativeEntryVenue::select(zone, slot, task);
         let native = matches!(
             venue,
@@ -355,7 +356,7 @@ pub fn dispatch_fault(
                 None => OwnerFaultSupply::new(portal),
             };
             let action = dispatch_fault_with_descriptor_txns(
-                frame,
+                frame.frame,
                 counters,
                 current_tasks,
                 carrick_el1::substrate::sched::object_wait::space_access(zone, slot),
@@ -403,7 +404,7 @@ pub fn dispatch_fault(
                 && (native || supply.outcome() == OwnerFaultSupplyOutcome::PolicyDeclined)
             {
                 crate::native_diagnostic::fault_verdict(
-                    frame,
+                    frame.frame,
                     task.mm.key.load(Ordering::Acquire),
                     native,
                     supply.verdict(),
@@ -472,7 +473,8 @@ mod tests {
         let counters = Counters::default();
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
 
-        let action = dispatch_fault(&mut frame, &counters, &mut None);
+        let mut positioned = crate::dispatch::positioned_trap_frame(&mut frame);
+        let action = dispatch_fault(&mut positioned, &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Ensure arbitrary x8 was not dispatched as a syscall and syscall counters were not touched

@@ -143,7 +143,13 @@ fn host_park(zone: &ZoneTables, tid: u64, uaddr: u64, ctx: ThreadCtx) -> RecordI
     let record = zone.alloc_record(identity(tid)).unwrap();
     // SAFETY: freshly allocated and unpublished.
     unsafe {
-        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(ctx, TTBR_MM, MM, 1)
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+            ctx,
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        )
     };
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)
@@ -386,8 +392,13 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
     saved.x[8] = crate::ipc::SYS_WRITE as u64;
     // SAFETY: the new record is unpublished and exclusively owned here.
     unsafe {
-        *zone.record(successor).ctx_mut() =
-            Aarch64ParkedContext::from_register(saved, TTBR_MM, MM, 1);
+        *zone.record(successor).ctx_mut() = Aarch64ParkedContext::from_register(
+            saved,
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
     assert!(zone.requeue_preempted(SLOT, successor).is_queued());
     let counters = counters();
@@ -742,7 +753,13 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         user: &HardwareUserWord,
         counters,
     }
-    .idle(&mut frame_b, ETIMEDOUT_RESULT);
+    .idle(
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame_b,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        },
+        ETIMEDOUT_RESULT,
+    );
     assert_eq!(served, Served::Returned { switched: true });
     let mut expected = b_before;
     expected.x[0] = 0;
@@ -784,8 +801,13 @@ fn an_el1_futex_wake_always_finishes_in_ring() {
         assert!(zone.mark_native_owned(record));
         // SAFETY: freshly allocated and unpublished.
         unsafe {
-            *zone.record(record).ctx_mut() =
-                Aarch64ParkedContext::from_register(thread_ctx(tid, words[0]), TTBR_MM, MM, 1)
+            *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+                thread_ctx(tid, words[0]),
+                TTBR_MM,
+                MM,
+                1,
+                carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            )
         };
         let seq = zone.next_seq(record);
         for (index, uaddr) in words.iter().enumerate() {
@@ -985,8 +1007,13 @@ fn late_host_work_on_a_switched_native_record_enters_its_owner_boundary() {
     assert!(zone.mark_native_owned(record));
     // SAFETY: the fresh unpublished record is exclusively owned here.
     unsafe {
-        *zone.record(record).ctx_mut() =
-            Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+            thread_ctx(0xA, 0x1000),
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
     assert!(zone.requeue_preempted(SLOT, record).is_queued());
     let task = CurrentTask::new();
@@ -1046,8 +1073,13 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
     assert!(zone.mark_native_owned(record));
     // SAFETY: the fresh unpublished record is exclusively owned here.
     unsafe {
-        *zone.record(record).ctx_mut() =
-            Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+            thread_ctx(0xA, 0x1000),
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
     assert!(zone.requeue_preempted(SLOT, record).is_queued());
     let task = CurrentTask::new();
@@ -1625,6 +1657,7 @@ fn queue_foreign_binding(
             if mm == MM { TTBR_MM } else { TTBR_OTHER },
             mm,
             binding.generation,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
         )
     };
     let seq = zone.next_seq(record);
@@ -2153,7 +2186,13 @@ fn idle_left_checkpoint_selects_the_next_runnable_record() {
             user: &HardwareUserWord,
             counters: counters(),
         })
-        .idle(&mut frame, 0),
+        .idle(
+            &mut carrick_guest_arch::PositionedFrame {
+                frame: &mut frame,
+                position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            },
+            0,
+        ),
         Served::Returned { switched: true }
     );
     assert_eq!(zone.slot(SLOT).current(), Some(second));
@@ -2238,8 +2277,13 @@ fn the_idle_entry_runs_no_thread_itself() {
         .unwrap();
     // SAFETY: freshly allocated and unpublished.
     unsafe {
-        *zone.record(record).ctx_mut() =
-            Aarch64ParkedContext::from_register(thread_ctx(0xB, b_addr), TTBR_OTHER, OTHER_MM, 1)
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+            thread_ctx(0xB, b_addr),
+            TTBR_OTHER,
+            OTHER_MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        )
     };
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, OTHER_MM, b_addr, u32::MAX, 0)
@@ -2296,8 +2340,13 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     b_ctx.pc = 0x8000;
     // SAFETY: freshly allocated, unpublished record.
     unsafe {
-        *zone.record(b).ctx_mut() =
-            Aarch64ParkedContext::from_register(b_ctx, TTBR_OTHER, OTHER_MM, 1)
+        *zone.record(b).ctx_mut() = Aarch64ParkedContext::from_register(
+            b_ctx,
+            TTBR_OTHER,
+            OTHER_MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AtSyscall,
+        )
     };
     let guard = zone
         .object_wait(key_b, &HostWait, &|owned| {
@@ -2542,7 +2591,13 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     assert_eq!(saved.native.fpcr, a.fpcr);
     cpu.load(
         &mut frame,
-        &Aarch64ParkedContext::from_register(b, TTBR_MM, MM, 1),
+        &Aarch64ParkedContext::from_register(
+            b,
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        ),
     );
     cpu.save(&frame, &mut saved, CpuExitCause::Interrupted);
     assert_eq!(saved.native.x, b.x);
@@ -2557,7 +2612,13 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     assert_eq!(saved.native.fpcr, b.fpcr);
     cpu.load(
         &mut frame,
-        &Aarch64ParkedContext::from_register(a, TTBR_MM, MM, 1),
+        &Aarch64ParkedContext::from_register(
+            a,
+            TTBR_MM,
+            MM,
+            1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        ),
     );
     cpu.set_translation(0x7000, 0x8000);
     cpu.invalidate_asid(0x7000);
@@ -2622,7 +2683,13 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     // failed publication restores the whole prior value, including its PC
     // position. A later adapter refusal must therefore still rewind once.
     let record = zone.current_or_new(SLOT, identity(101)).unwrap();
-    let mut prior = Aarch64ParkedContext::from_register(thread_ctx(0xa, 0x4000), TTBR_MM, MM, 1);
+    let mut prior = Aarch64ParkedContext::from_register(
+        thread_ctx(0xa, 0x4000),
+        TTBR_MM,
+        MM,
+        1,
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+    );
     prior.replace_saved_pc(0x7004, carrick_sched_core::SavedSyscallPc::AfterSyscall);
     // SAFETY: this unpublished host-home record belongs to the fixture lane.
     unsafe { *zone.record(record).ctx_mut() = prior };
@@ -2757,7 +2824,13 @@ fn idle_resched_keeps_an_affinity_excluded_home_record_queued() {
             );
         } else {
             assert_eq!(
-                sched.idle(&mut frame, ETIMEDOUT_RESULT),
+                sched.idle(
+                    &mut carrick_guest_arch::PositionedFrame {
+                        frame: &mut frame,
+                        position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+                    },
+                    ETIMEDOUT_RESULT,
+                ),
                 Served::Idle,
                 "idle must refuse an excluded home record after RESCHED"
             );
@@ -2824,7 +2897,13 @@ fn switched_affinity_boundary(at_return: bool) {
         assert_eq!(scheduler.run_ready(&mut frame), Some(Served::Idle));
     } else {
         assert_eq!(
-            scheduler.interrupt(&mut frame, ETIMEDOUT_RESULT),
+            scheduler.interrupt(
+                &mut carrick_guest_arch::PositionedFrame {
+                    frame: &mut frame,
+                    position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+                },
+                ETIMEDOUT_RESULT,
+            ),
             carrick_el1_abi::Action::Idle
         );
     }

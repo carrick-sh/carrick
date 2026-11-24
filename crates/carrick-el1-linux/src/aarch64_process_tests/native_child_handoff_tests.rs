@@ -87,7 +87,7 @@ fn begin_prefix_write<X: ForkStockCrossing>(
     };
     let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
     let decision = super::super::dispatch::native_service_decision(
-        &mut stage_frame,
+        &mut super::super::dispatch::positioned_trap_frame(&mut stage_frame),
         task,
         carrick_el1_abi::Action::Forward,
         None,
@@ -447,11 +447,11 @@ fn fork_child_service_ack(
         };
         let mut returned = None;
         let action = super::super::dispatch::native_service_user_return(
-            &mut frame,
+            &mut super::super::dispatch::positioned_trap_frame(&mut frame),
             operation,
             result,
             |frame| {
-                returned = Some((frame.elr, frame.x));
+                returned = Some((frame.frame.elr, frame.frame.x));
                 carrick_el1_abi::Action::Served
             },
         );
@@ -688,7 +688,10 @@ fn fork_child_service_ack(
         .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
         .unwrap();
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(task),
         &[],
@@ -804,7 +807,13 @@ fn arm_native_fork_timer_delivers_child_without_parent_wait() {
         fixture.slot,
         &mut handoff,
     )
-    .interrupt(&mut frame, 0);
+    .interrupt(
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        },
+        0,
+    );
     assert_eq!(action, carrick_el1_abi::Action::Served);
     assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
     assert_eq!(frame.x[0], 0, "the child receives fork's zero return");
@@ -954,7 +963,10 @@ fn arm_native_wait_runs_ready_child_before_host_handoff() {
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(&fixture.task),
         &[],
@@ -1262,7 +1274,7 @@ fn native_el0_sync_exceptions_have_owned_service_operations() {
     ] {
         frame.esr = esr;
         let operation = super::super::dispatch::native_service_operation(
-            &mut frame,
+            &mut super::super::dispatch::positioned_trap_frame(&mut frame),
             &fixture.task.linux,
             carrick_el1_abi::Action::Forward,
         )
@@ -1472,7 +1484,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             }
         };
         let operation = super::super::dispatch::native_service_operation(
-            &mut frame,
+            &mut super::super::dispatch::positioned_trap_frame(&mut frame),
             &fixture.task.linux,
             action,
         )
@@ -2077,8 +2089,9 @@ fn namespace_baseline(
                 .spaces
                 .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
                 .unwrap();
+            let mut trap = super::super::dispatch::positioned_trap_frame(&mut frame);
             let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
+                &mut trap,
                 &counters,
                 core::slice::from_ref(task),
                 &[],
@@ -2113,7 +2126,7 @@ fn namespace_baseline(
                 // dispatch, and must see the admitted child's real ownership.
                 assert_eq!(
                     super::super::dispatch::native_unstaged_exit(
-                        &mut frame,
+                        &mut trap,
                         &task.linux,
                         carrick_el1_abi::Action::Forward,
                         || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
@@ -2124,7 +2137,7 @@ fn namespace_baseline(
                     ),
                 );
                 assert_eq!(
-                    frame.x[0] as i64, -38,
+                    trap.frame.x[0] as i64, -38,
                     "baseline child {index} ordinal {nr}"
                 );
             }
@@ -2236,7 +2249,10 @@ fn forked_child_futex<T>(
         .grant(fixture.zone.spaces.find(child_mm).unwrap(), child_mm)
         .unwrap();
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
+        &mut carrick_guest_arch::PositionedFrame {
+            frame: &mut frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        },
         &counters,
         core::slice::from_ref(task),
         &[],
@@ -2264,7 +2280,7 @@ fn forked_child_futex<T>(
         _ => carrick_el1_abi::Action::Served,
     };
     let exit = super::super::dispatch::native_unstaged_exit(
-        &mut frame,
+        &mut super::super::dispatch::positioned_trap_frame(&mut frame),
         &task.linux,
         action,
         || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),

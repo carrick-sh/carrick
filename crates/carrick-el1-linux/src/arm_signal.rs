@@ -13,10 +13,8 @@ struct ArmSignalMachine {
     user_sp: carrick_guest_arch::UserVa,
     /// Where the frame's PC sits relative to its `SVC` (#2900). The
     /// vector-encoded `TrapFrame` has no word for it, so the machine carries
-    /// it beside the frame: exact for a frame built from a saved context,
-    /// and after a rerun or a handler entry. `None` is the live vector
-    /// frame, whose rerun still takes the interrupted context's position.
-    position: Option<carrick_sched_core::SavedSyscallPc>,
+    /// it beside the frame from the live frame's producer or saved context.
+    position: carrick_sched_core::SavedSyscallPc,
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -38,29 +36,25 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         frame: &mut TrapFrame,
         original: &carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
-        let Some(position) = self.position.or_else(|| original.saved_syscall_pc()) else {
-            return false;
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: self.position,
         };
-        let mut frame = carrick_guest_arch::PositionedFrame { frame, position };
         if !carrick_guest_arch::rerun_interrupted_syscall(&mut frame, original) {
             return false;
         }
-        self.position = Some(frame.position);
+        self.position = frame.position;
         true
     }
 
     fn restart_forwarded(&mut self, frame: &mut TrapFrame) -> Option<bool> {
-        let restarted = restart_forwarded_frame(frame);
-        if restarted == Some(true) {
-            self.position = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
-        }
-        restarted
+        restart_forwarded_frame_at(frame, &mut self.position)
     }
 
     /// The frame now enters the handler, which is where it resumes.
     fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
         self.user_sp = sp;
-        self.position = Some(carrick_sched_core::SavedSyscallPc::AtSyscall);
+        self.position = carrick_sched_core::SavedSyscallPc::AtSyscall;
     }
 
     fn sync_parked_context(
@@ -69,10 +63,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         ctx: &mut carrick_sched_core::Aarch64ParkedContext,
     ) {
         ctx.native.x = frame.x;
-        match self.position {
-            Some(position) => ctx.replace_saved_pc(frame.elr, position),
-            None => ctx.native.pc = frame.elr,
-        }
+        ctx.replace_saved_pc(frame.elr, self.position);
         ctx.native.pstate = frame.spsr;
         ctx.native.sp_el0 = self.user_sp.raw();
     }
@@ -93,30 +84,43 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
 /// `ipc::serve_ipc_with_signals` first settles retained progress with
 /// `RestartClass::Never`, then uses this marker for zero-progress non-epoll
 /// interruptions. The signal owner combines this predicate with SA_RESTART.
+#[cfg(any(test, feature = "host-test"))]
 pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
+    let mut position = carrick_sched_core::SavedSyscallPc::AfterSyscall;
+    restart_forwarded_frame_at(frame, &mut position)
+}
+
+fn restart_forwarded_frame_at(
+    frame: &mut TrapFrame,
+    position: &mut carrick_sched_core::SavedSyscallPc,
+) -> Option<bool> {
     if frame.esr != 0xfffe
         || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
         || !carrick_signal_core::is_native_restartable_syscall(frame.x[8])
     {
         return None;
     }
-    rewind_forwarded_frame(frame)
+    rewind_forwarded_frame(frame, position)
 }
 
 /// Rewind an interrupted restart-class forwarded SVC for `SA_RESTART` or when
 /// no handler runs at the checkpoint (`WaitDecision::Continue`). The host's
 /// checkpoint frame is the `SVC`'s own return, after the instruction.
-fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
+fn rewind_forwarded_frame(
+    frame: &mut TrapFrame,
+    position: &mut carrick_sched_core::SavedSyscallPc,
+) -> Option<bool> {
     use carrick_guest_arch::SyscallReturnFrame;
     let arg0 = frame.far;
     let mut frame = carrick_guest_arch::PositionedFrame {
         frame,
-        position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        position: *position,
     };
     if frame.rewind_to_syscall().is_none() {
         return Some(false);
     }
     frame.frame.x[0] = arg0;
+    *position = frame.position;
     Some(true)
 }
 
@@ -131,7 +135,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
         carrick_sched_core::Aarch64ParkedContext,
         super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     >,
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
 ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
     // The vector admitted this entry with the loaded task's lifecycle.
     let (_, control) = task.lifecycle_refs()?;
@@ -157,16 +161,17 @@ pub(crate) fn deliver_on_user_return_with_cpu<'a, C, X>(
         carrick_sched_core::Aarch64ParkedContext,
         super::aarch64_process::Aarch64NativeProcessService<'a, X>,
     >,
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
 ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>
 where
     C: crate::sched::ThreadCpu,
     X: super::aarch64_process::ForkStockCrossing,
 {
+    let exit = crate::sched::CpuExitCause::from(frame.position);
     let mut saved = None;
     let route = deliver_on_user_return_at(task, control, process, frame, |frame, fp| {
         let mut ctx = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-        cpu.save(frame, &mut ctx, crate::sched::CpuExitCause::Svc);
+        cpu.save(frame, &mut ctx, exit);
         fp.vregs = ctx.native.v;
         fp.fpsr = ctx.native.fpsr as u32;
         fp.fpcr = ctx.native.fpcr as u32;
@@ -178,11 +183,11 @@ where
     if route.is_none()
         && let Some(mut ctx) = saved
     {
-        ctx.native.x = frame.x;
-        ctx.native.pc = frame.elr;
-        ctx.native.pstate = frame.spsr;
+        ctx.replace_saved_pc(frame.frame.elr, frame.position);
+        ctx.native.x = frame.frame.x;
+        ctx.native.pstate = frame.frame.spsr;
         ctx.native.sp_el0 = current_signal_stack().raw();
-        cpu.load(frame, &ctx);
+        cpu.load(frame.frame, &ctx);
     }
     #[cfg(not(test))]
     let _ = saved;
@@ -203,40 +208,47 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
         carrick_sched_core::Aarch64ParkedContext,
         super::aarch64_process::Aarch64NativeProcessService<'a, X>,
     >,
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     capture: impl FnOnce(
         &TrapFrame,
         &mut carrick_syscall_abi::LinuxFpsimdContext,
     ) -> carrick_guest_arch::UserVa,
 ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
+    use super::signal_delivery::SignalMachine;
     use zerocopy::IntoBytes;
 
-    if frame.esr == 0xfffc {
+    if frame.frame.esr == 0xfffc {
         return Some(match process.cancel_owner_wait() {
             Ok(_) => carrick_personality_linux::dispatch::CompletionRoute::Suspended,
             Err(_) => carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion,
         });
     }
     if !(process.signal_checkpoint_needed()
-        || (frame.esr == 0xfffe
-            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64))
+        || (frame.frame.esr == 0xfffe
+            && frame.frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64))
     {
         return None;
     }
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-    let sp = capture(frame, &mut fp);
-    deliver_on_user_return_with(
+    let sp = capture(frame.frame, &mut fp);
+    let mut machine = ArmSignalMachine {
+        backend: LinuxAarch64Backend,
+        user_sp: sp,
+        position: frame.position,
+    };
+    let route = deliver_on_user_return_with(
         task,
         control,
         process,
-        frame,
+        frame.frame,
         fp.as_bytes(),
-        &mut ArmSignalMachine {
-            backend: LinuxAarch64Backend,
-            user_sp: sp,
-            position: None,
-        },
-    )
+        &mut machine,
+    );
+    frame.position = machine.position;
+    if route.is_none() {
+        machine.sync_parked_context(frame.frame, process.resume_context_mut());
+    }
+    route
 }
 
 /// Settle the native signal owner before its completed words cross back to
@@ -277,7 +289,7 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
         backend: LinuxAarch64Backend,
         user_sp: carrick_guest_arch::UserVa::new(saved.native.sp_el0),
         // The frame is the saved context's: its PC sits where it says.
-        position: Some(position),
+        position,
     };
     let control = process.resume_signal_control();
     let route = deliver_on_user_return_with(
@@ -449,7 +461,7 @@ fn publish_signal_stack(sp: carrick_guest_arch::UserVa) {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 pub(crate) fn restore_live_arm_signal_frame(
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
 ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
 {
@@ -460,7 +472,7 @@ pub(crate) fn restore_live_arm_signal_frame(
 #[inline(always)]
 pub(crate) fn restore_live_arm_signal_frame_with_cpu<C: crate::sched::ThreadCpu>(
     cpu: &mut C,
-    frame: &mut TrapFrame,
+    frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
     copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
 ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
 {
@@ -470,7 +482,11 @@ pub(crate) fn restore_live_arm_signal_frame_with_cpu<C: crate::sched::ThreadCpu>
     // The audited switch leaf is the sole reader/writer of EL0 FP/SIMD.
     // Retain the context off the 16 KiB EL1 stack until validation commits.
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    cpu.save(frame, &mut saved, crate::sched::CpuExitCause::Svc);
+    cpu.save(
+        frame.frame,
+        &mut saved,
+        crate::sched::CpuExitCause::from(frame.position),
+    );
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     publish_signal_stack(carrick_guest_arch::UserVa::new(saved.native.sp_el0));
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
@@ -478,15 +494,20 @@ pub(crate) fn restore_live_arm_signal_frame_with_cpu<C: crate::sched::ThreadCpu>
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
     let mask = LinuxAarch64Backend
-        .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
+        .restore_signal_frame(frame.frame, fp.as_mut_bytes(), &mut |dst, src| {
             copy_in.copy_in(dst, src).is_done()
         })
         .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
     // restore_signal_frame validates and then publishes SP_EL0. Re-read it
     // only after success; a failed copy leaves the saved hardware untouched.
     let restored_sp = current_signal_stack().raw();
-    apply_restored_context(&mut saved.native, frame, &fp, restored_sp);
-    cpu.load(frame, &saved);
+    apply_restored_context(&mut saved.native, frame.frame, &fp, restored_sp);
+    saved.replace_saved_pc(
+        saved.native.pc,
+        carrick_sched_core::SavedSyscallPc::AtSyscall,
+    );
+    cpu.load(frame.frame, &saved);
+    frame.position = carrick_sched_core::SavedSyscallPc::AtSyscall;
     Ok(mask)
 }
 
@@ -536,8 +557,6 @@ pub(crate) fn build(
     all(target_os = "none", target_arch = "aarch64")
 ))]
 use carrick_guest_arch::UserVa;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use zerocopy::FromBytes;
 
 /// The Linux signal-frame codec over the neutral ARM backend's types.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

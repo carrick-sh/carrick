@@ -4245,8 +4245,13 @@ mod tests {
                 let record = zone.alloc_record(identity(tid)).unwrap();
                 // SAFETY: freshly allocated and unpublished.
                 unsafe {
-                    *zone.record(record).ctx_mut() =
-                        Aarch64ParkedContext::from_register(thread_ctx(tid, uaddr), TTBR_MM, MM, 1)
+                    *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+                        thread_ctx(tid, uaddr),
+                        TTBR_MM,
+                        MM,
+                        1,
+                        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+                    )
                 };
                 let seq = zone.next_seq(record);
                 zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)

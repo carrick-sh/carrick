@@ -1158,7 +1158,7 @@ fn fork_exec_probe_copy_alignment(
             );
             assert_eq!(
                 crate::dispatch::native_unstaged_exit(
-                    &mut frame,
+                    &mut crate::dispatch::positioned_trap_frame(&mut frame),
                     &fixture.task.linux,
                     carrick_el1_abi::Action::Forward,
                     || owner,
@@ -2466,7 +2466,7 @@ fn child_futex<'a>(
             );
             assert_eq!(
                 crate::dispatch::native_unstaged_exit(
-                    &mut frame,
+                    &mut crate::dispatch::positioned_trap_frame(&mut frame),
                     &fixture.task.linux,
                     carrick_el1_abi::Action::Forward,
                     || owner,

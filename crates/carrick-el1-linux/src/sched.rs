@@ -50,7 +50,7 @@ impl ThreadCpu for HardwareCpu {
         task: &carrick_el1_abi::CurrentTask,
         _: carrick_el1_abi::SlotId,
         _: carrick_el1_abi::RecordId,
-        frame: &mut TrapFrame,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         counters: &carrick_el1_abi::Counters,
     ) -> carrick_el1_abi::Action {
         let action = if task.linux.served_boundary_pending() {
@@ -121,9 +121,9 @@ pub enum FutexRefusal {
     Mapping(LifecycleOutcome),
 }
 
-struct Adapter<'a, 's, 'm, C: ThreadCpu, U: UserWord> {
+struct Adapter<'a, 'f, 's, 'm, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
-    frame: &'a mut TrapFrame,
+    frame: &'a mut carrick_guest_arch::PositionedFrame<'f, TrapFrame>,
     refusal: Option<FutexRefusal>,
     operation: &'a mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
     /// A shared candidate keys shared-private.
@@ -132,7 +132,7 @@ struct Adapter<'a, 's, 'm, C: ThreadCpu, U: UserWord> {
     /// relative expiry. A shared wake was authenticated before policy.
     authenticate: Option<&'a mut SharedFutexMapping<'m>>,
 }
-impl<C: ThreadCpu, U: UserWord> Adapter<'_, '_, '_, C, U> {
+impl<C: ThreadCpu, U: UserWord> Adapter<'_, '_, '_, '_, C, U> {
     /// The scheduler key of `address`: the shared-private key for an
     /// authenticated shared word, the private key otherwise. `None` leaves
     /// the call unserved (a mapping the authority refuses, or its retry).
@@ -156,7 +156,7 @@ impl<C: ThreadCpu, U: UserWord> Adapter<'_, '_, '_, C, U> {
         MmFutexKey::shared_private(address).map(MmFutexKey::scheduler_address)
     }
 }
-impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
+impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, '_, C, U> {
     type Served = Served;
     fn mm(&self) -> Option<ReservationMm> {
         ReservationMm::new(self.sched.task.mm.key.load(Ordering::Acquire))
@@ -183,7 +183,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
         &mut self,
         result: carrick_personality_linux::entry::SyscallResult,
     ) -> Option<Served> {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame.frame.x[0] = result.raw() as u64;
         Some(Served::Returned { switched: false })
     }
     fn wake(&mut self, mm: ReservationMm, address: UserVa, bitset: u32, limit: u32) -> Served {
@@ -192,12 +192,12 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
         } else {
             MmFutexKey::private(address)
         }) else {
-            self.frame.x[0] = carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64;
+            self.frame.frame.x[0] = carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64;
             return Served::Returned { switched: false };
         };
         let key = key.scheduler_address();
         self.sched
-            .wake_word(self.frame, mm.raw(), key, bitset, limit)
+            .wake_word(self.frame.frame, mm.raw(), key, bitset, limit)
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
         if self.operation.is_none()
@@ -211,7 +211,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
 
         let zone = self.sched.zone;
         let binding = carrick_core::entry::binding(&self.sched.task.execution, &self.sched.task.mm);
-        let result = self.sched.wait_word_with(
+        let result = self.sched.wait_word_with_positioned(
             self.frame,
             wait.mm.raw(),
             key,
@@ -336,8 +336,22 @@ pub trait LinuxSchedEntry {
         operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
         shared: Option<&mut SharedFutexMapping<'_>>,
     ) -> Result<Option<Served>, FutexRefusal>;
+    fn serve_futex_operation_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
+        shared: Option<&mut SharedFutexMapping<'_>>,
+    ) -> Result<Option<Served>, FutexRefusal>;
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
+    fn serve_irq_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> carrick_el1_abi::Action;
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
+    fn serve_idle_entry_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> carrick_el1_abi::Action;
 }
 impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
     fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
@@ -360,11 +374,23 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
         shared: Option<&mut SharedFutexMapping<'_>>,
     ) -> Result<Option<Served>, FutexRefusal> {
-        if frame.x[8] != SYS_FUTEX as u64 {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.serve_futex_operation_positioned(&mut frame, operation, shared)
+    }
+    fn serve_futex_operation_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+        operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
+        shared: Option<&mut SharedFutexMapping<'_>>,
+    ) -> Result<Option<Served>, FutexRefusal> {
+        if frame.frame.x[8] != SYS_FUTEX as u64 {
             return Ok(None);
         }
         let mut call = FutexCall {
-            args: crate::sched::args(frame),
+            args: crate::sched::args(frame.frame),
         };
         // The same candidate rule as x86's native entry (`serve_native_futex`).
         let candidate = shared.is_some().then(|| call.shared_private_candidate());
@@ -404,10 +430,30 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         }
     }
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        };
+        self.serve_irq_positioned(&mut frame)
+    }
+    fn serve_irq_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> carrick_el1_abi::Action {
         self.interrupt(frame, ETIMEDOUT_RESULT)
     }
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
-        self.idle_entry(frame, ETIMEDOUT_RESULT)
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AtSyscall,
+        };
+        self.serve_idle_entry_positioned(&mut frame)
+    }
+    fn serve_idle_entry_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
+    ) -> carrick_el1_abi::Action {
+        self.idle_entry_positioned(frame, ETIMEDOUT_RESULT)
     }
 }
 

@@ -668,8 +668,9 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             region: owner.region(),
             tables: &crate::ipc::MapTables(map),
         };
+        let mut trap = crate::dispatch::positioned_trap_frame(frame);
         let begin = match crate::dispatch::native_service_decision(
-            frame,
+            &mut trap,
             &fixture.task,
             carrick_el1_abi::Action::Forward,
             None,
@@ -701,9 +702,9 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         };
         crate::sched::ThreadCpu::save(
             &mut fake_cpu,
-            frame,
+            trap.frame,
             &mut saved,
-            crate::sched::CpuExitCause::Svc,
+            crate::sched::CpuExitCause::from(trap.position),
         );
         let (page_ref, control_ref) = fixture.task.lifecycle_refs().unwrap();
         let mut arm_service = Aarch64NativeProcessService::with_crossing(
@@ -719,6 +720,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             source,
             &fixture.task,
             &saved.native,
+            trap.position,
             succ_ttbr0,
             page_ref,
             control_ref,
@@ -726,7 +728,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             |process| {
                 crate::dispatch::begin_native_service(
                     process,
-                    frame.x[8],
+                    trap.frame.x[8],
                     begin,
                     None,
                     counters,
@@ -896,7 +898,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         )
         .with_words(words);
         let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-            &mut frame,
+            &mut crate::dispatch::positioned_trap_frame(&mut frame),
             counters,
             core::slice::from_ref(&fixture.task),
             &[],

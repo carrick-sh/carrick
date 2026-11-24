@@ -1382,6 +1382,7 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
         0xabcd_0000_0000_0000 | parent_addr.root.address().raw(),
         parent_addr.mm.raw().get(),
         parent_addr.generation.raw().get(),
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
     );
     assert!(asid_ctx.authenticates(parent_addr));
     assert!(!asid_ctx.authenticates(diff_root));

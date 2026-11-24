@@ -238,6 +238,117 @@ impl<G: GuestDispatchFrame, Z: EntryContext> IpcExecution for NativeIpcExecution
     fn hand_back(&mut self, _frame: &mut Self::Frame, _packed_token: u64) {}
 }
 
+pub struct PositionedSchedIpc<'s, 'f, C: ThreadCpu, U: UserWord>(
+    pub Sched<'s, C, U>,
+    pub core::marker::PhantomData<fn(&mut carrick_guest_arch::PositionedFrame<'f, TrapFrame>)>,
+);
+
+impl<'f, C: ThreadCpu, U: UserWord> IpcExecution for PositionedSchedIpc<'_, 'f, C, U> {
+    type Context = carrick_el1_abi::Aarch64ParkedContext;
+    type Frame = carrick_guest_arch::PositionedFrame<'f, TrapFrame>;
+    fn zone(&self) -> &ZoneTables<Self::Context> {
+        self.0.zone
+    }
+    fn slot(&self) -> SlotId {
+        self.0.slot
+    }
+    fn task(&self) -> &CurrentTask {
+        self.0.task
+    }
+    fn counters(&self) -> &Counters {
+        self.0.counters
+    }
+    fn now(&self) -> u64 {
+        self.0.cpu.now()
+    }
+    fn ticks(&self, ns: u64) -> u64 {
+        Sched::ticks(&self.0, ns)
+    }
+    fn take_object_operation(&self) -> Result<Option<OperationToken>, ObjectWaitError> {
+        Sched::take_object_operation(&self.0)
+    }
+    fn observe_object(&self, key: ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
+        Sched::observe_object(&self.0, key)
+    }
+    fn notify_object(
+        &self,
+        key: ObjectWaitKey,
+    ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
+        Sched::notify_object(&self.0, key)
+    }
+    fn finish_object_wake(&mut self, effects: WakeEffects) {
+        Sched::finish_object_wake(&mut self.0, effects);
+    }
+    fn may_time_park(&self) -> bool {
+        Sched::may_time_park(&self.0)
+    }
+    fn object_wait_expired(&self) -> bool {
+        Sched::object_wait_expired(&self.0)
+    }
+    fn park(
+        &mut self,
+        frame: &mut Self::Frame,
+        key: ObjectWaitKey,
+        snapshot: ObjectStateSnapshot,
+        operation: OperationToken,
+        deadline: Option<u64>,
+        interrupt: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<IpcServed, (ObjectWaitError, OperationToken)> {
+        let Some(resume) = frame.operation_resume_pc() else {
+            return Err((ObjectWaitError::Stale, operation));
+        };
+        let parked = self
+            .0
+            .park_object(frame.frame, key, snapshot, resume, operation, deadline)?;
+        // Enrollment precedes the single pending-signal probe. A signal
+        // before enrollment is seen here; a later one owns queue intake.
+        if interrupt.is_some_and(|interrupt| interrupt()) {
+            self.0.task.linux.mark_pending_host_work();
+        }
+        let served = if self.0.task.linux.has_pending_host_work() {
+            self.0.leave_after_object_park(parked)
+        } else {
+            self.0.resume_after_object_park_positioned(frame, parked, 0)
+        };
+        Ok(match served {
+            Some(super::Served::Returned { switched }) => IpcServed::Returned { switched },
+            Some(super::Served::Idle) | None => IpcServed::Idle,
+        })
+    }
+    fn park_owner(
+        &mut self,
+        frame: &mut Self::Frame,
+        wait: carrick_core_abi::PortalOwnerWait,
+        operation: OperationToken,
+    ) -> Result<IpcServed, (ObjectWaitError, OperationToken)> {
+        let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+            self.0.zone,
+            wait.handle(),
+            wait,
+        )
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        IpcExecution::park(
+            self,
+            frame,
+            enrollment.key(),
+            enrollment.observed_snapshot(),
+            operation,
+            None,
+            None,
+        )
+    }
+    fn mark_restart(&mut self, frame: &mut Self::Frame, original_argument: u64) {
+        frame.frame.esr = 0xfffe;
+        frame.frame.far = original_argument;
+    }
+    fn hand_back(&mut self, frame: &mut Self::Frame, packed_token: u64) {
+        frame.frame.x[8] = super::IPC_HANDBACK_NR;
+        frame.frame.x[0] = packed_token;
+    }
+}
+
 impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
     type Context = carrick_el1_abi::Aarch64ParkedContext;
     type Frame = TrapFrame;
@@ -289,19 +400,21 @@ impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
         deadline: Option<u64>,
         interrupt: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<IpcServed, (ObjectWaitError, OperationToken)> {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        };
         let Some(resume) = frame.operation_resume_pc() else {
             return Err((ObjectWaitError::Stale, operation));
         };
-        let parked = self.park_object(frame, key, snapshot, resume, operation, deadline)?;
-        // Enrollment precedes the single pending-signal probe. A signal
-        // before enrollment is seen here; a later one owns queue intake.
+        let parked = self.park_object(frame.frame, key, snapshot, resume, operation, deadline)?;
         if interrupt.is_some_and(|interrupt| interrupt()) {
             self.task.linux.mark_pending_host_work();
         }
         let served = if self.task.linux.has_pending_host_work() {
             self.leave_after_object_park(parked)
         } else {
-            self.resume_after_object_park(frame, parked, 0)
+            self.resume_after_object_park_positioned(&mut frame, parked, 0)
         };
         Ok(match served {
             Some(super::Served::Returned { switched }) => IpcServed::Returned { switched },

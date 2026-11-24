@@ -4861,6 +4861,7 @@ pub(crate) mod tests {
             carrick_el1_linux::mm_portal::test_support::ROOT,
             sibling.shared().mm().id().raw(),
             1,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
         );
         fixture.add_sibling(
             carrick_el1_abi::ExecutionBinding {

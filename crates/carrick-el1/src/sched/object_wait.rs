@@ -423,6 +423,19 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
+        parked: ObjectParked<'_, Aarch64ParkedContext>,
+        timeout_result: u64,
+    ) -> Option<Served> {
+        let mut frame = carrick_guest_arch::PositionedFrame {
+            frame,
+            position: carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        };
+        self.resume_after_object_park_positioned(&mut frame, parked, timeout_result)
+    }
+
+    pub fn resume_after_object_park_positioned(
+        &mut self,
+        frame: &mut carrick_guest_arch::PositionedFrame<'_, TrapFrame>,
         mut parked: ObjectParked<'_, Aarch64ParkedContext>,
         timeout_result: u64,
     ) -> Option<Served> {
@@ -430,7 +443,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             return None;
         }
         self.record_handoff(parked.take_receipt());
-        Some(self.run_next(frame, timeout_result))
+        Some(self.run_next_positioned(frame, timeout_result))
     }
 
     /// Called at the adapter's re-entry before looking up its numeric fd.

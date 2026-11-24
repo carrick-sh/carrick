@@ -170,6 +170,17 @@ pub(super) enum ZoneExit {
     El0,
 }
 
+impl ZoneExit {
+    const fn saved_syscall_pc(self) -> carrick_sched_core::SavedSyscallPc {
+        match self {
+            Self::Syscall { completed: true } => carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            Self::Syscall { completed: false } | Self::El0 => {
+                carrick_sched_core::SavedSyscallPc::AtSyscall
+            }
+        }
+    }
+}
+
 /// The EL0 context a thread resumes with, from a live-vCPU capture.
 pub(super) fn zone_ctx_from_state(
     state: &GuestCpuState,
@@ -203,6 +214,7 @@ fn parked_context(
     native: ThreadCtx,
     state: &GuestCpuState,
     identity: ThreadIdentity,
+    exit: ZoneExit,
 ) -> Result<Aarch64ParkedContext, RuntimeError> {
     let GuestCpuState::Aarch64V1(cpu) = state else {
         return Err(RuntimeError::Configuration(
@@ -214,6 +226,7 @@ fn parked_context(
         cpu.ttbr0,
         identity.mm,
         cpu.asid_generation,
+        exit.saved_syscall_pc(),
     ))
 }
 
@@ -471,20 +484,22 @@ where
                 );
                 let state = engine.snapshot_guest_state_for_publication()?;
                 let (ctx_state, completed) = settle_served_state(state.clone(), boundary);
-                let ctx = zone_ctx_from_state(
-                    &ctx_state,
-                    match exit {
-                        ZoneExit::Syscall { .. } => ZoneExit::Syscall { completed },
-                        ZoneExit::El0 => ZoneExit::El0,
-                    },
-                )?;
+                let capture_exit = match exit {
+                    ZoneExit::Syscall { .. } => ZoneExit::Syscall { completed },
+                    ZoneExit::El0 => ZoneExit::El0,
+                };
+                let ctx = zone_ctx_from_state(&ctx_state, capture_exit)?;
                 engine.discard_terminal_syscall_continuation()?;
                 // SAFETY: `current` is OnCpu on this slot and the vCPU is
                 // stopped: this executor is its only owner until the
                 // handback below.
                 unsafe {
-                    *zone.record(current).ctx_mut() =
-                        parked_context(ctx, &ctx_state, zone.record(current).identity())?
+                    *zone.record(current).ctx_mut() = parked_context(
+                        ctx,
+                        &ctx_state,
+                        zone.record(current).identity(),
+                        capture_exit,
+                    )?
                 };
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
@@ -776,7 +791,12 @@ where
                     Ok(record) => {
                         // SAFETY: freshly allocated and not yet published.
                         unsafe {
-                            *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)?
+                            *zone.record(record).ctx_mut() = parked_context(
+                                ctx,
+                                &state,
+                                identity,
+                                ZoneExit::Syscall { completed: true },
+                            )?
                         };
                         let seq = zone.next_seq(record);
                         let enrollment = carrick_sched_core::FutexEnrollment {
@@ -928,7 +948,7 @@ where
             RuntimeError::Configuration(format!("IPC lock wait record unavailable: {error:?}"))
         })?;
         // SAFETY: this freshly allocated record has not been published.
-        unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+        unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity, exit)? };
         let seq = zone.next_seq(record);
         if let Err((error, _token)) = pending.defer(record, token) {
             // Nothing was transferred; a release race is not an error here
@@ -1064,7 +1084,7 @@ where
                     ),
                 };
                 let ctx = zone_ctx_from_state(&state, exit)?;
-                Some((state, ctx, request))
+                Some((state, ctx, exit, request))
             }
             OwnerMemoryAction::Retained | OwnerMemoryAction::Fault => None,
         };
@@ -1107,8 +1127,10 @@ where
             RuntimeError::Configuration(format!("owner wait record unavailable: {error:?}"))
         })?;
         // SAFETY: this freshly allocated record has not been published.
-        if let Some((state, ctx, _)) = &syscall_state {
-            unsafe { *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity)? };
+        if let Some((state, ctx, exit, _)) = &syscall_state {
+            unsafe {
+                *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity, *exit)?
+            };
         }
         let seq = zone.next_seq(record);
         let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
@@ -1123,7 +1145,10 @@ where
                     .host_parks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
-                    (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
+                    (
+                        OwnerMemoryAction::Syscall { frame, resume },
+                        Some((state, _, _, request)),
+                    ) => {
                         let origin = self.state.owner_wait_origin()?;
                         let exit = self.settle_into_zone(
                             control,
@@ -1924,7 +1949,9 @@ where
                 .alloc_record(identity)
                 .map_err(|error| ipc_error("park record", error))?;
             // SAFETY: freshly allocated and not yet published.
-            unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+            unsafe {
+                *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity, exit)?
+            };
             let token = host_ipc::to_sched_token(park.token)
                 .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
             // The park's sequence (the same one `park` publishes).
@@ -2280,7 +2307,13 @@ mod ipc_tests {
             lifecycle_page: 0,
             control_slot: 0,
         };
-        let parked = parked_context(ThreadCtx::ZERO, &state, identity).unwrap();
+        let parked = parked_context(
+            ThreadCtx::ZERO,
+            &state,
+            identity,
+            ZoneExit::Syscall { completed: true },
+        )
+        .unwrap();
         assert_eq!(parked.generation(), 101);
     }
 

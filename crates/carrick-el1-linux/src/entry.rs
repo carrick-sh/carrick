@@ -107,16 +107,17 @@ pub unsafe extern "C" fn carrick_el1_syscall(
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     let mut owner_wait = None;
+    let mut frame = carrick_el1_linux::dispatch::positioned_trap_frame(frame_ref);
     let action =
-        carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut owner_wait);
-    let action = carrick_el1::fault::drain_before_el0_hw(frame_ref, action);
+        carrick_el1_linux::dispatch::dispatch_entry(&mut frame, counters_ref, &mut owner_wait);
+    let action = carrick_el1::fault::drain_before_el0_hw(frame.frame, action);
     let action = carrick_el1_linux::dispatch::capture_native_service_exit(
-        frame_ref,
+        &mut frame,
         action,
         owner_wait,
         counters_ref,
     );
-    carrick_el1_linux::dispatch::seal_entry_exit(frame_ref, action).encode()
+    carrick_el1_linux::dispatch::seal_entry_exit(frame.frame, action).encode()
 }
 
 /// Observable bare-metal panic handler.

@@ -513,7 +513,16 @@ impl EntryBackend for Aarch64Backend {
         frame: &mut TrapFrame,
         saved: &ThreadCtx,
     ) -> Result<(), Self::Error> {
-        hw::HardwareCpu.load(frame, &Aarch64ParkedContext::from_register(*saved, 0, 0, 0));
+        hw::HardwareCpu.load(
+            frame,
+            &Aarch64ParkedContext::from_register(
+                *saved,
+                0,
+                0,
+                0,
+                carrick_sched_core::SavedSyscallPc::AtSyscall,
+            ),
+        );
         Ok(())
     }
     fn prepare_user_return(&mut self, _frame: &TrapFrame) -> Result<UserReturn, Self::Error> {
