@@ -449,6 +449,18 @@ pub struct ReservationNodeData {
     pub flags: u16,
     pub host_backing: Option<crate::HostBackingIdentity>,
 }
+/// Placement authority available for a private anonymous advisory hint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnonymousHintVenue {
+    /// A ring-only MM can use its allocation layout without a raw crossing.
+    /// It edits its own stage-1 tables, so only apertures no carrier or
+    /// HVPatch mapping touches are free to it.
+    Ring,
+    /// A host venue may still search its alias gaps when the layout is full,
+    /// and checks its own VMA rows and carrier windows for a hint.
+    Host,
+}
+
 /// ISA binding of the existing shared region. No owner logic belongs here.
 pub trait ReservationGeometry {
     const RESERVATIONS_OFFSET: usize;
@@ -458,6 +470,10 @@ pub trait ReservationGeometry {
     const BOOTSTRAP_SIZE: u64;
     /// The exclusive end of this ISA's user virtual address space.
     const USER_VA_END: u64;
+    /// The venue a run root's (`ServiceOrigin::Initial`) out-of-layout hint
+    /// may still reach: `Host` where a host VMA authority serves the run
+    /// root, `Ring` where every MM is ring-only and a forward has no venue.
+    const ROOT_HINT_VENUE: AnonymousHintVenue;
     fn authorizes_internal_read(address: u64, len: u64) -> bool;
     fn authorizes_identity_write(_address: u64, _len: u64) -> bool {
         false
@@ -468,8 +484,14 @@ pub trait ReservationGeometry {
 pub trait ReservationPolicy {
     fn validates_layout(layout: Layout) -> bool;
     /// Whether a private anonymous `range` outside `layout` lies in an
-    /// aperture no carrier mapping occupies, below the ISA's `user_end`.
-    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64) -> bool;
+    /// aperture no carrier mapping occupies for `venue`, below the ISA's
+    /// `user_end`.
+    fn external_anonymous_aperture(
+        layout: Layout,
+        range: ReservationRange,
+        user_end: u64,
+        venue: AnonymousHintVenue,
+    ) -> bool;
     fn active_value(policy: ReservationPolicyPayload) -> u64;
     fn apply_value(policy: &mut ReservationPolicyPayload, value: u64);
     fn admits_charges(

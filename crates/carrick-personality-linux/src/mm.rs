@@ -72,25 +72,44 @@ pub fn uses_alias_window(
 }
 
 /// Whether a private anonymous hint outside the allocation layout lies in
-/// an aperture no carrier mapping occupies: an alias window, or the free gap
-/// between the arena and the PIE image base, never the Rosetta window. Every
-/// admitted range starts at or above the arena's end, so the low carrier
-/// apertures (the EL1 region, the vDSO and the EL0 clock stub, all below
-/// [`LINUX_MMAP_BASE`]) are never offered. The exact root still refuses a
-/// collision with any node it holds.
-fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64) -> bool {
+/// an aperture no carrier mapping occupies, for `venue`. Both venues refuse
+/// the arena and everything below its end, the Rosetta window, and anything
+/// past the ISA's user VA end.
+///
+/// - **Ring** (a ring-only MM editing its own stage-1 tables): only at or
+///   above [`LINUX_HIGH_VA_THRESHOLD`]. Below 1 TiB live every carrier
+///   window (the EL1 region, vDSO, clock stub, GIC, the private overlay,
+///   the AArch64 stage-1 table pool) and, on AArch64 HVPatch, invalidated
+///   block descriptors the stage-1 editor refuses; and on x86 CPL0 an
+///   `ET_EXEC` image's arena sits low, under those windows. Nothing but
+///   Rosetta is mapped above 1 TiB on either ISA (`carrick-mem`'s asserts).
+/// - **Host**: also the low alias window and the gap between the arena and
+///   the PIE image base; the host venue checks its own VMA rows and carrier
+///   windows (`carrick-kernel`) before it offers one.
+fn external_anonymous_aperture(
+    layout: Layout,
+    range: ReservationRange,
+    user_end: u64,
+    venue: AnonymousHintVenue,
+) -> bool {
     let arena = layout.arena;
     let rosetta_end = LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE;
-    range.end() <= user_end
+    let outside = range.end() <= user_end
         && range.start() >= arena.end()
-        && (uses_alias_window(
-            range.start(),
-            range.end(),
-            arena.start(),
-            arena.end(),
-            user_end,
-        ) || range.end() <= LINUX_PIE_DEFAULT_BASE)
-        && !(range.start() < rosetta_end && LINUX_ROSETTA_VA_BASE < range.end())
+        && !(range.start() < rosetta_end && LINUX_ROSETTA_VA_BASE < range.end());
+    outside
+        && match venue {
+            AnonymousHintVenue::Ring => range.start() >= LINUX_HIGH_VA_THRESHOLD,
+            AnonymousHintVenue::Host => {
+                uses_alias_window(
+                    range.start(),
+                    range.end(),
+                    arena.start(),
+                    arena.end(),
+                    user_end,
+                ) || range.end() <= LINUX_PIE_DEFAULT_BASE
+            }
+        }
 }
 
 /// Linux edit authority and rlimit charging for the neutral flag record.
@@ -217,8 +236,13 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
         let brk = LinuxReservationState::from(layout.policy).brk;
         layout.heap.contains(brk) || brk == layout.heap.end()
     }
-    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64) -> bool {
-        external_anonymous_aperture(layout, range, user_end)
+    fn external_anonymous_aperture(
+        layout: Layout,
+        range: ReservationRange,
+        user_end: u64,
+        venue: AnonymousHintVenue,
+    ) -> bool {
+        external_anonymous_aperture(layout, range, user_end, venue)
     }
     fn active_value(policy: ReservationPolicyPayload) -> u64 {
         LinuxReservationState::from(policy).brk
@@ -436,55 +460,104 @@ mod aperture_tests {
         }
         .into()
     }
-    fn free(start: u64, len: u64, end: u64) -> bool {
-        external_anonymous_aperture(layout(), r(start, start + len), end)
+    fn free_for(venue: AnonymousHintVenue, start: u64, len: u64, end: u64) -> bool {
+        external_anonymous_aperture(layout(), r(start, start + len), end, venue)
+    }
+    fn ring(start: u64, len: u64, end: u64) -> bool {
+        free_for(AnonymousHintVenue::Ring, start, len, end)
+    }
+    fn host(start: u64, len: u64, end: u64) -> bool {
+        free_for(AnonymousHintVenue::Host, start, len, end)
     }
 
-    /// V8's cage hint (#2706), Go's arena hint and the gap above the arena
-    /// are free apertures on both ISAs; the carrier and image apertures,
-    /// the arena itself and anything past the ISA's user VA end are not.
+    /// V8's cage hint (#2706) is free to both venues on both ISAs. Below
+    /// 1 TiB only the host venue, which checks its own VMA rows and carrier
+    /// windows, is offered Go's arena hint and the gap above the arena
+    /// (#2950 review: HVPatch's invalidated blocks and the carrier windows
+    /// live there). The arena, the image, the shared aperture, the stack,
+    /// Rosetta and anything past the ISA's user VA end are free to neither.
     #[test]
-    fn external_anonymous_apertures_follow_the_layout_and_the_isa_end() {
+    fn external_anonymous_apertures_follow_the_venue_layout_and_isa_end() {
         let arena_end = LINUX_MMAP_BASE + LINUX_MMAP_SIZE;
         for end in [AARCH64_USER_VA_END, X86_64_USER_VA_END] {
-            assert!(free(0x2517_7424_0000, 0x7f000, end), "V8 cage hint");
-            assert!(free(0xc0_0000_0000, 0x400_0000, end), "Go arena hint");
-            assert!(free(arena_end, 0x1000, end), "gap above the arena");
-            assert!(!free(LINUX_MMAP_BASE, 0x1000, end), "inside the arena");
-            assert!(!free(0x1000_0000, 0x1000, end), "below the arena");
-            assert!(!free(LINUX_PIE_DEFAULT_BASE, 0x1000, end), "PIE image");
+            for free in [ring, host] {
+                assert!(free(0x2517_7424_0000, 0x7f000, end), "V8 cage hint");
+                assert!(free(LINUX_HIGH_VA_THRESHOLD, 0x1000, end), "1 TiB");
+                assert!(!free(LINUX_MMAP_BASE, 0x1000, end), "inside the arena");
+                assert!(!free(0x1000_0000, 0x1000, end), "below the arena");
+                assert!(!free(LINUX_PIE_DEFAULT_BASE, 0x1000, end), "PIE image");
+                assert!(!free(LINUX_SHARED_FILE_BASE, 0x1000, end), "shared");
+                assert!(!free(LINUX_STACK_TOP - 0x1000, 0x1000, end), "stack");
+                assert!(
+                    !free(LINUX_PIE_DEFAULT_BASE - 0x1000, 0x2000, end),
+                    "straddles PIE"
+                );
+            }
+            assert!(host(0xc0_0000_0000, 0x400_0000, end), "Go arena hint");
+            assert!(host(arena_end, 0x1000, end), "gap above the arena");
+            assert!(!ring(0xc0_0000_0000, 0x400_0000, end), "Go arena hint");
+            assert!(!ring(arena_end, 0x1000, end), "gap above the arena");
+            assert!(!ring(0x9a_0000_0000, 0x1000, end), "stage-1 table pool");
+            assert!(!ring(0x98_0000_0000, 0x1000, end), "private overlay");
             assert!(
-                !free(LINUX_SHARED_FILE_BASE, 0x1000, end),
-                "shared aperture"
-            );
-            assert!(!free(LINUX_STACK_TOP - 0x1000, 0x1000, end), "stack");
-            assert!(
-                !free(LINUX_PIE_DEFAULT_BASE - 0x1000, 0x2000, end),
-                "straddles PIE"
+                !ring(LINUX_HIGH_VA_THRESHOLD - 0x1000, 0x2000, end),
+                "straddles 1 TiB"
             );
         }
-        // The x86 end is the last lower-half page; AArch64 reaches 2^48.
-        assert!(!free(X86_64_USER_VA_END, 0x1000, X86_64_USER_VA_END));
-        assert!(free(
-            X86_64_USER_VA_END - 0x1000,
-            0x1000,
-            X86_64_USER_VA_END
-        ));
-        assert!(!free(1 << 47, 0x1000, X86_64_USER_VA_END));
-        assert!(free(
-            (1 << 47) + LINUX_ROSETTA_WINDOW_SIZE,
-            0x1000,
-            AARCH64_USER_VA_END
-        ));
-        assert!(
-            !free(LINUX_ROSETTA_VA_BASE, 0x1000, AARCH64_USER_VA_END),
-            "Rosetta window"
-        );
-        assert!(!free(
-            AARCH64_USER_VA_END - 0x1000,
-            0x2000,
-            AARCH64_USER_VA_END
-        ));
+        for free in [ring, host] {
+            // The x86 end is the last lower-half page; AArch64 reaches 2^48.
+            assert!(!free(X86_64_USER_VA_END, 0x1000, X86_64_USER_VA_END));
+            assert!(free(
+                X86_64_USER_VA_END - 0x1000,
+                0x1000,
+                X86_64_USER_VA_END
+            ));
+            assert!(!free(1 << 47, 0x1000, X86_64_USER_VA_END));
+            assert!(free(
+                (1 << 47) + LINUX_ROSETTA_WINDOW_SIZE,
+                0x1000,
+                AARCH64_USER_VA_END
+            ));
+            assert!(
+                !free(LINUX_ROSETTA_VA_BASE, 0x1000, AARCH64_USER_VA_END),
+                "Rosetta window"
+            );
+            assert!(!free(
+                AARCH64_USER_VA_END - 0x1000,
+                0x2000,
+                AARCH64_USER_VA_END
+            ));
+        }
+    }
+
+    /// An x86 `ET_EXEC` image's arena sits low (`[1 GiB, 33 GiB)`), under
+    /// the EL1 region, vDSO and trampoline windows: the ring venue still
+    /// offers nothing below 1 TiB there.
+    #[test]
+    fn a_low_arena_never_opens_the_carrier_windows_to_the_ring() {
+        let low = LinuxReservationLayout {
+            heap: r(0x40_0000, 0x4000_0000),
+            arena: r(0x4000_0000, 0x8_4000_0000),
+            brk: 0x40_0000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        }
+        .into();
+        for hint in [
+            0x2d_0400_0000,
+            0x2e_0000_0000,
+            0x30_0000_0000,
+            0xc0_0000_0000,
+        ] {
+            assert!(!external_anonymous_aperture(
+                low,
+                r(hint, hint + 0x1000),
+                X86_64_USER_VA_END,
+                AnonymousHintVenue::Ring
+            ));
+        }
     }
 }
 

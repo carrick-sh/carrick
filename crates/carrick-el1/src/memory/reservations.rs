@@ -16,6 +16,9 @@ impl owner::ReservationGeometry for NativeReservationGeometry {
     const BOOTSTRAP_BASE: u64 = EL1_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = EL1_BOOTSTRAP_METADATA_SIZE;
     const USER_VA_END: u64 = carrick_guest_arch::AARCH64_USER_VA_END;
+    /// The AArch64 run root keeps its host VMA venue.
+    const ROOT_HINT_VENUE: carrick_core_abi::AnonymousHintVenue =
+        carrick_core_abi::AnonymousHintVenue::Host;
     fn authorizes_identity_write(address: u64, len: u64) -> bool {
         CarrickIdentityWriteRange::authorizes(address, len)
     }
@@ -34,6 +37,9 @@ impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
     const BOOTSTRAP_BASE: u64 = carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE;
     const USER_VA_END: u64 = carrick_guest_arch::X86_64_USER_VA_END;
+    /// Every x86 CPL0 MM, the run root included, is ring-only.
+    const ROOT_HINT_VENUE: carrick_core_abi::AnonymousHintVenue =
+        carrick_core_abi::AnonymousHintVenue::Ring;
     fn authorizes_identity_write(address: u64, len: u64) -> bool {
         CarrickIdentityWriteRange::authorizes(address, len)
     }

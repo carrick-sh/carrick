@@ -185,9 +185,3 @@ test = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_
 reason = "#2867: the carrier venue now serves a held root socket's calls for a native member instead of refusing them, so the refusal witness became a service witness (getsockname names the bound address, accept4 takes the queued connection; an inherited regular file is still ENOTSOCK)."
 replaced_by = "carrick_kernel::dispatch::native_files::tests::an_inherited_root_socket_is_served_in_a_native_child"
 pr = 2880
-
-[[retired]]
-test = "carrick_el1_linux::decoder_tests::reservation_decoder_forwards_out_of_layout_hint"
-reason = "#2706: a free outside-layout mmap hint (Go's 0xc000000000) is now served exactly in ring by the shared reservation owner instead of forwarded, so the forward witness became an exact-proposal witness."
-replaced_by = "carrick_el1_linux::decoder_tests::reservation_decoder_serves_a_free_out_of_layout_hint_exactly"
-pr = 2950

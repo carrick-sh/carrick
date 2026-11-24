@@ -14,6 +14,8 @@ impl ReservationGeometry for Geometry {
     const BOOTSTRAP_BASE: u64 = 0;
     const BOOTSTRAP_SIZE: u64 = 0x100000;
     const USER_VA_END: u64 = 1 << 47;
+    const ROOT_HINT_VENUE: carrick_core_abi::AnonymousHintVenue =
+        carrick_core_abi::AnonymousHintVenue::Ring;
     fn authorizes_internal_read(_: u64, _: u64) -> bool {
         false
     }
