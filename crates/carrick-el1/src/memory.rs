@@ -79,6 +79,48 @@ pub fn unmap_x86_window(
     execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome
 }
 
+/// Change the access of the shared file window leaves of `range` on x86
+/// (mprotect(2), #1338): host-mapped leaves only, holes skipped (a lazy
+/// window page faults in under the node's new protection). The caller
+/// classified the range as [`RangeBacking::Window`] under the same exact-MM
+/// editor and checked the mapping's ceiling. x86 has no present
+/// inaccessible user leaf, so `PROT_NONE` is refused like the private
+/// `Protect`'s.
+pub fn protect_x86_window(
+    words: &impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords,
+    root: carrick_guest_arch::RootGpa,
+    mm: NonZeroU64,
+    generation: &AnonymousEditGeneration,
+    range: carrick_guest_arch::UserRange,
+    edit: &GuestPermissionEdit,
+) -> carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome {
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    use carrick_mmu_core::x86::descriptor_txn::{
+        DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, InlineJournal, PageSpan,
+        Permissions, execute_descriptor_txn,
+    };
+    if !edit.readable {
+        return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+    }
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: mm,
+            generation: generation.nonzero(),
+        },
+        root,
+        op: DescriptorOp::ProtectWindow {
+            span: PageSpan::new(range.start().raw(), range.len().raw()),
+            permissions: Permissions {
+                writable: edit.writable,
+                executable: edit.executable,
+                user: true,
+            },
+        },
+        tables: &[],
+    };
+    execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome
+}
+
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
@@ -696,6 +738,19 @@ pub trait AnonymousPermissionEditor {
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError>;
+
+    /// Change the access of the shared file window leaves of `edit`'s range
+    /// (a [`RangeBacking::Window`] range, mprotect(2), #1338) and invalidate
+    /// them. Only a carrier that installs windows serves this; the others
+    /// refuse, and the call leaves the ring (ARM's window installs are the
+    /// A2 seam).
+    fn protect_window_and_invalidate(
+        &mut self,
+        _ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        _edit: GuestPermissionEdit,
+    ) -> Result<(), GuestPermissionEditError> {
+        Err(GuestPermissionEditError::NotPrivateAnonymous)
+    }
 }
 
 /// Exact-MM live-terminal retirement behind the syscall policy.
@@ -1989,13 +2044,13 @@ fn serve_delegated_anonymous_attempt<
         frame.set_result(carrick_guest_arch::NativeReturnWord(0));
         return DelegatedAnonymous::Served;
     }
-    // A munmap or a replacing map over shared file window pages (#1338):
-    // the host-owned leaves inside the window nodes of the range are the
-    // file's pages, which the edit unlinks. Any other host-owned leaf stays
-    // foreign.
+    // A munmap, a replacing map or an mprotect over shared file window
+    // pages (#1338): the host-owned leaves inside the window nodes of the
+    // range are the file's pages, which the edit unlinks or re-permissions.
+    // Any other host-owned leaf stays foreign.
     let backing = if backing.summary == RangeBacking::Foreign
         && backing.foreign == ForeignBacking::HostOwnedLeaf
-        && matches!(request.operation, Retire | Prepare)
+        && matches!(request.operation, Retire | Prepare | Protect)
     {
         let mut windows = [(0u64, 0u64); MAX_BACKED_RUNS];
         let mut count = 0usize;
@@ -2025,8 +2080,8 @@ fn serve_delegated_anonymous_attempt<
     };
     // A discard can retire sparse residency in one descriptor transaction:
     // the retirement planners skip absent entries and validate every
-    // populated terminal before publishing the edit. So does a window
-    // unlink, which skips holes alike.
+    // populated terminal before publishing the edit. So do a window unlink
+    // and a window protect, which skip holes alike.
     let run = match backing.runs() {
         [] => None,
         [(start, end)] => Some((*start, *end - *start)),
@@ -2099,6 +2154,35 @@ fn serve_delegated_anonymous_attempt<
                     model.release_return(slot);
                     return refuse(pending, &mut model, Leave::EditRefused);
                 }
+            }
+        }
+        // mprotect over shared file window pages (#1338): the window leaves
+        // change access in place, within the mapping's ceiling; nothing is
+        // owed (the slot stays the file's).
+        (Protect, RangeBacking::Window, Some((start, run_len))) => {
+            let Some(ceiling) = model.protection_ceiling(request.range) else {
+                return refuse(pending, &mut model, Leave::RootUnavailable);
+            };
+            if request.protection.bits() & !ceiling.bits() != 0 {
+                return refuse(pending, &mut model, Leave::EditRefused);
+            }
+            let edit = GuestPermissionEdit {
+                va: start,
+                len: run_len,
+                readable: request.protection.bits() & PROT_READ != 0,
+                writable: request.protection.bits() & PROT_WRITE != 0,
+                executable: request.protection.bits() & PROT_EXEC != 0,
+                cow_ceiling: None,
+            };
+            match editor.protect_window_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                edit,
+            ) {
+                Ok(()) => None,
+                Err(GuestPermissionEditError::RollbackFailed) => {
+                    panic!("EL1 shared file window permission rollback failed")
+                }
+                Err(_) => return refuse(pending, &mut model, Leave::EditRefused),
             }
         }
         // The permission editor is the descriptor step of an mprotect and

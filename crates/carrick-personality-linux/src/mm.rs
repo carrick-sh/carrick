@@ -138,12 +138,14 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
     }
     /// A private mapping may take any protection (mprotect(2)). A shared
     /// mapping of a description not open for writing may never become
-    /// writable (mprotect(2), EACCES). Other shared mappings conservatively
-    /// cap at their committed `protection`.
+    /// writable (mprotect(2), EACCES). A shared file window maps only a
+    /// description open for writing (#1338), so it may take any protection.
+    /// Other shared mappings conservatively cap at their committed
+    /// `protection`.
     fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection {
         if self.contains(Self::SHARED_READ_ONLY) {
             ReservationProtection::READ_EXECUTE
-        } else if self.contains(Self::PRIVATE) {
+        } else if self.contains(Self::PRIVATE) || self.contains(Self::SHARED_WINDOW) {
             ReservationProtection::READ_WRITE_EXECUTE
         } else {
             protection
@@ -631,6 +633,12 @@ mod flag_tests {
         );
         assert!(ReservationNodeFlags::CARRIED.contains(ReservationNodeFlags::SHARED_WINDOW));
         assert!(!ReservationNodeFlags::ATTRIBUTES.contains(ReservationNodeFlags::SHARED_WINDOW));
+        // A window's description is open for writing: an mprotect to read
+        // only and back to read-write is allowed (mprotect(2)).
+        assert_eq!(
+            window.protection_ceiling(ReservationProtection::READ),
+            ReservationProtection::READ_WRITE_EXECUTE
+        );
         assert!(ReservationNodeFlags::CARRIED.contains(ReservationNodeFlags::SHARED_READ_ONLY));
         assert!(!ReservationNodeFlags::ATTRIBUTES.contains(ReservationNodeFlags::SHARED_READ_ONLY));
         assert_eq!(

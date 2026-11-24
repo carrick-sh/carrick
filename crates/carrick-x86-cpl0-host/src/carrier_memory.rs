@@ -1621,7 +1621,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             let (entry, size) = match terminal {
                 Ok(value) => value,
                 Err(DescriptorRefusal::MissingTable)
-                    if matches!(txn.op, DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)) =>
+                    if matches!(
+                        txn.op,
+                        DescriptorOp::Unmap(_)
+                            | DescriptorOp::Retire(_)
+                            | DescriptorOp::ProtectWindow { .. }
+                    ) =>
                 {
                     (0, PAGE)
                 }
@@ -1695,6 +1700,13 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
                 }
                 DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
+                // A window protect skips holes and edits host-mapped leaves.
+                DescriptorOp::ProtectWindow { permissions, .. } => {
+                    entry == 0
+                        || entry & PRESENT != 0
+                            && entry & PRIVATE == 0
+                            && Self::matches_permissions(entry, permissions)
+                }
                 DescriptorOp::Retire(_) => {
                     entry == 0
                         || entry & (PRESENT | PREPARED | RETIRED) == RETIRED
