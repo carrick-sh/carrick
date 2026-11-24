@@ -948,6 +948,75 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     })
 }
 
+/// What [`settle_unsettled_guest_cow`] did for an MM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestCowSettlement {
+    /// No completion was owed, or no published space names the MM.
+    Nothing,
+    /// The MM's completions were settled under this call's own exclusion.
+    Settled,
+    /// An admitted EL1 editor holds the MM: nothing was settled, and the
+    /// gate this call raised is lowered again. The retained operation waits
+    /// for that editor's release, which it observed before it asked.
+    EditorHeld,
+}
+
+/// Settle `mm`'s guest COW completions now if `pool` holds any: exclude the
+/// MM's EL1 editor, which settles them under the exclusion, and release it.
+/// An answer to carrier work runs this for its requester's MM, so an
+/// operation retained until its MM is settled (a fork arming its parent,
+/// #2947) reruns after a settlement rather than after a bare
+/// acknowledgement. It never waits for an admitted editor: the carrier
+/// would spin in the answer for as long as a sibling held it. The fork
+/// parks on that editor's release instead ([`GuestCowSettlement::EditorHeld`]).
+pub fn settle_unsettled_guest_cow(
+    pool: Option<&carrick_el1_abi::CowGrantPool>,
+    mm: MmId,
+) -> GuestCowSettlement {
+    let Some(zone) = crate::el1_zone::zone() else {
+        return GuestCowSettlement::Nothing;
+    };
+    settle_unsettled_guest_cow_in(
+        SpaceTables {
+            spaces: &zone.spaces,
+            occupancy: &zone.occupancy,
+            zone: Some(zone),
+            backing: None,
+        },
+        pool,
+        mm,
+    )
+}
+
+fn settle_unsettled_guest_cow_in(
+    tables: SpaceTables,
+    pool: Option<&carrick_el1_abi::CowGrantPool>,
+    mm: MmId,
+) -> GuestCowSettlement {
+    if !pool.is_some_and(|pool| pool.has_completions_for(mm.raw())) {
+        return GuestCowSettlement::Nothing;
+    }
+    let key = mm.raw();
+    let Some(index) = tables.spaces.find(key) else {
+        return GuestCowSettlement::Nothing;
+    };
+    tables.spaces.raise(index);
+    let Some(excluded) = tables.spaces.excluded_without_editor(index) else {
+        carrick_thread::fork_quiesce::FenceMirror::lower(&SpaceGate { tables, index });
+        return GuestCowSettlement::EditorHeld;
+    };
+    settle_excluded(&tables, &excluded);
+    let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
+    drop(El1EditorExclusion {
+        excluded,
+        tables,
+        index,
+        key,
+        held,
+    });
+    GuestCowSettlement::Settled
+}
+
 /// Run `f` under a proof that no EL1 editor of `mm` runs: `held` (the
 /// caller's own exclusion), else the proof that no published space names
 /// `mm`, else a fresh exclusion held for `f`'s duration. `None`: no proof
