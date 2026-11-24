@@ -2100,7 +2100,7 @@ mod carrier_vm_custody_tests {
     /// retirement authority: never dropped while that carrier's stage 2 may
     /// still translate to it (#2968 confirming review, P0).
     #[test]
-    fn a_refused_foreign_lease_whose_unmap_fails_keeps_its_mapping_and_backing() {
+    fn serial_host_a_refused_foreign_lease_whose_unmap_fails_keeps_its_mapping_and_backing() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let receiver = crate::trap::test_carrier_custody();
         let mapper = std::sync::Arc::new(RecordingStage2::default());
@@ -2169,7 +2169,7 @@ mod carrier_vm_custody_tests {
     /// The mapping carrier's VM destroy takes its stage 2 with it, so an
     /// unretired lease settles there without another unmap.
     #[test]
-    fn a_mapper_vm_destroy_settles_its_unretired_leases_without_an_unmap() {
+    fn serial_host_a_mapper_vm_destroy_settles_its_unretired_leases_without_an_unmap() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let receiver = crate::trap::test_carrier_custody();
         let mapper = std::sync::Arc::new(RecordingStage2::default());
