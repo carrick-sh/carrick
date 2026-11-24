@@ -1629,10 +1629,13 @@ pub(crate) fn create_vm_with_custody_using<T>(
 pub(crate) fn destroy_vm_with_custody_using(
     custody: &CarrierVmCustody,
     context: &str,
-    destroy: impl FnOnce() -> carrick_aarch64::stage2::Stage2Status,
+    raw_destroy: carrick_aarch64::stage2::Stage2Status,
     record_released: impl FnOnce(),
 ) -> Result<(), TrapError> {
-    super::stage2_backend::script_next_stage2_destroy(destroy());
+    // The scripted status is consumed only if the production sequence
+    // reaches the backend's raw destroy (`raw_stage2_destroy_count` counts
+    // that); a refused transition leaves it unconsumed and clears it here.
+    super::stage2_backend::script_next_stage2_destroy(raw_destroy);
     let result = destroy_vm_with_custody(custody, context);
     super::stage2_backend::script_next_stage2_destroy_clear();
     result.map(|()| record_released())
@@ -2907,7 +2910,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "deferred G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy deferred G1");
@@ -3053,7 +3056,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy G1");
@@ -3242,7 +3245,7 @@ mod carrier_vm_custody_tests {
             destroy_vm_with_custody_using(
                 &custody,
                 "failed G1 destroy",
-                || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4002),
+                carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4002),
                 || {},
             )
             .is_err()
@@ -3257,7 +3260,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "successful G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("persistent pre-destroy unmap failure must not block raw destroy");
@@ -3365,7 +3368,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "carrier-exit test",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("raw carrier-exit destroy succeeds");
@@ -3418,7 +3421,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "carrier-exit test",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("raw carrier-exit destroy succeeds");
@@ -3599,7 +3602,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "carrier G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy G1");
@@ -3645,7 +3648,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy G1");
@@ -3878,7 +3881,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy G1");
@@ -4317,7 +4320,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "structural G1 destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy structural G1");
@@ -4492,7 +4495,7 @@ mod carrier_vm_custody_tests {
         let result = destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
+            carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
             || released.store(true, std::sync::atomic::Ordering::SeqCst),
         );
 
@@ -4519,7 +4522,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || released_after_terminal.set(custody.live_generation().is_none()),
         )
         .expect("destroy transaction succeeds");
@@ -4900,7 +4903,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy VM with live committed child");
@@ -4942,7 +4945,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy exact generation");
@@ -4974,7 +4977,7 @@ mod carrier_vm_custody_tests {
             destroy_vm_with_custody_using(
                 &custody,
                 "test destroy",
-                || carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
+                carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001),
                 || {},
             )
             .is_err()
@@ -5001,7 +5004,7 @@ mod carrier_vm_custody_tests {
         destroy_vm_with_custody_using(
             &custody,
             "test destroy",
-            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
             || {},
         )
         .expect("destroy predecessor VM");

@@ -2246,23 +2246,23 @@ mod intake_tests {
     fn root_grant_destroy_proof_failure_retains_custody_and_blocks_reuse() {
         use std::sync::atomic::Ordering;
         let fixture = RootReplyFixture::new();
-        let destroys = core::cell::Cell::new(0);
+        let raw_destroys = crate::trap::raw_stage2_destroy_count;
+        let destroys_before = raw_destroys();
         let releases = core::cell::Cell::new(0);
         // The test grant has no destroyed-VM proof. The production destroy
         // entry must retain it after successful raw destruction, not publish
-        // release or permit a second raw destroy against a successor.
+        // release or permit a second raw destroy against a successor: the
+        // second attempt finds the generation `Gone` and never reaches the
+        // backend's raw destroy.
         for _ in 0..2 {
             let result = crate::trap::destroy_vm_with_custody_using(
                 &fixture.custody,
                 "root grant proof failure",
-                || {
-                    destroys.set(destroys.get() + 1);
-                    carrick_aarch64::stage2::Stage2Status::SUCCESS
-                },
+                carrick_aarch64::stage2::Stage2Status::SUCCESS,
                 || releases.set(releases.get() + 1),
             );
             assert!(result.is_err());
-            assert_eq!(destroys.get(), 1);
+            assert_eq!(raw_destroys() - destroys_before, 1);
             assert_eq!(releases.get(), 0);
             assert_eq!(fixture.drops.load(Ordering::Acquire), 0);
             assert_eq!(fixture.custody.native_root_replies.lock().entries.len(), 1);
