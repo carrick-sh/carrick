@@ -1391,10 +1391,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         acknowledge: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<(), TrapError> {
         let zone = self.exec_zone()?;
+        let sink = self.carrier_zone_wake()?;
         let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
             carrick_sched_core::ParkedContextWords,
-        >| self.complete_object_wake(cpu, owned);
+        >| self.complete_object_wake(cpu, &*sink, owned);
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native exec acknowledgment queue"))?;
@@ -1410,7 +1411,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if effects.queued_own || effects.owes_host_boundary() {
             self.task(cpu).linux.mark_pending_host_work();
         }
-        let sink = self.carrier_zone_wake()?;
         for target in effects.sgi_slots() {
             sink.resched(target);
         }
