@@ -936,6 +936,46 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
 /// lock on (#2949 review P0-4): Linux closes it, and a second process's
 /// lock then succeeds. An x86 fork child's record locks are the ring's, so
 /// the range owes no host close effect and must match Linux exactly.
+/// #2820: live fork children `dup2` a pipe over stdout, run beside each
+/// other on the carrier's two CPUs, then close it. Linux keeps the closed
+/// number closed: the child's close answers 0 and the root reads every byte
+/// to EOF. The carrier refused the close's release (rc 125) when a CPU
+/// re-admitted a second stdout description into a child's table.
+#[test]
+fn mounted_static_x86_fork_children_close_a_pipe_over_stdout() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("stdio-pipe-close");
+    compile_assembly_with_flags(
+        "x86_stdio_pipe_close.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native stdio pipe close oracle");
+    assert_eq!(native.stdout, b"n=120 c=0,0,0\n", "native oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, "stdio-pipe-close", false);
+    assert_eq!(
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "n is the bytes the root read, c each child's exit status (0: its \
+         close(1) answered 0). Status: {:?}; stderr: {}",
+        guest.status,
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), native.status.code());
+}
+
 #[test]
 fn mounted_static_x86_close_range_matches_native() {
     if skip_without_kvm() {
