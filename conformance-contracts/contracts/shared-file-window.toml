@@ -16,6 +16,7 @@ guest_surfaces = [
   "syscall:truncate",
   "syscall:fallocate",
   "syscall:fork",
+  "syscall:futex",
 ]
 semantic_authority = [
   "man 2 mmap: MAP_SHARED updates are visible to other processes mapping the same region and are carried through to the underlying file; access past the end of the file is SIGBUS",
@@ -54,6 +55,7 @@ vm_free = [
 ]
 embed = [
   "carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native (red on main: every writable MAP_SHARED mmap is ENOSYS)",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_futex_is_fenced_never_hangs (A1 fence, v3 C5: a non-private futex WAIT and WAKE on a window are a counted ENOSYS, never a hang)",
 ]
 
 [bindings.unresolved]
