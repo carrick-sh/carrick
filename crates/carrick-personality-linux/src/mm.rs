@@ -7,7 +7,110 @@ pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000;
 pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000;
 pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
-pub const LINUX_MMAP_SIZE_MAX: u64 = 0x88_0000_0000 - LINUX_MMAP_BASE;
+pub const LINUX_MMAP_SIZE_MAX: u64 = LINUX_PIE_DEFAULT_BASE - LINUX_MMAP_BASE;
+
+/// Default load base for ET_DYN (PIE) main executables. Linux places an
+/// ET_DYN image high (`ELF_ET_DYN_BASE = 2/3 * TASK_SIZE`), leaving the low
+/// gigabytes FREE for the program's own fixed mappings. The old 4 GiB base
+/// violated that: a glibc binary that `MAP_FIXED`s at 0x1_0000_0000 (the
+/// `aliassize` probe pins this) clobbered its own image and SIGSEGV'd where
+/// Linux succeeds. The Linux-proportional 2/3 point of the 1 TiB guest task
+/// size (~683 GiB) is unavailable — it falls inside the HVPatch global-frame
+/// IPA arena (620..1016 GiB) — so the base sits in the free identity window
+/// below the interpreter image (`LINUX_INTERPRETER_BASE`, 560 GiB) and the
+/// shared aperture (`LINUX_SHARED_FILE_BASE`, 576 GiB), 2 MiB-aligned for
+/// stage-1 block mappings. The exact value is guest-observable only through
+/// /proc/*/maps; the freed low region is what conformance measures.
+pub const LINUX_PIE_DEFAULT_BASE: u64 = 0x88_0000_0000;
+
+// Stable shared aperture for guest MAP_SHARED mmaps. The whole window is
+// hv_vm_map'd ONCE at boot (host MAP_ANON|MAP_SHARED|MAP_NORESERVE; see
+// `linux_runtime_regions`), then guest MAP_SHARED|MAP_ANON and MAP_SHARED file
+// mmaps sub-allocate sub-ranges via `shared_aperture::SharedAperture` — no
+// post-vCPU hv_vm_map. Kept disjoint from the private anonymous mmap arena.
+pub const LINUX_SHARED_FILE_BASE: u64 = 0x90_0000_0000; // 576 GiB
+pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
+pub const LINUX_STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default RLIMIT_STACK)
+
+// ── Rosetta 2 high-VA alias ──────────────────────────────────────────────────
+// Apple's Rosetta Linux interpreter is a non-relocatable ET_EXEC fixed-linked at
+// 2^47. M-series HVF caps the guest IPA at 40 bits, so we cannot hv_vm_map at
+// that address. Instead — exactly as Apple's Virtualization.framework does via
+// the guest kernel's own page tables — we alias the Rosetta VA window down to a
+// low IPA: the guest's stage-1 tables translate VA 2^47.. to this low IPA, which
+// is what actually gets hv_vm_map'd (well within 40 bits). This is the ONLY
+// region whose VA differs from its IPA; everything else stays identity-mapped.
+pub const LINUX_ROSETTA_VA_BASE: u64 = 0x8000_0000_0000; // 2^47, Rosetta's link base
+pub const LINUX_ROSETTA_WINDOW_SIZE: u64 = 0x20_0000; // 2 MiB (one L2 block; Rosetta ~1.7 MiB)
+
+/// Guest VAs at or above this are aliased to a low IPA rather than mapped
+/// identity. Above every identity region (stack top is just under 1 TiB).
+pub const LINUX_HIGH_VA_THRESHOLD: u64 = 0x100_0000_0000; // 1 TiB (2^40)
+
+/// Whether `[start, end)` lies in one of the layout's alias windows:
+/// outside the anonymous arena `[arena_start, arena_end)`, below the ISA's
+/// `user_end`, and either at or above [`LINUX_HIGH_VA_THRESHOLD`] or between
+/// the shared aperture and the stack.
+pub fn uses_alias_window(
+    start: u64,
+    end: u64,
+    arena_start: u64,
+    arena_end: u64,
+    user_end: u64,
+) -> bool {
+    if end > user_end || (arena_start <= start && end <= arena_end) {
+        return false;
+    }
+    if start >= LINUX_HIGH_VA_THRESHOLD {
+        return true;
+    }
+    let alias_low_base = LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE;
+    let stack_base = LINUX_STACK_TOP - LINUX_STACK_SIZE;
+    alias_low_base <= start && end <= stack_base
+}
+
+/// Whether a private anonymous hint outside the allocation layout lies in
+/// an aperture no carrier mapping occupies, for `venue`. Both venues refuse
+/// the arena and everything below its end, the Rosetta window, and anything
+/// past the ISA's user VA end.
+///
+/// - **Ring** (a ring-only MM editing its own stage-1 tables): only at or
+///   above [`LINUX_HIGH_VA_THRESHOLD`]. Below 1 TiB live every carrier
+///   window (the EL1 region, vDSO, clock stub, GIC, the private overlay,
+///   the AArch64 stage-1 table pool) and, on AArch64 HVPatch, invalidated
+///   block descriptors the stage-1 editor refuses; and on x86 CPL0 an
+///   `ET_EXEC` image's arena sits low, under those windows. Nothing but
+///   Rosetta is mapped above 1 TiB on either ISA (`carrick-mem`'s asserts).
+/// - **Host**: also the low alias window and the gap between the arena and
+///   the PIE image base; the host venue checks its own VMA rows and carrier
+///   windows (`carrick-kernel`) before it offers one.
+fn external_anonymous_aperture(
+    layout: Layout,
+    range: ReservationRange,
+    user_end: u64,
+    venue: AnonymousHintVenue,
+) -> bool {
+    let arena = layout.arena;
+    let rosetta_end = LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE;
+    let outside = range.end() <= user_end
+        && range.start() >= arena.end()
+        && !(range.start() < rosetta_end && LINUX_ROSETTA_VA_BASE < range.end());
+    outside
+        && match venue {
+            AnonymousHintVenue::Ring => range.start() >= LINUX_HIGH_VA_THRESHOLD,
+            AnonymousHintVenue::Host => {
+                uses_alias_window(
+                    range.start(),
+                    range.end(),
+                    arena.start(),
+                    arena.end(),
+                    user_end,
+                ) || range.end() <= LINUX_PIE_DEFAULT_BASE
+            }
+        }
+}
 
 /// Linux edit authority and rlimit charging for the neutral flag record.
 pub trait NodeFlagsPolicy {
@@ -132,6 +235,14 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
     fn validates_layout(layout: Layout) -> bool {
         let brk = LinuxReservationState::from(layout.policy).brk;
         layout.heap.contains(brk) || brk == layout.heap.end()
+    }
+    fn external_anonymous_aperture(
+        layout: Layout,
+        range: ReservationRange,
+        user_end: u64,
+        venue: AnonymousHintVenue,
+    ) -> bool {
+        external_anonymous_aperture(layout, range, user_end, venue)
     }
     fn active_value(policy: ReservationPolicyPayload) -> u64 {
         LinuxReservationState::from(policy).brk
@@ -327,6 +438,127 @@ impl MmErrorLinux for MmError {
 
 pub const fn cancelled_copy_errno() -> u32 {
     125
+}
+
+#[cfg(test)]
+mod aperture_tests {
+    use super::*;
+    use carrick_guest_arch::{AARCH64_USER_VA_END, X86_64_USER_VA_END};
+
+    fn r(start: u64, end: u64) -> ReservationRange {
+        ReservationRange::new(start, end).expect("aligned fixture range")
+    }
+    fn layout() -> Layout {
+        LinuxReservationLayout {
+            heap: r(LINUX_HEAP_BASE, LINUX_HEAP_BASE + LINUX_HEAP_SIZE),
+            arena: r(LINUX_MMAP_BASE, LINUX_MMAP_BASE + LINUX_MMAP_SIZE),
+            brk: LINUX_HEAP_BASE,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        }
+        .into()
+    }
+    fn free_for(venue: AnonymousHintVenue, start: u64, len: u64, end: u64) -> bool {
+        external_anonymous_aperture(layout(), r(start, start + len), end, venue)
+    }
+    fn ring(start: u64, len: u64, end: u64) -> bool {
+        free_for(AnonymousHintVenue::Ring, start, len, end)
+    }
+    fn host(start: u64, len: u64, end: u64) -> bool {
+        free_for(AnonymousHintVenue::Host, start, len, end)
+    }
+
+    /// V8's cage hint (#2706) is free to both venues on both ISAs. Below
+    /// 1 TiB only the host venue, which checks its own VMA rows and carrier
+    /// windows, is offered Go's arena hint and the gap above the arena
+    /// (#2950 review: HVPatch's invalidated blocks and the carrier windows
+    /// live there). The arena, the image, the shared aperture, the stack,
+    /// Rosetta and anything past the ISA's user VA end are free to neither.
+    #[test]
+    fn external_anonymous_apertures_follow_the_venue_layout_and_isa_end() {
+        let arena_end = LINUX_MMAP_BASE + LINUX_MMAP_SIZE;
+        for end in [AARCH64_USER_VA_END, X86_64_USER_VA_END] {
+            for free in [ring, host] {
+                assert!(free(0x2517_7424_0000, 0x7f000, end), "V8 cage hint");
+                assert!(free(LINUX_HIGH_VA_THRESHOLD, 0x1000, end), "1 TiB");
+                assert!(!free(LINUX_MMAP_BASE, 0x1000, end), "inside the arena");
+                assert!(!free(0x1000_0000, 0x1000, end), "below the arena");
+                assert!(!free(LINUX_PIE_DEFAULT_BASE, 0x1000, end), "PIE image");
+                assert!(!free(LINUX_SHARED_FILE_BASE, 0x1000, end), "shared");
+                assert!(!free(LINUX_STACK_TOP - 0x1000, 0x1000, end), "stack");
+                assert!(
+                    !free(LINUX_PIE_DEFAULT_BASE - 0x1000, 0x2000, end),
+                    "straddles PIE"
+                );
+            }
+            assert!(host(0xc0_0000_0000, 0x400_0000, end), "Go arena hint");
+            assert!(host(arena_end, 0x1000, end), "gap above the arena");
+            assert!(!ring(0xc0_0000_0000, 0x400_0000, end), "Go arena hint");
+            assert!(!ring(arena_end, 0x1000, end), "gap above the arena");
+            assert!(!ring(0x9a_0000_0000, 0x1000, end), "stage-1 table pool");
+            assert!(!ring(0x98_0000_0000, 0x1000, end), "private overlay");
+            assert!(
+                !ring(LINUX_HIGH_VA_THRESHOLD - 0x1000, 0x2000, end),
+                "straddles 1 TiB"
+            );
+        }
+        for free in [ring, host] {
+            // The x86 end is the last lower-half page; AArch64 reaches 2^48.
+            assert!(!free(X86_64_USER_VA_END, 0x1000, X86_64_USER_VA_END));
+            assert!(free(
+                X86_64_USER_VA_END - 0x1000,
+                0x1000,
+                X86_64_USER_VA_END
+            ));
+            assert!(!free(1 << 47, 0x1000, X86_64_USER_VA_END));
+            assert!(free(
+                (1 << 47) + LINUX_ROSETTA_WINDOW_SIZE,
+                0x1000,
+                AARCH64_USER_VA_END
+            ));
+            assert!(
+                !free(LINUX_ROSETTA_VA_BASE, 0x1000, AARCH64_USER_VA_END),
+                "Rosetta window"
+            );
+            assert!(!free(
+                AARCH64_USER_VA_END - 0x1000,
+                0x2000,
+                AARCH64_USER_VA_END
+            ));
+        }
+    }
+
+    /// An x86 `ET_EXEC` image's arena sits low (`[1 GiB, 33 GiB)`), under
+    /// the EL1 region, vDSO and trampoline windows: the ring venue still
+    /// offers nothing below 1 TiB there.
+    #[test]
+    fn a_low_arena_never_opens_the_carrier_windows_to_the_ring() {
+        let low = LinuxReservationLayout {
+            heap: r(0x40_0000, 0x4000_0000),
+            arena: r(0x4000_0000, 0x8_4000_0000),
+            brk: 0x40_0000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        }
+        .into();
+        for hint in [
+            0x2d_0400_0000,
+            0x2e_0000_0000,
+            0x30_0000_0000,
+            0xc0_0000_0000,
+        ] {
+            assert!(!external_anonymous_aperture(
+                low,
+                r(hint, hint + 0x1000),
+                X86_64_USER_VA_END,
+                AnonymousHintVenue::Ring
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

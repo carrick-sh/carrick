@@ -1993,48 +1993,42 @@ impl MemView<'_> {
             Some((address, stale))
         };
         let reservation_prot = ReservationProtection::from_bits(prot & 7);
-        // Validate the host apertures and VMAs before offering external
-        // placement to the same owner that can relocate an advisory hint.
-        let external = if root_eligible
+        // The root owner mints the free-aperture token (the same validator
+        // the ring uses); the host adds only its own VMA rows, which a
+        // delegated MM mirrors as opaque nodes anyway.
+        let host_clear = root_eligible
             && !fixed
             && congruence == MmapGrantCongruence::Any
-            && let Placement::Hint(hint) = placement
-            && let Some(range) = hint
-                .checked_add(length)
-                .and_then(|end| ReservationRange::new(hint, end))
-            && range.end() <= user_ceiling.exclusive_end()
-            && (mmap_address_uses_alias(hint, length, layout, user_ceiling)
-                || (hint >= layout.mmap_base.saturating_add(layout.mmap_size)
-                    && range.end() <= crate::elf::LINUX_PIE_DEFAULT_BASE))
-            && !guest_vma_overlaps_locked(mem, hint, length)
-            && mem
-                .semantic_vmas
-                .overlapping(hint, range.end())
-                .next()
-                .is_none()
-            && !super::overlaps_el0_clock_stub(hint, length)
-            && !ranges_overlap(
-                hint,
-                length,
-                crate::memory::LINUX_ROSETTA_VA_BASE,
-                crate::memory::LINUX_ROSETTA_VA_BASE
-                    .saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE),
-            ) {
-            Some(range)
-        } else {
-            None
-        };
+            && matches!(placement, Placement::Hint(hint)
+                if !guest_vma_overlaps_locked(mem, hint, length)
+                    && mem
+                        .semantic_vmas
+                        .overlapping(hint, hint.saturating_add(length))
+                        .next()
+                        .is_none()
+                    && !overlaps_host_hidden_carrier_window(hint, length));
         if root_eligible
             && congruence == MmapGrantCongruence::Any
             && let Some(reservation_prot) = reservation_prot
         {
             use carrick_core::mm::reservation::AnonymousHintVenue;
             match self.propose(mem, &root, |model| {
+                let external = host_clear
+                    .then(|| {
+                        model.external_anonymous_hint(
+                            placement,
+                            length,
+                            user_ceiling.exclusive_end(),
+                            AnonymousHintVenue::Host,
+                        )
+                    })
+                    .flatten();
                 model.mmap_with_advisory_hint(
                     placement,
                     length,
                     reservation_prot,
-                    AnonymousHintVenue::Host { external },
+                    AnonymousHintVenue::Host,
+                    external,
                 )
             })? {
                 Ok(request) => {
@@ -3115,4 +3109,24 @@ mod tests {
         );
         assert_eq!(union_of(vec![(4, 4), (0, 2)]), [(0, 2)]);
     }
+}
+
+/// Carrier windows inside the host venue's low alias apertures that no VMA
+/// row names (the semantic and guest VMA checks filter them as hidden
+/// backing): the private overlay, EL1's AArch64 stage-1 table pool, and
+/// the EL0 clock stub. A hint on one relocates instead (#2950 review).
+fn overlaps_host_hidden_carrier_window(hint: u64, length: u64) -> bool {
+    [
+        (
+            crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+            crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+        ),
+        (
+            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE,
+        ),
+    ]
+    .into_iter()
+    .any(|(base, size)| ranges_overlap(hint, length, base, base.saturating_add(size)))
+        || super::overlaps_el0_clock_stub(hint, length)
 }

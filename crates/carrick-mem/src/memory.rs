@@ -610,7 +610,9 @@ const AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET: usize = 0x000;
 const AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET: usize = 0x200;
 
 pub use carrick_personality_linux::mm::{
-    LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX,
+    LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
+    LINUX_MMAP_SIZE_MAX, LINUX_ROSETTA_VA_BASE, LINUX_ROSETTA_WINDOW_SIZE, LINUX_SHARED_FILE_BASE,
+    LINUX_SHARED_FILE_SIZE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 // 32 GiB runtime mmap arena. The region is lazily backed (HVF demand-zeroes
 // touched pages; PROT_NONE reservations are never touched and cost nothing), so
@@ -685,13 +687,6 @@ impl MemoryLayout {
         }
     }
 }
-// Stable shared aperture for guest MAP_SHARED mmaps. The whole window is
-// hv_vm_map'd ONCE at boot (host MAP_ANON|MAP_SHARED|MAP_NORESERVE; see
-// `linux_runtime_regions`), then guest MAP_SHARED|MAP_ANON and MAP_SHARED file
-// mmaps sub-allocate sub-ranges via `shared_aperture::SharedAperture` — no
-// post-vCPU hv_vm_map. Kept disjoint from the private anonymous mmap arena.
-pub const LINUX_SHARED_FILE_BASE: u64 = 0x90_0000_0000; // 576 GiB
-pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 // Private overlay aperture: mirrors the shared aperture but its host backing is
 // NOT MAP_SHARED, so fork(2) takes a per-process private snapshot of it (like
@@ -759,7 +754,6 @@ pub fn va_in_shared_aperture(va: u64, len: u64) -> bool {
 pub fn needs_stage1_translation(va: u64, len: u64) -> bool {
     va_in_shared_aperture(va, len)
 }
-pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 
 // Linux's default main-thread stack soft RLIMIT_STACK is 8 MiB; the kernel grows
 // the initial stack mapping down to that limit ON DEMAND. Runtimes that size
@@ -773,7 +767,6 @@ pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 // carrick crashed where Linux raises RecursionError. Match Linux: 8 MiB stack,
 // reported as 8 MiB via getrlimit(RLIMIT_STACK).
 pub const LINUX_RLIMIT_STACK_SOFT: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default, REPORTED)
-pub const LINUX_STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default RLIMIT_STACK)
 
 // ── Rosetta 2 high-VA alias ──────────────────────────────────────────────────
 // Apple's Rosetta Linux interpreter is a non-relocatable ET_EXEC fixed-linked at
@@ -783,9 +776,7 @@ pub const LINUX_STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default RLIMI
 // low IPA: the guest's stage-1 tables translate VA 2^47.. to this low IPA, which
 // is what actually gets hv_vm_map'd (well within 40 bits). This is the ONLY
 // region whose VA differs from its IPA; everything else stays identity-mapped.
-pub const LINUX_ROSETTA_VA_BASE: u64 = 0x8000_0000_0000; // 2^47, Rosetta's link base
 pub const LINUX_ROSETTA_IPA_BASE: u64 = 0x10_0000_0000; // 64 GiB (free; < 40-bit IPA)
-pub const LINUX_ROSETTA_WINDOW_SIZE: u64 = 0x20_0000; // 2 MiB (one L2 block; Rosetta ~1.7 MiB)
 
 /// True if `va` falls in the Rosetta high-VA alias window.
 pub fn is_rosetta_va(va: u64) -> bool {
@@ -798,9 +789,6 @@ pub fn is_rosetta_va(va: u64) -> bool {
 // set at ~240 TiB, so the dispatcher routes any high-VA MAP_FIXED to a low IPA
 // drawn from this arena, and the runtime maps it + builds a VA→IPA page-table
 // path (the dynamic counterpart of the static Rosetta image alias above).
-/// Guest VAs at or above this are aliased to a low IPA rather than mapped
-/// identity. Above every identity region (stack top is just under 1 TiB).
-pub const LINUX_HIGH_VA_THRESHOLD: u64 = 0x100_0000_0000; // 1 TiB (2^40)
 /// Low-IPA arena the alias mappings are drawn from. Free, 2 MiB-aligned, and
 /// below the 40-bit IPA ceiling and the kernel region (180 GiB).
 pub const LINUX_ALIAS_IPA_BASE: u64 = 0x18_0000_0000; // 96 GiB
@@ -10429,3 +10417,56 @@ mod layout_manifest {
         field!(Aarch64SyscallMailbox, portal_mm_generation, u64, 248, 8, 8);
     }
 }
+
+// The ring venue offers an external anonymous hint only at or above
+// `LINUX_HIGH_VA_THRESHOLD` (`carrick_personality_linux::mm`), on both
+// ISAs: every carrier window, on AArch64 and x86 CPL0 alike, must end at
+// or below it (Rosetta, the one window above, is refused by name).
+const _: () = {
+    const fn below(base: u64, size: u64) -> bool {
+        base + size <= LINUX_HIGH_VA_THRESHOLD
+    }
+    assert!(below(LINUX_EL0_CLOCK_STUB_BASE, LINUX_EL0_CLOCK_STUB_SIZE));
+    assert!(below(
+        crate::vdso::LINUX_VDSO_BASE,
+        crate::vdso::LINUX_VDSO_SIZE
+    ));
+    assert!(below(
+        crate::vdso::LINUX_VVAR_BASE,
+        crate::vdso::LINUX_VVAR_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_REGION_BASE,
+        carrick_el1_abi::EL1_REGION_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_IPC_BASE,
+        carrick_el1_abi::EL1_IPC_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_SERVICE_COPY_BASE,
+        carrick_el1_abi::EL1_SERVICE_COPY_SIZE
+    ));
+    assert!(below(LINUX_KERNEL_REGION_BASE, LINUX_KERNEL_REGION_SIZE));
+    assert!(below(LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE));
+    assert!(below(
+        LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        LINUX_SIGRETURN_TRAMPOLINE_SIZE
+    ));
+    assert!(below(LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE));
+    assert!(below(
+        LINUX_PRIVATE_OVERLAY_BASE,
+        LINUX_PRIVATE_OVERLAY_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE
+    ));
+    assert!(LINUX_HVPATCH_RESERVED_END <= LINUX_HIGH_VA_THRESHOLD);
+    assert!(LINUX_STACK_TOP <= LINUX_HIGH_VA_THRESHOLD);
+    assert!(LINUX_ROSETTA_VA_BASE >= LINUX_HIGH_VA_THRESHOLD);
+};

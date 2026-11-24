@@ -2866,20 +2866,13 @@ pub(super) fn mmap_address_uses_alias(
     let Some(end) = address.checked_add(length) else {
         return false;
     };
-    if end > user_ceiling.exclusive_end() {
-        return false;
-    }
-    if range_within(address, length, layout.mmap_base, layout.mmap_size) {
-        return false;
-    }
-    if crate::memory::is_high_va(address) {
-        return true;
-    }
-
-    let alias_low_base =
-        crate::memory::LINUX_SHARED_FILE_BASE + crate::memory::LINUX_SHARED_FILE_SIZE;
-    let stack_base = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
-    range_within(address, length, alias_low_base, stack_base - alias_low_base)
+    carrick_personality_linux::mm::uses_alias_window(
+        address,
+        end,
+        layout.mmap_base,
+        layout.mmap_base.saturating_add(layout.mmap_size),
+        user_ceiling.exclusive_end(),
+    )
 }
 
 /// HVPatch cannot create a new identity stage-2 mapping at a low arbitrary VA

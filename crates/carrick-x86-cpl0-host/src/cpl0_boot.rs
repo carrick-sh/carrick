@@ -3868,13 +3868,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             ));
         }
         let slot = SlotId::new(cpu.raw() as u8);
+        let sink = custody.carrier_zone_wake()?;
         if zone.claim_for_host(
             zone.record_ref(record),
             None,
             carrick_sched_core::Handback::Resumed,
             &carrick_sched_core::BoundedSpin(0),
-            &|owned| custody.complete_object_wake(cpu, owned),
+            &|owned| custody.complete_object_wake(cpu, &*sink, owned),
         ) != carrick_sched_core::HostClaim::Claimed
+            || sink.take_undelivered().is_some()
         {
             return Err(fail("fixture queue placement refused"));
         }

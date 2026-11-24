@@ -241,34 +241,33 @@ fn complete_carrier_object_wake(
     }
 }
 
+/// [`hand_back_completions_in`] for a carrier-scoped zone (x86 CPL0): the
+/// ring defers a completion it could not place to this zone's chain and
+/// rings only its venue's doorbell, so the host boundary that consumes the
+/// doorbell settles the chain here (#2928). Each record goes back to its
+/// native ring owner ([`hand_back_in_carrier`]). A reschedule the carrier
+/// could not deliver leaves a halted CPU with work it never runs: a broken
+/// invariant.
+pub(crate) fn hand_back_carrier_completions(carrier: CarrierZoneRef<'_>) {
+    carrier
+        .zone()
+        .take_completion_handbacks(&CarrierLockWait(carrier), &mut |record| {
+            hand_back_in_carrier(carrier, record)
+        });
+    if let Some(undelivered) = carrier.take_undelivered() {
+        carrick_fatal::carrick_fatal!("el1_zone::carrier_handback", "{}", undelivered.0);
+    }
+}
+
 /// A record a carrier-zone wake handed to the host (no guest slot could
 /// take it: every eligible CPU was stopped, e.g. the one serving the exit
 /// whose drain woke it). A native thread has no host continuation, so its
 /// readiness completion is retained on its owner's queue, exactly like
 /// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
 fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
-    let zone = carrier.zone();
-    // Refused: the record retired between publication and handback, or
-    // another owner (its exit, a signal) settled it. Nothing is left to
-    // deliver.
-    let Some(handback) = zone.place_host_handback(record) else {
-        return;
-    };
-    let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement else {
-        return;
-    };
-    if placement.resched {
-        carrier.resched(placement.slot);
-    }
-    if !zone.slot(placement.slot).is_live() && handback.homeless {
-        for index in 0..carrick_sched_core::ZONE_SLOTS {
-            let slot = SlotId::new(index as u8);
-            if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
-                zone.owe_resched(slot);
-                carrier.resched(slot);
-            }
-        }
-    }
+    carrier
+        .zone()
+        .hand_back_to_owner(record, &mut |slot| carrier.resched(slot));
 }
 
 /// Sample a native member's host-readiness queue
