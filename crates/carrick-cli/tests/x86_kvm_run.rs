@@ -1102,6 +1102,148 @@ fn mounted_static_x86_shared_file_window_shrink_is_fenced_before_the_host() {
     );
 }
 
+/// #1338 A1: the served surface of a range edit over shared file window
+/// pages. A munmap of a private page and a window page is served while at
+/// most one of them is faulted; with both faulted no one edit step covers
+/// both, so it is a counted ENOSYS (-38) that leaves both pages mapped, and
+/// each page then unmaps alone. PROT_NONE over a faulted window page is a
+/// counted ENOSYS, as over a faulted private page on x86 (no present
+/// inaccessible user leaf); over an unfaulted one it is served, and the
+/// restored page reads the file. Native Linux serves every row; the two
+/// refusals are the known gaps of this surface, pinned so a change to
+/// either is seen.
+#[test]
+fn mounted_static_x86_shared_file_window_mixed_range_edits_are_served_or_counted() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-mixed");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_mixed.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-mixed oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(
+        native_stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "mixed_both_faulted_munmap=0000000000000000",
+            "mixed_window_faulted_munmap=0000000000000000",
+            "mixed_private_faulted_munmap=0000000000000000",
+            "protnone_faulted=0000000000000000",
+            "protnone_unfaulted=0000000000000000",
+            "protnone_unfaulted_restore=0000000000000000",
+            "protnone_unfaulted_reads=0000000000000043",
+        ],
+        "native oracle"
+    );
+    let guest = run_mounted_binary(&elf, "window-mixed", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        (guest.status.code(), stdout.lines().collect::<Vec<_>>()),
+        (
+            Some(7),
+            vec![
+                "mixed_both_faulted_munmap=ffffffffffffffda",
+                "mixed_both_faulted_kept=0000000000000001",
+                "mixed_both_faulted_split=0000000000000000",
+                "mixed_window_faulted_munmap=0000000000000000",
+                "mixed_private_faulted_munmap=0000000000000000",
+                "protnone_faulted=ffffffffffffffda",
+                "protnone_unfaulted=0000000000000000",
+                "protnone_unfaulted_restore=0000000000000000",
+                "protnone_unfaulted_reads=0000000000000043",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// #1338 A1 / #2977: the shrink fence keys on the host inode a path routes
+/// to, so a shrink by name through a bind mount is fenced as well. A forked
+/// child truncates a windowed file by name, with truncate(2) and an O_TRUNC
+/// open, where the name is a bind mount of the host directory. Both are a
+/// counted ENOSYS (-38) before the mount's host call applies them, and the
+/// child still reads its byte on the second page (native Linux kills it
+/// with SIGBUS). Red before: the fence asked the rootfs for the name's
+/// inode, found none, and admitted the bind mount's host shrink under the
+/// live window leaf.
+#[test]
+fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-bind-shrink");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_bind_shrink.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir(work.path().join("data")).unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-bind-shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("child_status=0000000000000007"),
+        "native oracle: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+    let data = tempfile::tempdir().unwrap();
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "window-bind-shrink",
+        false,
+        &empty_image_archive(),
+        None,
+        Duration::from_secs(5),
+        &[format!("{}:/data", data.path().display())],
+    );
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec![
+                "child_otrunc=ffffffffffffffda",
+                "child_status=0000000000000000",
+                "child_touch=0000000000000042",
+                "child_truncate=ffffffffffffffda",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(data.path().join("win")).unwrap().len(),
+        8192,
+        "the host file keeps its size"
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
@@ -1426,6 +1568,7 @@ fn mounted_static_x86_munmap_split_keeps_residency_when_the_table_is_full() {
         &empty_image_archive(),
         None,
         Duration::from_secs(90),
+        &[],
     );
     assert_eq!(
         (guest.status.code(), guest.stdout.as_slice()),
@@ -2877,6 +3020,7 @@ fn run_mounted_binary_in_archive_with_census(
         image_archive,
         census_dir,
         Duration::from_secs(5),
+        &[],
     )
 }
 
@@ -2937,6 +3081,7 @@ fn run_mounted_binary_within(
     image_archive: &[u8],
     census_dir: Option<&std::path::Path>,
     deadline: Duration,
+    volumes: &[String],
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
@@ -2974,8 +3119,11 @@ fn run_mounted_binary_within(
         "never",
         "--volume",
         &format!("{}:/hello:ro", elf.display()),
-        "x86-kvm-hello:latest",
     ]);
+    for volume in volumes {
+        command.args(["--volume", volume]);
+    }
+    command.arg("x86-kvm-hello:latest");
     command
         .process_group(0)
         .stdout(Stdio::piped())
