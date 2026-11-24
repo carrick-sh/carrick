@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use super::{AdmissionError, HostDescriptionFlags, HostDescriptionState, HostIpc};
-use crate::el1_zone::HostLockWait;
 use carrick_el1_abi::ipc::{IPC_MAX_OFDS, fd};
 
 enum PhysicalRelease {
@@ -82,7 +81,7 @@ impl HostSlotReservation {
             match self
                 .owner
                 .region()
-                .fd(HostLockWait)
+                .fd(self.owner.wait())
                 .commit_reservation(claim, pin, cloexec)
             {
                 Ok(retired) => retired,
@@ -134,13 +133,13 @@ impl HostTable {
     fn reserve(
         &mut self,
         operation: impl Fn(
-            &carrick_el1_abi::ipc::IpcFdAuthority<'_, HostLockWait>,
+            &carrick_el1_abi::ipc::IpcFdAuthority<'_, super::RegionWait<'_>>,
             fd::TableId,
         ) -> Result<fd::reservation::SlotReservation, fd::Error>,
     ) -> Result<HostSlotReservation, AdmissionError> {
         loop {
             let region = self.owner.region();
-            match operation(&region.fd(HostLockWait), self.id) {
+            match operation(&region.fd(self.owner.wait()), self.id) {
                 Ok(claim) => {
                     return Ok(HostSlotReservation {
                         owner: Arc::clone(&self.owner),
@@ -183,7 +182,7 @@ impl HostTable {
         let id = self
             .owner
             .region()
-            .fork_descriptors(self.id, &HostLockWait, |_| Ok(()))?;
+            .fork_descriptors(self.id, &self.owner.wait(), |_| Ok(()))?;
         Ok(Self {
             owner: Arc::clone(&self.owner),
             id,
@@ -206,7 +205,7 @@ impl HostTable {
             };
             self.owner
                 .region()
-                .fd(HostLockWait)
+                .fd(self.owner.wait())
                 .replace_pin(self.id, target, pin, cloexec)?
         };
         if let Some(retired) = retired {
@@ -219,7 +218,7 @@ impl HostTable {
         if let Some(retired) = self
             .owner
             .region()
-            .fd(HostLockWait)
+            .fd(self.owner.wait())
             .close(self.id, target)?
         {
             Self::release(&self.owner, PhysicalRelease::Description(retired));
@@ -233,7 +232,7 @@ impl HostTable {
         let mut retired = Vec::with_capacity(self.capacity.min(IPC_MAX_OFDS));
         self.owner
             .region()
-            .fd(HostLockWait)
+            .fd(self.owner.wait())
             .exec(self.id, |d| retired.push(d))?;
         for description in retired {
             Self::release(&self.owner, PhysicalRelease::Description(description));
@@ -252,16 +251,19 @@ impl HostTable {
                 .map_err(AdmissionError::from),
             PhysicalRelease::RetiredTables => owner.drain_retired_tables().map(|_| ()),
             PhysicalRelease::Reservation(claim) => {
-                match owner.region().fd(HostLockWait).cancel_reservation(claim) {
+                match owner.region().fd(owner.wait()).cancel_reservation(claim) {
                     Ok(()) => Ok(()),
                     Err(refused) if refused.error() == fd::Error::StaleTable => Ok(()),
                     Err(refused) => Err(refused.error().into()),
                 }
             }
         };
-        result.unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("ipc::table", "invalid retired descriptor resource")
-        });
+        // A lock a stopped vCPU still holds quarantines this release (#2955).
+        result
+            .or_else(|error| owner.quarantine_cut_off(error))
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::table", "invalid retired descriptor resource")
+            });
     }
 }
 
@@ -270,10 +272,12 @@ impl Drop for HostTable {
         let mut retired = Vec::with_capacity(self.capacity.min(IPC_MAX_OFDS));
         self.owner
             .region()
-            .fd(HostLockWait)
+            .fd(self.owner.wait())
             .destroy_table(self.id, |d| retired.push(d))
             .map_err(AdmissionError::from)
             .and_then(|extent| self.owner.reclaim_descriptors(extent))
+            // Carrier exit after a cut-off ring section: quarantine (#2955).
+            .or_else(|error| self.owner.quarantine_cut_off(error))
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
             });
@@ -286,6 +290,7 @@ impl Drop for HostTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::el1_zone::HostLockWait;
     use carrick_el1_abi::ipc::{IpcBacking, pipe::EventMode};
 
     /// #2955: a ring section cut off when its vCPU stopped keeps its table
