@@ -21,7 +21,8 @@
 // thread's two return values, its own F_GETFD of b, and the root's F_GETFD
 // of b and b+1 after the thread is done. Last, a fork child's leader
 // raw-exits beside its one worker, whose CLOSE_RANGE_UNSHARE of b is then a
-// plain range (one `l` line). The root exits 7. No libc: raw
+// plain range (one `l` line), and a fork child closes a host file that owes
+// host close effects (one `e` line). The root exits 7. No libc: raw
 // syscalls only; the thread is a raw `clone` on a mapped stack.
 static long sc(long n, long a, long b, long c, long d, long e, long f) {
     register long r10 __asm__("r10") = d;
@@ -198,6 +199,54 @@ static void leader_exit(void) {
     if (sc(61, pid, (long)&status, 0, 0, 0, 0) != pid || status != 0) sc(231, 85, 0, 0, 0, 0, 0);
 }
 
+// A fork child's plain close_range over a host file that owes host close
+// effects (#2949 review P0-4): the child holds a record lock on it. One `e`
+// line: the lock's F_SETLK, the range's return value, F_GETFD of the file
+// after it, and a second process's F_SETLK of the same file (0 once the
+// close released the child's lock). Linux: `e lock=0 range=0 fd=-9 peer=0`.
+static void effects(void) {
+    long pid = sc(57, 0, 0, 0, 0, 0, 0); // fork
+    if (pid == 0) {
+        long made = sc(83, (long)"cr_work", 0755, 0, 0, 0, 0); // mkdir
+        if (made != 0 && made != -17) sc(231, 84, 0, 0, 0, 0, 0);
+        long fd = sc(257, -100, (long)"cr_work/f", 02 | 0100, 0644, 0, 0); // O_RDWR | O_CREAT
+        if (fd < 0) sc(231, 82, 0, 0, 0, 0, 0);
+        long lock[4] = {1, 0, 0, 0}; // struct flock: F_WRLCK, SEEK_SET, 0, 0 (the whole file)
+        long locked = sc(72, fd, 6, (long)lock, 0, 0, 0); // F_SETLK
+        long range = sc(436, fd, fd, 0, 0, 0, 0);
+        long after = sc(72, fd, 1, 0, 0, 0, 0);
+        long peer = sc(57, 0, 0, 0, 0, 0, 0); // fork
+        if (peer == 0) {
+            long other = sc(257, -100, (long)"cr_work/f", 02, 0, 0, 0);
+            long probe[4] = {1, 0, 0, 0};
+            long ret = other < 0 ? other : sc(72, other, 6, (long)probe, 0, 0, 0);
+            sc(231, -ret, 0, 0, 0, 0, 0);
+        }
+        int status = -1;
+        if (peer < 0 || sc(61, peer, (long)&status, 0, 0, 0, 0) != peer) sc(231, 81, 0, 0, 0, 0, 0);
+        char line[128];
+        char *at = line;
+        const char *what = "e lock=";
+        while (*what) *at++ = *what++;
+        put_num(&at, locked);
+        what = " range=";
+        while (*what) *at++ = *what++;
+        put_num(&at, range);
+        what = " fd=";
+        while (*what) *at++ = *what++;
+        put_num(&at, after);
+        what = " peer=";
+        while (*what) *at++ = *what++;
+        put_num(&at, -(long)((status >> 8) & 0xff));
+        *at++ = '\n';
+        sc(1, 1, (long)line, at - line, 0, 0, 0);
+        sc(231, 0, 0, 0, 0, 0, 0);
+    }
+    if (pid < 0) sc(231, 80, 0, 0, 0, 0, 0);
+    int status = -1;
+    if (sc(61, pid, (long)&status, 0, 0, 0, 0) != pid || status != 0) sc(231, 79, 0, 0, 0, 0, 0);
+}
+
 void start_c(long *sp) {
     (void)sp;
     long pid = sc(57, 0, 0, 0, 0, 0, 0); // fork
@@ -211,6 +260,7 @@ void start_c(long *sp) {
     sequence('r');
     threads();
     leader_exit();
+    effects();
     sc(231, 7, 0, 0, 0, 0, 0);
 }
 __asm__(".globl _start\n_start:\n mov %rsp,%rdi\n and $-16,%rsp\n call start_c\n hlt\n");
