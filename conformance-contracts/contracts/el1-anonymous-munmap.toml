@@ -26,6 +26,7 @@ vm_free = [
   "carrick-mmu-core::aarch64::tests::{allocation_free_guest_retirement_retires_complete_l2_and_l3_terminals,allocation_free_guest_retirement_refuses_partial_or_untagged_ranges}",
   "carrick-el1::memory::tests::{resident_anonymous_munmap_retires_under_exact_mm_guard,malformed_or_ineligible_munmap_preserves_linux_fallback}",
   "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
+  "carrick-el1::memory::tests::delegated::two_isa_parked_reprobe_refuses_a_closed_space_and_waits_out_a_counted_pause (#2986, both ISA call views: a parked munmap's reprobe waits out a counted pause and reruns after it lowers, while a closed (retiring) space refuses at the reprobe and at admission (NoGrant), never a gate wait; red at Some(Some(Gate)) before the fix)",
   "carrick-el1::memory::tests::native_memory_call_uses_projected_task_and_actual_editor_slot",
   "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
 ]
