@@ -119,6 +119,18 @@ impl Aarch64ParkedContext {
         self.saved_syscall_pc = position.word();
     }
 
+    /// Save a frame's PC with the position word it carries, verbatim: a
+    /// corrupt word stays corrupt for [`Self::saved_syscall_pc`] to refuse.
+    pub fn replace_saved_pc_word(&mut self, pc: u64, word: carrick_guest_arch::SavedSyscallPcWord) {
+        self.native.pc = pc;
+        self.saved_syscall_pc = word.stored();
+    }
+
+    /// The position word a frame loaded from this context carries.
+    pub fn saved_syscall_pc_word(&self) -> carrick_guest_arch::SavedSyscallPcWord {
+        carrick_guest_arch::SavedSyscallPcWord::from_stored(self.saved_syscall_pc)
+    }
+
     /// Interpret the position stored with this exact saved context.
     pub fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
         SavedSyscallPc::from_word(self.saved_syscall_pc)
@@ -137,7 +149,11 @@ impl Aarch64ParkedContext {
             ResumeDisposition::UserReturn => {}
             ResumeDisposition::OwnerContinuation(OwnerEntry::Exception) => return None,
             ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall) => {
-                native.pc = native.pc.checked_sub(4)?;
+                // The context's own position: one already at its `SVC`
+                // (rewound in place, #2900) is never rewound again.
+                native.pc = self
+                    .saved_syscall_pc()?
+                    .syscall_instruction(native.pc, carrick_guest_arch::AARCH64_SVC_LEN)?;
                 if native.pc == 0 || !native.pc.is_multiple_of(4) || native.pstate & 0xf != 0 {
                     return None;
                 }

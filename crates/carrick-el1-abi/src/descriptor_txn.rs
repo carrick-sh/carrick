@@ -316,7 +316,7 @@ mod tests {
             // Not suspended: the fixed placement.
             assert_eq!(descriptor_drain_frame_offset_below(slot, None), Some(fixed));
             // Suspended above the fixed frame: the fixed frame already lies below.
-            let shallow = crate::EL1_REGION_BASE + top - 0x120 - 0x40;
+            let shallow = crate::EL1_REGION_BASE + top - crate::TRAP_FRAME_ALLOCATION - 0x40;
             let placed = descriptor_drain_frame_offset_below(slot, Some(shallow)).unwrap();
             assert!(placed + frame <= shallow - crate::EL1_REGION_BASE);
             // Suspended deeper: the frame moves below the suspended SP.

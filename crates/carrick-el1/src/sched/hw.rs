@@ -13,7 +13,7 @@ use super::UserWord;
 ))]
 mod aarch64_context;
 #[cfg(any(test, feature = "host-test"))]
-pub(super) use aarch64_context::{load_frame, save_frame};
+pub(super) use aarch64_context::{load_frame, load_position, save_frame, save_position};
 use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
@@ -222,17 +222,18 @@ pub struct HardwareCpu;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(
-        &mut self,
-        frame: &TrapFrame,
-        ctx: &mut Aarch64ParkedContext,
-        exit: super::CpuExitCause,
-    ) {
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
         aarch64_context::save(frame, &mut ctx.native);
-        ctx.replace_saved_pc(ctx.native.pc, exit.saved_syscall_pc());
+        aarch64_context::save_position(frame, ctx);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        // SAFETY: EL1 writes the running EL0 thread's stack pointer, which
+        // the vector's `eret` resumes on.
+        unsafe { crate::isa::aarch64::set_signal_stack(sp) }
     }
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
         aarch64_context::load(frame, &ctx.native);
+        aarch64_context::load_position(frame, ctx);
     }
 
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
@@ -369,12 +370,11 @@ impl ThreadCpu for HardwareCpu {
     // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
     // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
     // x86 is an invalid entry-lane mix, never a successful context switch.
-    fn save(
-        &mut self,
-        _frame: &TrapFrame,
-        _ctx: &mut Aarch64ParkedContext,
-        _exit: super::CpuExitCause,
-    ) {
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut Aarch64ParkedContext) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        let _ = sp;
         crate::isa::x86::fatal_entry_binding()
     }
     fn load(&mut self, _frame: &mut TrapFrame, _ctx: &Aarch64ParkedContext) {

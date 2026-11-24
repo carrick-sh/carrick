@@ -125,11 +125,13 @@ pub trait GuestDispatchFrame: SyscallFrame {
         false
     }
     /// Re-enter this ISA's syscall instruction after argument preparation.
+    /// The frame's own position says where its PC sits, so a call already
+    /// rewound is never rewound again (#2900).
     fn restart_syscall(&mut self) {
         let frame = self
             .arm_frame()
             .unwrap_or_else(|| invalid_completion(NativeInvariant::EntryBinding));
-        frame.elr = frame.elr.wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+        rewind_live_frame(frame);
     }
     /// The PC of this call's syscall instruction, where a parked operation
     /// re-executes it: the saved return PC rewound by the same ISA length
@@ -230,6 +232,14 @@ impl GuestDispatchFrame for TrapFrame {
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
+    }
+}
+
+/// Put a live ARM frame's PC on its `SVC` from the position it carries. A
+/// corrupt position or an underflowing PC names no call to rerun.
+fn rewind_live_frame(frame: &mut TrapFrame) {
+    if carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame).is_none() {
+        invalid_completion(NativeInvariant::EntryBinding)
     }
 }
 
@@ -352,12 +362,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 )
             };
             let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-            sched::ThreadCpu::save(
-                &mut sched::HardwareCpu,
-                frame,
-                &mut saved,
-                sched::CpuExitCause::Svc,
-            );
+            sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
             let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let mut service =
                 match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
@@ -1007,7 +1012,7 @@ pub(super) fn native_service_operation(
             carrick_el1_abi::ServedBoundary::Completed => {}
             carrick_el1_abi::ServedBoundary::ForwardOriginal { x0 } => {
                 frame.x[0] = x0;
-                frame.elr = frame.elr.checked_sub(4)?;
+                carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(frame)?;
             }
             carrick_el1_abi::ServedBoundary::ReplayOriginal { .. } => return None,
         }
@@ -1685,7 +1690,7 @@ pub(super) fn native_service_decision(
                     // Staging made no descriptor/IPC effect. Re-enter the
                     // ring at the same SVC rather than staging InRing into
                     // ENOSYS after the owner resolved its destination.
-                    frame.elr = frame.elr.wrapping_sub(4);
+                    rewind_live_frame(frame);
                     return NativeServiceDecision::Action(Action::Served);
                 }
                 Action::Forward | Action::ServedWithWork => {
@@ -1971,12 +1976,7 @@ fn arm_native_service_exit(
             None
         };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(
-        &mut sched::HardwareCpu,
-        frame,
-        &mut saved,
-        sched::CpuExitCause::Svc,
-    );
+    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
     let (result, phase) = super::aarch64_process::with_process_entry(
@@ -2054,7 +2054,7 @@ pub(super) fn native_service_user_return(
         // with no effect, or a retained map source. Re-enter the SVC with
         // every original argument, as the scheduler's owner replay does.
         NativeResume::RetrySyscall => {
-            frame.elr = frame.elr.wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+            rewind_live_frame(frame);
             checkpoint(frame)
         }
         // Only a resumed checkpoint names a saved SVC, and a departure parks
@@ -2299,12 +2299,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(
-        &mut sched::HardwareCpu,
-        frame,
-        &mut saved,
-        sched::CpuExitCause::Svc,
-    );
+    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
@@ -2480,7 +2475,7 @@ where
     X: super::aarch64_process::ForkStockCrossing,
 {
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(cpu, frame, &mut saved, sched::CpuExitCause::Svc);
+    sched::ThreadCpu::save(cpu, frame, &mut saved);
     let (action, _) = arm_signal_user_return_admitted_entry(
         source,
         task,

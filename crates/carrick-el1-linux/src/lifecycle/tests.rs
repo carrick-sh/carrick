@@ -2600,13 +2600,11 @@ struct QueueLockProbeCpu<'a> {
     probe: &'a dyn Fn(),
 }
 impl crate::sched::ThreadCpu for QueueLockProbeCpu<'_> {
-    fn save(
-        &mut self,
-        f: &TrapFrame,
-        c: &mut carrick_sched_core::Aarch64ParkedContext,
-        exit: crate::sched::CpuExitCause,
-    ) {
-        self.inner.save(f, c, exit);
+    fn save(&mut self, f: &TrapFrame, c: &mut carrick_sched_core::Aarch64ParkedContext) {
+        self.inner.save(f, c);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.inner.publish_user_sp(sp);
     }
     fn load(&mut self, f: &mut TrapFrame, c: &carrick_sched_core::Aarch64ParkedContext) {
         self.inner.load(f, c);
