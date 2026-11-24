@@ -478,6 +478,66 @@ mod tests {
         }
     }
 
+    /// #2955 (#2988 review P0): the carrier-exit `FileTable` drop releases
+    /// each descriptor's functional reference; the last one of a pipe end
+    /// detaches its open file from every zone epoll under the pipe's IPC
+    /// object lock before it closes the endpoint. A ring section cut off
+    /// when its vCPU stopped keeps that lock forever, so once the executor
+    /// pool has stopped the detach must refuse, be counted, and let the
+    /// drop return; it spun at 100% CPU before.
+    #[test]
+    fn serial_file_table_drop_quarantines_a_member_lock_a_stopped_vcpu_holds() {
+        use crate::dispatch::fd_table::{
+            OpenDescription, OpenDescriptionBase, kernel_file_description,
+        };
+        use crate::dispatch::fs::pipe::PipeInner;
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        use std::sync::Arc;
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let table = FileTable::new(ids.file_table_id().unwrap());
+        let pipe = Arc::new(PipeInner::create(Arc::clone(&owner), 0, 4096).unwrap());
+        let description = kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+                pipe: Arc::clone(&pipe),
+            })),
+            carrick_abi::LINUX_O_RDONLY,
+        );
+        description.retain_fd_ref();
+        table.install(FileSlotNumber::for_open_fd(3).unwrap(), description, false);
+        assert!(
+            pipe.zone_member(carrick_el1_abi::ipc::pipe::End::Reader)
+                .is_some(),
+            "the reader's last close detaches it from the zone epolls"
+        );
+        // The frozen holder: the pipe's object lock is taken and never
+        // released, as by a vCPU stopped inside the ring's pipe section.
+        std::mem::forget(
+            owner
+                .region()
+                .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+                .unwrap(),
+        );
+        // ExecutorPool::shutdown after joining every worker.
+        owner.stop_guest_execution();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(table);
+            done_tx.send(()).unwrap();
+        });
+        // The bound only reports a spinning drop; a quarantining one
+        // answers at once.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "FileTable drop spins on a member lock a stopped vCPU holds"
+        );
+        assert!(owner.quarantined_teardowns() >= 1);
+    }
+
     #[test]
     fn epoll_hatch_is_on_unless_exactly_zero() {
         assert!(hatch_allows(None));
