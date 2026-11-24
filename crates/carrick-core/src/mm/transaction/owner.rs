@@ -447,6 +447,32 @@ impl<
             )
         }))
     }
+    /// The `Editor` wait of the exact parent incarnation a fork refused as
+    /// [`MmError::CowUnsettled`], observed after the fork released its own
+    /// editor, and whether another member holds that editor now. Observed
+    /// first, so a release after the check moves the revision the wait
+    /// enrols at. `None`: the parent was retired or replaced (the rerun
+    /// refuses it), or a source-free model fixture (#2947).
+    pub fn fork_parent_editor(
+        &self,
+        mm: ReservationMm,
+        incarnation: NonZeroU64,
+        slot: u32,
+    ) -> Option<(carrick_core_abi::PortalOwnerWait, bool)> {
+        let handle = self
+            .admitted_handle(mm, slot)
+            .ok()
+            .filter(|handle| handle.incarnation() == incarnation)?;
+        let editor = self
+            .observe_wait(handle, carrick_core_abi::PortalWaitCause::Editor)
+            .ok()
+            .flatten()?;
+        let held = self
+            .spaces
+            .find(mm.raw())
+            .is_some_and(|index| self.spaces.active_editor(index).is_some());
+        Some((editor, held))
+    }
     /// Take the exact admitted MM's editor. A held editor, raised gate or closed target
     /// returns [`MmError::Wait`] carrying the observed release, so the caller
     /// enrols on the holder instead of retrying a bare `Busy`.
