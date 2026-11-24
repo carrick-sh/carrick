@@ -928,7 +928,10 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
 /// (`CLONE_FILES`): its plain `close_range` closes for both threads, and its
 /// `CLOSE_RANGE_UNSHARE` must never close the root's descriptor. The ring
 /// has no per-thread table yet, so that one call stays unrouted (-38,
-/// nothing closed) until #2930; every other line must match Linux.
+/// nothing closed) until #2930; every other line must match Linux. Last, a
+/// fork child's leader raw-exits beside its one worker thread, whose
+/// `CLOSE_RANGE_UNSHARE` is then a plain range (#2949 review P0-1: the
+/// leader's credential row outlives it, the live count does not).
 #[test]
 fn mounted_static_x86_close_range_matches_native() {
     if skip_without_kvm() {
@@ -955,7 +958,7 @@ fn mounted_static_x86_close_range_matches_native() {
     let native_out = String::from_utf8_lossy(&native.stdout);
     let shared_native = "t shared=0 unshare=0 own=-9 root=0 -9\n";
     assert!(
-        native_out.ends_with(shared_native),
+        native_out.contains(shared_native),
         "native oracle: {native_out}"
     );
     // The thread's UNSHARE needs a table published for it alone (#2930):
