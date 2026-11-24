@@ -125,7 +125,8 @@ debug = true
 # runtime binary itself stays lean.
 split-debuginfo = "packed"
 
-# The nested EL1 image build (`carrick-el1-image/build.rs`). One codegen unit
+# The nested ring image builds: ARM EL1 (`carrick-el1-image/build.rs`) and
+# x86 CPL0 (`carrick-vmm-kvm/cpl0_build.rs`, #3005). One codegen unit
 # per crate stops LLVM emitting a private copy of every generic instance in
 # each of up to 16 partitions, about 110 KB of the 1.5 MiB loaded image
 # (#691). Speed settings, overflow checks and debuginfo stay release's;

@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out,
             cargo,
             copy: std::fs::copy::<PathBuf, PathBuf>,
+            read: std::fs::read::<PathBuf>,
         },
     )
 }
