@@ -1388,12 +1388,14 @@ fn process_tree(root: u32) -> Vec<u32> {
 /// Write every host thread's backtrace of a hung carrier and its
 /// descendants (`gdb -p <pid> -batch -ex 'thread apply all bt'`) into
 /// `path`, before the kill; with `CARRICK_DISCOVER_CORE=1`, also a core of
-/// the carrier (`gcore`, `<core>.<pid>`). Best effort, bounded like the
+/// the carrier (`<core>.<pid>`), written by gdb's `generate-core-file` in
+/// the same attach as its backtrace. Best effort, bounded like the
 /// zonedump: a missing gdb or a refused attach leaves its error in `path`.
 fn capture_host_stacks(carrier: u32, path: &Path, core: &Path) {
     let Ok(mut file) = std::fs::File::create(path) else {
         return;
     };
+    let want_core = std::env::var_os("CARRICK_DISCOVER_CORE").is_some_and(|v| v == "1");
     for pid in process_tree(carrier) {
         use std::io::Write;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
@@ -1404,9 +1406,23 @@ fn capture_host_stacks(carrier: u32, path: &Path, core: &Path) {
         let Ok(err) = file.try_clone() else {
             return;
         };
-        let Ok(child) = std::process::Command::new("gdb")
-            .args(["-nx", "-batch", "-p", &pid.to_string()])
-            .args(["-ex", "info threads", "-ex", "thread apply all bt"])
+        let mut gdb = std::process::Command::new("gdb");
+        gdb.args(["-nx", "-batch", "-p", &pid.to_string()]).args([
+            "-ex",
+            "info threads",
+            "-ex",
+            "thread apply all bt",
+        ]);
+        // The core comes from this same stop: a second attach finds the
+        // carrier already tearing down, because the first one knocks its
+        // executors out of KVM_RUN (#2962; #2928 comment 7125348822).
+        if pid == carrier && want_core {
+            let mut name = core.as_os_str().to_owned();
+            name.push(format!(".{carrier}"));
+            gdb.arg("-ex")
+                .arg(format!("generate-core-file {}", Path::new(&name).display()));
+        }
+        let Ok(child) = gdb
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err)
@@ -1415,19 +1431,12 @@ fn capture_host_stacks(carrier: u32, path: &Path, core: &Path) {
             let _ = writeln!(file, "gdb did not start");
             continue;
         };
-        let _ = wait_bounded(child, Duration::from_secs(ZONEDUMP_SECS), &mut || {});
-    }
-    if std::env::var_os("CARRICK_DISCOVER_CORE").is_some_and(|v| v == "1")
-        && let Ok(child) = std::process::Command::new("gcore")
-            .arg("-o")
-            .arg(core)
-            .arg(carrier.to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    {
-        let _ = wait_bounded(child, Duration::from_secs(5 * ZONEDUMP_SECS), &mut || {});
+        let bound = if pid == carrier && want_core {
+            6 * ZONEDUMP_SECS
+        } else {
+            ZONEDUMP_SECS
+        };
+        let _ = wait_bounded(child, Duration::from_secs(bound), &mut || {});
     }
 }
 
