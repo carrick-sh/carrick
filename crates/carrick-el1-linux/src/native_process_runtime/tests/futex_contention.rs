@@ -2374,9 +2374,9 @@ fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
     let member1_ref = zone.record_ref(member1);
     let member2_ref = zone.record_ref(member2);
     let bucket_contended = core::sync::atomic::AtomicBool::new(false);
-    let finished = core::sync::atomic::AtomicBool::new(false);
     let (start_tx, start_rx) = std::sync::mpsc::channel();
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
 
     struct ReboundVenue<'a> {
         page: &'a ThreadLifecyclePage,
@@ -2412,11 +2412,9 @@ fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
     let probe = |attempt: u32| {
         if attempt == LOCK_SPINS {
             bucket_contended.store(true, Ordering::Release);
+            let _ = release_tx.send(());
         }
     };
-
-    let bucket_contended_ref = &bucket_contended;
-    let finished_ref = &finished;
     let page = fixture.page;
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -2450,11 +2448,9 @@ fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
                 })
                 .collect();
             armed_tx.send(()).unwrap();
-            while !bucket_contended_ref.load(Ordering::Acquire)
-                && !finished_ref.load(Ordering::Acquire)
-            {
-                std::thread::yield_now();
-            }
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("dispatch must reach the reservation release checkpoint");
             // Peer A's NotYet rollback restores `page.live() == 2` right before
             // caller B acquires the reservation wait bucket lock and probes.
             drop(held_membership);
@@ -2538,7 +2534,7 @@ fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
             )
         };
         entry.publication_wait_probe = None;
-        finished.store(true, Ordering::Release);
+        let _ = release_tx.send(());
         assert_eq!(route, CompletionRoute::Suspended);
         assert!(
             bucket_contended.load(Ordering::Acquire),
