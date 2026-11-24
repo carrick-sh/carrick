@@ -1380,30 +1380,45 @@ impl CarrierStage2Backend {
     /// Retry the unmap of every unretired lease once. A lease that unmaps
     /// settles; the rest stay for the next turn or the VM's destroy.
     /// Returns how many remain.
+    ///
+    /// The list stays locked across the unmaps, so no lease is outside it
+    /// while a destroy drains it: a destroy that overlaps this turn waits for
+    /// it, then settles what is left, and every lease settles exactly once
+    /// (#2968 confirming review, P0 2). The lock nests inside the custody
+    /// state lock (`commit_destroy`) and is held only across backend unmaps,
+    /// which take no custody lock; settling happens after it is released.
     pub(crate) fn retry_unretired_unmaps(&self) -> usize {
-        let pending = std::mem::take(&mut *self.unretired.lock());
-        if pending.is_empty() {
+        let mut unretired = self.unretired.lock();
+        if unretired.is_empty() {
             return 0;
         }
-        let mut remaining = Vec::new();
-        for entry in pending {
+        let mut remaining = Vec::with_capacity(unretired.len());
+        let mut unmapped = Vec::new();
+        for entry in unretired.drain(..) {
             let (base, length) = entry.lease.key();
-            let unmapped = usize::try_from(length).is_ok_and(|size| {
+            let gone = usize::try_from(length).is_ok_and(|size| {
                 unsafe { inventory_stage2_unmap(self.as_backend(), base, size) }.is_success()
             });
-            if unmapped {
-                entry.settle_unmapped();
+            if gone {
+                unmapped.push(entry);
             } else {
                 remaining.push(entry);
             }
         }
-        let mut unretired = self.unretired.lock();
-        unretired.extend(remaining);
-        unretired.len()
+        *unretired = remaining;
+        let left = unretired.len();
+        // Their mappings are gone: release the IPAs, then the backings,
+        // outside the list's lock.
+        drop(unretired);
+        for entry in unmapped {
+            entry.settle_unmapped();
+        }
+        left
     }
 
     /// This backend's VM is destroyed, and its stage 2 with it: every
-    /// unretired lease settles without an unmap.
+    /// unretired lease settles without an unmap. An idle retry turn in
+    /// flight holds the list, so this waits for it.
     pub(crate) fn release_unretired_after_vm_destroy(&self) {
         let released = std::mem::take(&mut *self.unretired.lock());
         for entry in released {
