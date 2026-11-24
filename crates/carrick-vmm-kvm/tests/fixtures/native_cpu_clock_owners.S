@@ -3,10 +3,15 @@
  * pthread_getcpuclockid(3)), sampled as it asks. Native Linux 6.12 answers
  * every check here; the test runs this binary natively first as the oracle.
  *
- * 1. Two live threads. A worker burns >= 100 ms of its own thread CPU and
- *    parks. The root thread, parked meanwhile, reads the live sibling's
- *    thread clock (SCHED and VIRT), its own thread clock (static, and by its
- *    own tid), and the process clock (which includes the sibling); the
+ * 1. Two live threads. The root burns >= 20 ms of its own thread CPU, then
+ *    clones a worker. The worker burns >= 100 ms of its own thread CPU, then,
+ *    as a non-leader, reads its process clock by its own tid: that names its
+ *    process, so it reads the group's time, at least 20 ms (the root's)
+ *    over its own thread clock, as does the clock its leader's pid names
+ *    (clock_gettime(2); a native Linux 6.12 probe). It parks. The root
+ *    thread, parked meanwhile, reads the live sibling's thread clock (SCHED
+ *    and VIRT), its own thread clock (static, and by its own tid), and the
+ *    process clock (which includes the sibling); the
  *    sibling's tid names no process (EINVAL). The worker then leaves by raw
  *    exit. (Its cleared tid word does not prove its clock is gone: Linux
  *    clears it before the thread is released.)
@@ -24,7 +29,8 @@
  *    existed, is EINVAL (even with a null output).
  *
  * Exit 8: every check passed. 38 (root) or 138 (child): a counted ENOSYS.
- * Otherwise the failing check: 40..89 in the root, 150..156 in the child.
+ * Otherwise the failing check: 40..86 in the root, 78 and 87..89 in the
+ * worker, 150..156 in the child.
  * 91: setup failed.
  */
 .global _start
@@ -51,6 +57,19 @@ _start:
     movl $0, 0x1000(%r12)
     movl $0, 0x2000(%r12)
     movl $0, 0x3000(%r12)
+    /* The root burns >= 20 ms of its own thread CPU first, so the group's
+     * clock stands apart from the worker's thread clock. */
+    mov $72, %r14d
+0:
+    mov $0x10000, %ecx
+1:
+    pause
+    dec %ecx
+    jnz 1b
+    mov $3, %edi
+    call clock_ns
+    cmp $20000000, %rax
+    jb 0b
     /* 1. A worker thread (CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM
      * | PARENT_SETTID | CHILD_CLEARTID); its tid lands at 0x3000. */
     mov $80, %r14d
@@ -293,6 +312,55 @@ worker:
     call clock_ns
     cmp $100000000, %rax
     jb 3b
+    /* A non-leader's own tid as a process clock names its process: the
+     * group's time, the root's >= 20 ms over the worker's thread clock. */
+    mov $88, %r14d
+    mov $3, %edi
+    call clock_ns
+    mov %rax, %rbx
+    mov $186, %eax
+    syscall
+    mov %eax, %r13d
+    mov %r13d, %edi
+    mov $2, %esi
+    call dynamic_id
+    call clock_ns
+    sub %rbx, %rax
+    jb wrong
+    cmp $20000000, %rax
+    jb wrong
+    add %rbx, %rax
+    mov %rax, %rbx
+    /* The same clock its leader's pid names. */
+    mov $89, %r14d
+    mov $39, %eax
+    syscall
+    mov %eax, %edi
+    mov $2, %esi
+    call dynamic_id
+    call clock_ns
+    cmp %rbx, %rax
+    jb wrong
+    mov %rax, %rbx
+    /* Its own tid as a thread clock is its own thread, still the root's
+     * >= 20 ms under the process clock that tid names next. */
+    mov $78, %r14d
+    mov %r13d, %edi
+    mov $6, %esi
+    call dynamic_id
+    call clock_ns
+    push %rax
+    mov %r13d, %edi
+    mov $2, %esi
+    call dynamic_id
+    call clock_ns
+    pop %rcx
+    cmp %rbx, %rax
+    jb wrong
+    sub %rcx, %rax
+    jb wrong
+    cmp $20000000, %rax
+    jb wrong
     movl $1, 0x3008(%r12)
     lea 0x3008(%r12), %rdi
     mov $1, %esi
