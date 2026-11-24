@@ -614,6 +614,9 @@ struct TestSourceScan {
     /// Canonical targets of plain `#[path]` modules outside the initial scan
     /// (a sibling crate's file built as a module here), to scan as well.
     path_modules: Vec<PathBuf>,
+    /// Reached only through a `#[path]` into a sibling crate, not part of
+    /// the owning crate's own files.
+    followed: bool,
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
     /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
     inline_depth: usize,
@@ -644,15 +647,16 @@ struct ModDecl {
 
 impl TestSourceScan {
     /// The canonical target of a plain `#[path = "lit"]` at file level,
-    /// resolved against the visiting file's directory. The literal path is
-    /// walked component by component, so a link anywhere on it (even one
-    /// followed by `..`) refuses, and the target must be a regular `.rs` file
-    /// under the tree root. An in-crate target is one of the scanned files
-    /// already; an out-of-crate one (a sibling crate's file built as a module
-    /// here) is scanned too, so neither hides a test. Anything else (a
-    /// `cfg_attr` form, a non-literal, a `#[path]` inside an inline module,
-    /// which rustc resolves against a subdirectory, or a target outside the
-    /// tree) stays unresolved.
+    /// resolved against the visiting file's directory with
+    /// [`walk_literal_rs`]. The target is either one of the owning crate's
+    /// scanned files, or a file under a sibling workspace crate's `src/` or
+    /// `tests/` ([`sibling_crate_source`]: carrick-runtime builds HVF's
+    /// syscall mailbox that way), which is then scanned too, so neither hides
+    /// a test.
+    /// Anything else stays unresolved: a `cfg_attr` form, a non-literal, a
+    /// `#[path]` inside an inline module (rustc resolves it against a
+    /// subdirectory), or any other file in the repository (`fixtures/`, a
+    /// crate's other directories, a directory with no package manifest).
     fn path_module_target(&self, meta: &syn::Meta) -> Option<PathBuf> {
         if self.inline_depth != 0 {
             return None;
@@ -670,33 +674,9 @@ impl TestSourceScan {
         else {
             return None;
         };
-        let relative = lit.value();
-        let relative = Path::new(&relative);
-        if relative.extension().is_none_or(|e| e != "rs") {
-            return None;
-        }
-        use std::path::Component;
-        let mut candidate = self.file_dir.clone();
-        for component in relative.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir if candidate != self.tree_root => {
-                    candidate.pop();
-                }
-                Component::Normal(part) => {
-                    candidate.push(part);
-                    if std::fs::symlink_metadata(&candidate).ok()?.is_symlink() {
-                        return None;
-                    }
-                }
-                _ => return None,
-            }
-        }
-        if !std::fs::symlink_metadata(&candidate).ok()?.is_file() {
-            return None;
-        }
-        let target = candidate.canonicalize().ok()?;
-        target.starts_with(&self.tree_root).then_some(target)
+        let target = walk_literal_rs(&self.file_dir, Path::new(&lit.value()), &self.tree_root)?;
+        (self.scanned.contains(&target) || sibling_crate_source(&self.tree_root, &target))
+            .then_some(target)
     }
 
     /// The in-crate source a plain `include!("x.rs")` / `std::include!` /
@@ -719,39 +699,67 @@ impl TestSourceScan {
             return None;
         }
         let lit = mac.parse_body::<syn::LitStr>().ok()?;
-        let relative = lit.value();
-        let relative = Path::new(&relative);
-        if relative.extension().is_none_or(|ext| ext != "rs") {
-            return None;
-        }
-
-        // Walk the literal path before canonicalizing so even a link in an
-        // intermediate directory (including one followed by `..`) is refused.
-        use std::path::Component;
-        let mut candidate = self.file_dir.clone();
-        for component in relative.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir if candidate != self.crate_dir => {
-                    candidate.pop();
-                }
-                Component::Normal(part) => {
-                    candidate.push(part);
-                    if std::fs::symlink_metadata(&candidate).ok()?.is_symlink() {
-                        return None;
-                    }
-                }
-                _ => return None,
-            }
-        }
-        if !std::fs::symlink_metadata(&candidate).ok()?.is_file() {
-            return None;
-        }
-        let target = self.file_dir.join(relative).canonicalize().ok()?;
-        target
-            .starts_with(self.crate_dir.join("src"))
-            .then_some(target)
+        walk_literal_rs(&self.file_dir, Path::new(&lit.value()), &self.crate_dir)
+            .filter(|target| target.starts_with(self.crate_dir.join("src")))
     }
+}
+
+/// The canonical `.rs` file a literal relative source path names from `dir`.
+/// The path is walked one component at a time before canonicalizing, so a
+/// link anywhere on it (even one followed by `..`) refuses, as do `..` above
+/// `floor`, an absolute or prefix component, and anything but a regular
+/// file. Callers apply their own containment to the result.
+fn walk_literal_rs(dir: &Path, relative: &Path, floor: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if relative.extension().is_none_or(|ext| ext != "rs") {
+        return None;
+    }
+    let mut candidate = dir.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if candidate != floor && candidate.starts_with(floor) => {
+                candidate.pop();
+            }
+            Component::Normal(part) => {
+                candidate.push(part);
+                if std::fs::symlink_metadata(&candidate).ok()?.is_symlink() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !std::fs::symlink_metadata(&candidate).ok()?.is_file() {
+        return None;
+    }
+    candidate.canonicalize().ok()
+}
+
+/// Whether canonical `target` lies under `crates/<name>/src/` or
+/// `crates/<name>/tests/` of the canonical `tree_root`, where
+/// `crates/<name>/Cargo.toml` is a regular manifest declaring a `[package]`:
+/// a sibling workspace crate's own library or test source (carrick-runtime's
+/// integration tests share carrick-kernel's `tests/integration/common`).
+fn sibling_crate_source(tree_root: &Path, target: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(tree_root.join("crates")) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (Some(std::path::Component::Normal(name)), Some(std::path::Component::Normal(src))) =
+        (components.next(), components.next())
+    else {
+        return false;
+    };
+    if !(src == "src" || src == "tests") || components.next().is_none() {
+        return false;
+    }
+    let crate_dir = tree_root.join("crates").join(name);
+    regular_path(&crate_dir, Path::new("Cargo.toml"), false).unwrap_or(false)
+        && std::fs::read_to_string(crate_dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            .is_some_and(|manifest| manifest.get("package").is_some())
 }
 
 fn meta_has_path(meta: &syn::Meta) -> bool {
@@ -933,7 +941,8 @@ fn scan_crate_sources(
         scan.visit_file(&syntax);
         // A followed out-of-crate `#[path]` file's plain `mod x;` children
         // live outside the scanned files: refuse rather than guess.
-        if !scanned.contains(&file) && scan.mod_decls.iter().any(|decl| decl.path.is_none()) {
+        scan.followed = !scanned.contains(&file);
+        if scan.followed && scan.mod_decls.iter().any(|decl| decl.path.is_none()) {
             scan.unresolved = Some("#[path] module declaring out-of-line modules");
         }
         if depth < MAX_INCLUDE_DEPTH {
@@ -1198,6 +1207,19 @@ fn attribute_module_file(
         return;
     };
     if stack.contains(&canonical) {
+        return;
+    }
+    // Bound the walk as discovery is bounded: no more sibling-crate
+    // `#[path]` hops than `MAX_INCLUDE_DEPTH`, however the chain is reached.
+    let followed = stack
+        .iter()
+        .chain(std::iter::once(&canonical))
+        .filter(|file| scans.get(*file).is_some_and(|scan| scan.followed))
+        .count();
+    if followed > MAX_INCLUDE_DEPTH {
+        inventory
+            .unresolved
+            .get_or_insert_with(|| format!("#[path] module depth limit at {}", file.display()));
         return;
     }
     stack.push(canonical.clone());
