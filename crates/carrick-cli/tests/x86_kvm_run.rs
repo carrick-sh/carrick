@@ -1042,6 +1042,66 @@ fn mounted_static_x86_shared_file_window_futex_is_fenced_never_hangs() {
     );
 }
 
+/// #1338 A1 interim shrink fence: a shrink of a host file a shared file
+/// window maps would pull the host's pages out from under live window
+/// leaves. Until the revoke path lands (#1338 A3), every shrink of such a
+/// file is a counted ENOSYS (-38) before the host applies it: a forked
+/// child's ftruncate, hole punch and collapse on its inherited descriptor,
+/// and the root's truncate and O_TRUNC open by name. The file keeps its
+/// size (both processes still read their byte on the second page, where
+/// native Linux kills the child with SIGBUS); growth of the mapped file and
+/// a shrink of an unmapped one are served. Red before the fence: the host
+/// shrink pulled the page out from under a live window leaf, and the
+/// child's touch hung the run until the KVM deadline.
+#[test]
+fn mounted_static_x86_shared_file_window_shrink_is_fenced_before_the_host() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-shrink");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_shrink.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let guest = run_mounted_binary(&elf, "window-shrink", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec![
+                "child_collapse=ffffffffffffffda",
+                "child_ftruncate=ffffffffffffffda",
+                "child_punch=ffffffffffffffda",
+                "child_status=0000000000000000",
+                "child_touch=0000000000000042",
+                "plain_shrink=0000000000000000",
+                "root_grow=0000000000000000",
+                "root_otrunc=ffffffffffffffda",
+                "root_page2=0000000000000042",
+                "root_truncate=ffffffffffffffda",
+            ]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
