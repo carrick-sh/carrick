@@ -79,6 +79,13 @@ impl ImageBudget {
         for header in programs {
             let memsz = header.u64(0x28)?;
             if header.u32(0)? == PT_LOAD && memsz != 0 {
+                // The segment's file bytes lie inside the file and within
+                // its memory size; only `.bss` may extend past them.
+                let (offset, filesz) = (header.offset(0x08)?, header.u64(0x20)?);
+                if filesz > memsz {
+                    return None;
+                }
+                elf.span(offset, usize::try_from(filesz).ok()?)?;
                 let start = header.u64(0x10)?;
                 base = base.min(start);
                 end = end.max(start.checked_add(memsz)?);
