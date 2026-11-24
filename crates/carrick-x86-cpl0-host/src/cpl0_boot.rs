@@ -4566,6 +4566,11 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// Refused or withdrawn backings settled while their MM's exclusion was
     /// busy: cancelled at that MM's next exclusion.
     cancelled_backing_pending: Vec<anonymous_owner::PendingPrepare>,
+    /// Shared file window slots (#1338), by host device, inode and 2 MiB
+    /// chunk: a host `mmap(MAP_SHARED)` of the chunk installed once and kept
+    /// for the run, with its GPA and backing identity.
+    window_slots:
+        std::collections::BTreeMap<(u64, u64, u64), (BackingHandle, FrameGpa, BackingIdentity)>,
     owner_grant_crossings: u64,
     /// Serializes every settlement of an MM's owed returns (#1369 slice 3).
     return_settlement: carrick_hal::return_settlement::SettlementLock,
@@ -5947,6 +5952,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             cow_supplied: Default::default(),
             native_backing_pending: std::collections::BTreeMap::new(),
             cancelled_backing_pending: Vec::new(),
+            window_slots: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,
             return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
             return_settlement_counters: Default::default(),
