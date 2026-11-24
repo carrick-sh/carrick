@@ -874,6 +874,14 @@ pub trait Lifecycle {
     fn live(&self) -> u32 {
         self.live_word().load(Ordering::SeqCst)
     }
+    /// Whether a live member other than the caller shares this membership,
+    /// for a caller that must not mutate a resource its threads share (a
+    /// `CLONE_FILES` descriptor table). A raw-exited leader no longer
+    /// counts. Never a retirement decision; an empty count answers `true`,
+    /// so a caller declines rather than assume it is alone.
+    fn has_other_live_member(&self) -> bool {
+        self.live() != 1
+    }
     /// A thread was born: `n -> n+1`. Returns the new count, `None` on
     /// overflow.
     fn thread_born(&self) -> Option<u32> {
