@@ -35,6 +35,13 @@ pub(crate) struct KvmVcpuFd {
     run: KvmRunMap,
 }
 
+impl Drop for KvmVcpuFd {
+    fn drop(&mut self) {
+        // Before `fd` unmaps the mapping: no kick window may keep its byte.
+        self.run.revoke_kick();
+    }
+}
+
 impl KvmVcpuFd {
     /// Take ownership of a vCPU fd no run has entered yet.
     ///
@@ -44,6 +51,8 @@ impl KvmVcpuFd {
     pub(crate) fn new(mut fd: VcpuFd) -> Self {
         let run = KvmRunMap {
             run: NonNull::from(fd.get_kvm_run()),
+            #[cfg(target_arch = "x86_64")]
+            published: std::sync::Mutex::new(None),
         };
         Self { fd, run }
     }
@@ -82,6 +91,12 @@ impl KvmVcpuFd {
 /// only by borrowing that `KvmVcpuFd`, so the mapping outlives every use.
 pub(crate) struct KvmRunMap {
     run: NonNull<kvm_bindings::kvm_run>,
+    /// The kick window this mapping's `immediate_exit` byte was last
+    /// published into ([`Self::arm_kick`]). Revoked when the pair is
+    /// recycled ([`Self::revoke_kick`]) or dropped, so no window outlives the
+    /// mapping or reaches its next owner, on any path out of a run.
+    #[cfg(target_arch = "x86_64")]
+    published: std::sync::Mutex<Option<carrick_hal::posix_signal_kick::RunPublication>>,
 }
 
 // SAFETY: the pointer targets the mapping owned by the `VcpuFd` this map is
@@ -112,7 +127,32 @@ impl KvmRunMap {
     /// scheduler's last runnable check.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn arm_kick(&self, kick: &crate::KvmKickHandle) {
-        kick.arm_run(self.immediate_exit());
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Withdraw an earlier publication first (it may sit in another
+        // thread's window); revoking after the new arm would clear it.
+        if let Some(earlier) = published.take() {
+            earlier.revoke();
+        }
+        // SAFETY: the mapping lives until `revoke_kick` (on recycle) or the
+        // `KvmVcpuFd` drop revokes this publication.
+        *published = Some(unsafe { kick.arm_run(self.immediate_exit()) });
+    }
+
+    /// Withdraw this byte from the kick window it was last armed in, if it is
+    /// still published there. Called before the pair is reused or unmapped.
+    pub(crate) fn revoke_kick(&self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(publication) = self
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            publication.revoke();
+        }
     }
 
     /// Admit kicks into the next run until the returned guard drops. A run a
@@ -281,19 +321,28 @@ impl RawKvmExit {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    /// Every kvm-ioctls accessor that reaches a vCPU's `kvm_run` through a Rust
-    /// reference, and the raw fields a kick-racing run must not touch outside
-    /// [`super::KvmRunMap`].
-    const MAPPING_ACCESSES: &[&str] = &[
+    /// Every kvm-ioctls `VcpuFd` method that reaches a vCPU's `kvm_run`
+    /// through a Rust reference. Matched as a method call (`.name(`) or a
+    /// path (`::name(`), across whitespace and line breaks.
+    const MAPPING_METHODS: &[&str] = &[
+        "get_kvm_run",
+        "set_kvm_immediate_exit",
+        "sync_regs",
+        "sync_regs_mut",
+        "set_sync_valid_reg",
+        "clear_sync_valid_reg",
+        "set_sync_dirty_reg",
+        "clear_sync_dirty_reg",
+    ];
+
+    /// Raw `kvm_run` fields a kick-racing run must not touch outside
+    /// [`super::KvmRunMap`], and the deleted `&mut VcpuFd` accessor. `fd.run(`
+    /// catches a bare `VcpuFd` run before the fd is wrapped (`new_fd.run()`,
+    /// `parked.fd.run()`); once wrapped, `VcpuFd::run`'s `&mut VcpuFd` can
+    /// only be formed in this module.
+    const MAPPING_TOKENS: &[&str] = &[
         "fd.run(",
-        ".get_kvm_run(",
-        ".set_kvm_immediate_exit(",
-        ".sync_regs()",
-        ".sync_regs_mut(",
-        ".set_sync_valid_reg(",
-        ".clear_sync_valid_reg(",
-        ".set_sync_dirty_reg(",
-        ".clear_sync_dirty_reg(",
+        "VcpuFd::run(",
         "fd_mut(",
         "kvm_valid_regs",
         ".immediate_exit",
@@ -311,33 +360,54 @@ mod tests {
         }
     }
 
-    /// The uses of `MAPPING_ACCESSES` in the crate's code (comments aside)
-    /// outside this module. `VcpuFd::run` takes `&mut VcpuFd`, which only this
-    /// module can form once an fd is wrapped; `fd.run(` catches a bare
-    /// `VcpuFd` run before it is (`new_fd.run()`, `parked.fd.run()`).
+    /// A file's code with `//` comments and all whitespace removed, so a
+    /// call split by spaces or line breaks still matches.
+    fn flat_code(text: &str) -> String {
+        text.lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The uses of `MAPPING_METHODS` and `MAPPING_TOKENS` in the crate's code
+    /// outside this module, as `file: access xN`.
     fn mapping_accesses_outside_run_map() -> Vec<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let this = root.join("src/kvm/run_map.rs");
         let mut files = Vec::new();
         rust_sources(&root.join("src"), &mut files);
         rust_sources(&root.join("tests"), &mut files);
+        let patterns: Vec<String> = MAPPING_METHODS
+            .iter()
+            .flat_map(|method| [format!(".{method}("), format!("::{method}(")])
+            .chain(MAPPING_TOKENS.iter().map(|token| token.to_string()))
+            .collect();
         let mut found = Vec::new();
         for file in files.iter().filter(|file| **file != this) {
-            let text = std::fs::read_to_string(file).expect("read source");
-            for (number, line) in text.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or_default();
-                for access in MAPPING_ACCESSES {
-                    if code.contains(access) {
-                        found.push(format!(
-                            "{}:{}: {access}",
-                            file.strip_prefix(root).unwrap_or(file).display(),
-                            number + 1
-                        ));
-                    }
+            let code = flat_code(&std::fs::read_to_string(file).expect("read source"));
+            for pattern in &patterns {
+                let count = code.matches(pattern.as_str()).count();
+                if count > 0 {
+                    found.push(format!(
+                        "{}: {pattern} x{count}",
+                        file.strip_prefix(root).unwrap_or(file).display()
+                    ));
                 }
             }
         }
         found
+    }
+
+    /// The scan itself sees through spacing, line breaks and paths.
+    #[test]
+    fn the_mapping_scan_matches_split_and_path_calls() {
+        let code = flat_code(
+            "let r = vcpu.fd()\n    .sync_regs ();\nVcpuFd::sync_regs(fd); // .get_kvm_run(\n",
+        );
+        assert!(code.contains(".sync_regs("));
+        assert!(code.contains("::sync_regs("));
+        assert!(!code.contains("get_kvm_run"), "comments are not code");
     }
 
     #[test]
