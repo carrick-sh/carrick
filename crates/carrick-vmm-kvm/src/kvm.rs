@@ -21,12 +21,15 @@ use kvm_bindings::{
 };
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 #[cfg(target_arch = "x86_64")]
-use kvm_ioctls::{Cap, SyncReg};
+use kvm_ioctls::Cap;
 use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 use libc;
 
 #[cfg(target_arch = "aarch64")]
 use carrick_aarch64::Aarch64VcpuSnapshot;
+
+mod run_map;
+pub(crate) use run_map::{KvmRunMap, KvmVcpuFd, RawKvmExit};
 
 fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
@@ -702,19 +705,15 @@ pub(crate) struct SharedVmHandle {
 /// already assume): the engine + its vCPU are owned by exactly one host thread
 /// at a time, and the `vm`-side swap (`save_guest_state`/`rebind_to_slot`) runs
 /// ONLY on that same thread while it is parked in a host futex wait — i.e. when
-/// the vCPU is NOT inside `KVM_RUN`. So the `&VcpuFd`/`&mut VcpuFd` the accessors
-/// hand out never alias a concurrent swap.
+/// the vCPU is NOT inside `KVM_RUN`. So the `&KvmVcpuFd` the accessors hand out
+/// never aliases a concurrent swap. No `&mut VcpuFd` exists outside
+/// [`KvmVcpuFd`] (#2962).
 struct KvmVcpuSlot {
     /// `Some` until drop / reclaim-park. The `Option` lets `Drop` (and the
-    /// block-recycle save path) MOVE the fd into the recycle pool. The None arm
-    /// of [`KvmVcpu::fd`]/[`KvmVcpu::fd_mut`] is unreachable in normal operation.
-    fd: UnsafeCell<Option<VcpuFd>>,
-    /// `fd`'s mmap'd `kvm_run`, taken when the fd is installed (before any
-    /// kick can reach it) and swapped alongside `fd`. While a run admits
-    /// kicks, another thread may store the run's `immediate_exit` byte, so
-    /// [`HvVcpu::run`] reaches the mapping only through this raw pointer and
-    /// never forms a Rust reference to the whole `kvm_run` (#2962).
-    run: UnsafeCell<*mut kvm_bindings::kvm_run>,
+    /// block-recycle save path) MOVE the fd, with its `kvm_run` mapping, into
+    /// the recycle pool. The None arm of [`KvmVcpu::vcpu_fd`] is unreachable in
+    /// normal operation.
+    fd: UnsafeCell<Option<KvmVcpuFd>>,
     /// This vCPU's x86 fault-table slot (its `KVM_CREATE_VCPU` id at creation;
     /// recycled vcpus carry the parked slot). Swapped alongside `fd` on reclaim.
     #[cfg(target_arch = "x86_64")]
@@ -765,7 +764,7 @@ pub struct KvmVcpu {
 }
 
 struct ParkedVcpu {
-    fd: VcpuFd,
+    fd: KvmVcpuFd,
     #[cfg(target_arch = "x86_64")]
     fault_slot: u64,
 }
@@ -801,41 +800,11 @@ impl KvmVcpu {
         self._guard = Some(vcpu_census().created());
     }
 
-    /// Only the x86_64 CPL0 carrier (`carrier_cpu`) arms a run kick.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn arm_run_kick(&mut self, kick: &crate::KvmKickHandle) {
-        // SAFETY: single-thread-owned slot; `run` is this vCPU's live mapping
-        // (see `KvmVcpuSlot::run`).
-        let run = unsafe { *self.slot.run.get() };
-        // SAFETY: only the `immediate_exit` byte is borrowed, never the whole
-        // `kvm_run`, and `arm_run` holds the window lock while it clears it.
-        // The place `(*run).immediate_exit` goes through the raw pointer, so
-        // the only reference formed is to that byte.
-        kick.arm_run(unsafe { &mut (*run).immediate_exit });
-    }
-
-    /// The `kvm_run.s.regs` mirror the kernel synced out on the last exit,
-    /// copied by a raw field read. A kick armed for this run may store the
-    /// mapping's `immediate_exit` byte at any time, so no Rust reference to
-    /// the whole `kvm_run` (as `VcpuFd::sync_regs` forms) may exist (#2962).
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn sync_regs_mirror(&self) -> kvm_bindings::kvm_sync_regs {
-        // SAFETY: `run` is this vCPU's live mapping; `s.regs` is a different
-        // field from the byte kickers store and only this thread writes it
-        // (through KVM_RUN).
-        unsafe {
-            let run = *self.slot.run.get();
-            (&raw const (*run).s.regs).read()
-        }
-    }
-    /// The live vcpu fd. Present from construction to drop (the `Option` only
-    /// exists so `Drop` can move the fd into the recycle pool); the None arm
-    /// is unreachable, kept abort-deterministic per the crate's no-panic idiom.
-    ///
-    /// `pub(crate)` so `guest_setup_x86` (Task 2) and `trap_engine_x86` (Task 3)
-    /// can call `kvm_ioctls::VcpuFd::get_regs`/`set_regs`/`get_sregs`/`set_sregs`
-    /// without going through the aarch64 `HvVcpu::reg`/`set_reg` path.
-    pub(crate) fn fd(&self) -> &VcpuFd {
+    /// The live vcpu fd with its `kvm_run` mapping. Present from construction
+    /// to drop (the `Option` only exists so `Drop` can move it into the
+    /// recycle pool); the None arm is unreachable, kept abort-deterministic per
+    /// the crate's no-panic idiom.
+    pub(crate) fn vcpu_fd(&self) -> &KvmVcpuFd {
         // SAFETY: single-thread-owned (see `KvmVcpuSlot` doc) — no concurrent
         // swap aliases this borrow. The None arm is unreachable in normal
         // operation (set transiently only between save-park and rebind, on the
@@ -850,18 +819,17 @@ impl KvmVcpu {
         })
     }
 
-    /// Mutable access for the one fd method that needs it (`VcpuFd::run`).
-    pub(crate) fn fd_mut(&mut self) -> &mut VcpuFd {
-        // SAFETY: see `fd()` — single-thread-owned; the `&mut self` receiver plus
-        // the single-owner invariant guarantees no other access aliases this.
-        let opt = unsafe { &mut *self.slot.fd.get() };
-        opt.as_mut().unwrap_or_else(|| {
-            carrick_fatal!(
-                "vmm_kvm::vcpu_fd",
-                "mutable KVM vCPU file descriptor accessed after drop-park in slot (borrowed={})",
-                self.borrowed
-            );
-        })
+    /// The live vcpu fd, for the ioctls that do not touch its `kvm_run`
+    /// mapping (`guest_setup_x86`, `trap_engine_x86`: `get_regs`/`set_regs`/
+    /// `get_sregs`/`set_sregs`, …).
+    pub(crate) fn fd(&self) -> &VcpuFd {
+        self.vcpu_fd().fd()
+    }
+
+    /// The live vcpu's `kvm_run` mapping: kicks, entry requests and the
+    /// sync-out mirror all go through it (#2962).
+    pub(crate) fn run_map(&self) -> &KvmRunMap {
+        self.vcpu_fd().run_map()
     }
 
     /// Consume a pending KVM_EXIT_IO completion without entering the guest.
@@ -869,9 +837,9 @@ impl KvmVcpu {
     /// different task image on the same physical vCPU.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn complete_pending_io_exit(&mut self) -> Result<(), OsError> {
-        self.fd_mut().set_kvm_immediate_exit(1);
+        self.run_map().set_immediate_exit(true);
         let result = HvVcpu::run(self);
-        self.fd_mut().set_kvm_immediate_exit(0);
+        self.run_map().set_immediate_exit(false);
         match result {
             Ok(VcpuExit::Kicked) => Ok(()),
             Ok(_) => Err(os_err(
@@ -972,69 +940,6 @@ impl KvmVcpu {
                 s.fs_walk[1],
                 s.fs_walk[2],
                 s.fs_walk[3]
-            ));
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn append_kvm_internal_state(&mut self, msg: &mut String) {
-        use kvm_bindings::{
-            KVM_INTERNAL_ERROR_DELIVERY_EV, KVM_INTERNAL_ERROR_EMULATION,
-            KVM_INTERNAL_ERROR_EMULATION_FLAG_INSTRUCTION_BYTES, KVM_INTERNAL_ERROR_SIMUL_EX,
-            KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON,
-        };
-
-        fn suberror_name(suberror: u32) -> &'static str {
-            match suberror {
-                KVM_INTERNAL_ERROR_EMULATION => "EMULATION",
-                KVM_INTERNAL_ERROR_SIMUL_EX => "SIMUL_EX",
-                KVM_INTERNAL_ERROR_DELIVERY_EV => "DELIVERY_EV",
-                KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON => "UNEXPECTED_EXIT_REASON",
-                _ => "UNKNOWN",
-            }
-        }
-
-        // SAFETY: single-thread-owned slot (see `KvmVcpuSlot`); its cached
-        // pointer is this vCPU's live mapping.
-        let run = unsafe { *self.slot.run.get() };
-        // SAFETY: KVM_EXIT_INTERNAL_ERROR selects the `internal` union member.
-        // Raw field reads here and below: an armed kick may still store
-        // `immediate_exit` until the caller disarms it, so no reference to the
-        // whole `kvm_run` is formed (#2962).
-        let internal = unsafe { (&raw const (*run).__bindgen_anon_1.internal).read() };
-        let ndata = internal.ndata.min(internal.data.len() as u32) as usize;
-        msg.push_str(&format!(
-            " kvm_internal={{suberror={}({}) ndata={} data={:x?}}}",
-            internal.suberror,
-            suberror_name(internal.suberror),
-            internal.ndata,
-            &internal.data[..ndata]
-        ));
-        // SAFETY: when KVM_CAP_EXIT_ON_EMULATION_FAILURE is enabled,
-        // KVM_EXIT_INTERNAL_ERROR overlays the emulation_failure union member.
-        let emulation = unsafe { (&raw const (*run).__bindgen_anon_1.emulation_failure).read() };
-        let has_insn =
-            emulation.flags & u64::from(KVM_INTERNAL_ERROR_EMULATION_FLAG_INSTRUCTION_BYTES) != 0;
-        if has_insn {
-            // SAFETY: the instruction-byte flag marks this union arm valid.
-            let insn = unsafe { emulation.__bindgen_anon_1.__bindgen_anon_1 };
-            let size = usize::from(insn.insn_size).min(insn.insn_bytes.len());
-            msg.push_str(&format!(
-                " emulation_failure={{suberror={}({}) ndata={} flags=0x{:x} insn_size={} insn_bytes={:02x?}}}",
-                emulation.suberror,
-                suberror_name(emulation.suberror),
-                emulation.ndata,
-                emulation.flags,
-                insn.insn_size,
-                &insn.insn_bytes[..size],
-            ));
-        } else {
-            msg.push_str(&format!(
-                " emulation_failure={{suberror={}({}) ndata={} flags=0x{:x}}}",
-                emulation.suberror,
-                suberror_name(emulation.suberror),
-                emulation.ndata,
-                emulation.flags,
             ));
         }
     }
@@ -1200,13 +1105,10 @@ impl KvmReclaimHandle {
         let mut fresh = fresh;
         fresh.borrowed = true;
         drop(fresh);
-        let mut fd = fd.ok_or_else(|| os_err("kvm reclaim install", "recycled vcpu had no fd"))?;
-        // No run of this fd admits kicks yet, so nothing else touches its map.
-        let run = std::ptr::from_mut(fd.get_kvm_run());
+        let fd = fd.ok_or_else(|| os_err("kvm reclaim install", "recycled vcpu had no fd"))?;
         // SAFETY: single-thread-owned; the slot is empty (park_current took it).
         unsafe {
             *self.slot.fd.get() = Some(fd);
-            *self.slot.run.get() = run;
             *self.slot.fault_slot.get() = fault_slot;
             // The installed fd belongs to a vCPU that has never exited KVM_RUN in
             // this slot's identity; its kvm_run.s.regs mirror is the previous
@@ -1462,8 +1364,8 @@ impl KvmVm {
         let parked = self.vcpu_pool.lock().ok().and_then(|mut p| p.pop());
         #[cfg(target_arch = "x86_64")]
         let fault_slot: u64;
-        let fd: VcpuFd = match parked {
-            Some(mut parked) => {
+        let vcpu_fd: KvmVcpuFd = match parked {
+            Some(parked) => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     fault_slot = parked.fault_slot;
@@ -1489,9 +1391,9 @@ impl KvmVm {
                 // overwritten OLD PC) and returns EINTR before ever entering
                 // the guest. The caller's snapshot restore then programs the
                 // real entry state onto a clean vcpu.
-                parked.fd.set_kvm_immediate_exit(1);
-                let _ = parked.fd.run(); // -EINTR; consumes any stale MMIO completion
-                parked.fd.set_kvm_immediate_exit(0);
+                parked.fd.run_map().set_immediate_exit(true);
+                let _ = parked.fd.enter(); // -EINTR; consumes any stale MMIO completion
+                parked.fd.run_map().set_immediate_exit(false);
                 parked.fd
             }
             None => {
@@ -1522,9 +1424,10 @@ impl KvmVm {
                 #[cfg(target_arch = "x86_64")]
                 self.install_x86_cpuid(&new_fd, vcpu_id)?;
                 register_vcpu_kernel_stats(&new_fd);
-                new_fd
+                KvmVcpuFd::new(new_fd)
             }
         };
+        let fd = vcpu_fd.fd();
         #[cfg(target_arch = "x86_64")]
         {
             // Carrick installs the entry state itself, without a firmware SIPI
@@ -1581,12 +1484,9 @@ impl KvmVm {
                 align_counter_to_host_monotonic(&fd)?;
             }
         }
-        let mut fd = fd;
-        let run = std::ptr::from_mut(fd.get_kvm_run());
         Ok(KvmVcpu {
             slot: Arc::new(KvmVcpuSlot {
-                fd: UnsafeCell::new(Some(fd)),
-                run: UnsafeCell::new(run),
+                fd: UnsafeCell::new(Some(vcpu_fd)),
                 #[cfg(target_arch = "x86_64")]
                 fault_slot: UnsafeCell::new(fault_slot),
                 // A just-created (or recycled) vCPU has never exited KVM_RUN, so
@@ -1806,81 +1706,10 @@ fn interrupted_run_requested(run: &carrick_hal::posix_signal_kick::CurrentThread
         || !carrick_signal_linux::proc_pending_mask().is_empty()
 }
 
-/// `KVM_RUN`, `_IO(KVMIO, 0x80)` with `KVMIO = 0xAE` (Linux KVM API, 4.10).
-/// [`HvVcpu::run`] issues it directly: `kvm_ioctls::VcpuFd::run` decodes the
-/// exit through a `&mut kvm_run` that covers `immediate_exit`, which a kicker
-/// may store concurrently while the run admits kicks (#2962).
-const KVM_RUN_REQUEST: u64 = 0xAE80;
-
-/// One completed `KVM_RUN` exit, copied out of the mapped `kvm_run` field by
-/// field, so no Rust reference to the mapping outlives (or overlaps) a kick.
-enum RawKvmExit {
-    Intr,
-    IoOut { port: u16, data: Vec<u8> },
-    MmioWrite { gpa: u64, data: [u8; 8], len: u8 },
-    Halt,
-    Debug(kvm_bindings::kvm_debug_exit_arch),
-    InternalError,
-    Other(&'static str, u32),
-}
-
-impl RawKvmExit {
-    /// # Safety
-    /// `run` is a vCPU's live `kvm_run` mapping and its last `KVM_RUN`
-    /// returned 0, so `exit_reason` names the valid union member.
-    unsafe fn read(run: *mut kvm_bindings::kvm_run) -> Self {
-        // SAFETY: the caller's contract; every access is a raw field read.
-        unsafe {
-            let reason = (&raw const (*run).exit_reason).read();
-            match reason {
-                kvm_bindings::KVM_EXIT_INTR => Self::Intr,
-                kvm_bindings::KVM_EXIT_IO => {
-                    let io = (&raw const (*run).__bindgen_anon_1.io).read();
-                    if u32::from(io.direction) != kvm_bindings::KVM_EXIT_IO_OUT {
-                        return Self::Other("IoIn", reason);
-                    }
-                    let len = usize::from(io.size) * io.count as usize;
-                    // The data lies `data_offset` bytes into the mapping,
-                    // which the kernel sized to hold it.
-                    let start = run.cast::<u8>().add(io.data_offset as usize);
-                    let mut data = vec![0_u8; len];
-                    std::ptr::copy_nonoverlapping(start, data.as_mut_ptr(), len);
-                    Self::IoOut {
-                        port: io.port,
-                        data,
-                    }
-                }
-                kvm_bindings::KVM_EXIT_MMIO => {
-                    let mmio = (&raw const (*run).__bindgen_anon_1.mmio).read();
-                    if mmio.is_write == 0 {
-                        return Self::Other("MmioRead", reason);
-                    }
-                    let len = (mmio.len as usize).min(mmio.data.len());
-                    let mut data = [0_u8; 8];
-                    data[..len].copy_from_slice(&mmio.data[..len]);
-                    Self::MmioWrite {
-                        gpa: mmio.phys_addr,
-                        data,
-                        len: len as u8,
-                    }
-                }
-                kvm_bindings::KVM_EXIT_SYSTEM_EVENT
-                | kvm_bindings::KVM_EXIT_SHUTDOWN
-                | kvm_bindings::KVM_EXIT_HLT => Self::Halt,
-                kvm_bindings::KVM_EXIT_DEBUG => {
-                    Self::Debug((&raw const (*run).__bindgen_anon_1.debug).read().arch)
-                }
-                kvm_bindings::KVM_EXIT_INTERNAL_ERROR => Self::InternalError,
-                other => Self::Other("exit", other),
-            }
-        }
-    }
-}
-
 impl KvmVcpu {
     /// The `HvVcpu` view of a completed exit, after the run's kick window
     /// closed (the diagnostics may borrow the mapping).
-    fn decode_exit(&mut self, exit: RawKvmExit) -> Result<VcpuExit, OsError> {
+    fn decode_exit(&self, exit: RawKvmExit) -> Result<VcpuExit, OsError> {
         match exit {
             RawKvmExit::Intr => Ok(VcpuExit::Kicked),
             RawKvmExit::MmioWrite { gpa, data, len } => {
@@ -1922,7 +1751,7 @@ impl KvmVcpu {
                 let mut msg = "InternalError".to_string();
                 self.append_debug_state(&mut msg);
                 #[cfg(target_arch = "x86_64")]
-                self.append_kvm_internal_state(&mut msg);
+                self.run_map().append_internal_error(&mut msg);
                 Err(os_err("unexpected KVM_RUN exit", msg))
             }
             RawKvmExit::Other(name, reason) => {
@@ -1937,76 +1766,61 @@ impl KvmVcpu {
 
 impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
-        // SAFETY: single-thread-owned (see `KvmVcpuSlot` doc); the pointers stay
-        // valid for the whole call (the slot is an Arc field of `self`, and its
-        // fd, whose mapping `run` points into, stays installed while it runs).
+        // The pointer stays valid for the whole call: the slot is an Arc field
+        // of `self` (see `KvmVcpuSlot` doc for the single-owner contract).
         #[cfg(target_arch = "x86_64")]
         let sync_stale_cell: *mut bool = self.slot.sync_regs_stale.get();
-        let run: *mut kvm_bindings::kvm_run = unsafe { *self.slot.run.get() };
+        let vcpu_fd = self.vcpu_fd();
         // Admit kicks into this run for its whole life, across re-entries
         // after external stops. A caller that armed the run keeps it. From
         // here until the guard drops a kicker may store `immediate_exit`, so
-        // the mapping is reached only through `run` (#2962).
-        // SAFETY: a field projection of the live mapping; no reference.
-        let immediate_exit: *mut u8 = unsafe { &raw mut (*run).immediate_exit };
-        // SAFETY: the kvm_run mapping belongs to this vCPU fd, which `self`
-        // keeps open for the whole call; the guard drops before return.
-        let run_window =
-            unsafe { carrick_hal::posix_signal_kick::CurrentThreadRun::open(immediate_exit) };
-        let vcpu_fd = std::os::fd::AsRawFd::as_raw_fd(self.fd());
+        // the mapping is reached only through `KvmRunMap` (#2962).
+        // SAFETY: `vcpu_fd` stays installed in `self`'s slot for the whole
+        // call, and the guard drops before return.
+        let run_window = unsafe { vcpu_fd.run_map().open_kick_window() };
         loop {
             // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell
             // can read the frame without a KVM_GET_REGS ioctl. Set before every
             // KVM_RUN attempt so an interrupted re-entry keeps sync-out armed.
             #[cfg(target_arch = "x86_64")]
             if sync_regs_supported() {
-                // SAFETY: `kvm_valid_regs` is a different field from the
-                // byte kickers store, written only by this thread.
-                unsafe {
-                    let valid = &raw mut (*run).kvm_valid_regs;
-                    valid.write(
-                        valid.read() | SyncReg::Register as u64 | SyncReg::SystemRegister as u64,
-                    );
-                }
+                vcpu_fd.run_map().request_sync_regs();
             }
             record_kvm_stat(KvmStat::Run);
-            // SAFETY: `vcpu_fd` is this vCPU's open fd and KVM_RUN takes no
-            // argument; the kernel writes the exit record into `run`.
-            let ret = unsafe { libc::ioctl(vcpu_fd, KVM_RUN_REQUEST as _, 0) };
-            if ret == 0 {
-                // SAFETY: KVM_RUN returned 0, so `run` holds a complete exit
-                // record, read field by field through the raw mapping.
-                let exit = unsafe { RawKvmExit::read(run) };
-                // A genuine guest exit repopulated kvm_run.s.regs from the live
-                // registers — the sync-out mirror is fresh again (clears any
-                // reclaim staleness).
-                #[cfg(target_arch = "x86_64")]
-                if sync_regs_supported() {
-                    unsafe { *sync_stale_cell = false }
+            match vcpu_fd.enter() {
+                Ok(exit) => {
+                    // A genuine guest exit repopulated kvm_run.s.regs from the
+                    // live registers — the sync-out mirror is fresh again
+                    // (clears any reclaim staleness).
+                    #[cfg(target_arch = "x86_64")]
+                    if sync_regs_supported() {
+                        // SAFETY: single-thread-owned scalar (see above).
+                        unsafe { *sync_stale_cell = false }
+                    }
+                    if matches!(exit, RawKvmExit::Intr) {
+                        record_kvm_stat(KvmStat::ExitKicked);
+                    } else {
+                        // The run is over: close its kick window before decoding.
+                        drop(run_window);
+                        return self.decode_exit(exit);
+                    }
                 }
-                if matches!(exit, RawKvmExit::Intr) {
-                    record_kvm_stat(KvmStat::ExitKicked);
-                } else {
-                    // The run is over: close its kick window before decoding,
-                    // so the diagnostics below may borrow the mapping.
-                    drop(run_window);
-                    return self.decode_exit(exit);
+                Err(error) => {
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        drop(run_window);
+                        let mut msg = "KVM_RUN".to_string();
+                        self.append_debug_state(&mut msg);
+                        return Err(os_err(&msg, error));
+                    }
+                    // KVM_RUN returned -EINTR without guaranteeing kvm_run.s.regs
+                    // sync-out; mark the mirror stale until the next rc == 0 exit.
+                    #[cfg(target_arch = "x86_64")]
+                    if sync_regs_supported() {
+                        // SAFETY: single-thread-owned scalar (see above).
+                        unsafe { *sync_stale_cell = true }
+                    }
+                    record_kvm_stat(KvmStat::RunEintr);
                 }
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    drop(run_window);
-                    let mut msg = "KVM_RUN".to_string();
-                    self.append_debug_state(&mut msg);
-                    return Err(os_err(&msg, error));
-                }
-                // KVM_RUN returned -EINTR without guaranteeing kvm_run.s.regs
-                // sync-out; mark the mirror stale until the next rc == 0 exit.
-                #[cfg(target_arch = "x86_64")]
-                if sync_regs_supported() {
-                    unsafe { *sync_stale_cell = true }
-                }
-                record_kvm_stat(KvmStat::RunEintr);
             }
             // Only surface `Kicked` when Carrick requested an interruption (a
             // vCPU kick, immediate_exit, carrier shutdown, or pending host
@@ -2551,13 +2365,13 @@ mod run_kick_tests {
             let kick = KvmKickHandle::for_current_thread();
             // SAFETY: the calling thread's own id.
             let tid = unsafe { libc::pthread_self() };
-            spinner.vcpu.arm_run_kick(&kick);
+            spinner.vcpu.run_map().arm_kick(&kick);
             let first = HvVcpu::run(&mut spinner.vcpu).expect("first run");
             setup_tx.send((kick.clone(), tid, first)).unwrap();
             // The scheduler's kick lands here, before the owner disarms.
             go_rx.recv().unwrap();
             kick.disarm_run();
-            spinner.vcpu.arm_run_kick(&kick);
+            spinner.vcpu.run_map().arm_kick(&kick);
             let second = HvVcpu::run(&mut spinner.vcpu);
             kick.disarm_run();
             second.expect("second run")

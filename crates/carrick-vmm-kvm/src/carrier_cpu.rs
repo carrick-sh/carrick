@@ -87,7 +87,7 @@ impl CarrierCpuBackend for KvmCpuBackend {
     }
 
     fn arm_run_kick(&mut self, kick: &Self::KickHandle) -> Result<(), TrapError> {
-        self.vcpu.arm_run_kick(kick);
+        self.vcpu.run_map().arm_kick(kick);
         Ok(())
     }
 
