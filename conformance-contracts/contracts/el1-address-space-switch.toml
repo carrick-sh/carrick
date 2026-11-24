@@ -43,6 +43,7 @@ vm_free = [
   "carrick-kernel::kernel::mm_occupancy::tests (a_published_gate_follows_the_mm_fence, a_retired_publication_is_closed_unbound_and_freed, a_zone_vcpu_moved_off_the_mm_is_drained_while_it_stays_in_guest, red with the flag-only predicate)",
   "carrick-sched-core::tests (a_pause_never_misses_an_el1_address_space_install, an_install_that_skips_the_gate_is_caught, a_closed_space_is_never_installed_again)",
   "carrick-thread::fork_quiesce::tests (a_bound_mirror_follows_the_fence)",
+  "carrick-sched-core::edit_admission_closure::{editor_admission_classifies_closure_apart_from_a_counted_pause,source_free_admission_classifies_closure_apart_from_a_counted_pause} (#2986: the editor admission reads GATE_CLOSED as Closed, never as a counted pause, with a live source and with pauses still counted; a raised pause on an open space is Gate until its release admits the editor)",
 ]
 embed = [
   "carrick-embed::el1_sched (signed; el1_sched_two_processes_share_vcpus asserts fewer than 1.0 host exits per round trip and is red with CARRICK_EL1_MM_SWITCH=0 at 6.66; el1_sched_mm_occupancy_two_processes keeps two live processes with more threads than vCPUs, mmap/mprotect/munmap editors, fork and vfork correct with EL1 switching; plus the whole el1_ suite)",

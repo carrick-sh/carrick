@@ -180,6 +180,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::tests::serial_host_file_fault_owner_wait_parks_then_reruns_fetch (#1692: owner file-fault resolution releases the exact frame mailbox, production binding parks on the authenticated owner notification, wake resumes through ResumeFaultOwner, and the faulting fetch reruns without replaying host service)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
   "carrick-runtime::vcpu_loop::binding::tests::terminal_core_capture_parks_on_another_holder_then_publishes (#1733: a Busy core capture enrols through the retained-memory wait path (a physical dependency here), blocks with nothing queued, wakes once on release and reruns; red when the enrolment is skipped)",
+  "carrick-sched-core::edit_admission_closure::{editor_admission_classifies_closure_apart_from_a_counted_pause,source_free_admission_classifies_closure_apart_from_a_counted_pause} (#2986: EditAdmissionRefusal::wait_cause is the one reading of an admission refusal for a parking caller: Editor and Gate wait on their release, Stale and Closed wait on nothing)",
 ]
 
 embed = [

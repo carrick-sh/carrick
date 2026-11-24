@@ -1761,41 +1761,6 @@ mod tests {
         assert_eq!(zone.spaces.gate(index), 0);
         assert!(access.try_begin_edit(index, 78, NonZeroU64::MIN).is_some());
     }
-    /// #2986: with a live notification source and a matching key, a counted
-    /// pause is "not now" until its release lowers it, and a closed gate is
-    /// its own refusal, with or without a pause still counted under it.
-    #[test]
-    fn editor_admission_classifies_closure_apart_from_a_counted_pause() {
-        use super::super::EditAdmissionRefusal;
-        let zone = zone();
-        let entry = admitted(&zone);
-        let index = entry.index();
-        let access = access(&zone);
-        access.open(index);
-        let admit = || {
-            zone.spaces
-                .try_begin_edit_cause(index, 77, NonZeroU64::MIN, access.venue())
-                .map(drop)
-        };
-        let pause = access.try_exclude_editor(index, 77).unwrap();
-        assert_eq!(admit(), Err(EditAdmissionRefusal::Gate));
-        assert_eq!(
-            EditAdmissionRefusal::Gate.wait_cause(),
-            Some(SpaceWaitCause::Gate)
-        );
-        drop(pause);
-        assert_eq!(admit(), Ok(()), "the lowered pause admits the editor");
-
-        let pause = access.try_exclude_editor(index, 77).unwrap();
-        zone.spaces.close(index);
-        assert!(entry.notifications(NonZeroU64::MIN).is_ok(), "source live");
-        assert_eq!(admit(), Err(EditAdmissionRefusal::Closed));
-        drop(pause);
-        assert_eq!(zone.spaces.gate(index), super::super::GATE_CLOSED);
-        assert_eq!(admit(), Err(EditAdmissionRefusal::Closed));
-        assert_eq!(EditAdmissionRefusal::Closed.wait_cause(), None);
-        assert_eq!(EditAdmissionRefusal::Stale.wait_cause(), None);
-    }
     #[test]
     fn exclusion_retains_notification_custody_through_source_closure() {
         let zone = zone();
