@@ -999,7 +999,7 @@ pub(crate) fn test_carrier_custody() -> TestCarrierCustody {
 }
 
 /// A test's carrier custody, destroyed through the production VM teardown
-/// (`begin_destroy` then `commit_destroy`) when the test ends.
+/// sequence ([`destroy_vm_with_custody_target_using`]) when the test ends.
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct TestCarrierCustody(std::sync::Arc<CarrierVmCustody>);
 
@@ -1013,16 +1013,34 @@ impl std::ops::Deref for TestCarrierCustody {
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+impl TestCarrierCustody {
+    /// Destroy the fixture's carrier VM through the production teardown
+    /// sequence. The fixture never created a hardware VM of its own, so
+    /// `outcome` stands in for the backend's destroy: success commits the
+    /// teardown, and a failure restores the exact live custody.
+    pub(crate) fn destroy_vm(
+        &self,
+        outcome: carrick_aarch64::stage2::Stage2Status,
+    ) -> Result<(), TrapError> {
+        destroy_vm_with_custody_target_using(
+            &self.0,
+            "test carrier custody",
+            CarrierVmDestroyTarget::Live,
+            || outcome,
+            // The fixture never counted a hardware VM as live.
+            || {},
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 impl Drop for TestCarrierCustody {
     fn drop(&mut self) {
         // A test that destroyed (or never kept) its VM owns that outcome.
-        let CarrierVmLifecycle::Live(generation) = self.0.state.lock().lifecycle else {
+        if self.0.live_generation().is_none() {
             return;
-        };
-        let destroyed = self
-            .0
-            .begin_destroy(generation)
-            .and_then(|()| self.0.commit_destroy(generation));
+        }
+        let destroyed = self.destroy_vm(carrick_aarch64::stage2::Stage2Status::SUCCESS);
         if !std::thread::panicking() {
             assert!(
                 destroyed.is_ok(),

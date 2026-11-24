@@ -1752,6 +1752,8 @@ pub(crate) fn create_vm_with_custody_using<T>(
     }
 }
 
+/// Test form of [`destroy_vm_with_custody`]: the production teardown
+/// sequence, with `destroy` standing in for the backend's VM destroy.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 pub(crate) fn destroy_vm_with_custody_using(
@@ -1760,28 +1762,13 @@ pub(crate) fn destroy_vm_with_custody_using(
     destroy: impl FnOnce() -> carrick_aarch64::stage2::Stage2Status,
     record_released: impl FnOnce(),
 ) -> Result<(), TrapError> {
-    let generation = custody.live_generation().ok_or_else(|| {
-        TrapError::Hypervisor(format!(
-            "{context}: carrier VM custody has no live generation"
-        ))
-    })?;
-    custody
-        .begin_destroy(generation)
-        .map_err(|error| custody_transition_error(context, "begin_destroy", error))?;
-    let rc = destroy();
-    if rc != 0 {
-        custody
-            .abort_destroy(generation)
-            .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
-        return Err(TrapError::Hypervisor(format!(
-            "{context}: hv_vm_destroy rc={rc:#x}"
-        )));
-    }
-    custody
-        .commit_destroy(generation)
-        .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
-    record_released();
-    Ok(())
+    destroy_vm_with_custody_target_using(
+        custody,
+        context,
+        CarrierVmDestroyTarget::Live,
+        destroy,
+        record_released,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1804,6 +1791,29 @@ pub(crate) fn destroy_vm_with_custody_target(
     custody: &CarrierVmCustody,
     context: &str,
     target: CarrierVmDestroyTarget,
+) -> Result<(), TrapError> {
+    destroy_vm_with_custody_target_using(
+        custody,
+        context,
+        target,
+        // SAFETY: the sequence calls this only once custody is Destroying
+        // (or holds the exact Creating generation), so no vCPU of the VM runs.
+        || unsafe { inventory_stage2_destroy(custody.stage2_backend()) },
+        record_vm_released,
+    )
+}
+
+/// The one carrier VM teardown sequence: claim the generation, destroy the
+/// VM's stage 2, then commit custody, or restore it if the destroy failed.
+/// `destroy` is the backend's VM destroy; `record_released` runs once a Live
+/// generation's destroy commits.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn destroy_vm_with_custody_target_using(
+    custody: &CarrierVmCustody,
+    context: &str,
+    target: CarrierVmDestroyTarget,
+    destroy: impl FnOnce() -> carrick_aarch64::stage2::Stage2Status,
+    record_released: impl FnOnce(),
 ) -> Result<(), TrapError> {
     let generation = match target {
         CarrierVmDestroyTarget::Live => {
@@ -1828,7 +1838,7 @@ pub(crate) fn destroy_vm_with_custody_target(
         }
     };
 
-    let rc = unsafe { inventory_stage2_destroy(custody.stage2_backend()) };
+    let rc = destroy();
     if rc != 0 {
         if matches!(target, CarrierVmDestroyTarget::Live) {
             custody
@@ -1849,7 +1859,7 @@ pub(crate) fn destroy_vm_with_custody_target(
             custody
                 .commit_destroy(generation)
                 .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
-            record_vm_released();
+            record_released();
             Ok(())
         }
         CarrierVmDestroyTarget::Creating(_) => custody
@@ -2066,67 +2076,129 @@ mod carrier_vm_custody_tests {
         );
     }
 
+    /// A test carrier's custody tears down through the production sequence
+    /// (#2968 review, P0 2): a failed backend destroy restores the exact live
+    /// custody with its records untouched, and a successful one terminalizes
+    /// them and leaves the custody vacant.
+    #[test]
+    fn test_carrier_custody_tears_down_through_the_production_destroy() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = crate::trap::test_carrier_custody();
+        let generation = custody.live_generation().expect("a live fixture");
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 1))
+            .expect("admit a mapped record");
+        let terminalized = |custody: &CarrierVmCustody| {
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .expect("the record stays in custody")
+                .terminalized_by_vm_destroy
+        };
+
+        let refused =
+            custody.destroy_vm(carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001));
+        assert!(refused.is_err(), "a failed destroy reports: {refused:?}");
+        assert_eq!(
+            custody.live_generation(),
+            Some(generation),
+            "a failed destroy restores the exact live custody"
+        );
+        assert!(
+            !terminalized(&custody),
+            "a failed destroy leaves its records live"
+        );
+
+        custody
+            .destroy_vm(carrick_aarch64::stage2::Stage2Status::SUCCESS)
+            .expect("a successful destroy commits");
+        assert_eq!(custody.live_generation(), None, "the custody is vacant");
+        assert!(
+            terminalized(&custody),
+            "the destroy terminalizes its records"
+        );
+    }
+
     /// Two live threads, each with its own test task, publish an owner at the
     /// same global-frame key through the task's held custody. Each task's
     /// custody holds exactly its own owner, so tests that run in parallel no
     /// longer share one record table (#1236, M2c of the custody move).
+    ///
+    /// No worker ever waits on the other: a worker that fails returns its
+    /// error and ends, so a regression reports instead of hanging. The main
+    /// thread releases both publications at once and inspects both custodies
+    /// while both owners are live.
     #[test]
     fn two_threads_publish_through_distinct_task_custodies() {
         let key = (0xa082_0000_0000, 0x4000);
-        let both_published = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut starts = Vec::new();
         let workers: Vec<_> = (0..2)
             .map(|_| {
-                let both_published = std::sync::Arc::clone(&both_published);
-                std::thread::spawn(move || {
-                    let custody = crate::trap::test_carrier_custody();
-                    let task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
-                    let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                        key.1 as usize,
-                        crate::host_mapping::HostMappingKind::PerMmKernelState,
-                    )
-                    .expect("allocate task-local owner backing");
-                    let host_addr = mapping.as_ptr() as usize;
-                    let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-                    lease.mark_test_mapped_without_backend();
-                    super::register_global_frame_host_owner_in(
-                        &task.stage2.custody_arc(),
-                        lease,
-                        mapping,
-                        carrick_aarch64::stage2::stage2_perms_bits(
-                            carrick_hal::MemPerms::ReadWrite,
-                        ),
-                    )
-                    .expect("each task's custody admits its own owner at the shared key");
-                    // Both owners are live at the same key before either looks.
-                    both_published.wait();
-                    let identity = super::global_frame_host_owner_identity_in(
-                        task.stage2.custody(),
-                        key.0,
-                        key.1,
-                    )
-                    .expect("the task's custody holds its owner");
-                    assert_eq!(identity.0, host_addr, "the custody holds this task's owner");
-                    assert_eq!(
-                        task.stage2.custody().global_frame_host_owners.lock().len(),
-                        1
-                    );
-                    both_published.wait();
-                    (
-                        std::sync::Arc::as_ptr(&task.stage2.custody_arc()) as usize,
-                        host_addr,
-                    )
-                })
+                let (start, started) = std::sync::mpsc::channel::<()>();
+                starts.push(start);
+                std::thread::spawn(
+                    move || -> Result<(crate::trap::TestCarrierCustody, usize), String> {
+                        let custody = crate::trap::test_carrier_custody();
+                        let task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
+                        if !std::sync::Arc::ptr_eq(&task.stage2.custody_arc(), &*custody) {
+                            return Err("the task must hold the fixture's custody".to_owned());
+                        }
+                        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                            key.1 as usize,
+                            crate::host_mapping::HostMappingKind::PerMmKernelState,
+                        )
+                        .map_err(|error| format!("allocate task-local owner backing: {error}"))?;
+                        let host_addr = mapping.as_ptr() as usize;
+                        let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
+                        lease.mark_test_mapped_without_backend();
+                        // Released by the main thread, or by its sender's
+                        // drop: never by the other worker.
+                        let _ = started.recv();
+                        super::register_global_frame_host_owner_in(
+                            &task.stage2.custody_arc(),
+                            lease,
+                            mapping,
+                            carrick_aarch64::stage2::stage2_perms_bits(
+                                carrick_hal::MemPerms::ReadWrite,
+                            ),
+                        )
+                        .map_err(|error| {
+                            format!("each task's custody admits its own owner at the shared key: {error}")
+                        })?;
+                        Ok((custody, host_addr))
+                    },
+                )
             })
             .collect();
-        let results: Vec<_> = workers
+        for start in starts {
+            let _ = start.send(());
+        }
+        let published: Vec<_> = workers
             .into_iter()
-            .map(|worker| worker.join().expect("worker thread"))
+            .map(|worker| match worker.join() {
+                Ok(Ok(published)) => published,
+                Ok(Err(error)) => panic!("worker failed: {error}"),
+                Err(_) => panic!("worker panicked"),
+            })
             .collect();
-        assert_ne!(
-            results[0].0, results[1].0,
+
+        // Both owners are live at the same key while each custody is read.
+        for (custody, host_addr) in &published {
+            let identity = super::global_frame_host_owner_identity_in(custody, key.0, key.1)
+                .expect("the task's custody holds its owner");
+            assert_eq!(
+                identity.0, *host_addr,
+                "the custody holds this task's owner"
+            );
+            assert_eq!(custody.global_frame_host_owners.lock().len(), 1);
+        }
+        assert!(
+            !std::sync::Arc::ptr_eq(&*published[0].0, &*published[1].0),
             "each task holds its own custody"
         );
-        assert_ne!(results[0].1, results[1].1, "each owner has its own backing");
+        assert_ne!(
+            published[0].1, published[1].1,
+            "each owner has its own backing"
+        );
     }
 
     #[test]
