@@ -1368,6 +1368,78 @@ impl SettlementNeed {
     }
 }
 
+/// One reprobe of a parked anonymous call, shared by the ARM and x86
+/// venues: reread the exact MM's reservation root and the call's decision,
+/// then its page-table editor admission. `Some(None)` reruns the call,
+/// `Some(Some(cause))` parks it on that release source, and `None` refuses
+/// it (nothing a release could change). The caller has taken any owed
+/// settlement doorbell first.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_parked_anonymous_edit<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &(impl AnonymousCallView + ?Sized),
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    index: carrick_sched_core::spaces::SpaceIndex,
+    mm: carrick_el1_abi::ReservationMm,
+    slot: u32,
+    origin: ServiceOrigin,
+    metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+) -> Option<Option<SpaceWaitCause>> {
+    // The editor word names the executing slot, as every admission does.
+    let owner = NonZeroU64::new(u64::from(slot) + 1)?;
+    let mut root = match table.lock_in(spaces, index.index(), mm, slot) {
+        Ok(root) => root,
+        Err(reservations::Refusal::Busy) => return Some(Some(SpaceWaitCause::Reservations)),
+        Err(_) => return None,
+    };
+    match decide_reservation_syscall_for_origin(frame, current, &mut root, None, origin) {
+        ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
+            return Some(Some(SpaceWaitCause::PreparedOverlap));
+        }
+        ReservationDisposition::Unavailable(reservations::Refusal::Busy) => {
+            // An owed overlap with no settlement in flight reruns (behind
+            // the editor probe) and drives one itself.
+            if let Some(cause) = busy_root_cause(&root) {
+                return Some(Some(cause));
+            }
+        }
+        ReservationDisposition::Unavailable(reservations::Refusal::MetadataRequired) => {
+            if root.provision_metadata(metadata).is_err() {
+                return None;
+            }
+            return Some(None);
+        }
+        ReservationDisposition::Unavailable(_) => return None,
+        ReservationDisposition::Work(pending) => {
+            if pending.cancel(&mut root).is_err() {
+                return None;
+            }
+        }
+        ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
+    }
+    drop(root);
+    match spaces
+        .table()
+        .try_begin_edit_cause(index, mm.raw(), owner, spaces.venue())
+    {
+        Ok(editor) => {
+            drop(editor);
+            Some(None)
+        }
+        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
+            Some(Some(SpaceWaitCause::Editor))
+        }
+        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
+            Some(Some(SpaceWaitCause::Gate))
+        }
+        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
+    }
+}
+
 /// How a parked anonymous call's reprobe reads a `Busy` root: a pending edit
 /// or fork waits for `PendingEdit`; an owed overlap waits for the in-flight
 /// settlement's `Reservations` release, or, with no settlement in flight,

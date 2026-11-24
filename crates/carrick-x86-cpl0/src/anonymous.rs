@@ -330,7 +330,6 @@ impl X86AnonymousVenue<'_> {
             EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait,
             park_object_record_rechecked, space_access,
         };
-        use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall_for_origin};
         use carrick_sched_core::Waker;
         let zone = self.source.zone;
         let slot = self.source.slot;
@@ -345,7 +344,6 @@ impl X86AnonymousVenue<'_> {
         }
         let index = zone.spaces.find(mm.raw())?;
         let access = space_access(zone, slot, crate::native_process::release);
-        let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
         // Take the retained operation only now that this call is an anonymous
         // edit: any other syscall's operation (a timed poll's park) stays on
         // its record for the call's own owner to resume.
@@ -387,62 +385,17 @@ impl X86AnonymousVenue<'_> {
                     )
                     .edit_probe(&mut holder);
                 }
-                let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
-                    Ok(root) => root,
-                    Err(carrick_el1::memory::reservations::Refusal::Busy) => {
-                        return Some(Some(SpaceWaitCause::Reservations));
-                    }
-                    Err(_) => return None,
-                };
-                match decide_reservation_syscall_for_origin(frame, task, &mut root, None, origin) {
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::PreparedConflict,
-                    ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::Busy,
-                    ) => {
-                        // An owed overlap with no settlement in flight
-                        // reruns (behind the editor probe) and drives one.
-                        if let Some(cause) = carrick_el1::memory::busy_root_cause(&root) {
-                            return Some(Some(cause));
-                        }
-                    }
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                    ) => {
-                        if root
-                            .provision_metadata(&carrick_el1::alloc::GLOBAL_ALLOCATOR)
-                            .is_err()
-                        {
-                            return None;
-                        }
-                        return Some(None);
-                    }
-                    ReservationDisposition::Unavailable(_) => return None,
-                    ReservationDisposition::Work(pending) => {
-                        if pending.cancel(&mut root).is_err() {
-                            return None;
-                        }
-                    }
-                    ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
-                }
-                drop(root);
-                match zone
-                    .spaces
-                    .try_begin_edit_cause(index, mm.raw(), owner, access.venue())
-                {
-                    Ok(editor) => {
-                        drop(editor);
-                        Some(None)
-                    }
-                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
-                        Some(Some(SpaceWaitCause::Editor))
-                    }
-                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
-                        Some(Some(SpaceWaitCause::Gate))
-                    }
-                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
-                }
+                carrick_el1::memory::probe_parked_anonymous_edit(
+                    frame,
+                    task,
+                    access,
+                    table,
+                    index,
+                    mm,
+                    slot.index() as u32,
+                    origin,
+                    &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                )
             },
             |key, snapshot, token| {
                 let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
