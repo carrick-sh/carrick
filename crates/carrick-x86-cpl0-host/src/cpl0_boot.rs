@@ -2736,10 +2736,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         Ok(binding.task())
     }
 
-    /// Whether the loaded CPU currently stands at a user-mode boundary of the
-    /// host root lease's own leader thread (not on `maintenance_root`, an
-    /// in-zone forked child, a `CLONE_THREAD` member sharing the root CR3, or
-    /// CPL0 supervisor code).
+    /// Whether a reschedule may save the host root lease here: the loaded
+    /// CPU stands on the lease's root ([`CarrierCpu::can_save_loaded`]), in
+    /// user mode or in CPL0 supervisor code, and the CPL0 execution issued on
+    /// this slot is the lease's own leader thread. A `CLONE_THREAD` member
+    /// sharing the root, a forked child or the maintenance root never stands
+    /// in for the leader's saved image (#2962). Every save the executor
+    /// starts for a reschedule, after a kick or after a completed crossing,
+    /// checks this one rule.
     pub fn can_save_loaded_leader(
         &self,
         task: carrick_guest_arch::TaskIdentity,
