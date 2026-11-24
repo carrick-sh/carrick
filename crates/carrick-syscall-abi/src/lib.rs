@@ -394,6 +394,10 @@ pub enum LinuxCpuSample {
 }
 
 /// One CPU-time clock.
+///
+/// The id's pid field is private: a venue reaches the task a clock reads
+/// only through [`LinuxCpuClock::owner`], which applies Linux's caller rule,
+/// so no venue can resolve the caller's own tid as some other process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinuxCpuClock {
     /// A thread's clock, not its process's.
@@ -401,7 +405,50 @@ pub struct LinuxCpuClock {
     pub sample: LinuxCpuSample,
     /// The pid or tid a dynamic id names. `None` names the caller: the
     /// static ids, and a dynamic id whose pid field is 0.
-    pub target: Option<core::num::NonZeroU32>,
+    target: Option<core::num::NonZeroU32>,
+}
+
+/// The task a CPU clock reads, resolved against the calling thread's tid in
+/// its own pid namespace ([`LinuxCpuClock::owner`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxCpuClockOwner {
+    /// The calling thread: the static `CLOCK_THREAD_CPUTIME_ID`, a
+    /// per-thread id with pid field 0, or one naming the caller's own tid.
+    CallerThread,
+    /// The calling thread's process: the static `CLOCK_PROCESS_CPUTIME_ID`,
+    /// a process id with pid field 0, or one naming the caller's own tid,
+    /// leader or not.
+    CallerProcess,
+    /// Another thread by tid. It reads only a live thread of the caller's
+    /// own thread group; any other tid is EINVAL.
+    Thread(core::num::NonZeroU32),
+    /// Another process by pid: a thread-group leader, live or an unreaped
+    /// zombie. Any other tid, a sibling's non-leader tid included, is EINVAL.
+    Process(core::num::NonZeroU32),
+}
+
+impl LinuxCpuClock {
+    /// The id names its caller without a tid: a static CPU-time id, or a
+    /// dynamic id whose pid field is 0.
+    pub const fn names_caller_implicitly(self) -> bool {
+        self.target.is_none()
+    }
+
+    /// The task this clock reads when `caller_tid` asks.
+    ///
+    /// Linux (clock_gettime(2), clock_getcpuclockid(3); a native Linux 6.12
+    /// x86_64 probe): a process clock encoded with the caller's own tid reads
+    /// the caller's process, even from a non-leader thread, where
+    /// `clock_getcpuclockid(3)` refuses that tid with ESRCH. The same tid
+    /// from any other thread names no process and is EINVAL.
+    pub const fn owner(self, caller_tid: core::num::NonZeroU32) -> LinuxCpuClockOwner {
+        match (self.target, self.per_thread) {
+            (Some(tid), true) if tid.get() != caller_tid.get() => LinuxCpuClockOwner::Thread(tid),
+            (Some(pid), false) if pid.get() != caller_tid.get() => LinuxCpuClockOwner::Process(pid),
+            (_, true) => LinuxCpuClockOwner::CallerThread,
+            (_, false) => LinuxCpuClockOwner::CallerProcess,
+        }
+    }
 }
 
 /// Classify a `clockid_t` as Linux does for `clock_gettime(2)`, or `None`
@@ -863,6 +910,34 @@ mod clock_read_tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn a_cpu_clock_naming_the_callers_own_tid_reads_the_caller() {
+        use LinuxCpuClockOwner as O;
+        let cpu = |id| match linux_clock_read(id) {
+            Some(LinuxClockRead::Cpu(cpu)) => cpu,
+            other => panic!("clock id {id:#x} read {other:?}"),
+        };
+        let worker = NonZeroU32::new(43).unwrap();
+        let leader = NonZeroU32::new(42).unwrap();
+        // A non-leader's own tid as a process clock names its process,
+        // exactly as its tgid and pid field 0 do.
+        assert_eq!(cpu(dynamic(43, 2)).owner(worker), O::CallerProcess);
+        assert_eq!(cpu(dynamic(0, 2)).owner(worker), O::CallerProcess);
+        assert_eq!(cpu(dynamic(42, 2)).owner(worker), O::Process(leader));
+        // The same tid from another thread names no process.
+        assert_eq!(cpu(dynamic(43, 2)).owner(leader), O::Process(worker));
+        assert_eq!(cpu(dynamic(43, 6)).owner(worker), O::CallerThread);
+        assert_eq!(cpu(dynamic(43, 6)).owner(leader), O::Thread(worker));
+        assert_eq!(
+            cpu(LINUX_CLOCK_PROCESS_CPUTIME_ID).owner(worker),
+            O::CallerProcess
+        );
+        assert_eq!(
+            cpu(LINUX_CLOCK_THREAD_CPUTIME_ID).owner(worker),
+            O::CallerThread
+        );
     }
 
     #[test]

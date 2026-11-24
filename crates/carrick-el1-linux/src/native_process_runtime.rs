@@ -9805,45 +9805,46 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         &mut self,
         clock: carrick_syscall_abi::LinuxCpuClock,
     ) -> Option<Result<u64, carrick_syscall_abi::LinuxErrno>> {
-        use carrick_syscall_abi::{LINUX_EINVAL, LinuxCpuSample};
+        use carrick_syscall_abi::{LINUX_EINVAL, LinuxCpuClockOwner as Owner, LinuxCpuSample};
+        let owner = clock.owner(core::num::NonZeroU32::new(self.calling_tid)?);
         let (frequency, now) = self.cpu_clock()?;
         let graph = self.runtime.graph.lock();
-        if clock.per_thread {
-            // A thread clock reads the caller, or a live thread of the
-            // caller's own thread group; any other tid is EINVAL natively.
-            let record = match clock.target {
-                None => self.record,
-                Some(tid) => {
-                    let caller = graph.owner.task(self.key).ok()?;
-                    match caller.native().resources().live_signal_member(
-                        self.key,
-                        caller.metadata().namespace_pid,
-                        self.source.zone,
-                        tid.get(),
-                    ) {
-                        Some((record, _)) => record,
-                        None => return Some(Err(LINUX_EINVAL)),
-                    }
-                }
-            };
-            drop(graph);
-            let zone = self.source.zone;
-            let ticks = zone.sample_record_cpu_ticks(record, Some(now));
-            return Some(Ok(match clock.sample {
-                LinuxCpuSample::Virt => ticks.user_nanos(frequency),
-                LinuxCpuSample::Prof | LinuxCpuSample::Sched => {
-                    zone.ratchet_record_cpu_ns(record, ticks.total_nanos(frequency))
-                }
-            }));
-        }
-        // A process clock names a process by its pid (a thread-group leader,
-        // live or a zombie not yet reaped); a non-leader tid is EINVAL.
-        let key = match clock.target {
-            None => self.key,
-            Some(pid) => match graph.owner.namespace_key(self.key, pid.get()).ok()? {
+        let key = match owner {
+            Owner::CallerProcess => self.key,
+            // Another process is named by its pid (a thread-group leader,
+            // live or a zombie not yet reaped); a non-leader tid is EINVAL.
+            Owner::Process(pid) => match graph.owner.namespace_key(self.key, pid.get()).ok()? {
                 Some(key) => key,
                 None => return Some(Err(LINUX_EINVAL)),
             },
+            Owner::CallerThread | Owner::Thread(_) => {
+                let record = match owner {
+                    Owner::Thread(tid) => {
+                        // A live thread of the caller's own thread group; any
+                        // other tid is EINVAL natively.
+                        let caller = graph.owner.task(self.key).ok()?;
+                        match caller.native().resources().live_signal_member(
+                            self.key,
+                            caller.metadata().namespace_pid,
+                            self.source.zone,
+                            tid.get(),
+                        ) {
+                            Some((record, _)) => record,
+                            None => return Some(Err(LINUX_EINVAL)),
+                        }
+                    }
+                    _ => self.record,
+                };
+                drop(graph);
+                let zone = self.source.zone;
+                let ticks = zone.sample_record_cpu_ticks(record, Some(now));
+                return Some(Ok(match clock.sample {
+                    LinuxCpuSample::Virt => ticks.user_nanos(frequency),
+                    LinuxCpuSample::Prof | LinuxCpuSample::Sched => {
+                        zone.ratchet_record_cpu_ns(record, ticks.total_nanos(frequency))
+                    }
+                }));
+            }
         };
         let (user, system) = if let Some(task) = graph
             .owner

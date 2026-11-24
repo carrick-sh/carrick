@@ -545,19 +545,22 @@ ring's `clock_gettime`:
 A CPU clock id is `~pid << 3 | bits` (clock_getcpuclockid(3),
 pthread_getcpuclockid(3)): bit 2 asks for a thread's clock, the low two bits
 for PROF (user plus system), VIRT (user only) or SCHED (run time; Carrick's
-user plus system). The task owner resolves the target on each path: the ring's
-native process graph (`NativeProcessEntry::cpu_clock_nanos`, one
-implementation for ARM and x86) and the host dispatcher's kernel graph
-(`dispatch::time::cpu_clock_ns`). A native Linux 6.12 x86_64 probe fixes the
-answers:
+user plus system). One shared resolver, `LinuxCpuClock::owner` in
+carrick-syscall-abi, names the owner against the calling thread's tid; the id's
+pid field is private, so no venue can read a target without it. The task owner
+then resolves that owner on each path: the ring's native process graph
+(`NativeProcessEntry::cpu_clock_nanos`, one implementation for ARM and x86) and
+the host dispatcher's kernel graph (`dispatch::time::cpu_clock_ns`). A native
+Linux 6.12 x86_64 probe fixes the answers:
 
 | target | answer |
 | --- | --- |
 | pid 0, or a static id | the caller |
+| a process clock naming the caller's own tid, leader or not | the caller's process |
 | a process clock naming a live process's pid | that process's time |
 | a process clock naming an unreaped zombie | its final time |
 | a process clock naming a reaped or missing pid | EINVAL |
-| a process clock naming a non-leader tid | EINVAL |
+| a process clock naming another thread's non-leader tid | EINVAL |
 | a thread clock naming a live thread of the caller's thread group | that thread's time |
 | a thread clock naming another process's thread, or an exited thread | EINVAL |
 
@@ -579,9 +582,19 @@ The KVM witness `serial_host_native_cpu_clocks_read_the_named_task`
 (`native_cpu_clock_owners.S`, run natively first as the oracle) checks
 MONOTONIC and BOOTTIME across a fork (root T0 <= child T1 <= root T2), a busy
 child against its idle parent and back, a zombie's final time, a reaped and
-a missing pid, and a busy worker thread against its parked sibling. The host
-dispatcher's witness `clock_gettime_cpu_clocks_read_their_target_and_sample`
-covers the sample selection and a missing target; its fixture has one task.
+a missing pid, and a busy worker thread against its parked sibling; the
+worker, a non-leader, reads its process clock by its own tid and by its
+leader's pid as the group's time, at least the root's 20 ms over its own
+thread clock. The host dispatcher's witness
+`clock_gettime_cpu_clocks_read_their_target_and_sample` covers the sample
+selection and a missing target with one task. The non-leader's own tid has a
+witness on each path: ARM
+`born_thread_entry_tests::arm_non_leader_process_clock_by_its_own_tid_reads_its_group`
+(a native fork child's sibling reads 35 ms for its group by its own tid, its
+leader's pid and pid 0, 5 ms for its thread, and the leader asking for the
+sibling's tid as a process gets EINVAL) and the host dispatcher's
+`clock_gettime_non_leader_process_clock_by_its_own_tid_reads_its_group`
+(8 ms of group user time against the sibling's 3 ms).
 
 The TAI offset is fixed at 0. Linux can expose a nonzero offset (`adjtimex`
 `ADJ_TAI`); Carrick has no TAI offset authority yet, and the KVM fixture's
