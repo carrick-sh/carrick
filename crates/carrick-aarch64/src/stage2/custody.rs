@@ -84,6 +84,10 @@ pub enum Stage2CustodyError {
     GenerationExhausted,
     /// The backend refused the raw destroy; the exact lifecycle is kept.
     Backend(Stage2Status),
+    /// The stage 2 is gone, but the backend's own settlement of it (grants,
+    /// pools) could not finish; the generation stays `Gone`, admitting no
+    /// successor.
+    UnsettledAfterDestroy,
 }
 
 /// The stage 2 of the asked-for generation no longer exists (or never did):
@@ -143,6 +147,14 @@ impl<R> Stage2CustodyState<R> {
     /// The lifecycle, read under the lock.
     pub fn lifecycle(&self) -> Stage2Lifecycle {
         self.lifecycle
+    }
+
+    /// Forge the lifecycle, so a test can show a check failing closed for
+    /// one exact reason (test builds only; production moves it only through
+    /// the custody's transitions).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_lifecycle_for_test(&mut self, lifecycle: Stage2Lifecycle) {
+        self.lifecycle = lifecycle;
     }
 
     /// How many unretired mappings the custody still holds.

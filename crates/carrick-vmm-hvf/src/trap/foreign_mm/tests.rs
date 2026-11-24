@@ -5472,9 +5472,9 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
         "a structural generation without its exact owner Arc must fail closed",
     );
     {
-        let mut state = transport.custody.state.lock();
-        state.lifecycle = CarrierVmLifecycle::Creating(CarrierVmGeneration(
-            identity.vm_generation.0.wrapping_add(1),
+        let mut state = transport.custody.stage2.lock();
+        state.set_lifecycle_for_test(carrick_aarch64::stage2::custody::Stage2Lifecycle::Creating(
+            CarrierVmGeneration(identity.vm_generation.0.wrapping_add(1)),
         ));
     }
     assert!(
@@ -5483,8 +5483,10 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
         "a structural owner outside its custody generation must fail closed",
     );
     {
-        let mut state = transport.custody.state.lock();
-        state.lifecycle = CarrierVmLifecycle::Live(identity.vm_generation);
+        let mut state = transport.custody.stage2.lock();
+        state.set_lifecycle_for_test(carrick_aarch64::stage2::custody::Stage2Lifecycle::Live(
+            identity.vm_generation,
+        ));
         state
             .stage2_records
             .get_mut(&identity.record_id)
@@ -5498,7 +5500,7 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
         "a terminal structural custody record must fail closed",
     );
     {
-        let mut state = transport.custody.state.lock();
+        let mut state = transport.custody.stage2.lock();
         state
             .stage2_records
             .get_mut(&identity.record_id)

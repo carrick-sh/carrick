@@ -946,6 +946,7 @@ mod allocator_stats_tests {
             }
             let generation = custody.setup_generation().unwrap();
             custody.begin_destroy(generation).unwrap();
+            custody.destroy_stage2_for_test(generation);
             custody.commit_destroy(generation).unwrap();
             finalize_carrier_exit_global_frame_owners_in_using(
                 &custody,

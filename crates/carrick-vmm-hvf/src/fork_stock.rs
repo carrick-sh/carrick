@@ -458,7 +458,7 @@ impl ForkStockHostCustody {
         let identity = custody
             .stage2_record_covering(address, core::mem::size_of::<T>())
             .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
-        let state = custody.state.lock();
+        let state = custody.stage2.lock();
         let record = state
             .stage2_records
             .get(&identity.record_id)

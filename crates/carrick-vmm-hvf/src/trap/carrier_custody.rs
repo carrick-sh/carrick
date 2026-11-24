@@ -9,6 +9,9 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
+use carrick_aarch64::stage2::custody::{
+    Stage2Custody, Stage2CustodyError, Stage2CustodyState, Stage2Lifecycle,
+};
 use carrick_aarch64::vmm::VcpuDestroyError;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -275,43 +278,10 @@ pub(crate) use carrick_core::mm::retirement::{
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) enum CarrierVmCustodyError {
-    LifecycleConflict,
-    StaleGeneration,
-    GenerationExhausted,
-    UnsettledPhysicalGrants,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) enum CarrierVmLifecycle {
-    Vacant,
-    Creating(CarrierVmGeneration),
-    Live(CarrierVmGeneration),
-    Destroying(CarrierVmGeneration),
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) struct CarrierVmCustodyState {
-    pub(crate) next_generation: u64,
-    pub(crate) lifecycle: CarrierVmLifecycle,
+/// The carrier's stage-2 records, held under its [`Stage2Custody`]'s
+/// lifecycle lock (the custody owns the lifecycle and the generation).
+pub(crate) struct CarrierStage2Records {
     pub(crate) next_stage2_record_id: u64,
     pub(crate) next_logical_owner_id: u64,
     pub(crate) next_logical_owner_generation: u64,
@@ -324,7 +294,7 @@ pub(crate) struct CarrierVmCustodyState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CarrierVmCustodyState {
+impl CarrierStage2Records {
     fn index_record(&mut self, id: CarrierStage2RecordId, ipa: u64, len: usize) {
         self.stage2_extent_index
             .entry((ipa, len as u64))
@@ -332,7 +302,10 @@ impl CarrierVmCustodyState {
             .insert(id);
     }
 
-    fn remove_record(&mut self, id: CarrierStage2RecordId) -> Option<CarrierStage2Record> {
+    pub(crate) fn remove_record(
+        &mut self,
+        id: CarrierStage2RecordId,
+    ) -> Option<CarrierStage2Record> {
         let removed = self.stage2_records.remove(&id);
         if let Some(record) = &removed {
             let key = (record.snapshot.ipa, record.snapshot.len as u64);
@@ -384,7 +357,10 @@ pub struct CarrierVmCustody {
         >,
     >,
     pub asids: carrick_hal::asid::AsidAllocator,
-    pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
+    /// The VM lifecycle, its stage-2 backend and records: the only way to
+    /// map, unmap or destroy (lock order: `metadata_aperture`, then this,
+    /// then every pool, stock and registry lock).
+    pub(crate) stage2: Stage2Custody<CarrierStage2Records>,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
             CarrierStage2RecordId,
@@ -783,15 +759,16 @@ impl CarrierVmCustody {
                 ),
             ),
             asids,
-            state: parking_lot::Mutex::new(CarrierVmCustodyState {
-                next_generation: 1,
-                lifecycle: CarrierVmLifecycle::Vacant,
-                next_stage2_record_id: 1,
-                next_logical_owner_id: 1,
-                next_logical_owner_generation: 1,
-                stage2_records: std::collections::BTreeMap::new(),
-                stage2_extent_index: std::collections::BTreeMap::new(),
-            }),
+            stage2: Stage2Custody::new(
+                super::stage2_backend::HvfCarrierStage2::custody_backend(),
+                CarrierStage2Records {
+                    next_stage2_record_id: 1,
+                    next_logical_owner_id: 1,
+                    next_logical_owner_generation: 1,
+                    stage2_records: std::collections::BTreeMap::new(),
+                    stage2_extent_index: std::collections::BTreeMap::new(),
+                },
+            ),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -858,145 +835,119 @@ impl CarrierVmCustody {
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn new_live_fixture() -> Self {
         let custody = Self::new();
-        {
-            let mut state = custody.state.lock();
-            state.next_generation = 2;
-            state.lifecycle = CarrierVmLifecycle::Live(CarrierVmGeneration(1));
-        }
-        custody.native_root_waits.reset_for_new_vm();
+        let generation = custody.begin_create().unwrap_or_else(|error| {
+            carrick_fatal::carrick_fatal!("hvf::custody", "live fixture begin_create: {error:?}")
+        });
+        custody.commit_create(generation).unwrap_or_else(|error| {
+            carrick_fatal::carrick_fatal!("hvf::custody", "live fixture commit_create: {error:?}")
+        });
         custody
     }
 
-    pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        if state.lifecycle != CarrierVmLifecycle::Vacant {
-            return Err(CarrierVmCustodyError::LifecycleConflict);
-        }
-        let next_generation = state
-            .next_generation
-            .checked_add(1)
-            .ok_or(CarrierVmCustodyError::GenerationExhausted)?;
-        let generation = CarrierVmGeneration(state.next_generation);
-        state.next_generation = next_generation;
-        state.lifecycle = CarrierVmLifecycle::Creating(generation);
-        Ok(generation)
+    pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, Stage2CustodyError> {
+        self.stage2.begin_create()
     }
 
     pub(crate) fn commit_create(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                self.native_root_waits.reset_for_new_vm();
-                state.lifecycle = CarrierVmLifecycle::Live(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+    ) -> Result<(), Stage2CustodyError> {
+        self.stage2
+            .commit_create_with(generation, |_| self.native_root_waits.reset_for_new_vm())
     }
 
     pub(crate) fn abort_create(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+    ) -> Result<(), Stage2CustodyError> {
+        self.stage2.abort_create(generation)
     }
 
+    /// A failed setup's raw destroy left the generation `Gone`, its records
+    /// already terminal; a successor may now be created.
     pub(crate) fn abort_created_vm_after_raw_destroy(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                for record in state
-                    .stage2_records
-                    .values_mut()
-                    .filter(|record| record.snapshot.vm_generation == generation)
-                {
-                    carrick_core::mm::retirement::terminalize_record(record);
-                }
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+    ) -> Result<(), Stage2CustodyError> {
+        self.stage2.finish_destroy(generation)
     }
 
     pub(crate) fn begin_destroy(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Live(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Destroying(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Live(_) => Err(CarrierVmCustodyError::StaleGeneration),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => Err(CarrierVmCustodyError::LifecycleConflict),
-        }
+    ) -> Result<(), Stage2CustodyError> {
+        self.stage2.begin_destroy(generation)
     }
 
     pub(crate) fn abort_destroy(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Destroying(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Live(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
+    ) -> Result<(), Stage2CustodyError> {
+        self.stage2.abort_destroy(generation)
+    }
+
+    /// What the raw destroy settles under the custody lock: every record of
+    /// the destroyed generation is terminal before any thread can see `Gone`.
+    pub(crate) fn terminalize_generation(
+        records: &mut CarrierStage2Records,
+        generation: CarrierVmGeneration,
+    ) {
+        for record in records
+            .stage2_records
+            .values_mut()
+            .filter(|record| record.snapshot.vm_generation == generation)
+        {
+            carrick_core::mm::retirement::terminalize_record(record);
         }
     }
 
+    /// The raw destroy of `generation`'s stage 2 through the custody (the
+    /// only path to the backend's destroy), from `Destroying` or a failed
+    /// setup's `Creating`.
+    ///
+    /// # Safety
+    ///
+    /// No vCPU of the generation may still run.
+    pub(crate) unsafe fn destroy_stage2(
+        &self,
+        generation: CarrierVmGeneration,
+    ) -> Result<carrick_aarch64::stage2::custody::Stage2Destroyed, Stage2CustodyError> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            self.stage2
+                .destroy_stage2(generation, Self::terminalize_generation)
+        }
+    }
+
+    /// A test's raw destroy of `generation` through the custody, with the
+    /// backend scripted to succeed (no hypervisor VM in a lifecycle test).
+    #[cfg(test)]
+    pub(crate) fn destroy_stage2_for_test(&self, generation: CarrierVmGeneration) {
+        super::stage2_backend::script_next_stage2_destroy(
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        );
+        // SAFETY: no vCPU runs in a lifecycle test.
+        let destroyed = unsafe { self.destroy_stage2(generation) };
+        super::stage2_backend::script_next_stage2_destroy_clear();
+        drop(destroyed.unwrap_or_else(|error| panic!("test raw destroy: {error:?}")));
+    }
+
+    /// Settle a `Gone` generation: release its pools, grants and stock, then
+    /// let a successor in. Failed physical proof keeps `Gone`, so it admits
+    /// no successor and frees no unknown backing.
     pub(crate) fn commit_destroy(
         &self,
         generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        {
-            let state = self.state.lock();
-            match state.lifecycle {
-                CarrierVmLifecycle::Destroying(current) if current == generation => {}
-                CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
-                    return Err(CarrierVmCustodyError::StaleGeneration);
-                }
-                CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
-                    return Err(CarrierVmCustodyError::LifecycleConflict);
-                }
+    ) -> Result<(), Stage2CustodyError> {
+        match self.stage2.lifecycle() {
+            Stage2Lifecycle::Gone(current) if current == generation => {}
+            Stage2Lifecycle::Gone(_)
+            | Stage2Lifecycle::Live(_)
+            | Stage2Lifecycle::Destroying(_) => {
+                return Err(Stage2CustodyError::StaleGeneration);
+            }
+            Stage2Lifecycle::Vacant | Stage2Lifecycle::Creating(_) => {
+                return Err(Stage2CustodyError::LifecycleConflict);
             }
         }
         // Join physical callbacks before publishing Vacant: a successor VM
@@ -1005,62 +956,39 @@ impl CarrierVmCustody {
         let destroyed_stock = {
             // Match grant publication/return: aperture precedes lifecycle state.
             let mut metadata = self.metadata_aperture.lock();
-            let mut state = self.state.lock();
-            match state.lifecycle {
-                CarrierVmLifecycle::Destroying(current) if current == generation => {
-                    for record in state
-                        .stage2_records
-                        .values_mut()
-                        .filter(|record| record.snapshot.vm_generation == generation)
-                    {
-                        carrick_core::mm::retirement::terminalize_record(record);
-                    }
-                    if let CarrierFramePoolState::Active(pool) = std::mem::replace(
-                        &mut *self.frame_pool.lock(),
-                        CarrierFramePoolState::Uninitialized,
-                    ) {
-                        pool.forget_backend_mapping();
-                    }
-                    if let CarrierRootSlotPoolState::Active(pool) = std::mem::replace(
-                        &mut *self.root_slot_pool.lock(),
-                        CarrierRootSlotPoolState::Uninitialized,
-                    ) {
-                        pool.forget_backend_mapping();
-                    }
-                    metadata.release_destroyed_vm(generation.0, |identity| {
-                        let _ = state.remove_record(identity.record_id);
-                    });
-                    std::mem::replace(
-                        &mut *self.fork_stock.lock(),
-                        crate::fork_stock::ForkStockHostCustody::with_asids(
-                            self.transfer_carrier,
-                            self.asids.clone(),
-                        ),
-                    )
-                }
-                CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
-                    return Err(CarrierVmCustodyError::StaleGeneration);
-                }
-                CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
-                    return Err(CarrierVmCustodyError::LifecycleConflict);
-                }
+            let mut state = self.stage2.lock();
+            if state.lifecycle() != Stage2Lifecycle::Gone(generation) {
+                return Err(Stage2CustodyError::StaleGeneration);
             }
+            if let CarrierFramePoolState::Active(pool) = std::mem::replace(
+                &mut *self.frame_pool.lock(),
+                CarrierFramePoolState::Uninitialized,
+            ) {
+                pool.forget_backend_mapping();
+            }
+            if let CarrierRootSlotPoolState::Active(pool) = std::mem::replace(
+                &mut *self.root_slot_pool.lock(),
+                CarrierRootSlotPoolState::Uninitialized,
+            ) {
+                pool.forget_backend_mapping();
+            }
+            metadata.release_destroyed_vm(generation.0, |identity| {
+                let _ = state.remove_record(identity.record_id);
+            });
+            std::mem::replace(
+                &mut *self.fork_stock.lock(),
+                crate::fork_stock::ForkStockHostCustody::with_asids(
+                    self.transfer_carrier,
+                    self.asids.clone(),
+                ),
+            )
         };
-        // Failed physical proof retains the exact grants and Destroying
-        // generation. It cannot admit a successor or free unknown backing.
         self.native_root_replies
             .lock()
             .release_destroyed_vm()
-            .map_err(|_| CarrierVmCustodyError::UnsettledPhysicalGrants)?;
+            .map_err(|_| Stage2CustodyError::UnsettledAfterDestroy)?;
         drop(destroyed_stock);
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Destroying(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
-            }
-            _ => Err(CarrierVmCustodyError::StaleGeneration),
-        }
+        self.stage2.finish_destroy(generation)
     }
 
     pub(crate) fn frame_pool(
@@ -1071,9 +999,9 @@ impl CarrierVmCustody {
         }
         // Lock hierarchy: always read state lifecycle first without holding frame_pool,
         // so commit_destroy (which takes state then frame_pool) never deadlocks with us.
-        let state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => drop(state),
+        let state = self.stage2.lock();
+        match state.lifecycle() {
+            Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
             _ => return None,
         }
         let mut guard = self.frame_pool.lock();
@@ -1107,9 +1035,9 @@ impl CarrierVmCustody {
         }
         // Lock hierarchy: always read state lifecycle first without holding root_slot_pool,
         // so commit_destroy (which takes state then root_slot_pool) never deadlocks with us.
-        let state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => drop(state),
+        let state = self.stage2.lock();
+        match state.lifecycle() {
+            Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
             _ => return None,
         }
         let mut guard = self.root_slot_pool.lock();
@@ -1174,34 +1102,38 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn live_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Live(generation) => Some(generation),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => None,
+        match self.stage2.lifecycle() {
+            Stage2Lifecycle::Live(generation) => Some(generation),
+            Stage2Lifecycle::Vacant
+            | Stage2Lifecycle::Gone(_)
+            | Stage2Lifecycle::Creating(_)
+            | Stage2Lifecycle::Destroying(_) => None,
         }
     }
 
     pub(crate) fn setup_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
+        match self.stage2.lifecycle() {
+            Stage2Lifecycle::Creating(generation) | Stage2Lifecycle::Live(generation) => {
                 Some(generation)
             }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => None,
+            Stage2Lifecycle::Vacant | Stage2Lifecycle::Gone(_) | Stage2Lifecycle::Destroying(_) => {
+                None
+            }
         }
     }
 
     pub(crate) fn creating_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Creating(generation) => Some(generation),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Live(_)
-            | CarrierVmLifecycle::Destroying(_) => None,
+        match self.stage2.lifecycle() {
+            Stage2Lifecycle::Creating(generation) => Some(generation),
+            Stage2Lifecycle::Vacant
+            | Stage2Lifecycle::Gone(_)
+            | Stage2Lifecycle::Live(_)
+            | Stage2Lifecycle::Destroying(_) => None,
         }
     }
 
     pub(crate) fn stage2_record_identities(&self) -> Vec<CarrierStage2RecordIdentity> {
-        self.state
+        self.stage2
             .lock()
             .stage2_records
             .iter()
@@ -1216,7 +1148,7 @@ impl CarrierVmCustody {
     pub(crate) fn allocate_logical_owner(
         &self,
     ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let next_id = state
             .next_logical_owner_id
             .checked_add(1)
@@ -1238,7 +1170,7 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> Option<CarrierStage2RecordSnapshot> {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let record = state.stage2_records.get(&identity.record_id)?;
         if Self::stage2_identity_mismatch(record, identity).is_some()
             || record.snapshot.pin_count != 0
@@ -1255,7 +1187,7 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let record = state
             .stage2_records
             .get_mut(&identity.record_id)
@@ -1281,7 +1213,7 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let removable = state
             .stage2_records
             .get(&identity.record_id)
@@ -1300,7 +1232,7 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn abort_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             debug_assert!(false, "claimed terminal release record disappeared");
             return;
@@ -1317,7 +1249,7 @@ impl CarrierVmCustody {
 
     #[cfg(test)]
     pub(crate) fn disarm_stage2_backend_map_for_test(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let record = state
             .stage2_records
             .get_mut(&identity.record_id)
@@ -1333,7 +1265,7 @@ impl CarrierVmCustody {
         &self,
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        Self::register_stage2_record_locked(&mut self.state.lock(), spec)
+        Self::register_stage2_record_locked(&mut self.stage2.lock(), spec)
     }
 
     /// Commit backend mapping and its exact record under one lifecycle lock.
@@ -1344,7 +1276,7 @@ impl CarrierVmCustody {
         spec: CarrierStage2RecordSpec,
         map: impl FnOnce(CarrierStage2RecordIdentity) -> carrick_aarch64::stage2::Stage2Status,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
             TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
         })?;
@@ -1359,19 +1291,19 @@ impl CarrierVmCustody {
     }
 
     fn register_stage2_record_locked(
-        state: &mut CarrierVmCustodyState,
+        state: &mut Stage2CustodyState<CarrierStage2Records>,
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
         if spec.len == 0 || (spec.mapped && spec.host_addr == 0) {
             return Err(CarrierStage2RecordError::InvalidExtent);
         }
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation)
+        match state.lifecycle() {
+            Stage2Lifecycle::Creating(generation) | Stage2Lifecycle::Live(generation)
                 if generation == spec.vm_generation => {}
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
+            Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => {
                 return Err(CarrierStage2RecordError::VmGenerationMismatch);
             }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+            Stage2Lifecycle::Vacant | Stage2Lifecycle::Gone(_) | Stage2Lifecycle::Destroying(_) => {
                 return Err(CarrierStage2RecordError::NoLiveVm);
             }
         }
@@ -1422,12 +1354,10 @@ impl CarrierVmCustody {
         host_addr: usize,
         perms: u64,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
-        let live_generation = match state.lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
-                generation
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
+        let mut state = self.stage2.lock();
+        let live_generation = match state.lifecycle() {
+            Stage2Lifecycle::Creating(generation) | Stage2Lifecycle::Live(generation) => generation,
+            Stage2Lifecycle::Vacant | Stage2Lifecycle::Gone(_) | Stage2Lifecycle::Destroying(_) => {
                 return Err(CarrierStage2RecordError::NoLiveVm);
             }
         };
@@ -1502,7 +1432,7 @@ impl CarrierVmCustody {
         &self,
         record_id: CarrierStage2RecordId,
     ) -> Option<CarrierStage2RecordSnapshot> {
-        self.state
+        self.stage2
             .lock()
             .stage2_records
             .get(&record_id)
@@ -1514,7 +1444,7 @@ impl CarrierVmCustody {
         ipa: u64,
         len: usize,
     ) -> Option<CarrierStage2RecordIdentity> {
-        let state = self.state.lock();
+        let state = self.stage2.lock();
         let (&(base, length), ids) = state
             .stage2_extent_index
             .range(..=(ipa, u64::MAX))
@@ -1547,15 +1477,16 @@ impl CarrierVmCustody {
         self: &std::sync::Arc<Self>,
         identity: CarrierStage2RecordIdentity,
     ) -> Result<CarrierStage2Pin, CarrierStage2PinError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Live(generation) if generation == identity.vm_generation => {}
-            CarrierVmLifecycle::Live(_) => {
+        let mut state = self.stage2.lock();
+        match state.lifecycle() {
+            Stage2Lifecycle::Live(generation) if generation == identity.vm_generation => {}
+            Stage2Lifecycle::Live(_) => {
                 return Err(CarrierStage2PinError::VmGenerationMismatch);
             }
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => {
+            Stage2Lifecycle::Vacant
+            | Stage2Lifecycle::Gone(_)
+            | Stage2Lifecycle::Creating(_)
+            | Stage2Lifecycle::Destroying(_) => {
                 return Err(CarrierStage2PinError::VmNotLive);
             }
         }
@@ -1574,7 +1505,7 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> CarrierStage2RetireOutcome {
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -1587,7 +1518,7 @@ impl CarrierVmCustody {
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
         let (ipa, len) = {
-            let mut state = self.state.lock();
+            let mut state = self.stage2.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return CarrierStage2RetireOutcome::NotFound;
             };
@@ -1600,7 +1531,7 @@ impl CarrierVmCustody {
         };
 
         let backend_result = unmap(ipa, len);
-        let mut state = self.state.lock();
+        let mut state = self.stage2.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -1629,7 +1560,7 @@ impl CarrierVmCustody {
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
         use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
         let outcome = {
-            let mut state = self.state.lock();
+            let mut state = self.stage2.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return;
             };
@@ -1658,7 +1589,7 @@ impl CarrierVmCustody {
 pub(crate) fn custody_transition_error(
     context: &str,
     transition: &str,
-    error: CarrierVmCustodyError,
+    error: Stage2CustodyError,
 ) -> TrapError {
     TrapError::Hypervisor(format!(
         "{context}: carrier VM custody {transition} failed: {error:?}"
@@ -1701,28 +1632,10 @@ pub(crate) fn destroy_vm_with_custody_using(
     destroy: impl FnOnce() -> carrick_aarch64::stage2::Stage2Status,
     record_released: impl FnOnce(),
 ) -> Result<(), TrapError> {
-    let generation = custody.live_generation().ok_or_else(|| {
-        TrapError::Hypervisor(format!(
-            "{context}: carrier VM custody has no live generation"
-        ))
-    })?;
-    custody
-        .begin_destroy(generation)
-        .map_err(|error| custody_transition_error(context, "begin_destroy", error))?;
-    let rc = destroy();
-    if rc != 0 {
-        custody
-            .abort_destroy(generation)
-            .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
-        return Err(TrapError::Hypervisor(format!(
-            "{context}: hv_vm_destroy rc={rc:#x}"
-        )));
-    }
-    custody
-        .commit_destroy(generation)
-        .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
-    record_released();
-    Ok(())
+    super::stage2_backend::script_next_stage2_destroy(destroy());
+    let result = destroy_vm_with_custody(custody, context);
+    super::stage2_backend::script_next_stage2_destroy_clear();
+    result.map(|()| record_released())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1769,34 +1682,38 @@ pub(crate) fn destroy_vm_with_custody_target(
         }
     };
 
-    let rc = unsafe { inventory_stage2_destroy() };
-    if rc != 0 {
-        if matches!(target, CarrierVmDestroyTarget::Live) {
-            custody
-                .abort_destroy(generation)
-                .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
+    // SAFETY: the callers destroyed every vCPU of the generation first.
+    let destroyed = match unsafe { custody.destroy_stage2(generation) } {
+        Ok(destroyed) => destroyed,
+        Err(Stage2CustodyError::Backend(rc)) => {
+            if matches!(target, CarrierVmDestroyTarget::Live) {
+                custody
+                    .abort_destroy(generation)
+                    .map_err(|error| custody_transition_error(context, "abort_destroy", error))?;
+            }
+            let retained = match target {
+                CarrierVmDestroyTarget::Live => "exact Live custody restored",
+                CarrierVmDestroyTarget::Creating(_) => "exact Creating custody retained",
+            };
+            return Err(TrapError::Hypervisor(format!(
+                "{context}: hv_vm_destroy rc={rc:#x}; {retained}"
+            )));
         }
-        let retained = match target {
-            CarrierVmDestroyTarget::Live => "exact Live custody restored",
-            CarrierVmDestroyTarget::Creating(_) => "exact Creating custody retained",
-        };
-        return Err(TrapError::Hypervisor(format!(
-            "{context}: hv_vm_destroy rc={rc:#x}; {retained}"
-        )));
-    }
+        Err(error) => return Err(custody_transition_error(context, "destroy_stage2", error)),
+    };
 
-    match target {
-        CarrierVmDestroyTarget::Live => {
-            custody
-                .commit_destroy(generation)
-                .map_err(|error| custody_transition_error(context, "commit_destroy", error))?;
-            record_vm_released();
-            Ok(())
-        }
+    let settled = match target {
+        CarrierVmDestroyTarget::Live => custody
+            .commit_destroy(generation)
+            .map_err(|error| custody_transition_error(context, "commit_destroy", error))
+            .map(|()| record_vm_released()),
         CarrierVmDestroyTarget::Creating(_) => custody
             .abort_created_vm_after_raw_destroy(generation)
             .map_err(|error| custody_transition_error(context, "abort_created_vm", error)),
-    }
+    };
+    // The generation's unretired backings outlive its stage 2 only until here.
+    drop(destroyed);
+    settled
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -1804,7 +1721,7 @@ mod carrier_vm_custody_tests {
     use super::{
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, create_vm_with_custody_using,
+        CarrierVmCustody, CarrierVmGeneration, Stage2CustodyError, create_vm_with_custody_using,
         destroy_vm_with_custody_using,
     };
 
@@ -3617,6 +3534,7 @@ mod carrier_vm_custody_tests {
                 "{stage} published too early"
             );
 
+            custody.destroy_stage2_for_test(generation);
             custody
                 .abort_created_vm_after_raw_destroy(generation)
                 .expect("injected post-create failure rolls back exact raw VM");
@@ -3658,6 +3576,7 @@ mod carrier_vm_custody_tests {
             });
 
             custody.begin_destroy(generation).expect("begin destroy");
+            custody.destroy_stage2_for_test(generation);
             custody.commit_destroy(generation).expect("commit destroy");
 
             stop.store(true, Ordering::Release);
@@ -3809,6 +3728,7 @@ mod carrier_vm_custody_tests {
             |_| Ok(()),
             |custody, generation, _| {
                 vm_destroy_calls.set(vm_destroy_calls.get() + 1);
+                custody.destroy_stage2_for_test(generation);
                 custody
                     .abort_created_vm_after_raw_destroy(generation)
                     .map_err(|error| super::TrapError::Hypervisor(format!("{error:?}")))
@@ -4522,9 +4442,10 @@ mod carrier_vm_custody_tests {
 
         assert_eq!(
             custody.begin_create(),
-            Err(CarrierVmCustodyError::LifecycleConflict)
+            Err(Stage2CustodyError::LifecycleConflict)
         );
 
+        custody.destroy_stage2_for_test(first);
         custody
             .commit_destroy(first)
             .expect("terminalize first VM generation");
@@ -4536,7 +4457,7 @@ mod carrier_vm_custody_tests {
 
         assert_eq!(
             custody.begin_destroy(first),
-            Err(CarrierVmCustodyError::StaleGeneration)
+            Err(Stage2CustodyError::StaleGeneration)
         );
         assert_eq!(custody.live_generation(), Some(second));
     }
@@ -4580,7 +4501,7 @@ mod carrier_vm_custody_tests {
         assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             custody.begin_create(),
-            Err(CarrierVmCustodyError::LifecycleConflict),
+            Err(Stage2CustodyError::LifecycleConflict),
             "failed destroy must not admit a successor VM"
         );
     }

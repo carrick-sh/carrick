@@ -191,11 +191,17 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         2,
         "both lazy replay paths must use exact serialized replay"
     );
-    // VM destruction stays a custody transaction: the wrapper's definition
-    // and the custody transaction's one call.
+    // VM destruction stays a custody transaction: the carrier backend is
+    // built once, inside the custody that owns it, so its raw destroy is
+    // reachable only through the custody's generation guard.
     assert_eq!(
-        count(&sources, concat!("inventory_stage2_", "destroy()")),
-        2,
-        "inventory_stage2_destroy must appear only in its definition and the custody wrapper"
+        count(&sources, concat!("inventory_stage2_", "destroy")),
+        0,
+        "the free stage-2 destroy wrapper is gone; destroy through Stage2Custody"
+    );
+    assert_eq!(
+        count(&sources, concat!("HvfCarrierStage2::", "custody_backend()")),
+        1,
+        "only CarrierVmCustody may own the carrier stage-2 backend"
     );
 }
