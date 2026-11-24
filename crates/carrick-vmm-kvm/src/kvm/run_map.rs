@@ -81,7 +81,7 @@ impl KvmVcpuFd {
         }
         // SAFETY: KVM_RUN returned 0, so the mapping holds a complete exit
         // record naming its valid union member.
-        Ok(unsafe { RawKvmExit::read(self.run.run.as_ptr()) })
+        Ok(unsafe { RawKvmExit::copy_out(self.run.run.as_ptr()) })
     }
 }
 
@@ -267,7 +267,7 @@ impl RawKvmExit {
     /// # Safety
     /// `run` is a vCPU's live `kvm_run` mapping and its last `KVM_RUN`
     /// returned 0, so `exit_reason` names the valid union member.
-    unsafe fn read(run: *mut kvm_bindings::kvm_run) -> Self {
+    unsafe fn copy_out(run: *mut kvm_bindings::kvm_run) -> Self {
         // SAFETY: the caller's contract; every access is a raw field read.
         unsafe {
             let reason = (&raw const (*run).exit_reason).read();
