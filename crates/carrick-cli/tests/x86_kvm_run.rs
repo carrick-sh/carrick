@@ -2638,6 +2638,94 @@ fn mounted_carriers_with_the_same_label_publish_distinct_debug_endpoints() {
     }
 }
 
+/// A carrier spawned as the leader of its own process group. Dropping it
+/// unreaped, on any path including a panicking capture, kills the whole
+/// group, so a deadline never orphans a spinning carrier (#2955).
+struct CarrierGroup(Option<Child>);
+
+impl CarrierGroup {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        let child = command
+            .process_group(0)
+            .spawn()
+            .expect("run mounted x86 Linux binary through carrick");
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("carrier not yet collected")
+    }
+
+    /// Collect a carrier that already exited.
+    fn collect(mut self) -> std::process::Output {
+        let child = self.0.take().expect("carrier not yet collected");
+        child.wait_with_output().expect("collect mounted x86 run")
+    }
+
+    fn kill_and_collect(mut self) -> std::process::Output {
+        let child = self.0.take().expect("carrier not yet collected");
+        Self::kill_group(&child);
+        child.wait_with_output().expect("reap timed-out KVM run")
+    }
+
+    fn kill_group(child: &Child) {
+        // SAFETY: `spawn` made this child the leader of a process group that
+        // belongs to this run alone; the leader is not yet reaped, so the id
+        // cannot name another group.
+        unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+    }
+}
+
+impl Drop for CarrierGroup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            Self::kill_group(&child);
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn carrier_group_kills_its_whole_group_when_the_deadline_path_panics() {
+    use std::io::BufRead;
+    // A group leader whose grandchild reports its pid, then both wait forever.
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 1000 & echo $!; wait"])
+        .stdout(Stdio::piped());
+    let mut carrier = CarrierGroup::spawn(&mut command);
+    let mut line = String::new();
+    std::io::BufReader::new(carrier.child().stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let grandchild: libc::pid_t = line.trim().parse().unwrap();
+    // SAFETY: pidfd_open takes no pointers; the pidfd pins this exact process.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, grandchild, 0) } as i32;
+    assert!(pidfd >= 0, "pidfd_open({grandchild})");
+    // The deadline path's live capture fails and panics with the group live.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _carrier = carrier;
+        panic!("live capture failed: no kernel debug socket");
+    }));
+    assert!(panicked.is_err());
+    // A pidfd turns readable when its process exits. The bound only reports
+    // a surviving group; a killed group answers at once.
+    let mut ready = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for this call's duration.
+    let exited = unsafe { libc::poll(&mut ready, 1, 10_000) } == 1;
+    if !exited {
+        // SAFETY: the pidfd names the surviving grandchild; no pointer args.
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, libc::SIGKILL, 0, 0) };
+    }
+    // SAFETY: closes the pidfd this test opened.
+    unsafe { libc::close(pidfd) };
+    assert!(exited, "grandchild {grandchild} outlived its carrier group");
+}
+
 /// One mounted run with its own deadline, for a fixture whose work is large
 /// by design. Every other fixture keeps the five-second deadline.
 fn run_mounted_binary_within(
@@ -2686,26 +2774,20 @@ fn run_mounted_binary_within(
         &format!("{}:/hello:ro", elf.display()),
         "x86-kvm-hello:latest",
     ]);
-    command
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .expect("run mounted x86 Linux binary through carrick");
-    if child
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut carrier = CarrierGroup::spawn(&mut command);
+    if carrier
+        .child()
         .wait_timeout(deadline)
         .expect("wait for mounted x86 Linux binary")
         .is_some()
     {
-        return (
-            child.wait_with_output().expect("collect mounted x86 run"),
-            None,
-        );
+        return (carrier.collect(), None);
     }
 
     // The carrier is still live here. Request evidence before killing its
-    // scoped process group; a failed capture is a named test failure.
+    // scoped process group; a failed capture is a named test failure. Every
+    // exit from here, a panic included, kills the group (#2955).
     let capture_dir = std::env::var_os("CARRICK_KVM_CAPTURE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("carrick-kvm-deadlines"));
@@ -2763,9 +2845,7 @@ fn run_mounted_binary_within(
         Ok(dir) => eprintln!("KVM deadline host stacks: {dir}"),
         Err(error) => eprintln!("KVM deadline host stack capture failed: {error}"),
     }
-    // SAFETY: this test created an exclusive process group for this exact run.
-    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
-    let output = child.wait_with_output().expect("reap timed-out KVM run");
+    let output = carrier.kill_and_collect();
     let capture = capture.expect("run KVM deadline capture");
     assert!(
         capture.status.success(),
