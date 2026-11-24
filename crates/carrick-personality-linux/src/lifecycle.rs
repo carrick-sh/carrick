@@ -1937,9 +1937,13 @@ fn serve_exit<'a>(
     };
     if !native.release_current(record.reference, retirement) {
         // Requeue/refusal retains the progress already published above, so
-        // the next lane cannot clear and wake the joiner a second time.
+        // the next lane cannot clear and wake the joiner a second time. A
+        // refusal ahead of the scheduler's rollback still holds the reserved
+        // unit: restore it here and take the waiter wake it owes, rather
+        // than deferring a wake no later lane drains. After a requeue's
+        // rollback this only drains the wake that rollback deferred.
         drop(admission);
-        if let Some(notification) = membership.finish_reservation_wake() {
+        if let Some(notification) = membership.rollback_with_wake() {
             native.exit_reservation_released(notification);
         }
         return Err(ServeExitDecline::Other);
