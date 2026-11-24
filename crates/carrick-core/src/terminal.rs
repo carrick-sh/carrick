@@ -615,12 +615,6 @@ pub fn raw_exit_is_process(page: &impl Lifecycle) -> bool {
     page.live_is_sole_uncontested()
 }
 
-/// Whether the page sits at the one-member floor only because a peer holds an
-/// uncommitted refundable exit reservation.
-pub fn raw_exit_contended_at_floor(page: &impl Lifecycle) -> bool {
-    page.live_is_contended_floor()
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadTerminalIdentity {
     binding: ExecutionBinding,

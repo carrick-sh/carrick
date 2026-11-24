@@ -911,12 +911,6 @@ pub trait Lifecycle {
         let word = self.live_word().load(Ordering::SeqCst);
         (word & LIVE_COUNT_MASK) == 1 && (word & REFUNDABLE_EXIT_MASK) == 0
     }
-    /// Single-word atomic check that `live == 1` only because at least one peer
-    /// holds an uncommitted refundable exit reservation.
-    fn live_is_contended_floor(&self) -> bool {
-        let word = self.live_word().load(Ordering::SeqCst);
-        (word & LIVE_COUNT_MASK) == 1 && (word & REFUNDABLE_EXIT_MASK) != 0
-    }
     /// Consume a deferred reservation-release wake recorded by a host exit or
     /// drop path before its registry lock was released.
     fn take_exit_reservation_wake(&self) -> Option<crate::terminal::TerminalNotification> {

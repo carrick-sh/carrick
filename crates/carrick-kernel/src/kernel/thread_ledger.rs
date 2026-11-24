@@ -902,6 +902,7 @@ impl ThreadLedger {
                                 revisions,
                             },
                             None,
+                            &mut None,
                         )
                         .unwrap_or_else(|error| {
                             carrick_fatal::carrick_fatal!(
