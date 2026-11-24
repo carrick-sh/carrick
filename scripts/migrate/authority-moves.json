@@ -312,6 +312,18 @@
     {
       "owner": "carrick_core::mm::window::SizeAdmission",
       "issue": 1338
+    },
+    {
+      "owner": "carrick_vfs::host_size::WINDOWED",
+      "issue": 1338
+    },
+    {
+      "owner": "carrick_vfs::host_size::REFUSED",
+      "issue": 1338
+    },
+    {
+      "owner": "carrick_kernel::dispatch::fs::proc_synthetic::FsView<'a>::reopen_proc_self_fd",
+      "issue": 1338
     }
   ],
   "terminal_custody": []
