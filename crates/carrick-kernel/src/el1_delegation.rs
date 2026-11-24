@@ -91,6 +91,7 @@ pub fn settle_carrier_work(
 ) -> carrick_core_abi::service::CarrierWorkReply {
     use carrick_core_abi::service::{CarrierDemand, CarrierWorkReply, ServiceOperation};
     kernel.settle_thread_ledger();
+    settle_requester_guest_cow(request);
     let reply = match request.operation {
         ServiceOperation::CarrierWork {
             demand: CarrierDemand::ThreadStock,
@@ -108,6 +109,23 @@ pub fn settle_carrier_work(
     };
     deliver_boundary_wakes(kernel, true, doorbell);
     reply
+}
+
+/// Settle the requesting member's MM's guest COW completions before a
+/// `CarrierWork` answer. A retained operation that found them unsettled (a
+/// fork arming its parent, #2947) reruns only after this acknowledgement,
+/// and nothing else promises that the carrier will exclude that MM's editor
+/// first, so the request settles them itself: excluding the editor waits
+/// out an admitted EL1 editor and settles the MM's completions under the
+/// exclusion. One completed after this is a later round, which settles the
+/// same way, so the rerun makes progress.
+fn settle_requester_guest_cow(request: &carrick_core_abi::service::ServiceRequest) {
+    if let Some(mm) = crate::kernel::MmId::from_raw_u64(request.identity.birth.mm.mm().raw()) {
+        crate::kernel::mm_occupancy::settle_unsettled_guest_cow(
+            carrick_el1_abi::cow_grant_pool_host(),
+            mm,
+        );
+    }
 }
 
 /// Publish wakes after the stopped carrier has consumed its exact task's

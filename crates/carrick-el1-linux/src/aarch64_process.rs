@@ -2373,13 +2373,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             }
         };
         // A parent COW completion the carrier has not settled refuses as
-        // `Busy`. On this lane the carrier settles an MM's completions at
-        // its next exclusion of the MM's editor; the fork reruns after its
-        // editor is released (#2890).
+        // `CowUnsettled`, retained as carrier work. The host's answer to
+        // that work settles the requester's MM's completions under its own
+        // exclusion of the MM's editor before it acknowledges, so the rerun
+        // finds them settled (Busy once, then success; #2890, #2947).
         let cow = match crate::mm_portal::carrier_cow_pool() {
             Ok(cow) => cow,
             Err(e) => {
-                owner.spaces.free(index);
+                child_space.release();
                 return Err(abandon_loan(
                     &self.crossing,
                     self.worker(),

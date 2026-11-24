@@ -427,7 +427,7 @@ impl MmErrorLinux for MmError {
             Self::Fault => 14,
             Self::UnsupportedExecutableCow => 95,
             Self::Stale => 3,
-            Self::Busy | Self::ParentChanged => 16,
+            Self::Busy | Self::ParentChanged | Self::CowUnsettled => 16,
             Self::NoMemory => 12,
             Self::MetadataRequired | Self::Wait(_) => 11,
             Self::Invalid => 22,
