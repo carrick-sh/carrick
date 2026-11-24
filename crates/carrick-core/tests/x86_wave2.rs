@@ -9,7 +9,7 @@ struct NativePool {
     mm: EntryMmKey,
     terminal: carrick_core::terminal::ProcessExitCustody,
     gate: AtomicU32,
-    live: AtomicU32,
+    live: AtomicU64,
     cells: [AtomicEntry; 8],
     ledger: ThreadLedgerActivity,
     visits: AtomicU64,
@@ -20,7 +20,7 @@ impl NativePool {
             mm: EntryMmKey::from_raw(mm),
             terminal: carrick_core::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
-            live: AtomicU32::new(1),
+            live: AtomicU64::new(1),
             cells: std::array::from_fn(|_| AtomicEntry::new(pack(0, EntryState::Vacant))),
             ledger: ThreadLedgerActivity::new(),
             visits: AtomicU64::new(0),
@@ -42,7 +42,7 @@ impl Lifecycle for NativePool {
     fn gate_word(&self) -> &AtomicU32 {
         &self.gate
     }
-    fn live_word(&self) -> &AtomicU32 {
+    fn live_word(&self) -> &AtomicU64 {
         &self.live
     }
     fn entry_count(&self) -> usize {

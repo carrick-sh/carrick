@@ -2077,9 +2077,10 @@ fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit<C, B>(
             "caller B raw exit published root exit while peer A's reservation was refundable"
         );
         assert!(
-            entry_b.take_handoff_receipt().is_some(),
-            "caller B must release its execution lease and park on reservation release"
+            entry_b.take_handoff_receipt().is_none(),
+            "dispatch must consume caller B's handoff receipt on CompletionRoute::Suspended"
         );
+        assert!(zone.slot(slot2).current().is_none());
         assert!(entry_b.take_run_failure().is_none());
         assert!(
             matches!(
@@ -2169,7 +2170,8 @@ fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit<C, B>(
         );
     }
     assert!(caller_b_ran.load(Ordering::Acquire));
-    assert!(entry_a.take_handoff_receipt().is_some());
+    assert!(entry_a.take_handoff_receipt().is_none());
+    assert!(zone.slot(slot1).current().is_none());
     assert!(entry_a.take_run_failure().is_none());
     drop(entry_a);
     assert_eq!(

@@ -470,6 +470,48 @@ impl<
     fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
         self.process_venue()?.retire_closing_thread_exit()
     }
+    fn await_exit_reservation(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::ExitReservationWait> {
+        use carrick_personality_linux::lifecycle::ExitReservationWait;
+        let wait = self.process_venue()?.await_exit_reservation()?;
+        Some(match wait {
+            ExitReservationWait::Parked(mut outcome) => {
+                self.run_ready_after_native_transfer(&mut outcome);
+                ExitReservationWait::Parked(outcome)
+            }
+            ExitReservationWait::ProbeOnce => ExitReservationWait::ProbeOnce,
+        })
+    }
+    fn retire_sole_surviving_raw_exit(&mut self, status: u8) -> Option<LifecycleOutcome> {
+        self.process_venue()?.retire_sole_surviving_raw_exit(status)
+    }
+    fn redispatch_raw_exit(&mut self) -> Option<LifecycleOutcome> {
+        let _venue = self.process_venue()?;
+        self.frame.restart_syscall();
+        Some(LifecycleOutcome::Redispatch)
+    }
+    fn exit_reservation_released(
+        &mut self,
+        notification: carrick_core::terminal::TerminalNotification,
+    ) {
+        if let Some(venue) = self.process_venue() {
+            venue.publish_exit_reservation_notification(notification);
+            return;
+        }
+        let Some(zone) = &self.zone else {
+            return;
+        };
+        let Some(slot) = self.frame.slot() else {
+            return;
+        };
+        super::native_process_runtime::publish_terminal_notification(
+            &notification,
+            zone.tables,
+            slot,
+            &carrick_sched_core::ShortLockSpin,
+        );
+    }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
         if !binding.issued() {
