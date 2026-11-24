@@ -5344,3 +5344,118 @@ fn arm_fork_waits_while_sibling_fork_holds_birth_reservation() {
 fn arm_vfork_waits_while_sibling_fork_holds_birth_reservation() {
     fork_while_sibling_holds_birth_reservation(true);
 }
+
+/// #2028: a process CPU clock encoded with the caller's own tid names the
+/// caller's process, even from a non-leader thread (clock_gettime(2); a
+/// native Linux 6.12 probe: a worker's `(~gettid() << 3) | 2` reads its
+/// group's CPU time, the clock its tgid names, and the leader reading that
+/// same worker tid as a process clock gets EINVAL). A native fork child's
+/// non-leader sibling reads its process clock by its own tid and by its
+/// leader's pid, both distinct from its own thread clock; the leader
+/// asking for the sibling's tid as a process clock is EINVAL.
+#[test]
+fn arm_non_leader_process_clock_by_its_own_tid_reads_its_group() {
+    use carrick_guest_arch::{CounterFrequency, CounterTick};
+
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let zone = h.env.fixture.zone;
+    let counters = carrick_el1_abi::Counters::new();
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    h.env.call(
+        SlotId::new(1),
+        h.target_page,
+        h.sibling_control,
+        &counters,
+        &mut gettid,
+        &mut h.sibling_cpu,
+    );
+    let sibling_tid = gettid.x[0] as u32;
+    assert_ne!(sibling_tid, h.target_pid, "the sibling is not the leader");
+
+    // Both threads leave their slots, then the leader runs 30 ms of user
+    // time and the sibling 5 ms, so the group's clock differs from either
+    // thread's.
+    zone.publish_counter_frequency(CounterFrequency::new(
+        NonZeroU64::new(1_000_000_000).unwrap(),
+    ));
+    let leader = zone.record_ref(zone.slot(SlotId::new(0)).current().unwrap());
+    let sibling = zone.record_ref(zone.slot(SlotId::new(1)).current().unwrap());
+    let base = zone.latest_cpu_tick().raw();
+    zone.cpu_leave_slot(SlotId::new(0), CounterTick::new(base));
+    zone.cpu_leave_slot(SlotId::new(1), CounterTick::new(base));
+    let ns = |record| {
+        let ticks = zone.sample_record_cpu_ticks(record, None);
+        assert_eq!(ticks.user, 0, "no user time before the charge");
+        ticks.system
+    };
+    let (leader_before, sibling_before) = (ns(leader), ns(sibling));
+    zone.cpu_enter_user(SlotId::new(0), Some(leader), CounterTick::new(base));
+    zone.cpu_leave_slot(SlotId::new(0), CounterTick::new(base + 30_000_000));
+    zone.cpu_enter_user(
+        SlotId::new(1),
+        Some(sibling),
+        CounterTick::new(base + 30_000_000),
+    );
+    zone.cpu_leave_slot(SlotId::new(1), CounterTick::new(base + 35_000_000));
+    let group = 35_000_000 + leader_before + sibling_before;
+    let own = 5_000_000 + sibling_before;
+
+    // `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+    let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
+    let env = h.env;
+    let page = h.target_page;
+    let mut gettime = |slot: SlotId,
+                       control: &'static ThreadControlSlot,
+                       cpu: &mut crate::sched::FakeCpu,
+                       clock: u64| {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+        frame.x[0] = clock;
+        frame.x[1] = ts.arg();
+        let route = env.call(slot, page, control, &counters, &mut frame, cpu);
+        assert!(
+            matches!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            ),
+            "clock_gettime({clock:#x}) was not served in ring: {route:?}"
+        );
+        (frame.x[0] as i64, ts.get())
+    };
+    let sibling_slot = SlotId::new(1);
+    let (control, cpu) = (h.sibling_control, &mut h.sibling_cpu);
+    for (clock, expected) in [
+        // The group's clock: by the caller's own tid, its leader's pid, and
+        // pid 0, for SCHED, PROF and VIRT (user time only).
+        (dynamic(sibling_tid, 0b010), group),
+        (dynamic(sibling_tid, 0b000), group),
+        (dynamic(sibling_tid, 0b001), 35_000_000),
+        (dynamic(h.target_pid, 0b010), group),
+        (dynamic(h.target_pid, 0b001), 35_000_000),
+        (dynamic(0, 0b010), group),
+        // The sibling's own thread clock, by its tid and by tid 0.
+        (dynamic(sibling_tid, 0b110), own),
+        (dynamic(sibling_tid, 0b101), 5_000_000),
+        (dynamic(0, 0b110), own),
+    ] {
+        assert_eq!(
+            gettime(sibling_slot, control, cpu, clock),
+            (0, [0, expected]),
+            "sibling clock_gettime({clock:#x})"
+        );
+    }
+    // The same non-leader tid names no process for any other thread.
+    assert_eq!(
+        gettime(
+            SlotId::new(0),
+            h.leader_control,
+            &mut h.leader_cpu,
+            dynamic(sibling_tid, 0b010)
+        ),
+        (-22, [u64::MAX; 2]),
+        "leader clock_gettime(sibling tid as a process clock)"
+    );
+}

@@ -8176,6 +8176,91 @@ mod container_clock_tests {
         }
     }
 
+    /// #2028: a process CPU clock encoded with the caller's own tid names
+    /// the caller's process, even from a non-leader thread (clock_gettime(2);
+    /// a native Linux 6.12 probe: a worker's `(~gettid() << 3) | 1` reads its
+    /// group's user time, and the leader reading that worker tid as a
+    /// process clock gets EINVAL). VIRT is exact user time, so the group's
+    /// clock (5 + 3 ms) is distinct from the sibling's own thread (3 ms).
+    #[test]
+    fn clock_gettime_non_leader_process_clock_by_its_own_tid_reads_its_group() {
+        const SYS_GETPID: u64 = 172;
+        const SYS_GETTID: u64 = 178;
+        const LEADER_USER: Duration = Duration::from_millis(5);
+        const SIBLING_USER: Duration = Duration::from_millis(3);
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let leader = dispatcher.capture_one_task_context().expect("task context");
+        let sibling_tid = dispatcher
+            .register_one_task_thread(
+                &leader,
+                crate::thread::ThreadId::synthetic_for_tests(20_280),
+            )
+            .expect("sibling thread");
+        let sibling = leader
+            .kernel()
+            .context(leader.task().key().id, sibling_tid)
+            .expect("sibling context");
+        leader
+            .thread()
+            .charge_user_ns(LEADER_USER.as_nanos() as u64);
+        sibling
+            .thread()
+            .charge_user_ns(SIBLING_USER.as_nanos() as u64);
+        let mut call = |context: &crate::kernel::KernelContext, number: u64, clock: u64| {
+            let outcome = dispatcher
+                .dispatch(
+                    context,
+                    SyscallRequest::new(number, SyscallArgs([clock, TIMESPEC_ADDR, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("dispatch");
+            match outcome {
+                DispatchOutcome::Returned { value } if number != SYS_CLOCK_GETTIME => Ok(value),
+                DispatchOutcome::Returned { value: 0 } => {
+                    let bytes = memory.read_bytes(TIMESPEC_ADDR, 16).expect("timespec");
+                    let secs = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    let nanos = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    Ok(Duration::new(secs as u64, nanos as u32).as_nanos() as i64)
+                }
+                DispatchOutcome::Errno { errno } => Err(errno.get()),
+                other => panic!("syscall {number} ({clock:#x}): {other:?}"),
+            }
+        };
+        let pid = call(&leader, SYS_GETPID, 0).expect("getpid") as u32;
+        let tid = call(&sibling, SYS_GETTID, 0).expect("gettid") as u32;
+        assert_ne!(tid, pid, "the sibling is not the leader");
+        // `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+        let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
+        let group = (LEADER_USER + SIBLING_USER).as_nanos() as i64;
+        let own = SIBLING_USER.as_nanos() as i64;
+        for (clock, expected) in [
+            (dynamic(tid, 0b001), group),
+            (dynamic(pid, 0b001), group),
+            (dynamic(0, 0b001), group),
+            (dynamic(tid, 0b101), own),
+            (dynamic(0, 0b101), own),
+        ] {
+            assert_eq!(
+                call(&sibling, SYS_CLOCK_GETTIME, clock),
+                Ok(expected),
+                "sibling clock {clock:#x}"
+            );
+        }
+        assert!(
+            call(&sibling, SYS_CLOCK_GETTIME, dynamic(tid, 0b010)).expect("SCHED by own tid")
+                >= group,
+        );
+        // The same non-leader tid names no process for any other thread.
+        assert_eq!(
+            call(&leader, SYS_CLOCK_GETTIME, dynamic(tid, 0b001)),
+            Err(22),
+            "leader reading the sibling's tid as a process clock"
+        );
+    }
+
     #[test]
     fn clock_gettime_realtime_reads_the_callers_container_domain() {
         let mut a = SyscallDispatcher::new();
