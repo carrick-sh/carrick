@@ -5613,7 +5613,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                 rng ^= rng << 17;
                 held.retain(|record| zone.place_from_host(*record).is_none());
                 let record = records[rng as usize % records.len()];
-                if rng % 4 == 0 {
+                if rng.is_multiple_of(4) {
                     // A host futex wake that places in the guest.
                     let uaddr = ADDRESSES[(rng >> 8) as usize % ADDRESSES.len()];
                     let guard = zone
