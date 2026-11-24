@@ -2735,37 +2735,31 @@ fn run_mounted_binary_within(
         .output()
         .expect("run live KVM zonedump");
     std::fs::write(capture_dir.join("zonedump.txt"), &zonedump.stdout).expect("keep live zonedump");
+    // The host stacks need no debug endpoint, so they are taken from the
+    // carrier itself (this test's own child): a carrier stuck in teardown
+    // has no endpoint left and is still captured (#2955).
+    let request = carrick_kernel::wedge_capture::WedgeCaptureRequest {
+        label: "kvm-deadline".to_owned(),
+        pid: i32::try_from(child.id()).expect("carrier PID fits i32"),
+        run_id: Some(scoped_run_id.clone()),
+        budget_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        out_root: capture_dir.clone(),
+    };
+    match carrick_kernel::wedge_capture::capture_external_carrier(request, false) {
+        Ok(capture) => eprintln!("KVM deadline host stacks: {}", capture.backtrace.display()),
+        Err(error) => eprintln!("KVM deadline host stack capture failed: {error}"),
+    }
+    // Kill before any assertion: a failed capture must not leak the
+    // carrier (#2955: one spun for 3 h after its test had panicked).
+    // SAFETY: this test created an exclusive process group for this exact run.
+    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+    let output = child.wait_with_output().expect("reap timed-out KVM run");
     assert!(
         zonedump.status.success(),
         "live zonedump failed: {}",
         String::from_utf8_lossy(&zonedump.stderr)
     );
-    let endpoint = carrick_kernel::kernel::debug::DebugEndpoint::for_run_id(&scoped_run_id)
-        .expect("resolve KVM carrier endpoint");
-    let stack_result = endpoint
-        .live_owner_pid()
-        .map_err(|error| error.to_string())
-        .and_then(|pid| {
-            let pid = i32::try_from(pid).expect("carrier PID fits i32");
-            let request = carrick_kernel::wedge_capture::WedgeCaptureRequest {
-                label: "kvm-deadline".to_owned(),
-                pid,
-                run_id: Some(scoped_run_id.clone()),
-                budget_ms: 5_000,
-                elapsed_ms: 5_000,
-                out_root: capture_dir.clone(),
-            };
-            carrick_kernel::wedge_capture::capture_wedged_carrier(request)
-                .map(|capture| capture.dir.display().to_string())
-                .map_err(|error| error.to_string())
-        });
-    match stack_result {
-        Ok(dir) => eprintln!("KVM deadline host stacks: {dir}"),
-        Err(error) => eprintln!("KVM deadline host stack capture failed: {error}"),
-    }
-    // SAFETY: this test created an exclusive process group for this exact run.
-    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
-    let output = child.wait_with_output().expect("reap timed-out KVM run");
     let capture = capture.expect("run KVM deadline capture");
     assert!(
         capture.status.success(),
