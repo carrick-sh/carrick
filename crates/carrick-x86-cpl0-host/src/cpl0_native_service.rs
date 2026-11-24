@@ -70,9 +70,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // A stopped production lease names one of the carrier's two CPUs.
         let slot = SlotId::new(stopped_cpu.raw() as u8);
         let task = self.task(stopped_cpu);
-        deliver_stopped_completion(sink, slot, owned, &|| {
-            task.linux.mark_pending_host_work()
-        });
+        deliver_stopped_completion(sink, slot, owned, &|| task.linux.mark_pending_host_work());
     }
 
     /// Authenticate a retained supervisor span against this exact live root.
@@ -525,6 +523,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 /// host held the queue, or an admission handed to the holder. Handbacks go
 /// to the carrier's completion chain, which the stopped CPU's host-work
 /// boundary settles (#2928); `mark_stopped` rings that CPU's doorbell.
+///
+/// Every CPU the wake queued work on gets the reschedule MSI through
+/// `sink`, as the direct acknowledgment path and the carrier zone's
+/// handbacks (`hand_back_in_carrier`) do: x86 reads no owed-reschedule
+/// word, and a CPU idling in `hlt` wakes only on the interrupt.
 fn deliver_stopped_completion(
     sink: &dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>,
     stopped: SlotId,
@@ -535,7 +538,6 @@ fn deliver_stopped_completion(
     mark_stopped: &dyn Fn(),
 ) {
     let zone = owned.zone();
-    let _ = sink;
     let (waker, effects, deferred) = owned.defer_handbacks();
     carrick_el1::substrate::sched::object_wait::deliver_effects_with(
         zone,
@@ -545,6 +547,7 @@ fn deliver_stopped_completion(
         deferred,
         |target, _| {
             zone.owe_resched(target);
+            sink.resched(target);
             mark_stopped();
         },
         (|_| mark_stopped(), mark_stopped),
@@ -629,9 +632,7 @@ mod stopped_completion_tests {
         let key = ObjectWaitKey::new(3, 1).expect("key");
         let marks = std::cell::Cell::new(0_u32);
         let completion = |owned: OwnedObjectWakeEffects<'_, ParkedContextWords>| {
-            super::deliver_stopped_completion(&sink, stopped, owned, &|| {
-                marks.set(marks.get() + 1)
-            })
+            super::deliver_stopped_completion(&sink, stopped, owned, &|| marks.set(marks.get() + 1))
         };
         zone.bind_object_wait_with_completion(key, &ShortLockSpin, &completion)
             .expect("bind");
