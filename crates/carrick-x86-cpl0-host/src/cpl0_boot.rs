@@ -6007,10 +6007,13 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             carrick_hal::fork_stock::UntaggedRoots,
         );
-        // The carrier launches the boot task: its table gets the zone's one
-        // stdio admission before any guest instruction runs (#2820).
-        // SAFETY: `prepare_boot` initialized the aligned boot task record
-        // inside this retained metadata; nothing runs before this custody.
+        // The carrier launches the boot task: the table it names gets the
+        // zone's one stdio admission before any guest instruction runs
+        // (#2820). A boot record naming no table (0) leaves admission to the
+        // first table the carrier binds.
+        // SAFETY: the retained metadata holds the aligned boot task record,
+        // initialized by `prepare_boot` or zeroed (all-zero atomics are a
+        // valid record); nothing runs before this custody exists.
         let boot_table = unsafe {
             metadata_base
                 .0
@@ -6023,20 +6026,22 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         .linux
         .file_table
         .load(Ordering::Acquire);
-        let stdio = {
+        let mut stdio = stdio::StdioCustody::default();
+        if boot_table != 0 {
             let tables = files
                 .0
                 .registration
                 .tables(files.0.registration.binding())
                 .map_err(|error| fail(format!("boot stdio tables: {error:?}")))?;
-            stdio::StdioCustody::admit(
-                tables.fd_map(),
-                tables.opens(),
-                tables.objects(),
-                boot_table,
-            )
-            .map_err(|error| fail(format!("boot stdio admission: {error:?}")))?
-        };
+            stdio
+                .bind_table(
+                    tables.fd_map(),
+                    tables.opens(),
+                    tables.objects(),
+                    boot_table,
+                )
+                .map_err(|error| fail(format!("boot stdio admission: {error:?}")))?;
+        }
         Ok(Self(Cpl0HostCustody {
             _vm: memory,
             ram,
@@ -8176,7 +8181,13 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             .load(Ordering::Acquire);
         self.0
             .with_stdio(|stdio, tables| {
-                stdio.rename_unstarted(tables.fd_map(), provisional, identity.thread.file_table)
+                stdio.rename_unstarted(
+                    tables.fd_map(),
+                    tables.opens(),
+                    tables.objects(),
+                    provisional,
+                    identity.thread.file_table,
+                )
             })?
             .map_err(|error| fail(format!("initial root stdio table: {error:?}")))?;
         let task = self.stopped_task(0);
@@ -8288,7 +8299,12 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         self.stopped_slot(index).publish_host_birth_identity(birth);
         self.0
             .with_stdio(|stdio, tables| {
-                stdio.bind_table(tables.fd_map(), tables.opens(), file_table)
+                stdio.bind_table(
+                    tables.fd_map(),
+                    tables.opens(),
+                    tables.objects(),
+                    file_table,
+                )
             })?
             .map_err(|error| fail(format!("initial task stdio table: {error:?}")))?;
         let task = self.stopped_task(index);

@@ -2,9 +2,9 @@
 //!
 //! Linux gives a process stdin, stdout and stderr only by inheritance: the
 //! launcher's descriptors, then fork's copy. The stopped carrier is the
-//! launcher here. It admits the three descriptions once, before any guest
-//! instruction runs, into the table of the task it boots, and keeps the
-//! [`StdioDescriptions`] it gets back. No guest path admits stdio, so every
+//! launcher here. It admits the three descriptions once, into the first
+//! table it binds to an initial task and before that task runs, and keeps
+//! the [`StdioDescriptions`] it gets back; a later bound table shares them. No guest path admits stdio, so every
 //! other table holds them only by fork, and a number a process closed stays
 //! closed. The guest's release of a description's last reference must
 //! present exactly the identity this custody holds, once.
@@ -14,11 +14,11 @@ use carrick_el1_linux::file_table::{
     ReleasedDescription, StdioAdmissionError, StdioDescriptions, rename_unstarted_table,
 };
 
-/// The zone's stdio descriptions, the boot tables that reference them, and
-/// which ones the guest has released.
-#[derive(Debug)]
+/// The zone's stdio descriptions once the carrier has bound a table, the
+/// boot tables that reference them, and which ones the guest has released.
+#[derive(Debug, Default)]
 pub(crate) struct StdioCustody {
-    descriptions: StdioDescriptions,
+    descriptions: Option<StdioDescriptions>,
     tables: Vec<u64>,
     released: [bool; 3],
 }
@@ -29,6 +29,8 @@ pub(crate) struct StdioCustody {
 pub enum StdioReleaseRefusal {
     /// The binding names no stdio route.
     NotStdio { binding: u64 },
+    /// The carrier has bound no table, so it admitted no stdio.
+    NotAdmitted { binding: HostObjectBinding },
     /// The presented description is not the one the carrier admitted for
     /// this binding.
     Foreign {
@@ -49,6 +51,11 @@ impl core::fmt::Display for StdioReleaseRefusal {
             Self::NotStdio { binding } => {
                 write!(f, "host object release names no stdio binding ({binding})")
             }
+            Self::NotAdmitted { binding } => write!(
+                f,
+                "host object release of binding {} before the carrier admitted stdio",
+                binding.encoded()
+            ),
             Self::Foreign {
                 binding,
                 presented,
@@ -75,53 +82,46 @@ impl core::fmt::Display for StdioReleaseRefusal {
 }
 
 impl StdioCustody {
-    /// Admit the zone's stdio into `boot_table`, the stopped boot task's.
-    pub(crate) fn admit(
-        fd_map: &[FdMapSlot],
-        opens: &[DelegatedOpenFile],
-        objects: &[DelegatedFile],
-        boot_table: u64,
-    ) -> Result<Self, StdioAdmissionError> {
-        let descriptions = StdioDescriptions::admit(fd_map, opens, objects, boot_table)?;
-        Ok(Self {
-            descriptions,
-            tables: vec![boot_table],
-            released: [false; 3],
-        })
-    }
-
     /// Give `table`, which the stopped carrier binds to an initial task, the
-    /// zone's stdio once: a table already bound keeps what it has.
+    /// zone's stdio once: the first bound table admits the descriptions, a
+    /// later one shares them, and a table already bound keeps what it has.
     pub(crate) fn bind_table(
         &mut self,
         fd_map: &[FdMapSlot],
         opens: &[DelegatedOpenFile],
+        objects: &[DelegatedFile],
         table: u64,
     ) -> Result<(), StdioAdmissionError> {
         if self.tables.contains(&table) {
             return Ok(());
         }
-        self.descriptions.share_into(fd_map, opens, table)?;
+        match &self.descriptions {
+            Some(descriptions) => descriptions.share_into(fd_map, opens, table)?,
+            None => {
+                self.descriptions = Some(StdioDescriptions::admit(fd_map, opens, objects, table)?);
+            }
+        }
         self.tables.push(table);
         Ok(())
     }
 
     /// The stopped boot task, which has not run, takes the table its issued
-    /// identity names in place of its provisional one.
+    /// identity names in place of its provisional one; a provisional table
+    /// the carrier never bound is simply replaced by a bound `to`.
     pub(crate) fn rename_unstarted(
         &mut self,
         fd_map: &[FdMapSlot],
+        opens: &[DelegatedOpenFile],
+        objects: &[DelegatedFile],
         from: u64,
         to: u64,
     ) -> Result<(), StdioAdmissionError> {
         if from == to {
-            return Ok(());
+            return self.bind_table(fd_map, opens, objects, to);
         }
-        let position = self
-            .tables
-            .iter()
-            .position(|table| *table == from)
-            .ok_or(StdioAdmissionError::NoTable)?;
+        let Some(position) = self.tables.iter().position(|table| *table == from) else {
+            return self.bind_table(fd_map, opens, objects, to);
+        };
         if self.tables.contains(&to) || !rename_unstarted_table(fd_map, from, to) {
             return Err(StdioAdmissionError::TableHasStdio);
         }
@@ -147,6 +147,8 @@ impl StdioCustody {
             .ok_or(StdioReleaseRefusal::NotStdio { binding })?;
         let admitted = self
             .descriptions
+            .as_ref()
+            .ok_or(StdioReleaseRefusal::NotAdmitted { binding: object })?
             .key(object)
             .ok_or(StdioReleaseRefusal::NotStdio { binding })?;
         if presented != admitted {
@@ -190,8 +192,10 @@ mod tests {
                 objects: (0..64).map(|_| DelegatedFile::new()).collect(),
             }
         }
-        fn admit(&self, table: u64) -> StdioCustody {
-            StdioCustody::admit(&self.fd_map, &self.opens, &self.objects, table).unwrap()
+        fn bind(&self, stdio: &mut StdioCustody, table: u64) {
+            stdio
+                .bind_table(&self.fd_map, &self.opens, &self.objects, table)
+                .unwrap();
         }
     }
 
@@ -200,8 +204,24 @@ mod tests {
     #[test]
     fn release_presents_the_admitted_description_once() {
         let storage = Tables::new();
-        let mut stdio = storage.admit(5);
-        let stdout = stdio.descriptions.key(HostObjectBinding::STDOUT).unwrap();
+        let mut stdio = StdioCustody::default();
+        let unbound = ReleasedDescription {
+            handle: 2,
+            incarnation: 1,
+        };
+        assert_eq!(
+            stdio.release(2, unbound),
+            Err(StdioReleaseRefusal::NotAdmitted {
+                binding: HostObjectBinding::STDOUT
+            })
+        );
+        storage.bind(&mut stdio, 5);
+        let stdout = stdio
+            .descriptions
+            .as_ref()
+            .unwrap()
+            .key(HostObjectBinding::STDOUT)
+            .unwrap();
         let foreign = ReleasedDescription {
             handle: 5,
             incarnation: 1,
@@ -231,25 +251,37 @@ mod tests {
     #[test]
     fn boot_tables_share_one_admission_and_rename_before_running() {
         let storage = Tables::new();
-        let (fd_map, opens) = (&storage.fd_map, &storage.opens);
-        let mut stdio = storage.admit(5);
-        stdio.bind_table(fd_map, opens, 5).unwrap();
-        stdio.rename_unstarted(fd_map, 5, 77).unwrap();
+        let (fd_map, opens, objects) = (&storage.fd_map, &storage.opens, &storage.objects);
+        let mut stdio = StdioCustody::default();
+        // A provisional table the carrier never bound: the issued one admits.
+        stdio
+            .rename_unstarted(fd_map, opens, objects, 0, 5)
+            .unwrap();
+        storage.bind(&mut stdio, 5);
+        stdio
+            .rename_unstarted(fd_map, opens, objects, 5, 77)
+            .unwrap();
         assert!(fd_map_lookup(fd_map, 5, 1).is_none());
-        stdio.bind_table(fd_map, opens, 77).unwrap();
-        stdio.bind_table(fd_map, opens, 6).unwrap();
+        storage.bind(&mut stdio, 77);
+        storage.bind(&mut stdio, 6);
+        let stdout = stdio
+            .descriptions
+            .as_ref()
+            .unwrap()
+            .key(HostObjectBinding::STDOUT)
+            .unwrap();
         for table in [6, 77] {
-            assert_eq!(
-                fd_map_lookup(&storage.fd_map, table, 1).unwrap().0,
-                stdio
-                    .descriptions
-                    .key(HostObjectBinding::STDOUT)
-                    .unwrap()
-                    .handle
-            );
+            assert_eq!(fd_map_lookup(fd_map, table, 1).unwrap().0, stdout.handle);
         }
         assert_eq!(
-            stdio.rename_unstarted(fd_map, 77, 6),
+            opens[stdout.handle as usize - 1]
+                .lifetime
+                .ring_references(stdout.incarnation),
+            Some(2),
+            "one admission, shared by reference"
+        );
+        assert_eq!(
+            stdio.rename_unstarted(fd_map, opens, objects, 77, 6),
             Err(StdioAdmissionError::TableHasStdio)
         );
     }
