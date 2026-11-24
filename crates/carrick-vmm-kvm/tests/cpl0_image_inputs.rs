@@ -213,15 +213,17 @@ mod image_budget {
         assert_eq!(ImageBudget::of(&big_endian), None);
     }
 
-    /// Table offsets at `u64::MAX`: every offset sum is checked, so the
-    /// read is `None`, not an overflow panic in the build script.
+    /// Table offsets at `u64::MAX`, the program headers' and the section
+    /// headers' each alone: every offset sum is checked, so the read is
+    /// `None`, not an overflow panic in the build script.
     #[test]
     fn cpl0_image_tables_at_the_end_of_the_address_space_read_as_no_budget() {
         let (_, image) = IMAGES[0];
-        let mut huge_offsets = image.to_vec();
-        huge_offsets[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
-        huge_offsets[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(ImageBudget::of(&huge_offsets), None);
+        for (table, field) in [("program", 0x20..0x28), ("section", 0x28..0x30)] {
+            let mut huge_offset = image.to_vec();
+            huge_offset[field].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert_eq!(ImageBudget::of(&huge_offset), None, "{table} headers");
+        }
     }
 
     /// A minimal ELF64 image: one `PT_LOAD` of 0x300 bytes at 0x1000, and a
@@ -291,5 +293,38 @@ mod image_budget {
     #[test]
     fn an_unterminated_extent_name_reads_as_no_budget() {
         assert_eq!(ImageBudget::of(&synthetic_image(false, 0)), None);
+    }
+
+    /// Each table is checked whole: a file cut one byte inside the last
+    /// section header is malformed even though every field the reader
+    /// uses from that header is still present.
+    #[test]
+    fn a_section_table_cut_inside_its_last_entry_reads_as_no_budget() {
+        let image = synthetic_image(true, 0);
+        assert_eq!(ImageBudget::of(&image[..image.len() - 1]), None);
+    }
+
+    /// The synthetic image with its one `PT_LOAD`'s file offset, file size
+    /// and memory size replaced.
+    fn with_load_segment(offset: u64, filesz: u64, memsz: u64) -> Vec<u8> {
+        const PHOFF: usize = 64;
+        let mut image = synthetic_image(true, 0);
+        for (at, value) in [(0x08, offset), (0x20, filesz), (0x28, memsz)] {
+            image[PHOFF + at..PHOFF + at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        image
+    }
+
+    /// A load segment's file bytes must lie inside the file.
+    #[test]
+    fn a_load_segment_past_the_end_of_the_file_reads_as_no_budget() {
+        let len = synthetic_image(true, 0).len() as u64;
+        assert_eq!(ImageBudget::of(&with_load_segment(len, 1, 0x300)), None);
+    }
+
+    /// A load segment's file bytes must fit its memory size.
+    #[test]
+    fn a_load_segment_larger_in_the_file_than_in_memory_reads_as_no_budget() {
+        assert_eq!(ImageBudget::of(&with_load_segment(0, 0x10, 0x8)), None);
     }
 }
