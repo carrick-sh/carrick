@@ -413,3 +413,9 @@ test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_c
 reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference, where it runs on the Linux host unit lanes."
 replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
 pr = 2916
+
+[[retired]]
+test = "carrick_el1_linux::decoder_tests::reservation_decoder_forwards_out_of_layout_hint"
+reason = "#2706: a free outside-layout mmap hint (Go's 0xc000000000) is now served exactly in ring by the shared reservation owner instead of forwarded, so the forward witness became an exact-proposal witness."
+replaced_by = "carrick_el1_linux::decoder_tests::reservation_decoder_serves_a_free_out_of_layout_hint_exactly"
+pr = 2950
