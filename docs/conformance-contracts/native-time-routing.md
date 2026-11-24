@@ -512,3 +512,46 @@ The ARM VM-free witnesses verify null/fault validation plus non-zero user,
 system, and reaped-child tick accounting; the KVM witness verifies raw/vDSO
 ordering, two-thread spin + raw `exit`, and two-process user/system + `wait4`
 children accounting against the native Linux x86_64 oracle.
+
+## Every clock id in ring (#2028)
+
+`clock_gettime` used to serve only REALTIME, REALTIME_COARSE, MONOTONIC,
+MONOTONIC_RAW and the two static CPU-time ids. Any other id left the ring's
+family as a `Forward`, which for a native child (and the x86 root, which
+has no host replay) is a counted ENOSYS. The x86 vDSO serves only REALTIME,
+MONOTONIC and MONOTONIC_RAW, so libuv's fast clock (`CLOCK_MONOTONIC_COARSE`,
+chosen because Carrick reports a 1 ms coarse resolution) and BOOTTIME reach
+syscall 228. On x86 KVM the npm row's native child counted 131 such
+refusals on main `32e1b5976`, its top refusal.
+
+One classification, `carrick_syscall_abi::linux_clock_read`, now names the
+time base of every clock id. The host dispatcher's `linux_clock_duration`,
+`dynamic_cpu_clock` and `linux_clock_resolution_ns` use it, and so does the
+ring's `clock_gettime`:
+
+- an unknown id, a posix-clock fd (Carrick has no clock device; a native
+  probe of a regular file's fd also answers EINVAL) and a CPU clock with
+  `CPUCLOCK_WHICH` 3 are EINVAL, before the output is read;
+- a valid clock with a null or faulting output is EFAULT;
+- MONOTONIC, MONOTONIC_RAW, BOOTTIME and BOOTTIME_ALARM read the guest
+  counter, the vDSO's epoch (a guest never suspends apart from its counter,
+  so BOOTTIME equals MONOTONIC); MONOTONIC_COARSE is that counter on the 1 ms
+  coarse grid;
+- REALTIME, REALTIME_ALARM and TAI read the realtime calibration (the TAI
+  offset is 0, Linux's default; a native probe reads TAI - REALTIME = 0 s),
+  REALTIME_COARSE on the coarse grid;
+- the caller's CPU clocks are served by static id and by dynamic id naming
+  pid 0, its own pid or its own tid, for PROF and SCHED.
+
+Another task's CPU clock and a user-time-only (VIRT) CPU clock keep the
+counted ENOSYS: the ring has no authority over another task's accounting
+yet and accounts only total CPU time.
+
+The ARM VM-free witness `native_fork_child_clock_gettime_serves_every_clock_id`
+reads exact values from the zone calibration in a live fork child; the
+exec-successor witness `serial_host_native_exec_child_clock_gettime` (ignored
+on #2028 until now) reads every base through syscall 113. The KVM witness
+`serial_host_native_root_and_child_clock_gettime_every_clock_id` has a live
+root and fork child bracket each clock between raw samples of its base clock,
+read their own CPU clocks by static and dynamic id, and check EINVAL before
+EFAULT.

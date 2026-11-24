@@ -350,26 +350,106 @@ pub const LINUX_CLOCK_FD: u32 = 0b011;
 /// The syscall resolution and the coarse clock grid, also used by the ARM vDSO.
 pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 
-/// Carrick's clock resolution. Dynamic CPU clocks retain the legacy
-/// dispatcher's clock-ID classification on both entry paths.
+/// Carrick's clock resolution, for every clock id [`linux_clock_read`] knows.
 pub const fn linux_clock_resolution_ns(clock_id: i32) -> Option<i64> {
-    match clock_id as u64 {
-        LINUX_CLOCK_REALTIME
-        | LINUX_CLOCK_MONOTONIC
-        | LINUX_CLOCK_PROCESS_CPUTIME_ID
-        | LINUX_CLOCK_THREAD_CPUTIME_ID
-        | LINUX_CLOCK_MONOTONIC_RAW
-        | LINUX_CLOCK_REALTIME_COARSE
-        | LINUX_CLOCK_MONOTONIC_COARSE
-        | LINUX_CLOCK_BOOTTIME
-        | LINUX_CLOCK_REALTIME_ALARM
-        | LINUX_CLOCK_BOOTTIME_ALARM
-        | LINUX_CLOCK_TAI => Some(LINUX_CLOCK_RESOLUTION_NSEC),
-        _ if clock_id < 0 && (clock_id as u32) & LINUX_CLOCK_CPU_WHICH_MASK != LINUX_CLOCK_FD => {
-            Some(LINUX_CLOCK_RESOLUTION_NSEC)
-        }
-        _ => None,
+    match linux_clock_read(clock_id as u32 as u64) {
+        Some(_) => Some(LINUX_CLOCK_RESOLUTION_NSEC),
+        None => None,
     }
+}
+
+/// The time base one `clock_gettime(2)` clock id reads.
+///
+/// The one classification the host dispatcher and both ring entries share,
+/// so a clock id cannot be valid on one path and EINVAL on another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxClockRead {
+    /// `CLOCK_REALTIME`, `CLOCK_REALTIME_ALARM` and `CLOCK_TAI`. Carrick keeps
+    /// the TAI offset at 0, Linux's default (a native 6.12 probe reads
+    /// TAI - REALTIME = 0 s).
+    Realtime,
+    /// `CLOCK_REALTIME_COARSE`: the wall clock on the coarse grid.
+    RealtimeCoarse,
+    /// `CLOCK_MONOTONIC` and `CLOCK_MONOTONIC_RAW`.
+    Monotonic,
+    /// `CLOCK_MONOTONIC_COARSE`: the monotonic clock on the coarse grid.
+    MonotonicCoarse,
+    /// `CLOCK_BOOTTIME` and `CLOCK_BOOTTIME_ALARM`.
+    Boottime,
+    /// A CPU-time clock: the static `CLOCK_PROCESS_CPUTIME_ID` and
+    /// `CLOCK_THREAD_CPUTIME_ID`, or a dynamic `~pid << 3 | bits` id.
+    Cpu(LinuxCpuClock),
+}
+
+/// Which CPU time a CPU clock samples (`CPUCLOCK_WHICH`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxCpuSample {
+    /// User plus system time.
+    Prof,
+    /// User time only.
+    Virt,
+    /// Scheduler runtime: what the static CPU-time ids and
+    /// `clock_getcpuclockid(3)`/`pthread_getcpuclockid(3)` name.
+    Sched,
+}
+
+/// One CPU-time clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxCpuClock {
+    /// A thread's clock, not its process's.
+    pub per_thread: bool,
+    pub sample: LinuxCpuSample,
+    /// The pid or tid a dynamic id names. `None` names the caller: the
+    /// static ids, and a dynamic id whose pid field is 0.
+    pub target: Option<core::num::NonZeroU32>,
+}
+
+/// Classify a `clockid_t` as Linux does for `clock_gettime(2)`, or `None`
+/// for an id that is EINVAL before the clock or the output is touched.
+///
+/// `clockid_t` is a C int: Linux never sees the upper half of the register
+/// (a native probe of `0x1_0000_0001` reads `CLOCK_MONOTONIC`). Source:
+/// clock_gettime(2), clock_getcpuclockid(3) and a native Linux 6.12 x86_64
+/// errno probe: ids 10, 12 and up are EINVAL; a dynamic id whose low three
+/// bits are `CLOCKFD` names a posix-clock device, and carrick has none, so
+/// it is EINVAL as it is natively for a non-clock fd; a CPU clock with
+/// `CPUCLOCK_WHICH` 3 is EINVAL.
+pub const fn linux_clock_read(clock_id: u64) -> Option<LinuxClockRead> {
+    let id = clock_id as u32 as i32;
+    if id < 0 {
+        let bits = id as u32;
+        let sample = match bits & LINUX_CLOCK_CPU_WHICH_MASK {
+            0 => LinuxCpuSample::Prof,
+            1 => LinuxCpuSample::Virt,
+            2 => LinuxCpuSample::Sched,
+            // CLOCKFD, or an invalid per-thread `CPUCLOCK_WHICH`.
+            _ => return None,
+        };
+        // `~pid << 3`: an arithmetic shift recovers `~pid`.
+        let pid = !(id >> 3) as u32;
+        return Some(LinuxClockRead::Cpu(LinuxCpuClock {
+            per_thread: bits & LINUX_CLOCK_CPU_PERTHREAD != 0,
+            sample,
+            target: core::num::NonZeroU32::new(pid),
+        }));
+    }
+    Some(match id as u64 {
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
+            LinuxClockRead::Realtime
+        }
+        LINUX_CLOCK_REALTIME_COARSE => LinuxClockRead::RealtimeCoarse,
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW => LinuxClockRead::Monotonic,
+        LINUX_CLOCK_MONOTONIC_COARSE => LinuxClockRead::MonotonicCoarse,
+        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => LinuxClockRead::Boottime,
+        LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID => {
+            LinuxClockRead::Cpu(LinuxCpuClock {
+                per_thread: id as u64 == LINUX_CLOCK_THREAD_CPUTIME_ID,
+                sample: LinuxCpuSample::Sched,
+                target: None,
+            })
+        }
+        _ => return None,
+    })
 }
 
 /// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
@@ -738,3 +818,87 @@ pub const LINUX_MADV_DODUMP: u64 = 17;
 pub const LINUX_MADV_HUGEPAGE: u64 = 14;
 pub const LINUX_MADV_NOHUGEPAGE: u64 = 15;
 pub const LINUX_MADV_COLLAPSE: u64 = 25;
+
+#[cfg(test)]
+mod clock_read_tests {
+    use super::*;
+    use core::num::NonZeroU32;
+
+    /// `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+    fn dynamic(pid: u32, bits: u32) -> u64 {
+        ((!(pid as i32) << 3) as u32 | bits) as u64
+    }
+
+    #[test]
+    fn static_ids_follow_linux() {
+        use LinuxClockRead as R;
+        for (id, read) in [
+            (LINUX_CLOCK_REALTIME, Some(R::Realtime)),
+            (LINUX_CLOCK_MONOTONIC, Some(R::Monotonic)),
+            (LINUX_CLOCK_MONOTONIC_RAW, Some(R::Monotonic)),
+            (LINUX_CLOCK_REALTIME_COARSE, Some(R::RealtimeCoarse)),
+            (LINUX_CLOCK_MONOTONIC_COARSE, Some(R::MonotonicCoarse)),
+            (LINUX_CLOCK_BOOTTIME, Some(R::Boottime)),
+            (LINUX_CLOCK_REALTIME_ALARM, Some(R::Realtime)),
+            (LINUX_CLOCK_BOOTTIME_ALARM, Some(R::Boottime)),
+            (LINUX_CLOCK_TAI, Some(R::Realtime)),
+            (10, None),
+            (12, None),
+            (16, None),
+            // The upper half of the register is not part of `clockid_t`.
+            (0x1_0000_0001, Some(R::Monotonic)),
+        ] {
+            assert_eq!(linux_clock_read(id), read, "clock id {id:#x}");
+        }
+        for (id, per_thread) in [
+            (LINUX_CLOCK_PROCESS_CPUTIME_ID, false),
+            (LINUX_CLOCK_THREAD_CPUTIME_ID, true),
+        ] {
+            assert_eq!(
+                linux_clock_read(id),
+                Some(R::Cpu(LinuxCpuClock {
+                    per_thread,
+                    sample: LinuxCpuSample::Sched,
+                    target: None,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_ids_name_their_task_and_sample() {
+        for (bits, per_thread, sample) in [
+            (0, false, LinuxCpuSample::Prof),
+            (1, false, LinuxCpuSample::Virt),
+            (2, false, LinuxCpuSample::Sched),
+            (4, true, LinuxCpuSample::Prof),
+            (6, true, LinuxCpuSample::Sched),
+        ] {
+            for (pid, target) in [(0, None), (4242, NonZeroU32::new(4242))] {
+                let id = dynamic(pid, bits);
+                assert_eq!(
+                    linux_clock_read(id),
+                    Some(LinuxClockRead::Cpu(LinuxCpuClock {
+                        per_thread,
+                        sample,
+                        target,
+                    })),
+                    "clock id {id:#x}"
+                );
+                // A sign-extended register names the same clock.
+                assert_eq!(
+                    linux_clock_read(id as u32 as i32 as u64),
+                    linux_clock_read(id)
+                );
+            }
+        }
+        // CLOCKFD, and a per-thread clock with CPUCLOCK_WHICH 3 (-1).
+        assert_eq!(linux_clock_read(dynamic(3, LINUX_CLOCK_FD)), None);
+        assert_eq!(linux_clock_read(u64::MAX), None);
+        assert_eq!(linux_clock_resolution_ns(-1), None);
+        assert_eq!(
+            linux_clock_resolution_ns(dynamic(0, 2) as u32 as i32),
+            Some(LINUX_CLOCK_RESOLUTION_NSEC)
+        );
+    }
+}
