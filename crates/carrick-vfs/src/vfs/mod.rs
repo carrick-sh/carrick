@@ -1108,6 +1108,14 @@ pub trait Vfs: Send + Sync {
         None
     }
 
+    /// The host inode `path` names, following symlinks: `(st_dev,
+    /// st_ino)` of the host object an open of it would reach. `None` for a
+    /// mount with no host objects, or a path whose host object can't be
+    /// read. The shared file window shrink fence keys on it (#1338).
+    fn host_inode_identity(&self, _path: &str) -> Option<InodeIdentity> {
+        None
+    }
+
     fn readlink(&self, _path: &str) -> Result<PathBuf, VfsError> {
         Err(carrick_abi::LINUX_EINVAL)
     }

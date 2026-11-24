@@ -140,6 +140,13 @@ pub enum HostFileOp {
     SetXattr = 39,
     /// A Linux request from the native host-description allowlist.
     Ioctl = 40,
+    /// Retain the descriptor's host file as a shared file window source for
+    /// a writable `MAP_SHARED` mapping (#1338): the same request and reply
+    /// as [`HostFileOp::MapPrivate`] (`args[0]` offset, `args[1]` length,
+    /// releases as input, a [`MapSourceReply`] as output), but the carrier
+    /// maps the file's own pages for it rather than copying them, so a store
+    /// reaches the file. Only a carrier that installs windows admits it.
+    MapShared = 41,
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -785,6 +792,7 @@ impl HostFileOp {
             38 => Self::ListXattr,
             39 => Self::SetXattr,
             40 => Self::Ioctl,
+            41 => Self::MapShared,
             _ => return None,
         })
     }

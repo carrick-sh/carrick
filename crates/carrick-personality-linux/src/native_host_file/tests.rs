@@ -1043,6 +1043,67 @@ fn read_only_shared_file_mmap_takes_the_byte_source_crossing() {
     }
 }
 
+/// A writable `MAP_SHARED` mapping that [`HostFileCall::MapPrivate`] leaves
+/// unrouted is a shared file window when the venue asks for one (#1338):
+/// the same request shape, op [`HostFileOp::MapShared`], with or without
+/// `PROT_WRITE` (a later `mprotect` may add it). Anything the private route
+/// answers, or a description that cannot write, is never a window.
+#[test]
+fn writable_shared_file_mmap_stages_a_window_request() {
+    let mut user = memory(b"");
+    let args = |prot: u64, flags: u64, fd: u64| [0, 8192, prot, flags, fd, 4096];
+    for prot in [1, 3] {
+        let key = NativeMapKey::of(&args(prot, LINUX_MAP_SHARED, 1));
+        assert_eq!(run(HostFileCall::MapPrivate(key), &mut user), None);
+        let Some(HostFileStage::Request {
+            mut record,
+            output,
+            map,
+            ..
+        }) = run(HostFileCall::MapShared(key), &mut user)
+        else {
+            panic!("a writable shared mapping crosses for its window, prot {prot}");
+        };
+        assert_eq!((output, map), (None, Some(key)), "prot {prot}");
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.header().op, HostFileOp::MapShared);
+        assert_eq!(view.header().args[..2], [4096, 8192]);
+    }
+    // Not a window: a private mapping, or a read-only description.
+    for (flags, fd) in [(LINUX_MAP_PRIVATE, 1), (LINUX_MAP_SHARED, 3)] {
+        let key = NativeMapKey::of(&args(1, flags, fd));
+        assert_eq!(run(HostFileCall::MapShared(key), &mut user), None);
+    }
+    // The descriptor and argument errors match the private route's.
+    let key = NativeMapKey::of(&args(3, LINUX_MAP_SHARED, 1));
+    assert_eq!(
+        run(
+            HostFileCall::MapShared(NativeMapKey { fd: 0, ..key }),
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENODEV)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::MapShared(NativeMapKey { fd: 9, ..key }),
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_EBADF)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::MapShared(NativeMapKey { offset: 1, ..key }),
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_EINVAL)
+    );
+    // Decoding never yields a window: the venue asks for one.
+    assert!(matches!(
+        HostFileCall::decode(LINUX_NR_MMAP, &args(3, LINUX_MAP_SHARED, 1)),
+        Some(HostFileCall::MapPrivate(_))
+    ));
+}
+
 #[test]
 fn unserved_epoll_reads_do_not_prepare_output() {
     let mut user = memory(&[]);

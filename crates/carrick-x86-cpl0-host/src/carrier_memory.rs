@@ -117,6 +117,32 @@ enum ExtentStorage {
         owner: Arc<dyn carrick_el1_abi::IpcWindowBacking>,
         part: IpcWindowPart,
     },
+    /// One chunk of a host file's page cache (#1338 shared file window):
+    /// guest stores through the slot are the file's bytes, so there is no
+    /// copy and nothing to write back.
+    HostFile(HostFileMapping),
+}
+
+/// A retained host `mmap(MAP_SHARED)` of one file range, unmapped when the
+/// extent that owns it drops. The mapping keeps the file's pages alive on
+/// its own; the descriptor it was made from may close.
+struct HostFileMapping {
+    host: core::ptr::NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is a plain shared host range with no thread affinity;
+// all access goes through the carrier's own custody checks.
+unsafe impl Send for HostFileMapping {}
+// SAFETY: as above; the carrier never hands out a `&mut` to the bytes.
+unsafe impl Sync for HostFileMapping {}
+
+impl Drop for HostFileMapping {
+    fn drop(&mut self) {
+        // SAFETY: `host`/`len` name exactly the live mapping this value owns,
+        // made once by `BackingExtent::host_file_window` and never shared.
+        unsafe { libc::munmap(self.host.as_ptr().cast(), self.len) };
+    }
 }
 
 /// Which allocation of the original IPC authority this extent retains.
@@ -183,6 +209,58 @@ impl BackingExtent {
         })
     }
 
+    /// Retain one range of a host file as a live shared extent (#1338): a
+    /// host `mmap(MAP_SHARED)` of `len` bytes at `file_offset`, so the slot
+    /// projects the file's page cache. Only offsets the window record admits
+    /// below the file's size may ever be published from it: a host access
+    /// past EOF is a host `SIGBUS`, never a guest one.
+    pub fn host_file_window(
+        base: FrameGpa,
+        file: std::os::fd::BorrowedFd<'_>,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<Self, MemoryError> {
+        use std::os::fd::AsRawFd;
+        if len == 0
+            || !(len as u64).is_multiple_of(PAGE)
+            || !file_offset.is_multiple_of(PAGE)
+            || base.raw() & !ADDRESS != 0
+            || base
+                .raw()
+                .checked_add(len as u64)
+                .is_none_or(|end| end > 1 << 52)
+        {
+            return Err(error("invalid host-file window extent"));
+        }
+        let offset = libc::off_t::try_from(file_offset)
+            .map_err(|_| error("host-file window offset exceeds off_t"))?;
+        // SAFETY: a fresh shared mapping of a caller-borrowed descriptor,
+        // checked against MAP_FAILED before it is retained.
+        let host = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                offset,
+            )
+        };
+        if host == libc::MAP_FAILED {
+            return Err(error(format!(
+                "host-file window mmap failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let host = core::ptr::NonNull::new(host.cast::<u8>())
+            .ok_or_else(|| error("host-file window mmap returned null"))?;
+        Ok(Self {
+            storage: ExtentStorage::HostFile(HostFileMapping { host, len }),
+            base,
+            len,
+        })
+    }
+
     pub fn initialize(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if offset
             .checked_add(bytes.len())
@@ -191,7 +269,9 @@ impl BackingExtent {
             return Err(error("extent initialization bounds"));
         }
         let ExtentStorage::Ram(ram) = &mut self.storage else {
-            return Err(error("IPC authority cannot be initialized as private RAM"));
+            return Err(error(
+                "a retained IPC or host-file authority cannot be initialized as private RAM",
+            ));
         };
         Arc::get_mut(ram)
             .ok_or_else(|| error("extent already shared"))?
@@ -229,7 +309,17 @@ impl BackingExtent {
                 // the extent bounds were checked above.
                 Some(unsafe { ptr.add((pa - self.base.raw()) as usize) })
             }
+            // SAFETY: the owned mapping covers exactly `self.len` bytes from
+            // `self.base`; the extent bounds were checked above.
+            ExtentStorage::HostFile(mapping) => {
+                Some(unsafe { mapping.host.as_ptr().add((pa - self.base.raw()) as usize) })
+            }
         }
+    }
+
+    /// A shared file window chunk (#1338): kept for the run, never private.
+    pub(crate) fn is_host_file_window(&self) -> bool {
+        matches!(self.storage, ExtentStorage::HostFile(_))
     }
 
     /// Host view of this retained extent; never a guest VA or a GPA.
@@ -366,6 +456,21 @@ impl InheritedFrameEdge {
     }
     pub fn identity(&self) -> BackingIdentity {
         self.identity
+    }
+}
+
+/// One parent shared file window leaf a fork child keeps (#1338). It names
+/// the window slot and the parent root it was read from; it owns no frame
+/// and carries no inventory identity.
+pub struct InheritedWindowEdge {
+    handle: BackingHandle,
+    parent: AddressContext<RootGpa>,
+    span: PageSpan,
+    gpa: FrameGpa,
+}
+impl InheritedWindowEdge {
+    pub fn span(&self) -> PageSpan {
+        self.span
     }
 }
 
@@ -779,7 +884,13 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 .get(index)
                 .ok_or_else(|| error("retired MM admitted to no carrier slot"))?;
             let remaining = slot.alias_count - held.get(index).copied().unwrap_or(0);
-            if slot.allowed != [mm] || remaining != 0 || slot.bootstrap {
+            // A shared file window slot is one per file chunk, kept for the
+            // run and reused by every later fault (#1338).
+            if slot.allowed != [mm]
+                || remaining != 0
+                || slot.bootstrap
+                || slot.backing.extent.is_host_file_window()
+            {
                 continue;
             }
             // `revoke`'s preconditions, checked now so the revoke cannot
@@ -1061,6 +1172,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         for offset in (0..len).step_by(PAGE as usize) {
             let gpa = FrameGpa::new(ipa + offset);
             let span = PageSpan::new(va + offset, PAGE);
+            if self
+                .locate(gpa, PAGE as usize)
+                .is_some_and(|slot| slot.backing.extent.is_host_file_window())
+            {
+                // A window page has no frame-inventory row: answering
+                // `MappingGone` would rerun the fork forever (#1338).
+                return Err(
+                    error("a shared file window page is inherited as a window edge").into(),
+                );
+            }
             let identity = self.frame_identity(parent.mm.raw(), gpa)?;
             let bound = authority.bind(parent.into());
             if bound
@@ -1161,6 +1282,111 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 slot: edge.handle.slot,
                 span: edge.span,
                 inherited: Some(edge.gpa),
+            },
+        );
+        Ok(())
+    }
+
+    /// Classify one fork custody row against this carrier's shared file
+    /// windows (#1338). `None` means the row names no window slot and is
+    /// selected by [`Self::select_inherited_frames`]. A window page is the
+    /// file's own bytes behind one slot kept for the run, with no frame
+    /// inventory: the child keeps the parent's leaf (never a COW) and is
+    /// admitted to the slot by [`Self::attach_inherited_window`].
+    pub fn select_inherited_window(
+        &self,
+        parent: AddressContext<RootGpa>,
+        selection: carrick_el1_abi::PortalForkCustody,
+    ) -> Result<Option<InheritedWindowEdge>, MemoryError> {
+        self.admit()?;
+        let carrick_el1_abi::PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared,
+        } = selection
+        else {
+            return Ok(None);
+        };
+        let gpa = FrameGpa::new(ipa);
+        let Some(slot) = self
+            .locate(gpa, PAGE as usize)
+            .filter(|slot| slot.backing.extent.is_host_file_window())
+        else {
+            return Ok(None);
+        };
+        if self.root(parent.mm.raw()) != Some(parent) {
+            return Err(error("stale inherited window root"));
+        }
+        let span = PageSpan::new(va, PAGE);
+        // A window leaf is one 4 KiB MapAlias page of a shared mapping.
+        if !shared
+            || len != PAGE
+            || !va.is_multiple_of(PAGE)
+            || !ipa.is_multiple_of(PAGE)
+            || !slot.allowed.contains(&parent.mm.raw())
+            || !self.leaf_names(parent, span, gpa)
+        {
+            return Err(error("inherited window row names no parent window leaf"));
+        }
+        Ok(Some(InheritedWindowEdge {
+            handle: slot.handle,
+            parent,
+            span,
+            gpa,
+        }))
+    }
+
+    /// Admit a fork child to the window slot its kept leaf names, and
+    /// record that leaf as the child's alias, so retirement and unmap count
+    /// it. The guest already copied the leaf; this writes no descriptor.
+    pub fn attach_inherited_window(
+        &mut self,
+        child: AddressContext<RootGpa>,
+        edge: &InheritedWindowEdge,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let slot = self.record(edge.handle)?;
+        if child.mm == edge.parent.mm
+            || self.root(child.mm.raw()) != Some(child)
+            || self.root(edge.parent.mm.raw()) != Some(edge.parent)
+            || !slot.backing.extent.is_host_file_window()
+            || !self.leaf_names(edge.parent, edge.span, edge.gpa)
+            || !self.leaf_names(child, edge.span, edge.gpa)
+        {
+            return Err(error("stale or unauthenticated inherited window edge"));
+        }
+        let end = edge.span.va + PAGE;
+        if self.aliases.get(&child.mm.raw()).is_some_and(|aliases| {
+            aliases
+                .range(..end)
+                .next_back()
+                .is_some_and(|(_, alias)| alias.span.va + alias.span.len > edge.span.va)
+        }) {
+            return Err(error("inherited child alias already occupied"));
+        }
+        let count = slot
+            .alias_count
+            .checked_add(1)
+            .ok_or_else(|| error("inherited window alias count exhausted"))?;
+        let slot = self
+            .slots
+            .get_mut(&edge.handle.slot)
+            .ok_or_else(|| error("missing inherited window registration"))?;
+        slot.alias_count = count;
+        if !slot.allowed.contains(&child.mm.raw()) {
+            slot.allowed.push(child.mm.raw());
+            self.admitted
+                .entry(child.mm.raw())
+                .or_default()
+                .insert(edge.handle.slot);
+        }
+        self.aliases.entry(child.mm.raw()).or_default().insert(
+            edge.span.va,
+            Alias {
+                slot: edge.handle.slot,
+                span: edge.span,
+                inherited: None,
             },
         );
         Ok(())
@@ -1348,7 +1574,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         // for owner scrub. Keep that physical edge until repoint or unlink.
         if matches!(
             txn.op,
-            DescriptorOp::Unmap(_) | DescriptorOp::CowRepoint { .. }
+            DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) | DescriptorOp::CowRepoint { .. }
         ) {
             self.remove_aliases(txn.id.mm_key, txn.op.span(), context);
             if self.quarantined {
@@ -1395,7 +1621,13 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             let (entry, size) = match terminal {
                 Ok(value) => value,
                 Err(DescriptorRefusal::MissingTable)
-                    if matches!(txn.op, DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)) =>
+                    if matches!(
+                        txn.op,
+                        DescriptorOp::Unmap(_)
+                            | DescriptorOp::UnmapWindow(_)
+                            | DescriptorOp::Retire(_)
+                            | DescriptorOp::ProtectWindow { .. }
+                    ) =>
                 {
                     (0, PAGE)
                 }
@@ -1468,7 +1700,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
                         || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
                 }
-                DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
+                DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) => {
+                    entry & (PRESENT | PREPARED) == 0
+                }
+                // A window protect skips holes and edits host-mapped leaves.
+                DescriptorOp::ProtectWindow { permissions, .. } => {
+                    entry == 0
+                        || entry & PRESENT != 0
+                            && entry & PRIVATE == 0
+                            && Self::matches_permissions(entry, permissions)
+                }
                 DescriptorOp::Retire(_) => {
                     entry == 0
                         || entry & (PRESENT | PREPARED | RETIRED) == RETIRED

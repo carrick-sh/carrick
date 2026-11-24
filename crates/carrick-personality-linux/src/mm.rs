@@ -119,12 +119,15 @@ pub trait NodeFlagsPolicy {
     fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection;
 }
 impl NodeFlagsPolicy for ReservationNodeFlags {
-    /// EL1 may edit private anonymous or retained private file nodes,
-    /// preserving their carried attributes. File nodes additionally require
-    /// a retained source in the production reservation node.
+    /// EL1 may edit private anonymous or retained private file nodes, and
+    /// shared file windows (#1338), preserving their carried attributes.
+    /// File nodes additionally require a retained source in the production
+    /// reservation node.
     fn root_editable(self) -> bool {
         let kind = self.bits() & !Self::CARRIED.bits();
-        kind == Self::ANONYMOUS_PRIVATE.bits() || kind == (Self::PRIVATE.bits() | Self::FILE.bits())
+        kind == Self::ANONYMOUS_PRIVATE.bits()
+            || kind == (Self::PRIVATE.bits() | Self::FILE.bits())
+            || kind == Self::FILE.bits() && self.contains(Self::SHARED_WINDOW)
     }
     /// `RLIMIT_DATA` covers private writable non-stack mappings (getrlimit(2),
     /// mmap(2)); shared, stack and read-only nodes are not charged.
@@ -135,12 +138,14 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
     }
     /// A private mapping may take any protection (mprotect(2)). A shared
     /// mapping of a description not open for writing may never become
-    /// writable (mprotect(2), EACCES). Other shared mappings conservatively
-    /// cap at their committed `protection`.
+    /// writable (mprotect(2), EACCES). A shared file window maps only a
+    /// description open for writing (#1338), so it may take any protection.
+    /// Other shared mappings conservatively cap at their committed
+    /// `protection`.
     fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection {
         if self.contains(Self::SHARED_READ_ONLY) {
             ReservationProtection::READ_EXECUTE
-        } else if self.contains(Self::PRIVATE) {
+        } else if self.contains(Self::PRIVATE) || self.contains(Self::SHARED_WINDOW) {
             ReservationProtection::READ_WRITE_EXECUTE
         } else {
             protection
@@ -616,12 +621,30 @@ mod flag_tests {
             .union(ReservationNodeFlags::FILE)
             .union(ReservationNodeFlags::SHARED_READ_ONLY);
         assert!(shared.root_editable());
+        // A shared file window (#1338) is editable only with its mark: a
+        // bare shared file node is a host mapping the ring never edits.
+        let window = ReservationNodeFlags::FILE.union(ReservationNodeFlags::SHARED_WINDOW);
+        assert!(window.root_editable());
+        assert!(!ReservationNodeFlags::FILE.root_editable());
+        assert!(
+            !window
+                .union(ReservationNodeFlags::SHARED_ANONYMOUS)
+                .root_editable()
+        );
+        assert!(ReservationNodeFlags::CARRIED.contains(ReservationNodeFlags::SHARED_WINDOW));
+        assert!(!ReservationNodeFlags::ATTRIBUTES.contains(ReservationNodeFlags::SHARED_WINDOW));
+        // A window's description is open for writing: an mprotect to read
+        // only and back to read-write is allowed (mprotect(2)).
+        assert_eq!(
+            window.protection_ceiling(ReservationProtection::READ),
+            ReservationProtection::READ_WRITE_EXECUTE
+        );
         assert!(ReservationNodeFlags::CARRIED.contains(ReservationNodeFlags::SHARED_READ_ONLY));
         assert!(!ReservationNodeFlags::ATTRIBUTES.contains(ReservationNodeFlags::SHARED_READ_ONLY));
         assert_eq!(
             shared.protection_ceiling(ReservationProtection::READ),
             ReservationProtection::READ_EXECUTE
         );
-        assert_eq!(ReservationNodeFlags::from_bits(1 << 12), None);
+        assert_eq!(ReservationNodeFlags::from_bits(1 << 13), None);
     }
 }

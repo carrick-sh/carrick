@@ -150,7 +150,7 @@ impl X86AnonymousVenue<'_> {
     fn source(
         &self,
         zone: &X86Cpl0Zone,
-    ) -> Result<Option<carrick_el1_abi::HostBackingIdentity>, SyscallResult> {
+    ) -> Result<Option<carrick_el1::memory::NativeFileSource>, SyscallResult> {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
         };
@@ -185,16 +185,33 @@ impl X86AnonymousVenue<'_> {
             }
             count
         };
-        let staged = carrick_el1_linux::dispatch::stage_native_host_file(
-            HostFileCall::MapPrivate(key),
-            self.task,
-            &carrick_el1_linux::file::HardwareValidator,
-            &mut NativeNamespace {
-                table,
-                resolve: &mut resolve,
-                releases: &mut releases,
-            },
-        );
+        let mut stage = |call| {
+            carrick_el1_linux::dispatch::stage_native_host_file(
+                call,
+                self.task,
+                &carrick_el1_linux::file::HardwareValidator,
+                &mut NativeNamespace {
+                    table,
+                    resolve: &mut resolve,
+                    releases: &mut releases,
+                },
+            )
+        };
+        // A shared mapping of a description open for writing has no byte
+        // source: this carrier serves it as a shared file window instead,
+        // mapping the host file's own pages (#1338).
+        let (staged, pages) = match stage(HostFileCall::MapPrivate(key)) {
+            None => (
+                stage(HostFileCall::MapShared(key)),
+                carrick_el1::memory::NativeFileSource::Window
+                    as fn(_) -> carrick_el1::memory::NativeFileSource,
+            ),
+            staged => (
+                staged,
+                carrick_el1::memory::NativeFileSource::Copied
+                    as fn(_) -> carrick_el1::memory::NativeFileSource,
+            ),
+        };
         match staged {
             Some(HostFileStage::Request {
                 record,
@@ -210,17 +227,16 @@ impl X86AnonymousVenue<'_> {
                 };
                 carrick_x86_carrier::entry::forward_to_host(&frame);
                 native_host_file::map_source(&record).map(|reply| {
-                    Some(carrick_el1_abi::HostBackingIdentity::new(
+                    Some(pages(carrick_el1_abi::HostBackingIdentity::new(
                         reply.handle,
                         reply.generation,
                         0,
-                    ))
+                    )))
                 })
             }
             Some(HostFileStage::Returned(result)) => Err(result),
-            // The venue does not serve this mapping (a shared mapping of a
-            // writable description): no source, so the owner leaves it
-            // unrouted.
+            // The venue does not serve this mapping: no source, so the owner
+            // leaves it unrouted.
             None => Ok(None),
             _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
         }
@@ -621,6 +637,21 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
             len,
         )
     }
+    fn window_backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+        windows: &[(u64, u64)],
+    ) -> carrick_el1::memory::Stage1Backing {
+        carrick_el1::memory::classify_window_range::<X86AnonymousDecode>(
+            &|pa| self.words.load(pa).ok(),
+            root.raw(),
+            va.raw(),
+            len.raw(),
+            windows,
+        )
+    }
     fn stock_span(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -662,6 +693,41 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
         )
         .map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)
     }
+    fn protect_window_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        use carrick_mmu_core::aarch64::GuestPermissionEditError;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+        let register = RootGpa::page_aligned(FrameGpa::new(root.raw()))
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let range = UserRange::checked(UserVa::new(edit.va), GuestLen::new(edit.len))
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let context = self
+            .words
+            .context
+            .filter(|context| context.root == register)
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let generation = self
+            .sequence
+            .as_ref()
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        match carrick_el1::memory::protect_x86_window(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+            &edit,
+        ) {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {
+                Err(GuestPermissionEditError::NotPrivateAnonymous)
+            }
+            DescriptorOutcome::Indeterminate(_) => fatal_reservation(),
+        }
+    }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
@@ -690,6 +756,42 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
             return Err(carrick_mmu_core::aarch64::GuestRetirementError::RollbackFailed);
         }
         Ok(())
+    }
+    fn unmap_window_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        use carrick_mmu_core::aarch64::GuestRetirementError;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+        let register = RootGpa::page_aligned(FrameGpa::new(root.raw()))
+            .ok_or(GuestRetirementError::BadRange)?;
+        let range = UserRange::checked(va, len).ok_or(GuestRetirementError::BadRange)?;
+        let context = self
+            .words
+            .context
+            .filter(|context| context.root == register)
+            .ok_or(GuestRetirementError::BadRange)?;
+        let generation = self
+            .sequence
+            .as_ref()
+            .ok_or(GuestRetirementError::BadRange)?;
+        // A window page has no residency row (its `MapAlias` publication
+        // names none), so there is nothing to retire beside the leaf.
+        match carrick_el1::memory::unmap_x86_window(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+        ) {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {
+                Err(GuestRetirementError::NotPrivateAnonymous)
+            }
+            DescriptorOutcome::Indeterminate(_) => fatal_reservation(),
+        }
     }
     fn grow_residency(&mut self) -> bool {
         carrick_el1::memory::grow_guest_residency()

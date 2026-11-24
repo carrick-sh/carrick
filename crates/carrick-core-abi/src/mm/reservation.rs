@@ -284,6 +284,11 @@ pub enum FileMapSharing {
     /// `MAP_SHARED` of a description that cannot write the file: the
     /// mapping may never hold a store ([`ReservationNodeFlags::SHARED_READ_ONLY`]).
     SharedReadOnly,
+    /// `MAP_SHARED` served as a shared file window: the carrier maps the
+    /// file's own pages, so the node is [`ReservationNodeFlags::FILE`]
+    /// without [`ReservationNodeFlags::PRIVATE`], and its faults publish the
+    /// window's pages rather than copying bytes (#1338).
+    Shared,
 }
 
 /// Attributes of one reservation node, fixed when the node is inserted (host
@@ -337,6 +342,13 @@ impl ReservationNodeFlags {
     /// mapping proposal ([`FileMapSharing::SharedReadOnly`]); carried by
     /// splits, moves and fork.
     pub const SHARED_READ_ONLY: Self = Self(1 << 11);
+    /// A `MAP_SHARED` file mapping served as a shared file window (#1338):
+    /// `FILE` without `PRIVATE`, its pages the file's own behind a carrier
+    /// slot, so stores reach the file and every other mapping of it. The
+    /// ring edits its node (unmap, replace) and unlinks its leaves; it never
+    /// retires them into private custody. Minted only by a file mapping
+    /// proposal ([`FileMapSharing::Shared`]); carried by splits and fork.
+    pub const SHARED_WINDOW: Self = Self(1 << 12);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
     /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
@@ -357,7 +369,8 @@ impl ReservationNodeFlags {
             | Self::DONTDUMP.0
             | Self::IMAGE.0
             | Self::PLACED_OUTSIDE_LAYOUT.0
-            | Self::SHARED_READ_ONLY.0,
+            | Self::SHARED_READ_ONLY.0
+            | Self::SHARED_WINDOW.0,
     );
     const ALL: u32 = Self::ANONYMOUS_PRIVATE.0
         | Self::ATTRIBUTES.0
@@ -365,7 +378,8 @@ impl ReservationNodeFlags {
         | Self::SHARED_ANONYMOUS.0
         | Self::IMAGE.0
         | Self::PLACED_OUTSIDE_LAYOUT.0
-        | Self::SHARED_READ_ONLY.0;
+        | Self::SHARED_READ_ONLY.0
+        | Self::SHARED_WINDOW.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL == 0 {

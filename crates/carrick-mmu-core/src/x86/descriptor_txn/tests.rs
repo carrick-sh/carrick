@@ -92,6 +92,81 @@ fn owner_grant_projection_preserves_prepared_neighbors_and_refuses_exhaustion() 
     );
 }
 
+/// #1338: an owner grant for a shared file window page projects to one
+/// resident host `Map` leaf on the window slot: writable as the mapping is,
+/// never `PRIVATE` (so it is never retired into a private lease or COW
+/// copied), and the projection both the guest and the host settlement use
+/// names the exact page.
+#[test]
+fn owner_grant_projects_a_shared_file_window_page_as_a_host_map_leaf() {
+    use crate::aarch64::SubstrateGpa;
+    use crate::aarch64::descriptor_txn::{
+        AliasAccess, DescriptorOp as WireOp, DescriptorOutcome as WireOutcome,
+        DescriptorTxn as WireTxn, TableGrants,
+    };
+    use crate::owner_mmu::OwnerGrantMmu;
+    use crate::x86::owner_mmu::X86Mmu;
+    let tables = [
+        SubstrateGpa(0x2000),
+        SubstrateGpa(0x3000),
+        SubstrateGpa(0x4000),
+    ];
+    let grant = |access| WireTxn {
+        id: txn(DescriptorOp::Unmap(PageSpan::new(0x4000, PAGE)), &[]).id,
+        root: SubstrateGpa(0x1000),
+        op: WireOp::MapAlias {
+            access,
+            span: crate::aarch64::descriptor_txn::PageSpan::new(0x5000, PAGE),
+            target_ipa: SubstrateGpa(0x4000_0000 + 3 * PAGE),
+            backing: backing(),
+        },
+        tables: TableGrants::new(&tables).unwrap(),
+    };
+    let words = Words::new();
+    let before = words.words.borrow().clone();
+    // A deferred alias has no user leaf to give a window page.
+    assert_eq!(
+        X86Mmu::execute_grant(&words, 0x1000, &grant(AliasAccess::Deferred)),
+        WireOutcome::Refused(DescriptorRefusal::BadEncoding)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    let writable = grant(AliasAccess::User {
+        writable: true,
+        executable: false,
+    });
+    let WireOutcome::Applied(applied) = X86Mmu::execute_grant(&words, 0x1000, &writable) else {
+        panic!("window page grant applies");
+    };
+    assert_eq!(applied.pages, 1);
+    // The shared receipt rule (`DescriptorTxn::verify_receipt`): an alias
+    // names no resident span, so the host settlement accepts this receipt.
+    assert_eq!(applied.resident, PageSpan::EMPTY);
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x5000))
+        .unwrap()
+        .0;
+    assert_eq!(leaf & ADDRESS, 0x4000_0000 + 3 * PAGE);
+    assert_eq!(leaf & PRIVATE, 0);
+    assert_ne!(leaf & PRESENT, 0);
+    assert_ne!(leaf & WRITE, 0);
+    assert_ne!(leaf & NX, 0);
+    // The page beside it is untouched.
+    assert!(matches!(
+        translate_leaf(
+            &words,
+            root(0x1000),
+            UserVa::new(0x6000),
+            Access::Read,
+            true
+        ),
+        Err(FaultClass::NotPresent)
+    ));
+    // A second grant over the live leaf is refused, not stacked.
+    assert!(matches!(
+        X86Mmu::execute_grant(&words, 0x1000, &writable),
+        WireOutcome::Refused(_)
+    ));
+}
+
 #[test]
 fn neutral_prepare_intent_publishes_one_native_page() {
     use carrick_guest_arch::{
@@ -546,6 +621,133 @@ fn guest_retire_refuses_host_map_leaf() {
     assert_eq!(
         apply(&words, DescriptorOp::Retire(span), &[]),
         DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
+/// #1338: the unlink a shared file window munmap takes clears a host-mapped
+/// leaf and refuses a private one, which only ever retires.
+#[test]
+fn guest_unlink_clears_host_map_leaf_and_refuses_private_leaf() {
+    let words = Words::new();
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let host = PageSpan::new(0x4000, PAGE);
+    let private = PageSpan::new(0x5000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(host.va, 0x800000, PAGE, LeafSize::Page),
+            &tables
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(
+                private,
+                0x900000,
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+            ),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, DescriptorOp::UnmapWindow(private), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(&words, DescriptorOp::UnmapWindow(host), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(host.va))
+            .unwrap()
+            .0,
+        0
+    );
+    assert_ne!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(private.va))
+            .unwrap()
+            .0,
+        0
+    );
+}
+
+/// #1338: an mprotect over shared file window pages re-permissions the
+/// host-mapped leaves in place (read-only, then writable again), skips a
+/// hole, and refuses a private leaf, which takes `Protect`.
+#[test]
+fn window_protect_edits_host_map_leaves_and_refuses_private_leaf() {
+    let words = Words::new();
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let host = PageSpan::new(0x4000, PAGE);
+    let private = PageSpan::new(0x6000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(host.va, 0x800000, PAGE, LeafSize::Page),
+            &tables
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(
+                private,
+                0x900000,
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+            ),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let protect = |span, writable| DescriptorOp::ProtectWindow {
+        span,
+        permissions: Permissions {
+            writable,
+            executable: false,
+            user: true,
+        },
+    };
+    let leaf = |va| {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(va))
+            .unwrap()
+            .0
+    };
+    let mapped = leaf(host.va);
+    // The window page and the hole after it.
+    assert!(matches!(
+        apply(
+            &words,
+            protect(PageSpan::new(host.va, 2 * PAGE), false),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf(host.va), mapped & !WRITE);
+    assert_eq!(leaf(host.va + PAGE), 0);
+    assert!(matches!(
+        apply(&words, protect(host, true), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf(host.va), mapped);
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, protect(private, false), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
     );
     assert_eq!(*words.words.borrow(), before);
 }
