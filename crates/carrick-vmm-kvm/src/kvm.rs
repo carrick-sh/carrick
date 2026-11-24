@@ -1757,13 +1757,14 @@ impl HvVm for KvmVm {
     }
 }
 
-impl KvmVcpu {
-    fn should_surface_interrupted_run(&mut self) -> bool {
-        carrick_hal::posix_signal_kick::take_current_thread_kick_pending()
-            || self.fd_mut().get_kvm_run().immediate_exit != 0
-            || carrick_hal::vcpu_run::current_shutdown_requested()
-            || !carrick_signal_linux::proc_pending_mask().is_empty()
-    }
+/// Whether an interrupted `KVM_RUN` was requested by Carrick: a kick into
+/// this exact run (its `immediate_exit` byte), the carrier shutdown latch, or
+/// a pending host signal. Anything else (a ptrace stop, `SIGSTOP`/`SIGCONT`)
+/// re-enters the guest (#2962).
+fn interrupted_run_requested(run: &carrick_hal::posix_signal_kick::CurrentThreadRun) -> bool {
+    run.exit_requested()
+        || carrick_hal::vcpu_run::current_shutdown_requested()
+        || !carrick_signal_linux::proc_pending_mask().is_empty()
 }
 
 impl HvVcpu for KvmVcpu {
@@ -1775,6 +1776,13 @@ impl HvVcpu for KvmVcpu {
         // valid for the whole call (the slot is an Arc field of `self`).
         #[cfg(target_arch = "x86_64")]
         let sync_stale_cell: *mut bool = self.slot.sync_regs_stale.get();
+        // Admit kicks into this run for its whole life, across re-entries
+        // after external stops. A caller that armed the run keeps it.
+        let immediate_exit: *mut u8 = &mut self.fd_mut().get_kvm_run().immediate_exit;
+        // SAFETY: the kvm_run mapping belongs to this vCPU fd, which `self`
+        // keeps open for the whole call; the guard drops before return.
+        let run_window =
+            unsafe { carrick_hal::posix_signal_kick::CurrentThreadRun::open(immediate_exit) };
         loop {
             // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell
             // can read the frame without a KVM_GET_REGS ioctl. Set before every
@@ -1884,7 +1892,7 @@ impl HvVcpu for KvmVcpu {
             // vCPU kick, immediate_exit, carrier shutdown, or pending host
             // signal). External ptrace stops (gdb attach) and job-control stops
             // (SIGSTOP/SIGCONT) re-enter KVM_RUN transparently (#2962).
-            if self.should_surface_interrupted_run() {
+            if interrupted_run_requested(&run_window) {
                 return Ok(VcpuExit::Kicked);
             }
         }

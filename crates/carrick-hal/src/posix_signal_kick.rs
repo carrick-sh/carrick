@@ -40,18 +40,89 @@ extern "C" fn posix_kick_noop(_signum: libc::c_int) {}
 
 static INSTALLED_SIGNALS: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
 
+/// One host thread's run window: the mapped `immediate_exit` byte of the run
+/// currently admitting kicks on that thread, or `None` between runs.
+///
+/// Every [`PosixSignalKick`] for a thread shares this one window, so a kick
+/// through any handle reaches the run that is armed now. The byte is the only
+/// request record: it is published when a run is armed, read atomically when
+/// the run's ioctl is interrupted, and cleared and unpublished when the run is
+/// disarmed. A kick that lands while no run is armed records nothing; its
+/// sender published the state it wants observed (`need_resched`, shutdown,
+/// pending host work) before kicking, and the target's next pre-entry check
+/// reads that state. No request outlives the run it targeted (#2962).
+type RunWindow = Arc<Mutex<Option<RunExitByte>>>;
+
 thread_local! {
-    static CURRENT_THREAD_KICK_PENDING: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    static CURRENT_THREAD_RUN_WINDOW: RunWindow = Arc::new(Mutex::new(None));
 }
 
-/// Consume whether a [`PosixSignalKick`] targeted the current host thread.
+fn lock_window(
+    window: &Mutex<Option<RunExitByte>>,
+) -> std::sync::MutexGuard<'_, Option<RunExitByte>> {
+    window.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The current thread's view of one hypervisor run's kick window.
 ///
-/// External host stops (`ptrace` attach/interrupt, `SIGSTOP`/`SIGCONT`) and
-/// unrelated signals (`SIGCHLD`, `SIGWINCH`) also make hypervisor run ioctls
-/// return `EINTR`, without setting this flag.
-#[inline]
-pub fn take_current_thread_kick_pending() -> bool {
-    CURRENT_THREAD_KICK_PENDING.with(|pending| pending.swap(false, Ordering::SeqCst))
+/// [`CurrentThreadRun::open`] publishes the run's mapped `immediate_exit`
+/// byte unless a caller already armed one ([`PosixSignalKick::arm_run`]), in
+/// which case the caller keeps ownership and disarms it. A window this guard
+/// opened is disarmed when the guard drops, when the run returns.
+pub struct CurrentThreadRun {
+    window: RunWindow,
+    byte: RunExitByte,
+    owned: bool,
+}
+
+impl CurrentThreadRun {
+    /// Admit kicks into the run whose `immediate_exit` byte is `byte`.
+    ///
+    /// # Safety
+    /// `byte` must point at the live run structure of the vCPU this thread
+    /// is about to run, and stay mapped until the returned guard drops.
+    pub unsafe fn open(byte: *mut u8) -> Self {
+        let window = CURRENT_THREAD_RUN_WINDOW.with(Arc::clone);
+        let owned = {
+            let mut armed = lock_window(&window);
+            if armed.is_some() {
+                false
+            } else {
+                // Not zeroed: a stopped owner may already have requested this
+                // run's immediate exit (pending I/O completion, fixtures).
+                *armed = Some(RunExitByte(byte));
+                true
+            }
+        };
+        Self {
+            window,
+            byte: RunExitByte(byte),
+            owned,
+        }
+    }
+
+    /// Whether a kick, or the owner, requested this run's immediate exit.
+    /// An interrupted run that reads `false` was stopped by something Carrick
+    /// did not request (a ptrace stop, `SIGSTOP`/`SIGCONT`, an unrelated
+    /// signal) and may re-enter.
+    pub fn exit_requested(&self) -> bool {
+        // SAFETY: `open`'s contract keeps the byte mapped for this guard's
+        // life; kicks write it only with atomic stores under the window lock.
+        unsafe { AtomicU8::from_ptr(self.byte.0).load(Ordering::SeqCst) != 0 }
+    }
+}
+
+impl Drop for CurrentThreadRun {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let mut armed = lock_window(&self.window);
+        if armed.take().is_some() {
+            // SAFETY: see `exit_requested`; the window lock excludes kicks.
+            unsafe { AtomicU8::from_ptr(self.byte.0).store(0, Ordering::SeqCst) };
+        }
+    }
 }
 
 /// Process-wide idempotent installation of the POSIX kick signal handler.
@@ -80,8 +151,7 @@ pub fn install_posix_kick_handler<const SIG: i32>() {
 #[derive(Clone)]
 pub struct PosixSignalKick<const SIG: i32> {
     tid: libc::pthread_t,
-    run_exit: Arc<Mutex<Option<RunExitByte>>>,
-    thread_pending: Arc<AtomicBool>,
+    run_exit: RunWindow,
     kick_pending: Option<Arc<AtomicBool>>,
 }
 
@@ -92,8 +162,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         let tid = unsafe { libc::pthread_self() };
         Self {
             tid,
-            run_exit: Arc::new(Mutex::new(None)),
-            thread_pending: CURRENT_THREAD_KICK_PENDING.with(Arc::clone),
+            run_exit: CURRENT_THREAD_RUN_WINDOW.with(Arc::clone),
             kick_pending: None,
         }
     }
@@ -104,8 +173,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         let tid = unsafe { libc::pthread_self() };
         Self {
             tid,
-            run_exit: Arc::new(Mutex::new(None)),
-            thread_pending: CURRENT_THREAD_KICK_PENDING.with(Arc::clone),
+            run_exit: CURRENT_THREAD_RUN_WINDOW.with(Arc::clone),
             kick_pending: Some(kick_pending),
         }
     }
@@ -119,20 +187,17 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
     /// Publish the KVM_RUN byte before the scheduler's last runnable check.
     /// A kick after this point survives even if its signal precedes KVM_RUN.
     pub fn arm_run(&self, immediate_exit: &mut u8) {
-        let mut armed = self
-            .run_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *immediate_exit = 0;
-        *armed = Some(RunExitByte(immediate_exit as *mut u8));
+        let mut armed = lock_window(&self.run_exit);
+        let byte = immediate_exit as *mut u8;
+        // SAFETY: the byte is the caller's live vCPU mapping; the window lock
+        // excludes concurrent kicks while it is cleared.
+        unsafe { AtomicU8::from_ptr(byte).store(0, Ordering::SeqCst) };
+        *armed = Some(RunExitByte(byte));
     }
 
     /// Revoke the mapped-byte publication after KVM_RUN returns or entry is cancelled.
     pub fn disarm_run(&self) {
-        let mut armed = self
-            .run_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut armed = lock_window(&self.run_exit);
         if let Some(byte) = armed.take() {
             // SAFETY: the pointer was published from the live vCPU's mmap and
             // the owner disarms it before that mapping can be recycled.
@@ -143,10 +208,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
     /// Observe the armed KVM byte from a deterministic pre-entry fixture.
     #[doc(hidden)]
     pub fn fixture_run_exit_byte(&self) -> Option<u8> {
-        let armed = self
-            .run_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let armed = lock_window(&self.run_exit);
         armed.map(|byte| {
             // SAFETY: the arm keeps this mapping alive while the mutex guard
             // prevents concurrent disarm.
@@ -157,14 +219,10 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
 
 impl<const SIG: i32> crate::VcpuKick for PosixSignalKick<SIG> {
     fn kick(&self) {
-        self.thread_pending.store(true, Ordering::SeqCst);
         if let Some(ref pending) = self.kick_pending {
             pending.store(true, Ordering::SeqCst);
         }
-        let armed = self
-            .run_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let armed = lock_window(&self.run_exit);
         if let Some(byte) = *armed {
             // SAFETY: the arm holds the vCPU mapping alive through disarm;
             // the mutex serializes this write with disarm and recycling.
@@ -183,35 +241,66 @@ mod tests {
     use super::*;
     use crate::VcpuKick;
 
+    /// A kick that lands while its target has no run armed (it raced a
+    /// completed exit and the disarm) records nothing for the next run, and a
+    /// kick through any handle of a thread reaches the run armed now.
     #[test]
-    fn unrequested_signal_leaves_current_thread_kick_pending_clear_while_kick_sets_only_target_thread()
-     {
-        let _ = take_current_thread_kick_pending();
-        // SAFETY: SIGCONT's POSIX default action is ignore when not stopped.
-        assert_eq!(unsafe { libc::raise(libc::SIGCONT) }, 0);
-        assert!(
-            !take_current_thread_kick_pending(),
-            "an external signal must not manufacture a pending vCPU kick"
-        );
-
+    fn a_kick_reaches_only_the_run_armed_when_it_lands() {
         let (handle_tx, handle_rx) = std::sync::mpsc::channel();
-        let (kicked_tx, kicked_rx) = std::sync::mpsc::channel();
+        let (step_tx, step_rx) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _ = take_current_thread_kick_pending();
-            let handle = PosixSignalKick::<0>::for_current_thread();
-            handle_tx.send(handle).unwrap();
-            kicked_rx.recv().unwrap();
-            let first = take_current_thread_kick_pending();
-            let second = take_current_thread_kick_pending();
-            (first, second)
+            let armed_handle = PosixSignalKick::<0>::for_current_thread();
+            let other_handle = PosixSignalKick::<0>::for_current_thread();
+            handle_tx.send(other_handle).unwrap();
+            let mut first = 0_u8;
+            armed_handle.arm_run(&mut first);
+            armed_handle.disarm_run();
+            // The kick lands here, between runs.
+            seen_tx.send(()).unwrap();
+            step_rx.recv().unwrap();
+            let mut second = 0_u8;
+            // SAFETY: `second` outlives the guard.
+            let run = unsafe { CurrentThreadRun::open(&mut second) };
+            let stale = run.exit_requested();
+            seen_tx.send(()).unwrap();
+            // The kick through the other handle lands in this run.
+            step_rx.recv().unwrap();
+            let live = run.exit_requested();
+            drop(run);
+            (first, stale, live, second)
         });
         let handle = handle_rx.recv().unwrap();
+        seen_rx.recv().unwrap();
         handle.kick();
-        assert!(
-            !take_current_thread_kick_pending(),
-            "kicking a target thread must not mark the sender thread kicked"
+        step_tx.send(()).unwrap();
+        seen_rx.recv().unwrap();
+        handle.kick();
+        step_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            (0, false, true, 0),
+            "a between-runs kick must not request the next run; a live kick must, and the window clears on close"
         );
-        kicked_tx.send(()).unwrap();
-        assert_eq!(worker.join().unwrap(), (true, false));
+    }
+
+    /// A caller-armed run stays the caller's: a nested run window neither
+    /// re-zeroes nor disarms it.
+    #[test]
+    fn a_caller_armed_run_keeps_its_owner() {
+        let handle = PosixSignalKick::<0>::for_current_thread();
+        let mut byte = 0_u8;
+        handle.arm_run(&mut byte);
+        std::thread::scope(|scope| {
+            scope.spawn(|| handle.kick()).join().unwrap();
+        });
+        // SAFETY: `byte` outlives the guard.
+        let run = unsafe { CurrentThreadRun::open(&mut byte) };
+        assert!(run.exit_requested());
+        drop(run);
+        assert_eq!(handle.fixture_run_exit_byte(), Some(1));
+        handle.disarm_run();
+        assert_eq!(handle.fixture_run_exit_byte(), None);
+        assert_eq!(byte, 0);
     }
 }

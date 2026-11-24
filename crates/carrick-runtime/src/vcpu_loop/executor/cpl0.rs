@@ -1243,7 +1243,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 && self.physical.can_save_loaded_leader(task)?)
         {
             M::disarm_run_kick(&self.idle_kick);
-            let _ = carrick_hal::posix_signal_kick::take_current_thread_kick_pending();
             return Ok(ExecutorExit::Preempted);
         }
         let stopped = self.physical.cpu_mut().run_loaded(task);
