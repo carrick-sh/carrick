@@ -1658,6 +1658,21 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
+        // A path a mount claims is truncated by that mount, as `open` routes
+        // it (#3000): a bind mount truncates its host file through the host
+        // size door, a read-only mount answers EROFS, and a rootfs file the
+        // mount shadows is never touched.
+        if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
+            if context.is_some()
+                && let Some(errno) = self.rlimit_fsize_errno(length)
+            {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+            return Ok(match m.vfs.truncate(&m.full_path, length as u64) {
+                Ok(()) => DispatchOutcome::Returned { value: 0 },
+                Err(errno) => DispatchOutcome::errno(errno),
+            });
+        }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
         // so guest-created files are seen too.
         let kind = match self.layered_metadata(&resolved) {
@@ -1694,22 +1709,57 @@ impl<'a> FsView<'a> {
         }
     }
 
-    /// Whether a materialized description's writeback by `path` must be
-    /// refused (#1338 A1): it rewrites the host file from its own copy,
-    /// truncating it first, so it is refused whenever a shared file window
-    /// maps the file, whatever the new size. The writeback goes to the
-    /// rootfs, so the identity is the rootfs object at `path`, the one it
-    /// would rewrite; the host size door refuses the rewrite itself as
-    /// well, on the descriptor it opens. Checked first so neither copy
-    /// changes. An unreadable identity is refused while any window exists.
-    pub(in crate::dispatch) fn materialized_writeback_fenced(&self, path: &str) -> bool {
-        if !carrick_vfs::host_size::any_window() {
-            return false;
+    /// Rewrite the host file at `path` from a materialized copy, through
+    /// the host size door on the object the rewrite opens (#1338 A1):
+    /// `Err(ENOSYS)` when the door fences it, and the caller then changes
+    /// nothing. Any other failure keeps the rewrite's best-effort contract.
+    pub(in crate::dispatch) fn rewrite_materialized(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), LinuxErrno> {
+        let (_result, fenced) = carrick_vfs::host_size::fenced_during(|| {
+            self.fs.rootfs_vfs.set_file_contents(path, bytes)
+        });
+        if fenced {
+            return Err(carrick_abi::LINUX_ENOSYS);
         }
-        match self.fs.rootfs_vfs.path_inode_identity(path) {
-            Some(identity) => carrick_vfs::host_size::maps(identity),
-            None => !matches!(self.layered_metadata(path), Err(LINUX_ENOENT)),
+        Ok(())
+    }
+
+    /// Resize a materialized copy after its host rewrite was admitted and
+    /// applied ([`Self::rewrite_materialized`]): the copy, its offset and
+    /// its metadata follow the host file.
+    pub(in crate::dispatch) fn apply_materialized_resize(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        new_len: u64,
+    ) -> DispatchOutcome {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        };
+        let OpenDescription::File {
+            contents,
+            offset,
+            metadata,
+            ..
+        } = &mut *open
+        else {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        };
+        if let Err(errno) = contents.resize(new_len) {
+            return DispatchOutcome::errno(errno);
         }
+        let new_len = usize::try_from(new_len).unwrap_or(usize::MAX);
+        if *offset > new_len {
+            *offset = new_len;
+        }
+        metadata.size = contents
+            .len()
+            .ok()
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or(new_len);
+        DispatchOutcome::Returned { value: 0 }
     }
 
     // === Normalized shim-wrappers ===
@@ -2276,12 +2326,6 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
-                    // Its writeback rewrites the host file by path from this
-                    // copy: refused while a shared file window maps the file
-                    // (#1338 A1).
-                    if !is_anon_overlay_path(path) && this.materialized_writeback_fenced(path) {
-                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
-                    }
                     // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
                     // blocked only by F_SEAL_GROW when it extends the file —
                     // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
@@ -2302,6 +2346,28 @@ impl<'a> FsView<'a> {
                     if !contents.accepts_len(new_size) {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
+                    if !is_anon_overlay_path(path) {
+                        // Sync the grown contents to the overlay backing so
+                        // a later fstat of the path agrees. The rewrite is
+                        // admitted first, through the host size door on the
+                        // object it opens, and only then does the copy grow
+                        // (#1338 A1): a fenced rewrite changes nothing.
+                        let len = usize::try_from(new_size.max(cur_len)).unwrap_or(usize::MAX);
+                        let mut vec = vec![0u8; len];
+                        let keep = usize::try_from(cur_len).unwrap_or(usize::MAX).min(len);
+                        if let Err(errno) = contents.read_at(0, &mut vec[..keep]) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        let path = path.clone();
+                        drop(open);
+                        if let Err(errno) = this.rewrite_materialized(&path, vec) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        if new_size <= cur_len {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        return Ok(this.apply_materialized_resize(description, new_size));
+                    }
                     if new_size > cur_len {
                         if let Err(errno) = contents.resize(new_size) {
                             return Ok(DispatchOutcome::errno(errno));
@@ -2312,19 +2378,9 @@ impl<'a> FsView<'a> {
                         };
                         metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
                     }
-                    // Sync the grown contents to the overlay backing so a
-                    // later fstat of the path agrees. Anonymous files
-                    // (memfd, O_TMPFILE) have no overlay path to sync.
-                    let writeback_vec = if !is_anon_overlay_path(path) {
-                        let mut vec = vec![0u8; metadata.size];
-                        if let Err(errno) = contents.read_at(0, &mut vec) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        Some((path.clone(), vec))
-                    } else {
-                        None
-                    };
-                    writeback = writeback_vec;
+                    // Anonymous files (memfd, O_TMPFILE) have no overlay
+                    // path to sync.
+                    writeback = None;
                     outcome = DispatchOutcome::Returned { value: 0 };
                 }
                 OpenDescription::File {
@@ -2382,10 +2438,7 @@ impl<'a> FsView<'a> {
                         != 0
                     {
                         use std::os::fd::AsFd as _;
-                        match carrick_vfs::host_size::admit(
-                            host_fd.as_fd(),
-                            carrick_vfs::host_size::Change::Discard,
-                        ) {
+                        match carrick_vfs::host_size::admit_discard(host_fd.as_fd()) {
                             Ok(change) => Some(change),
                             Err(carrick_vfs::host_size::Fenced) => {
                                 return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
@@ -2421,13 +2474,13 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                         if new_size > st.st_size as u64 {
-                            if let Err(errno) = carrick_vfs::host_size::ftruncate(
-                                host_fd.raw(),
-                                new_size as libc::off_t,
-                            )
-                            .host_syscall_errno()
+                            use std::os::fd::AsFd as _;
+                            if let Err(errno) =
+                                carrick_vfs::host_size::resize(host_fd.as_fd(), new_size)
                             {
-                                return Ok(DispatchOutcome::errno(errno));
+                                return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
+                                    errno,
+                                )));
                             }
                             this.invalidate_dentry_host_fd(host_fd.raw());
                         }
@@ -2521,12 +2574,6 @@ impl<'a> FsView<'a> {
                         // (handled by open_file→None above).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    // Its writeback rewrites the host file by path from this
-                    // copy: refused while a shared file window maps the file
-                    // (#1338 A1).
-                    if !is_anon_overlay_path(path) && this.materialized_writeback_fenced(path) {
-                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
-                    }
                     if !contents.accepts_len(length as u64) {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
@@ -2544,6 +2591,25 @@ impl<'a> FsView<'a> {
                     ) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
+                    if !is_anon_overlay_path(path) {
+                        // Its writeback rewrites the host file by path from
+                        // this copy. The rewrite is admitted first, through
+                        // the host size door on the object it opens, and
+                        // only then does the copy change (#1338 A1): a
+                        // fenced rewrite leaves the copy, its offset and its
+                        // metadata untouched.
+                        let mut vec = vec![0u8; new_len];
+                        let keep = new_len.min(usize::try_from(cur_len).unwrap_or(usize::MAX));
+                        if let Err(errno) = contents.read_at(0, &mut vec[..keep]) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        let path = path.clone();
+                        drop(open);
+                        if let Err(errno) = this.rewrite_materialized(&path, vec) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        return Ok(this.apply_materialized_resize(description, length as u64));
+                    }
                     if let Err(errno) = contents.resize(length as u64) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
@@ -2555,16 +2621,7 @@ impl<'a> FsView<'a> {
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
                     metadata.size = usize::try_from(confirmed_len).unwrap_or(new_len);
-                    let writeback_vec = if !is_anon_overlay_path(path) {
-                        let mut vec = vec![0u8; metadata.size];
-                        if let Err(errno) = contents.read_at(0, &mut vec) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        Some((path.clone(), vec))
-                    } else {
-                        None
-                    };
-                    writeback = writeback_vec;
+                    writeback = None;
                     outcome = DispatchOutcome::Returned { value: 0 };
                 }
                 OpenDescription::InMemoryFile {
@@ -2602,11 +2659,11 @@ impl<'a> FsView<'a> {
                     // change is visible across fork), through the host size
                     // door: a shrink of a file a shared file window maps is
                     // a counted ENOSYS before the host applies it (#1338 A1).
+                    use std::os::fd::AsFd as _;
                     if let Err(errno) =
-                        carrick_vfs::host_size::ftruncate(host_fd.raw(), length as libc::off_t)
-                            .host_syscall_errno()
+                        carrick_vfs::host_size::resize(host_fd.as_fd(), length as u64)
                     {
-                        return Ok(DispatchOutcome::errno(errno));
+                        return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(errno)));
                     }
                     this.fs
                         .truncate_host_sparse_extents(host_fd.raw(), length as u64);

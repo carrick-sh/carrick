@@ -15931,12 +15931,11 @@ mod window_size_door {
         assert_eq!(size(&plain), 0);
     }
 
-    /// A mount over a rootfs name whose rootfs file is windowed. The
-    /// mutation reaches the shadowed rootfs file (path `truncate` goes to
-    /// the rootfs, #3000; a materialized description writes back to the
-    /// rootfs), so it is that object the fence must check. Red before:
-    /// the check looked at the mount's file, admitted, and the rootfs file
-    /// was truncated.
+    /// A mount over a rootfs name whose rootfs file is windowed. Path
+    /// `truncate(2)` goes to the mount that claims the path, as `open`
+    /// does (#3000): the mounted file is truncated and the shadowed,
+    /// windowed rootfs file is never touched. Red before: the truncate went
+    /// to the shadowed rootfs file and the door answered ENOSYS.
     #[test]
     fn a_mount_over_a_windowed_rootfs_file_never_shrinks_it() {
         let mut run = Run::new();
@@ -15949,19 +15948,62 @@ mod window_size_door {
             Box::new(carrick_vfs::BindVfs::new("/mnt", mounted.path(), false)),
         );
         assert_eq!(
-            run.call(SYS_TRUNCATE, Some("/mnt/x"), [PATH, 0, 0, 0, 0, 0]),
-            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+            run.call(SYS_TRUNCATE, Some("/mnt/x"), [PATH, 1024, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+            "truncate(2) through a writable bind mount"
         );
-        assert_eq!(size(&shadowed), 8192, "truncate(2) left the windowed file");
-        // A materialized description of the shadowed name writes back to
-        // the rootfs file: refused before either copy changes.
+        assert_eq!(size(&mounted.path().join("x")), 1024, "the mounted file");
+        assert_eq!(size(&shadowed), 8192, "the shadowed, windowed rootfs file");
+        assert_eq!(std::fs::read(&shadowed).unwrap(), vec![0x42; 8192]);
+    }
+
+    /// #3000: path `truncate(2)` of a name only a mount has (no rootfs
+    /// file) truncates the mount's file; a read-only mount answers EROFS.
+    /// Red before: both answered EROFS (the rootfs had no such object).
+    #[test]
+    fn path_truncate_reaches_the_mount_that_claims_the_path() {
+        let mut run = Run::new();
+        let writable = tempfile::tempdir().unwrap();
+        let readonly = tempfile::tempdir().unwrap();
+        std::fs::write(writable.path().join("f"), vec![1; 4096]).unwrap();
+        std::fs::write(readonly.path().join("f"), vec![2; 4096]).unwrap();
+        run.dispatcher.register_mount(
+            "/rw",
+            Box::new(carrick_vfs::BindVfs::new("/rw", writable.path(), false)),
+        );
+        run.dispatcher.register_mount(
+            "/ro",
+            Box::new(carrick_vfs::BindVfs::new("/ro", readonly.path(), true)),
+        );
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/rw/f"), [PATH, 100, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(size(&writable.path().join("f")), 100);
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/ro/f"), [PATH, 100, 0, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_EROFS)
+        );
+        assert_eq!(size(&readonly.path().join("f")), 4096);
+    }
+
+    /// Early review P0 3 (#2975): a materialized description's resize
+    /// takes the host size door's admission before it changes anything.
+    /// Its writeback rewrites the windowed rootfs file, so the door
+    /// refuses it on the object the rewrite opens, and the copy, its
+    /// offset and its metadata are untouched: ENOSYS and no partial state.
+    #[test]
+    fn a_fenced_materialized_resize_changes_nothing() {
+        let mut run = Run::new();
+        let windowed = run.rootfs_file("/m", 8192);
+        let _pin = window(&run, &windowed);
         let desc = OpenDescription::File {
-            path: "/mnt/x".to_string(),
+            path: "/m".to_string(),
             contents: FileContents::dense(vec![0x42; 8192]),
-            offset: 0,
+            offset: 6000,
             writable: true,
             metadata: RootFsMetadata {
-                path: std::path::PathBuf::from("/mnt/x"),
+                path: std::path::PathBuf::from("/m"),
                 kind: RootFsEntryKind::File,
                 mode: 0o644,
                 size: 8192,
@@ -15971,12 +16013,31 @@ mod window_size_door {
         let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
             panic!("install_fd");
         };
-        assert_eq!(
-            run.call(SYS_FTRUNCATE, None, [fd as u64, 4096, 0, 0, 0, 0]),
-            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
-        );
-        assert_eq!(size(&shadowed), 8192, "writeback left the windowed file");
-        assert_eq!(std::fs::read(&shadowed).unwrap(), vec![0x42; 8192]);
-        assert_eq!(size(&mounted.path().join("x")), 4096);
+        for (number, args) in [
+            (SYS_FTRUNCATE, [fd as u64, 4096, 0, 0, 0, 0]),
+            // fallocate(fd, 0, 0, 16384): a grow, rewritten by path.
+            (47, [fd as u64, 0, 0, 16384, 0, 0]),
+        ] {
+            assert_eq!(
+                run.call(number, None, args),
+                DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS),
+                "syscall {number}"
+            );
+            let file = run.dispatcher.open_file(fd as i32).unwrap();
+            let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+            let OpenDescription::File {
+                contents,
+                offset,
+                metadata,
+                ..
+            } = &*open
+            else {
+                panic!("a materialized description");
+            };
+            assert_eq!(contents.len().unwrap(), 8192, "syscall {number}: the copy");
+            assert_eq!(*offset, 6000, "syscall {number}: the offset");
+            assert_eq!(metadata.size, 8192, "syscall {number}: the metadata");
+        }
+        assert_eq!(std::fs::read(&windowed).unwrap(), vec![0x42; 8192]);
     }
 }

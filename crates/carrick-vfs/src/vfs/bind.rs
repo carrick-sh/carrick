@@ -29,6 +29,7 @@
 //! runs before the guest has any fds).
 
 use std::ffi::CString;
+use std::os::fd::{FromRawFd as _, IntoRawFd as _};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -575,14 +576,19 @@ impl Vfs for BindVfs {
 
         let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
         let cpath = CString::new(host.to_string_lossy().as_ref()).map_err(|_| LINUX_EINVAL)?;
-        // SAFETY: host path as NUL-terminated string
         // An O_TRUNC open goes through the host size door (#1338 A1).
-        let host_fd = crate::host_size::open_truncating(host_flags, |host_flags| unsafe {
-            libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int)
-        });
-        if host_fd < 0 {
-            return Err(host_open_errno());
-        }
+        let host_fd = crate::host_size::open_truncating(host_flags, |host_flags| {
+            // SAFETY: host path as NUL-terminated string.
+            let fd = unsafe { libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int) };
+            if fd < 0 {
+                Err(carrick_portable::errno())
+            } else {
+                // SAFETY: `open` returned a fresh descriptor.
+                Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+            }
+        })
+        .map_err(host_to_linux_errno)?
+        .into_raw_fd();
         if flags.create && !existed_before_create {
             self.publish_namespace();
         }
@@ -798,9 +804,8 @@ impl Vfs for BindVfs {
             .open(&host)
             .map_err(map_io_error)?;
         // Emptied through the host size door (#1338 A1).
-        if crate::host_size::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&file), 0) != 0 {
-            return Err(map_io_error(std::io::Error::last_os_error()));
-        }
+        crate::host_size::resize(std::os::fd::AsFd::as_fd(&file), 0)
+            .map_err(host_to_linux_errno)?;
         self.publish_namespace();
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
@@ -886,7 +891,7 @@ impl Vfs for BindVfs {
         Ok(())
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);
         }
@@ -896,11 +901,7 @@ impl Vfs for BindVfs {
             .open(&host)
             .map_err(map_io_error)?;
         // Through the host size door, on the object opened (#1338 A1).
-        let len = libc::off_t::try_from(len).map_err(|_| carrick_abi::LINUX_EFBIG)?;
-        if crate::host_size::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&file), len) != 0 {
-            return Err(map_io_error(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        crate::host_size::resize(std::os::fd::AsFd::as_fd(&file), len).map_err(host_to_linux_errno)
     }
 
     fn name(&self) -> &'static str {

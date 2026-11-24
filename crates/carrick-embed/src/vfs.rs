@@ -854,7 +854,7 @@ impl Vfs for InMemoryFileVfs {
         Ok(())
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);
         }
@@ -870,9 +870,16 @@ impl Vfs for InMemoryFileVfs {
                 Ok(())
             }
             Some(InMemNode::HostFd { fd, size: _, .. }) => {
-                // Through the host size door (#1338 A1).
-                let rc = carrick_vfs::host_size::ftruncate(*fd, len as libc::off_t);
-                if rc == 0 { Ok(()) } else { Err(LINUX_EINVAL) }
+                // Through the host size door, on this descriptor (#1338 A1).
+                // SAFETY: the node owns `fd` while the node table is borrowed.
+                let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(*fd) };
+                carrick_vfs::host_size::resize(fd, len).map_err(|errno| {
+                    if errno == libc::ENOSYS {
+                        LINUX_ENOSYS
+                    } else {
+                        LINUX_EINVAL
+                    }
+                })
             }
             Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),
             Some(InMemNode::Symlink { .. }) => Err(LINUX_EINVAL),
@@ -1167,7 +1174,7 @@ impl Vfs for LayeredVfs {
         self.layers[0].set_times(path, atime, mtime, nofollow)
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.layers.is_empty() {
             return Err(LINUX_EROFS);
         }
@@ -1436,7 +1443,7 @@ impl Vfs for FilterVfs {
         self.inner.set_times(&mapped, atime, mtime, nofollow)
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);
         }
@@ -1774,7 +1781,7 @@ impl Vfs for RecordingVfs {
         res
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         let res = self.inner.truncate(path, len);
         self.record(VfsEvent {
             op: VfsOp::Truncate { len },

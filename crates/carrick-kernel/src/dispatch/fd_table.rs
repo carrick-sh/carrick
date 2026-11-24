@@ -1030,17 +1030,10 @@ impl FileContents {
                 Ok(())
             }
             Self::HostBacked { fd } => {
-                use std::os::fd::AsRawFd;
-                let off = libc::off_t::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
-                // Through the host size door (#1338 A1).
-                let ret = carrick_vfs::host_size::ftruncate(fd.as_raw_fd(), off);
-                if ret != 0 {
-                    let errno = std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO);
-                    return Err(crate::host_to_linux_errno(errno));
-                }
-                Ok(())
+                use std::os::fd::AsFd;
+                // Through the host size door, on this descriptor (#1338 A1).
+                carrick_vfs::host_size::resize(fd.as_fd(), new_len)
+                    .map_err(crate::host_to_linux_errno)
             }
         }
     }

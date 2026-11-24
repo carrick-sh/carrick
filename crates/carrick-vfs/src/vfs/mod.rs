@@ -1230,7 +1230,7 @@ pub trait Vfs: Send + Sync {
         Err(carrick_abi::LINUX_EROFS)
     }
 
-    fn truncate(&mut self, _path: &str, _len: u64) -> Result<(), VfsError> {
+    fn truncate(&self, _path: &str, _len: u64) -> Result<(), VfsError> {
         Err(carrick_abi::LINUX_EROFS)
     }
 
