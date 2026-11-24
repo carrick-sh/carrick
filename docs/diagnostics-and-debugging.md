@@ -601,6 +601,34 @@ polls, a probe testing `mprotect`) also trips the hatch. Use it only on a
 workload where the first fault signal is the bug. SIGTRAP from BRK or
 single-step never trips it.
 
+### What a refused call asked for (`REFUSE` records)
+
+The census counts a counted ENOSYS by syscall number and caller only. Every
+`Counters::record_refusal` also keeps a typed record of the refused call in
+the mapped counters (`Counters::refused_calls`, the last 64, oldest
+overwritten): native ordinal, caller (`root` or `child`), venue (`ring` or
+`carrier`) and the six argument registers as the guest issued them (`x0..x5`
+on ARM; `rdi, rsi, rdx, r10, r8, r9` on x86). The guest kernel writes them
+on both ISAs; nothing reads guest memory, so a pointer stays a pointer, and a
+carrier-venue refusal says `args=unretained`. Read them from a census run
+(`CARRICK_EL1_CENSUS=<dir>`, then `carrick debug el1-census <dir>`, which
+prints them after the table), or from an HVF carrier or its core with
+`carrick el1-counters` or `carrick eventring`:
+
+```text
+REFUSE nr=72(pselect6) caller=child venue=ring a0=0x5 a1=0xffffd2a0 a2=0x0 a3=0x0 a4=0xffffd240 a5=0x0 nfds=5
+```
+
+For `select`/`pselect6` and `poll`/`ppoll` the line adds `nfds`; read the
+sets at the printed pointers from a core of the carrier.
+
+A writer claims its row with a compare-and-swap on the row's generation
+word. A writer that finds its row mid-write by another writer, or already
+holding a newer record (it was lapped by 64 refusals), writes nothing and
+counts the record in `Counters::refused_call_dropped` instead, so a reader
+never accepts a torn row. The census file keeps that count as
+`refused_calls_dropped`, and both decoders print it.
+
 ### Guest address-space mapping: the debug-state JSON
 
 The `mappings`/`gva`/`info` subcommands translate guest VAs back to image /

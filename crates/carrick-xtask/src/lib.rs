@@ -56,6 +56,7 @@ pub mod test_list;
 pub mod test_shards;
 pub mod test_touched;
 pub mod trusted_steps;
+pub mod union_build;
 pub mod workorder;
 pub mod worktree_admission;
 pub mod worktree_gc;

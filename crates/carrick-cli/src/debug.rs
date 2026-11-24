@@ -161,6 +161,44 @@ pub(crate) fn run_debug(
         DebugCommand::SoftRun { .. } => {
             bail!("debug soft-run needs a Linux arm64 host (the soft AArch64 CPU's block runner)");
         }
+        DebugCommand::Discover {
+            rows,
+            only,
+            runs,
+            out,
+            carrick,
+            instance,
+            label,
+            reap,
+            limit,
+            oracle,
+            oracle_only,
+            venue_profiles,
+            report,
+            provider,
+        } => {
+            if report {
+                crate::debug_discover::report(&out, limit)?;
+            } else {
+                crate::debug_discover::discover(crate::debug_discover::DiscoverOptions {
+                    rows: rows
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--rows is required"))?,
+                    only: &only,
+                    runs,
+                    out: &out,
+                    carrick: carrick.as_deref(),
+                    instance: instance.as_deref(),
+                    label: &label,
+                    reap: reap.as_deref(),
+                    limit,
+                    oracle: oracle.as_deref(),
+                    oracle_only,
+                    venue_profiles: &venue_profiles,
+                    provider,
+                })?;
+            }
+        }
         DebugCommand::El1Census {
             inputs,
             limit,
@@ -187,6 +225,7 @@ pub(crate) fn run_debug(
             run_id,
             post_mortem,
             region,
+            census_out,
         } => crate::debug_zonedump::run_zonedump(
             match (run_id.as_deref(), post_mortem.as_deref(), region.as_deref()) {
                 (Some(run_id), _, _) => crate::debug_zonedump::ZoneSource::Live(run_id),
@@ -194,6 +233,7 @@ pub(crate) fn run_debug(
                 (None, None, Some(path)) => crate::debug_zonedump::ZoneSource::Region(path),
                 (None, None, None) => bail!("zonedump needs --run-id, --post-mortem or --region"),
             },
+            census_out.as_deref(),
         )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();

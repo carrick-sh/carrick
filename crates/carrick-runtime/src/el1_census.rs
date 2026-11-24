@@ -191,6 +191,92 @@ pub struct Census {
     #[serde(default)]
     pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<CensusRow>,
+    /// The last counted refusals with what each refused call asked for
+    /// (`Counters::refused_calls`), oldest first; absent in older files.
+    #[serde(default)]
+    pub refused_calls: Vec<RefusedCallRecord>,
+    /// Refused-call records claimed but never written because a lapped or
+    /// concurrent writer held their row (`Counters::refused_call_dropped`).
+    #[serde(default)]
+    pub refused_calls_dropped: u64,
+}
+
+/// One counted refusal's typed record, as the census file keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusedCallRecord {
+    pub nr: u64,
+    pub name: Option<String>,
+    pub caller: carrick_spec::syscall_census::CallerClass,
+    pub venue: String,
+    /// The six argument registers; `None` when the venue did not retain them.
+    pub arguments: Option<[u64; 6]>,
+}
+
+impl RefusedCallRecord {
+    fn new(
+        call: carrick_el1_abi::RefusedCall,
+        isa: carrick_spec::syscall_census::CensusIsa,
+    ) -> Self {
+        let nr = call.ordinal.raw();
+        let name = match isa {
+            carrick_spec::syscall_census::CensusIsa::Aarch64 => {
+                carrick_abi::syscall::lookup_aarch64(nr).map(|s| s.name)
+            }
+            carrick_spec::syscall_census::CensusIsa::X86_64 => {
+                carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr).map(|s| s.name)
+            }
+        };
+        Self {
+            nr,
+            name: name.map(str::to_owned),
+            caller: match call.origin {
+                carrick_core_abi::service::ServiceOrigin::Initial => {
+                    carrick_spec::syscall_census::CallerClass::Root
+                }
+                carrick_core_abi::service::ServiceOrigin::Descendant => {
+                    carrick_spec::syscall_census::CallerClass::NativeChild
+                }
+            },
+            venue: match call.venue {
+                carrick_el1_abi::RefusalVenue::Ring => "ring",
+                carrick_el1_abi::RefusalVenue::Carrier => "carrier",
+            }
+            .to_owned(),
+            arguments: match call.arguments {
+                carrick_el1_abi::RefusalArguments::Registers(arguments) => Some(arguments),
+                carrick_el1_abi::RefusalArguments::Unretained => None,
+            },
+        }
+    }
+
+    /// `REFUSE nr=<n>(<name>) caller=<root|child> venue=<ring|carrier> a0..a5`,
+    /// the same line `carrick eventring` prints. For the select and poll
+    /// families it adds `nfds`; the descriptor sets stay in guest memory.
+    pub fn line(&self) -> String {
+        let mut line = format!(
+            "REFUSE nr={}({}) caller={} venue={}",
+            self.nr,
+            self.name.as_deref().unwrap_or("?"),
+            match self.caller {
+                carrick_spec::syscall_census::CallerClass::Root => "root",
+                carrick_spec::syscall_census::CallerClass::NativeChild => "child",
+            },
+            self.venue
+        );
+        let Some(arguments) = self.arguments else {
+            line.push_str(" args=unretained");
+            return line;
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            line.push_str(&format!(" a{index}={argument:#x}"));
+        }
+        match self.name.as_deref() {
+            Some("select" | "pselect6") => line.push_str(&format!(" nfds={}", arguments[0])),
+            Some("poll" | "ppoll") => line.push_str(&format!(" nfds={}", arguments[1])),
+            _ => {}
+        }
+        line
+    }
 }
 
 fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
@@ -305,6 +391,15 @@ fn snapshot_counters(
                 .collect()
         }),
         rows,
+        refused_calls: counters.map_or_else(Vec::new, |counters| {
+            counters
+                .refused_calls()
+                .map(|call| RefusedCallRecord::new(call, isa))
+                .collect()
+        }),
+        refused_calls_dropped: counters.map_or(0, |counters| {
+            counters.refused_call_dropped.load(Ordering::Acquire)
+        }),
     }
 }
 
@@ -394,6 +489,22 @@ pub fn publish_counters_terminal(
         snapshot_counters(run_id, Some(counters), isa),
         destination(),
     )
+}
+
+/// The census so far, as the JSON `publish_counters_terminal` would write
+/// for a run without an identity, for a live debug capture. `None` when the
+/// run did not opt in (`CARRICK_EL1_CENSUS`): a capture adds nothing to a
+/// run that asked for no census. Nothing is published; the caller of the
+/// capture owns the file.
+pub fn live_capture_json(
+    counters: Option<&carrick_el1_abi::Counters>,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Option<String> {
+    init_from_env();
+    if !enabled() {
+        return None;
+    }
+    serde_json::to_string(&snapshot_counters(None, counters, isa)).ok()
 }
 
 fn destination() -> std::path::PathBuf {
@@ -595,6 +706,16 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
     out
 }
 
+/// The census of an ISA's mapped counters, as `publish_counters_terminal`
+/// would write it for a run without an identity. For tools that judge a
+/// census (`carrick debug discover`) and their tests.
+pub fn census_of_counters(
+    counters: &carrick_el1_abi::Counters,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Census {
+    snapshot_counters(None, Some(counters), isa)
+}
+
 /// One refused syscall for one caller class, summed over several censuses.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RefusalRank {
@@ -633,7 +754,10 @@ pub struct RefusalRanking {
     pub rows: Vec<RefusalRank>,
 }
 
-fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
+/// The name of native syscall `native` on `isa` (`overflow` past the
+/// table, else `nr<N>`): the name refusal rankings and `carrick debug
+/// discover` print.
+pub fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
     use carrick_spec::syscall_census::CensusIsa;
     let name = match isa {
         CensusIsa::Aarch64 => carrick_abi::syscall::lookup_aarch64(native).map(|s| s.name),
@@ -824,7 +948,60 @@ mod tests {
             ipc_leaves: Default::default(),
             anonymous_leaves: Default::default(),
             rows,
+            refused_calls: Vec::new(),
+            refused_calls_dropped: 0,
         }
+    }
+
+    #[test]
+    fn census_names_each_refused_calls_arguments_per_isa() {
+        use carrick_spec::syscall_census::CensusIsa;
+        let counters = carrick_el1_abi::Counters::new();
+        for (nr, origin, venue, arguments) in [
+            (
+                270,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                carrick_el1_abi::RefusalVenue::Ring,
+                carrick_el1_abi::RefusalArguments::Registers([4, 0x7000, 0, 0, 0x7100, 0x7200]),
+            ),
+            (
+                59,
+                carrick_core_abi::service::ServiceOrigin::Initial,
+                carrick_el1_abi::RefusalVenue::Carrier,
+                carrick_el1_abi::RefusalArguments::Unretained,
+            ),
+        ] {
+            counters.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(nr),
+                origin,
+                venue,
+                arguments,
+            );
+        }
+        let x86 = snapshot_counters(None, Some(&counters), CensusIsa::X86_64);
+        assert_eq!(
+            x86.refused_calls
+                .iter()
+                .map(RefusedCallRecord::line)
+                .collect::<Vec<_>>(),
+            [
+                "REFUSE nr=270(pselect6) caller=child venue=ring a0=0x4 a1=0x7000 a2=0x0 a3=0x0 a4=0x7100 a5=0x7200 nfds=4",
+                "REFUSE nr=59(execve) caller=root venue=carrier args=unretained",
+            ]
+        );
+        // The same native ordinals name ARM's calls on an ARM census.
+        let arm = snapshot_counters(None, Some(&counters), CensusIsa::Aarch64);
+        assert_eq!(arm.refused_calls[1].name.as_deref(), Some("pipe2"));
+        let file: Census = serde_json::from_str(&serde_json::to_string(&x86).unwrap()).unwrap();
+        assert_eq!(file.refused_calls, x86.refused_calls);
+        // Records a lapped writer dropped are counted in the census file.
+        assert_eq!(x86.refused_calls_dropped, 0);
+        counters
+            .refused_call_dropped
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let dropped = snapshot_counters(None, Some(&counters), CensusIsa::X86_64);
+        let file: Census = serde_json::from_str(&serde_json::to_string(&dropped).unwrap()).unwrap();
+        assert_eq!(file.refused_calls_dropped, 3);
     }
 
     #[test]
@@ -899,6 +1076,7 @@ mod tests {
             carrick_guest_arch::NativeOrdinal::new(34),
             carrick_core_abi::service::ServiceOrigin::Descendant,
             carrick_el1_abi::RefusalVenue::Carrier,
+            carrick_el1_abi::RefusalArguments::Unretained,
         );
         let clean = carrick_el1_abi::Counters::new();
         publish(
@@ -963,11 +1141,13 @@ mod tests {
             carrick_guest_arch::NativeOrdinal::new(34),
             carrick_core_abi::service::ServiceOrigin::Descendant,
             carrick_el1_abi::RefusalVenue::Ring,
+            carrick_el1_abi::RefusalArguments::Unretained,
         );
         counters.record_refusal(
             carrick_guest_arch::NativeOrdinal::new(34),
             carrick_core_abi::service::ServiceOrigin::Descendant,
             carrick_el1_abi::RefusalVenue::Carrier,
+            carrick_el1_abi::RefusalArguments::Unretained,
         );
         let snapshot = snapshot_counters(None, Some(&counters), CensusIsa::Aarch64);
         assert!(snapshot.refusal_evidence.complete);
@@ -1004,6 +1184,7 @@ mod tests {
                 carrick_guest_arch::NativeOrdinal::new(native),
                 origin,
                 venue,
+                carrick_el1_abi::RefusalArguments::Unretained,
             );
         }
     }
