@@ -49,15 +49,20 @@ mod tests {
     #[test]
     fn armed_run_kick_survives_signal_before_kvm_run() {
         let handle = KvmKickHandle::for_current_thread();
-        let mut immediate_exit = 0_u8;
-        handle.arm_run(&mut immediate_exit);
+        let immediate_exit = std::sync::atomic::AtomicU8::new(0);
+        handle.arm_run(&immediate_exit);
         std::thread::scope(|scope| {
             scope.spawn(|| handle.kick()).join().expect("kick thread");
         });
-        assert_eq!(immediate_exit, 1, "KVM_RUN must see the pre-entry kick");
+        assert_eq!(
+            immediate_exit.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "KVM_RUN must see the pre-entry kick"
+        );
         handle.disarm_run();
         assert_eq!(
-            immediate_exit, 0,
+            immediate_exit.load(std::sync::atomic::Ordering::SeqCst),
+            0,
             "the next run must not inherit the prior kick"
         );
     }

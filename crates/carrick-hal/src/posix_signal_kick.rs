@@ -186,13 +186,14 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
 
     /// Publish the KVM_RUN byte before the scheduler's last runnable check.
     /// A kick after this point survives even if its signal precedes KVM_RUN.
-    pub fn arm_run(&self, immediate_exit: &mut u8) {
+    ///
+    /// The byte is shared with kicks from other threads, so it is taken only
+    /// as an atomic. The caller keeps it mapped until [`Self::disarm_run`].
+    pub fn arm_run(&self, immediate_exit: &AtomicU8) {
         let mut armed = lock_window(&self.run_exit);
-        let byte = immediate_exit as *mut u8;
-        // SAFETY: the byte is the caller's live vCPU mapping; the window lock
-        // excludes concurrent kicks while it is cleared.
-        unsafe { AtomicU8::from_ptr(byte).store(0, Ordering::SeqCst) };
-        *armed = Some(RunExitByte(byte));
+        // The window lock excludes concurrent kicks while it is cleared.
+        immediate_exit.store(0, Ordering::SeqCst);
+        *armed = Some(RunExitByte(immediate_exit.as_ptr()));
     }
 
     /// Revoke the mapped-byte publication after KVM_RUN returns or entry is cancelled.
@@ -253,8 +254,8 @@ mod tests {
             let armed_handle = PosixSignalKick::<0>::for_current_thread();
             let other_handle = PosixSignalKick::<0>::for_current_thread();
             handle_tx.send(other_handle).unwrap();
-            let mut first = 0_u8;
-            armed_handle.arm_run(&mut first);
+            let first = AtomicU8::new(0);
+            armed_handle.arm_run(&first);
             armed_handle.disarm_run();
             // The kick lands here, between runs.
             seen_tx.send(()).unwrap();
@@ -268,7 +269,7 @@ mod tests {
             step_rx.recv().unwrap();
             let live = run.exit_requested();
             drop(run);
-            (first, stale, live, second)
+            (first.into_inner(), stale, live, second)
         });
         let handle = handle_rx.recv().unwrap();
         seen_rx.recv().unwrap();
@@ -289,18 +290,18 @@ mod tests {
     #[test]
     fn a_caller_armed_run_keeps_its_owner() {
         let handle = PosixSignalKick::<0>::for_current_thread();
-        let mut byte = 0_u8;
-        handle.arm_run(&mut byte);
+        let byte = AtomicU8::new(0);
+        handle.arm_run(&byte);
         std::thread::scope(|scope| {
             scope.spawn(|| handle.kick()).join().unwrap();
         });
         // SAFETY: `byte` outlives the guard.
-        let run = unsafe { CurrentThreadRun::open(&mut byte) };
+        let run = unsafe { CurrentThreadRun::open(byte.as_ptr()) };
         assert!(run.exit_requested());
         drop(run);
         assert_eq!(handle.fixture_run_exit_byte(), Some(1));
         handle.disarm_run();
         assert_eq!(handle.fixture_run_exit_byte(), None);
-        assert_eq!(byte, 0);
+        assert_eq!(byte.into_inner(), 0);
     }
 }
