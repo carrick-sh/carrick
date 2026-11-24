@@ -544,6 +544,10 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
         None
     }
     fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
+    /// Retire a thread whose raw `exit` raced its group's terminal close.
+    fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
     fn route_host_thread_exit(
         &mut self,
         _verdict: carrick_core::terminal::RetirementVerdict,
@@ -783,6 +787,10 @@ pub trait LifecycleNative<'a>: UserCopy {
         None
     }
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
+    /// Retire a thread whose raw `exit` raced its group's terminal close.
+    fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
         None
     }
     /// Exact retained process owner for an adopted thread's terminal handoff.
@@ -1069,25 +1077,41 @@ pub fn invoke<'a>(
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            if let Some(outcome) = serve_exit(thread, native) {
-                Some(outcome)
-            } else {
-                let binding = native.binding()?;
-                let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-                    binding,
-                    thread.slot.entry(),
-                    TerminationStatus::exited(args[0] as u32),
-                )?;
-                let verdict = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Thread,
-                    carrick_core::terminal::Live,
-                >::admitted(identity)
-                .begin()
-                .route_to_host();
-                native
-                    .route_host_thread_exit(verdict)
-                    .then_some(LifecycleOutcome::HostCustody)
+            loop {
+                match serve_exit(thread, native) {
+                    Ok(outcome) => return Some(outcome),
+                    Err(decline) => {
+                        if let Some(outcome) = native.retire_closing_thread_exit() {
+                            return Some(outcome);
+                        }
+                        if carrick_core::terminal::raw_exit_is_process(thread.page)
+                            && let Some(outcome) = native.process_exit_group(args[0] as u8)
+                        {
+                            return Some(outcome);
+                        }
+                        if !matches!(decline, ServeExitDecline::Floor)
+                            || native.process_exit_binding().is_none()
+                        {
+                            break;
+                        }
+                    }
+                }
             }
+            let binding = native.binding()?;
+            let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                binding,
+                thread.slot.entry(),
+                TerminationStatus::exited(args[0] as u32),
+            )?;
+            let verdict = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Thread,
+                carrick_core::terminal::Live,
+            >::admitted(identity)
+            .begin()
+            .route_to_host();
+            native
+                .route_host_thread_exit(verdict)
+                .then_some(LifecycleOutcome::HostCustody)
         }
         _ => None,
     }
@@ -1646,18 +1670,24 @@ fn serve_clone<'a>(
     Some(returned(SyscallResult::new(visible as i64), false))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServeExitDecline {
+    Floor,
+    Other,
+}
+
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is
-/// not the last thread: `Some` with how the vCPU goes on, either the exit
+/// not the last thread: `Ok` with how the vCPU goes on, either the exit
 /// itself or the owner's wait before it reruns.
 fn serve_exit<'a>(
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<LifecycleOutcome> {
+) -> Result<LifecycleOutcome, ServeExitDecline> {
     let (page, slot) = (thread.page, thread.slot);
     macro_rules! decline {
         ($reason:expr) => {{
             native.record_decline($reason);
-            None
+            Err(ServeExitDecline::Other)
         }};
     }
     if !page.serves_threads() {
@@ -1667,9 +1697,9 @@ fn serve_exit<'a>(
         return decline!(LifecycleDecline::ExitGate);
     }
     // The leader holds no pool entry.
-    let entry = slot.entry().or_else(|| {
+    let entry = slot.entry().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoEntry);
-        None
+        ServeExitDecline::Other
     })?;
     if !matches!(
         page.state(entry.index()),
@@ -1684,11 +1714,11 @@ fn serve_exit<'a>(
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
         return decline!(LifecycleDecline::ExitPending);
     }
-    let binding = native.binding()?;
+    let binding = native.binding().ok_or(ServeExitDecline::Other)?;
     let mm = binding.mm.raw();
-    let record = native.exit_record().or_else(|| {
+    let record = native.exit_record().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoCurrent);
-        None
+        ServeExitDecline::Other
     })?;
     if mm == 0 {
         return decline!(LifecycleDecline::ExitNoMm);
@@ -1719,7 +1749,8 @@ fn serve_exit<'a>(
         binding,
         Some(entry),
         carrick_sched_core::process::TerminationStatus::exited(native.arguments()[0] as u32),
-    )?;
+    )
+    .ok_or(ServeExitDecline::Other)?;
     let custody = carrick_core::terminal::TerminalCustody::<
         carrick_core::terminal::Thread,
         carrick_core::terminal::Live,
@@ -1727,20 +1758,19 @@ fn serve_exit<'a>(
     .begin();
     // Core reserves the page's nonfinal membership before the native
     // handoff; a declined handoff restores that membership on drop.
-    let (custody, mut membership) = custody
-        .reserve_member(page, slot)
-        .map_err(|_| {
-            native.record_decline(LifecycleDecline::ExitLast);
-        })
-        .ok()?;
+    let (custody, mut membership) = custody.reserve_member(page, slot).map_err(|(_, error)| {
+        native.record_decline(LifecycleDecline::ExitLast);
+        match error {
+            carrick_core::lifecycle::MemberMembershipError::Floor => ServeExitDecline::Floor,
+            _ => ServeExitDecline::Other,
+        }
+    })?;
     // The member claim precedes ABI admission, so a host retirement which
     // already owns the live unit never encounters a new Exiting state.
-    let mut admission = page
-        .begin_exit(entry)
-        .inspect_err(|_| {
-            native.record_decline(LifecycleDecline::ExitAdmission);
-        })
-        .ok()?;
+    let mut admission = page.begin_exit(entry).map_err(|_| {
+        native.record_decline(LifecycleDecline::ExitAdmission);
+        ServeExitDecline::Other
+    })?;
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
@@ -1763,7 +1793,7 @@ fn serve_exit<'a>(
                     LifecycleOutcome::Returned { .. } => {
                         decline!(LifecycleDecline::ExitClearTidCopyout)
                     }
-                    waiting => Some(waiting),
+                    waiting => Ok(waiting),
                 };
             }
         };
@@ -1784,11 +1814,13 @@ fn serve_exit<'a>(
         // exact-address CAS preserves a newer set_tid_address if one won.
         slot.mark_child_tid_cleared_in_zone(clear_child_tid);
     }
-    let retirement = custody.zone_retirement(slot, &mut membership, Some(&mut admission))?;
+    let retirement = custody
+        .zone_retirement(slot, &mut membership, Some(&mut admission))
+        .ok_or(ServeExitDecline::Other)?;
     if !native.release_current(record.reference, retirement) {
         // Requeue/refusal retains the progress already published above, so
         // the next lane cannot clear and wake the joiner a second time.
-        return None;
+        return Err(ServeExitDecline::Other);
     }
     if admission.commit_with_member(slot).is_err() {
         // Unreachable (checked above; only this thread leaves Born or
@@ -1804,7 +1836,7 @@ fn serve_exit<'a>(
         // guest task must not execute on the exiting job's host lease.
         (Served::Idle, SyscallResult::new(0))
     };
-    Some(LifecycleOutcome::Transferred { progress, result })
+    Ok(LifecycleOutcome::Transferred { progress, result })
 }
 
 #[cfg(test)]
