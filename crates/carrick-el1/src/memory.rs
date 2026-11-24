@@ -349,16 +349,31 @@ pub fn decide_reservation_syscall_for_origin<
                 },
                 // Linux places a free hint at the address asked for
                 // (mmap(2)), inside the layout or in a free carrier aperture
-                // outside it; a taken or unusable hint relocates. A run root
-                // may still have a host venue that searches its alias gaps.
+                // outside it (the token); a descendant relocates any other.
+                // A run root serves the token exactly and keeps its host
+                // venue's VMA checks for every other outside-layout hint.
                 None => {
                     let len = frame.arguments()[1];
                     let external = model.external_anonymous_hint(placement, len, G::USER_VA_END);
-                    let venue = match service_origin {
-                        ServiceOrigin::Descendant => AnonymousHintVenue::Ring,
-                        ServiceOrigin::Initial => AnonymousHintVenue::Host,
-                    };
-                    model.mmap_with_advisory_hint(placement, len, prot, venue, external)
+                    match service_origin {
+                        ServiceOrigin::Descendant => model.mmap_with_advisory_hint(
+                            placement,
+                            len,
+                            prot,
+                            AnonymousHintVenue::Ring,
+                            external,
+                        ),
+                        ServiceOrigin::Initial => {
+                            match external.map(|hint| model.prepare_external_anonymous(hint, prot))
+                            {
+                                Some(Err(
+                                    Refusal::Collision | Refusal::ForeignMapping | Refusal::Hole,
+                                ))
+                                | None => model.mmap(placement, len, prot),
+                                Some(result) => result,
+                            }
+                        }
+                    }
                 }
             }
         }
