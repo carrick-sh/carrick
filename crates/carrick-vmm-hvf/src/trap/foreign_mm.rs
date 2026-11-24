@@ -958,7 +958,7 @@ impl MmAccessState {
         );
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
         state.install_identity(snapshot.mm, snapshot.binding);
-        let resolver = MmAccessLiveResolver::new(&state, std::sync::Arc::clone(&custody));
+        let resolver = MmAccessLiveResolver::new(&state, std::sync::Arc::clone(custody));
         state.set_live_resolver(resolver);
         state
     }

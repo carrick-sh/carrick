@@ -302,7 +302,7 @@ pub(crate) fn inherited_fork_inventory_extents(
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
     inherited_fork_inventory_extents_indexed(
-        &custody,
+        custody,
         mapping,
         &index_fork_inventory_by_stage2(inventory),
     )
