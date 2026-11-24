@@ -553,8 +553,10 @@ pub(in crate::dispatch) enum NetServed {
     /// The call's result and the reply output (written extents).
     Reply(i64, Vec<u8>),
     /// The call would block: the member waits on its host-readiness queue
-    /// from this sampled revision.
-    Wait(u64),
+    /// from this sampled revision. `timed` when the wait has a deadline
+    /// (a socket timeout): a signal then interrupts it with EINTR, never a
+    /// restart (signal(7), #2920).
+    Wait { revision: u64, timed: bool },
     /// Not served: the ring answers a counted ENOSYS.
     Refused,
 }
@@ -852,7 +854,10 @@ impl SyscallDispatcher {
                     if owner
                         .watch_host_ready_with_zone(&reactor, record, &interests, zone, deadline)
                     {
-                        NetServed::Wait(revision)
+                        NetServed::Wait {
+                            revision,
+                            timed: deadline.is_some(),
+                        }
                     } else {
                         NetServed::Refused
                     }
