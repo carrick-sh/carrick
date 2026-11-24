@@ -82,7 +82,7 @@ where
         return None;
     }
 
-    let (sig, mut info, action, saved_mask, thread_blocked) = if let Some(retained) =
+    let (sig, mut info, action, saved_mask, thread_blocked, frame_refused) = if let Some(retained) =
         process.take_pending_signal_delivery()
     {
         let PendingSignalDelivery {
@@ -94,23 +94,7 @@ where
             frame_refused,
             ..
         } = *retained;
-        if frame_refused {
-            // The owner refused this frame's memory (#3004): Linux cannot
-            // write the frame either, and forces SIGSEGV.
-            return force_delivery_fault(
-                task,
-                slot,
-                process,
-                frame,
-                fpstate,
-                machine,
-                SignalDeliveryFailure {
-                    original: sig,
-                    blocked: thread_blocked,
-                },
-            );
-        }
-        (sig, info, action, saved_mask, thread_blocked)
+        (sig, info, action, saved_mask, thread_blocked, frame_refused)
     } else {
         let mut thread_blocked = SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(slot.blocked().0),
@@ -203,7 +187,7 @@ where
                         },
                     );
                 }
-                (sig, info, action, saved_mask, thread_blocked)
+                (sig, info, action, saved_mask, thread_blocked, false)
             }
         }
     };
@@ -217,7 +201,10 @@ where
         interrupted_sp,
         action.flags.on_stack,
     );
-    let Some((sp, stack)) = selected_stack else {
+    // A retained delivery whose frame memory the owner refused (#3004) has
+    // no usable stack either: Linux cannot write the frame, and forces
+    // SIGSEGV. One frame-failure call keeps the EL1 frame small.
+    let Some((sp, stack)) = selected_stack.filter(|_| !frame_refused) else {
         return force_delivery_fault(
             task,
             slot,
