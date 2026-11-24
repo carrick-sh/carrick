@@ -608,6 +608,12 @@ struct TestSourceScan {
     /// Canonical paths from the initial scan, used to check `#[path]` modules.
     scanned: Rc<BTreeSet<PathBuf>>,
     crate_dir: PathBuf,
+    /// Canonical root of the source tree: a `#[path]` module is followed
+    /// only to a regular file under it.
+    tree_root: PathBuf,
+    /// Canonical targets of plain `#[path]` modules outside the initial scan
+    /// (a sibling crate's file built as a module here), to scan as well.
+    path_modules: Vec<PathBuf>,
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
     /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
     inline_depth: usize,
@@ -637,46 +643,60 @@ struct ModDecl {
 }
 
 impl TestSourceScan {
-    /// A plain `#[path = "lit"]` whose target, resolved against the visiting
-    /// file's directory, is a file inside the crate root. Every `.rs` file
-    /// under the crate root is scanned anyway, so such a module hides nothing.
-    /// Anything else (a `cfg_attr` form, a non-literal, or an out-of-crate
-    /// target) stays unresolved.
-    fn path_stays_in_crate(&self, meta: &syn::Meta) -> bool {
+    /// The canonical target of a plain `#[path = "lit"]` at file level,
+    /// resolved against the visiting file's directory. The literal path is
+    /// walked component by component, so a link anywhere on it (even one
+    /// followed by `..`) refuses, and the target must be a regular `.rs` file
+    /// under the tree root. An in-crate target is one of the scanned files
+    /// already; an out-of-crate one (a sibling crate's file built as a module
+    /// here) is scanned too, so neither hides a test. Anything else (a
+    /// `cfg_attr` form, a non-literal, a `#[path]` inside an inline module,
+    /// which rustc resolves against a subdirectory, or a target outside the
+    /// tree) stays unresolved.
+    fn path_module_target(&self, meta: &syn::Meta) -> Option<PathBuf> {
         if self.inline_depth != 0 {
-            return false;
+            return None;
         }
         let syn::Meta::NameValue(nv) = meta else {
-            return false;
+            return None;
         };
         if !nv.path.is_ident("path") {
-            return false;
+            return None;
         }
         let syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Str(lit),
             ..
         }) = &nv.value
         else {
-            return false;
+            return None;
         };
-        self.scanned_rs_file(&lit.value()).is_some()
-    }
-
-    /// `relative`, resolved against the visiting file's directory, when it
-    /// names a regular (not symlinked) `.rs` file that is one of the exact
-    /// files this scan reads, so following it hides nothing the scan doesn't
-    /// see. Returns the canonical path.
-    fn scanned_rs_file(&self, relative: &str) -> Option<PathBuf> {
-        let candidate = self.file_dir.join(relative);
-        if candidate.extension().is_none_or(|e| e != "rs") {
+        let relative = lit.value();
+        let relative = Path::new(&relative);
+        if relative.extension().is_none_or(|e| e != "rs") {
             return None;
         }
-        let meta = std::fs::symlink_metadata(&candidate).ok()?;
-        if !meta.file_type().is_file() {
+        use std::path::Component;
+        let mut candidate = self.file_dir.clone();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir if candidate != self.tree_root => {
+                    candidate.pop();
+                }
+                Component::Normal(part) => {
+                    candidate.push(part);
+                    if std::fs::symlink_metadata(&candidate).ok()?.is_symlink() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !std::fs::symlink_metadata(&candidate).ok()?.is_file() {
             return None;
         }
         let target = candidate.canonicalize().ok()?;
-        self.scanned.contains(&target).then_some(target)
+        target.starts_with(&self.tree_root).then_some(target)
     }
 
     /// The in-crate source a plain `include!("x.rs")` / `std::include!` /
@@ -841,8 +861,12 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        if meta_has_path(&attr.meta) && !self.path_stays_in_crate(&attr.meta) {
-            self.unresolved = Some("#[path] module");
+        if meta_has_path(&attr.meta) {
+            match self.path_module_target(&attr.meta) {
+                Some(target) if !self.scanned.contains(&target) => self.path_modules.push(target),
+                Some(_) => {}
+                None => self.unresolved = Some("#[path] module"),
+            }
         }
         syn::visit::visit_attribute(self, attr);
     }
@@ -868,11 +892,15 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
 const MAX_INCLUDE_DEPTH: usize = 8;
 
 fn scan_crate_sources(
+    tree_root: &Path,
     crate_dir: &Path,
     manifest: &toml::Value,
     test_name: Option<&str>,
 ) -> Result<BTreeMap<PathBuf, TestSourceScan>, ReceiptError> {
     use syn::visit::Visit;
+    let tree_root = tree_root
+        .canonicalize()
+        .map_err(|e| source_io(tree_root, e))?;
     let crate_dir = crate_dir
         .canonicalize()
         .map_err(|e| source_io(crate_dir, e))?;
@@ -897,17 +925,27 @@ fn scan_crate_sources(
         let mut scan = TestSourceScan {
             scanned: Rc::clone(&scanned),
             crate_dir: crate_dir.clone(),
+            tree_root: tree_root.clone(),
             file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
             name_mentioned: test_name.is_some_and(|name| source.contains(name)),
             ..Default::default()
         };
         scan.visit_file(&syntax);
+        // A followed out-of-crate `#[path]` file's plain `mod x;` children
+        // live outside the scanned files: refuse rather than guess.
+        if !scanned.contains(&file) && scan.mod_decls.iter().any(|decl| decl.path.is_none()) {
+            scan.unresolved = Some("#[path] module declaring out-of-line modules");
+        }
         if depth < MAX_INCLUDE_DEPTH {
             pending.extend(
                 scan.includes
                     .iter()
-                    .map(|include| (include.file.clone(), depth + 1)),
+                    .map(|include| include.file.clone())
+                    .chain(scan.path_modules.iter().cloned())
+                    .map(|file| (file, depth + 1)),
             );
+        } else if !scan.path_modules.is_empty() {
+            scan.unresolved = Some("#[path] module depth limit");
         }
         scans.insert(file, scan);
     }
@@ -968,7 +1006,7 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
             continue;
         }
         check_target_paths(&crate_dir, &manifest)?;
-        let scans = scan_crate_sources(&crate_dir, &manifest, Some(fn_name))?;
+        let scans = scan_crate_sources(tree_root, &crate_dir, &manifest, Some(fn_name))?;
         let mut name_mentioned = false;
         let mut item_generator = false;
         for (file, scan) in &scans {
@@ -1257,7 +1295,7 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
             crate_name,
             ..Default::default()
         };
-        let scans = scan_crate_sources(&crate_dir, &manifest, None)?;
+        let scans = scan_crate_sources(tree_root, &crate_dir, &manifest, None)?;
         for (file, scan) in &scans {
             // Keep scanning and report any source or generator that can
             // hide tests from the inventory.
