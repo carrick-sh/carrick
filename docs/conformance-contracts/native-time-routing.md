@@ -540,18 +540,49 @@ ring's `clock_gettime`:
 - REALTIME, REALTIME_ALARM and TAI read the realtime calibration (the TAI
   offset is 0, Linux's default; a native probe reads TAI - REALTIME = 0 s),
   REALTIME_COARSE on the coarse grid;
-- the caller's CPU clocks are served by static id and by dynamic id naming
-  pid 0, its own pid or its own tid, for PROF and SCHED.
+- a CPU clock reads the task it names, sampled as it asks.
 
-Another task's CPU clock and a user-time-only (VIRT) CPU clock keep the
-counted ENOSYS: the ring has no authority over another task's accounting
-yet and accounts only total CPU time.
+A CPU clock id is `~pid << 3 | bits` (clock_getcpuclockid(3),
+pthread_getcpuclockid(3)): bit 2 asks for a thread's clock, the low two bits
+for PROF (user plus system), VIRT (user only) or SCHED (run time; Carrick's
+user plus system). The task owner resolves the target on each path: the ring's
+native process graph (`NativeProcessEntry::cpu_clock_nanos`, one
+implementation for ARM and x86) and the host dispatcher's kernel graph
+(`dispatch::time::cpu_clock_ns`). A native Linux 6.12 x86_64 probe fixes the
+answers:
+
+| target | answer |
+| --- | --- |
+| pid 0, or a static id | the caller |
+| a process clock naming a live process's pid | that process's time |
+| a process clock naming an unreaped zombie | its final time |
+| a process clock naming a reaped or missing pid | EINVAL |
+| a process clock naming a non-leader tid | EINVAL |
+| a thread clock naming a live thread of the caller's thread group | that thread's time |
+| a thread clock naming another process's thread, or an exited thread | EINVAL |
+
+The target is checked before the output, so a bad target with a null output
+is EINVAL and a good one is EFAULT.
 
 The ARM VM-free witness `native_fork_child_clock_gettime_serves_every_clock_id`
-reads exact values from the zone calibration in a live fork child; the
-exec-successor witness `serial_host_native_exec_child_clock_gettime` (ignored
-on #2028 until now) reads every base through syscall 113. The KVM witness
+reads exact values from the zone calibration in a live fork child, the
+caller's VIRT clocks, and EINVAL for a missing pid. The ARM witness
+`native_fork_child_cputime_and_times_account_user_system_and_children`
+charges a live parent 70 ms user + 10 ms system and its fork child 35 + 22
+ms: the child reads its own clocks (57 ms, VIRT 35 ms), its parent's (80 ms,
+VIRT 70 ms), and EINVAL for its reaped grandchild and for the parent's thread
+clock. The exec-successor witness `serial_host_native_exec_child_clock_gettime`
+reads every base through syscall 113. The KVM witness
 `serial_host_native_root_and_child_clock_gettime_every_clock_id` has a live
-root and fork child bracket each clock between raw samples of its base clock,
-read their own CPU clocks by static and dynamic id, and check EINVAL before
-EFAULT.
+root and fork child bracket each clock between raw samples of its base clock.
+The KVM witness `serial_host_native_cpu_clocks_read_the_named_task`
+(`native_cpu_clock_owners.S`, run natively first as the oracle) checks
+MONOTONIC and BOOTTIME across a fork (root T0 <= child T1 <= root T2), a busy
+child against its idle parent and back, a zombie's final time, a reaped and
+a missing pid, and a busy worker thread against its parked sibling. The host
+dispatcher's witness `clock_gettime_cpu_clocks_read_their_target_and_sample`
+covers the sample selection and a missing target; its fixture has one task.
+
+The TAI offset is fixed at 0. Linux can expose a nonzero offset (`adjtimex`
+`ADJ_TAI`); Carrick has no TAI offset authority yet, and the KVM fixture's
+TAI check holds only for a zero offset.
