@@ -2634,6 +2634,81 @@ fn native_fork_child_realtime_reads_the_zone_calibration() {
     }
 }
 
+/// #2028: a native child's `clock_gettime` is served in ring for every clock
+/// id, as Linux answers it (errno numbers from a native Linux 6.12 probe).
+/// Before, only REALTIME(_COARSE), MONOTONIC(_RAW) and the static CPU clocks
+/// were: COARSE monotonic (libuv's fast clock), BOOTTIME, the ALARM clocks,
+/// TAI, dynamic CPU clocks and even an unknown id got a counted ENOSYS.
+#[test]
+fn native_fork_child_clock_gettime_serves_every_clock_id() {
+    use carrick_guest_arch::{CounterFrequency, CounterTick};
+    use carrick_syscall_abi::{
+        LINUX_CLOCK_BOOTTIME, LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_MONOTONIC_COARSE,
+        LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_TAI,
+    };
+
+    const OFFSET_NS: u64 = 1_700_000_000_123_456_789;
+    // 7.001234567 s of guest counter at 1 GHz.
+    const TICK: u64 = 7_001_234_567;
+    let number = carrick_abi::syscall::nr::CLOCK_GETTIME;
+    let read = |clock: u64, output: u64| {
+        native_fork_child_time_result_with(number, clock, output, |fixture| {
+            fixture
+                .zone
+                .publish_counter_frequency(CounterFrequency::new(
+                    NonZeroU64::new(1_000_000_000).unwrap(),
+                ));
+            fixture.zone.publish_realtime_offset(OFFSET_NS);
+            fixture
+                .zone
+                .cpu_leave_slot(fixture.slot, CounterTick::new(TICK));
+        })
+    };
+    // `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+    let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
+    for (clock, expected) in [
+        (LINUX_CLOCK_MONOTONIC_COARSE, [7, 1_000_000]),
+        (LINUX_CLOCK_BOOTTIME, [7, 1_234_567]),
+        (LINUX_CLOCK_BOOTTIME_ALARM, [7, 1_234_567]),
+        (LINUX_CLOCK_REALTIME_ALARM, [1_700_000_007, 124_691_356]),
+        (LINUX_CLOCK_TAI, [1_700_000_007, 124_691_356]),
+    ] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(read(clock, ts.arg()), (0, 0), "clock_gettime({clock})");
+        assert_eq!(ts.get(), expected, "clock {clock}");
+        // A valid clock faults a null output.
+        assert_eq!(read(clock, 0), (-14, 0), "clock_gettime({clock}, NULL)");
+    }
+    // The caller's own CPU clocks by a dynamic id with pid 0, PROF or SCHED.
+    for clock in [dynamic(0, 0b000), dynamic(0, 0b010), dynamic(0, 0b110)] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(read(clock, ts.arg()), (0, 0), "clock_gettime({clock:#x})");
+        assert!(
+            ts.get()[1] < 1_000_000_000,
+            "clock {clock:#x}: {:?}",
+            ts.get()
+        );
+    }
+    // Unknown ids, CLOCKFD (carrick has no posix-clock device) and an invalid
+    // per-thread CPUCLOCK_WHICH are EINVAL before the output is touched.
+    for clock in [10, 12, 16, dynamic(3, 0b011), u64::from(u32::MAX)] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(read(clock, ts.arg()), (-22, 0), "clock_gettime({clock:#x})");
+        assert_eq!(ts.get(), [u64::MAX; 2], "clock {clock:#x} left its output");
+        assert_eq!(read(clock, 0), (-22, 0), "clock_gettime({clock:#x}, NULL)");
+    }
+    // Another task's CPU clock, and a user-time-only one, have no ring
+    // authority yet: a counted refusal, never a wrong value.
+    for clock in [
+        dynamic(4242, 0b010),
+        dynamic(4242, 0b110),
+        dynamic(0, 0b001),
+    ] {
+        let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
+        assert_eq!(read(clock, ts.arg()), (-38, 1), "clock_gettime({clock:#x})");
+    }
+}
+
 #[test]
 fn native_fork_child_cputime_and_times_reach_time_handler() {
     let clock_gettime = carrick_abi::syscall::nr::CLOCK_GETTIME;

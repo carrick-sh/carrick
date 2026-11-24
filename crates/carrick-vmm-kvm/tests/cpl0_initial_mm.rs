@@ -421,6 +421,22 @@ fn serial_host_native_root_and_child_monotonic_clock_gettime() {
     );
 }
 
+/// #2028: a live root and its live native fork child read every clock id
+/// through raw `clock_gettime` (228), the call a libc makes for a clock the
+/// vDSO does not serve, and get native Linux's answers: COARSE, BOOTTIME,
+/// ALARM and TAI values on their base clock, their own CPU clocks by static
+/// and dynamic id, EINVAL and EFAULT in Linux's order. Exit 38 (root) or
+/// 138 (child) is a counted ENOSYS: the npm row's top refusal.
+#[test]
+fn serial_host_native_root_and_child_clock_gettime_every_clock_id() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_root_and_child_clock_gettime_every_clock_id",
+        "native_clock_ids.S",
+        &[],
+        8,
+    );
+}
+
 #[test]
 fn serial_host_native_root_and_child_vdso_monotonic_matches_raw_clock() {
     native_child_sleep_witness_with_exit(

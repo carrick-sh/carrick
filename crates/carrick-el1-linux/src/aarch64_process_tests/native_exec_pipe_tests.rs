@@ -69,11 +69,11 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe_with_departure(None, u32::MAX as u64, false, None, None, true);
 }
 
-/// RED until #1808 slice 3 routes clock_gettime for native children: an
-/// exec successor's clock read is a counted ENOSYS refusal, which musl
-/// reports as EINVAL for CLOCK_MONOTONIC (the #1900 holder panic).
+/// #2028: an exec successor whose vDSO has no clock fast path reads every
+/// clock through syscall 113, all served in ring. Unrouted, a clock read is a
+/// counted ENOSYS refusal, which musl reports as EINVAL for CLOCK_MONOTONIC
+/// (the #1900 holder panic).
 #[test]
-#[ignore = "#2028: native-child clock_gettime is unrouted when the vDSO has no clock fast path; un-ignore in #2028's PR"]
 fn serial_host_native_exec_child_clock_gettime() {
     fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, true, None, true);
 }
@@ -1595,25 +1595,59 @@ fn fork_exec_probe_copy_alignment(
         if clock {
             // musl's clock_gettime issues syscall 113 when the vDSO exports no
             // clock (fast-path visibility) and turns its ENOSYS into EINVAL
-            // for every clock except CLOCK_REALTIME.
+            // for every clock except CLOCK_REALTIME. Every clock id is the
+            // ring's (#2028); the physical clock reads 1000 ticks at 1 GHz.
+            use carrick_syscall_abi as abi;
+            // The carrier publishes its realtime calibration at load
+            // (`cow_engine`, `cpl0_boot`), before any guest runs.
+            const OFFSET_NS: u64 = 1_700_000_000_000_000_000;
+            fixture.zone.publish_realtime_offset(OFFSET_NS);
             let timespec = memory.arg() + 1024;
-            for clock_id in [
-                carrick_abi::LINUX_CLOCK_MONOTONIC,
-                carrick_abi::LINUX_CLOCK_REALTIME,
+            let gettime = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
+            for (clock_id, seconds, nanos) in [
+                (abi::LINUX_CLOCK_MONOTONIC, 0, 1000),
+                (abi::LINUX_CLOCK_MONOTONIC_RAW, 0, 1000),
+                (abi::LINUX_CLOCK_MONOTONIC_COARSE, 0, 0),
+                (abi::LINUX_CLOCK_BOOTTIME, 0, 1000),
+                (abi::LINUX_CLOCK_REALTIME, 1_700_000_000, 1000),
+                (abi::LINUX_CLOCK_REALTIME_COARSE, 1_700_000_000, 0),
+                (abi::LINUX_CLOCK_TAI, 1_700_000_000, 1000),
             ] {
                 assert_eq!(
-                    call_full(
-                        carrick_abi::syscall::nr::CLOCK_GETTIME.raw(),
-                        clock_id,
-                        timespec,
-                        0,
-                        0
-                    ) as i64,
+                    call_full(gettime, clock_id, timespec, 0, 0) as i64,
                     0,
                     "exec successor clock_gettime({clock_id}): negative result is Linux errno"
                 );
-                assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 0);
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&(seconds as i64).to_le_bytes());
+                bytes[8..].copy_from_slice(&(nanos as i64).to_le_bytes());
+                assert_eq!(
+                    crate::native_process_runtime::host_test_support::take_signal_copies(),
+                    vec![(UserVa::new(timespec), bytes.to_vec())],
+                    "exec successor clock {clock_id}"
+                );
             }
+            for clock_id in [
+                abi::LINUX_CLOCK_PROCESS_CPUTIME_ID,
+                abi::LINUX_CLOCK_THREAD_CPUTIME_ID,
+            ] {
+                assert_eq!(call_full(gettime, clock_id, timespec, 0, 0) as i64, 0);
+                assert_eq!(
+                    crate::native_process_runtime::host_test_support::take_signal_copies().len(),
+                    1
+                );
+            }
+            // Linux answers an unknown id (EINVAL) before a null output (EFAULT).
+            assert_eq!(call_full(gettime, 12, 0, 0, 0) as i64, -22);
+            assert_eq!(
+                call_full(gettime, abi::LINUX_CLOCK_BOOTTIME, 0, 0, 0) as i64,
+                -14
+            );
+            assert!(
+                crate::native_process_runtime::host_test_support::take_signal_copies().is_empty()
+            );
+            assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.refused[113].load(Ordering::Relaxed), 0);
         }
         registry.unregister_root_for_test(&runtime);
         return;
