@@ -7505,14 +7505,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if self.yield_terminal_host_custody() {
                     CompletionRoute::Suspended
                 } else {
-                    CompletionRoute::InvalidCompletion
+                    crate::diag_invalid()
                 }
             }
             None if lane.host_record() == Some(self.record.id) => {
                 self.current.linux.mark_pending_host_work();
                 CompletionRoute::Served
             }
-            _ => CompletionRoute::InvalidCompletion,
+            _ => crate::diag_invalid(),
         }
     }
 

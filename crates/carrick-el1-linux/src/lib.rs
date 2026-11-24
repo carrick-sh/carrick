@@ -49,3 +49,18 @@ pub mod x86_signal;
 mod decoder_tests;
 #[cfg(test)]
 mod native_ownership_tests;
+
+/// DIAGNOSTICS ONLY (never lands): the last site that produced an invalid
+/// completion route.
+pub static DIAG_INVALID_SITE: core::sync::atomic::AtomicPtr<core::panic::Location<'static>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[track_caller]
+pub(crate) fn diag_invalid() -> carrick_personality_linux::dispatch::CompletionRoute {
+    let loc: &'static core::panic::Location<'static> = core::panic::Location::caller();
+    DIAG_INVALID_SITE.store(
+        loc as *const _ as *mut _,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+}

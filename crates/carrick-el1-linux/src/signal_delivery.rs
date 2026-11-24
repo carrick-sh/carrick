@@ -71,7 +71,7 @@ where
                 ..
             } => CompletionRoute::Suspended,
             LifecycleOutcome::HostCustody => process.user_return_host_custody(),
-            _ => CompletionRoute::InvalidCompletion,
+            _ => crate::diag_invalid(),
         });
     }
     if !carrick_personality_linux::signal::signal_delivery_before_work(
@@ -147,7 +147,7 @@ where
                         Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
                         Ok(_) => CompletionRoute::Suspended,
                         Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
-                        Err(_) => CompletionRoute::InvalidCompletion,
+                        Err(_) => crate::diag_invalid(),
                     })
                 } else {
                     if carrick_signal_core::wait::interrupted_wait(
@@ -192,7 +192,7 @@ where
     };
 
     let policy::Disposition::Handler(handler) = action.disposition else {
-        return Some(CompletionRoute::InvalidCompletion);
+        return Some(crate::diag_invalid());
     };
     let interrupted_sp = machine.user_sp(frame);
     let selected_stack = carrick_personality_linux::signal::delivery_stack(
@@ -269,7 +269,7 @@ where
             },
         );
         if invariant_failure {
-            return Some(CompletionRoute::InvalidCompletion);
+            return Some(crate::diag_invalid());
         }
         match setup {
             Ok(SignalFrameSetup::Installed(published_sp)) => {
@@ -277,7 +277,7 @@ where
             }
             Ok(SignalFrameSetup::NotYet(_)) => {
                 let Some(deferral) = deferred else {
-                    return Some(CompletionRoute::InvalidCompletion);
+                    return Some(crate::diag_invalid());
                 };
                 machine.sync_parked_context(frame, process.resume_context_mut());
                 match process.retain_and_defer_signal_delivery(
@@ -292,7 +292,7 @@ where
                     Err(NativeProcessError::GroupExitCustody) => {
                         return Some(machine.group_exit_custody(task));
                     }
-                    Err(_) => return Some(CompletionRoute::InvalidCompletion),
+                    Err(_) => return Some(crate::diag_invalid()),
                 }
             }
             Err(_) => {
@@ -372,11 +372,11 @@ where
             Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
             Ok(_) => CompletionRoute::Suspended,
             Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
-            Err(_) => CompletionRoute::InvalidCompletion,
+            Err(_) => crate::diag_invalid(),
         });
     }
     if process.force_sigsegv(blocked).is_err() {
-        return Some(CompletionRoute::InvalidCompletion);
+        return Some(crate::diag_invalid());
     }
     let mask = blocked.signals().without(Signal::SEGV);
     let _ = slot.store_blocked_then_read_pending(BlockedMask(mask.bits()), slot.pending());

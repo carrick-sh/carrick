@@ -274,7 +274,24 @@ pub fn schedule(slot: SlotId) -> ! {
                             carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
                                 suspended = true
                             }
-                            _ => fatal_boot!(),
+                            carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+                                let p = carrick_el1_linux::DIAG_INVALID_SITE
+                                    .load(core::sync::atomic::Ordering::SeqCst);
+                                if p.is_null() {
+                                    fatal_boot!()
+                                }
+                                let loc = unsafe { &*p };
+                                carrick_el1::isa::x86::transport::fatal_boot_at(
+                                    loc.file(),
+                                    loc.line(),
+                                    loc.column(),
+                                )
+                            }
+                            carrick_personality_linux::dispatch::CompletionRoute::Served => fatal_boot!(),
+                            carrick_personality_linux::dispatch::CompletionRoute::WithWork => fatal_boot!(),
+                            carrick_personality_linux::dispatch::CompletionRoute::HostCustody => fatal_boot!(),
+                            carrick_personality_linux::dispatch::CompletionRoute::NativeService => fatal_boot!(),
+                            carrick_personality_linux::dispatch::CompletionRoute::Forward => fatal_boot!(),
                         }
                     }
                     words = context::context_words::from_native(
