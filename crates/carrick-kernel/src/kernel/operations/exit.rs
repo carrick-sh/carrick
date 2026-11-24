@@ -541,16 +541,19 @@ impl Kernel {
 
         let files = context.resources.files();
         let mut state = self.registry().settled().write();
+        let mut reservation_wake = None;
         let next = self.retire_thread_in_registry(
             context,
             &mut state,
             ThreadRetirementLane::Host,
             failpoint,
+            &mut reservation_wake,
         );
         drop(state);
-        if let Some(notification) = carrick_core::lifecycle::Lifecycle::take_exit_reservation_wake(
+        let deferred_wake = carrick_core::lifecycle::Lifecycle::take_exit_reservation_wake(
             &*context.lifecycle_page(),
-        ) {
+        );
+        if let Some(notification) = reservation_wake.or(deferred_wake) {
             let _ = crate::el1_zone::wake_exit_wait_channel(notification.mm, notification.address);
         }
         let next = next?;
@@ -565,6 +568,7 @@ impl Kernel {
         state: &mut parking_lot::RwLockWriteGuard<'_, RegistryState>,
         mut lane: ThreadRetirementLane,
         failpoint: Option<KernelFailpoint>,
+        reservation_wake: &mut Option<carrick_core::terminal::TerminalNotification>,
     ) -> Result<TaskRevision, KernelOperationError> {
         if state
             .reservations
@@ -709,10 +713,11 @@ impl Kernel {
                                 "host retirement lost membership custody"
                             )
                         })
-                        .retire_published(
+                        .retire_published_with_wake(
                             owned.entry,
                             &*owned.control,
                             &state.retiring_capability(),
+                            reservation_wake,
                         )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(

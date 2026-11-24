@@ -1791,12 +1791,12 @@ fn serve_exit<'a>(
     if page.gate() != GateState::Open {
         return decline!(LifecycleDecline::ExitGate);
     }
-    // The leader holds no pool entry, but if a peer holds a refundable exit
-    // reservation at the live floor, the leader's raw exit must enrol on that
-    // reservation's release rather than routing to host or promoting early.
+    // The leader holds no pool entry. At the live floor, recheck terminal
+    // ownership through the reservation wait path. A peer may have committed
+    // its reservation since the entry check without changing the live count.
     let entry = slot.entry().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoEntry);
-        if carrick_core::terminal::raw_exit_contended_at_floor(page) {
+        if page.live() == 1 {
             ServeExitDecline::Floor
         } else {
             ServeExitDecline::Other
