@@ -1221,6 +1221,7 @@ impl carrick_personality_linux::dispatch::SyscallFrame for ExitStatusFrame {
     }
 }
 impl crate::dispatch::GuestDispatchFrame for ExitStatusFrame {
+    fn restart_syscall(&mut self) {}
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         carrick_guest_arch::NativeOrdinal::new(match self.0 {
             carrick_personality_linux::crossing::HostCrossingSet::X86 => 60,
@@ -1896,6 +1897,694 @@ fn concurrent_raw_exit_floor_race_becomes_process_exit_aarch64() {
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
     >(
         arm_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}
+
+fn arm_syscall_words(address: AddressContext<RootGpa>) -> carrick_sched_core::Aarch64ParkedContext {
+    let mut native = carrick_el1_abi::ThreadCtx::ZERO;
+    native.pc = 0x40_0004;
+    native.sp_el0 = 0x80_0000;
+    carrick_sched_core::Aarch64ParkedContext::from_parts(native, address)
+}
+
+/// #2932 verifier blocker: peer A enters raw `SYS_exit(0)` with
+/// `CLONE_CHILD_CLEARTID` (`0x4000`) and reserves the penultimate live unit
+/// (`page.live() == 1`), so peer A's reservation is still refundable when
+/// caller B enters raw `SYS_exit(38)`. Caller B must never promote its thread
+/// exit to `exit_group`: it must enrol on the reservation owner's release and
+/// park, then after peer A's `NotYet` child-TID copy restores `page.live() == 2`
+/// and wakes caller B, caller B reruns `SYS_exit(38)` and retires only itself
+/// in ring while peer A remains live.
+fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit<C, B>(
+    make: &'static dyn Fn(AddressContext<RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+
+    let fixture: &'static Fixture<C> = Box::leak(Box::new(Fixture::<C>::new::<B>(make)));
+    let zone = fixture.zone;
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let slot1 = SlotId::new(1);
+    let slot2 = SlotId::new(2);
+
+    let controls: &'static [ThreadControlSlot; 2] = Box::leak(Box::new([
+        ThreadControlSlot::new(),
+        ThreadControlSlot::new(),
+    ]));
+    let control1 = &controls[0];
+    let control2 = &controls[1];
+    let (task1, member1) = spawn_registered_born_member(fixture, &make, control1, 0);
+    let (task2, member2) = spawn_registered_born_member(fixture, &make, control2, 1);
+    control1.set_clear_child_tid(0x4000);
+    assert_eq!(fixture.page.live(), 3);
+
+    // Retire the leader's membership so the two ring-born members own the final
+    // two live units (`page.live() == 2`).
+    assert_eq!(
+        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        carrick_sched_core::CurrentRelease::Released
+    );
+    fixture.page.reserve_nonfinal_exit().unwrap().publish();
+    let leader_birth = fixture.control.host_birth_identity().unwrap();
+    fixture
+        .page
+        .publish_exact_host_retirement(fixture.control, leader_birth.retirement());
+    assert_eq!(fixture.page.live(), 2);
+
+    struct MemberVenue<'a> {
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    }
+    impl crate::thread_setup::LifecycleVenue for MemberVenue<'_> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+
+    let member1_ref = zone.record_ref(member1);
+    let member2_ref = zone.record_ref(member2);
+    let caller_b_ran = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let caller_b_ran_hook = caller_b_ran.clone();
+
+    fail_signal_copies(&[NativeProcessError::Busy]);
+    ENTROPY_PREPARE_BUSY_ONCE.with(|busy| busy.set(true));
+    set_before_signal_copy_hook(Box::new(move |address| {
+        assert_eq!(address, UserVa::new(0x4000));
+        assert_eq!(
+            fixture.page.live(),
+            1,
+            "peer A must hold its refundable reservation during clear_child_tid copy"
+        );
+        let counters_b = carrick_el1_abi::Counters::new();
+        let names_b = carrick_el1_abi::InotifyNameCache::new();
+        let venue_b = MemberVenue {
+            page: fixture.page,
+            control: control2,
+        };
+        let mut service_b = Physical {
+            zone,
+            page: fixture.page,
+            controls: &controls[..],
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            child_copy_error: None,
+            prepare_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
+            native_ipc: None,
+            refuse_copy: false,
+            waker_slot: slot2,
+            on_signal_clock: None,
+        };
+        let mut entry_b = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource { zone, slot: slot2 },
+                task2,
+                fixture.address,
+                &make(fixture.address),
+                &mut service_b,
+            )
+            .unwrap();
+        let route_b = {
+            let mut frame_b = ExitStatusFrame(isa, slot2, 38);
+            let mut pending_b: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame_b,
+                counters: &counters_b,
+                current_tasks: core::slice::from_ref(task2),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names_b,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue_b),
+                process: Some(entry_b.as_mut()),
+                source: Some(BornInZoneSource { zone, slot: slot2 }),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending_b,
+            )
+        };
+        assert_eq!(
+            route_b,
+            CompletionRoute::Suspended,
+            "caller B raw exit on {isa:?} must suspend on peer A's refundable reservation"
+        );
+        assert_eq!(
+            fixture.page.gate(),
+            carrick_el1_abi::GateState::Open,
+            "caller B raw exit promoted to exit_group while peer A's reservation was refundable"
+        );
+        assert!(
+            entry_b.take_root_exit().is_none(),
+            "caller B raw exit published root exit while peer A's reservation was refundable"
+        );
+        assert!(
+            entry_b.take_handoff_receipt().is_some(),
+            "caller B must release its execution lease and park on reservation release"
+        );
+        assert!(entry_b.take_run_failure().is_none());
+        assert!(
+            matches!(
+                zone.record(member2).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ),
+            "caller B must park enrolled on reservation release"
+        );
+        caller_b_ran_hook.store(true, Ordering::Release);
+    }));
+
+    let counters_a = carrick_el1_abi::Counters::new();
+    let names_a = carrick_el1_abi::InotifyNameCache::new();
+    let venue_a = MemberVenue {
+        page: fixture.page,
+        control: control1,
+    };
+    let mut service_a = Physical {
+        zone,
+        page: fixture.page,
+        controls: &controls[..],
+        copies: Vec::new(),
+        tid_words: BTreeMap::from([((1, 0x4000), 42)]),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: slot1,
+        on_signal_clock: None,
+    };
+    let mut entry_a = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource { zone, slot: slot1 },
+            task1,
+            fixture.address,
+            &make(fixture.address),
+            &mut service_a,
+        )
+        .unwrap();
+    {
+        let mut frame_a = ExitStatusFrame(isa, slot1, 0);
+        let mut pending_a: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            futex_argument0: None,
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame_a,
+            counters: &counters_a,
+            current_tasks: core::slice::from_ref(task1),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names_a,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue_a),
+            process: Some(entry_a.as_mut()),
+            source: Some(BornInZoneSource { zone, slot: slot1 }),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending_a,
+            ),
+            CompletionRoute::Suspended,
+            "peer A NotYet clear_child_tid copy must park peer A after refunding its reservation"
+        );
+    }
+    assert!(caller_b_ran.load(Ordering::Acquire));
+    assert!(entry_a.take_handoff_receipt().is_some());
+    assert!(entry_a.take_run_failure().is_none());
+    drop(entry_a);
+    assert_eq!(
+        fixture.page.live(),
+        2,
+        "peer A NotYet rollback must restore live count to 2"
+    );
+    assert!(zone.live(member1_ref).is_some(), "peer A remains live");
+    assert_eq!(
+        zone.slot(slot2).queued(),
+        1,
+        "peer A's reservation release must wake parked caller B"
+    );
+
+    // Caller B resumes its parked SYS_exit(38) and retires only itself in ring.
+    zone.install_space(slot2, 1).unwrap();
+    assert_eq!(zone.switch_in_full(slot2).unwrap().record, member2);
+    // SAFETY: `member2` was just selected on `slot2`.
+    let saved_b = unsafe { fixture.runtime.record_binding(member2_ref) }
+        .unwrap()
+        .words;
+    let mut service_b = Physical {
+        zone,
+        page: fixture.page,
+        controls: &controls[..],
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: slot2,
+        on_signal_clock: None,
+    };
+    let mut entry_b = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource { zone, slot: slot2 },
+            task2,
+            fixture.address,
+            &saved_b,
+            &mut service_b,
+        )
+        .unwrap();
+    let resumed_b = entry_b.resume_checkpoint(|_| Ok(None)).unwrap();
+    assert!(
+        matches!(
+            resumed_b,
+            NativeResume::RetrySyscall | NativeResume::RetrySavedSyscall
+        ),
+        "resumed caller B must rerun its saved SYS_exit"
+    );
+    drop(entry_b);
+
+    let counters_rerun = carrick_el1_abi::Counters::new();
+    let names_rerun = carrick_el1_abi::InotifyNameCache::new();
+    let venue_b = MemberVenue {
+        page: fixture.page,
+        control: control2,
+    };
+    let mut entry_b = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource { zone, slot: slot2 },
+            task2,
+            fixture.address,
+            &saved_b,
+            &mut service_b,
+        )
+        .unwrap();
+    {
+        let mut frame_b = ExitStatusFrame(isa, slot2, 38);
+        let mut pending_b: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            futex_argument0: None,
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame_b,
+            counters: &counters_rerun,
+            current_tasks: core::slice::from_ref(task2),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names_rerun,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue_b),
+            process: Some(entry_b.as_mut()),
+            source: Some(BornInZoneSource { zone, slot: slot2 }),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending_b,
+            ),
+            CompletionRoute::Suspended,
+            "rerun SYS_exit(38) on {isa:?} must retire caller B in ring"
+        );
+    }
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    assert!(entry_b.take_root_exit().is_none());
+    assert!(entry_b.take_handoff_receipt().is_none());
+    assert!(entry_b.take_run_failure().is_none());
+    drop(entry_b);
+    assert!(zone.live(member2_ref).is_none());
+    assert!(
+        zone.live(member1_ref).is_some(),
+        "peer A must still be live"
+    );
+    assert_eq!(fixture.page.live(), 1);
+}
+
+#[test]
+fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit_x86() {
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::Ring));
+    refundable_peer_raw_exit_parks_then_retires_as_thread_exit::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        &words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::HostThread));
+}
+
+#[test]
+fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit_aarch64() {
+    refundable_peer_raw_exit_parks_then_retires_as_thread_exit::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        &arm_syscall_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}
+
+/// #2932 verifier blocker ("Busy once, then success"): peer A holds a
+/// refundable reservation when caller B hits `Floor`, and peer A refunds that
+/// reservation (`live` rebounds `1 -> 2`) right before caller B's reservation
+/// wait bucket enrollment probes under the bucket lock. Caller B must reach the
+/// reservation owner's wait bucket (never spin in-ring without enrolling),
+/// observe the released reservation under the bucket lock, probe once, and
+/// retire only itself in ring without promoting to `exit_group`.
+fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
+    make: impl Fn(AddressContext<RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+
+    let fixture = Fixture::<C>::new::<B>(&make);
+    let zone = fixture.zone;
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let slot2 = SlotId::new(2);
+
+    let controls = Box::leak(Box::new([
+        ThreadControlSlot::new(),
+        ThreadControlSlot::new(),
+    ]));
+    let control1 = &controls[0];
+    let control2 = &controls[1];
+    let (_task1, member1) = spawn_registered_born_member(&fixture, &make, control1, 0);
+    let (task2, member2) = spawn_registered_born_member(&fixture, &make, control2, 1);
+    assert_eq!(fixture.page.live(), 3);
+
+    assert_eq!(
+        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        carrick_sched_core::CurrentRelease::Released
+    );
+    fixture.page.reserve_nonfinal_exit().unwrap().publish();
+    let leader_birth = fixture.control.host_birth_identity().unwrap();
+    fixture
+        .page
+        .publish_exact_host_retirement(fixture.control, leader_birth.retirement());
+    assert_eq!(fixture.page.live(), 2);
+
+    let member1_ref = zone.record_ref(member1);
+    let member2_ref = zone.record_ref(member2);
+    let bucket_contended = core::sync::atomic::AtomicBool::new(false);
+    let finished = core::sync::atomic::AtomicBool::new(false);
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+
+    struct ReboundVenue<'a> {
+        page: &'a ThreadLifecyclePage,
+        caller: &'a ThreadControlSlot,
+        calls: core::cell::Cell<usize>,
+        arm_peer: core::cell::RefCell<
+            Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        >,
+    }
+    impl crate::thread_setup::LifecycleVenue for ReboundVenue<'_> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            let seen = self.calls.get();
+            self.calls.set(seen + 1);
+            if seen == 1
+                && let Some((tx, rx)) = self.arm_peer.borrow_mut().take()
+            {
+                tx.send(()).unwrap();
+                rx.recv().unwrap();
+            }
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.caller,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+
+    let probe = |attempt: u32| {
+        if attempt == LOCK_SPINS {
+            bucket_contended.store(true, Ordering::Release);
+        }
+    };
+
+    let bucket_contended_ref = &bucket_contended;
+    let finished_ref = &finished;
+    let page = fixture.page;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if start_rx.recv().is_err() {
+                return;
+            }
+            let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(42),
+                    generation: carrick_core_abi::SnapshotGeneration::from_raw(102),
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
+                },
+                control1.entry(),
+                carrick_sched_core::process::TerminationStatus::exited(0),
+            )
+            .unwrap();
+            let (_custody, held_membership) = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Thread,
+                carrick_core::terminal::Live,
+            >::admitted(identity)
+            .begin()
+            .reserve_member(page, control1)
+            .map_err(|(_, error)| error)
+            .unwrap();
+            assert_eq!(page.live(), 1);
+            let guards: Vec<_> = (0..carrick_sched_core::ZONE_BUCKETS)
+                .map(|bucket| {
+                    zone.lock(bucket, &carrick_sched_core::BoundedSpin(0))
+                        .unwrap()
+                })
+                .collect();
+            armed_tx.send(()).unwrap();
+            while !bucket_contended_ref.load(Ordering::Acquire)
+                && !finished_ref.load(Ordering::Acquire)
+            {
+                std::thread::yield_now();
+            }
+            // Peer A's NotYet rollback restores `page.live() == 2` right before
+            // caller B acquires the reservation wait bucket lock and probes.
+            drop(held_membership);
+            drop(guards);
+        });
+
+        let counters = carrick_el1_abi::Counters::new();
+        let names = carrick_el1_abi::InotifyNameCache::new();
+        let venue = ReboundVenue {
+            page: fixture.page,
+            caller: control2,
+            calls: core::cell::Cell::new(0),
+            arm_peer: core::cell::RefCell::new(Some((start_tx, armed_rx))),
+        };
+        let mut service = Physical {
+            zone,
+            page: fixture.page,
+            controls: &controls[..],
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            child_copy_error: None,
+            prepare_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
+            native_ipc: None,
+            refuse_copy: false,
+            waker_slot: slot2,
+            on_signal_clock: None,
+        };
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource { zone, slot: slot2 },
+                task2,
+                fixture.address,
+                &make(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        entry.publication_wait_probe = Some(&probe);
+        let route = {
+            let mut frame = ExitStatusFrame(isa, slot2, 38);
+            let mut pending: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame,
+                counters: &counters,
+                current_tasks: core::slice::from_ref(task2),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue),
+                process: Some(entry.as_mut()),
+                source: Some(BornInZoneSource { zone, slot: slot2 }),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64,
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending,
+            )
+        };
+        entry.publication_wait_probe = None;
+        finished.store(true, Ordering::Release);
+        assert_eq!(route, CompletionRoute::Suspended);
+        assert!(
+            bucket_contended.load(Ordering::Acquire),
+            "caller B must enrol on the reservation wait bucket before probing once"
+        );
+        assert_eq!(
+            fixture.page.gate(),
+            carrick_el1_abi::GateState::Open,
+            "caller B promoted raw exit to exit_group while peer A's reservation was refundable"
+        );
+        assert!(
+            entry.take_root_exit().is_none(),
+            "caller B published root exit while peer A's reservation was refundable"
+        );
+        assert_eq!(
+            counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitLast as usize]
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(entry.take_handoff_receipt().is_none());
+        assert!(entry.take_run_failure().is_none());
+    });
+
+    assert!(zone.live(member2_ref).is_none());
+    assert!(zone.live(member1_ref).is_some(), "peer A remains live");
+    assert_eq!(fixture.page.live(), 1);
+}
+
+#[test]
+fn refundable_peer_rebound_before_enrol_probes_once_and_retires_x86() {
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::Ring));
+    refundable_peer_rebound_before_enrol_probes_once_and_retires::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::HostThread));
+}
+
+#[test]
+fn refundable_peer_rebound_before_enrol_probes_once_and_retires_aarch64() {
+    refundable_peer_rebound_before_enrol_probes_once_and_retires::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_syscall_words,
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
     );
 }
