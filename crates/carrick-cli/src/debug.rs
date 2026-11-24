@@ -195,6 +195,19 @@ pub(crate) fn run_debug(
                 (None, None, None) => bail!("zonedump needs --run-id, --post-mortem or --region"),
             },
         )?,
+        DebugCommand::HostStacks {
+            run_id,
+            pid,
+            out_dir,
+            core,
+        } => crate::debug_host_stacks::run_host_stacks(
+            &crate::debug_host_stacks::HostStacksOptions {
+                run_id: run_id.as_deref(),
+                pid,
+                out_dir: &out_dir,
+                core,
+            },
+        )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped
@@ -849,42 +862,17 @@ fn run_lldb_attach(
 }
 
 fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
-    let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,command="])
-        .output()
-        .context("failed to run ps")?;
-    if !output.status.success() {
-        bail!("ps failed with status {}", output.status);
-    }
     let needle = format!("carrick:{run_id}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut processes = Vec::new();
-    for line in stdout.lines() {
-        if !line.contains(&needle) {
+    for row in crate::debug_host_stacks::process_table()? {
+        if !row.title.contains(&needle) {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let Some(pid_raw) = parts.next() else {
-            continue;
-        };
-        let Some(ppid_raw) = parts.next() else {
-            continue;
-        };
-        let Some(stat) = parts.next() else {
-            continue;
-        };
-        let command = parts.collect::<Vec<_>>().join(" ");
-        let pid = pid_raw
-            .parse::<libc::pid_t>()
-            .with_context(|| format!("failed to parse pid from `{line}`"))?;
-        let ppid = ppid_raw
-            .parse::<libc::pid_t>()
-            .with_context(|| format!("failed to parse ppid from `{line}`"))?;
         processes.push(MatchedProcess {
-            pid,
-            ppid,
-            stat: stat.to_owned(),
-            command,
+            pid: libc::pid_t::try_from(row.pid).context("pid fits pid_t")?,
+            ppid: libc::pid_t::try_from(row.ppid).context("ppid fits pid_t")?,
+            stat: row.stat,
+            command: row.title,
         });
     }
     Ok(processes)

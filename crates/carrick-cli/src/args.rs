@@ -1185,6 +1185,28 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         region: Option<PathBuf>,
     },
+    /// Write every host thread's backtrace of a live, wedged or orphaned
+    /// carrier and of each of its descendants (gdb; `sudo -n lldb` on
+    /// macOS), and optionally a core. Use it on a hang, beside `zonedump`:
+    /// it needs no debug endpoint, so it also reads a carrier stuck in
+    /// teardown. Fails when nothing matches or a capture failed.
+    HostStacks {
+        /// Every process titled `carrick:<run-id>:` (the token
+        /// `scripts/sudo/kill.sh` reaps by), so a reparented carrier is
+        /// found too.
+        #[arg(long, conflicts_with = "pid", required_unless_present = "pid")]
+        run_id: Option<String>,
+        /// Or one host process by pid.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Each process gets a private `host-stacks-<pid>/` here, with a
+        /// `manifest.json` and `backtrace.txt` (and `carrier.core`).
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Also write a core of each matched carrier (`carrier.core`).
+        #[arg(long)]
+        core: bool,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {

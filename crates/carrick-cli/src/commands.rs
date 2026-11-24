@@ -977,6 +977,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                 },
             )?,
+            DebugCommand::HostStacks {
+                run_id,
+                pid,
+                out_dir,
+                core,
+            } => crate::debug_host_stacks::run_host_stacks(
+                &crate::debug_host_stacks::HostStacksOptions {
+                    run_id: run_id.as_deref(),
+                    pid,
+                    out_dir: &out_dir,
+                    core,
+                },
+            )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

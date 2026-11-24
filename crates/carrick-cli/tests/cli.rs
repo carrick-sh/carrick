@@ -981,3 +981,61 @@ fn minimal_aarch64_elf_with_load_segment() -> Vec<u8> {
     elf[0x1000..0x1004].copy_from_slice(b"\x1f\x20\x03\xd5");
     elf
 }
+
+/// `debug host-stacks` fails by name when no process carries the run's
+/// `carrick:<run-id>:` title, rather than writing an empty capture.
+#[test]
+fn debug_host_stacks_refuses_a_run_with_no_titled_process() {
+    let out = tempfile::tempdir().unwrap();
+    command()
+        .args(["debug", "host-stacks", "--run-id", "host-stacks-absent-run"])
+        .arg("--out-dir")
+        .arg(out.path())
+        .assert()
+        .failure()
+        .stderr(contains(
+            "no host process is titled `carrick:host-stacks-absent-run:`",
+        ));
+}
+
+/// The production entry on a live process titled like a carrier (#2955):
+/// it writes a private capture directory with a manifest naming the run
+/// and a non-empty backtrace of every host thread.
+#[test]
+#[ignore = "attaches the host debugger (gdb; `sudo -n lldb` on macOS) to a sibling \
+            process, which Yama ptrace_scope 1 refuses; run where the debugger may attach"]
+fn debug_host_stacks_captures_a_titled_live_process() {
+    use std::os::unix::process::CommandExt;
+    let run_id = format!("host-stacks-live-{}", std::process::id());
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg0(format!("carrick:{run_id}: sleeper"))
+        .arg("60")
+        .spawn()
+        .expect("spawn the titled sleeper");
+    let out = tempfile::tempdir().unwrap();
+    let result = command()
+        .timeout(std::time::Duration::from_secs(300))
+        .args(["debug", "host-stacks", "--run-id", &run_id])
+        .arg("--out-dir")
+        .arg(out.path())
+        .output();
+    let pid = sleeper.id();
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let result = result.expect("run debug host-stacks");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        result.status.success(),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let dir = out.path().join(format!("host-stacks-{pid}"));
+    assert!(stdout.contains(&format!("pid {pid} ")), "{stdout}");
+    let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains(&format!("\"run_id\": \"{run_id}\"")),
+        "{manifest}"
+    );
+    let backtrace = std::fs::read_to_string(dir.join("backtrace.txt")).unwrap();
+    assert!(backtrace.contains("hread"), "{backtrace}");
+}

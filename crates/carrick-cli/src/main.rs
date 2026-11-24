@@ -130,6 +130,7 @@ mod debug_amplification;
 mod debug_core;
 mod debug_el1_census;
 mod debug_exec_stamps;
+mod debug_host_stacks;
 #[cfg(target_os = "linux")]
 mod debug_soft_run;
 mod debug_venue_gaps;

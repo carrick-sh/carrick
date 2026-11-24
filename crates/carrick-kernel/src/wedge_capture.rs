@@ -201,7 +201,20 @@ pub fn capture_wedged_carrier(
     if !claim_capture() {
         return Err(WedgeCaptureError::AlreadyClaimed);
     }
-    capture_with(request, &LldbCaptureRunner, &SigkillReaper)
+    capture_with(request, &HostDebuggerRunner, &SigkillReaper)
+}
+
+/// Capture ANOTHER live carrier from outside (`carrick debug host-stacks`,
+/// the KVM test deadline): the same private directory, manifest, host
+/// debugger, bounds and fail-closed rules as a wedge capture, with the core
+/// only when `core` is set. It claims nothing and arms no reap: the caller
+/// owns the process and its kill. It needs no debug endpoint, so a carrier
+/// stuck in teardown (#2955) is captured like a live one.
+pub fn capture_external_carrier(
+    request: WedgeCaptureRequest,
+    core: bool,
+) -> Result<WedgeCapture, WedgeCaptureError> {
+    capture_steps(request, &HostDebuggerRunner, core)
 }
 
 pub(crate) fn capture_with(
@@ -216,7 +229,16 @@ pub(crate) fn capture_with(
         request.pid,
         REAP_GRACE + CAPTURE_STEP_TIMEOUT + CAPTURE_STEP_TIMEOUT,
     );
+    capture_steps(request, runner, true)
+}
 
+/// The capture directory, its manifest, the backtrace, and the core when
+/// `core` is set. Never `Ok` with an empty artifact.
+fn capture_steps(
+    request: WedgeCaptureRequest,
+    runner: &dyn CaptureRunner,
+    core: bool,
+) -> Result<WedgeCapture, WedgeCaptureError> {
     let dir = prepare_capture_directory(&request.out_root, &request.label, request.pid).map_err(
         |error| WedgeCaptureError::Directory {
             dir: request
@@ -240,6 +262,13 @@ pub(crate) fn capture_with(
     )?;
     require_evidence(&dir, &backtrace, CaptureStep::Backtrace)?;
 
+    if !core {
+        return Ok(WedgeCapture {
+            dir,
+            backtrace,
+            core: None,
+        });
+    }
     let core = dir.join("carrier.core");
     run_step(runner, CaptureStep::Core, request.pid, &core, &dir)?;
     require_evidence(&dir, &core, CaptureStep::Core)?;
@@ -384,14 +413,22 @@ fn json_string(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// The shipped runner: `sudo -n lldb`, exactly the commands a human runs by
-/// hand on a wedged carrier (AGENTS.md's post-mortem instruction), with the
-/// step's stdout captured into the artifact.
-struct LldbCaptureRunner;
+/// The shipped runner: the host's debugger, with exactly the commands a
+/// human runs by hand on a wedged carrier (AGENTS.md's post-mortem
+/// instruction), and the step's stdout captured into the artifact.
+///
+/// - macOS: `sudo -n lldb` (`thread backtrace all`, `process save-core
+///   --style modified-memory`), since attaching needs the debugger grant.
+/// - every other host (Linux KVM, the BSDs): `gdb` as the same user
+///   (`thread apply all bt`, `generate-core-file`). A KVM carrier's guest
+///   memory is a shared host mapping, so gdb's core keeps it.
+struct HostDebuggerRunner;
 
-impl CaptureRunner for LldbCaptureRunner {
-    fn run(&self, step: CaptureStep, pid: i32, output: &Path, bound: Duration) -> StepOutcome {
-        let pid_text = pid.to_string();
+/// The debugger invocation for one capture step on this host, and its name
+/// for a named failure.
+fn debugger_command(step: CaptureStep, pid: i32, output: &Path) -> (Command, &'static str) {
+    let pid_text = pid.to_string();
+    if cfg!(target_os = "macos") {
         let mut command = Command::new("sudo");
         command.arg("-n").arg("lldb").arg("-p").arg(&pid_text);
         command.arg("--batch");
@@ -407,9 +444,30 @@ impl CaptureRunner for LldbCaptureRunner {
             }
         }
         command.arg("-o").arg("detach").arg("-o").arg("quit");
+        (command, "sudo -n lldb")
+    } else {
+        let mut command = Command::new("gdb");
+        command.args(["-nx", "-batch", "-p", &pid_text]);
+        match step {
+            CaptureStep::Backtrace => {
+                command.args(["-ex", "info threads", "-ex", "thread apply all bt"]);
+            }
+            CaptureStep::Core => {
+                command
+                    .arg("-ex")
+                    .arg(format!("generate-core-file {}", output.display()));
+            }
+        }
+        (command, "gdb")
+    }
+}
+
+impl CaptureRunner for HostDebuggerRunner {
+    fn run(&self, step: CaptureStep, pid: i32, output: &Path, bound: Duration) -> StepOutcome {
+        let (mut command, debugger) = debugger_command(step, pid, output);
 
         let sink = match step {
-            // The backtrace IS lldb's stdout.
+            // The backtrace IS the debugger's stdout.
             CaptureStep::Backtrace => match std::fs::File::create(output) {
                 Ok(file) => Stdio::from(file),
                 Err(error) => {
@@ -419,7 +477,7 @@ impl CaptureRunner for LldbCaptureRunner {
                     ));
                 }
             },
-            // `save-core` writes the file itself; its stdout is only progress.
+            // The core step writes the file itself; its stdout is only progress.
             CaptureStep::Core => Stdio::null(),
         };
         command
@@ -429,7 +487,7 @@ impl CaptureRunner for LldbCaptureRunner {
 
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(error) => return StepOutcome::Unavailable(format!("sudo -n lldb: {error}")),
+            Err(error) => return StepOutcome::Unavailable(format!("{debugger}: {error}")),
         };
         let started = Instant::now();
         loop {
@@ -438,7 +496,7 @@ impl CaptureRunner for LldbCaptureRunner {
                     return if status.success() {
                         StepOutcome::Completed
                     } else {
-                        StepOutcome::Unavailable(format!("sudo -n lldb exited with {status}"))
+                        StepOutcome::Unavailable(format!("{debugger} exited with {status}"))
                     };
                 }
                 Ok(None) => {}
@@ -660,6 +718,43 @@ mod tests {
             "{manifest}"
         );
         assert_eq!(reaper.armed.lock().expect("record").len(), 1);
+    }
+
+    /// An external capture without a core runs the backtrace step only and
+    /// still writes the manifest; an empty backtrace is still a failure.
+    #[test]
+    fn an_external_capture_without_a_core_takes_the_backtrace_only() {
+        let temp = tempfile::Builder::new()
+            .prefix("carrick-wedge-external")
+            .tempdir_in("/tmp")
+            .expect("test parent");
+        let root = temp.path().join("host-stacks");
+        let capture = capture_steps(
+            request(&root, "host-stacks"),
+            &StubRunner {
+                bytes: 64,
+                outcome: || StepOutcome::Completed,
+            },
+            false,
+        )
+        .expect("a backtrace-only capture");
+        assert_eq!(capture.backtrace, capture.dir.join("backtrace.txt"));
+        assert_eq!(capture.core, None);
+        assert!(!capture.dir.join("carrier.core").exists());
+        assert!(capture.dir.join("manifest.json").is_file());
+        let error = capture_steps(
+            request(&root, "host-stacks-empty"),
+            &StubRunner {
+                bytes: 0,
+                outcome: || StepOutcome::Completed,
+            },
+            false,
+        )
+        .expect_err("an empty backtrace is never a capture");
+        assert!(
+            matches!(&error, WedgeCaptureError::NoEvidence { .. }),
+            "{error}"
+        );
     }
 
     #[test]

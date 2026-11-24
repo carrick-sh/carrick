@@ -117,7 +117,9 @@ REVIEWED_OPERATOR_LIMITS = {
     (PurePosixPath("crates/carrick-cli/src/apfs_operator.rs"), "run_diskutil", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_deadline", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_attach", "process_command"): 1,
-    (PurePosixPath("crates/carrick-cli/src/debug.rs"), "collect_scoped_processes", "process_command"): 1,
+    # The one host process table of `carrick debug` (`ps`): `host-stacks`
+    # and the macOS scoped-run helpers read it (#2959).
+    (PurePosixPath("crates/carrick-cli/src/debug_host_stacks.rs"), "process_table", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "dump_lldb", "kill"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "kill"): 3,
@@ -134,7 +136,8 @@ REVIEWED_OPERATOR_LIMITS = {
     (PurePosixPath("crates/carrick-cli/src/trace_cli.rs"), "exec_trace_child", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "git_dirty", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "command_output", "process_command"): 1,
-    # The wedge capture's `sudo -n lldb`: the same operator tool the CLI's
+    # The wedge capture's host debugger (`sudo -n lldb` on macOS, gdb
+    # elsewhere, #2959): the same operator tool the CLI's
     # `run_lldb_attach` is allowed, moved to where a wedged carrier can reach
     # it. It creates no guest process and carries no Linux task; it exists
     # because a spinning executor cannot reach the in-process abort sink, and
@@ -142,9 +145,9 @@ REVIEWED_OPERATOR_LIMITS = {
     # the same debugger by hand.
     (
         PurePosixPath("crates/carrick-kernel/src/wedge_capture.rs"),
-        "run",
+        "debugger_command",
         "process_command",
-    ): 1,
+    ): 2,
 }
 REVIEWED_PROBE_LIMITS = {
     (PurePosixPath("crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs"), "live_fork", "fork"): 1,
