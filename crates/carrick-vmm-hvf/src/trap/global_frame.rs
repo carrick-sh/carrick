@@ -1349,6 +1349,16 @@ impl<F: FnOnce() -> Option<GlobalFrameBacking>> LeaseTransferBacking
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for UnretiredStage2Lease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnretiredStage2Lease")
+            .field("key", &self.lease.key())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl UnretiredStage2Lease {
     /// The stage-2 mapping is gone: the lease's `Drop` releases its IPA
     /// reservation, and only then is the backing freed.

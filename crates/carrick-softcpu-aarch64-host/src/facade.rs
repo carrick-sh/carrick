@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -20,6 +20,8 @@ use carrick_aarch64::mailbox::{
     AARCH64_SYSCALL_MAILBOX_SIZE, Aarch64SyscallMailbox, HvcImmediateKind, MailboxSlot,
     classify_hvc_immediate,
 };
+use carrick_aarch64::stage2::custody::Stage2Custody;
+use carrick_aarch64::stage2::{Stage2Backend, Stage2Contention, Stage2ReleaseEpoch, Stage2Status};
 use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
@@ -227,6 +229,9 @@ pub struct SoftStage2 {
     /// [`SoftStage2::map_retained_metadata`], keyed by its aperture GPA. A
     /// backing leaves only with its successful unmap, or with this carrier.
     retained_metadata: BTreeMap<u64, Arc<dyn RetainedMetadataBacking>>,
+    /// Set by the custody backend's destroy: the guest-physical space is
+    /// gone, and every later custody map is refused.
+    destroyed: bool,
 }
 
 impl SoftStage2 {
@@ -241,6 +246,7 @@ impl SoftStage2 {
             last_abort: None,
             _ipc_pin: None,
             retained_metadata: BTreeMap::new(),
+            destroyed: false,
         })
     }
 
@@ -1051,6 +1057,64 @@ impl SoftGuestMemory for SoftStage2 {
 struct ExclusiveStage2 {
     borrowed: AtomicBool,
     inner: UnsafeCell<SoftStage2>,
+    /// The release a contended custody operation enrols on.
+    releases: Arc<Stage2Releases>,
+}
+
+/// Releases of one soft carrier's stage-2 borrow, for the custody
+/// operations that found it busy ([`Stage2Contention`]). A guard's drop
+/// signals only while someone is enrolled, so an uncontended borrow costs
+/// one extra atomic load.
+#[derive(Default)]
+struct Stage2Releases {
+    waiters: AtomicUsize,
+    epoch: Mutex<u64>,
+    released: Condvar,
+}
+
+impl Stage2Releases {
+    fn signal(&self) {
+        if self.waiters.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *epoch = epoch.wrapping_add(1);
+        self.released.notify_all();
+    }
+}
+
+impl Stage2Contention for Stage2Releases {
+    fn enrol(&self) -> Stage2ReleaseEpoch {
+        let epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Enrolled before the caller's probe: a release that races the
+        // probe sees this waiter and advances the epoch.
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        Stage2ReleaseEpoch(*epoch)
+    }
+
+    fn wait_and_leave(&self, seen: Stage2ReleaseEpoch) {
+        let mut epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *epoch == seen.0 {
+            epoch = self
+                .released
+                .wait(epoch)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 // SAFETY: `ExclusiveStage2` grants mutable/shared access to `SoftStage2` only
@@ -1065,7 +1129,8 @@ struct Stage2Guard<'a> {
 
 impl Drop for Stage2Guard<'_> {
     fn drop(&mut self) {
-        self.cell.borrowed.store(false, Ordering::Release);
+        self.cell.borrowed.store(false, Ordering::SeqCst);
+        self.cell.releases.signal();
     }
 }
 
@@ -1090,14 +1155,110 @@ impl ExclusiveStage2 {
         Self {
             borrowed: AtomicBool::new(false),
             inner: UnsafeCell::new(stage2),
+            releases: Arc::default(),
         }
     }
 
     fn try_borrow(&self) -> Result<Stage2Guard<'_>, TrapError> {
         self.borrowed
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .map(|_| Stage2Guard { cell: self })
             .map_err(|_| TrapError::Hypervisor("concurrent SoftStage2 access refused".to_owned()))
+    }
+}
+
+/// The soft carrier's refusal codes as [`Stage2Status`] words.
+pub mod soft_stage2_status {
+    use carrick_aarch64::stage2::Stage2Status;
+
+    /// The soft stage 2 refused the operation (an overlap, no exact window,
+    /// a bad extent).
+    pub const REFUSED: Stage2Status = Stage2Status::from_raw(0x5f53_0001);
+    /// The carrier this backend names is gone.
+    pub const CARRIER_GONE: Stage2Status = Stage2Status::from_raw(0x5f53_0002);
+    /// The backend's VM was destroyed; nothing maps into it again.
+    pub const DESTROYED: Stage2Status = Stage2Status::from_raw(0x5f53_0003);
+}
+
+/// One soft carrier's [`Stage2Backend`]: the raw map, unmap and destroy of
+/// its [`SoftStage2`] windows, for the carrier's [`Stage2Custody`].
+///
+/// It names its carrier weakly, so a custody outliving the carrier fails
+/// closed. A borrow held elsewhere is [`Stage2Status::BUSY`], and its
+/// release is the one the custody waits on.
+pub struct SoftStage2Backend {
+    stage2: Weak<ExclusiveStage2>,
+    releases: Arc<Stage2Releases>,
+}
+
+impl SoftStage2Backend {
+    fn with_stage2(
+        &self,
+        operation: impl FnOnce(&mut SoftStage2) -> Result<(), TrapError>,
+    ) -> Stage2Status {
+        let Some(stage2) = self.stage2.upgrade() else {
+            return soft_stage2_status::CARRIER_GONE;
+        };
+        let Ok(mut guard) = stage2.try_borrow() else {
+            return Stage2Status::BUSY;
+        };
+        match operation(&mut guard) {
+            Ok(()) => Stage2Status::SUCCESS,
+            Err(_) => soft_stage2_status::REFUSED,
+        }
+    }
+}
+
+impl Stage2Backend for SoftStage2Backend {
+    unsafe fn map(
+        &self,
+        host: *mut core::ffi::c_void,
+        ipa: u64,
+        size: usize,
+        perms: MemPerms,
+    ) -> Stage2Status {
+        let Some(host) = NonNull::new(host.cast::<u8>()) else {
+            return soft_stage2_status::REFUSED;
+        };
+        let mut destroyed = false;
+        let status = self.with_stage2(|stage2| {
+            if stage2.destroyed {
+                destroyed = true;
+                return Ok(());
+            }
+            // SAFETY: the `Stage2Backend::map` contract keeps `host` live
+            // and unshared until this extent's unmap or the VM's destroy.
+            unsafe { stage2.map_external_stage2(ipa, host, size as u64, perms, false) }
+        });
+        if destroyed {
+            soft_stage2_status::DESTROYED
+        } else {
+            status
+        }
+    }
+
+    unsafe fn unmap(&self, ipa: u64, size: usize) -> Stage2Status {
+        self.with_stage2(|stage2| stage2.unmap_stage2(ipa, size as u64))
+    }
+
+    unsafe fn destroy(&self) -> Stage2Status {
+        self.with_stage2(|stage2| {
+            stage2.destroyed = true;
+            let external: Vec<(u64, u64)> = stage2
+                .windows
+                .values()
+                .filter(|window| matches!(window._backing, WindowBacking::External))
+                .map(|window| (window.start, window.end - window.start))
+                .collect();
+            for (gpa, len) in external {
+                stage2.unmap_stage2(gpa, len)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn contention(&self) -> Option<&dyn Stage2Contention> {
+        Some(self.releases.as_ref())
     }
 }
 
@@ -1824,6 +1985,8 @@ enum PendingAliasInventory {
 /// Soft AArch64 VM backend implementing [`Aarch64Vmm`] over [`SoftStage2`].
 pub struct SoftAarch64Vmm<X = HostBlockRunner> {
     stage2: Arc<ExclusiveStage2>,
+    /// The carrier's stage-2 custody, over its own [`SoftStage2Backend`].
+    custody: Arc<Stage2Custody>,
     protections: Arc<MemoryProtections>,
     seat: Arc<SoftRunSeat>,
     next_alias_gpa: u64,
@@ -1871,6 +2034,7 @@ where
         let mailbox = mailbox_ptr.map(|ptr| unsafe { MailboxSlot::new(ptr, 1) });
 
         let stage2 = Arc::new(ExclusiveStage2::new(stage2));
+        let custody = soft_carrier_custody(&stage2)?;
         let protections = Arc::new(MemoryProtections::default());
         let seat = Arc::new(SoftRunSeat::default());
 
@@ -1934,6 +2098,7 @@ where
 
         let vmm = Self {
             stage2,
+            custody,
             protections,
             seat,
             next_alias_gpa: SOFT_ALIAS_GPA_BASE,
@@ -1945,7 +2110,29 @@ where
     }
 }
 
+/// The soft carrier's live stage-2 custody over its own backend.
+fn soft_carrier_custody(stage2: &Arc<ExclusiveStage2>) -> Result<Arc<Stage2Custody>, TrapError> {
+    let custody = Stage2Custody::new(Arc::new(SoftStage2Backend {
+        stage2: Arc::downgrade(stage2),
+        releases: Arc::clone(&stage2.releases),
+    }));
+    let generation = custody
+        .begin_create()
+        .map_err(|error| TrapError::Hypervisor(format!("soft custody create: {error:?}")))?;
+    custody
+        .commit_create_with(generation, || {})
+        .map_err(|error| TrapError::Hypervisor(format!("soft custody commit: {error:?}")))?;
+    Ok(Arc::new(custody))
+}
+
 impl<X> SoftAarch64Vmm<X> {
+    /// This carrier's stage-2 custody: its records map through this
+    /// carrier's own [`SoftStage2`].
+    #[must_use]
+    pub fn stage2_custody(&self) -> &Arc<Stage2Custody> {
+        &self.custody
+    }
+
     pub fn stage2_geometry(&self) -> Result<MappingGeometry, TrapError> {
         Ok(self.stage2.try_borrow()?.geometry())
     }
@@ -2566,5 +2753,163 @@ where
 
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
         Arc::new(GenericVcpuRegistry::new())
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use carrick_aarch64::stage2::custody::{CarrierStage2RecordSpec, CarrierStage2RetireOutcome};
+    use carrick_aarch64::stage2::{STAGE2_PERM_READ, STAGE2_PERM_WRITE};
+
+    const IPA: u64 = 0xf0_0000_0000;
+
+    fn carrier() -> (Arc<ExclusiveStage2>, Arc<Stage2Custody>) {
+        let stage2 = Arc::new(ExclusiveStage2::new(
+            SoftStage2::new().expect("soft stage 2"),
+        ));
+        let custody = soft_carrier_custody(&stage2).expect("soft custody");
+        (stage2, custody)
+    }
+
+    fn spec(custody: &Stage2Custody, host: &[u8]) -> CarrierStage2RecordSpec {
+        CarrierStage2RecordSpec {
+            vm_generation: custody.live_generation().expect("a live soft carrier"),
+            ipa: IPA,
+            len: host.len(),
+            host_addr: host.as_ptr() as usize,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: STAGE2_PERM_READ | STAGE2_PERM_WRITE,
+            logical_owner: None,
+        }
+    }
+
+    fn page() -> Box<[u8]> {
+        vec![0u8; PAGE_BYTES_USIZE * 4].into_boxed_slice()
+    }
+
+    /// Busy is "not now" (AGENTS.md): a publish that finds the carrier's
+    /// stage 2 borrowed enrols on the holder's release and waits, holding
+    /// no custody state, and succeeds once the holder releases. It never
+    /// fails, and the custody holds no record while it waits.
+    #[test]
+    fn soft_carrier_custody_waits_out_a_busy_stage2_then_publishes() {
+        let (stage2, custody) = carrier();
+        let host = page();
+        let spec = spec(&custody, &host);
+        let holder = stage2.try_borrow().expect("the holder's borrow");
+
+        let publisher = {
+            let custody = Arc::clone(&custody);
+            std::thread::spawn(move || {
+                // SAFETY: `host` outlives the record, which the test retires.
+                unsafe { custody.publish_stage2_record(spec) }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stage2.releases.waiters.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the publisher never enrolled on the release"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !publisher.is_finished(),
+            "a busy publish must wait, not fail"
+        );
+        assert!(
+            custody.stage2_record_covering(IPA, host.len()).is_none(),
+            "a waiting publish holds no record"
+        );
+        assert!(
+            custody.state.try_lock().is_some(),
+            "a waiting publish holds no custody lock"
+        );
+
+        drop(holder);
+        let identity = publisher
+            .join()
+            .expect("publisher thread")
+            .expect("the publish succeeds once the holder releases");
+        assert_eq!(stage2.releases.waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            custody.stage2_record_covering(IPA, host.len()),
+            Some(identity)
+        );
+        assert_eq!(
+            stage2.try_borrow().unwrap().host_ptr(IPA, host.len()),
+            Some(host.as_ptr().cast_mut())
+        );
+        assert_eq!(
+            custody.retire_stage2_record(identity),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        assert_eq!(stage2.try_borrow().unwrap().host_ptr(IPA, host.len()), None);
+    }
+
+    /// A retire that finds the stage 2 borrowed waits for the release too,
+    /// and unmaps exactly once.
+    #[test]
+    fn soft_carrier_custody_retire_waits_out_a_busy_stage2() {
+        let (stage2, custody) = carrier();
+        let host = page();
+        // SAFETY: `host` outlives the record.
+        let identity =
+            unsafe { custody.publish_stage2_record(spec(&custody, &host)) }.expect("publish");
+        let holder = stage2.try_borrow().expect("the holder's borrow");
+        let retirer = {
+            let custody = Arc::clone(&custody);
+            std::thread::spawn(move || custody.retire_stage2_record(identity))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stage2.releases.waiters.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the retire never enrolled");
+            std::thread::yield_now();
+        }
+        assert!(!retirer.is_finished());
+        drop(holder);
+        assert_eq!(
+            retirer.join().expect("retirer thread"),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        assert_eq!(stage2.try_borrow().unwrap().host_ptr(IPA, host.len()), None);
+    }
+
+    /// A custody that outlives its carrier fails closed, and a destroyed
+    /// carrier maps nothing again.
+    #[test]
+    fn soft_carrier_custody_fails_closed_after_destroy_and_carrier_drop() {
+        let (stage2, custody) = carrier();
+        let host = page();
+        // SAFETY: nothing is mapped yet; the destroy below takes the window.
+        let identity =
+            unsafe { custody.publish_stage2_record(spec(&custody, &host)) }.expect("publish");
+        // SAFETY: no soft vCPU runs on this test carrier.
+        assert!(unsafe { custody.backend().destroy() }.is_success());
+        assert_eq!(stage2.try_borrow().unwrap().host_ptr(IPA, host.len()), None);
+        assert_eq!(
+            // SAFETY: the map is refused, so `host` is never installed.
+            unsafe {
+                custody.backend().map(
+                    host.as_ptr().cast_mut().cast(),
+                    IPA,
+                    host.len(),
+                    MemPerms::ReadWrite,
+                )
+            },
+            soft_stage2_status::DESTROYED
+        );
+        let _ = identity;
+        drop(stage2);
+        assert_eq!(
+            // SAFETY: the carrier is gone, so nothing is unmapped.
+            unsafe { custody.backend().unmap(IPA, host.len()) },
+            soft_stage2_status::CARRIER_GONE
+        );
     }
 }

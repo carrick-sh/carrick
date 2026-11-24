@@ -266,86 +266,21 @@ impl Drop for SetupVmGuard {
     }
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use carrick_core::mm::retirement::CarrierStage2RecordError;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use carrick_core::mm::retirement::{
-    CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError, CarrierStage2Record,
-    CarrierStage2RecordError, CarrierStage2RecordId, CarrierStage2RecordIdentity,
-    CarrierStage2RecordSnapshot, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-    CarrierVmGeneration,
+    CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError, CarrierStage2RecordId,
+    CarrierStage2RecordIdentity, CarrierStage2RecordSnapshot, CarrierStage2RecordSpec,
+    CarrierStage2RetireOutcome, CarrierVmGeneration,
 };
 
+/// The lifecycle and record table live in the neutral custody every aarch64
+/// carrier holds (#1236 slice D); HVF keeps its historical names for them.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) enum CarrierVmCustodyError {
-    LifecycleConflict,
-    StaleGeneration,
-    GenerationExhausted,
-    UnsettledPhysicalGrants,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) enum CarrierVmLifecycle {
-    Vacant,
-    Creating(CarrierVmGeneration),
-    Live(CarrierVmGeneration),
-    Destroying(CarrierVmGeneration),
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::fmt::Debug)]
-#[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) struct CarrierVmCustodyState {
-    pub(crate) next_generation: u64,
-    pub(crate) lifecycle: CarrierVmLifecycle,
-    pub(crate) next_stage2_record_id: u64,
-    pub(crate) next_logical_owner_id: u64,
-    pub(crate) next_logical_owner_generation: u64,
-    pub(crate) stage2_records:
-        std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2Record>,
-    /// One physical index over every record, independent of the authority
-    /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
-    stage2_extent_index:
-        std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<CarrierStage2RecordId>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CarrierVmCustodyState {
-    fn index_record(&mut self, id: CarrierStage2RecordId, ipa: u64, len: usize) {
-        self.stage2_extent_index
-            .entry((ipa, len as u64))
-            .or_default()
-            .insert(id);
-    }
-
-    fn remove_record(&mut self, id: CarrierStage2RecordId) -> Option<CarrierStage2Record> {
-        let removed = self.stage2_records.remove(&id);
-        if let Some(record) = &removed {
-            let key = (record.snapshot.ipa, record.snapshot.len as u64);
-            if let Some(ids) = self.stage2_extent_index.get_mut(&key) {
-                ids.remove(&id);
-                if ids.is_empty() {
-                    self.stage2_extent_index.remove(&key);
-                }
-            }
-        }
-        removed
-    }
-}
+pub(crate) use carrick_aarch64::stage2::custody::{
+    Stage2Custody, Stage2CustodyError as CarrierVmCustodyError, VmLifecycle as CarrierVmLifecycle,
+};
 
 /// The carrier's exec owner (#2305): the neutral owner the x86 carrier
 /// shares, over HVF's prepared successors. HVF never parks a request.
@@ -362,8 +297,13 @@ pub(crate) type NativeExecOwner =
 #[derive(::core::clone::Clone)]
 pub(crate) struct CarrierStage2Backend {
     backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
-    pub(crate) unretired: std::sync::Arc<parking_lot::Mutex<Vec<super::UnretiredStage2Lease>>>,
+    pub(crate) unretired: UnretiredStage2Leases,
 }
+
+/// The leases one carrier VM's backend still maps after a failed rollback.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type UnretiredStage2Leases =
+    std::sync::Arc<parking_lot::Mutex<Vec<super::UnretiredStage2Lease>>>;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::fmt::Debug for CarrierStage2Backend {
@@ -376,11 +316,11 @@ impl std::fmt::Debug for CarrierStage2Backend {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierStage2Backend {
-    fn new(backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>) -> Self {
-        Self {
-            backend,
-            unretired: std::sync::Arc::default(),
-        }
+    fn new(
+        backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
+        unretired: UnretiredStage2Leases,
+    ) -> Self {
+        Self { backend, unretired }
     }
 
     pub(crate) fn as_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
@@ -402,7 +342,7 @@ impl CarrierStage2Backend {
     pub(crate) fn for_test(
         backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
     ) -> Self {
-        Self::new(backend)
+        Self::new(backend, UnretiredStage2Leases::default())
     }
 }
 
@@ -416,7 +356,12 @@ impl CarrierStage2Backend {
 #[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
-    stage2_backend: CarrierStage2Backend,
+    /// The VM lifecycle, the stage-2 record table and the backend that maps
+    /// it: the neutral custody, reached through `Deref`.
+    stage2: Stage2Custody,
+    /// Leases this carrier's backend mapped whose pre-custody rollback
+    /// failed, shared by every handle of the backend.
+    unretired_stage2_leases: UnretiredStage2Leases,
     pub(crate) transfer_carrier: core::num::NonZeroU64,
     pub(crate) el1_frame_grants: std::sync::Arc<El1FrameGrantLedger>,
     /// Host COW accounting for every MM admitted to this carrier.
@@ -438,7 +383,6 @@ pub struct CarrierVmCustody {
         >,
     >,
     pub asids: carrick_hal::asid::AsidAllocator,
-    pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
             CarrierStage2RecordId,
@@ -795,6 +739,15 @@ pub(crate) enum CarrierRootSlotPoolState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for CarrierVmCustody {
+    type Target = Stage2Custody;
+
+    fn deref(&self) -> &Stage2Custody {
+        &self.stage2
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Default for CarrierVmCustody {
     fn default() -> Self {
         Self::new()
@@ -805,17 +758,20 @@ impl Default for CarrierVmCustody {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 impl CarrierVmCustody {
     pub(crate) fn stage2_backend(&self) -> &dyn carrick_aarch64::stage2::Stage2Backend {
-        self.stage2_backend.as_backend()
+        self.stage2.backend()
     }
 
     pub(crate) fn stage2_backend_handle(&self) -> CarrierStage2Backend {
-        self.stage2_backend.clone()
+        CarrierStage2Backend::new(
+            std::sync::Arc::clone(self.stage2.backend_handle()),
+            std::sync::Arc::clone(&self.unretired_stage2_leases),
+        )
     }
 
     /// Whether `backend` is this carrier VM's own backend. A stage-2 extent
     /// mapped through another carrier's backend is never this custody's.
     pub(crate) fn holds_stage2_backend(&self, backend: &CarrierStage2Backend) -> bool {
-        self.stage2_backend.is_same_backend(backend)
+        self.stage2_backend_handle().is_same_backend(backend)
     }
 
     pub fn new() -> Self {
@@ -834,9 +790,8 @@ impl CarrierVmCustody {
         });
         let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
-            stage2_backend: CarrierStage2Backend::new(std::sync::Arc::new(
-                super::stage2_backend::HvfStage2,
-            )),
+            stage2: Stage2Custody::new(std::sync::Arc::new(super::stage2_backend::HvfStage2)),
+            unretired_stage2_leases: UnretiredStage2Leases::default(),
             transfer_carrier,
             el1_frame_grants: std::sync::Arc::new(El1FrameGrantLedger::default()),
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
@@ -854,15 +809,6 @@ impl CarrierVmCustody {
                 ),
             ),
             asids,
-            state: parking_lot::Mutex::new(CarrierVmCustodyState {
-                next_generation: 1,
-                lifecycle: CarrierVmLifecycle::Vacant,
-                next_stage2_record_id: 1,
-                next_logical_owner_id: 1,
-                next_logical_owner_generation: 1,
-                stage2_records: std::collections::BTreeMap::new(),
-                stage2_extent_index: std::collections::BTreeMap::new(),
-            }),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -945,125 +891,34 @@ impl CarrierVmCustody {
         backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
     ) -> Self {
         let mut custody = Self::new_live_fixture();
-        custody.stage2_backend = CarrierStage2Backend::for_test(backend);
-        custody
-    }
-
-    pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        if state.lifecycle != CarrierVmLifecycle::Vacant {
-            return Err(CarrierVmCustodyError::LifecycleConflict);
+        let stage2 = Stage2Custody::new(backend);
+        {
+            let live = custody.stage2.state.lock();
+            let mut state = stage2.state.lock();
+            state.next_generation = live.next_generation;
+            state.lifecycle = live.lifecycle;
         }
-        let next_generation = state
-            .next_generation
-            .checked_add(1)
-            .ok_or(CarrierVmCustodyError::GenerationExhausted)?;
-        let generation = CarrierVmGeneration(state.next_generation);
-        state.next_generation = next_generation;
-        state.lifecycle = CarrierVmLifecycle::Creating(generation);
-        Ok(generation)
+        custody.stage2 = stage2;
+        custody
     }
 
     pub(crate) fn commit_create(
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                self.native_root_waits.reset_for_new_vm();
-                state.lifecycle = CarrierVmLifecycle::Live(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
-    }
-
-    pub(crate) fn abort_create(
-        &self,
-        generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+        self.stage2.commit_create_with(generation, || {
+            self.native_root_waits.reset_for_new_vm();
+        })
     }
 
     pub(crate) fn abort_created_vm_after_raw_destroy(
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(current) if current == generation => {
-                for record in state
-                    .stage2_records
-                    .values_mut()
-                    .filter(|record| record.snapshot.vm_generation == generation)
-                {
-                    carrick_core::mm::retirement::terminalize_record(record);
-                }
-                self.stage2_backend.release_unretired_after_vm_destroy();
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
-            }
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
-    }
-
-    pub(crate) fn begin_destroy(
-        &self,
-        generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Live(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Destroying(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Live(_) => Err(CarrierVmCustodyError::StaleGeneration),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => Err(CarrierVmCustodyError::LifecycleConflict),
-        }
-    }
-
-    pub(crate) fn abort_destroy(
-        &self,
-        generation: CarrierVmGeneration,
-    ) -> Result<(), CarrierVmCustodyError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Destroying(current) if current == generation => {
-                state.lifecycle = CarrierVmLifecycle::Live(generation);
-                Ok(())
-            }
-            CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+        self.stage2.abort_created_vm_after_raw_destroy(generation)?;
+        self.stage2_backend_handle()
+            .release_unretired_after_vm_destroy();
+        Ok(())
     }
 
     pub(crate) fn commit_destroy(
@@ -1091,13 +946,7 @@ impl CarrierVmCustody {
             let mut state = self.state.lock();
             match state.lifecycle {
                 CarrierVmLifecycle::Destroying(current) if current == generation => {
-                    for record in state
-                        .stage2_records
-                        .values_mut()
-                        .filter(|record| record.snapshot.vm_generation == generation)
-                    {
-                        carrick_core::mm::retirement::terminalize_record(record);
-                    }
+                    state.terminalize_generation(generation);
                     if let CarrierFramePoolState::Active(pool) = std::mem::replace(
                         &mut *self.frame_pool.lock(),
                         CarrierFramePoolState::Uninitialized,
@@ -1110,7 +959,8 @@ impl CarrierVmCustody {
                     ) {
                         pool.forget_backend_mapping();
                     }
-                    self.stage2_backend.release_unretired_after_vm_destroy();
+                    self.stage2_backend_handle()
+                        .release_unretired_after_vm_destroy();
                     metadata.release_destroyed_vm(generation.0, |identity| {
                         let _ = state.remove_record(identity.record_id);
                     });
@@ -1257,143 +1107,6 @@ impl CarrierVmCustody {
         *self.root_slot_pool.lock() = CarrierRootSlotPoolState::Active(pool);
     }
 
-    pub(crate) fn live_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Live(generation) => Some(generation),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => None,
-        }
-    }
-
-    pub(crate) fn setup_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
-                Some(generation)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => None,
-        }
-    }
-
-    pub(crate) fn creating_generation(&self) -> Option<CarrierVmGeneration> {
-        match self.state.lock().lifecycle {
-            CarrierVmLifecycle::Creating(generation) => Some(generation),
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Live(_)
-            | CarrierVmLifecycle::Destroying(_) => None,
-        }
-    }
-
-    pub(crate) fn stage2_record_identities(&self) -> Vec<CarrierStage2RecordIdentity> {
-        self.state
-            .lock()
-            .stage2_records
-            .iter()
-            .map(|(&record_id, record)| CarrierStage2RecordIdentity {
-                record_id,
-                vm_generation: record.snapshot.vm_generation,
-                logical_owner: record.snapshot.logical_owner,
-            })
-            .collect()
-    }
-
-    pub(crate) fn allocate_logical_owner(
-        &self,
-    ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
-        let next_id = state
-            .next_logical_owner_id
-            .checked_add(1)
-            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
-        let next_generation = state
-            .next_logical_owner_generation
-            .checked_add(1)
-            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
-        let owner = CarrierLogicalOwner {
-            id: state.next_logical_owner_id,
-            generation: state.next_logical_owner_generation,
-        };
-        state.next_logical_owner_id = next_id;
-        state.next_logical_owner_generation = next_generation;
-        Ok(owner)
-    }
-
-    pub(crate) fn remove_terminal_stage2_record(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> Option<CarrierStage2RecordSnapshot> {
-        let mut state = self.state.lock();
-        let record = state.stage2_records.get(&identity.record_id)?;
-        if Self::stage2_identity_mismatch(record, identity).is_some()
-            || record.snapshot.pin_count != 0
-            || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
-        {
-            return None;
-        }
-        state
-            .remove_record(identity.record_id)
-            .map(|record| record.snapshot)
-    }
-
-    pub(crate) fn claim_terminal_stage2_release(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
-        let record = state
-            .stage2_records
-            .get_mut(&identity.record_id)
-            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
-        if Self::stage2_identity_mismatch(record, identity).is_some() {
-            return Err(CarrierStage2RecordError::RecordIdentityMismatch);
-        }
-        if record.snapshot.pin_count != 0
-            || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
-        {
-            return Err(CarrierStage2RecordError::RecordNotTerminal);
-        }
-        if record.snapshot.release_in_flight {
-            return Err(CarrierStage2RecordError::ReleaseInFlight);
-        }
-        if !record.snapshot.release_ipa {
-            let _ = state.remove_record(identity.record_id);
-            return Ok(None);
-        }
-        record.snapshot.release_in_flight = true;
-        record.snapshot.release_retry_pending = false;
-        Ok(Some((record.snapshot.ipa, record.snapshot.len as u64)))
-    }
-
-    pub(crate) fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
-        let removable = state
-            .stage2_records
-            .get(&identity.record_id)
-            .is_some_and(|record| {
-                Self::stage2_identity_mismatch(record, identity).is_none()
-                    && record.snapshot.release_in_flight
-                    && record.snapshot.release_ipa
-            });
-        debug_assert!(
-            removable,
-            "claimed terminal release identity must remain stable"
-        );
-        if removable {
-            let _ = state.remove_record(identity.record_id);
-        }
-    }
-
-    pub(crate) fn abort_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
-        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-            debug_assert!(false, "claimed terminal release record disappeared");
-            return;
-        };
-        debug_assert!(Self::stage2_identity_mismatch(record, identity).is_none());
-        record.snapshot.release_in_flight = false;
-        record.snapshot.release_retry_pending = true;
-    }
-
     #[cfg(test)]
     pub(crate) fn pending_global_frame_owner_count(&self) -> usize {
         self.pending_global_frame_owners.lock().len()
@@ -1407,288 +1120,18 @@ impl CarrierVmCustody {
             .get_mut(&identity.record_id)
             .unwrap_or_else(|| panic!("missing test stage-2 record"));
         assert!(
-            Self::stage2_identity_mismatch(record, identity).is_none(),
+            Stage2Custody::stage2_identity_mismatch(record, identity).is_none(),
             "test stage-2 record identity drifted"
         );
         record.snapshot.backend_map_installed = false;
-    }
-
-    pub(crate) fn register_stage2_record(
-        &self,
-        spec: CarrierStage2RecordSpec,
-    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        Self::register_stage2_record_locked(&mut self.state.lock(), spec)
-    }
-
-    /// Commit backend mapping and its exact record under one lifecycle lock.
-    /// The backend callback must not re-enter custody. All fallible record
-    /// admission happens before map; a failed map removes the unpublished record.
-    pub(crate) fn publish_stage2_record_using(
-        &self,
-        spec: CarrierStage2RecordSpec,
-        map: impl FnOnce(CarrierStage2RecordIdentity) -> carrick_aarch64::stage2::Stage2Status,
-    ) -> Result<CarrierStage2RecordIdentity, TrapError> {
-        let mut state = self.state.lock();
-        let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
-            TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
-        })?;
-        let rc = map(identity);
-        if rc != 0 {
-            let _ = state.remove_record(identity.record_id);
-            return Err(TrapError::Hypervisor(format!(
-                "stage-2 map failed: {rc:#x}"
-            )));
-        }
-        Ok(identity)
-    }
-
-    fn register_stage2_record_locked(
-        state: &mut CarrierVmCustodyState,
-        spec: CarrierStage2RecordSpec,
-    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        if spec.len == 0 || (spec.mapped && spec.host_addr == 0) {
-            return Err(CarrierStage2RecordError::InvalidExtent);
-        }
-        match state.lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation)
-                if generation == spec.vm_generation => {}
-            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => {
-                return Err(CarrierStage2RecordError::VmGenerationMismatch);
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                return Err(CarrierStage2RecordError::NoLiveVm);
-            }
-        }
-        let next_id = state
-            .next_stage2_record_id
-            .checked_add(1)
-            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
-        let record_id = CarrierStage2RecordId(state.next_stage2_record_id);
-        state.next_stage2_record_id = next_id;
-        let identity = CarrierStage2RecordIdentity {
-            record_id,
-            vm_generation: spec.vm_generation,
-            logical_owner: spec.logical_owner,
-        };
-        state.stage2_records.insert(
-            record_id,
-            CarrierStage2Record {
-                snapshot: CarrierStage2RecordSnapshot {
-                    record_id,
-                    vm_generation: spec.vm_generation,
-                    ipa: spec.ipa,
-                    len: spec.len,
-                    host_addr: spec.host_addr,
-                    mapped: spec.mapped,
-                    backend_map_installed: spec.backend_map_installed,
-                    release_ipa: spec.release_ipa,
-                    perms: spec.perms,
-                    logical_owner: spec.logical_owner,
-                    pin_count: 0,
-                    retirement_requested: false,
-                    retry_eligible: false,
-                    retry_pending: None,
-                    terminalized_by_vm_destroy: false,
-                    superseded_by_rebind: false,
-                    release_in_flight: false,
-                    release_retry_pending: false,
-                },
-                unmap_in_flight: false,
-            },
-        );
-        state.index_record(record_id, spec.ipa, spec.len);
-        Ok(identity)
-    }
-
-    pub(crate) fn rebind_terminal_stage2_record(
-        &self,
-        old_identity: CarrierStage2RecordIdentity,
-        host_addr: usize,
-        perms: u64,
-    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
-        let live_generation = match state.lifecycle {
-            CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
-                generation
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Destroying(_) => {
-                return Err(CarrierStage2RecordError::NoLiveVm);
-            }
-        };
-        let old = state
-            .stage2_records
-            .get(&old_identity.record_id)
-            .copied()
-            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
-        if Self::stage2_identity_mismatch(&old, old_identity).is_some() {
-            return Err(CarrierStage2RecordError::RecordIdentityMismatch);
-        }
-        if !old.snapshot.terminalized_by_vm_destroy || old.snapshot.mapped {
-            return Err(CarrierStage2RecordError::RecordNotTerminal);
-        }
-        if old.snapshot.release_in_flight {
-            return Err(CarrierStage2RecordError::ReleaseInFlight);
-        }
-        if old.snapshot.vm_generation == live_generation {
-            return Err(CarrierStage2RecordError::VmGenerationMismatch);
-        }
-        if host_addr == 0 || host_addr != old.snapshot.host_addr {
-            return Err(CarrierStage2RecordError::InvalidExtent);
-        }
-        let next_id = state
-            .next_stage2_record_id
-            .checked_add(1)
-            .ok_or(CarrierStage2RecordError::RecordIdExhausted)?;
-        let record_id = CarrierStage2RecordId(state.next_stage2_record_id);
-        state.next_stage2_record_id = next_id;
-        let identity = CarrierStage2RecordIdentity {
-            record_id,
-            vm_generation: live_generation,
-            logical_owner: old_identity.logical_owner,
-        };
-        state.stage2_records.insert(
-            record_id,
-            CarrierStage2Record {
-                snapshot: CarrierStage2RecordSnapshot {
-                    record_id,
-                    vm_generation: live_generation,
-                    ipa: old.snapshot.ipa,
-                    len: old.snapshot.len,
-                    host_addr,
-                    mapped: true,
-                    backend_map_installed: true,
-                    release_ipa: old.snapshot.release_ipa,
-                    perms,
-                    logical_owner: old.snapshot.logical_owner,
-                    pin_count: 0,
-                    retirement_requested: false,
-                    retry_eligible: false,
-                    retry_pending: None,
-                    terminalized_by_vm_destroy: false,
-                    superseded_by_rebind: false,
-                    release_in_flight: false,
-                    release_retry_pending: false,
-                },
-                unmap_in_flight: false,
-            },
-        );
-        state.index_record(record_id, old.snapshot.ipa, old.snapshot.len);
-        let old = state
-            .stage2_records
-            .get_mut(&old_identity.record_id)
-            .ok_or(CarrierStage2RecordError::RecordNotFound)?;
-        old.snapshot.release_ipa = false;
-        old.snapshot.superseded_by_rebind = true;
-        Ok(identity)
-    }
-
-    pub(crate) fn stage2_record_snapshot(
-        &self,
-        record_id: CarrierStage2RecordId,
-    ) -> Option<CarrierStage2RecordSnapshot> {
-        self.state
-            .lock()
-            .stage2_records
-            .get(&record_id)
-            .map(|record| record.snapshot)
-    }
-
-    pub(crate) fn stage2_record_covering(
-        &self,
-        ipa: u64,
-        len: usize,
-    ) -> Option<CarrierStage2RecordIdentity> {
-        let state = self.state.lock();
-        let (&(base, length), ids) = state
-            .stage2_extent_index
-            .range(..=(ipa, u64::MAX))
-            .next_back()?;
-        let end = ipa.checked_add(len as u64)?;
-        if end > base.checked_add(length)? {
-            return None;
-        }
-        ids.iter().rev().find_map(|id| {
-            let record = state.stage2_records.get(id)?;
-            let snapshot = record.snapshot;
-            (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
-                CarrierStage2RecordIdentity {
-                    record_id: *id,
-                    vm_generation: snapshot.vm_generation,
-                    logical_owner: snapshot.logical_owner,
-                },
-            )
-        })
-    }
-
-    pub(crate) fn stage2_identity_mismatch(
-        record: &CarrierStage2Record,
-        identity: CarrierStage2RecordIdentity,
-    ) -> Option<CarrierStage2RetireOutcome> {
-        carrick_core::mm::retirement::record_identity_mismatch(record, identity)
     }
 
     pub(crate) fn pin_stage2_record(
         self: &std::sync::Arc<Self>,
         identity: CarrierStage2RecordIdentity,
     ) -> Result<CarrierStage2Pin, CarrierStage2PinError> {
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Live(generation) if generation == identity.vm_generation => {}
-            CarrierVmLifecycle::Live(_) => {
-                return Err(CarrierStage2PinError::VmGenerationMismatch);
-            }
-            CarrierVmLifecycle::Vacant
-            | CarrierVmLifecycle::Creating(_)
-            | CarrierVmLifecycle::Destroying(_) => {
-                return Err(CarrierStage2PinError::VmNotLive);
-            }
-        }
-        let record = state
-            .stage2_records
-            .get_mut(&identity.record_id)
-            .ok_or(CarrierStage2PinError::NotFound)?;
-        carrick_core::mm::retirement::pin_record(
-            record,
-            identity,
-            CarrierPinVenue(std::sync::Arc::downgrade(self)),
-        )
-    }
-
-    pub(crate) fn request_stage2_record_retirement(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> CarrierStage2RetireOutcome {
-        let mut state = self.state.lock();
-        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-            return CarrierStage2RetireOutcome::NotFound;
-        };
-        carrick_core::mm::retirement::request_record_retirement(record, identity)
-    }
-
-    pub(crate) fn retire_stage2_record_using(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
-    ) -> CarrierStage2RetireOutcome {
-        let (ipa, len) = {
-            let mut state = self.state.lock();
-            let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-                return CarrierStage2RetireOutcome::NotFound;
-            };
-            match carrick_core::mm::retirement::prepare_record_retirement(record, identity) {
-                carrick_core::mm::retirement::RecordRetirement::Complete(outcome) => {
-                    return outcome;
-                }
-                carrick_core::mm::retirement::RecordRetirement::Unmap { ipa, len } => (ipa, len),
-            }
-        };
-
-        let backend_result = unmap(ipa, len);
-        let mut state = self.state.lock();
-        let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-            return CarrierStage2RetireOutcome::NotFound;
-        };
-        carrick_core::mm::retirement::settle_record_retirement(record, identity, backend_result)
+        self.stage2
+            .pin_stage2_record_in(identity, CarrierPinVenue(std::sync::Arc::downgrade(self)))
     }
 }
 
@@ -1711,17 +1154,9 @@ impl CarrierVmCustody {
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
-        use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
-        let outcome = {
-            let mut state = self.state.lock();
-            let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
-                return;
-            };
-            let outcome = release_record_pin_outcome(record, identity);
-            if outcome == RecordPinRelease::RemovePredecessor {
-                let _ = state.remove_record(identity.record_id);
-            }
-            outcome
+        use carrick_core::mm::retirement::RecordPinRelease;
+        let Some(outcome) = self.stage2.release_stage2_pin_outcome(identity) else {
+            return;
         };
         if outcome == RecordPinRelease::ReadyToRetry {
             self.request_global_frame_retirement_retry();
