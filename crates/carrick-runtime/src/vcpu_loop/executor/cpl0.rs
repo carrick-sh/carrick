@@ -1338,7 +1338,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             CarrierRunExit::Kick => {
                 if carrick_hal::vcpu_run::current_shutdown_requested()
                     || (need_resched.load(Ordering::Acquire)
-                        && self.physical.cpu_mut().can_save_loaded(task)?)
+                        && self.physical.can_save_loaded_leader(task)?)
                 {
                     Ok(ExecutorExit::Preempted)
                 } else {

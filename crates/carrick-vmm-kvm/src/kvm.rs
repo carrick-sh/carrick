@@ -1768,15 +1768,6 @@ impl KvmVcpu {
 
 impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
-        // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell can
-        // read the frame without a KVM_GET_REGS ioctl. Read-only mirror: we set
-        // kvm_valid_regs (sync-out) but never kvm_dirty_regs, so kernel registers
-        // remain authoritative for every ioctl path. Idempotent + ioctl-free.
-        #[cfg(target_arch = "x86_64")]
-        if sync_regs_supported() {
-            self.fd_mut().set_sync_valid_reg(SyncReg::Register);
-            self.fd_mut().set_sync_valid_reg(SyncReg::SystemRegister);
-        }
         // Capture the stale-flag cell pointer BEFORE the run borrow: a successful
         // exit borrows `self` (the kvm_run slice in `KvmExit::IoOut`/`MmioWrite`)
         // through the `match exit` below, so we cannot touch `self.slot` there.
@@ -1785,9 +1776,21 @@ impl HvVcpu for KvmVcpu {
         #[cfg(target_arch = "x86_64")]
         let sync_stale_cell: *mut bool = self.slot.sync_regs_stale.get();
         loop {
+            // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell
+            // can read the frame without a KVM_GET_REGS ioctl. Set before every
+            // KVM_RUN attempt so an interrupted re-entry keeps sync-out armed.
+            #[cfg(target_arch = "x86_64")]
+            if sync_regs_supported() {
+                self.fd_mut().set_sync_valid_reg(SyncReg::Register);
+                self.fd_mut().set_sync_valid_reg(SyncReg::SystemRegister);
+            }
             record_kvm_stat(KvmStat::Run);
             match self.fd_mut().run() {
                 Ok(KvmExit::Intr) => {
+                    #[cfg(target_arch = "x86_64")]
+                    if sync_regs_supported() {
+                        unsafe { *sync_stale_cell = false }
+                    }
                     record_kvm_stat(KvmStat::ExitKicked);
                 }
                 Ok(exit) => {
@@ -1863,8 +1866,12 @@ impl HvVcpu for KvmVcpu {
                     };
                 }
                 Err(e) if e.errno() == libc::EINTR => {
-                    // KVM_RUN was interrupted BEFORE entering the guest — the
-                    // kernel did NOT repopulate s.regs, so leave any staleness intact.
+                    // KVM_RUN returned -EINTR without guaranteeing kvm_run.s.regs
+                    // sync-out; mark the mirror stale until the next rc == 0 exit.
+                    #[cfg(target_arch = "x86_64")]
+                    if sync_regs_supported() {
+                        unsafe { *sync_stale_cell = true }
+                    }
                     record_kvm_stat(KvmStat::RunEintr);
                 }
                 Err(e) => {
