@@ -1,10 +1,17 @@
 //! One linked CPL0 image's loaded span against its supervisor extent.
 //!
 //! Shared by `cpl0_build.rs` (the build-time budget report) and
-//! `tests/cpl0_image_inputs.rs` (its witness), both by `#[path]`. Every
-//! table is checked whole against the file before any entry is read, and
-//! every name must end in its string table: a truncated or malformed image
-//! is `None`, never a panic and never a budget.
+//! `tests/cpl0_image_inputs.rs` (its witness), both by `#[path]`.
+//!
+//! What it guarantees: it never panics, and it reads a budget only from
+//! structures that lie whole in the file. The header must be ELF64
+//! little-endian; each table it reads (program headers, section headers, a
+//! symbol table) is checked whole against the file before any entry is
+//! read; every `PT_LOAD`'s file bytes lie in the file and within its memory
+//! size; and every symbol name ends inside its string table. Anything else
+//! is `None`. It is a report, not an ELF validator: fields it does not use
+//! (such as `EI_VERSION`) are not checked, and `link.ld`'s assert stays the
+//! enforcement of the extent.
 
 /// The image's own extent symbol: `carrick-x86-carrier` defines it from
 /// `X86_CPL0_SUPERVISOR_IMAGE_BASE + X86_CPL0_SUPERVISOR_IMAGE_SIZE`, and
@@ -77,15 +84,19 @@ impl ImageBudget {
         let sections = elf.table(elf.offset(0x28)?, elf.u16(0x3a)?, elf.u16(0x3c)?, SHDR_LEN)?;
         let (mut base, mut end) = (u64::MAX, 0_u64);
         for header in programs {
-            let memsz = header.u64(0x28)?;
-            if header.u32(0)? == PT_LOAD && memsz != 0 {
-                // The segment's file bytes lie inside the file and within
-                // its memory size; only `.bss` may extend past them.
-                let (offset, filesz) = (header.offset(0x08)?, header.u64(0x20)?);
-                if filesz > memsz {
-                    return None;
-                }
-                elf.span(offset, usize::try_from(filesz).ok()?)?;
+            if header.u32(0)? != PT_LOAD {
+                continue;
+            }
+            // Every load segment's file bytes lie inside the file and
+            // within its memory size, empty or not; only `.bss` may extend
+            // past them.
+            let (offset, filesz, memsz) =
+                (header.offset(0x08)?, header.u64(0x20)?, header.u64(0x28)?);
+            if filesz > memsz {
+                return None;
+            }
+            elf.span(offset, usize::try_from(filesz).ok()?)?;
+            if memsz != 0 {
                 let start = header.u64(0x10)?;
                 base = base.min(start);
                 end = end.max(start.checked_add(memsz)?);
