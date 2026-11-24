@@ -4712,6 +4712,65 @@ fn test_inventory_bounds_a_path_module_chain_discovery_did_not() {
     assert!(reason.contains("#[path] module depth limit"), "{reason}");
 }
 
+/// A chain of `links` sibling-crate `#[path]` files, each also declared
+/// straight from lib.rs, so every file is one hop from the crate.
+fn path_module_chain_fixture(links: usize) -> tempfile::TempDir {
+    let mut lib = String::new();
+    for n in 0..links {
+        lib.push_str(&format!(
+            "#[path = \"../../shared/src/c{n}.rs\"] mod c{n};\n"
+        ));
+    }
+    let dir = path_module_fixture(&lib, "");
+    for n in 0..links {
+        let next = if n + 1 < links {
+            format!("#[path = \"c{}.rs\"] mod next;", n + 1)
+        } else {
+            String::new()
+        };
+        write_source(dir.path(), &format!("crates/shared/src/c{n}.rs"), &next);
+    }
+    dir
+}
+
+#[test]
+fn retirement_refuses_a_path_module_chain_past_the_limit_reached_by_a_shortcut() {
+    // The shortcut from lib.rs gives every file depth 1, but the chain
+    // c0 -> c1 -> ... -> c9 is still ten hops: the retirement must refuse.
+    let dir = path_module_chain_fixture(10);
+    let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+    assert!(
+        error.to_string().contains("#[path] module depth limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retirement_follows_a_path_module_chain_within_the_limit() {
+    let dir = path_module_chain_fixture(4);
+    assert!(!tree_has_test(dir.path(), "example", "gone").unwrap());
+}
+
+#[test]
+fn retirement_refuses_a_sibling_whose_package_is_not_a_named_table() {
+    // `package = false`, or a `[package]` with no name, is no crate manifest.
+    for manifest in [
+        "package = false\n",
+        "package = 'shared'\n",
+        "[package]\nversion = '0.0.0'\n",
+        "[package]\nname = false\n",
+    ] {
+        let dir = include_fixture("#[path = \"../../shared/src/mailbox.rs\"] mod mailbox;", "");
+        write_source(dir.path(), "crates/shared/Cargo.toml", manifest);
+        write_source(dir.path(), "crates/shared/src/mailbox.rs", "");
+        let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot resolve #[path] module"),
+            "{manifest:?}: {error}"
+        );
+    }
+}
+
 #[test]
 fn retirement_applies_across_a_sibling_crate_path_module() {
     let dir = tempfile::tempdir().unwrap();
