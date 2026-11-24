@@ -15807,3 +15807,176 @@ fn signalfd_read_bounds_permit_secures_available_records_and_consumes_on_genuine
         "genuine fault on signalfd read must consume the faulting signal",
     );
 }
+
+/// #1338 A1 / #2975: a guest syscall that would shrink a file a shared file
+/// window maps is refused by the host size door on the object it would
+/// mutate. Each case reaches that object by a route a path check beside the
+/// mutation could misjudge. The window is recorded by pinning the file's
+/// host inode, as `HostFileOp::MapShared` does.
+mod window_size_door {
+    use super::*;
+    use carrick_vfs::fs_backend::HostFsBackend;
+
+    const SYS_OPENAT: u64 = 56;
+    const SYS_TRUNCATE: u64 = 45;
+    const SYS_FTRUNCATE: u64 = 46;
+    const AT_FDCWD: u64 = LINUX_AT_FDCWD as i64 as u64;
+    const PATH: u64 = crate::memory::LINUX_IDENTITY_PAGE_BASE + 256;
+
+    struct Run {
+        dispatcher: SyscallDispatcher,
+        memory: LinearMemory,
+        scratch: tempfile::TempDir,
+    }
+
+    impl Run {
+        /// `--fs host`: rootfs files are host inodes, as a window's are.
+        fn new() -> Self {
+            let scratch = tempfile::tempdir().unwrap();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.set_fs_backend(Box::new(HostFsBackend::from_path(scratch.path()).unwrap()));
+            let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+            Self {
+                dispatcher,
+                memory: LinearMemory::new(base, vec![0; 4096]),
+                scratch,
+            }
+        }
+
+        fn rootfs_file(&self, path: &str, len: usize) -> std::path::PathBuf {
+            let host = self.scratch.path().join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            self.dispatcher
+                .fs
+                .rootfs_vfs
+                .set_file_contents(path, vec![0x42; len])
+                .unwrap();
+            self.scratch.path().join(path.trim_start_matches('/'))
+        }
+
+        fn call(&mut self, number: u64, path: Option<&str>, args: [u64; 6]) -> DispatchOutcome {
+            if let Some(path) = path {
+                let mut bytes = path.as_bytes().to_vec();
+                bytes.push(0);
+                self.memory.write_bytes_raw(PATH, &bytes).unwrap();
+            }
+            let context = self.dispatcher.capture_one_task_context().unwrap();
+            self.dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    &mut self.memory,
+                    &CompatReporter::default(),
+                )
+                .unwrap()
+        }
+
+        fn open(&mut self, path: &str, flags: u64) -> DispatchOutcome {
+            self.call(SYS_OPENAT, Some(path), [AT_FDCWD, PATH, flags, 0, 0, 0])
+        }
+    }
+
+    /// Record `host` as windowed; the returned file pins it.
+    fn window(_run: &Run, host: &std::path::Path) -> std::fs::File {
+        let pin = std::fs::File::open(host).unwrap();
+        carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)).unwrap();
+        pin
+    }
+
+    fn size(host: &std::path::Path) -> u64 {
+        std::fs::metadata(host).unwrap().len()
+    }
+
+    /// `open("/proc/self/fd/N", O_TRUNC)` of a windowed host file. The
+    /// reopen goes by the description's path, with a copy of the
+    /// description as the fallback for an unlinked file. Red before: the
+    /// fallback was prepared first, and preparing it truncated the host
+    /// file through the descriptor, before the by-path open was fenced.
+    #[test]
+    fn proc_fd_reopen_truncation_of_a_windowed_file_changes_nothing() {
+        let mut run = Run::new();
+        let windowed = run.rootfs_file("/windowed", 8192);
+        let plain = run.rootfs_file("/plain", 8192);
+        let _pin = window(&run, &windowed);
+        let mut fds = Vec::new();
+        for path in ["/windowed", "/plain"] {
+            let DispatchOutcome::Returned { value } = run.open(path, LINUX_O_RDWR) else {
+                panic!("open {path}");
+            };
+            // The route under test: a host-backed description.
+            let file = run.dispatcher.open_file(value as i32).unwrap();
+            assert!(matches!(
+                &*crate::kernel::FileDescription::read_for_io(&file.description).unwrap(),
+                OpenDescription::HostFile { .. }
+            ));
+            fds.push(value);
+        }
+        assert_eq!(
+            run.open(
+                &format!("/proc/self/fd/{}", fds[0]),
+                LINUX_O_RDWR | LINUX_O_TRUNC
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_eq!(size(&windowed), 8192, "the windowed file keeps its bytes");
+        assert_eq!(std::fs::read(&windowed).unwrap(), vec![0x42; 8192]);
+        // A file no window maps is truncated by the same reopen.
+        assert!(matches!(
+            run.open(
+                &format!("/proc/self/fd/{}", fds[1]),
+                LINUX_O_RDWR | LINUX_O_TRUNC
+            ),
+            DispatchOutcome::Returned { .. }
+        ));
+        assert_eq!(size(&plain), 0);
+    }
+
+    /// A mount over a rootfs name whose rootfs file is windowed. The
+    /// mutation reaches the shadowed rootfs file (path `truncate` goes to
+    /// the rootfs, #3000; a materialized description writes back to the
+    /// rootfs), so it is that object the fence must check. Red before:
+    /// the check looked at the mount's file, admitted, and the rootfs file
+    /// was truncated.
+    #[test]
+    fn a_mount_over_a_windowed_rootfs_file_never_shrinks_it() {
+        let mut run = Run::new();
+        let shadowed = run.rootfs_file("/mnt/x", 8192);
+        let _pin = window(&run, &shadowed);
+        let mounted = tempfile::tempdir().unwrap();
+        std::fs::write(mounted.path().join("x"), vec![0x17; 4096]).unwrap();
+        run.dispatcher.register_mount(
+            "/mnt",
+            Box::new(carrick_vfs::BindVfs::new("/mnt", mounted.path(), false)),
+        );
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/mnt/x"), [PATH, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_eq!(size(&shadowed), 8192, "truncate(2) left the windowed file");
+        // A materialized description of the shadowed name writes back to
+        // the rootfs file: refused before either copy changes.
+        let desc = OpenDescription::File {
+            path: "/mnt/x".to_string(),
+            contents: FileContents::dense(vec![0x42; 8192]),
+            offset: 0,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/mnt/x"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 8192,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
+            panic!("install_fd");
+        };
+        assert_eq!(
+            run.call(SYS_FTRUNCATE, None, [fd as u64, 4096, 0, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_eq!(size(&shadowed), 8192, "writeback left the windowed file");
+        assert_eq!(std::fs::read(&shadowed).unwrap(), vec![0x42; 8192]);
+        assert_eq!(size(&mounted.path().join("x")), 4096);
+    }
+}

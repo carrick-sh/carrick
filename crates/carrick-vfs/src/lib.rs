@@ -35,6 +35,7 @@ pub mod apfs {
 pub mod darwin_fs;
 pub mod fs_backend;
 pub mod fs_resolve_cache;
+pub mod host_size;
 pub mod layer_cache;
 pub mod overlay;
 pub mod pathcodec;
