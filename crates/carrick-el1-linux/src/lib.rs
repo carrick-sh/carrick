@@ -82,3 +82,36 @@ pub(crate) fn diag_invalid_err(
     );
     diag_invalid()
 }
+
+/// DIAGNOSTICS ONLY (never lands).
+pub(crate) fn diag_note(text: &str) {
+    let text = rust_alloc::boxed::Box::new(rust_alloc::string::String::from(text));
+    DIAG_INVALID_ERR.store(
+        rust_alloc::boxed::Box::leak(text),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// DIAGNOSTICS ONLY (never lands): stop the x86 carrier at the caller with the last note.
+#[track_caller]
+pub(crate) fn diag_fatal_here() {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let loc = core::panic::Location::caller();
+        let mut report = carrick_el1_abi::PanicReport::new(loc.file(), loc.line(), loc.column());
+        let e = DIAG_INVALID_ERR.load(core::sync::atomic::Ordering::SeqCst);
+        {
+            use core::fmt::Write;
+            let mut w = report.message_writer();
+            if e.is_null() {
+                let _ = w.write_str("diag: no note");
+            } else {
+                let _ = w.write_str(unsafe { &*e });
+            }
+        }
+        carrick_el1::isa::x86::transport::publish_fatal_report(
+            carrick_el1_abi::PanicReportKind::FatalSite,
+            &report,
+        )
+    }
+}

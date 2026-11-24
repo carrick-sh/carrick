@@ -239,7 +239,9 @@ where
             params,
             info_bytes,
             fpstate,
-            &mut |va, bytes| match process.copy_signal_frame(va, bytes) {
+            &mut |va, bytes| match process.copy_signal_frame(va, bytes).inspect_err(|e| {
+                crate::diag_note(&rust_alloc::format!("copy {:#x}+{} {e:?}", va.raw(), bytes.len()))
+            }) {
                 Ok(()) => carrick_core::user_copy::CopyOutcome::Done,
                 Err(NativeProcessError::OwnerWait(wait)) => {
                     deferred = Some(SignalCopyDeferral::Portal(wait));
@@ -359,6 +361,7 @@ where
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    crate::diag_fatal_here();
     let SignalDeliveryFailure { original, blocked } = failure;
     if let Some((_, code, address, _)) = slot.synchronous_fault() {
         // Match host synchronous injection: an unusable handler stack is
