@@ -6,6 +6,8 @@
 #![cfg_attr(target_os = "none", no_std)]
 #[cfg(target_os = "none")]
 extern crate alloc as rust_alloc;
+#[cfg(not(target_os = "none"))]
+extern crate alloc as rust_alloc;
 pub mod aarch64_process;
 #[cfg(any(test, feature = "host-test"))]
 pub mod aarch64_process_tests;
