@@ -292,48 +292,37 @@ pub enum DynamicCpuClock {
     PerProcess,
 }
 
+/// A dynamic (negative) CPU-clock id, classified by the shared
+/// [`carrick_abi::linux_clock_read`]. Static ids and CLOCKFD are `None`.
 pub(crate) fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
-    // clockid_t is a 32-bit `int`; the guest may zero- OR sign-extend it into
-    // x0 (the vDSO __kernel_clock_gettime fast-path loads only w0, so a dynamic
-    // id arrives as a LARGE positive u64, not sign-extended). Interpret as i32:
-    // static CLOCK_* ids are small non-negative; dynamic per-task ids are
-    // negative. Bit layout (clean-room from clock_getcpuclockid(3) + observed
-    // Docker encodings): low 2 bits = clock type (SCHED=2), low 3 bits == 3 is
-    // CPUCLOCK_FD (not a CPU clock), bit 2 (mask 4) = CPUCLOCK_PERTHREAD.
-    if (clock_id as i32) >= 0 {
+    if (clock_id as u32 as i32) >= 0 {
         return None;
     }
-    if (clock_id & 0b11) as u8 == 3 {
-        return None;
-    }
-    if clock_id & 0b100 != 0 {
-        Some(DynamicCpuClock::PerThread)
-    } else {
-        Some(DynamicCpuClock::PerProcess)
+    match carrick_abi::linux_clock_read(clock_id)? {
+        carrick_abi::LinuxClockRead::Cpu(cpu) if cpu.per_thread => Some(DynamicCpuClock::PerThread),
+        carrick_abi::LinuxClockRead::Cpu(_) => Some(DynamicCpuClock::PerProcess),
+        _ => None,
     }
 }
 
+/// The host dispatcher's reading of one clock id, classified by the shared
+/// [`carrick_abi::linux_clock_read`] the ring entries also use. A CPU clock
+/// reads the calling thread's or process's time whatever task it names.
 pub(crate) fn linux_clock_duration(
     clock: &crate::kernel::container::ClockDomain,
     clock_id: u64,
 ) -> Option<Duration> {
-    match clock_id {
-        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
-            Some(clock.realtime_now())
-        }
-        LINUX_CLOCK_REALTIME_COARSE => Some(linux_coarse_duration(clock.realtime_now())),
-        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW => Some(clock.monotonic_now()),
-        LINUX_CLOCK_MONOTONIC_COARSE => Some(linux_coarse_duration(clock.monotonic_now())),
+    use carrick_abi::LinuxClockRead as Read;
+    Some(match carrick_abi::linux_clock_read(clock_id)? {
+        Read::Realtime => clock.realtime_now(),
+        Read::RealtimeCoarse => linux_coarse_duration(clock.realtime_now()),
+        Read::Monotonic => clock.monotonic_now(),
+        Read::MonotonicCoarse => linux_coarse_duration(clock.monotonic_now()),
         // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
-        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(clock.boottime_now()),
-        LINUX_CLOCK_PROCESS_CPUTIME_ID => Some(Duration::from_nanos(time::task_process_cpu_ns())),
-        LINUX_CLOCK_THREAD_CPUTIME_ID => Some(Duration::from_nanos(time::task_thread_cpu_ns())),
-        // A dynamic per-task CPU-clock id (negative) → current thread/process CPU time.
-        _ => match dynamic_cpu_clock(clock_id)? {
-            DynamicCpuClock::PerThread => Some(Duration::from_nanos(time::task_thread_cpu_ns())),
-            DynamicCpuClock::PerProcess => Some(Duration::from_nanos(time::task_process_cpu_ns())),
-        },
-    }
+        Read::Boottime => clock.boottime_now(),
+        Read::Cpu(cpu) if cpu.per_thread => Duration::from_nanos(time::task_thread_cpu_ns()),
+        Read::Cpu(_) => Duration::from_nanos(time::task_process_cpu_ns()),
+    })
 }
 
 /// A COARSE clock reading: its base clock truncated down to a multiple of the
