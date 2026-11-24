@@ -207,3 +207,81 @@ fn loom_concurrent_insert_and_invalidate_release_the_entry_and_stay_linearizable
         assert!(matches!(final_lookup, None | Some(11)));
     });
 }
+
+/// A refused-call writer lapped by the ring (#2690): writer A claims logical
+/// record 0 and stalls while writer B publishes records 1 and 2, and record 2
+/// lands on A's row. Whatever the interleaving, a row the reader accepts as
+/// record `i` holds exactly the words published as record `i`.
+#[test]
+fn loom_lapped_refused_call_writer_never_leaves_an_accepted_torn_row() {
+    use crate::{REFUSED_CALL_WORDS, publish_refused_call_row, read_refused_call_row};
+
+    type Row = [LoomNameCacheAtomic; REFUSED_CALL_WORDS];
+    struct Ring {
+        rows: [Row; 2],
+        next: LoomNameCacheAtomic,
+        dropped: LoomNameCacheAtomic,
+    }
+    fn record(tag: u64) -> [u64; REFUSED_CALL_WORDS - 1] {
+        core::array::from_fn(|word| tag << 8 | word as u64)
+    }
+
+    check_with_preemptions(3, || {
+        let ring = Arc::new(Ring {
+            rows: Default::default(),
+            next: LoomNameCacheAtomic::default(),
+            dropped: LoomNameCacheAtomic::default(),
+        });
+        let stalled = Arc::clone(&ring);
+        let a =
+            thread::spawn(move || {
+                [publish_refused_call_row(
+                    &stalled.rows,
+                    &stalled.next,
+                    &stalled.dropped,
+                    record(0xa),
+                )
+                .map(|index| (index, record(0xa)))]
+            });
+        let lapping = Arc::clone(&ring);
+        let b = thread::spawn(move || {
+            [0xb1, 0xb2].map(|tag| {
+                publish_refused_call_row(
+                    &lapping.rows,
+                    &lapping.next,
+                    &lapping.dropped,
+                    record(tag),
+                )
+                .map(|index| (index, record(tag)))
+            })
+        });
+        let published: std::vec::Vec<(u64, [u64; REFUSED_CALL_WORDS - 1])> = a
+            .join()
+            .unwrap()
+            .into_iter()
+            .chain(b.join().unwrap())
+            .flatten()
+            .collect();
+        let next = ring.next.load(Ordering::Acquire);
+        assert_eq!(next, 3);
+        // Every claimed record was either published or counted as dropped.
+        assert_eq!(
+            published.len() as u64 + ring.dropped.load(Ordering::Relaxed),
+            next
+        );
+        for index in next - 2..next {
+            let Some(words) = read_refused_call_row(&ring.rows, index) else {
+                continue;
+            };
+            let expected = published
+                .iter()
+                .find(|(published, _)| *published == index)
+                .map(|(_, words)| *words);
+            assert_eq!(
+                Some(words),
+                expected,
+                "row accepted as record {index} holds another record's words"
+            );
+        }
+    });
+}

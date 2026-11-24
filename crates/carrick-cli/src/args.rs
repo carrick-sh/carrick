@@ -1122,6 +1122,81 @@ pub(crate) enum DebugCommand {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Full-depth diagnosis of parity rows: run every stage of every row N
+    /// times through `carrick run`, each stage in a fresh container so an
+    /// early stop never hides a later stage, and rank EVERY failure the runs
+    /// produced (counted refusals with their recorded arguments, carrier
+    /// fatal sites, panics, guest-reported errnos, contention leaves,
+    /// timeouts and exits) in one table: `<out>/table.md` and `table.json`,
+    /// with each run in `<out>/runs.jsonl`. Diagnostics only. Run it under
+    /// the host's guest lease (`just lease gate carrick debug discover ...`).
+    Discover {
+        /// The rows file (JSON; `docs/parity/parity-rows.json`).
+        #[arg(long, required_unless_present = "report")]
+        rows: Option<PathBuf>,
+        /// Only these rows (repeat the flag); default every row.
+        #[arg(long = "row")]
+        only: Vec<String>,
+        /// Runs of each stage.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Output directory: every run's streams, census and the table.
+        #[arg(long)]
+        out: PathBuf,
+        /// The carrick binary to run the rows with (a union build's, say);
+        /// default this binary.
+        #[arg(long)]
+        carrick: Option<PathBuf>,
+        /// The instance column (default the host name).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Label stamped into every `CARRICK_RUN_ID`
+        /// (`discover-<label>-<row>-<stage>-<run>`).
+        #[arg(long, default_value = "local")]
+        label: String,
+        /// Reap each run by its run id with this script under `sudo -n`
+        /// (`scripts/sudo/kill.sh`).
+        #[arg(long)]
+        reap: Option<PathBuf>,
+        /// Rows to print in the table.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Time every selected stage on the native Docker oracle with this
+        /// docker CLI first, in a Docker-only phase that ends before the
+        /// first carrick run (`<out>/oracle.jsonl`), and rank each stage
+        /// that passes at 5x the oracle's median time or more as
+        /// `pathological_time`. Without it, an `oracle.jsonl` already in
+        /// `--out` is used. Never run carrick elsewhere on the host meanwhile.
+        #[arg(long, value_name = "DOCKER")]
+        oracle: Option<PathBuf>,
+        /// Stop after the `--oracle` phase: write `<out>/oracle.jsonl` and
+        /// run no carrick stage, so a Docker-only window records the oracle
+        /// and a later carrick-only run in the same `--out` ranks against it.
+        #[arg(long, requires = "oracle", conflicts_with_all = ["carrick", "reap"])]
+        oracle_only: bool,
+        /// A row's native-oracle syscall profile, `<row>=<file>` (repeat the
+        /// flag; `scripts/conformance/oracle-venue-profile.sh` records one).
+        /// Each call shape the row makes natively that Carrick's static route
+        /// answers ENOSYS is ranked as `venue_gap`, for both ISAs: the stops
+        /// past the ones the runs reached (`carrick debug venue-gaps` prints
+        /// one row's full diff). Kept in `<out>/venue/` for `--report`.
+        #[arg(
+            long = "venue-profile",
+            value_name = "ROW=FILE",
+            conflicts_with = "report"
+        )]
+        venue_profiles: Vec<String>,
+        /// Re-rank a finished `--out` directory without running anything.
+        #[arg(long, conflicts_with_all = ["rows", "only", "carrick", "reap", "oracle", "oracle_only"])]
+        report: bool,
+        /// Where the rows run: `hardware` (`carrick run` on this host) or
+        /// `soft-a64` (each row's first single process on the soft AArch64
+        /// CPU via `carrick debug soft-run`, from the row's arm64 image;
+        /// needs a Linux arm64 host and the production EL1 ELF in
+        /// `CARRICK_A64_ELF`).
+        #[arg(long, value_enum, default_value_t = crate::debug_discover::Provider::Hardware)]
+        provider: crate::debug_discover::Provider,
+    },
     /// Rank EL1 census files (written by runs with
     /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
     /// syscall class, host services and their thread CPU, continuation
@@ -1184,6 +1259,12 @@ pub(crate) enum DebugCommand {
         /// bytes), decoded through the `carrick-el1-abi` layout.
         #[arg(long)]
         region: Option<PathBuf>,
+        /// Also write the capture's syscall census so far to this file, as
+        /// the census JSON the carrier would publish at its exit. For a run
+        /// started with `CARRICK_EL1_CENSUS` that will be killed: a killed
+        /// carrier publishes none.
+        #[arg(long, conflicts_with = "region")]
+        census_out: Option<PathBuf>,
     },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
@@ -1299,6 +1380,12 @@ pub(crate) enum RootfsCommand {
         /// Rootful layer materialization target (used by image export).
         #[arg(long, hide = true)]
         destination: Option<PathBuf>,
+        /// Export the carrier's own view instead of the native oracle's: the
+        /// digest-keyed immutable extraction `carrick run` uses as its lower,
+        /// built unprivileged (ownership and unreadable modes are recorded in
+        /// Carrick's metadata xattrs, not applied). For `debug soft-run`.
+        #[arg(long, conflicts_with = "destination")]
+        carrier_view: bool,
     },
     Summary,
     Ls {

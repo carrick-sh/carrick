@@ -820,8 +820,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 image,
                 platform,
                 destination,
+                carrier_view,
             } = &command
             {
+                if *carrier_view {
+                    return export_carrier_rootfs(&store, &layers, image.as_deref(), platform);
+                }
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = (image, platform, destination);
@@ -929,6 +933,44 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     export_loader_spans.as_deref(),
                 )?;
             }
+            DebugCommand::Discover {
+                rows,
+                only,
+                runs,
+                out,
+                carrick,
+                instance,
+                label,
+                reap,
+                limit,
+                oracle,
+                oracle_only,
+                venue_profiles,
+                report,
+                provider,
+            } => {
+                if report {
+                    crate::debug_discover::report(&out, limit)?;
+                } else {
+                    crate::debug_discover::discover(crate::debug_discover::DiscoverOptions {
+                        rows: rows
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("--rows is required"))?,
+                        only: &only,
+                        runs,
+                        out: &out,
+                        carrick: carrick.as_deref(),
+                        instance: instance.as_deref(),
+                        label: &label,
+                        reap: reap.as_deref(),
+                        limit,
+                        oracle: oracle.as_deref(),
+                        oracle_only,
+                        venue_profiles: &venue_profiles,
+                        provider,
+                    })?;
+                }
+            }
             DebugCommand::El1Census {
                 inputs,
                 limit,
@@ -967,6 +1009,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 run_id,
                 post_mortem,
                 region,
+                census_out,
             } => crate::debug_zonedump::run_zonedump(
                 match (run_id.as_deref(), post_mortem.as_deref(), region.as_deref()) {
                     (Some(run_id), _, _) => crate::debug_zonedump::ZoneSource::Live(run_id),
@@ -976,6 +1019,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         bail!("zonedump needs --run-id, --post-mortem or --region")
                     }
                 },
+                census_out.as_deref(),
             )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
@@ -2223,6 +2267,49 @@ fn resource_error_message(body: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| body.to_string())
+}
+
+/// `rootfs export --carrier-view`: the image's layers as the carrier sees
+/// them, the digest-keyed immutable extraction `carrick run` uses as its
+/// lower (`layer_cache::acquire_immutable_entry`), built unprivileged. It
+/// prints the native export's JSON shape, so `debug discover`'s soft-a64
+/// provider reads either; `extractor` names which view it is.
+fn export_carrier_rootfs(
+    store: &ImageStore,
+    layers: &[std::path::PathBuf],
+    image: Option<&str>,
+    platform: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(layers.is_empty(), "image export takes no --layer");
+    let image = ImageReference::parse(image.context("rootfs export requires an image")?)?;
+    let platform =
+        carrick_image::PlatformTarget::parse(platform).context("invalid rootfs export platform")?;
+    let resolved = block_on_oci(store.resolve_with_platform(&image, &platform))?;
+    let summary = block_on_oci(store.load_pull_summary_for(&image, &platform))?;
+    let digest = summary
+        .digest
+        .context("rootfs export requires image digest")?;
+    let layer_paths: Vec<std::path::PathBuf> = resolved
+        .layers
+        .iter()
+        .map(|layer| layer.as_std_path().to_path_buf())
+        .collect();
+    let scratch_root = carrick_vfs::fs_backend::default_scratch_root()?;
+    let root = carrick_vfs::layer_cache::acquire_immutable_entry(&layer_paths, &scratch_root)?
+        .context("the carrier's layer cache published no extraction for this image")?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "root": std::fs::canonicalize(root)?,
+            "image_digest": digest,
+            "extractor": "carrick-carrier-view",
+            "env": resolved.config.env,
+            "entrypoint": resolved.config.entrypoint.unwrap_or_default(),
+            "cmd": resolved.config.cmd.unwrap_or_default(),
+            "workdir": resolved.config.working_dir,
+        }))?
+    );
+    Ok(())
 }
 
 /// Explicit operator-only image materialization. This function cannot launch
