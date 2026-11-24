@@ -852,13 +852,14 @@ impl RootFsVfs {
 
     /// Truncate path-based file and update dentry cache.
     pub fn truncate_path(&self, path: &str, length: u64) -> Result<(), LinuxErrno> {
-        use crate::vfs::errno::HostSyscallResult as _;
         match self.overlay.open_raw_fd(path, true, false, false) {
             crate::fs_backend::HostFdOpen::Served(host_fd) => {
                 let inode = Self::host_fd_inode_identity(host_fd);
                 // Through the host size door, on the object opened (#1338 A1).
-                let err = crate::host_size::ftruncate(host_fd, length as libc::off_t)
-                    .host_syscall_errno()
+                // SAFETY: `host_fd` is open until the close below.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) };
+                let err = crate::host_size::resize(borrowed, length)
+                    .map_err(crate::host_to_linux_errno)
                     .err();
                 unsafe { libc::close(host_fd) };
                 if let Some(err) = err {
@@ -2613,10 +2614,9 @@ impl Vfs for RootFsVfs {
             })
     }
 
-    fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
-        // This trait entrypoint requires exclusive ownership of RootFsVfs via
-        // `&mut self`; shared dispatcher mutations use the admitted path-based
-        // helpers instead.
+    fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
+        // The in-memory overlay's truncate; the dispatcher's path truncate of
+        // a host-backed rootfs goes through `truncate_path`.
         if len > MAX_IN_MEMORY_FILE_SIZE {
             return Err(LINUX_EFBIG);
         }
