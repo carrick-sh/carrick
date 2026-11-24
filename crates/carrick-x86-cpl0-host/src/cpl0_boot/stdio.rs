@@ -123,7 +123,7 @@ impl StdioCustody {
             .position(|table| *table == from)
             .ok_or(StdioAdmissionError::NoTable)?;
         if self.tables.contains(&to) || !rename_unstarted_table(fd_map, from, to) {
-            return Err(StdioAdmissionError::Occupied);
+            return Err(StdioAdmissionError::TableHasStdio);
         }
         self.tables[position] = to;
         Ok(())
@@ -250,7 +250,7 @@ mod tests {
         }
         assert_eq!(
             stdio.rename_unstarted(fd_map, 77, 6),
-            Err(StdioAdmissionError::Occupied)
+            Err(StdioAdmissionError::TableHasStdio)
         );
     }
 }

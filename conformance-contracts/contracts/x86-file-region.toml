@@ -21,6 +21,19 @@ semantic_authority = ["open(2): distinct open descriptions share an inode", "dup
 fixture = "carrick-x86-cpl0:file_region; carrick-vmm-kvm:cpl0_entry"
 scale_points = [1, 16, 20, 128, 512]
 rationale = """
+#2820: the zone's stdin, stdout and stderr are three descriptions the
+stopped carrier admits once (StdioDescriptions), before any guest
+instruction runs, into its boot task's table; it renames that unstarted
+table to the issued root's and shares the same descriptions into any other
+table it binds to an initial task. No guest path admits stdio, so every
+other table gets them only by fork (Linux: from the launcher and fork, and
+a closed number stays closed); the closed-stdio tombstones that guarded the
+deleted per-CPU lazy admission are gone. The carrier accepts a guest stdio
+release only for the exact admitted (handle, incarnation), once. Red on
+main 16d20f23d (3 of 3, rc 125 "host object release identity mismatch"):
+x86_kvm_run::mounted_static_x86_fork_children_close_a_pipe_over_stdout,
+three live fork children closing a pipe dup'd over stdout; green after.
+
 One checked venue names the shared ABI object/open/fd/name/cache allocations. KVM retains the exact host mapping with its separately typed supervisor VA and GPA. Guest venue authentication checks same-VM header/binding self-consistency plus a per-carrier identity; foreign, unpublished and retired bindings have distinct refusals. Guest-observed retirement is fixture-only. Descriptor mutation uses one region-resident lock word; host mutations own stopped-carrier execution exclusion and refuse paused CPL0 descriptor transactions. Guest admission never waits on host custody, and poisoning is a typed fatal. This is not inode-lock quiescence: a kicked CPU can hold an inode lock (F3/F4 constraint). Single-step fixtures use exclusive mutable carrier custody; M1 create_stopped has no F2 registration. Two carriers remain independent; real guest fork/dup/child-exit preserves distinct parent/child descriptor references to the inherited inode. Exact shared-open ring-reference counts are 1 before fork, 4 after both dup calls, and 3 after child retirement with the independently admitted idle-peer stdout included; the VM-free twin checks 1, 2, 4, 2 without that peer. Table witnesses do not claim FileService Open or regular-file I/O acceptance.
 
 #671 R1c neutral CPL0 boot extraction: the helper boundary preserves the
@@ -92,10 +105,12 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
+  "carrick-el1-linux::file_table::tests::{stdio_is_admitted_once_and_shared_by_reference,stdout_replaced_by_a_ring_pipe_stays_gone_across_fork,fresh_table_cannot_resurrect_terminal_stdio,rename_moves_only_an_unstarted_tables_descriptors} (#2820: one stdio admission per zone, shared by reference; a stdio number a table lost stays lost across fork)",
+  "carrick-x86-cpl0-host::cpl0_boot::stdio::tests::{release_presents_the_admitted_description_once,boot_tables_share_one_admission_and_rename_before_running} (#2820: the carrier accepts only the exact admitted stdio description, once)",
 ]
 
 [bindings.unresolved]
 terminal_open_release = "F3 (issue #384) owns region-indexed terminal open retirement: queue_open_release still suppresses x86 exit-time keys. Pass the authenticated FileTables/binding region to the producer, retain per-carrier host open cleanup custody, and drain that region's pending keys at host boundaries including child exit. The KVM executor currently acknowledges only explicit stdio HostObjectReleaseCrossing records; it does not consume OpenReferencePending. The existing owned_recall drain uses the global ARM aperture and ALLOCATED_OPEN_FILES ownership, not F2 carrier custody. Required live witness: child holds the last reference to a host-bound open, exits without close, and the host observes Terminal and retires the exact host object once. F2 table witnesses do not prove this lifecycle."
-x86_cpl0 = "Live KVM bindings: carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry , carrick-vmm-kvm::cpl0_shared_entry::production_file_region_stdio_dup_parity and carrick-vmm-kvm::cpl0_entry::{file_region_guest_stdio_parity_and_two_carrier_independence,file_region_guest_closes_record_beyond_fifteen,file_region_guest_refuses_foreign_publication,file_region_guest_refuses_retired_publication,file_region_guest_refuses_unpublished_binding}, carrick-vmm-kvm::cpl0_initial_mm::file_region_guest_fork_dup_and_child_retirement_preserve_parent and cpl0_layout_tests::{file_region_host_mutation_refused_while_cpu_running,file_region_host_refuses_paused_cpl0_descriptor_transaction,file_region_run_refuses_host_access_without_waiting,file_region_poisoned_admission_is_repeated_typed_fatal}. Merge-queue NEW=[] receipt remains director-owned."
+x86_cpl0 = "Live KVM bindings: carrick-cli::x86_kvm_run::mounted_static_x86_fork_children_close_a_pipe_over_stdout (#2820, production entry, three live fork children), carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry , carrick-vmm-kvm::cpl0_shared_entry::production_file_region_stdio_dup_parity and carrick-vmm-kvm::cpl0_entry::{file_region_guest_stdio_parity_and_two_carrier_independence,file_region_guest_closes_record_beyond_fifteen,file_region_guest_refuses_foreign_publication,file_region_guest_refuses_retired_publication,file_region_guest_refuses_unpublished_binding}, carrick-vmm-kvm::cpl0_initial_mm::file_region_guest_fork_dup_and_child_retirement_preserve_parent and cpl0_layout_tests::{file_region_host_mutation_refused_while_cpu_running,file_region_host_refuses_paused_cpl0_descriptor_transaction,file_region_run_refuses_host_access_without_waiting,file_region_poisoned_admission_is_repeated_typed_fatal}. Merge-queue NEW=[] receipt remains director-owned."
 embed_structural = "Full signed gate on the director's HVF host remains required by the approved F2 exit."
 docker = "F2 changes storage venue and carrier custody, not regular-file Open lowering; full file-service differential binding belongs to F4. No Docker is available on the F2 worker."
