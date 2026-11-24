@@ -2961,6 +2961,7 @@ mod serial_host {
     fn wait_carrier_job_state(child: &mut Child, flag: libc::c_int, what: &str) -> bool {
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut timed_out = true;
         while Instant::now() < deadline {
             if child.try_wait().expect("poll carrier exit").is_some() {
                 return false;
@@ -2970,11 +2971,13 @@ mod serial_host {
             let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, flag | libc::WNOHANG) };
             // SAFETY: POSIX si_pid union field populated on waitid match.
             if rc == 0 && unsafe { info.si_pid() } == pid as i32 {
-                return true;
+                timed_out = false;
+                break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        panic!("timed out waiting for carrier {pid} {what}");
+        assert!(!timed_out, "timed out waiting for carrier {pid} {what}");
+        true
     }
 
     /// #2962: a multi-threaded + forked guest running on KVM must survive
@@ -3059,7 +3062,14 @@ mod serial_host {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => panic!("read carrier stdout: {e}"),
+                    Err(e) => {
+                        assert_eq!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted,
+                            "read carrier stdout: {e}"
+                        );
+                        break;
+                    }
                 }
             }
             collected
@@ -3070,7 +3080,8 @@ mod serial_host {
             collected
         });
 
-        if ready_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+        let reached_ready = ready_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        if !reached_ready {
             let status = child.wait_timeout(Duration::from_secs(2)).unwrap();
             if status.is_none() {
                 unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
@@ -3078,11 +3089,13 @@ mod serial_host {
             }
             let out = stdout_reader.join().unwrap_or_default();
             let err = stderr_reader.join().unwrap_or_default();
-            panic!(
+            assert!(
+                reached_ready,
                 "guest did not reach READY barrier: status={status:?} stdout={:?} stderr={}",
                 String::from_utf8_lossy(&out),
                 String::from_utf8_lossy(&err)
             );
+            return;
         }
 
         let mut stop_cycles = 0usize;
@@ -3113,19 +3126,20 @@ mod serial_host {
             std::thread::sleep(Duration::from_millis(8));
         }
 
-        let status = match child
+        let waited = child
             .wait_timeout(Duration::from_secs(15))
-            .expect("wait for KVM carrier")
-        {
-            Some(status) => status,
-            None => {
-                // SAFETY: exclusive process group created for this child.
-                unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
-                let _ = child.wait();
-                panic!(
-                    "KVM carrier hung after {stop_cycles} SIGSTOP and {ptrace_cycles} ptrace cycles"
-                );
-            }
+            .expect("wait for KVM carrier");
+        if waited.is_none() {
+            // SAFETY: exclusive process group created for this child.
+            unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        let Some(status) = waited else {
+            assert!(
+                waited.is_some(),
+                "KVM carrier hung after {stop_cycles} SIGSTOP and {ptrace_cycles} ptrace cycles"
+            );
+            return;
         };
         let guest_stdout = stdout_reader.join().expect("join stdout reader");
         let guest_stderr = stderr_reader.join().expect("join stderr reader");
@@ -3239,14 +3253,17 @@ mod serial_host {
         );
 
         std::thread::sleep(Duration::from_millis(150));
-        if let Some(early) = child.try_wait().expect("poll carrier after detach") {
+        let early = child.try_wait().expect("poll carrier after detach");
+        if let Some(early_status) = early {
             let output = child
                 .wait_with_output()
                 .expect("collect failed carrier output");
-            panic!(
-                "carrier died after debugger detach instead of staying parked (gdb_attached={gdb_attached}, stopped_threads={stopped_threads}, status={early:?}): {}",
+            assert!(
+                early.is_none(),
+                "carrier died after debugger detach instead of staying parked (gdb_attached={gdb_attached}, stopped_threads={stopped_threads}, status={early_status:?}): {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            return;
         }
 
         // SAFETY: exclusive process group created for this child.

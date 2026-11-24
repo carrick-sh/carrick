@@ -1,3 +1,9 @@
+# #2962: POSIX signal kicks mark the kicked carrier thread in TLS so KVM
+# resumes unrequested `EINTR`/`KvmExit::Intr` stops (SIGSTOP/SIGCONT, ptrace/gdb
+# attach) inside `KvmVcpu::run`, and `CarrierCpu` admits a requested kick on
+# `maintenance_root` (`state: None`) plus `reset_for_shutdown` without poisoning
+# the carrier or demanding a task CR3. Existing shutdown-entry semantics and
+# work budgets are unchanged; KVM container witnesses live in `x86_kvm_run`.
 # #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
 # (enter_mm_executor_then_register, the leased-root check and
 # open_first_address_space) and the stopped zone-slot publication move to
@@ -106,6 +112,8 @@ vm_free = [
   "carrick-x86-cpl0-host::carrier_cpu::tests::kicked_child_on_root_executor_keeps_its_issued_root (component: a kicked CPU switched to a registered child root captures that child's issued binding; red before #2581 fix; does not qualify KVM container shutdown)",
   "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_a_registered_child_resolves_its_binding (component, #2581: a fault doorbell from a child CR3 registered with the carrier resolves that child's issued binding instead of the loaded root; red before the fix; does not qualify the KVM container)",
   "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_an_unregistered_child_root_is_refused (component, #2581: an unregistered child root is refused, never bound to the loaded root)",
+  "carrick-hal::posix_signal_kick::tests::unrequested_signal_leaves_current_thread_kick_pending_clear_while_kick_sets_only_target_thread (component, #2962: POSIX signal kicks mark only the kicked thread so unrequested EINTR stops do not masquerade as Carrick kicks)",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::maintenance_root_kick_does_not_poison_or_require_a_task_root (component, #2962: a requested kick on maintenance_root returns state None without poisoning the carrier and resets cleanly on shutdown; KVM container witnesses live in x86_kvm_run)",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
