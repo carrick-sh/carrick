@@ -1237,12 +1237,9 @@ impl HostThreadExitMembership<'_> {
     }
 
     pub fn publish(self) {
-        let _ = self.publish_with_wake();
-    }
-
-    pub fn publish_with_wake(self) -> Option<TerminalNotification> {
-        self.reserved
-            .and_then(NonfinalExitMembership::publish_with_wake)
+        if let Some(reserved) = self.reserved {
+            reserved.publish();
+        }
     }
 
     pub fn rollback_with_wake(mut self) -> Option<TerminalNotification> {
