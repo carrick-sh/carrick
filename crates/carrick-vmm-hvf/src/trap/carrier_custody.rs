@@ -1852,7 +1852,8 @@ mod carrier_vm_custody_tests {
     #[allow(clippy::expect_used)]
     fn executable_publication_invalidates_a_frame_once_per_incarnation() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        // Owner registration admits only a creating or live carrier VM.
+        let custody = crate::trap::test_carrier_custody();
         let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x51_0000;
         let len = 0x8000_u64;
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -1982,9 +1983,8 @@ mod carrier_vm_custody_tests {
             .map(|_| {
                 let both_published = std::sync::Arc::clone(&both_published);
                 std::thread::spawn(move || {
-                    let task = crate::trap::hvpatch_neutral_task_state_for_test(
-                        &crate::trap::test_carrier_custody(),
-                    );
+                    let custody = crate::trap::test_carrier_custody();
+                    let task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
                     let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                         key.1 as usize,
                         crate::host_mapping::HostMappingKind::PerMmKernelState,
