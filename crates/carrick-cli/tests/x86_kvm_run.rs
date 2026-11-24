@@ -2851,8 +2851,9 @@ mod serial_host {
         // The empty poll parks in the ring's own object wait (#2909), not a
         // host wait, so the host kernel's thread row still reads Running:
         // the zone census names the wait. It must name a parked record of a
-        // captured thread (its tid and serial), and that record's object
-        // wait with its waiter enrolled.
+        // captured thread (its tid and serial), that record's object wait,
+        // and the live queue of the same generation with that record
+        // enrolled at its head or tail.
         let threads: Vec<(u64, u64)> = capture["degraded_kernel"]["tasks"]
             .as_array()
             .into_iter()
@@ -2865,29 +2866,42 @@ mod serial_host {
                 ))
             })
             .collect();
+        let field = |text: &str, name: &str| -> Option<String> {
+            text.split_whitespace()
+                .find_map(|word| word.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
         let named_wait = zone_census.lines().any(|line| {
-            let Some(rest) = line.strip_prefix("zone record ") else {
+            let Some((record, state)) = line
+                .strip_prefix("zone record ")
+                .and_then(|rest| rest.split_once(": claim=Parked "))
+            else {
                 return false;
             };
-            let Some((record, state)) = rest.split_once(": claim=Parked ") else {
-                return false;
-            };
-            let parked_thread = threads
-                .iter()
-                .any(|(tid, serial)| state.contains(&format!(" tid={tid} serial={serial} ")));
-            let object_wait = zone_census
+            let parked_thread = threads.iter().any(|(tid, serial)| {
+                field(state, "tid") == Some(tid.to_string())
+                    && field(state, "serial") == Some(serial.to_string())
+            });
+            let wait = zone_census
                 .lines()
-                .filter_map(|line| {
-                    line.strip_prefix(&format!("zone record {record} object wait: queue="))
+                .find_map(|line| line.strip_prefix(&format!("zone record {record} object wait: ")));
+            let enrolled = wait.is_some_and(|wait| {
+                let (Some(queue), Some(generation)) =
+                    (field(wait, "queue"), field(wait, "generation"))
+                else {
+                    return false;
+                };
+                zone_census.lines().any(|line| {
+                    line.strip_prefix(&format!("zone object queue {queue}: "))
+                        .is_some_and(|live| {
+                            field(live, "generation").as_ref() == Some(&generation)
+                                && (field(live, "head").as_deref() == Some(record)
+                                    || field(live, "tail").as_deref() == Some(record))
+                                && field(live, "waiters").is_some_and(|n| n != "0")
+                        })
                 })
-                .filter_map(|queue| queue.split_whitespace().next())
-                .any(|queue| {
-                    zone_census.lines().any(|line| {
-                        line.strip_prefix(&format!("zone object queue {queue}: "))
-                            .is_some_and(|q| q.contains(" waiters=1 "))
-                    })
-                });
-            parked_thread && object_wait
+            });
+            parked_thread && enrolled
         });
         assert!(
             named_wait,
