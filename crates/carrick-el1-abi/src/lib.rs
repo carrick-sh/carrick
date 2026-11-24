@@ -480,6 +480,10 @@ pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 /// Guest-physical base shared by the CPL0 image loader and fixture table grant.
 pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x20_0000;
+/// The supervisor VAs the CPL0 image may occupy; every image-entry bound
+/// checks against this one range.
+pub const X86_CPL0_SUPERVISOR_IMAGE_EXTENT: core::ops::Range<u64> =
+    X86_CPL0_SUPERVISOR_IMAGE_BASE..X86_CPL0_SUPERVISOR_IMAGE_BASE + X86_CPL0_SUPERVISOR_IMAGE_SIZE;
 const _: () = {
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));

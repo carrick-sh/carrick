@@ -159,3 +159,57 @@ missing = { path = "../missing" }
         .collect();
     assert_eq!(inputs.package_dirs, expected);
 }
+
+/// #3005: the build-time budget report reads each image's loaded span and
+/// its extent from the image itself. On the real embedded images the
+/// extent is the ABI's supervisor extent and every image fits it; any
+/// truncation, and a big-endian header, reads as `None`, never a panic.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "../cpl0_budget.rs"]
+mod cpl0_budget;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod image_budget {
+    use super::cpl0_budget::ImageBudget;
+
+    const IMAGES: [(&str, &[u8]); 3] = [
+        ("production", include_bytes!(env!("CARRICK_X86_CPL0_IMAGE"))),
+        ("test", include_bytes!(env!("CARRICK_X86_CPL0_TEST_IMAGE"))),
+        (
+            "fixture",
+            include_bytes!(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")),
+        ),
+    ];
+
+    #[test]
+    fn every_embedded_cpl0_image_reads_its_budget_from_its_own_extent_symbol() {
+        for (name, image) in IMAGES {
+            let budget = ImageBudget::of(image).expect(name);
+            assert_eq!(
+                budget.extent,
+                carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+                "{name}"
+            );
+            assert!(
+                0 < budget.loaded && budget.loaded <= budget.extent,
+                "{name}: {budget:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_cpl0_image_reads_as_no_budget() {
+        let (_, image) = IMAGES[0];
+        // Every header prefix, then coarse steps through the tables.
+        for len in (0..0x100).chain((0x100..image.len()).step_by(4093)) {
+            assert_eq!(ImageBudget::of(&image[..len]), None, "prefix {len:#x}");
+        }
+        let mut big_endian = image.to_vec();
+        big_endian[5] = 2;
+        assert_eq!(ImageBudget::of(&big_endian), None);
+        let mut huge_offsets = image.to_vec();
+        huge_offsets[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
+        huge_offsets[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(ImageBudget::of(&huge_offsets), None);
+    }
+}

@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use super::cpl0_budget::ImageBudget;
 use super::cpl0_inputs;
 
 /// What one build script needs from the shared recipe.
@@ -70,6 +71,10 @@ pub fn build_images(
     );
     println!(
         "cargo:rerun-if-changed={}cpl0_build.rs",
+        consumer.shared_dir
+    );
+    println!(
+        "cargo:rerun-if-changed={}cpl0_budget.rs",
         consumer.shared_dir
     );
     let target_dir = out.join("cpl0-target");
@@ -164,12 +169,6 @@ fn nested_image_build(cargo: &std::ffi::OsStr, target_dir: &std::path::Path) -> 
     command
 }
 
-/// The image's own extent symbol: `carrick-x86-carrier` defines it from
-/// `X86_CPL0_SUPERVISOR_IMAGE_BASE + X86_CPL0_SUPERVISOR_IMAGE_SIZE`, and
-/// `link.ld` asserts against it. Reading it back from the linked image
-/// keeps the report on that one constant.
-const EXTENT_END_SYMBOL: &[u8] = b"CARRICK_X86_CPL0_IMAGE_END";
-
 /// Print `image`'s loaded bytes against its supervisor extent, as the EL1
 /// image does (`EL1 image budget: ...`), so growth is visible before the
 /// link assert fails. The link assert stays the enforcement.
@@ -182,66 +181,4 @@ fn report_budget(image: &str, elf: &[u8]) -> Result<(), Box<dyn std::error::Erro
         budget.extent.saturating_sub(budget.loaded),
     );
     Ok(())
-}
-
-/// One linked image's loaded span and extent, from its base.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ImageBudget {
-    pub loaded: u64,
-    pub extent: u64,
-}
-
-impl ImageBudget {
-    /// Read the lowest and highest loaded addresses (`PT_LOAD`, memory
-    /// size, so `.bss` counts) and the extent symbol's value.
-    pub fn of(elf: &[u8]) -> Option<Self> {
-        let u16_at = |at: usize| Some(u16::from_le_bytes(elf.get(at..at + 2)?.try_into().ok()?));
-        let u32_at = |at: usize| Some(u32::from_le_bytes(elf.get(at..at + 4)?.try_into().ok()?));
-        let u64_at = |at: usize| Some(u64::from_le_bytes(elf.get(at..at + 8)?.try_into().ok()?));
-        if elf.get(..5)? != b"\x7fELF\x02" {
-            return None;
-        }
-        let (phoff, phentsize, phnum) = (
-            usize::try_from(u64_at(0x20)?).ok()?,
-            usize::from(u16_at(0x36)?),
-            usize::from(u16_at(0x38)?),
-        );
-        let (mut base, mut end) = (u64::MAX, 0);
-        for header in (0..phnum).map(|index| phoff + index * phentsize) {
-            if u32_at(header)? == 1 && u64_at(header + 0x28)? != 0 {
-                let start = u64_at(header + 0x10)?;
-                base = base.min(start);
-                end = end.max(start.checked_add(u64_at(header + 0x28)?)?);
-            }
-        }
-        let (shoff, shentsize, shnum) = (
-            usize::try_from(u64_at(0x28)?).ok()?,
-            usize::from(u16_at(0x3a)?),
-            usize::from(u16_at(0x3c)?),
-        );
-        let section = |index: usize| shoff + index * shentsize;
-        let mut extent_end = None;
-        for symtab in (0..shnum)
-            .map(section)
-            .filter(|&s| u32_at(s + 4) == Some(2))
-        {
-            let strtab = section(usize::try_from(u32_at(symtab + 0x28)?).ok()?);
-            let names = usize::try_from(u64_at(strtab + 0x18)?).ok()?;
-            let offset = usize::try_from(u64_at(symtab + 0x18)?).ok()?;
-            let size = usize::try_from(u64_at(symtab + 0x20)?).ok()?;
-            let entry = usize::try_from(u64_at(symtab + 0x38)?).ok()?.max(24);
-            for symbol in (offset..offset + size).step_by(entry) {
-                let name = names + usize::try_from(u32_at(symbol)?).ok()?;
-                let name = elf.get(name..)?.split(|&byte| byte == 0).next()?;
-                if name == EXTENT_END_SYMBOL {
-                    extent_end = Some(u64_at(symbol + 8)?);
-                }
-            }
-        }
-        let extent_end = extent_end?;
-        (base <= end && base <= extent_end).then(|| Self {
-            loaded: end - base,
-            extent: extent_end - base,
-        })
-    }
 }
