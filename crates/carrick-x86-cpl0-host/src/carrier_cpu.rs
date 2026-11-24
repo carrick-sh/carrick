@@ -941,12 +941,12 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         }
         Ok(saved)
     }
-    /// Whether the loaded CPU currently stands at a user-mode boundary of
-    /// `task`'s own root address space, where [`Self::save_and_detach`] can
-    /// produce a valid reloadable [`X86ArchContext`] for the host root lease.
-    /// When CPL0 is parked on `maintenance_root`, executing a forked child's
-    /// CR3, or mid-CPL0 supervisor code, a non-shutdown kick must re-enter
-    /// CPL0 rather than overwriting the root task's snapshot (#2962).
+    /// Whether the loaded CPU stands on `task`'s own root address space, so
+    /// [`Self::save_and_detach`] produces an image that reloads under the
+    /// lease's binding. A user stop and a CPL0 supervisor stop both qualify:
+    /// the save captures the slot's kernel stack, and the image resumes on
+    /// this slot exactly where it stopped. On `maintenance_root` or a forked
+    /// child's root there is no reloadable image for this lease (#2962).
     pub fn can_save_loaded(&self, task: TaskIdentity) -> Result<bool, TrapError> {
         let Custody::Loaded { binding, .. } = self.custody else {
             return Err(boundary_error(
@@ -959,14 +959,7 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             ));
         }
         let cr3 = self.io.get_gpr(X86Reg::Cr3)?;
-        let rip = self.io.get_gpr(X86Reg::Rip)?;
-        let rsp = self.io.get_gpr(X86Reg::Rsp)?;
-        let user_ceiling =
-            carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
-                .exclusive_end();
-        Ok((cr3 & !0xfff) == binding.context().root.address().raw()
-            && rip < user_ceiling
-            && rsp < carrick_x86::cpl0_entry::DIRECT_VA)
+        Ok((cr3 & !0xfff) == binding.context().root.address().raw())
     }
     /// Detach and reset the hardware CPU to its neutral image during carrier
     /// shutdown without requiring the stopped CPU to stand on a user task
