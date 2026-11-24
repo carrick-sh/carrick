@@ -2525,6 +2525,73 @@ mod tests {
     }
 
     #[test]
+    fn a_hung_plain_carrier_without_census_out_still_gives_its_zonedump() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stand-in for a main carrier that predates `zonedump
+        // --census-out` (cfg(test) only): `run` hangs; `debug zonedump`
+        // refuses the flag the way clap does (usage error, exit 2) and
+        // answers with a zone line without it.
+        let fake = dir.path().join("carrick");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$1\" = run ]; then exec sleep 30; fi\n\
+             if [ \"$5\" = --census-out ]; then\n\
+             echo \"error: unexpected argument '--census-out' found\" >&2; exit 2; fi\n\
+             echo 'zone slot 1: state=IdleWfi'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let rows = dir.path().join("rows.json");
+        std::fs::write(
+            &rows,
+            r#"{"rows":[{"name":"shell","image":{"x86_64":"u","arm64":"u"},"timeout_secs":1,
+                "stages":[{"name":"hang","command":["x"]}]}]}"#,
+        )
+        .unwrap();
+        let out = dir.path().join("out");
+        discover(DiscoverOptions {
+            rows: &rows,
+            only: &[],
+            runs: 1,
+            out: &out,
+            carrick: Some(&fake),
+            instance: Some("unit"),
+            label: "t",
+            reap: None,
+            limit: 50,
+            oracle: None,
+            oracle_only: false,
+            venue_profiles: &[],
+            provider: Provider::Hardware,
+        })
+        .unwrap();
+        let zonedump = std::fs::read_to_string(out.join("shell-hang-1.zonedump")).unwrap();
+        assert!(
+            zonedump.contains("zone slot 1: state=IdleWfi"),
+            "{zonedump}"
+        );
+        let records = read_records(&out).unwrap();
+        let hang = &records[0];
+        assert!(hang.timed_out, "{hang:?}");
+        assert!(
+            !hang
+                .findings
+                .iter()
+                .any(|finding| finding.site == "zonedump read no zone"),
+            "{hang:?}"
+        );
+        // Without a census at the kill the run still says it has none.
+        assert!(
+            hang.findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::NoCensus),
+            "{hang:?}"
+        );
+    }
+
+    #[test]
     fn discover_runs_each_stage_and_report_rerenders_the_table() {
         let dir = tempfile::tempdir().unwrap();
         // A stand-in carrier (cfg(test) only): it writes the census
