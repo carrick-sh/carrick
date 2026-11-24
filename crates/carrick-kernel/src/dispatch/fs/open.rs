@@ -419,6 +419,14 @@ impl<'a> FsView<'a> {
                 _ => {}
             }
         }
+        // A shared file window maps this inode: the truncation is refused
+        // before any open applies it, a mount's (a bind mount's host open
+        // truncates) or the rootfs's below (#1338 A1).
+        if want_trunc && self.path_shrink_fence(&path, 0) == super::ShrinkFence::Refuse {
+            return Ok(sink
+                .refuse_native()
+                .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)));
+        }
         let vfs_outcome = self.try_vfs_open(sink, &path, access, flags, vfs_create_mode);
         match vfs_outcome {
             // A native caller's sink checked O_DIRECTORY before it installed
@@ -683,13 +691,6 @@ impl<'a> FsView<'a> {
         // the truncation.
         if want_trunc {
             crate::el1_delegation::recall_path(self.fs, &path);
-            // A shared file window maps this inode: the truncation is
-            // refused before the host open applies it (#1338 A1).
-            if self.path_shrink_fence(&path, 0) == super::ShrinkFence::Refuse {
-                return Ok(sink
-                    .refuse_native()
-                    .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)));
-            }
         }
         // Layered overlay+rootfs lookup with full openat semantics
         // (O_CREAT/O_EXCL/O_TRUNC, write-promotion of rootfs-only

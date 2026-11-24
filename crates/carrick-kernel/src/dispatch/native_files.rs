@@ -1945,6 +1945,10 @@ impl SyscallDispatcher {
                 return Served::Refused;
             };
             self.fs.window_inodes.record(identity);
+            // An in-zone copy of the inode leaves the zone first: its later
+            // writeback would rewrite the window's pages from older bytes.
+            // Delegation refuses a windowed inode from now on.
+            crate::el1_delegation::recall_inode(identity);
         }
         match self.mem().retain_native_private_source(reference, label) {
             Some((source, identity)) => Served::Source(

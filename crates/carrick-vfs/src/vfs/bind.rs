@@ -441,6 +441,11 @@ impl Vfs for BindVfs {
         (rc == 0).then(|| real_stat_from_host(&host, &st, !follow))
     }
 
+    fn host_inode_identity(&self, path: &str) -> Option<super::InodeIdentity> {
+        let meta = std::fs::metadata(self.to_host(path).ok()?).ok()?;
+        Some(super::InodeIdentity::new(meta.dev(), meta.ino()))
+    }
+
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
         let host = self.to_host(path)?;
         std::fs::read_link(&host).map_err(map_io_error)
