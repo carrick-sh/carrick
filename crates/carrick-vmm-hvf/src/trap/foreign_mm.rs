@@ -151,12 +151,6 @@ impl CarrierForeignMmTransport {
         }
     }
 
-    /// A transport with a fresh live-carrier custody owned by this fixture.
-    #[cfg(test)]
-    pub(crate) fn live_fixture() -> Self {
-        Self::with_custody(std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
-    }
-
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn register(
         &self,
