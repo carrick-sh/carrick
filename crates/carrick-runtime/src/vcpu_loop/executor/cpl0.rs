@@ -1238,13 +1238,17 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         if let Some(hook) = self.loaded_pre_entry_hook.take() {
             hook(need_resched, &self.idle_kick);
         }
-        if carrick_hal::vcpu_run::current_shutdown_requested()
-            || (need_resched.load(Ordering::Acquire)
-                && self.physical.can_save_loaded_leader(task)?)
-        {
+        let preempt = if carrick_hal::vcpu_run::current_shutdown_requested() {
+            Ok(true)
+        } else if need_resched.load(Ordering::Acquire) {
+            self.physical.can_save_loaded_leader(task)
+        } else {
+            Ok(false)
+        };
+        if !matches!(preempt, Ok(false)) {
             M::disarm_run_kick(&self.idle_kick);
             let _ = carrick_hal::posix_signal_kick::take_current_thread_kick_pending();
-            return Ok(ExecutorExit::Preempted);
+            return preempt.map(|_| ExecutorExit::Preempted);
         }
         let stopped = self.physical.cpu_mut().run_loaded(task);
         M::disarm_run_kick(&self.idle_kick);

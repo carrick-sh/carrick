@@ -4,7 +4,7 @@
 //! registers via KVM_GET/SET_REGS/SREGS from guest_setup_x86 (Tasks 2–3).
 //! Guest RAM via KVM_SET_USER_MEMORY_REGION over a host mmap; run via KVM_RUN.
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use carrick_fatal::carrick_fatal;
@@ -1758,11 +1758,18 @@ impl HvVm for KvmVm {
 }
 
 impl KvmVcpu {
+    fn immediate_exit_requested(&mut self) -> bool {
+        let byte = &raw mut self.fd_mut().get_kvm_run().immediate_exit;
+        // SAFETY: the live vCPU owns this mapping. The kick sender shares
+        // this byte through AtomicU8 while the run kick is armed.
+        unsafe { AtomicU8::from_ptr(byte).load(Ordering::SeqCst) != 0 }
+    }
+
     fn should_surface_interrupted_run(&mut self) -> bool {
         carrick_hal::posix_signal_kick::take_current_thread_kick_pending()
-            || self.fd_mut().get_kvm_run().immediate_exit != 0
+            || self.immediate_exit_requested()
             || carrick_hal::vcpu_run::current_shutdown_requested()
-            || !carrick_signal_linux::proc_pending_mask().is_empty()
+            || carrick_signal_linux::has_process_pending()
     }
 }
 
