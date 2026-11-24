@@ -95,6 +95,13 @@ pub enum DescriptorOp {
     /// Owner retirement retains an inaccessible physical predecessor for scrub.
     Retire(PageSpan),
     Unmap(PageSpan),
+    /// mprotect(2) over shared file window pages (#1338): a permission edit
+    /// of host-mapped leaves, holes skipped. The caller checked the
+    /// mapping's ceiling; a private leaf is refused (it takes `Protect`).
+    ProtectWindow {
+        span: PageSpan,
+        permissions: Permissions,
+    },
     Coalesce {
         span: PageSpan,
         size: LeafSize,
@@ -113,6 +120,7 @@ impl DescriptorOp {
             Self::Coalesce { .. } => 7,
             Self::Prepare { .. } => 8,
             Self::Retire(_) => 9,
+            Self::ProtectWindow { .. } => 10,
         }
     }
 
@@ -122,6 +130,7 @@ impl DescriptorOp {
             | Self::Map { span, .. }
             | Self::Publish { span, .. }
             | Self::Protect { span, .. }
+            | Self::ProtectWindow { span, .. }
             | Self::CowRepoint { span, .. }
             | Self::Coalesce { span, .. }
             | Self::ArmCow(span)
@@ -580,7 +589,9 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         if entry == 0
             && matches!(
                 self.txn.op,
-                DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)
+                DescriptorOp::Unmap(_)
+                    | DescriptorOp::Retire(_)
+                    | DescriptorOp::ProtectWindow { .. }
             )
         {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
@@ -592,6 +603,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             && remaining >= bytes
             && match self.txn.op {
                 DescriptorOp::Protect { .. }
+                | DescriptorOp::ProtectWindow { .. }
                 | DescriptorOp::ArmCow(_)
                 | DescriptorOp::Retire(_)
                 | DescriptorOp::Unmap(_)
@@ -749,6 +761,14 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 return Err(DescriptorRefusal::WrongBacking);
             }
             DescriptorOp::Unmap(_) => 0,
+            // A window page is the file's own page, resident for the run:
+            // only its access bits change. Private custody takes `Protect`.
+            DescriptorOp::ProtectWindow { permissions: p, .. } => {
+                if entry & PRESENT == 0 || entry & PRIVATE != 0 || entry & COW != 0 {
+                    return Err(DescriptorRefusal::WrongBacking);
+                }
+                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
+            }
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
         };
         check_leaf_privilege_matches_range(UserVa::new(self.txn.op.span().va + offset), new)?;
@@ -865,6 +885,7 @@ impl DescriptorTxn<'_> {
                 old, new, backing, ..
             } => (old.raw(), new.raw(), 0, Some(backing)),
             DescriptorOp::Unmap(_) => (0, 0, 0, None),
+            DescriptorOp::ProtectWindow { permissions: p, .. } => (0, 0, permissions(p), None),
             DescriptorOp::Retire(_) => (0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (size.bytes(), 0, 0, None),
         };

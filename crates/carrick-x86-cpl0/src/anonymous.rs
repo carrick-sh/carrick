@@ -697,6 +697,41 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
         )
         .map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)
     }
+    fn protect_window_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        use carrick_mmu_core::aarch64::GuestPermissionEditError;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+        let register = RootGpa::page_aligned(FrameGpa::new(root.raw()))
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let range = UserRange::checked(UserVa::new(edit.va), GuestLen::new(edit.len))
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let context = self
+            .words
+            .context
+            .filter(|context| context.root == register)
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        let generation = self
+            .sequence
+            .as_ref()
+            .ok_or(GuestPermissionEditError::NotPrivateAnonymous)?;
+        match carrick_el1::memory::protect_x86_window(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+            &edit,
+        ) {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {
+                Err(GuestPermissionEditError::NotPrivateAnonymous)
+            }
+            DescriptorOutcome::Indeterminate(_) => fatal_reservation(),
+        }
+    }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
