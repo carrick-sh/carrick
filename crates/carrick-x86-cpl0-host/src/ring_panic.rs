@@ -4,7 +4,7 @@
 //! ring cannot carry there: the return addresses of the panicking CPU's
 //! kernel stack, read through the stopped CPU's own page tables. They name
 //! the panic's callers; resolve them against the CPL0 image, for example
-//! `addr2line -fipCe target/x86_64-unknown-none/release/carrick-x86-cpl0`.
+//! `addr2line -fipCe target/x86_64-unknown-none/el1-image/carrick-x86-cpl0`.
 
 use crate::carrier_memory::{CarrierMemory, CarrierMemoryIo};
 use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
