@@ -675,6 +675,7 @@ pub(super) fn park_contended_fault(
         park_object_record_rechecked, space_access,
     };
     use carrick_sched_core::Waker;
+    use carrick_sched_core::spaces::EditAdmissionRefusal;
     if !matches!(
         cause,
         SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
@@ -722,7 +723,13 @@ pub(super) fn park_contended_fault(
                     drop(editor);
                     Some(None)
                 }
-                Err(refusal) => refusal.wait_cause().map(Some),
+                Err(EditAdmissionRefusal::Editor) => Some(Some(SpaceWaitCause::Editor)),
+                // As the owner fault path: a closed target waits on its
+                // gate key until it opens or its source publishes terminal.
+                Err(EditAdmissionRefusal::Gate | EditAdmissionRefusal::Closed) => {
+                    Some(Some(SpaceWaitCause::Gate))
+                }
+                Err(EditAdmissionRefusal::Stale) => None,
             }
         },
         |key, snapshot, fallback| {

@@ -61,7 +61,7 @@ vm_free = [
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
   "carrick-mmu-core::x86::descriptor_txn::tests::fork_armed_prepared_leaf_publishes_for_write_and_stays_cow_armed (#2226 cause A: publication preserves COW until the retried private write)",
-  "carrick-sched-core::edit_admission_closure::{editor_admission_classifies_closure_apart_from_a_counted_pause,source_free_admission_classifies_closure_apart_from_a_counted_pause} (#2986: the fault path's editor contention reads refusals through wait_cause, so a closed space declines instead of waiting on a gate that never lowers)",
+  "carrick-sched-core::edit_admission_closure::{editor_admission_classifies_closure_apart_from_a_counted_pause,source_free_admission_classifies_closure_apart_from_a_counted_pause} (#2986: the admission types a closed space apart from a counted pause; the owner fault path names both and waits on the gate key, which the entry's open or its source's terminal publication releases)",
 ]
 embed = [
   "carrick-embed::el1_sched (signed; el1_memory_fault_entry_preserves_context verifies stage-1 permission fault entry, SIGSEGV si_addr accuracy, mprotect retry, complete register canary preservation, and positive fault_taken counter in live carrier)",
