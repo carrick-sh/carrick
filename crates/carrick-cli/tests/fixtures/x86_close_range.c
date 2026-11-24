@@ -19,7 +19,9 @@
 // (the root sees it closed) and then b with CLOSE_RANGE_UNSHARE, which
 // closes b in the thread's private copy only. One line reports the
 // thread's two return values, its own F_GETFD of b, and the root's F_GETFD
-// of b and b+1 after the thread is done. The root exits 7. No libc: raw
+// of b and b+1 after the thread is done. Last, a fork child's leader
+// raw-exits beside its one worker, whose CLOSE_RANGE_UNSHARE of b is then a
+// plain range (one `l` line). The root exits 7. No libc: raw
 // syscalls only; the thread is a raw `clone` on a mapped stack.
 static long sc(long n, long a, long b, long c, long d, long e, long f) {
     register long r10 __asm__("r10") = d;
@@ -147,6 +149,55 @@ static void threads(void) {
     sc(1, 1, (long)line, at - line, 0, 0, 0);
 }
 
+// A fork child whose leader raw-exits (SYS_exit) while its one worker
+// thread lives (#2949 review P0-1): the worker is then the table's only
+// user, so its CLOSE_RANGE_UNSHARE is a plain range on Linux (0, b closed).
+// The leader's clear-tid word ends the worker's bounded wait; if it never
+// clears, the bound passes with the leader long gone all the same.
+static volatile int leader_word;
+
+static void lone(void *unused) {
+    (void)unused;
+    long interval[2] = {0, 2000000L};
+    for (int waited = 0; leader_word != 0 && waited < 500; waited++) sc(35, (long)interval, 0, 0, 0, 0, 0);
+    long interval_settle[2] = {0, 20000000L};
+    sc(35, (long)interval_settle, 0, 0, 0, 0, 0);
+    char line[96];
+    char *at = line;
+    const char *what = "l unshare=";
+    while (*what) *at++ = *what++;
+    put_num(&at, sc(436, base, base, CLOSE_RANGE_UNSHARE, 0, 0, 0));
+    what = " own=";
+    while (*what) *at++ = *what++;
+    put_num(&at, sc(72, base, 1, 0, 0, 0, 0));
+    *at++ = ' ';
+    put_num(&at, sc(72, base + 1, 1, 0, 0, 0, 0));
+    *at++ = '\n';
+    sc(1, 1, (long)line, at - line, 0, 0, 0);
+    sc(231, 0, 0, 0, 0, 0, 0);
+}
+
+static void leader_exit(void) {
+    long pid = sc(57, 0, 0, 0, 0, 0, 0); // fork
+    if (pid == 0) {
+        int fds[2];
+        if (sc(293, (long)fds, 0, 0, 0, 0, 0) != 0) sc(231, 89, 0, 0, 0, 0, 0);
+        base = fds[0];
+        leader_word = (int)sc(186, 0, 0, 0, 0, 0, 0); // gettid
+        sc(218, (long)&leader_word, 0, 0, 0, 0, 0);    // set_tid_address
+        long stack = sc(9, 0, 65536, 3, 0x22, -1, 0);
+        if (stack < 0 && stack > -4096) sc(231, 88, 0, 0, 0, 0, 0);
+        long *top = (long *)(stack + 65536) - 2;
+        top[0] = 0;
+        top[1] = (long)lone;
+        if (thread_spawn(CLONE_THREAD_FLAGS, top) < 0) sc(231, 87, 0, 0, 0, 0, 0);
+        sc(60, 0, 0, 0, 0, 0, 0); // the leader's raw exit
+    }
+    if (pid < 0) sc(231, 86, 0, 0, 0, 0, 0);
+    int status = -1;
+    if (sc(61, pid, (long)&status, 0, 0, 0, 0) != pid || status != 0) sc(231, 85, 0, 0, 0, 0, 0);
+}
+
 void start_c(long *sp) {
     (void)sp;
     long pid = sc(57, 0, 0, 0, 0, 0, 0); // fork
@@ -159,6 +210,7 @@ void start_c(long *sp) {
     if (sc(61, pid, (long)&status, 0, 0, 0, 0) != pid || status != 0) sc(231, 94, 0, 0, 0, 0, 0);
     sequence('r');
     threads();
+    leader_exit();
     sc(231, 7, 0, 0, 0, 0, 0);
 }
 __asm__(".globl _start\n_start:\n mov %rsp,%rdi\n and $-16,%rsp\n call start_c\n hlt\n");
