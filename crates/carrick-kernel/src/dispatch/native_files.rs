@@ -2453,6 +2453,61 @@ mod tests {
         );
     }
 
+    impl Fixture {
+        /// The ring's `epoll_create1` (a zone epoll record and its
+        /// descriptor) and its `EPOLL_CTL_ADD` of native socket `sock` for
+        /// `events`, forwarded to the carrier as the ring forwards it.
+        fn zone_epoll_watching(
+            &self,
+            sock: i64,
+            events: u32,
+        ) -> carrick_el1_abi::ipc::IpcObjectHandle {
+            let fixture = self;
+            let region = fixture.owner.region();
+            let epoll = region
+                .create_epoll(&crate::el1_zone::TestRegionWait)
+                .unwrap();
+            region
+                .ensure_table_capacity(fixture.ring_fd(), 64, &crate::el1_zone::TestRegionWait)
+                .unwrap();
+            let epfd = region
+                .fd(crate::el1_zone::TestRegionWait)
+                .open(
+                    fixture.ring_fd(),
+                    fd::Fd(0),
+                    fd::Description::new(
+                        carrick_el1_abi::ipc::IpcBacking::Epoll { object: epoll }.encode(),
+                        fd::AccessMode::ReadWrite,
+                        fd::StatusFlags::default(),
+                    ),
+                    false,
+                )
+                .unwrap();
+            // `EPOLL_CTL_ADD` of the socket, as the ring forwards it.
+            let mut ctl = vec![0u8; host_file::record_len(0, 0).unwrap()];
+            host_file::encode(
+                &mut ctl,
+                HostFileHeader {
+                    op: HostFileOp::EpollSocketCtl,
+                    table: fixture.table,
+                    fd: epfd.0,
+                    flags: events,
+                    args: [carrick_abi::LINUX_EPOLL_CTL_ADD, sock as u64, 0x5eed, 0],
+                },
+                &[],
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                fixture.result(None, ctl).0,
+                0,
+                "EPOLL_CTL_ADD of the socket"
+            );
+            assert!(fixture.owner.existing_native_socket_epolls().is_some());
+            epoll
+        }
+    }
+
     /// #2955 (#2988 confirming review P0): a native socket's final release
     /// (`NativeNetFile::drop`, after the carrier's `release` of its backing)
     /// deletes each of its zone-epoll registrations under that epoll's IPC
@@ -2514,48 +2569,8 @@ mod tests {
             ),
         );
         assert!(sock >= 0, "a native UDP socket: {sock}");
-        // The ring's `epoll_create1`: a zone epoll record and its descriptor.
         let region = fixture.owner.region();
-        let epoll = region
-            .create_epoll(&crate::el1_zone::TestRegionWait)
-            .unwrap();
-        region
-            .ensure_table_capacity(fixture.ring_fd(), 64, &crate::el1_zone::TestRegionWait)
-            .unwrap();
-        let epfd = region
-            .fd(crate::el1_zone::TestRegionWait)
-            .open(
-                fixture.ring_fd(),
-                fd::Fd(0),
-                fd::Description::new(
-                    carrick_el1_abi::ipc::IpcBacking::Epoll { object: epoll }.encode(),
-                    fd::AccessMode::ReadWrite,
-                    fd::StatusFlags::default(),
-                ),
-                false,
-            )
-            .unwrap();
-        // `EPOLL_CTL_ADD` of the socket, as the ring forwards it.
-        let mut ctl = vec![0u8; host_file::record_len(0, 0).unwrap()];
-        host_file::encode(
-            &mut ctl,
-            HostFileHeader {
-                op: HostFileOp::EpollSocketCtl,
-                table: fixture.table,
-                fd: epfd.0,
-                flags: carrick_el1_abi::ipc::epoll::events::IN,
-                args: [carrick_abi::LINUX_EPOLL_CTL_ADD, sock as u64, 0x5eed, 0],
-            },
-            &[],
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            fixture.result(None, ctl).0,
-            0,
-            "EPOLL_CTL_ADD of the socket"
-        );
-        assert!(fixture.owner.existing_native_socket_epolls().is_some());
+        let epoll = fixture.zone_epoll_watching(sock, carrick_el1_abi::ipc::epoll::events::IN);
         // The frozen holder: the epoll's object lock is taken and never
         // released, as by a vCPU stopped inside the ring's epoll section.
         std::mem::forget(
@@ -2591,6 +2606,65 @@ mod tests {
         );
         // One step meets the held lock: the socket's epoll delete.
         assert_eq!(fixture.owner.quarantined_teardowns(), 1);
+    }
+
+    /// #2988 fix round 3: the carrier's reactor stays up after the executor
+    /// pool has stopped guest execution, and a host socket event it then
+    /// samples publishes into its zone epoll under that epoll's IPC object
+    /// lock. A ring section cut off when its vCPU stopped keeps that lock
+    /// forever: the sample must settle as a counted quarantine (the carrier
+    /// is gone, no waiter runs again), never `carrick_fatal!` (as at
+    /// `9f879446e`) and never a spin (as before it). Production entries: the
+    /// native child's `socket`, `connect`, `sendto` and `EPOLL_CTL_ADD`
+    /// records, the run's carrier reactor, and a real datagram from a peer.
+    #[test]
+    fn serial_reactor_socket_event_after_the_stop_quarantines_an_epoll_lock_a_stopped_vcpu_holds() {
+        use carrick_personality_linux::crossing::nr;
+        // The region keeps the frozen lock: its teardown, and the reactor's,
+        // stay out of the test.
+        let fixture = std::mem::ManuallyDrop::new(fixture());
+        let kernel = Arc::clone(fixture.dispatcher.kernel_binding.read().kernel());
+        let service =
+            std::mem::ManuallyDrop::new(crate::kernel::continuation::CarrierWaitService::new(
+                Arc::new(crate::kernel::Scheduler::new(kernel)),
+            ));
+        service.serve_host_readiness();
+        // A peer that answers only when told to: its answer is the host
+        // event the reactor meets after the stop.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let sock = fixture.net_connected(2, peer.local_addr().unwrap());
+        let query = b"q";
+        let args = [sock, query.as_ptr() as u64, 1, 0, 0, 0];
+        assert_eq!(fixture.net_call(nr::SENDTO, args), 1);
+        let mut received = [0u8; 8];
+        let (_, child) = peer.recv_from(&mut received).unwrap();
+        let region = fixture.owner.region();
+        let epoll =
+            fixture.zone_epoll_watching(sock as i64, carrick_el1_abi::ipc::epoll::events::IN);
+        assert_eq!(fixture.owner.quarantined_teardowns(), 0);
+        // The frozen holder: a vCPU stopped inside the ring's epoll section.
+        std::mem::forget(
+            region
+                .lock(epoll, &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
+        // ExecutorPool::shutdown after joining every worker.
+        fixture.owner.stop_guest_execution();
+        // The answer arrives: the socket turns readable on the host.
+        peer.send_to(b"R", child).unwrap();
+        // The reactor samples it once; the bound only reports a reactor
+        // that never settled (it died in `carrick_fatal!`, or it spins).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fixture.owner.quarantined_teardowns() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Each sample that meets the lock counts once (one edge here).
+        assert!(
+            fixture.owner.quarantined_teardowns() >= 1,
+            "the reactor's sample of a socket event after the stop settles as a quarantine"
+        );
     }
 
     /// #2414, director ruling Q3: `read(2)`, `write(2)` and `fstat(2)` of a
