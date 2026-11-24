@@ -2910,13 +2910,54 @@ mod serial_host {
         );
     }
 
-    fn ptrace_stop_and_detach_all_threads(carrier_pid: i32) -> usize {
+    /// Kills a carrier's exclusive process group when a witness ends early,
+    /// so a failed assertion never leaves a stopped or running carrier.
+    struct CarrierGroup(i32);
+
+    impl CarrierGroup {
+        /// The carrier was reaped: its group id may be reused, so never
+        /// signal it again.
+        fn reaped(self) {
+            std::mem::forget(self);
+        }
+    }
+
+    impl Drop for CarrierGroup {
+        fn drop(&mut self) {
+            // SAFETY: the group was created for this test's child; SIGKILL
+            // ends even a ptrace-stopped member. ESRCH after reaping is fine.
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// Wait for one seized thread's ptrace stop with a bound, never a
+    /// blocking `waitpid`. `None`: no stop within the bound.
+    fn wait_ptrace_stop(tid: libc::pid_t, deadline: Instant) -> Option<libc::c_int> {
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: non-blocking wait for a thread this process traces.
+            let waited = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if waited == tid {
+                return libc::WIFSTOPPED(status).then_some(status);
+            }
+            if waited != 0 || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Seize every carrier thread, interrupt each into a ptrace stop, and
+    /// detach. Returns how many threads were stopped and then successfully
+    /// detached (running again); any thread that stopped but failed to
+    /// detach is an error, since it would leave the carrier stopped.
+    fn ptrace_stop_and_detach_all_threads(carrier_pid: i32) -> Result<usize, String> {
         const PTRACE_SEIZE: libc::c_uint = 0x4206;
         const PTRACE_INTERRUPT: libc::c_uint = 0x4207;
 
         let task_dir = format!("/proc/{carrier_pid}/task");
         let Ok(entries) = std::fs::read_dir(&task_dir) else {
-            return 0;
+            return Ok(0);
         };
         let mut tids = Vec::new();
         for entry in entries.flatten() {
@@ -2928,34 +2969,51 @@ mod serial_host {
                 }
             }
         }
-        let mut stopped = Vec::with_capacity(tids.len());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut detached = 0usize;
+        let mut failures = Vec::new();
         for tid in tids {
             // SAFETY: `tid` was seized above by this parent test process.
-            if unsafe { libc::ptrace(PTRACE_INTERRUPT, tid, 0, 0) } != 0 {
-                unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
-                continue;
-            }
-            let mut status: libc::c_int = 0;
-            // SAFETY: bounded wait for the seized thread's interrupt stop.
-            let waited = unsafe { libc::waitpid(tid, &mut status, libc::__WALL) };
-            if waited == tid && libc::WIFSTOPPED(status) {
-                let inject = if (status >> 16) != 0 {
+            let interrupted = unsafe { libc::ptrace(PTRACE_INTERRUPT, tid, 0, 0) } == 0;
+            let stop = if interrupted {
+                wait_ptrace_stop(tid, deadline)
+            } else {
+                None
+            };
+            // Preserve a non-event signal that raced the interrupt.
+            let inject = stop.map_or(0, |status| {
+                if (status >> 16) != 0 {
                     0
                 } else {
                     libc::WSTOPSIG(status)
-                };
-                stopped.push((tid, inject));
-            } else {
-                unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
+                }
+            });
+            // SAFETY: detaches a thread this process seized.
+            let released = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, inject) } == 0;
+            match (stop.is_some(), released) {
+                (true, true) => detached += 1,
+                (true, false) => failures.push(format!(
+                    "thread {tid} stopped but PTRACE_DETACH failed: {}",
+                    std::io::Error::last_os_error()
+                )),
+                // A thread that exited was not counted. One that is still
+                // alive but neither stopped nor released is a failure.
+                (false, false)
+                    if std::path::Path::new(&format!("/proc/{carrier_pid}/task/{tid}"))
+                        .exists() =>
+                {
+                    failures.push(format!(
+                        "thread {tid} did not stop within the bound and could not be detached"
+                    ))
+                }
+                (false, _) => {}
             }
         }
-        let count = stopped.len();
-        for (tid, inject) in stopped {
-            // SAFETY: detaches each interrupted thread, preserving any non-event
-            // signal that raced the interrupt.
-            unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, inject) };
+        if failures.is_empty() {
+            Ok(detached)
+        } else {
+            Err(failures.join("; "))
         }
-        count
     }
 
     fn wait_carrier_job_state(child: &mut Child, flag: libc::c_int, what: &str) -> bool {
@@ -3043,6 +3101,7 @@ mod serial_host {
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn KVM carrier");
         let carrier_pid = child.id() as i32;
+        let group = CarrierGroup(carrier_pid);
         let mut stdout_pipe = child.stdout.take().expect("piped stdout");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
 
@@ -3087,6 +3146,7 @@ mod serial_host {
                 unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
                 let _ = child.wait();
             }
+            group.reaped();
             let out = stdout_reader.join().unwrap_or_default();
             let err = stderr_reader.join().unwrap_or_default();
             assert!(
@@ -3117,7 +3177,8 @@ mod serial_host {
                     break;
                 }
             } else {
-                let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid);
+                let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid)
+                    .unwrap_or_else(|error| panic!("ptrace cycle {cycle}: {error}"));
                 if stopped_threads == 0 {
                     break;
                 }
@@ -3134,6 +3195,7 @@ mod serial_host {
             unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
             let _ = child.wait();
         }
+        group.reaped();
         let Some(status) = waited else {
             assert!(
                 waited.is_some(),
@@ -3202,6 +3264,7 @@ mod serial_host {
             .spawn()
             .expect("spawn parked KVM carrier");
         let carrier_pid = child.id() as i32;
+        let group = CarrierGroup(carrier_pid);
 
         let park_deadline = Instant::now() + Duration::from_secs(5);
         let mut parked = false;
@@ -3228,7 +3291,8 @@ mod serial_host {
             .map(|s| s.trim() == "0")
             .unwrap_or(true);
         let gdb_attached = if yama_allows_sibling {
-            std::process::Command::new("gdb")
+            Command::new("gdb")
+                .timeout(Duration::from_secs(30))
                 .args([
                     "-nx",
                     "--batch",
@@ -3246,7 +3310,8 @@ mod serial_host {
         } else {
             false
         };
-        let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid);
+        let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid)
+            .unwrap_or_else(|error| panic!("ptrace stop/detach: {error}"));
         assert!(
             gdb_attached || stopped_threads >= 2,
             "neither gdb nor direct ptrace attached to live carrier threads (gdb_attached={gdb_attached}, stopped_threads={stopped_threads})"
@@ -3258,6 +3323,7 @@ mod serial_host {
             let output = child
                 .wait_with_output()
                 .expect("collect failed carrier output");
+            group.reaped();
             assert!(
                 early.is_none(),
                 "carrier died after debugger detach instead of staying parked (gdb_attached={gdb_attached}, stopped_threads={stopped_threads}, status={early_status:?}): {}",
@@ -3269,6 +3335,7 @@ mod serial_host {
         // SAFETY: exclusive process group created for this child.
         unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
         let output = child.wait_with_output().expect("reap killed carrier");
+        group.reaped();
         assert_eq!(output.status.signal(), Some(libc::SIGKILL));
     }
 }
