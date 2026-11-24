@@ -3418,7 +3418,9 @@ fn mounted_static_x86_netlink_sockets_match_native() {
 /// hold reaches the child, and the child's receive leaves it set for the
 /// root, as on Linux, where the flag is the shared description's. Socket
 /// receive and send timeouts that must wait answer EAGAIN when they pass,
-/// and a write within a receive timeout wakes the receive (#2878). Each wait is bounded by a
+/// and a write within a receive timeout wakes the receive (#2878). A signal
+/// interrupting a timed receive or send answers EINTR even under
+/// `SA_RESTART`, never a restart (#2920). Each wait is bounded by a
 /// receive timeout, a poll timeout or the other process's later write, so
 /// a lost wake prints a wrong line against the oracle instead of hanging.
 #[test]

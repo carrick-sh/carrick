@@ -22,7 +22,12 @@
 //      root's receive under a longer one is woken by the child's write;
 //   f: a send that must wait (#2878): the child fills the root's inherited
 //      connection without blocking, then its send under a short
-//      SO_SNDTIMEO answers EAGAIN, as nobody reads the other end.
+//      SO_SNDTIMEO answers EAGAIN, as nobody reads the other end;
+//   g, h: a signal interrupts a timed socket wait (#2920). The child has a
+//      SIGUSR1 handler installed with SA_RESTART. Its receive under a 2 s
+//      SO_RCVTIMEO (g), then its send into the full buffer under a 2 s
+//      SO_SNDTIMEO (h), are each interrupted by the root's kill: Linux
+//      answers EINTR, never a restart (signal(7)), and runs the handler.
 // Every line is `who.name result`, where a failure prints as `-errno`; the
 // native run is the oracle. The root prints after the child exits, so the
 // processes' lines never interleave.
@@ -32,6 +37,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -59,6 +65,12 @@ static void record(const char *name, long ret) {
         later[nlater].ret = call(ret);
         nlater++;
     }
+}
+
+static volatile int handled;
+static void on_usr1(int signo) {
+    (void)signo;
+    handled++;
 }
 
 static void pause_ms(long ms) {
@@ -99,6 +111,11 @@ int main(void) {
     pid_t pid = fork();
     if (pid == 0) {
         who = "child";
+        struct sigaction restart;
+        memset(&restart, 0, sizeof restart);
+        restart.sa_handler = on_usr1;
+        restart.sa_flags = SA_RESTART;
+        value("g.sigaction", sigaction(SIGUSR1, &restart, NULL));
         close(listener);
         close(pipe_fds[1]);
         int sock = (int)call(syscall(SYS_socket, AF_INET, SOCK_STREAM, 0));
@@ -159,6 +176,24 @@ int main(void) {
         ready.revents = 0;
         value("e.poll", syscall(SYS_poll, &ready, 1, 3000));
         value("e.done", syscall(SYS_read, pipe_fds[0], &byte, 1));
+        // Rows g and h: the root's two kills land in these timed waits.
+        struct timeval patient = {2, 0};
+        value("g.rcvtimeo", syscall(SYS_setsockopt, sock, SOL_SOCKET, SO_RCVTIMEO, &patient, sizeof patient));
+        value("g.recv", syscall(SYS_recvfrom, sock, &byte, 1, 0, NULL, NULL));
+        value("g.handled", handled);
+        // Refill: the buffer row f filled has room again by now.
+        filled = 0;
+        for (int i = 0; i < 100000; i++) {
+            long sent = syscall(SYS_sendto, shared_peer, chunk, sizeof chunk, MSG_DONTWAIT, NULL, 0);
+            if (sent < 0) {
+                filled = call(sent);
+                break;
+            }
+        }
+        value("h.filled", filled);
+        value("h.sndtimeo", syscall(SYS_setsockopt, shared_peer, SOL_SOCKET, SO_SNDTIMEO, &patient, sizeof patient));
+        value("h.send", syscall(SYS_sendto, shared_peer, chunk, 1, 0, NULL, 0));
+        value("h.handled", handled);
         _exit(0);
     }
     close(pipe_fds[0]);
@@ -227,6 +262,11 @@ int main(void) {
     record("e.timeout", syscall(SYS_recvfrom, peer, &byte, 1, 0, NULL, NULL));
     byte = 'f';
     record("e.done", syscall(SYS_write, pipe_fds[1], &byte, 1));
+    // Rows g and h: interrupt the child's timed receive, then its timed send.
+    pause_ms(400);
+    record("g.kill", syscall(SYS_kill, pid, SIGUSR1));
+    pause_ms(400);
+    record("h.kill", syscall(SYS_kill, pid, SIGUSR1));
 
     int status = 0;
     long reaped = waitpid(pid, &status, 0) == pid ? 0 : -1;
