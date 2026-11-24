@@ -958,15 +958,15 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 "carrier save check requires its exact loaded task generation",
             ));
         }
-        let image = self.io.read_image()?;
+        let cr3 = self.io.get_gpr(X86Reg::Cr3)?;
+        let rip = self.io.get_gpr(X86Reg::Rip)?;
+        let rsp = self.io.get_gpr(X86Reg::Rsp)?;
         let user_ceiling =
             carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
                 .exclusive_end();
-        Ok(
-            (image.cr3 & !0xfff) == binding.context().root.address().raw()
-                && image.rip < user_ceiling
-                && image.rsp < carrick_x86::cpl0_entry::DIRECT_VA,
-        )
+        Ok((cr3 & !0xfff) == binding.context().root.address().raw()
+            && rip < user_ceiling
+            && rsp < carrick_x86::cpl0_entry::DIRECT_VA)
     }
     /// Detach and reset the hardware CPU to its neutral image during carrier
     /// shutdown without requiring the stopped CPU to stand on a user task
@@ -1097,6 +1097,8 @@ pub(crate) mod tests {
         fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
             match reg {
                 X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
                 _ => Err(boundary_error("unused test GPR")),
             }
         }
@@ -1272,8 +1274,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -1855,8 +1862,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -2038,8 +2050,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -2230,8 +2247,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
