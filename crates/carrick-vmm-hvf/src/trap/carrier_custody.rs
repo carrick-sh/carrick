@@ -938,6 +938,17 @@ impl CarrierVmCustody {
         custody
     }
 
+    /// A live fixture whose stage 2 is `backend`, so a test can drive this
+    /// carrier's own idle and destroy entry points over a recording backend.
+    #[cfg(test)]
+    pub(crate) fn new_live_fixture_over(
+        backend: std::sync::Arc<dyn carrick_aarch64::stage2::Stage2Backend + Send>,
+    ) -> Self {
+        let mut custody = Self::new_live_fixture();
+        custody.stage2_backend = CarrierStage2Backend::for_test(backend);
+        custody
+    }
+
     pub(crate) fn begin_create(&self) -> Result<CarrierVmGeneration, CarrierVmCustodyError> {
         let mut state = self.state.lock();
         if state.lifecycle != CarrierVmLifecycle::Vacant {
@@ -2020,11 +2031,13 @@ mod carrier_vm_custody_tests {
     }
 
     /// A stage-2 backend that records every unmap it is asked for, and
-    /// refuses them while `fail_unmaps` is set.
+    /// refuses them while `fail_unmaps` is set. `on_unmap` runs once, inside
+    /// the next unmap, before it returns.
     #[derive(Default)]
     struct RecordingStage2 {
         unmaps: parking_lot::Mutex<Vec<(u64, usize)>>,
         fail_unmaps: std::sync::atomic::AtomicBool,
+        on_unmap: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl carrick_aarch64::stage2::Stage2Backend for RecordingStage2 {
@@ -2040,6 +2053,10 @@ mod carrier_vm_custody_tests {
 
         unsafe fn unmap(&self, ipa: u64, size: usize) -> carrick_aarch64::stage2::Stage2Status {
             self.unmaps.lock().push((ipa, size));
+            let hook = self.on_unmap.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             if self.fail_unmaps.load(std::sync::atomic::Ordering::SeqCst) {
                 return carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4001);
             }
@@ -2208,6 +2225,115 @@ mod carrier_vm_custody_tests {
             "the destroy settles without another unmap"
         );
         assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    /// A mapper's VM destroy that overlaps its idle unmap retry settles the
+    /// unretired lease exactly once (#2968 confirming review, P0 2): the
+    /// lease is never outside the mapper's list while the destroy drains it,
+    /// so the retry cannot requeue it after the destroy, and its reserved IPA
+    /// and backing are each released once. Both halves run through the
+    /// production entry points: the carrier's idle turn and its VM destroy.
+    ///
+    /// The destroy starts on a second thread from inside the retry's unmap.
+    /// The unmap waits a bounded time for it, then fails. Before the fix the
+    /// destroy finished inside that window, found the list empty, and the
+    /// failed retry requeued the lease onto a destroyed VM. After it, the
+    /// destroy waits for the retry turn and then settles the lease; the bound
+    /// only decides how soon the unmap gives up, never the verdict.
+    #[test]
+    fn serial_host_a_destroy_overlapping_an_idle_unmap_retry_settles_the_lease_once() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let receiver = crate::trap::test_carrier_custody();
+        let recorder = std::sync::Arc::new(RecordingStage2::default());
+        recorder
+            .fail_unmaps
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mapper = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+            std::sync::Arc::clone(&recorder) as _,
+        ));
+        let length = 0x4000_u64;
+        let mut lease = super::GlobalFrameStage2Lease::reserve(length, length)
+            .expect("reserve the lease's IPA");
+        let base = lease.key().0;
+        lease.mark_mapped(mapper.stage2_backend_handle());
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            length as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("allocate the lease's backing");
+        let host_addr = mapping.as_ptr() as usize;
+        assert!(
+            super::register_global_frame_host_owner_in(
+                &receiver,
+                lease,
+                mapping,
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            )
+            .is_err(),
+            "the receiver refuses a lease the mapper's backend mapped"
+        );
+        assert_eq!(mapper.stage2_backend_handle().unretired_lease_count(), 1);
+
+        let destroyer = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        {
+            let mapper = std::sync::Arc::clone(&mapper);
+            let destroyer = std::sync::Arc::clone(&destroyer);
+            *recorder.on_unmap.lock() = Some(Box::new(move || {
+                let (done, finished) = std::sync::mpsc::sync_channel(1);
+                *destroyer.lock() = Some(std::thread::spawn(move || {
+                    let destroyed = super::destroy_vm_with_custody_target_using(
+                        &mapper,
+                        "overlapping destroy",
+                        super::CarrierVmDestroyTarget::Live,
+                        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                        || {},
+                    );
+                    let _ = done.send(());
+                    destroyed
+                }));
+                let _ = finished.recv_timeout(std::time::Duration::from_secs(1));
+            }));
+        }
+
+        let _ =
+            super::retry_pending_global_frame_retirements_at_idle_in_using(&mapper, &mut |_, _| {
+                Ok(())
+            });
+        let destroyed = destroyer
+            .lock()
+            .take()
+            .expect("the retry's unmap started the destroy")
+            .join()
+            .expect("the destroy thread");
+
+        assert!(destroyed.is_ok(), "the mapper's VM destroy: {destroyed:?}");
+        assert_eq!(mapper.live_generation(), None);
+        assert_eq!(
+            mapper.stage2_backend_handle().unretired_lease_count(),
+            0,
+            "no lease is requeued onto the destroyed VM"
+        );
+        assert_eq!(
+            recorder.unmaps.lock().len(),
+            2,
+            "one rollback unmap and one idle retry, none after the destroy"
+        );
+        assert!(
+            !super::alias_backing_is_live(host_addr),
+            "the destroy settles the lease and frees its backing"
+        );
+        let allocator = super::global_frame_ipa_allocator().lock();
+        assert!(
+            !allocator.live.contains_key(&base),
+            "the lease's IPA is released"
+        );
+        assert!(
+            !allocator
+                .drop_release_retry
+                .iter()
+                .any(|&(retry, _)| retry == base),
+            "the IPA is released exactly once"
+        );
     }
 
     /// A test carrier's custody tears down through the production sequence
