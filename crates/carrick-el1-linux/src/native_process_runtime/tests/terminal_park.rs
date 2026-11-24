@@ -896,7 +896,8 @@ fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process<C, B>(
             "leader raw exit promoted to exit_group while sibling's reservation was refundable"
         );
         assert!(entry.take_root_exit().is_none());
-        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_handoff_receipt().is_none());
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
         assert!(entry.take_run_failure().is_none());
         assert!(matches!(
             fixture.zone.record(fixture.record.id).claim(),
@@ -1087,7 +1088,7 @@ fn refundable_peer_commit_wakes_parked_raw_exit_to_retire_process<C, B>(
         entry_leader.take_root_exit(),
         Some(LinuxWaitStatus::exited(38))
     );
-    assert!(entry_leader.take_handoff_receipt().is_some());
+    assert!(entry_leader.take_handoff_receipt().is_none());
     assert!(entry_leader.take_run_failure().is_none());
     assert!(fixture.zone.live(fixture.record).is_none());
     assert_eq!(fixture.page.live(), 0);
