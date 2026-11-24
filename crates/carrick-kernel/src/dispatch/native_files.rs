@@ -573,7 +573,10 @@ impl SyscallDispatcher {
                 super::net::native::NetServed::Reply(result, output) => {
                     Served::Reply(result, output)
                 }
-                super::net::native::NetServed::Wait(revision) => {
+                super::net::native::NetServed::Wait { revision, timed } => {
+                    if timed && !view.mark_timed_wait() {
+                        return Err(NativeHostFileRefusal);
+                    }
                     return Ok(NativeHostFileServed {
                         retained_source: None,
                         host_ready_wait: Some(revision),
@@ -588,7 +591,10 @@ impl SyscallDispatcher {
                 super::net::native::NetServed::Reply(result, output) => {
                     Served::Reply(result, output)
                 }
-                super::net::native::NetServed::Wait(revision) => {
+                super::net::native::NetServed::Wait { revision, timed } => {
+                    if timed && !view.mark_timed_wait() {
+                        return Err(NativeHostFileRefusal);
+                    }
                     return Ok(NativeHostFileServed {
                         retained_source: None,
                         host_ready_wait: Some(revision),

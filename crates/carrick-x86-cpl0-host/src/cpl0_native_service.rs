@@ -438,10 +438,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .ok()
             .and_then(|reply| reply.owner_wait(pending.ticket.request().identity.birth.mm));
         match &served {
-            // No reply was written: the member waits on its host-readiness
-            // queue and publishes the call's record again.
-            Ok(carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }) => {}
-            Ok(carrick_hal::fork_stock::NativeHostFileReply::Replied(None)) => {
+            // A reply was written, or none was and the member waits on its
+            // host-readiness queue to publish the call's record again. The
+            // pending record goes back either way: the carrier may have
+            // marked it (a socket timeout's wait, which a signal interrupts
+            // with EINTR, never a restart: #2920), and HVF's carrier writes
+            // the ring's record in place.
+            Ok(
+                carrick_hal::fork_stock::NativeHostFileReply::HostReadyWait { .. }
+                | carrick_hal::fork_stock::NativeHostFileReply::Replied(None),
+            ) => {
                 let physical = kernel_pod_physical(
                     &self.kernel_pod_storage,
                     pending.address,

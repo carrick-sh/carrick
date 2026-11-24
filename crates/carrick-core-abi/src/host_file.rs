@@ -896,6 +896,11 @@ const STATE: usize = 92;
 
 const REPLY_PENDING: u32 = 0;
 const REPLY_WRITTEN: u32 = 1;
+/// While a record's reply is pending, its result word says how the carrier
+/// parked the call: [`WAIT_TIMED`] when the wait has a deadline the carrier
+/// fixed (a socket timeout, `SO_RCVTIMEO` or `SO_SNDTIMEO`), else 0. A
+/// written reply replaces it with the call's result.
+const WAIT_TIMED: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostFileRecordError {
@@ -1012,6 +1017,12 @@ impl<'a> HostFileRequestView<'a> {
         self.header
     }
 
+    /// [`mark_timed_wait`] on this pending record: the carrier parked its
+    /// call against a deadline it fixed.
+    pub fn mark_timed_wait(self) -> bool {
+        mark_timed_wait(self.bytes)
+    }
+
     /// Replace the header's scalar arguments: the ring's own stamp of a
     /// value only it knows (for example a `Write`'s file-size limit) on a
     /// record it staged.
@@ -1045,6 +1056,24 @@ impl<'a> HostFileRequestView<'a> {
         self.bytes[STATE..STATE + 4].copy_from_slice(&REPLY_WRITTEN.to_le_bytes());
         Ok(())
     }
+}
+
+/// Carrier: mark `bytes`, a record whose reply is still pending, as a call
+/// parked against a deadline the carrier fixed (#2920): Linux answers such a
+/// wait EINTR when a signal interrupts it, even under `SA_RESTART`
+/// (signal(7)). `false` (nothing written) for any other record.
+pub fn mark_timed_wait(bytes: &mut [u8]) -> bool {
+    if record_parts(bytes, REPLY_PENDING).is_none() {
+        return false;
+    }
+    bytes[RESULT..RESULT + 8].copy_from_slice(&WAIT_TIMED.to_le_bytes());
+    true
+}
+
+/// Whether the carrier parked `bytes`'s pending call against a deadline
+/// ([`mark_timed_wait`]).
+pub fn waits_timed(bytes: &[u8]) -> bool {
+    record_parts(bytes, REPLY_PENDING).is_some() && read_u64(bytes, RESULT) == Some(WAIT_TIMED)
 }
 
 /// The reply the ring reads back after acknowledgment.

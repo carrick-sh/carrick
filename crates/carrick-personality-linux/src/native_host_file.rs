@@ -3069,13 +3069,19 @@ pub fn request_again(record: &[u8]) -> Option<Box<[u8]>> {
     let (header, input, output_cap) = host_file::request_parts(record)?;
     let mut again = vec![0u8; record_len(input.len(), output_cap)?].into_boxed_slice();
     host_file::encode(&mut again, header, input, output_cap).ok()?;
+    // A socket timeout is the call's, across its records: a signal before
+    // the carrier parks the next one still finds the call timed.
+    if host_file::waits_timed(record) && !host_file::mark_timed_wait(&mut again) {
+        return None;
+    }
     Some(again)
 }
 
 /// Whether Linux restarts `record`'s call under `SA_RESTART` when a signal
 /// interrupts it before any effect (signal(7)): a socket call, a read or a
-/// write of a slow object, never a poll. The canonical number is the
-/// record's own, whatever the caller's ISA.
+/// write of a slow object, never a poll, and never a socket wait under a
+/// timeout the carrier fixed ([`host_file::waits_timed`], #2920). The
+/// canonical number is the record's own, whatever the caller's ISA.
 pub fn restarts_after_interrupt(record: &[u8]) -> bool {
     let Some((header, input, _)) = host_file::request_parts(record) else {
         return false;
@@ -3089,6 +3095,16 @@ pub fn restarts_after_interrupt(record: &[u8]) -> bool {
         HostFileOp::Write => crate::crossing::nr::WRITE.raw(),
         _ => return false,
     };
+    let timeout = if host_file::waits_timed(record) {
+        carrick_signal_core::wait::SocketWaitTimeout::Timed
+    } else {
+        carrick_signal_core::wait::SocketWaitTimeout::Untimed
+    };
+    if timeout == carrick_signal_core::wait::SocketWaitTimeout::Timed
+        && carrick_signal_core::wait::is_timeout_sensitive_socket_call(canonical)
+    {
+        return false;
+    }
     carrick_signal_core::is_native_restartable_syscall(canonical)
 }
 
