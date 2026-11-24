@@ -1478,9 +1478,8 @@ pub(crate) fn cpu_clock_ns(cpu: carrick_abi::LinuxCpuClock) -> Option<u64> {
     use carrick_abi::{LinuxCpuClockOwner as Owner, LinuxCpuSample};
     let user_only = cpu.sample == LinuxCpuSample::Virt;
     super::resources::with_active_context(|context| {
-        let caller_tid = u32::try_from(context.thread().key().tid.raw())
-            .ok()
-            .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(context, tid))
+        // The caller's tid in its own pid namespace, what gettid(2) reports.
+        let caller_tid = crate::namespace::pid::ns_visible_guest_tid(context)
             .and_then(core::num::NonZeroU32::new)?;
         let thread_ns = |thread: &crate::kernel::Thread| {
             if user_only {
