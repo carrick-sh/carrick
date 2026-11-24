@@ -43,6 +43,12 @@ pub enum MmError {
     /// ([`crate::mm::fork::ForkError::ParentChanged`]): contention, the
     /// fork reruns from a fresh snapshot.
     ParentChanged,
+    /// A fork's parent has a guest copy-on-write completion its carrier
+    /// has not settled: contention. The fork's venue asks its carrier to
+    /// settle the MM's completions and reruns after that settlement (or
+    /// after the release of the editor that kept it from settling), never
+    /// on a bare retry (#2947).
+    CowUnsettled,
     Wait(carrick_core_abi::PortalOwnerWait),
     NoMemory,
     MetadataRequired,

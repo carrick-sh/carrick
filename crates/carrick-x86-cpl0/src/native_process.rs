@@ -441,6 +441,49 @@ impl Service {
         })
     }
 
+    /// A fork refused because its parent has guest COW completions the
+    /// carrier has not settled, with its editor, index and loan already
+    /// released (`refusal`). Ring the MM's settlement crossing now. The
+    /// carrier settles under its own exclusion, so a completion still in
+    /// the pool afterwards means it met the MM's editor held on the other
+    /// CPU: the fork then waits for that editor's release, observed before
+    /// the crossing decided, so a release in between reruns it at once.
+    /// A settled parent reruns at once as carrier work (Busy once, then
+    /// success, #2947).
+    fn settle_parent_cow(
+        &self,
+        owner: &Portal,
+        cow: &carrick_el1_abi::CowGrantPool,
+        request: carrick_el1_abi::PortalForkRequest,
+        refusal: NativeProcessError,
+    ) -> NativeProcessError {
+        if refusal != NativeProcessError::Busy {
+            return refusal;
+        }
+        let mm = request.operation.mm;
+        #[cfg(feature = "test-support")]
+        if let Some(zone) = owner.zone {
+            crate::test_support::hold_editor_for_fork_cow_settle(zone, self.worker(), mm.raw());
+        }
+        let Some((editor, _)) =
+            owner.fork_parent_editor(mm, request.operation.incarnation, self.worker())
+        else {
+            // The parent was retired or replaced: the rerun refuses it.
+            return NativeProcessError::Busy;
+        };
+        carrick_x86_carrier::entry::cross_owner_grant(
+            carrick_guest_arch::CpuId::new(self.worker()),
+            carrick_guest_arch::UserVa::new(0),
+        );
+        if cow.has_completions_for(mm.raw()) {
+            NativeProcessError::OwnerWait(editor)
+        } else {
+            #[cfg(feature = "test-support")]
+            crate::test_support::record_fork_cow_settled();
+            NativeProcessError::Busy
+        }
+    }
+
     /// The part of `prepare_mm_start` after the stock crossing granted
     /// `loan`. Every error frees the space index it took and returns the
     /// loan ([`abandon_loan`]), so a failed fork never strands this CPU's
@@ -494,8 +537,16 @@ impl Service {
             Ok(scratch) => scratch,
             Err(e) => return Err(free(child_space, refused(NativeForkStage::Scratch, e))),
         };
-        let plan = match owner.prepare_fork(loan.request, scratch, live, self.worker()) {
+        let cow = match carrick_el1_linux::mm_portal::carrier_cow_pool() {
+            Ok(cow) => cow,
+            Err(e) => return Err(free(child_space, refused(NativeForkStage::Prepare, e))),
+        };
+        let plan = match owner.prepare_fork(loan.request, scratch, live, cow, self.worker()) {
             Ok(plan) => plan,
+            Err(carrick_core::mm::transaction::MmError::CowUnsettled) => {
+                let refusal = free(child_space, NativeProcessError::Busy);
+                return Err(self.settle_parent_cow(owner, cow, loan.request, refusal));
+            }
             Err(e) => return Err(free(child_space, refused(NativeForkStage::Prepare, e))),
         };
         let mut custody = Vec::new();

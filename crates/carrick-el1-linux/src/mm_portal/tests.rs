@@ -9,6 +9,13 @@ use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
+/// A COW grant pool with no grant published: a fork's parent has no
+/// unsettled guest COW completion.
+fn no_cow() -> &'static carrick_el1_abi::CowGrantPool {
+    static NO_COW: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
+    &NO_COW
+}
+
 #[test]
 fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
     use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
@@ -2419,7 +2426,9 @@ fn fork_publication_metadata_pressure(reserve_child: bool, copy_nodes_available:
         loads: core::cell::Cell::new(0),
     };
     let plan = portal.census_fork(request, &words, 0).unwrap();
-    let plan = portal.prepare_fork(request, plan, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(request, plan, &words, no_cow(), 0)
+        .unwrap();
     let before: Vec<_> = parent_tables
         .words
         .iter()
@@ -2534,7 +2543,9 @@ fn fork_publication_metadata_pressure(reserve_child: bool, copy_nodes_available:
         .abort_import()
         .unwrap();
     let scratch = portal.census_fork(request, &words, 0).unwrap();
-    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(request, scratch, &words, no_cow(), 0)
+        .unwrap();
     let mut pending = portal.publish_fork(plan, &words, 0).unwrap();
     pending.abort(&portal, &words, 0).unwrap();
 }
@@ -2575,6 +2586,7 @@ pub(crate) fn owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_o
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -2639,6 +2651,7 @@ fn owner_fork_refuses_stale_unchanged_shared_leaf_during_custody() {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -2693,6 +2706,7 @@ fn owner_fork_refuses_outstanding_copy_and_keeps_peer_same_va_separate() {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             1
         ),
         Err(MmError::Busy)
@@ -2820,7 +2834,9 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
     let pending =
         carrick_aarch64::fork::prepare(request, &slot, &ExactParentFrames, |frame, effect| {
             let service = slot.claim().unwrap();
-            let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+            let plan = portal
+                .prepare_fork(request, scratch, &words, no_cow(), 0)
+                .unwrap();
             assert_eq!(
                 plan.custody().len(),
                 6,
@@ -2964,6 +2980,7 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -3337,7 +3354,7 @@ fn owner_fork_private_blocks_arm_in_place_without_table_work() {
     );
     assert_eq!(custody, BLOCKS, "one frame record per block");
     let plan = portal
-        .prepare_fork(fork.request, scratch, &words, 0)
+        .prepare_fork(fork.request, scratch, &words, no_cow(), 0)
         .unwrap();
     let block_custody = plan
         .custody()
@@ -3407,7 +3424,7 @@ fn owner_fork_one_gib_private_block_forks_without_table_work() {
     assert_eq!(parent_words, 0);
     assert_eq!(child_words, 4 * 512, "root, L1 and copy-window L2/L3 only");
     let plan = portal
-        .prepare_fork(fork.request, scratch, &words, 0)
+        .prepare_fork(fork.request, scratch, &words, no_cow(), 0)
         .unwrap();
     let completion = portal
         .publish_fork(plan, &words, 0)
@@ -3455,7 +3472,7 @@ fn owner_fork_private_block_splits_once_on_first_cow_write() {
     let words = fork.words();
     let scratch = portal.census_fork(fork.request, &words, 0).unwrap();
     let plan = portal
-        .prepare_fork(fork.request, scratch, &words, 0)
+        .prepare_fork(fork.request, scratch, &words, no_cow(), 0)
         .unwrap();
     portal
         .publish_fork(plan, &words, 0)
@@ -3538,7 +3555,7 @@ fn owner_fork_abort_keeps_a_block_split_by_a_pending_parent_write() {
     let words = fork.words();
     let scratch = portal.census_fork(fork.request, &words, 0).unwrap();
     let plan = portal
-        .prepare_fork(fork.request, scratch, &words, 0)
+        .prepare_fork(fork.request, scratch, &words, no_cow(), 0)
         .unwrap();
     let mut pending = portal.publish_fork(plan, &words, 0).unwrap();
     let (outcome, _) = fork.resolve(&words, VA + 0x1234, (IPA + 0x10_0000, &SPLIT_TABLES[..1]));
@@ -3593,6 +3610,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -3849,6 +3867,28 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
             arenas: &all,
             loads: core::cell::Cell::new(0),
         };
+        // The child's own COW write completed in the guest and the carrier
+        // has not settled it: its replacement leaf is not the carrier's yet.
+        // A fork arming it would break the carrier's publication (#2890's
+        // `guest MMU publication live descriptor mismatch`), so the fork is
+        // contention until the settlement below.
+        assert_eq!(
+            portal
+                .prepare_fork(
+                    request,
+                    ForkScratch::new(
+                        request,
+                        portal.fork_mapping_count(receipt.child.mm(), 0).unwrap()
+                    )
+                    .unwrap(),
+                    &words,
+                    &pool,
+                    1
+                )
+                .err(),
+            Some(MmError::CowUnsettled),
+            "an unsettled parent COW completion refuses the fork as contention"
+        );
         let mut transfer = portal
             .begin(
                 receipt.child,
@@ -3875,6 +3915,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                     )
                     .unwrap(),
                     &words,
+                    &pool,
                     1
                 ),
                 Err(MmError::Busy)
@@ -4055,6 +4096,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                 )
                 .unwrap(),
                 &words,
+                &pool,
                 1
             ),
             Err(MmError::ParentChanged)
@@ -4078,6 +4120,7 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                 )
                 .unwrap(),
                 &words,
+                &pool,
                 1,
             )
             .unwrap();
@@ -4809,6 +4852,7 @@ fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -5233,6 +5277,7 @@ fn owner_fork_live_store_failure_restores_parent_and_refuses_child() {
                 request,
                 ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
                 &words,
+                no_cow(),
                 0,
             )
             .unwrap();
@@ -5298,6 +5343,7 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -5443,6 +5489,7 @@ fn owner_fork_dontfork_omits_and_wipeonfork_retains_zero_reservation() {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -5530,6 +5577,7 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
             request,
             ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
             &words,
+            no_cow(),
             0,
         )
         .unwrap();
@@ -5657,7 +5705,9 @@ fn owner_fork_census_allocates_for_live_graph_not_physical_arena_capacity() {
     request.parent_tables.base = ROOT + 0x400000;
     let scratch = portal.census_fork(request, &words, 0).unwrap();
     assert_eq!(scratch.allocation_counts(), (2048, 0, 2048, 2));
-    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let plan = portal
+        .prepare_fork(request, scratch, &words, no_cow(), 0)
+        .unwrap();
     assert_eq!(
         plan.custody()
             .iter()
