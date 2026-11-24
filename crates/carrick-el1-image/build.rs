@@ -48,6 +48,47 @@ pub(crate) fn el1_artifact_dir(el1_target_dir: &Path) -> PathBuf {
         .join(EL1_PROFILE)
 }
 
+/// The nested `cargo build` of the `carrick-el1` image (owned by
+/// `carrick-el1-linux`) for `aarch64-unknown-none-softfloat` under the
+/// workspace `el1-image` profile, identical under every outer cargo command.
+/// `cargo clippy` hands build scripts its `RUSTC_WORKSPACE_WRAPPER`
+/// (clippy-driver), which compiles with MIR optimizations off: under clippy
+/// the image grew by about 20 KB of its 70 KB headroom (#3013, the ARM half
+/// of #3005). The image is an artifact, so it is built by rustc alone; its
+/// sources are linted by `just clippy-linux`'s own
+/// `aarch64-unknown-none-softfloat` pass.
+pub(crate) fn nested_image_build(
+    cargo: &Path,
+    el1_target_dir: &Path,
+    allocator_test_control: bool,
+) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "carrick-el1-linux",
+            "--target",
+            "aarch64-unknown-none-softfloat",
+            "--profile",
+            EL1_PROFILE,
+            "--target-dir",
+        ])
+        .arg(el1_target_dir);
+    if allocator_test_control {
+        command.args(["--features", "allocator-test-control"]);
+    }
+    // The outer build's jobserver, flags and compiler wrapper are not the
+    // image's.
+    command
+        .env_remove("CARGO_MAKEFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+    command
+}
+
 fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
     let sysroot_path = Path::new(sysroot)
         .join("lib/rustlib")
@@ -319,32 +360,13 @@ fn main() {
 
     let el1_target_dir = Path::new(&out_dir).join("el1-target");
 
-    // Build the carrick-el1 image binary (owned by carrick-el1-linux) for
-    // aarch64-unknown-none-softfloat under the workspace `el1-image` profile.
-    let mut build_cmd = Command::new(&cargo);
-    build_cmd
-        .arg("build")
-        .arg("--locked")
-        .arg("-p")
-        .arg("carrick-el1-linux")
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .arg("--profile")
-        .arg(EL1_PROFILE)
-        .arg("--target-dir")
-        .arg(&el1_target_dir);
-
-    if std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some() {
-        build_cmd.arg("--features").arg("allocator-test-control");
-    }
-
-    // Remove cargo env vars that might interfere with nested cargo invocation
-    build_cmd.env_remove("CARGO_MAKEFLAGS");
-    build_cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
-
-    let status = build_cmd
-        .status()
-        .expect("failed to invoke cargo build for carrick-el1");
+    let status = nested_image_build(
+        Path::new(&cargo),
+        &el1_target_dir,
+        std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some(),
+    )
+    .status()
+    .expect("failed to invoke cargo build for carrick-el1");
     if !status.success() {
         panic!(
             "failed to build carrick-el1 for aarch64-unknown-none-softfloat (exit code: {status})"

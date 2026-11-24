@@ -498,6 +498,11 @@ pub fn package_guest_image(
 
     cmd.env_remove("CARGO_MAKEFLAGS");
     cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+    // A guest image is an artifact built by rustc alone: an outer `cargo
+    // clippy` would otherwise compile it through clippy-driver, with MIR
+    // optimizations off and a larger image (#3013, #3005).
+    cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd.env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
 
     if !config.rustflags.is_empty() {
         cmd.env("RUSTFLAGS", config.rustflags.join(" "));
