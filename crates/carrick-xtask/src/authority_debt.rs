@@ -85,6 +85,23 @@ impl Lane {
             Self::Shared
         }
     }
+    /// The lane a cohort keyed `self` takes when a reviewed move gives it
+    /// the owner path `owner`. A source lane is the owning crate's
+    /// (`module`, the scanner's rule), so a move across crates (HVF code
+    /// moving into a shared crate) lands in the destination crate's lane. A
+    /// compiled-profile or build-time lane belongs to the build, not the
+    /// crate, and stays. Every `::` segment after the crate counts as a
+    /// module for the `x86_` rule; owner paths add only impl and item names,
+    /// which never take that prefix.
+    pub fn moved_to(self, owner: &str) -> Self {
+        if self.is_profile() || self == Self::BuildTime {
+            return self;
+        }
+        let mut segments = owner.split("::");
+        let krate = segments.next().unwrap_or_default();
+        let modules: Vec<String> = segments.map(str::to_owned).collect();
+        Self::module(krate, &modules)
+    }
     pub fn profile(profile: &str) -> Result<Self, DebtError> {
         serde_json::from_value(Value::String(profile.replace('-', "_"))).map_err(DebtError::Json)
     }
@@ -217,6 +234,7 @@ impl AuthorityDebtCeilings {
                 |key| key.owner.as_str(),
                 |key, owner| Key {
                     owner: owner.to_owned(),
+                    lane: key.lane.moved_to(owner),
                     ..key.clone()
                 },
             )
