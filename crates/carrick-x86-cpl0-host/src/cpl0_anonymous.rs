@@ -341,6 +341,59 @@ pub fn fail_carrier_resched_for_test() {
     FAIL_CARRIER_RESCHED.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// #2941 witness seam (test-support only): the next native backing plan's
+/// own exclusion of its MM finds the MM's editor held by a real maintenance
+/// borrow, admitted under the caller's outer exclusion as
+/// `try_begin_maintenance_edit` allows. The borrow is released through its
+/// production release right after that probe.
+#[cfg(feature = "test-support")]
+pub(super) mod plan_editor_hold {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static HOLDS: AtomicU64 = AtomicU64::new(0);
+    /// The borrower: no member of the zone.
+    const HOLDER: NonZeroU64 = NonZeroU64::MAX;
+
+    pub(in super::super) fn take<'a>(
+        venue: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
+        mm: NonZeroU64,
+    ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, carrick_sched_core::ParkedContextWords>>
+    {
+        if !ARMED.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let index = venue.zone.spaces.find(mm.get())?;
+        let editor = venue
+            .zone
+            .spaces
+            .try_begin_maintenance_edit(index, mm.get(), HOLDER, Some(venue))
+            .ok()?;
+        HOLDS.fetch_add(1, Ordering::AcqRel);
+        Some(editor)
+    }
+    pub(in super::super) fn arm() {
+        ARMED.store(true, Ordering::Release);
+    }
+    pub(in super::super) fn holds() -> u64 {
+        HOLDS.load(Ordering::Acquire)
+    }
+}
+
+/// Arm [`plan_editor_hold`] for the next native backing plan in this
+/// process (test-support only).
+#[cfg(feature = "test-support")]
+pub fn hold_editor_at_next_backing_plan_for_test() {
+    plan_editor_hold::arm();
+}
+
+/// Backing plans whose own exclusion met the armed maintenance borrow.
+#[cfg(feature = "test-support")]
+pub fn backing_plan_editor_holds_for_test() -> u64 {
+    plan_editor_hold::holds()
+}
+
 /// The carrier-scoped zone host IPC releases wake into (#2031). The zone
 /// and APIC routes live in guest RAM this sink retains; the host IPC owner
 /// delivers through it when no process-global zone serves.
@@ -2787,16 +2840,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 '_,
                 carrick_sched_core::ParkedContextWords,
             >| wake.deliver(zone, waker, owned);
-            let pause = self.settled_pause_or_fail(
-                SpaceReleaseVenue {
-                    zone,
-                    waker: Waker::Host,
-                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                        &delivery,
-                    ),
-                },
-                mm.get(),
-            )?;
+            let venue = SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                    &delivery,
+                ),
+            };
+            #[cfg(feature = "test-support")]
+            let maintenance = plan_editor_hold::take(venue, mm);
+            let pause = self.settled_pause_or_fail(venue, mm.get())?;
+            #[cfg(feature = "test-support")]
+            drop(maintenance);
             let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
                 self._vm.admit_guest_edit(native).map_err(|error| fail(error.to_string()))?;
                 Ok(carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)

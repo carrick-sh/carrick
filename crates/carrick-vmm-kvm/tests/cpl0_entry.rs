@@ -4731,7 +4731,68 @@ die:
 /// synchronize via CLONE_CHILD_CLEARTID + futex_wait and exit cleanly.
 #[test]
 fn two_live_threads_concurrent_root_first_touch_and_futex_complete() {
-    let asm = r#"
+    let elf = compile_static_gas_witness(TWO_THREAD_ROOT_FIRST_TOUCH);
+    let outcome = run_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "concurrent two-thread root first-touch failed: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #2941: a native first-touch backing plan takes its own exclusion of the
+/// MM under the caller's outer one, and can meet the MM's editor held there
+/// (a maintenance borrow admitted under the raised gate, or a refused
+/// admission backing out of the editor word). That is contention: the
+/// faulting member waits for the editor's release and reruns, never a
+/// carrier fatal (`owner COW editor exclusion refused: Busy`). The host seam
+/// holds a real maintenance borrow across the next plan's probe and
+/// releases it right after, so the run is "Busy once, then success". Run in
+/// a child process: the seam is process-global.
+#[test]
+fn root_first_touch_waits_out_an_editor_held_under_the_backing_plan() {
+    const CHILD: &str = "CARRICK_2941_PLAN_EDITOR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::hold_editor_at_next_backing_plan_for_test();
+        let elf = compile_static_gas_witness(TWO_THREAD_ROOT_FIRST_TOUCH);
+        let outcome = run_pool_fixture(&elf, 64);
+        assert_eq!(
+            carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::backing_plan_editor_holds_for_test(),
+            1,
+            "the seam never held a backing plan's editor"
+        );
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.terminating_signal),
+            (7, None),
+            "first-touch beside a held plan editor: {:?}",
+            outcome.run
+        );
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "root_first_touch_waits_out_an_editor_held_under_the_backing_plan",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .expect("plan-editor child");
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The #2581 fixture: two live threads sharing the root MM concurrently
+/// first-touch the same and adjacent anonymous pages across 8 lazy 2 MiB
+/// grant blocks, then synchronize via CLONE_CHILD_CLEARTID + futex_wait and
+/// exit cleanly (exit 7).
+const TWO_THREAD_ROOT_FIRST_TOUCH: &str = r#"
 .global _start
 .text
 _start:
@@ -4905,16 +4966,6 @@ die:
     syscall
     ud2
 "#;
-
-    let elf = compile_static_gas_witness(asm);
-    let outcome = run_pool_fixture(&elf, 64);
-    assert_eq!(
-        outcome.run.exit_code, 7,
-        "concurrent two-thread root first-touch failed: {:?}",
-        outcome.run
-    );
-    assert_eq!(outcome.run.terminating_signal, None);
-}
 
 /// #2581: a fault doorbell raised on the idle CPL0 peer (CPU 1) while CPU 0 is
 /// parked in guest wait must capture the 15-word `FaultDoorbellRecord` and
