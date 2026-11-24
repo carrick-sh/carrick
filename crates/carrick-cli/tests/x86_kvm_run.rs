@@ -1000,6 +1000,48 @@ fn mounted_static_x86_shared_file_window_maps_line_matches_native() {
     }
 }
 
+/// #1338 v3 C5 (A1 fence): a non-private futex WAIT and WAKE on a shared
+/// file window. Until shared futex keys for file pages land (#1338 B), both
+/// are a counted ENOSYS (-38) on x86, never a hang: the root WAITs on a
+/// window word while a forked child stores to it and WAKEs it.
+#[test]
+fn mounted_static_x86_shared_file_window_futex_is_fenced_never_hangs() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-futex");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_futex.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let work = tempfile::tempdir().unwrap();
+    let native = Command::new(&elf)
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native window-futex oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let guest = run_mounted_binary(&elf, "window-futex", false);
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    let mut rows: Vec<&str> = stdout.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        (guest.status.code(), rows),
+        (
+            Some(7),
+            vec!["child_wake=ffffffffffffffda", "root_wait=ffffffffffffffda"]
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
