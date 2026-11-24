@@ -292,7 +292,7 @@ where
                     Err(NativeProcessError::GroupExitCustody) => {
                         return Some(machine.group_exit_custody(task));
                     }
-                    Err(_) => return Some(crate::diag_invalid()),
+                    Err(e) => return Some(crate::diag_invalid_err(&e)),
                 }
             }
             Err(_) => {

@@ -283,10 +283,25 @@ pub fn schedule(slot: SlotId) -> ! {
                                     fatal_boot!()
                                 }
                                 let loc = unsafe { &*p };
-                                carrick_el1::isa::x86::transport::fatal_boot_at(
+                                let mut report = carrick_el1_abi::PanicReport::new(
                                     loc.file(),
                                     loc.line(),
                                     loc.column(),
+                                );
+                                let e = carrick_el1_linux::DIAG_INVALID_ERR
+                                    .load(core::sync::atomic::Ordering::SeqCst);
+                                {
+                                    use core::fmt::Write;
+                                    let mut w = report.message_writer();
+                                    if e.is_null() {
+                                        let _ = w.write_str("diag: no error");
+                                    } else {
+                                        let _ = w.write_str(unsafe { &*e });
+                                    }
+                                }
+                                carrick_el1::isa::x86::transport::publish_fatal_report(
+                                    carrick_el1_abi::PanicReportKind::FatalSite,
+                                    &report,
                                 )
                             }
                             carrick_personality_linux::dispatch::CompletionRoute::Served => fatal_boot!(),

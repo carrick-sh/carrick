@@ -64,3 +64,19 @@ pub(crate) fn diag_invalid() -> carrick_personality_linux::dispatch::CompletionR
     );
     carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
 }
+
+/// DIAGNOSTICS ONLY (never lands): the error behind the last invalid route.
+pub static DIAG_INVALID_ERR: core::sync::atomic::AtomicPtr<rust_alloc::string::String> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[track_caller]
+pub(crate) fn diag_invalid_err(
+    error: &dyn core::fmt::Debug,
+) -> carrick_personality_linux::dispatch::CompletionRoute {
+    let text = rust_alloc::boxed::Box::new(rust_alloc::format!("{error:?}"));
+    DIAG_INVALID_ERR.store(
+        rust_alloc::boxed::Box::leak(text),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    diag_invalid()
+}
