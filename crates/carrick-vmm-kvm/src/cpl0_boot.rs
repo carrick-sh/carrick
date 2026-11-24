@@ -251,14 +251,24 @@ impl ProductionRunContext {
         // SAFETY: the retained RAM owns this aligned table for the entire
         // worker lifetime. The guest and host access its published atomics.
         let table = unsafe { &*table };
-        run_member(
+        let exit = run_member(
             cpu,
             table,
             self.slot,
             &self.vm,
             Some(&self.actual_run[self.slot]),
             &self.file_execution,
-        )
+        )?;
+        if matches!(
+            exit,
+            VcpuExit::IoOut {
+                port: FATAL_PORT,
+                ..
+            }
+        ) {
+            crate::fatal_hold::hold_at_fatal(cpu, table, self.slot, &self.ram);
+        }
+        Ok(exit)
     }
 }
 
