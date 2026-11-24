@@ -984,9 +984,48 @@ type GlobalFrameHostOwnerDirectory =
 /// A fresh live carrier VM custody owned by one test fixture. Each test holds
 /// its own, exactly as each carrier does, so parallel tests never share a
 /// stage-2 record table or global-frame owner directory (#1236, M2c).
+///
+/// A live custody maps VM-scoped stage-2 extents of its own on first use (the
+/// pre-mapped frame and root-slot pools). A carrier hands those back through
+/// its VM destroy before the custody drops; the fixture does the same, so its
+/// mapped leases never reach the lease drop check un-transferred.
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn test_carrier_custody() -> std::sync::Arc<CarrierVmCustody> {
-    std::sync::Arc::new(CarrierVmCustody::new_live_fixture())
+pub(crate) fn test_carrier_custody() -> TestCarrierCustody {
+    TestCarrierCustody(std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
+}
+
+/// A test's carrier custody, destroyed through the production VM teardown
+/// (`begin_destroy` then `commit_destroy`) when the test ends.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct TestCarrierCustody(std::sync::Arc<CarrierVmCustody>);
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for TestCarrierCustody {
+    type Target = std::sync::Arc<CarrierVmCustody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+impl Drop for TestCarrierCustody {
+    fn drop(&mut self) {
+        // A test that destroyed (or never kept) its VM owns that outcome.
+        let CarrierVmLifecycle::Live(generation) = self.0.state.lock().lifecycle else {
+            return;
+        };
+        let destroyed = self
+            .0
+            .begin_destroy(generation)
+            .and_then(|()| self.0.commit_destroy(generation));
+        if !std::thread::panicking() {
+            assert!(
+                destroyed.is_ok(),
+                "tear the test carrier VM down through its production destroy: {destroyed:?}"
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
