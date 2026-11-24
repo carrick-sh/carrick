@@ -1175,12 +1175,15 @@ fn mounted_static_x86_shared_file_window_mixed_range_edits_are_served_or_counted
 /// #1338 A1 / #2977: the shrink fence keys on the host inode a path routes
 /// to, so a shrink by name through a bind mount is fenced as well. A forked
 /// child truncates a windowed file by name, with truncate(2) and an O_TRUNC
-/// open, where the name is a bind mount of the host directory. Both are a
-/// counted ENOSYS (-38) before the mount's host call applies them, and the
+/// open, where the name is a bind mount of the host directory. The O_TRUNC
+/// open is a counted ENOSYS (-38): the host size door refuses it on the
+/// descriptor the bind mount opened, before anything is truncated. Path
+/// truncate(2) never reaches the mount on main (#3000) and answers EROFS
+/// (-30); it is pinned here so a fix of #3000 must keep it fenced. The
 /// child still reads its byte on the second page (native Linux kills it
-/// with SIGBUS). Red before: the fence asked the rootfs for the name's
-/// inode, found none, and admitted the bind mount's host shrink under the
-/// live window leaf.
+/// with SIGBUS). Red before #2977: the fence asked the rootfs for the
+/// name's inode, found none, and admitted the bind mount's host shrink
+/// under the live window leaf.
 #[test]
 fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced() {
     if skip_without_kvm() {
@@ -1231,7 +1234,7 @@ fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced()
                 "child_otrunc=ffffffffffffffda",
                 "child_status=0000000000000000",
                 "child_touch=0000000000000042",
-                "child_truncate=ffffffffffffffda",
+                "child_truncate=ffffffffffffffe2",
             ]
         ),
         "stderr: {}",

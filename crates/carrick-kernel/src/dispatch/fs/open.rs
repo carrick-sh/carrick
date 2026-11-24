@@ -419,14 +419,6 @@ impl<'a> FsView<'a> {
                 _ => {}
             }
         }
-        // A shared file window maps this inode: the truncation is refused
-        // before any open applies it, a mount's (a bind mount's host open
-        // truncates) or the rootfs's below (#1338 A1).
-        if want_trunc && self.path_shrink_fence(&path, 0) == super::ShrinkFence::Refuse {
-            return Ok(sink
-                .refuse_native()
-                .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)));
-        }
         let vfs_outcome = self.try_vfs_open(sink, &path, access, flags, vfs_create_mode);
         match vfs_outcome {
             // A native caller's sink checked O_DIRECTORY before it installed
@@ -1854,7 +1846,10 @@ impl<'a> FsView<'a> {
             nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
-        let opened = vfs.open(full_path, vfs_flags, ctx);
+        // A mount's ENOSYS means "not mine, fall through"; one the host size
+        // door answered is the call's own refusal (#1338 A1).
+        let (opened, fenced) =
+            carrick_vfs::host_size::fenced_during(|| vfs.open(full_path, vfs_flags, ctx));
         // The render observed a busy memory owner: whatever it produced is
         // not an answer. Install nothing; the open reruns on the release.
         if let Some(busy) = memory_busy.and_then(std::cell::Cell::take) {
@@ -1866,7 +1861,7 @@ impl<'a> FsView<'a> {
         }
         let handle = match opened {
             Ok(h) => h,
-            Err(errno) if errno == LINUX_ENOSYS => {
+            Err(errno) if errno == LINUX_ENOSYS && !fenced => {
                 return VfsOpenAttempt::FallThrough;
             }
             Err(errno) => {

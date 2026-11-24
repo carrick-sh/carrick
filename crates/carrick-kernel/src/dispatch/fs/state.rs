@@ -216,119 +216,6 @@ pub(crate) struct FsState {
     /// cannot describe the sparse layout Linux callers created. Key by host
     /// object identity so dup/open/fork aliases observe one layout.
     pub(crate) host_sparse_extents: HostSparseExtentsRegistry,
-
-    /// Host inodes a shared file window maps (#1338 A1). Shared by every
-    /// forked dispatcher: a shrink by any process of the run must see a
-    /// window another process made.
-    pub(crate) window_inodes: WindowInodes,
-}
-
-/// Host inodes whose pages a carrier maps into a shared file window: the
-/// interim shrink fence of #1338 A1.
-///
-/// A window maps the host file's own pages, and the carrier keeps the
-/// window slot for the run. A host shrink would pull pages out from under
-/// live window leaves (on KVM the next touch past the new end hangs the
-/// run). Until a shrink revokes those leaves first (#1338 A3, through
-/// `carrick_core::mm::window::WindowRegistry::begin_size_change`), every
-/// shrink of a recorded inode is a [`ShrinkFence::Refuse`]: a counted
-/// ENOSYS before the host applies it. A growth is admitted.
-///
-/// An inode stays recorded for the rest of the run, as its window slot
-/// does, so a file once mapped shared and writable cannot shrink again in
-/// this run even after its last `munmap`. That is the interim trade-off.
-#[derive(::core::clone::Clone, ::core::default::Default)]
-pub(crate) struct WindowInodes {
-    inodes:
-        std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<carrick_vfs::InodeIdentity>>>,
-    any: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// Whether a host size change of a file may run now.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub(crate) enum ShrinkFence {
-    /// No window maps the file, or the change does not shrink it.
-    Admit,
-    /// A window maps the file and the change would shrink it (or its size
-    /// or identity could not be read): a counted ENOSYS, before the host.
-    Refuse,
-}
-
-impl WindowInodes {
-    /// Record `identity` before its first window source is retained.
-    pub(crate) fn record(&self, identity: carrick_vfs::InodeIdentity) {
-        self.inodes.write().insert(identity);
-        self.any.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Whether any window of this run maps `identity`. One atomic load when
-    /// no window was ever made.
-    pub(crate) fn maps(&self, identity: carrick_vfs::InodeIdentity) -> bool {
-        self.any_window() && self.inodes.read().contains(&identity)
-    }
-
-    /// Whether any window was made in this run.
-    #[inline]
-    pub(crate) fn any_window(&self) -> bool {
-        self.any.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// A change of the file at `identity` from `current` bytes to
-    /// `new_len`. An unreadable identity or size of a file that may be
-    /// mapped is refused, never guessed.
-    pub(crate) fn fence(
-        &self,
-        identity: Option<carrick_vfs::InodeIdentity>,
-        current: impl FnOnce() -> Option<u64>,
-        new_len: u64,
-    ) -> ShrinkFence {
-        if !self.any_window() {
-            return ShrinkFence::Admit;
-        }
-        let Some(identity) = identity else {
-            return ShrinkFence::Refuse;
-        };
-        if !self.maps(identity) {
-            return ShrinkFence::Admit;
-        }
-        match current() {
-            Some(current) if new_len >= current => ShrinkFence::Admit,
-            _ => ShrinkFence::Refuse,
-        }
-    }
-
-    /// [`Self::fence`] for an open host descriptor, read with one `fstat`.
-    pub(crate) fn fence_host_fd(&self, host_fd: &HostFdRef, new_len: u64) -> ShrinkFence {
-        if !self.any_window() {
-            return ShrinkFence::Admit;
-        }
-        self.fence(
-            host_fd.inode_identity(),
-            || host_file_size(host_fd.raw()),
-            new_len,
-        )
-    }
-
-    /// A change that discards bytes without moving the end of the file (a
-    /// hole punch, a collapse): refused whenever a window maps the file.
-    pub(crate) fn fence_host_fd_discard(&self, host_fd: &HostFdRef) -> ShrinkFence {
-        self.fence(host_fd.inode_identity(), || None, 0)
-    }
-}
-
-fn host_file_size(fd: i32) -> Option<u64> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stat = unsafe { stat.assume_init() };
-    u64::try_from(stat.st_size).ok()
 }
 
 #[derive(
@@ -1067,7 +954,6 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
             host_sparse_extents: HostSparseExtentsRegistry::new(),
-            window_inodes: WindowInodes::default(),
         }
     }
 
@@ -1095,8 +981,6 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
             host_sparse_extents: self.host_sparse_extents.clone(),
-            // Arc clone: the run's one record of windowed inodes.
-            window_inodes: self.window_inodes.clone(),
         }
     }
 
@@ -1834,50 +1718,6 @@ mod stdio_sink_tests {
             b.fs.rootfs_vfs.dentry_cache.host_open_count(),
             opens,
             "unrelated cohort must not reconcile cached names"
-        );
-    }
-}
-
-#[cfg(test)]
-mod window_inodes_tests {
-    use super::{ShrinkFence, WindowInodes};
-    use carrick_vfs::InodeIdentity;
-
-    #[test]
-    fn a_window_fences_shrinks_and_discards_of_its_inode_only() {
-        let windows = WindowInodes::default();
-        let mapped = InodeIdentity::new(1, 10);
-        let other = InodeIdentity::new(1, 11);
-        // No window yet: nothing is fenced, not even an unnamed inode.
-        assert_eq!(windows.fence(None, || None, 0), ShrinkFence::Admit);
-        // A fork's alias sees the record made through the original.
-        let fork = windows.clone();
-        windows.record(mapped);
-        assert!(fork.maps(mapped));
-        assert!(!fork.maps(other));
-        // Shrink refused, growth and the same size admitted.
-        assert_eq!(
-            fork.fence(Some(mapped), || Some(8192), 4096),
-            ShrinkFence::Refuse
-        );
-        assert_eq!(
-            fork.fence(Some(mapped), || Some(8192), 8192),
-            ShrinkFence::Admit
-        );
-        assert_eq!(
-            fork.fence(Some(mapped), || Some(8192), 12288),
-            ShrinkFence::Admit
-        );
-        // An unreadable size or identity is refused, never guessed.
-        assert_eq!(
-            fork.fence(Some(mapped), || None, 12288),
-            ShrinkFence::Refuse
-        );
-        assert_eq!(fork.fence(None, || Some(0), 4096), ShrinkFence::Refuse);
-        // An inode no window maps shrinks as before.
-        assert_eq!(
-            fork.fence(Some(other), || Some(8192), 0),
-            ShrinkFence::Admit
         );
     }
 }

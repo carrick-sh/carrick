@@ -205,6 +205,9 @@ impl<T> HostFdOpen<T> {
 pub(crate) fn host_open_refusal(host_errno: i32) -> Option<LinuxErrno> {
     match host_errno {
         libc::EMFILE | libc::ENFILE => Some(carrick_abi::LINUX_ENFILE),
+        // The host size door fenced a truncating open (#1338 A1): its
+        // answer, never retried down another lane.
+        libc::ENOSYS => Some(carrick_abi::LINUX_ENOSYS),
         libc::ENOSPC | libc::EDQUOT | libc::ENOMEM | libc::EIO => {
             Some(crate::host_to_linux_errno(host_errno))
         }

@@ -1032,7 +1032,8 @@ impl FileContents {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
                 let off = libc::off_t::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
-                let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), off) };
+                // Through the host size door (#1338 A1).
+                let ret = carrick_vfs::host_size::ftruncate(fd.as_raw_fd(), off);
                 if ret != 0 {
                     let errno = std::io::Error::last_os_error()
                         .raw_os_error()
@@ -4748,7 +4749,11 @@ mod tests {
             Some(identity),
             dispatcher.fs.rootfs_vfs.path_inode_identity("/plain")
         );
-        dispatcher.fs.window_inodes.record(identity);
+        let pin = std::fs::File::open(scratch.path().join("windowed")).unwrap();
+        assert_eq!(
+            carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)),
+            Some(identity)
+        );
         let kernel = dispatcher.capture_one_task_context().unwrap();
         let mut call = |nr: u64, args: [u64; 6]| {
             dispatcher

@@ -856,7 +856,8 @@ impl RootFsVfs {
         match self.overlay.open_raw_fd(path, true, false, false) {
             crate::fs_backend::HostFdOpen::Served(host_fd) => {
                 let inode = Self::host_fd_inode_identity(host_fd);
-                let err = unsafe { libc::ftruncate(host_fd, length as libc::off_t) }
+                // Through the host size door, on the object opened (#1338 A1).
+                let err = crate::host_size::ftruncate(host_fd, length as libc::off_t)
                     .host_syscall_errno()
                     .err();
                 unsafe { libc::close(host_fd) };

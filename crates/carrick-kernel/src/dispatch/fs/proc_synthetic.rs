@@ -168,7 +168,12 @@ pub(crate) fn reportable_status_flags(raw: u64) -> u64 {
 enum ReopenAction {
     ByPath {
         target_path: String,
-        fallback_unlinked: Option<Box<ReopenAction>>,
+        /// When the by-path open finds nothing (an unlinked file), reopen
+        /// a copy of the description instead. The copy is prepared only
+        /// then: preparing it applies the open's `O_TRUNC` to the
+        /// description's own object, which must not happen when the
+        /// by-path open is the one chosen (#1338 A1).
+        fallback_unlinked: bool,
     },
     CopyDescription(
         Box<OpenDescription>,
@@ -276,7 +281,14 @@ impl<'a> FsView<'a> {
                 let mut new_metadata = metadata.clone();
                 if flags & LINUX_O_TRUNC != 0 && is_writable {
                     use std::os::fd::AsRawFd;
-                    unsafe { libc::ftruncate(owned.as_raw_fd(), 0) };
+                    // Through the host size door, on the reopened object:
+                    // a file a shared file window maps is not truncated
+                    // (#1338 A1).
+                    if carrick_vfs::host_size::ftruncate(owned.as_raw_fd(), 0) != 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+                    {
+                        return ReopenAction::Errno(carrick_abi::LINUX_ENOSYS);
+                    }
                     new_metadata.size = 0;
                     self.invalidate_dentry_host_fd(owned.as_raw_fd());
                 }
@@ -506,39 +518,27 @@ impl<'a> FsView<'a> {
             let open_ref = &*open;
             match open_ref {
                 OpenDescription::File { path, .. } if !fd_table::is_anon_overlay_path(path) => {
-                    let fallback = self.prepare_reopen_copy(
-                        open_ref,
-                        open_file.description.common(),
-                        flags,
-                        fd_flags,
-                    );
                     ReopenAction::ByPath {
                         target_path: path.clone(),
-                        fallback_unlinked: Some(Box::new(fallback)),
+                        fallback_unlinked: true,
                     }
                 }
                 OpenDescription::HostFile { metadata, .. }
                     if !fd_table::is_anon_overlay_path(&metadata.path.to_string_lossy()) =>
                 {
                     let target_path = metadata.path.to_string_lossy().into_owned();
-                    let fallback = self.prepare_reopen_copy(
-                        open_ref,
-                        open_file.description.common(),
-                        flags,
-                        fd_flags,
-                    );
                     ReopenAction::ByPath {
                         target_path,
-                        fallback_unlinked: Some(Box::new(fallback)),
+                        fallback_unlinked: true,
                     }
                 }
                 OpenDescription::Directory { path, .. } => ReopenAction::ByPath {
                     target_path: path.clone(),
-                    fallback_unlinked: None,
+                    fallback_unlinked: false,
                 },
                 OpenDescription::SyntheticFile { path, .. } => ReopenAction::ByPath {
                     target_path: path.clone(),
-                    fallback_unlinked: None,
+                    fallback_unlinked: false,
                 },
                 OpenDescription::ProcExecutable { .. } => self.prepare_reopen_copy(
                     open_ref,
@@ -577,8 +577,27 @@ impl<'a> FsView<'a> {
                     Err(DispatchError::Errno(errno)) => *errno == LINUX_ENOENT,
                     _ => false,
                 };
-                if failed_enoent && let Some(fallback) = fallback_unlinked {
-                    match *fallback {
+                let fallback = if failed_enoent && fallback_unlinked {
+                    let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
+                        LINUX_FD_CLOEXEC
+                    } else {
+                        0
+                    };
+                    crate::kernel::FileDescription::write_for_io(&open_file.description).map(
+                        |open| {
+                            self.prepare_reopen_copy(
+                                &open,
+                                open_file.description.common(),
+                                flags,
+                                fd_flags,
+                            )
+                        },
+                    )
+                } else {
+                    None
+                };
+                if failed_enoent && let Some(fallback) = fallback {
+                    match fallback {
                         ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
                             Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
                         }
