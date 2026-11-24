@@ -183,7 +183,7 @@ pub(super) enum BackingPreparation {
 /// editor word, or a maintenance borrow admitted under the raised gate
 /// (#2941). The prepared backing was cancelled; the caller waits for the
 /// editor's release, never fails the carrier.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(super) struct EditorBusy;
 
 /// Why the read-only table plan made nothing guest-visible.
@@ -362,7 +362,8 @@ pub fn fail_carrier_resched_for_test() {
 /// production release right after that probe.
 #[cfg(feature = "test-support")]
 pub(super) mod plan_editor_hold {
-    use super::*;
+    use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
+    use core::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static ARMED: AtomicBool = AtomicBool::new(false);
