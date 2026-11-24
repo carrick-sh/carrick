@@ -284,21 +284,7 @@ fn last_errno() -> libc::c_int {
 }
 
 fn set_errno(errno: libc::c_int) {
-    // SAFETY: the calling thread's errno slot.
-    unsafe {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            *libc::__errno_location() = errno;
-        }
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-        {
-            *libc::__error() = errno;
-        }
-        #[cfg(target_os = "netbsd")]
-        {
-            *libc::__errno() = errno;
-        }
-    }
+    carrick_portable::set_errno(errno);
 }
 
 #[cfg(test)]
