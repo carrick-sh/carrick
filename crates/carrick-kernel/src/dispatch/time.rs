@@ -1468,36 +1468,40 @@ pub(crate) fn task_thread_cpu_us() -> (u64, u64) {
 }
 
 /// One CPU-time clock as the host dispatcher reads it: the caller's, or the
-/// process or thread a dynamic id names, sampled as the id asks
-/// (`CPUCLOCK_VIRT` is user time; PROF and SCHED are user plus system).
-/// `None` is EINVAL: a pid naming no process in the
-/// caller's namespace (a thread's tid is not a process), or a tid naming no
-/// live thread of the caller's own thread group.
+/// process or thread a dynamic id names ([`carrick_abi::LinuxCpuClock::owner`]
+/// against the calling thread's tid), sampled as it asks (`CPUCLOCK_VIRT` is
+/// user time; PROF and SCHED are user plus system). `None` is EINVAL: a pid
+/// naming no process in the caller's namespace (another thread's tid is not
+/// a process), or a tid naming no live thread of the caller's own thread
+/// group.
 pub(crate) fn cpu_clock_ns(cpu: carrick_abi::LinuxCpuClock) -> Option<u64> {
-    use carrick_abi::LinuxCpuSample;
+    use carrick_abi::{LinuxCpuClockOwner as Owner, LinuxCpuSample};
     let user_only = cpu.sample == LinuxCpuSample::Virt;
     super::resources::with_active_context(|context| {
-        if cpu.per_thread {
-            let thread = match cpu.target {
-                None => std::sync::Arc::clone(context.thread()),
-                Some(tid) => {
-                    let tid = crate::namespace::pid::guest_tid_to_kernel_for(
-                        context,
-                        i32::try_from(tid.get()).ok()?,
-                    )?;
-                    let tid = crate::kernel::LinuxTid::from_abi_positive(tid).ok()?;
-                    context.task().thread(tid)?
-                }
-            };
-            return Some(if user_only {
+        let caller_tid = u32::try_from(context.thread().key().tid.raw())
+            .ok()
+            .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(context, tid))
+            .and_then(core::num::NonZeroU32::new)?;
+        let thread_ns = |thread: &crate::kernel::Thread| {
+            if user_only {
                 thread.cpu_ns_including_active()
             } else {
                 thread.total_cpu_ns_including_active()
-            });
-        }
-        let task = match cpu.target {
-            None => std::sync::Arc::clone(context.task()),
-            Some(pid) => {
+            }
+        };
+        let task = match cpu.owner(caller_tid) {
+            Owner::CallerThread => return Some(thread_ns(context.thread())),
+            Owner::Thread(tid) => {
+                let tid = crate::namespace::pid::guest_tid_to_kernel_for(
+                    context,
+                    i32::try_from(tid.get()).ok()?,
+                )?;
+                let tid = crate::kernel::LinuxTid::from_abi_positive(tid).ok()?;
+                let thread = context.task().thread(tid)?;
+                return Some(thread_ns(&thread));
+            }
+            Owner::CallerProcess => std::sync::Arc::clone(context.task()),
+            Owner::Process(pid) => {
                 let kernel = crate::namespace::pid::ns_to_kernel_for(context, pid.get())?;
                 let id = carrick_personality_linux::identity::task_id_from_linux_pid(
                     i32::try_from(kernel).ok()?,
@@ -1533,7 +1537,7 @@ pub(crate) fn cpu_clock_ns(cpu: carrick_abi::LinuxCpuClock) -> Option<u64> {
     })
     // Outside a dispatch scope there is no caller: its own clock reads 0, as
     // it always has, and a named task resolves to nothing.
-    .unwrap_or(cpu.target.is_none().then_some(0))
+    .unwrap_or(cpu.names_caller_implicitly().then_some(0))
 }
 
 /// The calling Linux process's CHILDREN ledger as (user µs, system µs) — the
