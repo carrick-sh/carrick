@@ -10,6 +10,8 @@
 
 use carrick_hal::MemPerms;
 
+pub mod custody;
+
 /// A backend's raw status for one stage-2 operation. Zero is success; any
 /// other value is the backend's own refusal code, kept exact so a log or a
 /// [`carrick_core_abi::mm::custody::CarrierStage2BackendError`] names what the
@@ -22,6 +24,11 @@ pub struct Stage2Status(u32);
 impl Stage2Status {
     /// The operation took effect.
     pub const SUCCESS: Self = Self(0);
+
+    /// The custody refused before the backend: the generation's stage 2
+    /// admits no new mapping (`HV_BAD_ARGUMENT`'s word, so a log still reads
+    /// as a refusal).
+    pub const NO_LIVE_VM: Self = Self(0xfae9_4003);
 
     /// Wrap a backend's raw status word.
     pub const fn from_raw(raw: u32) -> Self {
