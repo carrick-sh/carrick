@@ -26,23 +26,24 @@ pub use prepared::ClaimedPreparedCopy;
 pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions, StockPolicy};
 pub use storage::ResolvedReservationNodes;
 
-/// Placement authority available for a private anonymous advisory hint.
-pub enum AnonymousHintVenue {
-    /// A ring-only MM can use its allocation layout without a raw crossing.
-    Ring,
-    /// A host venue may still search its alias gaps when the layout is full.
-    Host,
-}
+pub use carrick_core_abi::AnonymousHintVenue;
 
 /// A private anonymous hint outside the allocation layout that the
 /// personality placed in a free carrier aperture below this ISA's user VA
-/// end. Only [`Reservations::external_anonymous_hint`] mints one, so the
-/// root's outside-layout prepare needs no venue-specific authorization.
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
-pub struct ExternalAnonymousHint(ReservationRange);
-impl ExternalAnonymousHint {
-    pub fn range(self) -> ReservationRange {
-        self.0
+/// end. Only [`Reservations::external_anonymous_hint`] mints one, bound to
+/// the minting MM, its policy generation, and its policy and geometry, so
+/// [`Reservations::prepare_external_anonymous`] refuses it on any other MM,
+/// generation or ISA. It is consumed by that prepare, never copied.
+#[derive(::core::fmt::Debug)]
+pub struct ExternalAnonymousHint<Policy, Geometry> {
+    range: ReservationRange,
+    mm: ReservationMm,
+    generation: ReservationGeneration,
+    _owner: ::core::marker::PhantomData<fn() -> (Policy, Geometry)>,
+}
+impl<Policy, Geometry> ExternalAnonymousHint<Policy, Geometry> {
+    pub fn range(&self) -> ReservationRange {
+        self.range
     }
 }
 
@@ -2639,14 +2640,16 @@ impl<
     }
     /// A free-aperture token for a page-aligned private anonymous hint
     /// outside the allocation layout, below both `user_end` and this
-    /// geometry's user VA end, or `None` (an in-layout or unaligned hint,
-    /// or one the personality places in no free aperture).
+    /// geometry's user VA end, in an aperture the personality leaves free
+    /// for `venue`, or `None` (an in-layout or unaligned hint, or one the
+    /// personality places in no free aperture for that venue).
     pub fn external_anonymous_hint(
         &self,
         placement: Placement,
         len: u64,
         user_end: u64,
-    ) -> Option<ExternalAnonymousHint> {
+        venue: AnonymousHintVenue,
+    ) -> Option<ExternalAnonymousHint<Policy, Geometry>> {
         let Placement::Hint(hint) = placement else {
             return None;
         };
@@ -2661,8 +2664,14 @@ impl<
                 layout,
                 range,
                 user_end.min(Geometry::USER_VA_END),
+                venue,
             ))
-        .then_some(ExternalAnonymousHint(range))
+        .then_some(ExternalAnonymousHint {
+            range,
+            mm: self.mm(),
+            generation: self.generation(),
+            _owner: ::core::marker::PhantomData,
+        })
     }
     /// Settle a private anonymous hint through this MM's allocation owner.
     /// A free external aperture (`external`) takes precedence over
@@ -2673,7 +2682,7 @@ impl<
         len: u64,
         prot: ReservationProtection,
         venue: AnonymousHintVenue,
-        external: Option<ExternalAnonymousHint>,
+        external: Option<ExternalAnonymousHint<Policy, Geometry>>,
     ) -> Result<Decision, Refusal> {
         if let Some(external) = external {
             match self.prepare_external_anonymous(external, prot) {
@@ -2713,10 +2722,19 @@ impl<
     /// rollbackable proposal, from either venue.
     pub fn prepare_external_anonymous(
         &mut self,
-        external: ExternalAnonymousHint,
+        external: ExternalAnonymousHint<Policy, Geometry>,
         prot: ReservationProtection,
     ) -> Result<Decision, Refusal> {
         let range = external.range();
+        // The token names exactly this MM at this policy generation; a
+        // layout or limit edit since the mint, or another MM, voids it.
+        if external.mm != self.mm()
+            || external.generation != self.generation()
+            || self.in_layout(range)
+            || range.end() > Geometry::USER_VA_END
+        {
+            return Err(Refusal::Stale);
+        }
         if self
             .next(range.start())
             .is_some_and(|node| node.start < range.end())
@@ -7738,6 +7756,44 @@ mod tests {
         );
     }
 
+    /// A free-aperture token names the MM that minted it: another MM
+    /// refuses it (`Stale`) and keeps no proposal (#2950 review).
+    #[test]
+    fn external_hint_token_is_refused_on_another_mm() {
+        let table = table();
+        let hint = 0x2517_7424_0000;
+        let token = {
+            let minting = admitted(&table, 1, 90);
+            minting
+                .external_anonymous_hint(
+                    Placement::Hint(hint),
+                    0x1000,
+                    u64::MAX,
+                    AnonymousHintVenue::Ring,
+                )
+                .expect("a free high hint")
+        };
+        let mut other = admitted(&table, 0, 89);
+        assert_eq!(
+            other.prepare_external_anonymous(token, ReservationProtection::READ_WRITE),
+            Err(Refusal::Stale)
+        );
+        assert!(other.pending().is_none());
+        let own = other
+            .external_anonymous_hint(
+                Placement::Hint(hint),
+                0x1000,
+                u64::MAX,
+                AnonymousHintVenue::Ring,
+            )
+            .expect("a free high hint");
+        assert!(
+            other
+                .prepare_external_anonymous(own, ReservationProtection::READ_WRITE)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn outside_layout_fixed_prepare_retains_owner_provenance_and_admitted_opaque_rejects_it() {
         let table = table();
@@ -7761,8 +7817,24 @@ mod tests {
         // Go `sysReserveOS` outside layout, then `sysMapOS` `MAP_FIXED` within it.
         let arena = range(0xc0_0000_0000, 0xc0_0400_0000);
         // No host proposal: the aperture token is the whole authority.
+        // Below 1 TiB only the host venue, which checks its own VMA rows and
+        // carrier windows, is offered the alias window.
+        assert!(
+            g.external_anonymous_hint(
+                Placement::Hint(arena.start()),
+                arena.len(),
+                u64::MAX,
+                AnonymousHintVenue::Ring,
+            )
+            .is_none()
+        );
         let external = g
-            .external_anonymous_hint(Placement::Hint(arena.start()), arena.len(), u64::MAX)
+            .external_anonymous_hint(
+                Placement::Hint(arena.start()),
+                arena.len(),
+                u64::MAX,
+                AnonymousHintVenue::Host,
+            )
             .expect("a free alias-window hint");
         assert_eq!(external.range(), arena);
         let reserve = g

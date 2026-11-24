@@ -249,11 +249,24 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
     assert_eq!(counters.served[222].load(Ordering::Relaxed), 2);
     assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
 }
-/// Linux places a free hint where it was asked for (mmap(2)): Go's
-/// 0xc000000000 arena hint, outside the layout in a free alias window, is
-/// one exact ring proposal instead of a forward (#2706).
+/// Below 1 TiB an out-of-layout hint (Go's 0xc000000000 arena hint) on the
+/// AArch64 run root still goes to its host venue's VMA checks.
 #[test]
-fn reservation_decoder_serves_a_free_out_of_layout_hint_exactly() {
+fn reservation_decoder_forwards_out_of_layout_hint() {
+    let table = table();
+    let mut g = admitted(&table, 0, 17);
+    // mmap(0xc000000000, 64 KiB, RW, MAP_PRIVATE|MAP_ANONYMOUS)
+    assert_eq!(
+        decide(&mut g, 222, [0xc0_0000_0000, 0x10000, 3, 0x22, u64::MAX, 0]),
+        AnonymousRouteKind::Forward
+    );
+    assert!(g.pending().is_none());
+}
+/// Linux places a free hint where it was asked for (mmap(2)): V8's cage
+/// hint, outside the layout above 1 TiB, is one exact ring proposal on the
+/// AArch64 run root instead of a forward (#2706).
+#[test]
+fn reservation_decoder_serves_a_free_high_hint_exactly() {
     use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let table = table();
     let mut g = admitted(&table, 0, 17);
@@ -264,8 +277,8 @@ fn reservation_decoder_serves_a_free_out_of_layout_hint_exactly() {
     let counters = Counters::default();
     let mut frame = TrapFrame::default();
     frame.x[8] = 222;
-    // mmap(0xc000000000, 64 KiB, RW, MAP_PRIVATE|MAP_ANONYMOUS)
-    frame.x[..6].copy_from_slice(&[0xc0_0000_0000, 0x10000, 3, 0x22, u64::MAX, 0]);
+    // mmap(0x251774240000, 64 KiB, RW, MAP_PRIVATE|MAP_ANONYMOUS)
+    frame.x[..6].copy_from_slice(&[0x2517_7424_0000, 0x10000, 3, 0x22, u64::MAX, 0]);
     let AnonymousReservationRoute::Work(mut pending) =
         dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut g)
     else {
@@ -273,7 +286,7 @@ fn reservation_decoder_serves_a_free_out_of_layout_hint_exactly() {
     };
     assert_eq!(
         g.pending().map(|request| request.range),
-        Some(range(0xc0_0000_0000, 0xc0_0001_0000))
+        Some(range(0x2517_7424_0000, 0x2517_7425_0000))
     );
     pending.refuse(&mut frame, &current, &mut g).unwrap();
     assert!(g.pending().is_none());

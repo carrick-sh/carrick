@@ -2005,7 +2005,8 @@ impl MemView<'_> {
                         .semantic_vmas
                         .overlapping(hint, hint.saturating_add(length))
                         .next()
-                        .is_none());
+                        .is_none()
+                    && !overlaps_host_hidden_carrier_window(hint, length));
         if root_eligible
             && congruence == MmapGrantCongruence::Any
             && let Some(reservation_prot) = reservation_prot
@@ -2018,6 +2019,7 @@ impl MemView<'_> {
                             placement,
                             length,
                             user_ceiling.exclusive_end(),
+                            AnonymousHintVenue::Host,
                         )
                     })
                     .flatten();
@@ -3107,4 +3109,24 @@ mod tests {
         );
         assert_eq!(union_of(vec![(4, 4), (0, 2)]), [(0, 2)]);
     }
+}
+
+/// Carrier windows inside the host venue's low alias apertures that no VMA
+/// row names (the semantic and guest VMA checks filter them as hidden
+/// backing): the private overlay, EL1's AArch64 stage-1 table pool, and
+/// the EL0 clock stub. A hint on one relocates instead (#2950 review).
+fn overlaps_host_hidden_carrier_window(hint: u64, length: u64) -> bool {
+    [
+        (
+            crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+            crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+        ),
+        (
+            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE,
+        ),
+    ]
+    .into_iter()
+    .any(|(base, size)| ranges_overlap(hint, length, base, base.saturating_add(size)))
+        || super::overlaps_el0_clock_stub(hint, length)
 }
