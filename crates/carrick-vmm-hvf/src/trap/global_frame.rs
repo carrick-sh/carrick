@@ -1190,9 +1190,16 @@ impl GlobalFrameStage2Lease {
     /// release; the lease must not repeat either operation from `Drop`.
     pub(crate) fn transfer_to_record(
         mut self,
+        custody: &CarrierVmCustody,
         record: CarrierStage2RecordSnapshot,
     ) -> Result<(), TrapError> {
+        // The record's custody must hold the backend that mapped the lease.
+        let foreign_backend = self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| !custody.holds_stage2_backend(backend));
         let mismatch = !self.active
+            || foreign_backend
             || record.ipa != self.base
             || record.len as u64 != self.length
             || !record.mapped
@@ -2096,6 +2103,16 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
         )));
     }
     let registration = (|| {
+        // The record must belong to the backend that mapped the lease: a
+        // custody never adopts an extent another carrier VM installed.
+        if let Some(backend) = &lease.backend
+            && !custody.holds_stage2_backend(backend)
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "global frame lease {:?} was mapped by another carrier VM's stage-2 backend",
+                lease.key()
+            )));
+        }
         let vm_generation = custody.setup_generation().ok_or_else(|| {
             TrapError::Hypervisor(
                 "global frame owner registration has no creating/live carrier VM".to_owned(),

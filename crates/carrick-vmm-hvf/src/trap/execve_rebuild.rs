@@ -811,7 +811,7 @@ impl PreparedExecBacking {
                     retained: rollback_after_install_failure(installed, &mut unmap),
                 });
             };
-            if let Err(error) = lease.transfer_to_record(snapshot) {
+            if let Err(error) = lease.transfer_to_record(&installed.custody, snapshot) {
                 installed.regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),
