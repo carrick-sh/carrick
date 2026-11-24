@@ -3,6 +3,9 @@
 #[path = "cpl0_inputs.rs"]
 mod cpl0_inputs;
 
+#[path = "cpl0_budget.rs"]
+mod cpl0_budget;
+
 #[path = "cpl0_build.rs"]
 mod cpl0_build;
 

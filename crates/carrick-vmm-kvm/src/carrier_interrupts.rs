@@ -91,7 +91,7 @@ pub fn witness(
     if words[0] != PROGRESS_MAGIC
         || words[1..]
             .iter()
-            .any(|pc| !(0xffff_ffff_8000_0000..0xffff_ffff_800f_0000).contains(pc))
+            .any(|pc| !carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_EXTENT.contains(pc))
     {
         return Err(fail("CPL0 progress header/version/entry mismatch"));
     }
