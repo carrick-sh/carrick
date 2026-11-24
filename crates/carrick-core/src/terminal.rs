@@ -1241,12 +1241,6 @@ impl HostThreadExitMembership<'_> {
             reserved.publish();
         }
     }
-
-    pub fn rollback_with_wake(mut self) -> Option<TerminalNotification> {
-        self.reserved
-            .take()
-            .and_then(NonfinalExitMembership::rollback_with_wake)
-    }
 }
 
 /// Select membership ownership before changing the live count. Native terminal
