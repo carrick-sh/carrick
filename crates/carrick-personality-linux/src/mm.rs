@@ -83,8 +83,13 @@ fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end
     let rosetta_end = LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE;
     range.end() <= user_end
         && range.start() >= arena.end()
-        && (uses_alias_window(range.start(), range.end(), arena.start(), arena.end(), user_end)
-            || range.end() <= LINUX_PIE_DEFAULT_BASE)
+        && (uses_alias_window(
+            range.start(),
+            range.end(),
+            arena.start(),
+            arena.end(),
+            user_end,
+        ) || range.end() <= LINUX_PIE_DEFAULT_BASE)
         && !(range.start() < rosetta_end && LINUX_ROSETTA_VA_BASE < range.end())
 }
 
@@ -212,11 +217,7 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
         let brk = LinuxReservationState::from(layout.policy).brk;
         layout.heap.contains(brk) || brk == layout.heap.end()
     }
-    fn external_anonymous_aperture(
-        layout: Layout,
-        range: ReservationRange,
-        user_end: u64,
-    ) -> bool {
+    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64) -> bool {
         external_anonymous_aperture(layout, range, user_end)
     }
     fn active_value(policy: ReservationPolicyPayload) -> u64 {
@@ -452,17 +453,38 @@ mod aperture_tests {
             assert!(!free(LINUX_MMAP_BASE, 0x1000, end), "inside the arena");
             assert!(!free(0x1000_0000, 0x1000, end), "below the arena");
             assert!(!free(LINUX_PIE_DEFAULT_BASE, 0x1000, end), "PIE image");
-            assert!(!free(LINUX_SHARED_FILE_BASE, 0x1000, end), "shared aperture");
+            assert!(
+                !free(LINUX_SHARED_FILE_BASE, 0x1000, end),
+                "shared aperture"
+            );
             assert!(!free(LINUX_STACK_TOP - 0x1000, 0x1000, end), "stack");
-            assert!(!free(LINUX_PIE_DEFAULT_BASE - 0x1000, 0x2000, end), "straddles PIE");
+            assert!(
+                !free(LINUX_PIE_DEFAULT_BASE - 0x1000, 0x2000, end),
+                "straddles PIE"
+            );
         }
         // The x86 end is the last lower-half page; AArch64 reaches 2^48.
         assert!(!free(X86_64_USER_VA_END, 0x1000, X86_64_USER_VA_END));
-        assert!(free(X86_64_USER_VA_END - 0x1000, 0x1000, X86_64_USER_VA_END));
+        assert!(free(
+            X86_64_USER_VA_END - 0x1000,
+            0x1000,
+            X86_64_USER_VA_END
+        ));
         assert!(!free(1 << 47, 0x1000, X86_64_USER_VA_END));
-        assert!(free((1 << 47) + LINUX_ROSETTA_WINDOW_SIZE, 0x1000, AARCH64_USER_VA_END));
-        assert!(!free(LINUX_ROSETTA_VA_BASE, 0x1000, AARCH64_USER_VA_END), "Rosetta window");
-        assert!(!free(AARCH64_USER_VA_END - 0x1000, 0x2000, AARCH64_USER_VA_END));
+        assert!(free(
+            (1 << 47) + LINUX_ROSETTA_WINDOW_SIZE,
+            0x1000,
+            AARCH64_USER_VA_END
+        ));
+        assert!(
+            !free(LINUX_ROSETTA_VA_BASE, 0x1000, AARCH64_USER_VA_END),
+            "Rosetta window"
+        );
+        assert!(!free(
+            AARCH64_USER_VA_END - 0x1000,
+            0x2000,
+            AARCH64_USER_VA_END
+        ));
     }
 }
 
