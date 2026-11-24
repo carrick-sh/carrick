@@ -67,6 +67,9 @@ pub mod carrier_memory;
 pub mod cpl0_boot;
 
 #[cfg(target_arch = "x86_64")]
+mod fatal_hold;
+
+#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 pub mod carrier_interrupts;
 
