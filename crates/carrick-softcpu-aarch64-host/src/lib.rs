@@ -16,7 +16,7 @@ pub mod runner;
 pub use facade::{
     GUEST_PAGE_BYTES, MappingGeometry, SOFT_ALIAS_GPA_BASE, SoftAarch64Engine, SoftAarch64Vcpu,
     SoftAarch64Vmm, SoftKickHandle, SoftRetainedExtent, SoftRetainedMetadata, SoftStage2,
-    Stage2Abort, Stage2AbortAccess, Stage2AbortReason,
+    SoftStage2Backend, Stage2Abort, Stage2AbortAccess, Stage2AbortReason, soft_stage2_status,
 };
 pub use memory::SoftMemory;
 pub use runner::{

@@ -10,6 +10,8 @@
 
 use carrick_hal::MemPerms;
 
+pub mod custody;
+
 /// A backend's raw status for one stage-2 operation. Zero is success; any
 /// other value is the backend's own refusal code, kept exact so a log or a
 /// [`carrick_core_abi::mm::custody::CarrierStage2BackendError`] names what the
@@ -22,6 +24,12 @@ pub struct Stage2Status(u32);
 impl Stage2Status {
     /// The operation took effect.
     pub const SUCCESS: Self = Self(0);
+
+    /// "Not now": another holder has the backend's stage 2. Nothing changed;
+    /// the caller keeps its operation, enrols on the holder's release
+    /// ([`Stage2Backend::contention`]), probes once, and reruns it. Never a
+    /// refusal and never reported to a guest.
+    pub const BUSY: Self = Self(0x4255_5359);
 
     /// Wrap a backend's raw status word.
     pub const fn from_raw(raw: u32) -> Self {
@@ -36,6 +44,11 @@ impl Stage2Status {
     /// Whether the operation took effect.
     pub const fn is_success(self) -> bool {
         self.0 == 0
+    }
+
+    /// Whether the backend was busy ([`Stage2Status::BUSY`]).
+    pub const fn is_busy(self) -> bool {
+        self.0 == Self::BUSY.0
     }
 }
 
@@ -118,6 +131,56 @@ pub trait Stage2Backend: Sync {
     /// No guest CPU of the VM may still run, and the caller owns the VM's
     /// custody transaction.
     unsafe fn destroy(&self) -> Stage2Status;
+
+    /// The release a caller that saw [`Stage2Status::BUSY`] enrols on. A
+    /// backend that is never busy (HVF) has none.
+    fn contention(&self) -> Option<&dyn Stage2Contention> {
+        None
+    }
+}
+
+/// The holder's release of a backend that can be busy.
+///
+/// A contended caller enrols first, then probes once (reruns its
+/// operation); only if that probe is busy too does it wait, and the wait
+/// ends at the first release after enrolment, so no release is lost.
+pub trait Stage2Contention: Sync {
+    /// Enrol on the next release. Returns the release epoch the caller saw.
+    fn enrol(&self) -> Stage2ReleaseEpoch;
+
+    /// Wait for a release after `epoch`, then leave.
+    fn wait_and_leave(&self, epoch: Stage2ReleaseEpoch);
+
+    /// Leave without waiting: the probe after enrolment was not busy.
+    fn leave(&self);
+}
+
+/// A release count a contended caller enrolled at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stage2ReleaseEpoch(pub u64);
+
+/// Run `operation` until it is not busy: enrol on the backend's release,
+/// probe once, and wait only if that probe is busy too.
+pub fn run_past_busy(
+    backend: &dyn Stage2Backend,
+    mut operation: impl FnMut() -> Stage2Status,
+) -> Stage2Status {
+    let status = operation();
+    if !status.is_busy() {
+        return status;
+    }
+    let Some(contention) = backend.contention() else {
+        return status;
+    };
+    loop {
+        let epoch = contention.enrol();
+        let status = operation();
+        if !status.is_busy() {
+            contention.leave();
+            return status;
+        }
+        contention.wait_and_leave(epoch);
+    }
 }
 
 #[cfg(test)]
