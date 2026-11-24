@@ -16,8 +16,9 @@
 //   90 rt_sigaction failed   91 mmap of a thread stack failed
 //   92 clone failed          93 the threads did not start
 //   94 the threads did not stop
-//   95 a handler ran outside its thread's alternate stack, or a thread's
-//      own mmap or sigaltstack failed
+//   95 a handler ran outside its thread's alternate stack, a thread's
+//      own mmap or sigaltstack failed, or a syscall a handler interrupted
+//      returned the wrong result
 //   96 a thread's handler never ran
 //   7  every step matched Linux
 // A thread whose signal frame is refused is killed by SIGSEGV instead.
@@ -107,7 +108,12 @@ static void worker(void *arg) {
     long ss[3] = {alt, 0, ALT}; // ss_sp, ss_flags, ss_size
     if (sc(131, (long)ss, 0, 0, 0, 0, 0) != 0) __sync_fetch_and_add(&bad, 1);
     __sync_fetch_and_add(&started, 1);
-    while (!stop) sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
+    // A handler delivered on a syscall return keeps that call's result:
+    // gettid answers this thread's id however its frame setup was served.
+    while (!stop) {
+        if (sc(186, 0, 0, 0, 0, 0, 0) != tids[i]) __sync_fetch_and_add(&bad, 1);
+        sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
+    }
     __sync_fetch_and_add(&done, 1);
     for (;;) sc(60, 0, 0, 0, 0, 0, 0); // exit this thread only
 }
