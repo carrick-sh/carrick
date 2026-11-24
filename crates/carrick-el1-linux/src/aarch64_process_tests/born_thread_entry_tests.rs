@@ -5405,10 +5405,10 @@ fn arm_non_leader_process_clock_by_its_own_tid_reads_its_group() {
     let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
     let env = h.env;
     let page = h.target_page;
-    let mut gettime = |slot: SlotId,
-                       control: &'static ThreadControlSlot,
-                       cpu: &mut crate::sched::FakeCpu,
-                       clock: u64| {
+    let gettime = |slot: SlotId,
+                   control: &'static ThreadControlSlot,
+                   cpu: &mut crate::sched::FakeCpu,
+                   clock: u64| {
         let ts = carrick_test_support::GuestUserValue::new([u64::MAX; 2]);
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[8] = carrick_abi::syscall::nr::CLOCK_GETTIME.raw();
