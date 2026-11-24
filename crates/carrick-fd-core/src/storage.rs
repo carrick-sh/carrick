@@ -115,6 +115,20 @@ impl<const N: usize> Storage<N> {
         Ok(Guard(&self.lock))
     }
 
+    /// Take the storage lock and never release it, as a vCPU stopped
+    /// inside a storage section holds it (#2988 witnesses). False if it was
+    /// already held.
+    #[cfg(feature = "test-support")]
+    pub fn hold_forever_for_test(&self) -> bool {
+        match self.acquire(&crate::BoundedSpin(0)) {
+            Ok(guard) => {
+                core::mem::forget(guard);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn order(bytes: u64) -> Result<u32, StorageError> {
         let pages = bytes.max(1).div_ceil(4096);
         pages

@@ -2654,15 +2654,15 @@ mod tests {
         fixture.owner.stop_guest_execution();
         // The answer arrives: the socket turns readable on the host.
         peer.send_to(b"R", child).unwrap();
-        // The reactor samples it once; the bound only reports a reactor
-        // that never settled (it died in `carrick_fatal!`, or it spins).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while fixture.owner.quarantined_teardowns() == 0 && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
+        // The reactor samples it and settles: the test orders on that
+        // quarantine as an event. The bound only reports a reactor that
+        // never settled (it died in `carrick_fatal!`, or it spins).
+        let settled = fixture
+            .owner
+            .await_quarantined(1, std::time::Duration::from_secs(10));
         // Each sample that meets the lock counts once (one edge here).
         assert!(
-            fixture.owner.quarantined_teardowns() >= 1,
+            settled >= 1,
             "the reactor's sample of a socket event after the stop settles as a quarantine"
         );
     }

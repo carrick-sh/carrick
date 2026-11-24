@@ -5667,6 +5667,135 @@ fn fasync_si_fd_is_the_armed_fd_across_a_parked_pipe_write() {
     rig.close(read_fd);
 }
 
+/// The IPC object a pipe or eventfd descriptor of `rig` names, and its owner.
+fn ipc_object_of(
+    rig: &SpliceTestRig,
+    fd: u64,
+) -> (
+    Arc<crate::el1_ipc::HostIpc>,
+    carrick_el1_abi::ipc::IpcObjectHandle,
+) {
+    let owner = rig.dispatcher.kernel_binding.read().kernel().ipc().unwrap();
+    let object =
+        rig.dispatcher
+            .open_file(fd as i32)
+            .unwrap()
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::PipeReader { pipe, .. }
+                | OpenDescription::PipeWriter { pipe, .. } => pipe.ipc_object(),
+                OpenDescription::EventFd { state, .. } => state.ipc_object(),
+                other => panic!("an IPC object descriptor: {other:?}"),
+            })
+            .unwrap();
+    (owner, object)
+}
+
+/// After the stop, the parked write's next step meets `object`'s lock that
+/// a ring section cut off at the stop holds forever: it completes as
+/// owner-cancelled by the carrier, counted once, never `carrick_fatal!`
+/// (as at `9f879446e`) and never a spin. `blocked` was parked by the
+/// production `write(2)` dispatch; the step is `drive_blocking_write`, the
+/// one the carrier's reactor runs when the write's wait queue fires.
+fn assert_parked_write_after_the_stop_is_owner_cancelled(
+    owner: &crate::el1_ipc::HostIpc,
+    object: carrick_el1_abi::ipc::IpcObjectHandle,
+    mut blocked: crate::dispatch::outcome::BlockingWrite,
+) {
+    // The frozen holder: a vCPU stopped inside the ring's object section.
+    std::mem::forget(
+        owner
+            .region()
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap(),
+    );
+    assert_eq!(owner.quarantined_teardowns(), 0);
+    // ExecutorPool::shutdown after joining every worker.
+    owner.stop_guest_execution();
+    match crate::dispatch::drive_blocking_write(
+        &mut blocked,
+        &carrick_hal::NullHostSignalBridge::default(),
+    ) {
+        crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::OwnerCancelled(
+            crate::kernel::continuation::OwnerWaitCancellation::Carrier,
+        )) => {}
+        crate::dispatch::BlockingWriteStep::Done(other) => {
+            panic!("the parked write after the stop is owner-cancelled: {other:?}")
+        }
+        crate::dispatch::BlockingWriteStep::Wait => {
+            panic!("the parked write after the stop is owner-cancelled, not parked again")
+        }
+    }
+    assert_eq!(owner.quarantined_teardowns(), 1);
+    // Its release (and the rig's) would meet the same frozen lock: the
+    // teardown witnesses cover that; this one keeps them out.
+    std::mem::forget(blocked);
+}
+
+/// #2988 fix round 3: a blocking pipe write the production `write(2)` parked
+/// after a partial copy, driven again after the executor pool stopped guest
+/// execution, with the pipe's object lock held by a cut-off ring section.
+#[test]
+fn serial_parked_pipe_write_after_the_stop_is_owner_cancelled_under_a_held_lock() {
+    const BUFFER: u64 = 0x8000;
+    const CAPACITY: usize = crate::dispatch::fs::pipe::DEFAULT_PIPE_CAPACITY;
+    const SLACK: usize = 4096;
+    let mut rig = std::mem::ManuallyDrop::new(SpliceTestRig::new(0x30000));
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let blocked = match rig.run(
+        SpliceTestRig::SYS_WRITE,
+        [write_fd, BUFFER, (CAPACITY + SLACK) as u64, 0, 0, 0],
+    ) {
+        DispatchOutcome::BlockingWrite(write) => write,
+        other => panic!("expected a parked partial pipe write, got {other:?}"),
+    };
+    // The reader makes room: the write's queue fires and the reactor runs it.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_READ,
+            [read_fd, 0x4300, SLACK as u64, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: SLACK as i64
+        },
+    );
+    let (owner, object) = ipc_object_of(&rig, read_fd);
+    assert_parked_write_after_the_stop_is_owner_cancelled(&owner, object, blocked);
+}
+
+/// As above, for a blocking `eventfd` write the production `write(2)` parked
+/// on a full counter.
+#[test]
+fn serial_parked_eventfd_write_after_the_stop_is_owner_cancelled_under_a_held_lock() {
+    const SYS_EVENTFD2: u64 = 19;
+    const VALUE: u64 = 0x4300;
+    let mut rig = std::mem::ManuallyDrop::new(SpliceTestRig::new(0x30000));
+    let efd = match rig.run(SYS_EVENTFD2, [0; 6]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("eventfd2: {other:?}"),
+    };
+    // The counter one short of full, then a write that cannot fit: it parks.
+    rig.memory
+        .write_bytes(VALUE, &(u64::MAX - 1).to_ne_bytes())
+        .unwrap();
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_WRITE, [efd, VALUE, 8, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 8 },
+    );
+    rig.memory.write_bytes(VALUE, &1u64.to_ne_bytes()).unwrap();
+    let blocked = match rig.run(SpliceTestRig::SYS_WRITE, [efd, VALUE, 8, 0, 0, 0]) {
+        DispatchOutcome::BlockingWrite(write) => write,
+        other => panic!("expected a parked eventfd write, got {other:?}"),
+    };
+    // A reader drains the counter: the write's queue fires.
+    assert_eq!(
+        rig.run(SpliceTestRig::SYS_READ, [efd, 0x4400, 8, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 8 },
+    );
+    let (owner, object) = ipc_object_of(&rig, efd);
+    assert_parked_write_after_the_stop_is_owner_cancelled(&owner, object, blocked);
+}
+
 /// A description created with `O_ASYNC` already in its status flags never saw
 /// an `O_ASYNC` 0 -> 1 `F_SETFL`, so its first synchronisation (here an
 /// `F_SETSIG`/`F_SETOWN` through a `dup`) names `fa_fd`; a later one through

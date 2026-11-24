@@ -2202,3 +2202,94 @@ fn el1_ipc_readv_handback_fault_preserves_only_the_secured_prefix() {
         assert_eq!(w.region.descriptor_allocations(), baseline);
     }
 }
+
+/// #2988 fix round 3 (#2995 C): an IPC operation retained across an
+/// owner-memory wait is dropped at carrier exit, after the executor pool
+/// stopped guest execution, while a ring section cut off at the stop holds
+/// a lock its release needs (`hold`). `RetainedIpcOperation::drop` must
+/// settle as one counted quarantine: never a spin (as on the storage lock at
+/// `9f879446e`, whose `reclaim_vectors` waited as a short section) and never
+/// `carrick_fatal!`. The operation is admitted as the EL1 adapter admits it:
+/// a writer description whose only reference is the operation's pin, with
+/// two imported iovec headers in descriptor storage.
+fn retained_write_drop_after_the_stop_quarantines(
+    hold: impl FnOnce(&carrick_el1_abi::ipc::IpcRegion<'_>, IpcObjectHandle),
+) {
+    let dispatcher = std::mem::ManuallyDrop::new(crate::dispatch::SyscallDispatcher::new());
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let region = owner.region();
+    let object = region
+        .create_pipe(65536, &crate::el1_zone::TestRegionWait)
+        .unwrap();
+    let pin = region
+        .fd(crate::el1_zone::TestRegionWait)
+        .create_pinned(Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            AccessMode::WriteOnly,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    let token = region
+        .begin_operation(IpcOperation {
+            kind: IpcOpKind::PipeWrite,
+            pin: pin.into_raw(),
+            object: object.to_raw(),
+            task: IpcTaskKey(1),
+            mm: MM,
+            buf: IpcUserVa(BUF),
+            progress: WriteProgress::new(6),
+            nr: 66,
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    region
+        .import_vectors(
+            &token,
+            2,
+            &crate::el1_zone::TestRegionWait,
+            |index, header| {
+                header[..8].copy_from_slice(&(BUF + index as u64 * 8).to_ne_bytes());
+                header[8..].copy_from_slice(&3u64.to_ne_bytes());
+                true
+            },
+        )
+        .unwrap();
+    let retained = RetainedIpcOperation::new(context.kernel(), token).unwrap();
+    hold(&region, object);
+    assert_eq!(owner.quarantined_teardowns(), 0);
+    // ExecutorPool::shutdown after joining every worker; then carrier exit
+    // drops the owner-memory wait that retained the operation.
+    owner.stop_guest_execution();
+    drop(retained);
+    assert_eq!(
+        owner.quarantined_teardowns(),
+        1,
+        "the retained operation's release settles as one quarantine"
+    );
+}
+
+#[test]
+fn serial_retained_operation_drop_after_the_stop_quarantines_a_pipe_lock_a_stopped_vcpu_holds() {
+    retained_write_drop_after_the_stop_quarantines(|region, object| {
+        // A vCPU stopped inside the ring's pipe section: `release_backing`.
+        std::mem::forget(
+            region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
+    });
+}
+
+#[test]
+fn serial_retained_operation_drop_after_the_stop_quarantines_a_storage_lock_a_stopped_vcpu_holds() {
+    retained_write_drop_after_the_stop_quarantines(|region, _| {
+        // A vCPU stopped inside a descriptor storage section:
+        // `finish_operation`'s `reclaim_vectors`.
+        assert!(region.hold_descriptor_storage_forever_for_test());
+    });
+}

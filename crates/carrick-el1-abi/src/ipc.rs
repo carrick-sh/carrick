@@ -1453,6 +1453,13 @@ impl<'a> IpcRegion<'a> {
         self.dir.fd.bind(self, wait)
     }
 
+    /// Hold the descriptor storage lock forever, as a vCPU stopped inside a
+    /// storage section does (#2988 witnesses). False if it was held.
+    #[cfg(feature = "test-support")]
+    pub fn hold_descriptor_storage_forever_for_test(&self) -> bool {
+        self.descriptor_storage().hold_forever_for_test()
+    }
+
     fn descriptor_storage(&self) -> &'a DescriptorStorage {
         // SAFETY: attach checks the complete directory reservation; this aligned
         // region contains only synchronized, pointer-free allocator metadata.
