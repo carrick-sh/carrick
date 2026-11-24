@@ -469,8 +469,7 @@ pub trait ReservationPolicy {
     fn validates_layout(layout: Layout) -> bool;
     /// Whether a private anonymous `range` outside `layout` lies in an
     /// aperture no carrier mapping occupies, below the ISA's `user_end`.
-    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64)
-    -> bool;
+    fn external_anonymous_aperture(layout: Layout, range: ReservationRange, user_end: u64) -> bool;
     fn active_value(policy: ReservationPolicyPayload) -> u64;
     fn apply_value(policy: &mut ReservationPolicyPayload, value: u64);
     fn admits_charges(
