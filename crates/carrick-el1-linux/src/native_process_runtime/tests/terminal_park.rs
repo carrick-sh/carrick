@@ -1151,11 +1151,10 @@ impl crate::thread_setup::LifecycleVenue for RawExitVenue<'_> {
 /// dispatch, with `process` as the member's native process venue.
 #[cfg(test)]
 fn dispatch_raw_exit<'ipc, C>(
-    zone: &'static carrick_sched_core::ZoneTables<C>,
+    source: BornInZoneSource<'static, C>,
     task: &'static carrick_el1_abi::CurrentTask,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
-    slot: carrick_sched_core::SlotId,
     process: &mut dyn ProcessNative<'ipc, C>,
     isa: carrick_personality_linux::crossing::HostCrossingSet,
     status: u64,
@@ -1166,7 +1165,7 @@ where
     let counters = carrick_el1_abi::Counters::new();
     let names = carrick_el1_abi::InotifyNameCache::new();
     let venue = RawExitVenue { page, control };
-    let mut frame = RawExitStatusFrame(isa, slot, status);
+    let mut frame = RawExitStatusFrame(isa, source.slot, status);
     let mut pending: crate::dispatch::El1PendingFamilies<
         '_,
         'ipc,
@@ -1191,7 +1190,7 @@ where
         ipc: None,
         lifecycle: Some(&venue),
         process: Some(process),
-        source: Some(BornInZoneSource { zone, slot }),
+        source: Some(source),
         anonymous: None,
         cache_lookup: |_| core::ptr::null_mut(),
     };
@@ -1253,11 +1252,13 @@ fn refused_nonfinal_release_wakes_parked_raw_exit<C, B>(
             .unwrap();
         assert_eq!(
             dispatch_raw_exit(
-                fixture.zone,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
                 fixture.task,
                 fixture.page,
                 fixture.control,
-                fixture.slot,
                 entry.as_mut(),
                 isa,
                 38,
@@ -1294,11 +1295,13 @@ fn refused_nonfinal_release_wakes_parked_raw_exit<C, B>(
         )
         .unwrap();
     let _ = dispatch_raw_exit(
-        fixture.zone,
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling_slot,
+        },
         sibling_task,
         fixture.page,
         sibling_control,
-        sibling_slot,
         entry_a.as_mut(),
         isa,
         0,
@@ -1401,11 +1404,13 @@ fn resumed_raw_exit_runs_no_pending_signal_handler<C, B>(
             .unwrap();
         assert_eq!(
             dispatch_raw_exit(
-                fixture.zone,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
                 fixture.task,
                 fixture.page,
                 fixture.control,
-                fixture.slot,
                 entry.as_mut(),
                 isa,
                 38,
@@ -1435,11 +1440,13 @@ fn resumed_raw_exit_runs_no_pending_signal_handler<C, B>(
         .unwrap();
     assert_eq!(
         dispatch_raw_exit(
-            fixture.zone,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling_slot,
+            },
             sibling_task,
             fixture.page,
             sibling_control,
-            sibling_slot,
             entry_a.as_mut(),
             isa,
             0,
@@ -1506,8 +1513,10 @@ fn resumed_raw_exit_runs_no_pending_signal_handler<C, B>(
         !entry_leader.signal_checkpoint_needed(),
         "an exiting thread owes no signal checkpoint"
     );
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.elr = 0x40_0000;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0000,
+        ..Default::default()
+    };
     frame.x[0] = 38;
     frame.x[8] = 93;
     let before = frame;
@@ -1547,11 +1556,13 @@ fn resumed_raw_exit_runs_no_pending_signal_handler<C, B>(
         .unwrap();
     assert_eq!(
         dispatch_raw_exit(
-            fixture.zone,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
             fixture.task,
             fixture.page,
             fixture.control,
-            fixture.slot,
             entry_leader.as_mut(),
             isa,
             38,
