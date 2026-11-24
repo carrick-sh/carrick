@@ -135,7 +135,7 @@ pub(crate) fn script_signal_clock(reads: &[u64]) {
 
 /// Fail the next exact-MM user copies (direct or page-admitted owned
 /// copies), in order: `Unsupported` is a not-yet-backed page.
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn fail_signal_copies(errors: &[NativeProcessError]) {
     SIGNAL_COPY_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
