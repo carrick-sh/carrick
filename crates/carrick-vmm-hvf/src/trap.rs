@@ -4287,6 +4287,20 @@ impl HvpatchPreparedTaskAuthority {
     }
 }
 
+/// Take the backing a prepared task's mapping holds for the stage-2 extent
+/// `key`, for a carrier lease that must keep it while still mapped.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn take_task_mapping_backing(
+    mappings: &mut [HvpatchTaskMappingState],
+    key: (u64, u64),
+) -> Option<GlobalFrameBacking> {
+    mappings
+        .iter_mut()
+        .filter(|mapping| (mapping.physical_ipa, mapping.physical_size as u64) == key)
+        .find_map(|mapping| mapping.host_mapping.take())
+        .map(GlobalFrameBacking::Owned)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn abort_prepared_task_and_carrier(
     mut task: HvpatchPreparedTaskAuthority,
@@ -6095,7 +6109,7 @@ impl HvpatchCarrierTaskStateDirectory {
         self: &std::sync::Arc<Self>,
         identity: HvpatchCarrierTaskIdentity,
         state: HvpatchCarrierTaskState,
-        task: HvpatchPreparedTaskAuthority,
+        mut task: HvpatchPreparedTaskAuthority,
         failpoint: u8,
     ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
         let custody = match task.custody.as_ref() {
@@ -6297,11 +6311,15 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_record_identities = match register_carrier_stage2_leases(
+                // A lease the batch cannot roll back takes its backing from
+                // the task mapping, so the abort below cannot drop it.
+                let registration = register_carrier_stage2_leases(
                     &carrier_custody,
                     &mut stage2_leases,
                     &owner_hosts,
-                ) {
+                    &mut |key| take_task_mapping_backing(&mut task.mappings, key),
+                );
+                let stage2_record_identities = match registration {
                     Ok(keys) => keys,
                     Err(error) => {
                         abort_prepared_task_and_carrier(
@@ -6350,11 +6368,15 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_record_identities = match register_carrier_stage2_leases(
+                // A lease the batch cannot roll back takes its backing from
+                // the task mapping, so the abort below cannot drop it.
+                let registration = register_carrier_stage2_leases(
                     &carrier_custody,
                     &mut stage2_leases,
                     &owner_hosts,
-                ) {
+                    &mut |key| take_task_mapping_backing(&mut task.mappings, key),
+                );
+                let stage2_record_identities = match registration {
                     Ok(keys) => keys,
                     Err(error) => {
                         abort_prepared_task_and_carrier(

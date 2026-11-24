@@ -2373,7 +2373,8 @@ impl HvfVmState {
                     }
                 }
                 let stage2_lease_keys =
-                    register_carrier_stage2_leases(&custody, &mut stage2_leases, &owner_hosts)
+                    // Any refusal is fatal below, so no backing needs to move.
+                    register_carrier_stage2_leases(&custody, &mut stage2_leases, &owner_hosts, &mut |_| None)
                         .unwrap_or_else(|error| {
                             // Replacement inventory already names every candidate.
                             // Fail-stop before unwinding can drop their leases or host

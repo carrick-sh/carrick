@@ -487,7 +487,8 @@ fn register_carrier_lease(
     let key = lease.key();
     lease.mark_test_mapped_without_backend();
     let owners = std::collections::BTreeMap::from([(key, host_addr)]);
-    let identities = register_carrier_stage2_leases(custody, &mut vec![lease], &owners).unwrap();
+    let identities =
+        register_carrier_stage2_leases(custody, &mut vec![lease], &owners, &mut |_| None).unwrap();
     assert_eq!(identities.len(), 1);
     assert_eq!(
         custody
@@ -5163,7 +5164,7 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
     let key = next_test_physical_key(0x4000);
     let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
     let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
-    let error = register_carrier_stage2_leases(&custody, &mut unmapped, &owners)
+    let error = register_carrier_stage2_leases(&custody, &mut unmapped, &owners, &mut |_| None)
         .expect_err("an unmapped carrier lease cannot authenticate retirement");
     assert!(error.to_string().contains("mapped=false"));
     assert!(
@@ -5175,7 +5176,7 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
     let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
     unmapped[0].mark_test_mapped_without_backend();
     unmapped[0].active = false;
-    let error = register_carrier_stage2_leases(&custody, &mut unmapped, &owners)
+    let error = register_carrier_stage2_leases(&custody, &mut unmapped, &owners, &mut |_| None)
         .expect_err("an inactive mapped carrier lease cannot authenticate retirement");
     assert!(error.to_string().contains("active=false"));
     assert!(unmapped.is_empty());
@@ -5183,9 +5184,13 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
 
     let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
     unmapped[0].mark_test_mapped_without_backend();
-    let error =
-        register_carrier_stage2_leases(&custody, &mut unmapped, &std::collections::BTreeMap::new())
-            .expect_err("a mapped key without its exact host owner is still insufficient");
+    let error = register_carrier_stage2_leases(
+        &custody,
+        &mut unmapped,
+        &std::collections::BTreeMap::new(),
+        &mut |_| None,
+    )
+    .expect_err("a mapped key without its exact host owner is still insufficient");
     assert!(error.to_string().contains("host=0x0"));
     assert!(unmapped.is_empty());
     assert!(!custody.carrier_stage2_records.lock().contains_key(&key));
@@ -5292,7 +5297,7 @@ fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate()
     }
 
     let owners = std::collections::BTreeMap::from([(reserved_key, 0x2000), (existing_key, 0x1000)]);
-    let error = register_carrier_stage2_leases(&custody, &mut candidates, &owners)
+    let error = register_carrier_stage2_leases(&custody, &mut candidates, &owners, &mut |_| None)
         .expect_err("an existing carrier key must reject the complete batch");
 
     assert!(error.to_string().contains("collision"));

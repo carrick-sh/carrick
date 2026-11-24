@@ -2336,6 +2336,79 @@ mod carrier_vm_custody_tests {
         );
     }
 
+    /// A batch lease the carrier registration cannot roll back stays mapped,
+    /// so it keeps the backing its task mapping held (#2968 confirming
+    /// review, P0 1). Before this, the refused batch put the still-mapped
+    /// lease into custody with no backing, and the process-preparation abort
+    /// then dropped the task's backing under a live stage-2 mapping.
+    #[test]
+    fn serial_host_a_batch_lease_whose_rollback_unmap_fails_keeps_its_task_backing() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let recorder = std::sync::Arc::new(RecordingStage2::default());
+        recorder
+            .fail_unmaps
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let custody = std::sync::Arc::new(super::CarrierVmCustody::new_live_fixture_over(
+            std::sync::Arc::clone(&recorder) as _,
+        ));
+        let length = 0x4000_u64;
+        let mut mapped = super::GlobalFrameStage2Lease::reserve(length, length)
+            .expect("reserve the lease's IPA");
+        mapped.mark_mapped(custody.stage2_backend_handle());
+        let mapped_key = mapped.key();
+        // The task mapping that owns the mapped lease's backing.
+        let mut task_backing = Some(
+            crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                length as usize,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .expect("allocate the lease's backing"),
+        );
+        let host_addr = task_backing.as_ref().map(|m| m.as_ptr() as usize).unwrap();
+        // A second lease with no host owner refuses the whole batch.
+        let orphan_key = (0xa086_0000_0000_u64, length);
+        let mut orphan = super::GlobalFrameStage2Lease::fixed(orphan_key.0, orphan_key.1);
+        orphan.mark_test_mapped_without_backend();
+        let owners = std::collections::BTreeMap::from([(mapped_key, host_addr)]);
+        let mut leases = vec![mapped, orphan];
+
+        let registered =
+            super::register_carrier_stage2_leases(&custody, &mut leases, &owners, &mut |key| {
+                (key == mapped_key)
+                    .then(|| task_backing.take())
+                    .flatten()
+                    .map(super::GlobalFrameBacking::Owned)
+            });
+
+        assert!(registered.is_err(), "the batch is refused: {registered:?}");
+        assert!(leases.is_empty());
+        // The preparation abort drops what the task still owns.
+        drop(task_backing.take());
+        assert!(
+            super::alias_backing_is_live(host_addr),
+            "a still-mapped batch lease keeps its backing past the task's abort"
+        );
+        assert_eq!(
+            custody.stage2_backend_handle().unretired_lease_count(),
+            1,
+            "the backend that mapped it keeps the lease and its backing"
+        );
+
+        let destroyed = super::destroy_vm_with_custody_target_using(
+            &custody,
+            "batch witness",
+            super::CarrierVmDestroyTarget::Live,
+            || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        );
+        assert!(destroyed.is_ok(), "{destroyed:?}");
+        assert_eq!(custody.stage2_backend_handle().unretired_lease_count(), 0);
+        assert!(
+            !super::alias_backing_is_live(host_addr),
+            "the mapper's VM destroy settles the lease and frees its backing"
+        );
+    }
+
     /// A test carrier's custody tears down through the production sequence
     /// (#2968 review, P0 2): a failed backend destroy restores the exact live
     /// custody with its records untouched, and a successful one terminalizes
@@ -4196,9 +4269,13 @@ mod carrier_vm_custody_tests {
         let mut g1_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
         g1_lease.mark_test_mapped_without_backend();
         let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
-        let old_identity =
-            super::register_carrier_stage2_leases(&custody, &mut vec![g1_lease], &owners)
-                .expect("register G1 carrier-MM record")[0];
+        let old_identity = super::register_carrier_stage2_leases(
+            &custody,
+            &mut vec![g1_lease],
+            &owners,
+            &mut |_| None,
+        )
+        .expect("register G1 carrier-MM record")[0];
         assert_eq!(old_identity.vm_generation, g1);
         destroy_vm_with_custody_using(
             &custody,

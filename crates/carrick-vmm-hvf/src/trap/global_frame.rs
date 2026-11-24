@@ -2074,6 +2074,7 @@ pub(crate) fn register_carrier_stage2_leases(
     custody: &std::sync::Arc<CarrierVmCustody>,
     leases: &mut Vec<GlobalFrameStage2Lease>,
     owner_hosts: &std::collections::BTreeMap<(u64, u64), usize>,
+    _take_backing: &mut dyn FnMut((u64, u64)) -> Option<GlobalFrameBacking>,
 ) -> Result<Vec<CarrierStage2RecordIdentity>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
     let mut distinct = std::collections::BTreeSet::new();
