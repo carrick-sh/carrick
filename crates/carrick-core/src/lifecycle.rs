@@ -901,10 +901,6 @@ pub trait Lifecycle {
     fn live(&self) -> u32 {
         (self.live_word().load(Ordering::SeqCst) & LIVE_COUNT_MASK) as u32
     }
-    /// Whether any peer currently holds an uncommitted refundable exit reservation.
-    fn has_refundable_exit(&self) -> bool {
-        (self.live_word().load(Ordering::SeqCst) & REFUNDABLE_EXIT_MASK) != 0
-    }
     /// Single-word atomic check that one live member remains and no peer holds
     /// a refundable exit reservation that could still restore membership.
     fn live_is_sole_uncontested(&self) -> bool {
