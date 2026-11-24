@@ -1682,6 +1682,11 @@ impl<'a> FsView<'a> {
         {
             return Ok(DispatchOutcome::errno(errno));
         }
+        // A shared file window maps this inode: a shrink is refused before
+        // the host applies it (#1338 A1).
+        if self.path_shrink_fence(&resolved, length as u64) == ShrinkFence::Refuse {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
         // is materialised on the cap-std scratch under --fs host, so this
         // works for both rootfs and guest-created files. MemoryBackend has no
@@ -1690,6 +1695,28 @@ impl<'a> FsView<'a> {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
         }
+    }
+
+    /// [`WindowInodes::fence`] for a size change of the file at the
+    /// absolute, resolved `path` to `new_len` (a `truncate`, an `O_TRUNC`
+    /// open). A path naming no rootfs inode names no window.
+    pub(in crate::dispatch) fn path_shrink_fence(&self, path: &str, new_len: u64) -> ShrinkFence {
+        let windows = &self.fs.window_inodes;
+        if !windows.any_window() {
+            return ShrinkFence::Admit;
+        }
+        let Some(identity) = self.fs.rootfs_vfs.path_inode_identity(path) else {
+            return ShrinkFence::Admit;
+        };
+        windows.fence(
+            Some(identity),
+            || {
+                self.layered_metadata(path)
+                    .ok()
+                    .and_then(|md| u64::try_from(md.size).ok())
+            },
+            new_len,
+        )
     }
 
     // === Normalized shim-wrappers ===
@@ -2348,6 +2375,17 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    // A hole punch or a collapse discards a window's pages
+                    // under its live leaves: refused before the host applies
+                    // it (#1338 A1).
+                    if mode
+                        & (LINUX_FALLOC_FL_PUNCH_HOLE | carrick_abi::LINUX_FALLOC_FL_COLLAPSE_RANGE)
+                        != 0
+                        && this.fs.window_inodes.fence_host_fd_discard(host_fd)
+                            == ShrinkFence::Refuse
+                    {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                    }
                     if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
                         if let Err(errno) =
                             rw::punch_host_file_hole(host_fd.raw(), offset as u64, length as u64)
@@ -2530,6 +2568,13 @@ impl<'a> FsView<'a> {
                     if !*writable {
                         // RO fd → EINVAL (ftruncate03), not EBADF.
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    // A shared file window maps this inode: a shrink is
+                    // refused before the host applies it (#1338 A1).
+                    if this.fs.window_inodes.fence_host_fd(host_fd, length as u64)
+                        == ShrinkFence::Refuse
+                    {
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
                     }
                     // Real fd: ftruncate the kernel file directly (the
                     // change is visible across fork).
