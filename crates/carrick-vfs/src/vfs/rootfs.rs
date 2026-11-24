@@ -3819,7 +3819,7 @@ mod tests {
 
     #[test]
     fn truncate_rejects_unbounded_in_memory_file_growth() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
 
         assert_eq!(
             v.truncate("/etc/hosts", crate::vfs::MAX_IN_MEMORY_FILE_SIZE + 1),

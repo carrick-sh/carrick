@@ -34080,6 +34080,13 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
+      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized_resize",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "k1_create_install",
+      "operation": "write_for_io",
       "owner": "carrick_kernel::dispatch::fs::FsView<'a>::fallocate",
       "lane": "shared",
       "ceiling": 1
