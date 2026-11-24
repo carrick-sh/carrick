@@ -290,7 +290,6 @@ impl Drop for HostTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::el1_zone::HostLockWait;
     use carrick_el1_abi::ipc::{IpcBacking, pipe::EventMode};
 
     /// #2955: a ring section cut off when its vCPU stopped keeps its table
@@ -307,14 +306,16 @@ mod tests {
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let region_owner = owner.clone();
         std::thread::spawn(move || {
-            let _ = region_owner
-                .region()
-                .fork_descriptors(id, &HostLockWait, |_| {
+            let _ = region_owner.region().fork_descriptors(
+                id,
+                &crate::el1_zone::TestRegionWait,
+                |_| {
                     held_tx.send(()).unwrap();
                     loop {
                         std::thread::park();
                     }
-                });
+                },
+            );
         });
         held_rx.recv().unwrap();
         // ExecutorPool::shutdown after joining every worker.
@@ -351,7 +352,12 @@ mod tests {
             .unwrap();
         // The frozen holder: the object's lock is taken and never released,
         // as by a vCPU stopped inside the ring's eventfd section.
-        std::mem::forget(owner.region().lock(object, &HostLockWait).unwrap());
+        std::mem::forget(
+            owner
+                .region()
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
         // ExecutorPool::shutdown after joining every worker.
         owner.stop_guest_execution();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -499,7 +505,7 @@ mod tests {
         table.replace(fd::Fd(0), &original.flags(), true).unwrap();
         let child = table.fork().unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let (operation, _) = authority.pin(table.id(), fd::Fd(0)).unwrap();
         drop(original);
         let successor_object = owner.create_eventfd(9, EventMode::Counter).unwrap();
@@ -529,10 +535,14 @@ mod tests {
         );
         drop(table);
         drop(successor);
-        assert!(region.lock(successor_object, &HostLockWait).is_err());
+        assert!(
+            region
+                .lock(successor_object, &crate::el1_zone::TestRegionWait)
+                .is_err()
+        );
         assert_eq!(
             region
-                .lock(object, &HostLockWait)
+                .lock(object, &crate::el1_zone::TestRegionWait)
                 .unwrap()
                 .eventfd()
                 .unwrap()
@@ -542,6 +552,10 @@ mod tests {
         );
         let final_description = authority.unpin(operation).unwrap().unwrap();
         owner.release(final_description.backing).unwrap();
-        assert!(region.lock(object, &HostLockWait).is_err());
+        assert!(
+            region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .is_err()
+        );
     }
 }

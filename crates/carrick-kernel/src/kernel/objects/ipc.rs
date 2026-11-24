@@ -191,7 +191,7 @@ impl Binding {
         }
         self.owner
             .region()
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(self.owner.wait())
             .setfd(self.table.id(), fd::Fd(number), cloexec)
             .map_err(Into::into)
     }
@@ -295,7 +295,7 @@ impl Binding {
             return Some(Err(crate::linux_abi::LINUX_EBADF));
         }
         let region = self.owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(self.owner.wait());
         match authority.getfd(self.table.id(), fd::Fd(number)) {
             Ok(true) => Some(Ok(crate::linux_abi::LINUX_FD_CLOEXEC)),
             Ok(false) => Some(Ok(0)),
@@ -306,7 +306,7 @@ impl Binding {
 
     fn refresh_flags(&self, slots: &mut FileSlotMap) {
         let region = self.owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(self.owner.wait());
         for (&fd, slot) in slots.iter_mut() {
             if let Ok(cloexec) = authority.getfd(self.table.id(), fd::Fd(fd)) {
                 if cloexec {
@@ -320,7 +320,7 @@ impl Binding {
 
     fn refresh_stdio(&mut self) {
         let region = self.owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(self.owner.wait());
         for number in 0..3 {
             if self.explicit_stdio[number] {
                 continue;
@@ -498,7 +498,7 @@ impl FileTable {
             return None;
         }
         let region = ring.owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(ring.owner.wait());
         let capacity = authority.backing_capacity(table).ok()?;
         let copies = (0..capacity)
             .filter_map(|slot| i32::try_from(slot).ok())
@@ -531,7 +531,7 @@ impl FileTable {
         }
         let cloexec = owner
             .region()
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(owner.wait())
             .getfd(table, fd::Fd(number))
             .ok()?;
         Some((
@@ -753,7 +753,7 @@ mod tests {
         let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
         peer.publish_ipc(Arc::clone(&owner), map).unwrap();
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
         let peer_id = fd::TableId::from_raw(map.lookup(peer.id().raw()).unwrap());
         authority.setfd(shared, fd::Fd(3), true).unwrap();
@@ -778,7 +778,7 @@ mod tests {
         let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
         peer.publish_ipc(Arc::clone(&owner), map).unwrap();
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
         // Bare stdio is present only as implicit markers in the host map.
         assert_eq!(parent.slot_count(), 0);
@@ -812,7 +812,7 @@ mod tests {
         let shared = fd::TableId::from_raw(map.lookup(table.id().raw()).unwrap());
         owner
             .region()
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .close(shared, fd::Fd(3))
             .unwrap();
         let reservation = table.reserve_slot_at_or_above(0, 64).unwrap();
@@ -889,7 +889,7 @@ mod tests {
         let child = child_context.resources().files();
         child.publish_ipc(Arc::clone(&owner), map).unwrap();
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let parent_id = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
         let child_id = fd::TableId::from_raw(map.lookup(child.id().raw()).unwrap());
         assert_eq!(
@@ -981,7 +981,7 @@ mod tests {
         files.publish_ipc(Arc::clone(&owner), map).unwrap();
         assert_eq!(map.lookup(files.id().raw()), None);
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         assert!(
             authority
                 .get(fd::TableId::from_raw(shared), fd::Fd(1))
@@ -1007,7 +1007,7 @@ mod tests {
             .expect("publish complete live FileTable");
         let shared = fd::TableId::from_raw(map.lookup(table.id().raw()).expect("live namespace"));
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         for number in 0..4 {
             assert!(matches!(
                 IpcBacking::decode(authority.get(shared, fd::Fd(number)).unwrap().backing),

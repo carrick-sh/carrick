@@ -2516,12 +2516,14 @@ mod tests {
         assert!(sock >= 0, "a native UDP socket: {sock}");
         // The ring's `epoll_create1`: a zone epoll record and its descriptor.
         let region = fixture.owner.region();
-        let epoll = region.create_epoll(&crate::el1_zone::HostLockWait).unwrap();
+        let epoll = region
+            .create_epoll(&crate::el1_zone::TestRegionWait)
+            .unwrap();
         region
-            .ensure_table_capacity(fixture.ring_fd(), 64, &crate::el1_zone::HostLockWait)
+            .ensure_table_capacity(fixture.ring_fd(), 64, &crate::el1_zone::TestRegionWait)
             .unwrap();
         let epfd = region
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .open(
                 fixture.ring_fd(),
                 fd::Fd(0),
@@ -2556,7 +2558,11 @@ mod tests {
         assert!(fixture.owner.existing_native_socket_epolls().is_some());
         // The frozen holder: the epoll's object lock is taken and never
         // released, as by a vCPU stopped inside the ring's epoll section.
-        std::mem::forget(region.lock(epoll, &crate::el1_zone::HostLockWait).unwrap());
+        std::mem::forget(
+            region
+                .lock(epoll, &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
         // ExecutorPool::shutdown after joining every worker.
         fixture.owner.stop_guest_execution();
         let owner = Arc::clone(&fixture.owner);
@@ -2568,7 +2574,7 @@ mod tests {
             // reference drops here.
             let released = owner
                 .region()
-                .fd(crate::el1_zone::HostLockWait)
+                .fd(crate::el1_zone::TestRegionWait)
                 .close(table, fd::Fd(sock as i32))
                 .unwrap()
                 .expect("the socket's last descriptor");
@@ -3258,10 +3264,10 @@ mod tests {
             .install_ipc_for_test(Arc::clone(&fixture.owner));
         let region = fixture.owner.region();
         let mut storage = region
-            .provision_descriptors(256, &crate::el1_zone::HostLockWait)
+            .provision_descriptors(256, &crate::el1_zone::TestRegionWait)
             .unwrap();
         let child = region
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .fork(fixture.ring_fd(), &mut storage)
             .unwrap()
             .to_raw();
@@ -3936,7 +3942,7 @@ mod tests {
             assert_eq!(path_resize(&[b'x'; 256], 1), -36);
             assert_eq!(path_resize(b"missing", u64::MAX), -22);
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             if let Some(released) = ring.close(fixture.ring_fd(), fd::Fd(file as i32)).unwrap() {
                 fixture.owner.release(released.backing).unwrap();
             }
@@ -4056,9 +4062,9 @@ mod tests {
                     .description(),
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             let mut storage = region
-                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
                 .unwrap();
             let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap().to_raw();
             fixture.table = [child.authority, child.index, child.generation];
@@ -4167,9 +4173,9 @@ mod tests {
             0
         );
         let region = fixture.owner.region();
-        let ring = region.fd(crate::el1_zone::HostLockWait);
+        let ring = region.fd(crate::el1_zone::TestRegionWait);
         let mut storage = region
-            .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+            .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
             .unwrap();
         let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap().to_raw();
         fixture.table = [child.authority, child.index, child.generation];
@@ -4319,11 +4325,11 @@ mod tests {
                     .description(),
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             ring.dup2(fixture.ring_fd(), fd::Fd(opened as i32), fd::Fd(1))
                 .unwrap();
             let mut storage = region
-                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
                 .unwrap();
             let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap();
             let raw = child.to_raw();
@@ -4621,7 +4627,7 @@ mod tests {
         // dup2 from another thread would after the ring staged the set.
         let region = fixture.owner.region();
         if let Some(closed) = region
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .close(table, fd::Fd(3))
             .unwrap()
         {
@@ -4752,7 +4758,7 @@ mod tests {
                     .is_none()
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             let released = ring.close(table, fd::Fd(4)).unwrap().unwrap();
             fixture.owner.release(released.backing).unwrap();
         }
@@ -4803,7 +4809,7 @@ mod tests {
             generation: fixture.table[2],
         };
         let authority_fd = fixture.owner.region();
-        let authority_fd = authority_fd.fd(crate::el1_zone::HostLockWait);
+        let authority_fd = authority_fd.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(
             authority_fd.getfd(fd::TableId::from_raw(raw), fd::Fd(fd)),
             Ok(true),
@@ -5297,7 +5303,7 @@ mod tests {
             let fd = fixture.venue_open(&authority, b"/tmp/f", CREATE, 0o644);
             assert!(fd >= 0, "{upper:?}: create: {fd}");
             let ring = fixture.owner.region();
-            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let ring = ring.fd(crate::el1_zone::TestRegionWait);
             let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
             assert_eq!(access, fd::AccessMode::WriteOnly, "{upper:?}");
             assert_eq!(fixture.venue_write(fd, b"hello "), 6, "{upper:?}");
@@ -5319,7 +5325,7 @@ mod tests {
         let fd = fixture.venue_open(&authority, b"/dev/null", CREATE, 0o666);
         assert!(fd >= 0, "open /dev/null: {fd}");
         let ring = fixture.owner.region();
-        let ring = ring.fd(crate::el1_zone::HostLockWait);
+        let ring = ring.fd(crate::el1_zone::TestRegionWait);
         let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
         assert_eq!(access, fd::AccessMode::WriteOnly);
         assert_eq!(fixture.venue_write(fd, b"discarded"), 9);
@@ -5337,7 +5343,7 @@ mod tests {
             let fd = fixture.venue_open(&authority, b"/tmp/log", append, 0);
             assert!(fd >= 0, "{upper:?}: append open: {fd}");
             let ring = fixture.owner.region();
-            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let ring = ring.fd(crate::el1_zone::TestRegionWait);
             let (_, status) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
             assert!(status.append, "{upper:?}: F_GETFL reports O_APPEND");
             assert_eq!(fixture.venue_write(fd, b"de"), 2, "{upper:?}");
@@ -6025,7 +6031,7 @@ mod tests {
         let native = host_file::reply(&open).unwrap().result as i32;
         assert_eq!(native, 3, "the child's lowest free ring descriptor");
         let region = owner.region();
-        let ring = region.fd(crate::el1_zone::HostLockWait);
+        let ring = region.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(ring.getfd(table, fd::Fd(native)), Ok(false));
         assert_eq!(
             root_slots(&root_files),

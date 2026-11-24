@@ -104,6 +104,31 @@ pub use carrick_pipe_core::{
     self as pipe, End, EventFd, EventMode, Page, Pipe, PipeRecord, WakeSet, WriteProgress,
 };
 
+/// A lock wait admitted to this region's object, table and storage locks
+/// (#2955, #2988). Every region operation takes one, so a venue's wait type
+/// says whether it may wait on a lock the guest's ring also takes. A ring
+/// venue's wait runs on the vCPU that holds or waits for the lock. The host
+/// carrier's wait must stop waiting once no executor can resume the holder:
+/// its only implementor is the owner's stop-aware region wait, and the
+/// carrier's general zone wait (which spins forever) has no impl, so the
+/// compiler names every host site that would wait on a region lock with it.
+pub trait RegionLockWait: LockWait {}
+
+/// The storage allocators' short sections nested inside a region
+/// operation that already holds its object or table lock: an extent
+/// supply or reclaim, in either venue. Not constructible outside this
+/// module, so no venue can name it for a lock of its own.
+struct NestedShortWait;
+impl carrick_sched_core::ShortLockWait for NestedShortWait {
+    fn wait_short(&self, attempt: u32) {
+        carrick_sched_core::ShortLockSpin.wait_short(attempt);
+    }
+}
+impl RegionLockWait for NestedShortWait {}
+/// A bounded spin refuses at its budget, so its caller retains the work:
+/// it can never wait on a holder that is not coming back.
+impl RegionLockWait for carrick_sched_core::BoundedSpin {}
+
 /// Descriptor tables (distinct `CLONE_FILES` groups) in the shared authority.
 /// Exhaustion is not guest-visible: the host keeps serving a table it could
 /// not publish.
@@ -1414,7 +1439,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// The shared descriptor authority, with this venue's lock policy.
-    pub fn fd<W: LockWait>(&'a self, wait: W) -> IpcFdAuthority<'a, W> {
+    pub fn fd<W: RegionLockWait>(&'a self, wait: W) -> IpcFdAuthority<'a, W> {
         self.dir.fd.bind(self, wait)
     }
 
@@ -1447,7 +1472,7 @@ impl<'a> IpcRegion<'a> {
         object: IpcObjectHandle,
         requested: usize,
         limit: usize,
-        wait: &impl LockWait,
+        wait: &impl RegionLockWait,
         mut deliver: impl FnMut(IpcWake),
     ) -> Result<usize, IpcError> {
         let region = self;
@@ -1509,7 +1534,7 @@ impl<'a> IpcRegion<'a> {
         &self,
         ring_bytes: u64,
         pages: u64,
-        wait: &impl LockWait,
+        wait: &impl RegionLockWait,
     ) -> Result<IpcPipeStorage, IpcError> {
         if ring_bytes == 0 || !ring_bytes.is_multiple_of(IPC_PIPE_PAGE_SIZE as u64) || pages == 0 {
             return Err(IpcError::BadStorage);
@@ -1537,7 +1562,7 @@ impl<'a> IpcRegion<'a> {
     pub fn reclaim_pipe_storage(
         &self,
         storage: &mut IpcPipeStorage,
-        wait: &impl LockWait,
+        wait: &impl RegionLockWait,
     ) -> Result<(), IpcError> {
         if storage.ring_bytes == 0 && storage.pages == 0 {
             return Ok(());
@@ -1572,7 +1597,7 @@ impl<'a> IpcRegion<'a> {
     pub fn provision_descriptors(
         &self,
         capacity: usize,
-        wait: &impl LockWait,
+        wait: &impl RegionLockWait,
     ) -> Result<Extent, fd::storage::StorageError> {
         if capacity == 0 || capacity > i32::MAX as usize {
             return Err(fd::storage::StorageError::Invalid);
@@ -1591,7 +1616,7 @@ impl<'a> IpcRegion<'a> {
     pub fn reclaim_descriptors(
         &self,
         extent: &mut Extent,
-        wait: &impl LockWait,
+        wait: &impl RegionLockWait,
     ) -> Result<(), fd::storage::StorageError> {
         if extent.capacity == 0 {
             return Ok(());
@@ -1620,18 +1645,19 @@ impl<'a> IpcRegion<'a> {
     /// One fork/storage transaction for host and ring venues. The binding
     /// publisher runs under the parent descriptor lock; refusal returns both
     /// the unpublished child identity and its extent without a final release.
-    pub fn fork_descriptors<W: LockWait>(
+    pub fn fork_descriptors<W: RegionLockWait>(
         &self,
         parent: fd::TableId,
         wait: &W,
         publish: impl FnOnce(fd::TableId) -> Result<(), fd::Error>,
     ) -> Result<fd::TableId, IpcError> {
         struct BorrowedWait<'a, W>(&'a W);
-        impl<W: LockWait> LockWait for BorrowedWait<'_, W> {
+        impl<W: RegionLockWait> LockWait for BorrowedWait<'_, W> {
             fn wait(&self, attempt: u32) -> bool {
                 self.0.wait(attempt)
             }
         }
+        impl<W: RegionLockWait> RegionLockWait for BorrowedWait<'_, W> {}
         let authority = self.fd(BorrowedWait(wait));
         let capacity = authority.backing_capacity(parent).map_err(IpcError::Fd)?;
         let mut extent =
@@ -1643,7 +1669,7 @@ impl<'a> IpcRegion<'a> {
         match authority.fork_published(parent, &mut extent, publish) {
             Ok(child) => Ok(child),
             Err(error) => {
-                self.reclaim_descriptors(&mut extent, &carrick_sched_core::ShortLockSpin)
+                self.reclaim_descriptors(&mut extent, &NestedShortWait)
                     .map_err(|_| IpcError::Corrupt)?;
                 Err(IpcError::Fd(error))
             }
@@ -1653,18 +1679,19 @@ impl<'a> IpcRegion<'a> {
     /// Grow `table`'s descriptor backing to at least `descriptors` (rounded up
     /// to a power of two within `MAX_DESCRIPTORS`) and reclaim the retired
     /// extent in the same synchronized pool.
-    pub fn ensure_table_capacity<W: LockWait>(
+    pub fn ensure_table_capacity<W: RegionLockWait>(
         &self,
         table: fd::TableId,
         descriptors: usize,
         wait: &W,
     ) -> Result<(), IpcError> {
         struct BorrowedWait<'a, W>(&'a W);
-        impl<W: LockWait> LockWait for BorrowedWait<'_, W> {
+        impl<W: RegionLockWait> LockWait for BorrowedWait<'_, W> {
             fn wait(&self, attempt: u32) -> bool {
                 self.0.wait(attempt)
             }
         }
+        impl<W: RegionLockWait> RegionLockWait for BorrowedWait<'_, W> {}
         let capacity = descriptors
             .max(1)
             .checked_next_power_of_two()
@@ -1691,7 +1718,7 @@ impl<'a> IpcRegion<'a> {
             }
             result => result,
         };
-        self.reclaim_descriptors(&mut extent, &carrick_sched_core::ShortLockSpin)
+        self.reclaim_descriptors(&mut extent, &NestedShortWait)
             .map_err(|_| IpcError::Corrupt)?;
         result.map_err(IpcError::Fd)
     }
@@ -2012,7 +2039,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Lock `object` for exclusive use. Authenticates kind and generation
     /// after the lock is held.
-    pub fn lock<W: LockWait>(
+    pub fn lock<W: RegionLockWait>(
         &self,
         object: IpcObjectHandle,
         wait: &W,
@@ -2075,7 +2102,7 @@ impl<'a> IpcRegion<'a> {
         Ok((index, self.record(index).ok_or(IpcError::Corrupt)?))
     }
 
-    fn lock_fresh<W: LockWait>(
+    fn lock_fresh<W: RegionLockWait>(
         &self,
         index: u32,
         record: &'a IpcObjectRecord,
@@ -2114,7 +2141,7 @@ impl<'a> IpcRegion<'a> {
     /// storage is reused when it fits; otherwise the pipe starts unbacked.
     /// A too-small extent stays owned by the record until the host replaces
     /// it through `provide_pipe_storage`, which returns it for reclamation.
-    pub fn create_pipe<W: LockWait>(
+    pub fn create_pipe<W: RegionLockWait>(
         &self,
         capacity: usize,
         wait: &W,
@@ -2141,7 +2168,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Create an eventfd counter object.
-    pub fn create_eventfd<W: LockWait>(
+    pub fn create_eventfd<W: RegionLockWait>(
         &self,
         initial: u32,
         mode: EventMode,
@@ -2160,7 +2187,7 @@ impl<'a> IpcRegion<'a> {
     /// it without allocating; a retained extent large enough for both lanes
     /// backs it at once, otherwise its first write supplies one
     /// ([`IpcObjectGuard::ensure_stream_storage`]).
-    pub fn create_stream<W: LockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
+    pub fn create_stream<W: RegionLockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
         let fresh = PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, IPC_STREAM_LANE_BYTES)
             .map_err(IpcError::Object)?;
         let (index, record) = self.pop_object()?;
@@ -2186,7 +2213,7 @@ impl<'a> IpcRegion<'a> {
     /// for SHUT_WR, its peer lane's reader for SHUT_RD). The references are
     /// the shutdown state, so a repeated shutdown and the final close drop
     /// only what remains. Deliver the returned wake after unlocking.
-    pub fn shutdown_stream<W: LockWait>(
+    pub fn shutdown_stream<W: RegionLockWait>(
         &self,
         object: IpcObjectHandle,
         end: StreamEnd,
@@ -2220,7 +2247,7 @@ impl<'a> IpcRegion<'a> {
     /// description is returned for the host venue to release. On
     /// `Contended` nothing changed: an EL1 caller hands the release to the
     /// host rather than retrying.
-    pub fn release_backing<W: LockWait>(
+    pub fn release_backing<W: RegionLockWait>(
         &self,
         backing: BackingToken,
         wait: &W,
@@ -2307,7 +2334,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Register a host readiness subscriber (poll/epoll/host blocking wait)
     /// on `object`. While any exist, changes set the owed-wake flag.
-    pub fn subscribe_host<W: LockWait>(
+    pub fn subscribe_host<W: RegionLockWait>(
         &self,
         object: IpcObjectHandle,
         wait: &W,
@@ -2317,7 +2344,7 @@ impl<'a> IpcRegion<'a> {
         Ok(())
     }
 
-    pub fn unsubscribe_host<W: LockWait>(
+    pub fn unsubscribe_host<W: RegionLockWait>(
         &self,
         object: IpcObjectHandle,
         wait: &W,
@@ -2537,7 +2564,10 @@ impl<'a> FileLocksGuard<'a> {
 impl<'a> IpcRegion<'a> {
     /// The zone's advisory lock object, creating it on first use. Lock
     /// waits park on its `Readable` lane and every release publishes it.
-    pub fn file_locks_object<W: LockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
+    pub fn file_locks_object<W: RegionLockWait>(
+        &self,
+        wait: &W,
+    ) -> Result<IpcObjectHandle, IpcError> {
         if let Some(object) = unpack_file_locks(self.dir.file_locks.load(Ordering::Acquire)) {
             return Ok(object);
         }
@@ -2569,14 +2599,14 @@ impl<'a> IpcRegion<'a> {
 
     /// Lock the zone's advisory lock table (creating its object on first
     /// use).
-    pub fn file_locks<W: LockWait>(&self, wait: &W) -> Result<FileLocksGuard<'a>, IpcError> {
+    pub fn file_locks<W: RegionLockWait>(&self, wait: &W) -> Result<FileLocksGuard<'a>, IpcError> {
         let object = self.file_locks_object(wait)?;
         self.lock_file_locks(object, wait)
     }
 
     /// [`Self::file_locks`] only if a lock was ever taken in this zone:
     /// release paths of descriptions that never locked anything stop here.
-    pub fn existing_file_locks<W: LockWait>(
+    pub fn existing_file_locks<W: RegionLockWait>(
         &self,
         wait: &W,
     ) -> Result<Option<FileLocksGuard<'a>>, IpcError> {
@@ -2589,7 +2619,7 @@ impl<'a> IpcRegion<'a> {
     /// Apply `release` to the zone's lock table, when a lock was ever taken
     /// here. A change that gave any lock up publishes the waiters' lane:
     /// the caller delivers the returned wake (no lock is held by then).
-    pub fn release_file_locks<W: LockWait>(
+    pub fn release_file_locks<W: RegionLockWait>(
         &self,
         wait: &W,
         release: impl FnOnce(&LockTable<'a>) -> bool,
@@ -2603,7 +2633,7 @@ impl<'a> IpcRegion<'a> {
         Ok(Some(locks.released()))
     }
 
-    fn lock_file_locks<W: LockWait>(
+    fn lock_file_locks<W: RegionLockWait>(
         &self,
         object: IpcObjectHandle,
         wait: &W,
@@ -2997,7 +3027,7 @@ impl<'a> IpcObjectGuard<'a> {
             None => self.region.provision_pipe_storage(
                 2 * IPC_STREAM_LANE_BYTES as u64,
                 2 * (IPC_STREAM_LANE_BYTES / IPC_PIPE_PAGE_SIZE) as u64,
-                &carrick_sched_core::ShortLockSpin,
+                &NestedShortWait,
             )?,
         };
         let result = self.provide_stream_storage(&mut storage);
@@ -3008,7 +3038,7 @@ impl<'a> IpcObjectGuard<'a> {
                 from_stock && result.is_err() && self.region.stock_ring(storage).is_ok();
             if !restocked {
                 self.region
-                    .reclaim_pipe_storage(&mut storage, &carrick_sched_core::ShortLockSpin)?;
+                    .reclaim_pipe_storage(&mut storage, &NestedShortWait)?;
             }
         }
         result.map(|()| true)
@@ -3055,12 +3085,12 @@ impl<'a> IpcObjectGuard<'a> {
         let mut storage = self.region.provision_pipe_storage(
             capacity,
             capacity / IPC_PIPE_PAGE_SIZE as u64,
-            &carrick_sched_core::ShortLockSpin,
+            &NestedShortWait,
         )?;
         let result = self.provide_pipe_storage(&mut storage);
         // Supply returns either the replaced extent or the unused allocation.
         self.region
-            .reclaim_pipe_storage(&mut storage, &carrick_sched_core::ShortLockSpin)?;
+            .reclaim_pipe_storage(&mut storage, &NestedShortWait)?;
         result
     }
 

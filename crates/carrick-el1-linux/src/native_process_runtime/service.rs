@@ -4337,7 +4337,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
             .is_err()
                 || region
-                    .fd(carrick_sched_core::ShortLockSpin)
+                    .fd(crate::ipc::RingShortSpin)
                     .exec_deferred(table)
                     .is_err()
             {

@@ -2820,7 +2820,7 @@ fn with_x86_ring_stream_pair<R>(
     let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
     let object = owner
         .region()
-        .create_stream(&carrick_sched_core::ShortLockSpin)
+        .create_stream(&carrick_kernel::el1_zone::TestRegionWait)
         .unwrap();
     let mut held = Vec::new();
     for (number, end) in [(3, StreamEnd::First), (4, StreamEnd::Second)] {
@@ -2938,7 +2938,7 @@ fn x86_socket_calls_on_a_ring_stream_end_are_served() {
         {
             let mut guard = owner
                 .region()
-                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
                 .unwrap();
             assert_eq!(
                 guard

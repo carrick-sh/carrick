@@ -156,7 +156,7 @@ impl ExecLockFds {
         table: fd::TableId,
     ) -> ExecLockOwners {
         use fd::record_lock::{Lock, LockClass, LockKind, LockOwner, LockPid, LockRange};
-        let authority = region.fd(ShortLockSpin);
+        let authority = region.fd(carrick_kernel::el1_zone::TestRegionWait);
         assert_eq!(authority.getfd(table, self.cloexec), Ok(true));
         let key = |fd| {
             let (pin, _) = authority.pin(table, fd).unwrap();
@@ -170,7 +170,9 @@ impl ExecLockFds {
             ofd: key(self.ofd),
         };
         assert_ne!(key(self.record), key(self.cloexec), "two descriptions");
-        let locks = region.file_locks(&ShortLockSpin).unwrap();
+        let locks = region
+            .file_locks(&carrick_kernel::el1_zone::TestRegionWait)
+            .unwrap();
         for (owner, class, range) in [
             (
                 owners.table,
@@ -213,7 +215,9 @@ impl ExecLockFds {
 impl ExecLockOwners {
     fn held(&self, region: carrick_el1_abi::ipc::IpcRegion<'_>) -> ExecLockHeld {
         use fd::record_lock::LockClass;
-        let locks = region.file_locks(&ShortLockSpin).unwrap();
+        let locks = region
+            .file_locks(&carrick_kernel::el1_zone::TestRegionWait)
+            .unwrap();
         ExecLockHeld {
             record: locks.table().holds(self.table, LockClass::Record),
             flock: locks.table().holds(self.flock, LockClass::Flock),
@@ -1637,7 +1641,7 @@ fn fork_exec_probe_copy_alignment(
         assert!(
             owner
                 .region()
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .getfd(table.id(), fd::Fd(6))
                 .unwrap()
         );

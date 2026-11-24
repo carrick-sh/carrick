@@ -621,6 +621,10 @@ impl carrick_el1_abi::LockWait for RegionWait<'_> {
     }
 }
 
+/// The host carrier's only region wait (#2988): it refuses once guest
+/// execution has stopped, where the carrier's zone wait would spin forever.
+impl carrick_el1_abi::ipc::RegionLockWait for RegionWait<'_> {}
+
 impl carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext> for RegionWait<'_> {
     fn complete_object_wake(
         &self,
@@ -2173,7 +2177,7 @@ mod tests {
         let region = owner.region();
         let count = || {
             region
-                .lock(object, &HostLockWait)
+                .lock(object, &crate::el1_zone::TestRegionWait)
                 .unwrap()
                 .host_subscribers()
         };
@@ -2185,7 +2189,9 @@ mod tests {
         assert_eq!(count(), 1);
         drop(callback);
         assert_eq!(count(), 0);
-        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(!guard.publish(step.wake).host_owed);
         drop(guard);
@@ -2198,7 +2204,9 @@ mod tests {
     /// Publish one owed host wake on `object` (a host subscriber exists).
     fn publish_owed(owner: &HostIpc, object: IpcObjectHandle) {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
     }
@@ -2266,7 +2274,9 @@ mod tests {
                 .ensure_pipe_storage(object)
                 .expect("first write's ring");
             let region = owner.region();
-            let mut guard = region.lock(object, &HostLockWait).expect("object");
+            let mut guard = region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .expect("object");
             assert_eq!(guard.pipe().unwrap().try_write(b"shared").result, Ok(6));
             drop(guard);
             let attached = unsafe {
@@ -2279,7 +2289,9 @@ mod tests {
             }
             .expect("second venue");
             let mut bytes = [0; 6];
-            let mut guard = attached.lock(object, &HostLockWait).unwrap();
+            let mut guard = attached
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(guard.pipe().unwrap().try_read(&mut bytes).result, Ok(6));
             assert_eq!(&bytes, b"shared");
             drop(guard);
@@ -2289,7 +2301,7 @@ mod tests {
                     .unwrap();
             }
             assert!(matches!(
-                region.lock(object, &HostLockWait),
+                region.lock(object, &crate::el1_zone::TestRegionWait),
                 Err(IpcError::Stale)
             ));
         }
@@ -2304,7 +2316,7 @@ mod tests {
         let table = owner.create_table(4096, 4).unwrap();
         owner.ensure_capacity(table, 2048).unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let object = owner.create_eventfd(7, pipe::EventMode::Counter).unwrap();
         let desc = fd::Description::new(
             IpcBacking::EventFd { object }.encode(),
@@ -2339,7 +2351,7 @@ mod tests {
         );
         assert!(owner.region().pipe_allocations() == 0);
         let region = owner.region();
-        let mut guard = region.lock(pipe, &HostLockWait).unwrap();
+        let mut guard = region.lock(pipe, &crate::el1_zone::TestRegionWait).unwrap();
         assert!(!guard.pipe().unwrap().is_backed());
         drop(guard);
         for end in [pipe::End::Reader, pipe::End::Writer] {
@@ -2378,7 +2390,9 @@ mod tests {
         owner.ensure_pipe_storage(second).unwrap();
         assert_eq!(allocated(), IPC_RING_STOCK + 2, "sized past a stock ring");
         let region = owner.region();
-        let mut guard = region.lock(second, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(second, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let mut ring = guard.pipe().unwrap();
         assert_eq!((ring.capacity(), ring.is_backed()), (1 << 20, true));
         assert_eq!(ring.try_write(&[7; 70_000]).result, Ok(70_000));
@@ -2405,7 +2419,9 @@ mod tests {
         let region = owner.region();
         for object in &pipes {
             // What EL1's first write does under the object lock.
-            let mut guard = region.lock(*object, &HostLockWait).unwrap();
+            let mut guard = region
+                .lock(*object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(guard.provide_ring_from_stock(), Ok(true));
         }
         assert_eq!(owner.region().pipe_allocations(), 128, "one ring per pipe");

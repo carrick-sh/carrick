@@ -7593,7 +7593,7 @@ mod tests {
         });
         let mut guard = owner
             .region()
-            .lock(object, &carrick_kernel::el1_zone::HostLockWait)
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);

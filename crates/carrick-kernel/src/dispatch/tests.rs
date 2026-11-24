@@ -163,16 +163,16 @@ mod overlay_dispatch_tests {
         let DispatchOutcome::Returned { value: number } = create else { panic!("eventfd creation: {create:?}"); };
         let table = fd::TableId::from_raw(map.lookup(files.id().raw()).unwrap());
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let description = authority.get(table, fd::Fd(number as i32)).unwrap();
         let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(description.backing) else { panic!("production eventfd must route to its shared object"); };
-        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(7));
+        assert_eq!(region.lock(object, &crate::el1_zone::TestRegionWait).unwrap().eventfd().unwrap().try_read().result, Ok(7));
         memory.write_bytes(0x4000, &9u64.to_ne_bytes()).unwrap();
         assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(64, SyscallArgs([number as u64, 0x4000, 8, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 8 });
-        assert_eq!(region.lock(object, &crate::el1_zone::HostLockWait).unwrap().eventfd().unwrap().try_read().result, Ok(9));
+        assert_eq!(region.lock(object, &crate::el1_zone::TestRegionWait).unwrap().eventfd().unwrap().try_read().result, Ok(9));
         assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(57, SyscallArgs([number as u64, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap(), DispatchOutcome::Returned { value: 0 });
         assert_eq!(authority.get(table, fd::Fd(number as i32)), Err(fd::Error::BadFd));
-        assert!(region.lock(object, &crate::el1_zone::HostLockWait).is_err());
+        assert!(region.lock(object, &crate::el1_zone::TestRegionWait).is_err());
     }
 
     #[test]
@@ -6294,7 +6294,7 @@ mod hvpatch_in_process_fork_tests {
             .unwrap();
         assert_eq!(
             ipc.region()
-                .fd(crate::el1_zone::HostLockWait)
+                .fd(crate::el1_zone::TestRegionWait)
                 .close_effects(table.id(), carrick_el1_abi::ipc::fd::Fd(target))
                 .unwrap(),
             carrick_el1_abi::ipc::fd::CloseEffects::EPOLL_DETACH,

@@ -24,7 +24,6 @@ use carrick_el1_abi::ipc::{IpcBacking, IpcObjectHandle, IpcWake, fd};
 use parking_lot::Mutex;
 
 use crate::el1_ipc::{HostDescription, HostDescriptionFlags, HostIpc};
-use crate::el1_zone::HostLockWait;
 use crate::linux_abi::LinuxEpollEvent;
 
 /// A zone epoll item's member: an IPC object side and the identity of the
@@ -141,7 +140,7 @@ impl ZoneEpoll {
         )) {
             Ok(lifetime) => lifetime,
             Err(_) => {
-                let _ = owner.region().epoll_destroy(object, &HostLockWait);
+                let _ = owner.region().epoll_destroy(object, &owner.wait());
                 return Err(ZoneEpollRefusal::Exhausted);
             }
         };
@@ -279,7 +278,7 @@ impl ZoneEpoll {
             member.file_key,
             events,
             data,
-            &HostLockWait,
+            &self.owner.wait(),
         );
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -292,7 +291,7 @@ impl ZoneEpoll {
             file_key,
             events,
             data,
-            &HostLockWait,
+            &self.owner.wait(),
         );
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -302,7 +301,7 @@ impl ZoneEpoll {
         let result = self
             .owner
             .region()
-            .epoll_delete(self.object, fd, file_key, &HostLockWait)
+            .epoll_delete(self.object, fd, file_key, &self.owner.wait())
             .map(|()| None);
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -313,7 +312,7 @@ impl ZoneEpoll {
         let _ = self
             .owner
             .region()
-            .epoll_set_host_items(self.object, count, &HostLockWait);
+            .epoll_set_host_items(self.object, count, &self.owner.wait());
     }
 
     /// Harvest up to `max` zone reports (the shared routine EL1 uses).
@@ -323,7 +322,7 @@ impl ZoneEpoll {
         let harvest = self
             .owner
             .region()
-            .epoll_harvest(self.object, &mut out, &mut taken, &HostLockWait)
+            .epoll_harvest(self.object, &mut out, &mut taken, &self.owner.wait())
             .unwrap_or_else(|error| {
                 carrick_fatal::carrick_fatal!("epoll::zone", "zone harvest refused: {error:?}")
             });
@@ -359,14 +358,14 @@ impl ZoneEpoll {
         let _ = self
             .owner
             .region()
-            .epoll_restore(self.object, taken, &HostLockWait);
+            .epoll_restore(self.object, taken, &self.owner.wait());
     }
 
     /// Items in the zone half.
     pub(crate) fn zone_items(&self) -> usize {
         self.owner
             .region()
-            .epoll_zone_items(self.object, &HostLockWait)
+            .epoll_zone_items(self.object, &self.owner.wait())
             .map_or(0, |n| n as usize)
     }
 
@@ -375,7 +374,7 @@ impl ZoneEpoll {
     pub(crate) fn has_item_fd(&self, fd: i32) -> bool {
         self.owner
             .region()
-            .epoll_has_item_fd(self.object, fd, &HostLockWait)
+            .epoll_has_item_fd(self.object, fd, &crate::el1_zone::TestRegionWait)
             .unwrap_or(false)
     }
 
@@ -386,7 +385,7 @@ impl ZoneEpoll {
     ) -> Option<carrick_el1_abi::ipc::epoll::ZoneOnlyEpollReadyCount> {
         self.owner
             .region()
-            .epoll_zone_only_ready_count(self.object, limit, &HostLockWait)
+            .epoll_zone_only_ready_count(self.object, limit, &self.owner.wait())
             .ok()
             .flatten()
     }
@@ -395,7 +394,7 @@ impl ZoneEpoll {
     pub(crate) fn ready(&self) -> bool {
         self.owner
             .region()
-            .epoll_ready_probe(self.object, &HostLockWait)
+            .epoll_ready_probe(self.object, &self.owner.wait())
             .unwrap_or(false)
     }
 }
@@ -525,7 +524,7 @@ mod tests {
         std::mem::forget(
             owner
                 .region()
-                .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+                .lock(pipe.ipc_object(), &crate::el1_zone::TestRegionWait)
                 .unwrap(),
         );
         // ExecutorPool::shutdown after joining every worker.

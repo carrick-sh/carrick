@@ -1542,14 +1542,17 @@ impl NativeOwnerSignalFixture {
         use crate::file_table::{LINUX_POLLIN, PollFd};
         use carrick_el1_abi::ipc::{EventMode, IpcBacking, fd};
         use carrick_kernel::el1_ipc::{HostIpc, HostTable};
-        use carrick_kernel::el1_zone::HostLockWait;
         use carrick_test_support::GuestUserBuffer;
         let host: &'static Arc<HostIpc> =
             Box::leak(Box::new(Arc::new(HostIpc::new(1 << 20).unwrap())));
         let table = HostTable::create(host.clone(), 64, 8).unwrap();
         let object = host
             .region()
-            .create_eventfd(1, EventMode::Counter, &HostLockWait)
+            .create_eventfd(
+                1,
+                EventMode::Counter,
+                &carrick_kernel::el1_zone::TestRegionWait,
+            )
             .unwrap();
         let description = host
             .admit_description(fd::Description::new(
@@ -1680,7 +1683,7 @@ impl NativeOwnerSignalFixture {
         // Change readiness after completion. Output must not be re-polled.
         let drained = host
             .region()
-            .lock(object, &HostLockWait)
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap()
             .eventfd()
             .unwrap()
@@ -4065,7 +4068,7 @@ mod anonymous_wait_cancellation_tests {
         drop(description);
         let region = ipc.region();
         let (pin, _) = region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .pin(table, fd::Fd(0))
             .unwrap();
         let binding = crate::common_entry::execution_binding(fixture.task);
@@ -4106,7 +4109,7 @@ mod anonymous_wait_cancellation_tests {
         // Only the pending operation retains the endpoint description.
         assert!(
             region
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .close(table, fd::Fd(0))
                 .unwrap()
                 .is_none()
@@ -8883,7 +8886,7 @@ fn retained_poll_output_owner_wait(
                     .as_ref()
                     .unwrap()
                     .region()
-                    .fd(carrick_kernel::el1_zone::HostLockWait)
+                    .fd(carrick_kernel::el1_zone::TestRegionWait)
                     .get(table.id(), carrick_el1_abi::ipc::fd::Fd(fd)),
                 Err(carrick_el1_abi::ipc::fd::Error::BadFd)
             );
@@ -8981,7 +8984,7 @@ fn retained_poll_output_owner_wait(
     }
     if let Some(table) = constructor_table.as_ref() {
         let region = constructor_owner.as_ref().unwrap().region();
-        let authority = region.fd(carrick_kernel::el1_zone::HostLockWait);
+        let authority = region.fd(carrick_kernel::el1_zone::TestRegionWait);
         if cancel {
             let mut claims = authority.reserve_pair(table.id()).unwrap();
             assert_eq!(
@@ -8993,7 +8996,7 @@ fn retained_poll_output_owner_wait(
             );
             authority.cancel_pair(&mut claims).unwrap();
             let object = region
-                .create_pipe(65536, &carrick_kernel::el1_zone::HostLockWait)
+                .create_pipe(65536, &carrick_kernel::el1_zone::TestRegionWait)
                 .unwrap();
             assert_eq!(
                 object.to_raw().index,
@@ -9061,7 +9064,7 @@ fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
         .unwrap(),
     );
     let region = shared.region();
-    let wait = carrick_sched_core::ShortLockSpin;
+    let wait = carrick_kernel::el1_zone::TestRegionWait;
     let object = region
         .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter, &wait)
         .unwrap();
@@ -9286,7 +9289,7 @@ fn retained_ipc_supply_for<
     drop(description);
     let region = shared.region();
     let (pin, _) = region
-        .fd(carrick_sched_core::ShortLockSpin)
+        .fd(carrick_kernel::el1_zone::TestRegionWait)
         .pin(table, Fd(0))
         .unwrap();
     let binding = crate::common_entry::execution_binding(fixture.task);
@@ -9483,7 +9486,7 @@ fn retained_ipc_supply_for<
     // Closing the numeric fd cannot revoke the retained operation's pin.
     assert!(
         region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .close(table, Fd(0))
             .unwrap()
             .is_none()
@@ -9561,7 +9564,7 @@ fn retained_ipc_supply_for<
         let mut active = region.operation(&token).unwrap();
         let mut copy = CompleteCopy(Vec::new());
         let mut object_guard = region
-            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap();
         let (status, _) = carrick_el1::substrate::ipc::transfer(
             &mut object_guard,
@@ -9576,7 +9579,7 @@ fn retained_ipc_supply_for<
         assert_eq!(copy.0, 7u64.to_ne_bytes());
         let op = region.finish_operation(token, || {}).unwrap();
         let release = region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .unpin_filtered(
                 OfdPin::from_raw(op.pin),
                 crate::ipc::is_zone_releasable_backing,
@@ -9600,7 +9603,7 @@ fn retained_ipc_supply_for<
     }
     assert!(
         region
-            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .is_err(),
         "the final description pin was released"
     );
@@ -9668,7 +9671,7 @@ fn retained_ipc_terminal_close_for<
 
     let region = shared.region();
     let (pin, _) = region
-        .fd(carrick_sched_core::ShortLockSpin)
+        .fd(carrick_kernel::el1_zone::TestRegionWait)
         .pin(table, Fd(0))
         .unwrap();
     let raw_pin = pin.into_raw();
@@ -9713,7 +9716,7 @@ fn retained_ipc_terminal_close_for<
         // Close the numeric fd so only the retained IPC operation's pin keeps the object live.
         assert!(
             region
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .close(table, Fd(0))
                 .unwrap()
                 .is_none()
@@ -9863,13 +9866,13 @@ fn retained_ipc_terminal_close_for<
     assert!(
         region.observe(object).is_err()
             && region
-                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
                 .is_err(),
         "retirement must release the final endpoint pin"
     );
     assert!(
         region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .unpin_filtered(
                 OfdPin::from_raw(raw_pin),
                 crate::ipc::is_zone_releasable_backing,
@@ -13272,7 +13275,7 @@ fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() 
     );
     assert!(
         host.region()
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .close(table.id(), fd::Fd(3))
             .unwrap()
             .is_some(),
@@ -14237,6 +14240,10 @@ fn native_arm_pselect6_handback(
 
     struct ClockedServices(ZoneHostServices, u64);
     impl IpcHostServices for ClockedServices {
+        type RegionWait<'a> = <ZoneHostServices as IpcHostServices>::RegionWait<'a>;
+        fn region_wait(&self) -> Self::RegionWait<'_> {
+            self.0.region_wait()
+        }
         fn operation_slot_released(&self, region: &IpcRegion<'_>) {
             self.0.operation_slot_released(region);
         }
@@ -14290,7 +14297,7 @@ fn native_arm_pselect6_handback(
     let table =
         carrick_kernel::el1_ipc::HostTable::create(std::sync::Arc::clone(owner), 64, 64).unwrap();
     let object = owner.create_pipe(65_536).unwrap();
-    let fd = region.fd(HostIpcWait);
+    let fd = region.fd(carrick_kernel::el1_zone::TestRegionWait);
     // A set selects the reader of a second pipe as well: fds 0..=3.
     let pipes = if set {
         std::vec![object, owner.create_pipe(65_536).unwrap()]
@@ -14420,7 +14427,9 @@ fn native_arm_pselect6_handback(
             table.close(Fd(1)).unwrap();
         }
         fixture.zone.leave_guest(fixture.slot, &HostIpcWait);
-        let object = region.lock(object, &HostIpcWait).unwrap();
+        let object = region
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+            .unwrap();
         let queue = fixture
             .zone
             .object_wait(key, &HostIpcWait, &completion)
@@ -14456,7 +14465,12 @@ fn native_arm_pselect6_handback(
         carrick_kernel::dispatch::LinearMemory::new(args.arg(), args.as_bytes().to_vec());
     if set {
         assert!(
-            crate::ipc::readiness_set::transient_epoll(&region, &op, HostIpcWait).is_some(),
+            crate::ipc::readiness_set::transient_epoll(
+                &region,
+                &op,
+                carrick_kernel::el1_zone::TestRegionWait
+            )
+            .is_some(),
             "a set parks on its transient epoll: {op:?}"
         );
         if eof {

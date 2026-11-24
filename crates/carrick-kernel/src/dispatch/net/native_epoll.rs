@@ -18,7 +18,6 @@ use carrick_hal::event::{EventMultiplexer, TriggerMode};
 use parking_lot::Mutex;
 
 use crate::el1_ipc::{HostIpc, PinnedHostResourceError};
-use crate::el1_zone::HostLockWait;
 use crate::host_readiness::{
     HostEventSource, HostReadinessReactor, HostReadinessSource, HostReadinessToken,
 };
@@ -136,7 +135,7 @@ impl State {
                 registration.item,
                 level.bits(),
                 edge,
-                &HostLockWait,
+                &owner.wait(),
             )
         }) {
             Ok(wake) => wake,
@@ -308,7 +307,7 @@ impl NativeSocketEpolls {
                     file_key,
                     report,
                     0,
-                    &HostLockWait,
+                    &owner.wait(),
                 ) {
                     Ok((item, _)) => item,
                     Err(error) => {
@@ -338,7 +337,7 @@ impl NativeSocketEpolls {
                     item,
                     report,
                     0,
-                    &HostLockWait,
+                    &owner.wait(),
                 ) {
                     Ok((item, _)) => item,
                     Err(error) => {
@@ -362,7 +361,7 @@ impl NativeSocketEpolls {
             (LINUX_EPOLL_CTL_DEL, Some(token)) => {
                 let registration = &state.registrations[&token];
                 region
-                    .epoll_delete_host_socket(key.epoll, registration.item, &HostLockWait)
+                    .epoll_delete_host_socket(key.epoll, registration.item, &owner.wait())
                     .map_err(ctl_errno)?;
                 state.retire(token);
                 None
@@ -402,12 +401,17 @@ impl NativeSocketEpolls {
             return;
         };
         for token in tokens {
-            if let Some(registration) = state.retire(token) {
-                let _ = region.epoll_delete_host_socket(
+            if let Some(registration) = state.retire(token)
+                && let Err(EpollCtlError::Ipc(error)) = region.epoll_delete_host_socket(
                     registration.key.epoll,
                     registration.item,
-                    &HostLockWait,
-                );
+                    &owner.wait(),
+                )
+            {
+                // The socket's final release (`NativeNetFile::drop`) meets
+                // an epoll lock a stopped vCPU holds: the item stays in the
+                // quarantined epoll and the release goes on (#2988).
+                let _ = owner.quarantine_cut_off(error.into());
             }
         }
     }

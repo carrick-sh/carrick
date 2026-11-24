@@ -526,7 +526,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                     .unwrap();
                 if let Some(description) = owner
                     .region()
-                    .fd(ShortLockSpin)
+                    .fd(carrick_kernel::el1_zone::TestRegionWait)
                     .close(fd::TableId::from_raw(raw), fd::Fd(4))
                     .unwrap()
                 {
@@ -781,7 +781,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             let child_table = fd::TableId::from_raw(raw);
             if let Some(description) = owner
                 .region()
-                .fd(ShortLockSpin)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .close(child_table, fd::Fd(4))
                 .unwrap()
             {
