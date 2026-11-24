@@ -17,7 +17,9 @@
 //              msync(MS_SYNC), then a read by path;
 //   double_map_* one page mapped twice; after the first munmap the second
 //              mapping still writes the file;
-//   dev_zero_* a MAP_SHARED /dev/zero page shared with a forked child.
+//   dev_zero_* a MAP_SHARED /dev/zero page shared with a forked child;
+//   protect_* mprotect read-only and back over faulted window pages;
+//   eof_*     the window's `rw-s` maps line, and SIGBUS past end of file.
 // The root runs every row, then a forked child runs them all again (the Go
 // linker is a forked child of `go build`). Exit 7 when every row ran.
 //
@@ -30,7 +32,7 @@ static long sc(long n, long a, long b, long c, long d, long e, long f) {
     __asm__ volatile("syscall" : "=a"(ret) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
     return ret;
 }
-enum { READ = 0, WRITE = 1, CLOSE = 3, MMAP = 9, MUNMAP = 11, PREAD64 = 17, PIPE = 22, MSYNC = 26, FORK = 57,
+enum { READ = 0, WRITE = 1, CLOSE = 3, MMAP = 9, MPROTECT = 10, MUNMAP = 11, PREAD64 = 17, PIPE = 22, MSYNC = 26, FORK = 57,
        EXIT = 60, WAIT4 = 61, FTRUNCATE = 77, OPENAT = 257, FALLOCATE = 285 };
 #define MAP_PRIVATE 2
 #define MAP_FIXED 0x10
@@ -43,7 +45,9 @@ enum { READ = 0, WRITE = 1, CLOSE = 3, MMAP = 9, MUNMAP = 11, PREAD64 = 17, PIPE
 #define O_CREAT 0100
 #define O_TRUNC 01000
 #define O_CLOEXEC 02000000
+#define PROT_READ 1
 #define PROT_RW 3
+#define SIGBUS 7
 #define MAP_SHARED 1
 #define PG 4096L
 static int put(char *out, const char *s) {
@@ -231,12 +235,105 @@ static void dev_zero_rows(const char *who) {
     sc(MUNMAP, p, PG, 0, 0, 0, 0);
 }
 
+// mprotect over faulted window pages: read-only, then writable again; the
+// bytes written before and after are in the file (#1338 A1).
+static void protect_rows(const char *who, const char *path) {
+    long fd = sc(OPENAT, AT_FDCWD, (long)path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    long r = fd >= 0 ? sc(FTRUNCATE, fd, 2 * PG, 0, 0, 0, 0) : fd;
+    if (fd < 0 || r != 0) {
+        row(who, "protect_setup", r, 0);
+        return;
+    }
+    long p = sc(MMAP, 0, 2 * PG, PROT_RW, MAP_SHARED, fd, 0);
+    int mapped = !(p < 0 && p > -4096);
+    row(who, "protect_mmap", mapped ? 0 : p, mapped);
+    if (!mapped) {
+        sc(CLOSE, fd, 0, 0, 0, 0, 0);
+        return;
+    }
+    volatile unsigned char *m = (volatile unsigned char *)p;
+    m[1] = 'R'; // fault the first page in before the protect
+    r = sc(MPROTECT, p, 2 * PG, PROT_READ, 0, 0, 0);
+    row(who, "protect_read_only", r, r == 0 && m[1] == 'R');
+    r = sc(MPROTECT, p, 2 * PG, PROT_RW, 0, 0, 0);
+    m[2] = 'W';
+    m[PG + 2] = 'X';
+    unsigned char three[3] = {0, 0, 0};
+    long a = sc(PREAD64, fd, (long)&three[0], 1, 1, 0, 0);
+    long b = sc(PREAD64, fd, (long)&three[1], 1, 2, 0, 0);
+    long c = sc(PREAD64, fd, (long)&three[2], 1, PG + 2, 0, 0);
+    row(who, "protect_writable_again", r,
+        r == 0 && a + b + c == 3 && three[0] == 'R' && three[1] == 'W' && three[2] == 'X');
+    sc(MUNMAP, p, 2 * PG, 0, 0, 0, 0);
+    sc(CLOSE, fd, 0, 0, 0, 0, 0);
+}
+
+// The window is `rw-s` in /proc/self/maps, and a touch of a mapped page past
+// the end of the file is SIGBUS (mmap(2)); a forked child takes the touch.
+static char maps[16384];
+static void eof_rows(const char *who, const char *path) {
+    long fd = sc(OPENAT, AT_FDCWD, (long)path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    long r = fd >= 0 ? sc(FTRUNCATE, fd, PG, 0, 0, 0, 0) : fd;
+    if (fd < 0 || r != 0) {
+        row(who, "eof_setup", r, 0);
+        return;
+    }
+    long p = sc(MMAP, 0, 2 * PG, PROT_RW, MAP_SHARED, fd, 0);
+    int mapped = !(p < 0 && p > -4096);
+    row(who, "eof_mmap", mapped ? 0 : p, mapped);
+    sc(CLOSE, fd, 0, 0, 0, 0, 0);
+    if (!mapped) return;
+    ((volatile unsigned char *)p)[0] = 'E';
+    long mf = sc(OPENAT, AT_FDCWD, (long)"/proc/self/maps", O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    long got = 0;
+    while (mf >= 0 && got < (long)sizeof maps - 1) {
+        long n = sc(READ, mf, (long)maps + got, sizeof maps - 1 - got, 0, 0, 0);
+        if (n <= 0) break;
+        got += n;
+    }
+    if (mf >= 0) sc(CLOSE, mf, 0, 0, 0, 0, 0);
+    maps[got] = 0;
+    // The line that starts with the mapping's address in lowercase hex.
+    char want[20];
+    int w = 0;
+    int lead = 1;
+    for (int i = 60; i >= 0; i -= 4) {
+        char d = "0123456789abcdef"[((unsigned long)p >> i) & 15];
+        if (lead && d == '0') continue;
+        lead = 0;
+        want[w++] = d;
+    }
+    want[w++] = '-';
+    int perms = 0;
+    for (long i = 0; i < got && !perms; i++) {
+        if (i > 0 && maps[i - 1] != '\n') continue;
+        int k = 0;
+        while (k < w && maps[i + k] == want[k]) k++;
+        if (k < w) continue;
+        long j = i + k;
+        while (j < got && maps[j] != ' ') j++;
+        perms = j + 4 < got && maps[j + 1] == 'r' && maps[j + 2] == 'w' && maps[j + 3] == '-' && maps[j + 4] == 's';
+    }
+    row(who, "eof_maps_rw_s", perms ? 0 : got, perms);
+    long pid = sc(FORK, 0, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        ((volatile unsigned char *)p)[PG + 1] = 'Q';
+        sc(EXIT, 3, 0, 0, 0, 0, 0);
+    }
+    int status = -1;
+    long wt = sc(WAIT4, pid, (long)&status, 0, 0, 0, 0);
+    row(who, "eof_touch_past_end_sigbus", wt == pid ? status : wt, wt == pid && (status & 0x7f) == SIGBUS);
+    sc(MUNMAP, p, 2 * PG, 0, 0, 0, 0);
+}
+
 static void all_rows(const char *who, const char *link, const char *shared, const char *fixed, const char *dbl) {
     linker_rows(who, link);
     shared_rows(who, shared);
     populate_fixed_rows(who, fixed);
     double_map_rows(who, dbl);
     dev_zero_rows(who);
+    protect_rows(who, who[0] == 'r' ? "protect-root" : "protect-child");
+    eof_rows(who, who[0] == 'r' ? "eof-root" : "eof-child");
 }
 
 void _start(void) {
