@@ -208,10 +208,6 @@ pub(super) fn admit_root(
     };
     owner.admit_thread_stock(NativeLifecycleResources { page, controls })?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
-    let binding =
-        carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;
-    let files = crate::linux_personality::file_tables(binding);
-    crate::linux_personality::admit_stdio_cached(binding, task, &files);
     Ok(())
 }
 

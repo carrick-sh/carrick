@@ -1,8 +1,10 @@
 //! Shared guest file table for standard descriptors and native poll.
 //!
-//! Descriptors 0..2 are admitted as host-backed open descriptions in the existing
+//! The zone's standard descriptions (stdin, stdout, stderr) are admitted once,
+//! by the stopped carrier, as host-backed open descriptions in the existing
 //! guest file owner (`FdMapSlot`, `DelegatedOpenFile`, `DelegatedFile`), keyed by
-//! `(file_table, fd)`. Closed standard descriptors stay absent.
+//! `(file_table, fd)` ([`StdioDescriptions`]). Every other table gets them only
+//! by inheritance (fork), as Linux does; a closed descriptor stays absent.
 //!
 //! Poll validates its bounded `pollfd` array, resolves each entry through the
 //! existing zone tables and IPC venue, ignores negative descriptors, and reports
@@ -101,23 +103,6 @@ fn retain_reference(open_table: &[DelegatedOpenFile], key: ReleasedDescription) 
         .is_some_and(|record| record.lifetime.retain(key.incarnation))
 }
 
-fn tombstone_index(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<usize> {
-    if fd < 0 {
-        return None;
-    }
-    fd_map.iter().take(FD_MAP_CAPACITY).position(|slot| {
-        slot.incarnation.load(Ordering::Acquire) == 1
-            && slot.file_table.load(Ordering::Relaxed) == file_table
-            && slot.fd.load(Ordering::Relaxed) == fd as u32
-            && slot.handle.load(Ordering::Relaxed) == 0
-    })
-}
-
-#[cfg(test)]
-fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> bool {
-    (0..=2).contains(&fd) && tombstone_index(fd_map, file_table, fd).is_some()
-}
-
 /// Raise the carrier's descriptor ceiling for a number this ring makes live
 /// without any host FileTable (#1398); `false` refuses the projection.
 fn cover_in_ring(fd: i32) -> bool {
@@ -145,18 +130,11 @@ pub fn close_host_binding_observed(
 ) -> Option<GuestDescriptorChange> {
     let _guard = lock_fd_map(fd_map);
     let (handle, index) = fd_map_lookup(fd_map, file_table, fd)?;
-    if handle == 0 || fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0 {
+    if fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0 {
         return None;
     }
     let incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
     fd_map[index].clear();
-    if (0..=2).contains(&fd) {
-        // Preserve an explicit close of bare stdio. A later descriptor lookup
-        // can distinguish it from a table not yet admitted by the carrier.
-        if fd_map[index].try_claim() {
-            fd_map[index].set(file_table, fd as u32, 0, 1);
-        }
-    }
     let description = ReleasedDescription {
         handle,
         incarnation,
@@ -183,9 +161,6 @@ pub fn dup2_host_binding(
     }
     let _guard = lock_fd_map(fd_map);
     let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
-    if handle == 0 {
-        return None;
-    }
     if old_fd == new_fd {
         if cloexec {
             return None;
@@ -196,7 +171,6 @@ pub fn dup2_host_binding(
         });
     }
     let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
-    let tombstone = tombstone_index(fd_map, file_table, new_fd);
     let target = fd_map_lookup(fd_map, file_table, new_fd);
     if target.is_some_and(|(_, index)| {
         fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0
@@ -224,19 +198,7 @@ pub fn dup2_host_binding(
             release_reference(open_table, source, file_table);
             return None;
         }
-        (
-            slot,
-            (old_handle != 0)
-                .then(|| release_reference(open_table, old, file_table))
-                .flatten(),
-        )
-    } else if let Some(index) = tombstone {
-        let slot = &fd_map[index];
-        if !slot.try_claim_live(1) {
-            release_reference(open_table, source, file_table);
-            return None;
-        }
-        (slot, None)
+        (slot, release_reference(open_table, old, file_table))
     } else {
         match fd_map
             .iter()
@@ -301,7 +263,6 @@ pub fn with_host_binding_dup<T, E>(
         }
         return Err(HostBindingDupError::Invalid);
     }
-    let tombstone = tombstone_index(fd_map, file_table, new_fd);
     let target = if let Some((handle, index)) = live_target {
         Some((
             index,
@@ -309,8 +270,6 @@ pub fn with_host_binding_dup<T, E>(
             fd_map[index].incarnation.load(Ordering::Acquire),
             fd_map[index].fd_flags.load(Ordering::Acquire),
         ))
-    } else if let Some(index) = tombstone {
-        Some((index, 0, 1, fd_map[index].fd_flags.load(Ordering::Acquire)))
     } else if source.is_some() {
         fd_map
             .iter()
@@ -407,21 +366,15 @@ pub fn dup_host_binding(
     }
     let _guard = lock_fd_map(fd_map);
     let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
-    if handle == 0 {
-        return None;
-    }
     let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
     let new_fd = (min_fd..max_fd).find(|fd| fd_map_lookup(fd_map, file_table, *fd).is_none())?;
     if !cover_in_ring(new_fd) {
         return None;
     }
-    let tombstone = tombstone_index(fd_map, file_table, new_fd);
-    let candidate = tombstone.map(|index| &fd_map[index]).or_else(|| {
-        fd_map
-            .iter()
-            .take(FD_MAP_CAPACITY)
-            .find(|slot| slot.incarnation.load(Ordering::Acquire) == 0)
-    })?;
+    let candidate = fd_map
+        .iter()
+        .take(FD_MAP_CAPACITY)
+        .find(|slot| slot.incarnation.load(Ordering::Acquire) == 0)?;
     let source = ReleasedDescription {
         handle,
         incarnation,
@@ -433,12 +386,7 @@ pub fn dup_host_binding(
     if let Some(hook) = RETAINED_HOOK.lock().take() {
         hook();
     }
-    let claimed = if tombstone.is_some() {
-        candidate.try_claim_live(1)
-    } else {
-        candidate.try_claim()
-    };
-    if !claimed {
+    if !candidate.try_claim() {
         release_reference(open_table, source, file_table);
         return None;
     }
@@ -515,60 +463,194 @@ fn claim_open_record<'a>(
     None
 }
 
-/// Admits standard descriptors 0..2 as host-backed open descriptions in the
-/// existing zone tables for `file_table`.
-///
-/// - 0: stdin (ReadOnly)
-/// - 1: stdout (WriteOnly)
-/// - 2: stderr (WriteOnly)
-///
-/// Closed standard descriptors stay absent in `fd_map`.
-pub fn admit_stdio(
-    fd_map: &[FdMapSlot],
-    open_table: &[DelegatedOpenFile],
-    object_table: &[DelegatedFile],
-    file_table: u64,
-    open_mask: [bool; 3],
-) {
-    if file_table == 0 {
-        return;
+/// Why the zone's standard descriptions could not be admitted or shared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioAdmissionError {
+    /// No table id: table 0 names no process.
+    NoTable,
+    /// The table already holds a descriptor 0..2: it is not a fresh table.
+    Occupied,
+    /// A stdio description of this zone is still live: the zone has one.
+    AlreadyAdmitted,
+    /// The descriptor map or the open-description table is full.
+    Exhausted,
+    /// A shared description is no longer live.
+    Stale,
+}
+
+/// The zone's three standard open descriptions (stdin, stdout, stderr),
+/// bound to the carrier's stdio host objects. Exactly one value exists per
+/// zone: the stopped carrier admits it once, before any guest instruction
+/// runs, and holds it as the identity a guest release must present. It is
+/// neither `Clone` nor `Copy`, and no guest path admits stdio, so a table
+/// gets these descriptions only from the carrier ([`Self::share_into`]) or
+/// by inheriting them (fork), as Linux does; a closed descriptor stays
+/// closed.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StdioDescriptions {
+    keys: [ReleasedDescription; 3],
+}
+
+const STDIO_BINDINGS: [HostObjectBinding; 3] = [
+    HostObjectBinding::STDIN,
+    HostObjectBinding::STDOUT,
+    HostObjectBinding::STDERR,
+];
+
+impl StdioDescriptions {
+    /// Admit stdin (read-only), stdout and stderr (write-only) as new
+    /// descriptions and publish them as descriptors 0..2 of `boot_table`,
+    /// whose descriptor numbers 0..2 must all be free. Refused while any
+    /// stdio description of the zone is live, so a second set cannot exist.
+    /// One transaction under the descriptor lock: capacity is checked before
+    /// anything is claimed.
+    pub fn admit(
+        fd_map: &[FdMapSlot],
+        open_table: &[DelegatedOpenFile],
+        object_table: &[DelegatedFile],
+        boot_table: u64,
+    ) -> Result<Self, StdioAdmissionError> {
+        if boot_table == 0 {
+            return Err(StdioAdmissionError::NoTable);
+        }
+        let _guard = lock_fd_map(fd_map);
+        if (0..3).any(|fd| fd_map_lookup(fd_map, boot_table, fd).is_some()) {
+            return Err(StdioAdmissionError::Occupied);
+        }
+        if open_table.iter().any(|record| {
+            let generation = record.generation.load(Ordering::Acquire);
+            record.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+                && generation != 0
+                && !record.lifetime.is_terminal(generation)
+                && record
+                    .host_object()
+                    .is_some_and(|binding| binding.stdio_fd().is_some())
+        }) {
+            return Err(StdioAdmissionError::AlreadyAdmitted);
+        }
+        let free_slots = fd_map
+            .iter()
+            .take(FD_MAP_CAPACITY)
+            .filter(|slot| slot.incarnation.load(Ordering::Acquire) == 0)
+            .count();
+        let free_records = open_table
+            .iter()
+            .zip(object_table)
+            .map(|(record, _)| record)
+            .filter(|record| {
+                let generation = record.generation.load(Ordering::Acquire);
+                record.state.load(Ordering::Acquire) == DELEGATED_STATE_DEAD
+                    || (generation != 0 && record.lifetime.is_terminal(generation))
+            })
+            .count();
+        if free_slots < 3 || free_records < 3 {
+            return Err(StdioAdmissionError::Exhausted);
+        }
+        let mut keys = [ReleasedDescription {
+            handle: 0,
+            incarnation: 0,
+        }; 3];
+        for (fd, (binding, key)) in STDIO_BINDINGS.iter().zip(keys.iter_mut()).enumerate() {
+            let flags = if fd == 0 {
+                DELEGATED_FLAG_READABLE
+            } else {
+                DELEGATED_FLAG_WRITABLE
+            };
+            let slot = fd_map
+                .iter()
+                .take(FD_MAP_CAPACITY)
+                .find(|slot| slot.try_claim())
+                .ok_or(StdioAdmissionError::Exhausted)?;
+            let Some((handle, incarnation, open_file)) =
+                claim_open_record(open_table, object_table, flags)
+            else {
+                slot.clear();
+                return Err(StdioAdmissionError::Exhausted);
+            };
+            open_file.bind_host_object(*binding);
+            open_file
+                .state
+                .store(DELEGATED_STATE_GUEST, Ordering::Release);
+            slot.set(boot_table, fd as u32, handle, incarnation);
+            *key = ReleasedDescription {
+                handle,
+                incarnation,
+            };
+        }
+        Ok(Self { keys })
+    }
+
+    /// Publish the same three descriptions as descriptors 0..2 of another
+    /// fresh table the carrier binds to an initial task: each gains one
+    /// reference, as a fork child's table would. Refuses a table holding any
+    /// descriptor 0..2, so it never revives a number a process closed.
+    pub fn share_into(
+        &self,
+        fd_map: &[FdMapSlot],
+        open_table: &[DelegatedOpenFile],
+        table: u64,
+    ) -> Result<(), StdioAdmissionError> {
+        if table == 0 {
+            return Err(StdioAdmissionError::NoTable);
+        }
+        let _guard = lock_fd_map(fd_map);
+        if (0..3).any(|fd| fd_map_lookup(fd_map, table, fd).is_some()) {
+            return Err(StdioAdmissionError::Occupied);
+        }
+        let mut claimed = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let Some(slot) = fd_map.iter().take(FD_MAP_CAPACITY).find(|s| s.try_claim()) else {
+                claimed.iter().for_each(|slot: &&FdMapSlot| slot.clear());
+                return Err(StdioAdmissionError::Exhausted);
+            };
+            claimed.push(slot);
+        }
+        for (index, key) in self.keys.iter().enumerate() {
+            if !retain_reference(open_table, *key) {
+                for key in &self.keys[..index] {
+                    release_reference(open_table, *key, table);
+                }
+                claimed.iter().for_each(|slot| slot.clear());
+                return Err(StdioAdmissionError::Stale);
+            }
+        }
+        for (fd, (slot, key)) in claimed.into_iter().zip(self.keys).enumerate() {
+            slot.set(table, fd as u32, key.handle, key.incarnation);
+        }
+        Ok(())
+    }
+
+    /// The exact description admitted for `binding`, or `None` for a binding
+    /// that is not stdio.
+    pub fn key(&self, binding: HostObjectBinding) -> Option<ReleasedDescription> {
+        let index = usize::try_from(binding.stdio_fd()?).ok()?;
+        self.keys.get(index).copied()
+    }
+}
+
+/// Rename every descriptor of `from` to `to`: the stopped carrier replaces
+/// the provisional table of an initial task that has not run with the table
+/// its issued identity names. Refuses when `to` already has descriptors.
+pub fn rename_unstarted_table(fd_map: &[FdMapSlot], from: u64, to: u64) -> bool {
+    if from == 0 || to == 0 {
+        return false;
+    }
+    if from == to {
+        return true;
     }
     let _guard = lock_fd_map(fd_map);
-    for (fd, &open) in open_mask.iter().enumerate() {
-        if !open {
-            continue;
-        }
-        let binding = match fd {
-            0 => HostObjectBinding::STDIN,
-            1 => HostObjectBinding::STDOUT,
-            _ => HostObjectBinding::STDERR,
-        };
-        let ufd = fd as u32;
-        if fd_map_lookup(fd_map, file_table, fd as i32).is_some()
-            || tombstone_index(fd_map, file_table, fd as i32).is_some()
-        {
-            continue;
-        }
-        let Some(slot) = fd_map.iter().take(FD_MAP_CAPACITY).find(|s| s.try_claim()) else {
-            continue;
-        };
-        let flags = if fd == 0 {
-            DELEGATED_FLAG_READABLE
-        } else {
-            DELEGATED_FLAG_WRITABLE
-        };
-        let Some((handle, incarnation, open_file)) =
-            claim_open_record(open_table, object_table, flags)
-        else {
-            slot.clear();
-            continue;
-        };
-        open_file.bind_host_object(binding);
-        open_file
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Release);
-        slot.set(file_table, ufd, handle, incarnation);
+    let live = |slot: &FdMapSlot, table: u64| {
+        let inc = slot.incarnation.load(Ordering::Acquire);
+        inc != 0 && slot.file_table.load(Ordering::Relaxed) == table
+    };
+    let slots = fd_map.iter().take(FD_MAP_CAPACITY);
+    if slots.clone().any(|slot| live(slot, to)) {
+        return false;
     }
+    for slot in slots.filter(|slot| live(slot, from)) {
+        slot.file_table.store(to, Ordering::Release);
+    }
+    true
 }
 
 /// Admits a host-backed file descriptor in the zone tables.
@@ -1100,6 +1182,25 @@ mod tests {
         assert_eq!(carrick_syscall_abi::LINUX_POLLNVAL, 0x0020);
     }
 
+    /// The carrier's one admission into `table`, then closes the numbers
+    /// `open` leaves out, as a launcher with those numbers closed would.
+    fn admit_stdio(
+        fd_map: &[FdMapSlot],
+        open_table: &[DelegatedOpenFile],
+        object_table: &[DelegatedFile],
+        table: u64,
+        open: [bool; 3],
+    ) -> StdioDescriptions {
+        let stdio = StdioDescriptions::admit(fd_map, open_table, object_table, table)
+            .expect("fresh boot table");
+        for (fd, open) in open.into_iter().enumerate() {
+            if !open {
+                close_host_binding(fd_map, open_table, table, fd as i32).expect("admitted stdio");
+            }
+        }
+        stdio
+    }
+
     fn setup_tables() -> (
         [FdMapSlot; FD_MAP_CAPACITY],
         [DelegatedOpenFile; MAX_ZONE_OPEN_FILES],
@@ -1187,7 +1288,6 @@ mod tests {
                 release: None
             })
         );
-        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
         assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
         assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
         let mut entries = [
@@ -1355,53 +1455,132 @@ mod tests {
         assert!(fd_map_lookup(&fd_map, 11, 5).is_none());
         assert!(fd_map_lookup(&fd_map, 10, 5).is_some());
         drop(releases);
-        assert_eq!(open_table[0].lifetime.ring_references(1), Some(3));
+        // Stdout is the second description the carrier admitted.
+        assert_eq!(open_table[1].lifetime.ring_references(1), Some(3));
     }
 
     #[test]
     fn fresh_table_cannot_resurrect_terminal_stdio() {
         let (fd_map, open_table, object_table) = setup_tables();
-        admit_stdio(
-            &fd_map,
-            &open_table,
-            &object_table,
-            10,
-            [false, true, false],
-        );
+        let stdio = admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
+        let stdout = stdio.key(HostObjectBinding::STDOUT).unwrap();
         assert_eq!(
             close_host_binding(&fd_map, &open_table, 10, 1)
                 .unwrap()
                 .release,
-            Some(ReleasedDescription {
-                handle: 1,
-                incarnation: 1,
-            })
+            Some(stdout)
         );
-        assert!(open_table[0].lifetime.is_terminal(1));
-        admit_stdio(
-            &fd_map,
-            &open_table,
-            &object_table,
-            11,
-            [false, true, false],
+        assert!(
+            open_table[stdout.handle as usize - 1]
+                .lifetime
+                .is_terminal(1)
         );
-        let (handle, slot_idx) = fd_map_lookup(&fd_map, 11, 1).expect("fresh table stdout");
-        assert_eq!(handle, 1);
-        assert_eq!(fd_map[slot_idx].incarnation.load(Ordering::Acquire), 2);
-        assert_eq!(open_table[0].lifetime.ring_references(1), None);
-        assert!(!open_table[0].lifetime.retain(1));
-        assert_eq!(open_table[0].lifetime.ring_references(2), Some(1));
+        assert_eq!(
+            stdio.share_into(&fd_map, &open_table, 11),
+            Err(StdioAdmissionError::Stale)
+        );
+        assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 11, fd).is_none()));
+        for binding in [HostObjectBinding::STDIN, HostObjectBinding::STDERR] {
+            let key = stdio.key(binding).unwrap();
+            assert_eq!(
+                open_table[key.handle as usize - 1]
+                    .lifetime
+                    .ring_references(key.incarnation),
+                Some(1),
+                "the refused share rolled back its references"
+            );
+        }
+    }
+
+    /// #2820: the zone has one description per stdio binding. A table
+    /// holding a stdio number refuses a second share, and a fresh table only
+    /// gains references to the same descriptions.
+    #[test]
+    fn stdio_is_admitted_once_and_shared_by_reference() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        let stdio = StdioDescriptions::admit(&fd_map, &open_table, &object_table, 10).unwrap();
+        assert_eq!(
+            StdioDescriptions::admit(&fd_map, &open_table, &object_table, 10),
+            Err(StdioAdmissionError::Occupied)
+        );
+        assert_eq!(
+            StdioDescriptions::admit(&fd_map, &open_table, &object_table, 12),
+            Err(StdioAdmissionError::AlreadyAdmitted)
+        );
+        assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 12, fd).is_none()));
+        assert_eq!(
+            stdio.share_into(&fd_map, &open_table, 10),
+            Err(StdioAdmissionError::Occupied)
+        );
+        assert_eq!(
+            stdio.share_into(&fd_map, &open_table, 0),
+            Err(StdioAdmissionError::NoTable)
+        );
+        stdio.share_into(&fd_map, &open_table, 11).unwrap();
+        for (fd, binding) in STDIO_BINDINGS.into_iter().enumerate() {
+            let key = stdio.key(binding).unwrap();
+            for table in [10, 11] {
+                let (handle, index) = fd_map_lookup(&fd_map, table, fd as i32).unwrap();
+                assert_eq!(handle, key.handle);
+                assert_eq!(
+                    fd_map[index].incarnation.load(Ordering::Acquire),
+                    key.incarnation
+                );
+            }
+            let record = &open_table[key.handle as usize - 1];
+            assert_eq!(record.host_object(), Some(binding));
+            assert_eq!(record.lifetime.ring_references(key.incarnation), Some(2));
+        }
+        assert_eq!(
+            stdio.key(HostObjectBinding::from_host_fd(
+                HostBoundFd::new(9).unwrap()
+            )),
+            None
+        );
+    }
+
+    /// #2820, the go-real and npm record: a fork child replaces stdout with a
+    /// description outside this map (a ring pipe), so its stdout number
+    /// leaves the map. Nothing may put a stdout description back under that
+    /// number: the child's close of the pipe then releases no stdio
+    /// description, and its own fork child inherits no stdout either.
+    #[test]
+    fn stdout_replaced_by_a_ring_pipe_stays_gone_across_fork() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        let stdio = admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
+        assert!(fork_fd_map(&fd_map, &open_table, 10, 11));
+        let (_, release) =
+            with_host_binding_dup(&fd_map, &open_table, 11, 7, 1, false, || Ok::<_, ()>(()))
+                .unwrap();
+        assert_eq!(release, None, "the root still holds stdout");
+        assert_eq!(fd_map_lookup(&fd_map, 11, 1), None);
+        assert!(fork_fd_map(&fd_map, &open_table, 11, 12));
+        assert_eq!(fd_map_lookup(&fd_map, 12, 1), None);
+        assert_eq!(close_host_binding(&fd_map, &open_table, 11, 1), None);
+        let stdout = stdio.key(HostObjectBinding::STDOUT).unwrap();
+        assert_eq!(
+            open_table[stdout.handle as usize - 1]
+                .lifetime
+                .ring_references(stdout.incarnation),
+            Some(1),
+            "only the root's stdout remains"
+        );
+        assert_eq!(
+            fd_map_lookup(&fd_map, 12, 2).unwrap().0,
+            stdio.key(HostObjectBinding::STDERR).unwrap().handle
+        );
     }
 
     #[test]
-    fn readmitting_a_table_does_not_reopen_explicitly_closed_stdio() {
+    fn rename_moves_only_an_unstarted_tables_descriptors() {
         let (fd_map, open_table, object_table) = setup_tables();
-        admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
-        assert!(close_host_binding(&fd_map, &open_table, 10, 1).is_some());
-        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
-        admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
-        assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
-        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
+        let stdio = admit_stdio(&fd_map, &open_table, &object_table, 5, [true; 3]);
+        stdio.share_into(&fd_map, &open_table, 6).unwrap();
+        assert!(!rename_unstarted_table(&fd_map, 5, 6), "6 has descriptors");
+        assert!(rename_unstarted_table(&fd_map, 5, 9));
+        assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 5, fd).is_none()));
+        assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 9, fd).is_some()));
+        assert!((0..3).all(|fd| fd_map_lookup(&fd_map, 6, fd).is_some()));
     }
 
     #[test]

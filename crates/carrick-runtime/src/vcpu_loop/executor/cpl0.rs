@@ -96,7 +96,6 @@ pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMem
     stats: Arc<Cpl0ForwardStats>,
     scheduler: Arc<Scheduler>,
     root_binding: Arc<Cpl0RootBinding>,
-    host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
@@ -352,7 +351,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
             stats: config.stats,
             scheduler: config.scheduler,
             root_binding: Arc::new(Cpl0RootBinding::new(config.root_binding)),
-            host_objects: Arc::new(Mutex::new([1; 3])),
             bound_host_fds,
             #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: config.loaded_pre_entry_hook,
@@ -401,7 +399,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutorFactory
             task: None,
             loaded_generation: None,
             completion_sent: false,
-            host_objects: Arc::clone(&self.host_objects),
             bound_host_fds: Arc::clone(&self.bound_host_fds),
             external_signals: HostSignalIngressProducer::new(),
             idle_kick: M::for_current_thread_kick(),
@@ -431,7 +428,6 @@ pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo =
     task: Option<TaskIdentity>,
     loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
-    host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
@@ -764,24 +760,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             if frame.rax == carrick_el1_abi::HostObjectReleaseCrossing::NUMBER
                 && frame.rcx == carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG
             {
-                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(frame.rdi as u32)
-                    .filter(|_| frame.rdi <= u64::from(u32::MAX))
-                    .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("invalid host object release binding".into())
-                    })?;
-                if frame.rsi != binding as u64 + 1 || frame.rdx != 1 {
-                    return Err(TrapError::Hypervisor(
-                        "host object release identity mismatch".into(),
-                    ));
-                }
-                let mut refs = self.host_objects.lock().map_err(|_| {
-                    TrapError::Hypervisor("host object release owner poisoned".into())
-                })?;
-                let count = &mut refs[binding as usize];
-                *count = count
-                    .checked_sub(1)
-                    .ok_or_else(|| TrapError::Hypervisor("duplicate host object release".into()))?;
+                // The carrier's stdio custody accepts only the exact
+                // description it admitted at boot, once (#2820).
+                venue.release_stdio(frame.rdi, frame.rsi, frame.rdx)?;
                 return Ok(ForwardDecision::Immediate(
                     InitialSyscallDisposition::Return(0),
                 ));

@@ -1311,7 +1311,6 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         BornInZoneSource, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, ThreadControlSlot,
         ThreadIdentity, ThreadLifecyclePage,
     };
-    use carrick_el1_linux::file_table::admit_stdio;
     use carrick_el1_linux::ipc::{IpcVenue, MapTables};
     use carrick_el1_linux::native_process_runtime::{
         NativeFailure, NativeForkPreparation, NativeLifecycleResources, NativeProcessError,
@@ -1831,13 +1830,6 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         next_root_page: 0x2000,
         prepare_synchronously: false,
     });
-    admit_stdio(
-        &service.fd_map,
-        &service.opens,
-        &[],
-        root_table_key,
-        [true; 3],
-    );
     zone.mm_issuer().observe_existing(address.mm);
 
     let counters = Counters::new();

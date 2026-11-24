@@ -4,7 +4,8 @@
 
 use carrick_el1_abi::*;
 use carrick_el1_linux::file_table::{
-    admit_host_fd, admit_stdio, close_host_binding, dup_host_binding, fork_fd_map, retire_fd_map,
+    StdioAdmissionError, StdioDescriptions, admit_host_fd, close_host_binding, dup_host_binding,
+    fork_fd_map, retire_fd_map,
 };
 use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
 use carrick_test_support::TestEl1Region;
@@ -111,13 +112,8 @@ fn file_region_layout_alignment_capacity_and_extent() {
 fn file_region_stdio_parity_and_closed_descriptor_stays_closed() {
     let fixture = Fixture::new(2);
     let tables = fixture.tables();
-    admit_stdio(
-        tables.fd_map(),
-        tables.opens(),
-        tables.objects(),
-        51,
-        [true; 3],
-    );
+    StdioDescriptions::admit(tables.fd_map(), tables.opens(), tables.objects(), 51)
+        .expect("boot stdio");
     for (fd, expected) in [
         HostObjectBinding::STDIN,
         HostObjectBinding::STDOUT,
@@ -141,12 +137,10 @@ fn file_region_stdio_parity_and_closed_descriptor_stays_closed() {
     }
     let change = close_host_binding(tables.fd_map(), tables.opens(), 51, 1).expect("close stdout");
     assert!(change.release.is_some());
-    admit_stdio(
-        tables.fd_map(),
-        tables.opens(),
-        tables.objects(),
-        51,
-        [true; 3],
+    assert_eq!(
+        StdioDescriptions::admit(tables.fd_map(), tables.opens(), tables.objects(), 51),
+        Err(StdioAdmissionError::Occupied),
+        "stdin and stderr are still open"
     );
     assert!(fd_map_lookup(tables.fd_map(), 51, 1).is_none());
     assert!(fd_map_lookup(tables.fd_map(), 51, 2).is_some());
@@ -157,13 +151,8 @@ fn file_region_record_beyond_fifteen_uses_shared_capacity() {
     let fixture = Fixture::new(3);
     let tables = fixture.tables();
     let host = std::fs::File::open("/dev/null").expect("real host crossing object");
-    admit_stdio(
-        tables.fd_map(),
-        tables.opens(),
-        tables.objects(),
-        51,
-        [true; 3],
-    );
+    StdioDescriptions::admit(tables.fd_map(), tables.opens(), tables.objects(), 51)
+        .expect("boot stdio");
     for index in 3..20 {
         let handle = admit_host_fd(
             tables.fd_map(),
@@ -221,13 +210,8 @@ fn file_region_foreign_retired_and_two_carriers() {
 fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     let fixture = Fixture::new(6);
     let tables = fixture.tables();
-    admit_stdio(
-        tables.fd_map(),
-        tables.opens(),
-        tables.objects(),
-        51,
-        [true; 3],
-    );
+    StdioDescriptions::admit(tables.fd_map(), tables.opens(), tables.objects(), 51)
+        .expect("boot stdio");
     let stdout = fd_map_lookup(tables.fd_map(), 51, 1).expect("stdout").0;
     let shared_open = &tables.opens()[stdout as usize - 1];
     let incarnation = shared_open.generation.load(Ordering::Acquire);

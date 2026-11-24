@@ -354,7 +354,8 @@ mod tests {
             core::array::from_fn(|_| carrick_el1_abi::DelegatedFile::new());
         let opens: [DelegatedOpenFile; 8] = core::array::from_fn(|_| DelegatedOpenFile::new());
         let table = 10;
-        crate::file_table::admit_stdio(&fd_map, &opens, &objects, table, [true, true, false]);
+        crate::file_table::StdioDescriptions::admit(&fd_map, &opens, &objects, table).unwrap();
+        assert!(crate::file_table::close_host_binding(&fd_map, &opens, table, 2).is_some());
         let none = |_| None;
         assert_eq!(
             classify_fd_operand(&fd_map, &opens, table, 1, none),

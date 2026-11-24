@@ -419,9 +419,6 @@ pub struct CpuBinding {
     pub mm_owner_generation: AtomicU64,
     /// Last invalidation generation drained by this CPU for its active root.
     pub last_seen_generation: AtomicU64,
-    /// Per-physical CPU cache of the file table last admitted to the shared
-    /// in-ring stdio owner. It is a cache, never descriptor authority.
-    pub stdio_table_admitted: AtomicU64,
     /// Carrier-issued region publication; installed before any guest entry.
     pub file_region: carrick_el1_abi::FileRegionBinding,
     /// This CPU's CR4, read from hardware once by its first CPL0 user
