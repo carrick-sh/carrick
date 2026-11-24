@@ -4432,6 +4432,164 @@ fn native_fork_busy_diagnostic_names_unsettled_parent_fork() {
     assert_eq!(format!("{:?}", refusal.stage), "ParentForkReady");
 }
 
+/// #2947 review: a fork whose parent holds an unsettled guest COW completion
+/// is carrier work, and a sibling holding the parent's editor must never
+/// make the carrier spin in its answer. Through the ARM service's fork entry
+/// and the carrier's production settlement: the fork refuses "not now"; the
+/// carrier's answer with a sibling's editor held returns at once and leaves
+/// the completion owed; the rerun parks on that editor's release; after the
+/// release the next answer settles under its own exclusion, and the rerun
+/// prepares the child. `serial_host`: the guest COW pool is the process's
+/// one installed EL1 region.
+#[test]
+#[allow(clippy::disallowed_methods)] // VM-free carrier answer beside a held editor.
+fn serial_host_native_fork_parks_on_a_held_editor_and_forks_after_the_carrier_settles() {
+    use carrick_kernel::kernel::mm_occupancy::{
+        install_guest_cow_settlement, settle_unsettled_guest_cow,
+    };
+    /// The carrier's settlement, reduced to freeing what it settled.
+    struct FreeCompletions;
+    impl carrick_el1_abi::CowGrantSettlement for FreeCompletions {
+        fn settle(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+            let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
+                return;
+            };
+            let settled: Vec<_> = pool.completions(excluded).collect();
+            for completion in settled {
+                assert!(pool.finish(excluded, &completion.grant));
+            }
+        }
+        fn release(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+            if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
+                pool.release_mm(excluded);
+            }
+        }
+    }
+    struct RestoreRegion(usize);
+    impl Drop for RestoreRegion {
+        fn drop(&mut self) {
+            carrick_el1_abi::record_el1_region_host_ptr(self.0);
+        }
+    }
+    let fixture = Fixture::new(0x10000, asid(1));
+    let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
+    carrick_el1_abi::record_el1_region_host_ptr(fixture.region.ptr.as_ptr() as usize);
+    install_guest_cow_settlement(Arc::new(FreeCompletions));
+    let pool = carrick_el1_abi::cow_grant_pool_host().expect("the fixture's region holds the pool");
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    pool.publish(
+        1,
+        0x8_0000_4000,
+        carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            frame_id: nz(10),
+            mapping_id: nz(11),
+            owner_generation: nz(12),
+            inventory_revision: nz(13),
+        },
+    )
+    .unwrap();
+    let grant = pool.claim(1, 0).unwrap();
+    assert!(pool.complete(&carrick_core_abi::CowGrantCompletion {
+        purpose: carrick_core_abi::CowGrantPurpose::UserWrite,
+        grant,
+        span_va: 0x4000_1000,
+        span_len: 0x3000,
+        old_ipa: 0x9_0000_1000,
+        new_ipa: grant.physical_ipa + 0x1000,
+        tables_linked: 0,
+    }));
+    assert!(pool.has_completions_for(1));
+
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000, 0x28000, 0x29000,
+        0x2a000, 0x2b000, 0x2c000, 0x2d000, 0x2e000, 0x2f000,
+    ]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let child_mm = MmGeneration::new(nz(2));
+    let mm = carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap();
+    let zone = fixture.zone;
+    let answer = move || {
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let _ = settle_unsettled_guest_cow(carrick_el1_abi::cow_grant_pool_host(), mm);
+        });
+    };
+
+    // The parent's completion is the carrier's to settle: "not now".
+    let error = service
+        .prepare_mm(&fixture.address, &parked, child_mm)
+        .expect_err("an unsettled parent completion refuses this attempt");
+    assert_eq!(error.failure(), Err(NativeContention::BUSY));
+    assert!(pool.has_completions_for(1));
+
+    // A sibling's edit holds the parent's editor while the carrier answers.
+    let owner = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let index = fixture.zone.spaces.find(1).unwrap();
+    let access = owner.space_access(0).unwrap();
+    let editor = access.try_begin_edit(index, 1, NonZeroU64::MIN).unwrap();
+    let carrier = std::thread::spawn(answer);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !carrier.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let answered = carrier.is_finished();
+    // Let a waiting answer finish before asserting, so a failure joins it.
+    let rerun_with_editor_held = answered.then(|| {
+        service
+            .prepare_mm(&fixture.address, &parked, child_mm)
+            .expect_err("the sibling's editor still holds the parent")
+    });
+    drop(editor);
+    carrier.join().unwrap();
+    assert!(
+        answered,
+        "the carrier spun in its answer for as long as the sibling held the editor"
+    );
+    assert!(
+        pool.has_completions_for(1),
+        "no settlement while the sibling may still complete a COW"
+    );
+    assert_eq!(
+        fixture.zone.spaces.gate(index),
+        0,
+        "the answer lowered its gate"
+    );
+    // The rerun parks on the editor's release, never retries a bare Busy.
+    assert_eq!(
+        rerun_with_editor_held
+            .unwrap()
+            .failure()
+            .err()
+            .and_then(NativeContention::owner_wait)
+            .map(|wait| wait.cause()),
+        Some(carrick_core_abi::PortalWaitCause::Editor)
+    );
+
+    // After the release, the next answer settles, and the rerun forks.
+    answer();
+    assert!(
+        !pool.has_completions_for(1),
+        "the answer settled the parent"
+    );
+    let prepared = service
+        .prepare_mm(&fixture.address, &parked, child_mm)
+        .expect("the settled parent forks");
+    service.abort_mm(prepared).expect("abort_mm should succeed");
+}
+
 #[test]
 fn fork_commit_refusal_after_admitted_reservation_fails_closed_without_opening_child_space() {
     assert_commit_fault_keeps_child_closed(CommitFault::Refusal);
