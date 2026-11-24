@@ -352,9 +352,10 @@ impl<
         // would break that publication. Completions are claimed and
         // completed only under this editor, so with it held and none
         // outstanding none can appear; one outstanding is the settlement's
-        // "not now": the caller rings it and the fork reruns (#2890).
+        // "not now": the venue asks its carrier for it and the fork reruns
+        // after it (#2890, #2947).
         if cow.has_completions_for(request.operation.mm.raw()) {
-            return Err(MmError::Busy);
+            return Err(MmError::CowUnsettled);
         }
         let child = self.child_root(request.child_mm, worker)?;
         if child.is_admitted() {
