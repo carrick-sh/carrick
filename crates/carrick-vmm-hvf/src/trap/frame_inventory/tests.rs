@@ -423,7 +423,7 @@ fn exec_predecessor_authority_test_fixture(
     carrick_hal::ExecPredecessorIdentity,
     carrick_hal::FrameCowIdentity,
 ) {
-    let mut task = hvpatch_task_state_test_fixture(&custody, 200, 0x4000, 73);
+    let mut task = hvpatch_task_state_test_fixture(custody, 200, 0x4000, 73);
     let current_cow = carrick_hal::FrameCowIdentity {
         linux_pid: 41,
         // This field is paired to the persistent backend/kicker ThreadId;
@@ -437,7 +437,7 @@ fn exec_predecessor_authority_test_fixture(
     let directory = std::sync::Arc::new(HvpatchCarrierTaskStateDirectory::default());
     let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
     task.registration = Some(HvpatchTaskRegistration {
-        custody: std::sync::Arc::clone(&custody),
+        custody: std::sync::Arc::clone(custody),
         directory: std::sync::Arc::clone(&directory),
         key: HvpatchCarrierTaskStateKey {
             directory_instance: directory.instance,
@@ -487,7 +487,7 @@ fn register_carrier_lease(
     let key = lease.key();
     lease.mark_test_mapped_without_backend();
     let owners = std::collections::BTreeMap::from([(key, host_addr)]);
-    let identities = register_carrier_stage2_leases(&custody, &mut vec![lease], &owners).unwrap();
+    let identities = register_carrier_stage2_leases(custody, &mut vec![lease], &owners).unwrap();
     assert_eq!(identities.len(), 1);
     assert_eq!(
         custody
@@ -2860,14 +2860,14 @@ fn process_retirement_task(
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
     let key = next_test_physical_key(0x4000);
-    let generation = next_global_frame_owner_generation(&custody);
+    let generation = next_global_frame_owner_generation(custody);
     let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
         crate::host_mapping::HostMappingKind::FrameCow,
     )
     .unwrap();
     let host_addr = host.as_ptr();
-    let mut task = hvpatch_task_state_test_fixture(&custody, 12, key.0, 12);
+    let mut task = hvpatch_task_state_test_fixture(custody, 12, key.0, 12);
     task.stage2.cow_authority = Some(std::sync::Arc::new(authority));
     task.stage2.mappings[0].start = key.0;
     task.stage2.mappings[0].end = key.0 + key.1;
@@ -2920,7 +2920,7 @@ fn process_retirement_task(
         );
     }
     let owner = GlobalFrameHostOwner::new(
-        &custody,
+        custody,
         GlobalFrameStage2Lease::fixed(key.0, key.1),
         host,
         carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
@@ -2937,7 +2937,7 @@ fn process_retirement_task(
         "publication must displace no predecessor"
     );
     let guard = TestGlobalFrameOwnerGuard {
-        custody: std::sync::Arc::clone(&custody),
+        custody: std::sync::Arc::clone(custody),
         key,
         generation,
     };
@@ -3012,7 +3012,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
 
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(451));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(452));
-    let mut task = hvpatch_task_state_test_fixture(&custody, 12, root_slot.0, 12);
+    let mut task = hvpatch_task_state_test_fixture(custody, 12, root_slot.0, 12);
     task.stage2.mm_root_slot = Some(root_slot);
     task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
     task.stage2.mappings = TaskMappingIndex::from_region(root_region);
@@ -3150,7 +3150,7 @@ fn shared_inventory_root_fixture(
         .cloned()
         .expect("shared-inventory root has structural custody");
     let identity = owner.record_identity();
-    let mut task = hvpatch_task_state_test_fixture(&custody, 12, root_slot.0, 12);
+    let mut task = hvpatch_task_state_test_fixture(custody, 12, root_slot.0, 12);
     task.stage2.mm_root_slot = Some(root_slot);
     task.stage2.shared_process_mm = true;
     task.stage2.mappings = TaskMappingIndex::from_region(root_region);
@@ -7753,17 +7753,17 @@ fn exit_task_holding_owned_lease(
         private_file_backing: None,
     };
     let mut region =
-        prepare_exec_region_raw_in(&custody, &guest_mapping).expect("prepare exec region");
+        prepare_exec_region_raw_in(custody, &guest_mapping).expect("prepare exec region");
     lease.mark_mapped(custody.stage2_backend_handle());
-    let generation = publish_exec_region_host_owner_in(&custody, &mut region, lease, None)
+    let generation = publish_exec_region_host_owner_in(custody, &mut region, lease, None)
         .expect("publish exec region host owner");
     let stage2_owner = mapped_region_stage2_owner_identity(&region)
         .expect("published exec region has a physical owner identity");
-    disarm_test_owner_stage2_unmap(&custody, key, generation);
-    mark_el1_frame_grant_in(&custody, key.0, key.1, mm, generation).unwrap();
+    disarm_test_owner_stage2_unmap(custody, key, generation);
+    mark_el1_frame_grant_in(custody, key.0, key.1, mm, generation).unwrap();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(frame));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(mapping));
-    let mut task = hvpatch_task_state_test_fixture(&custody, mm, key.0, mm as i32);
+    let mut task = hvpatch_task_state_test_fixture(custody, mm, key.0, mm as i32);
     task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
         std::sync::Arc::clone(kernel),
     )));
@@ -7822,7 +7822,7 @@ fn fork_sibling_of(
         let (&key, &extent) = inventory.extents.iter().next().expect("one extent");
         (key, extent, std::sync::Arc::clone(&inventory.frames))
     };
-    let mut task = hvpatch_task_state_test_fixture(&custody, mm, key.0, mm as i32);
+    let mut task = hvpatch_task_state_test_fixture(custody, mm, key.0, mm as i32);
     task.stage2.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::PerFrame(
         std::sync::Arc::clone(kernel),
     )));
@@ -7967,7 +7967,7 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
     for run in 0..4 {
         let id = 800 + run * 2;
         let (mut task, _, _, _) = exit_task_holding_owned_lease(
-            &custody,
+            custody,
             id,
             0x4000 + run * 0x4000,
             id,
@@ -7975,7 +7975,7 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
             &kernel,
             &frames,
         );
-        let record = relocate_exit_fixture_root(&custody, &mut task, base);
+        let record = relocate_exit_fixture_root(custody, &mut task, base);
         if let Some(old) = predecessor {
             assert_eq!(
                 custody.request_stage2_record_retirement(old),
@@ -8021,9 +8021,9 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut task, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 820, 0x4000, 820, 821, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 820, 0x4000, 820, 821, &kernel, &frames);
     let base = pool.base_ipa();
-    let record = relocate_exit_fixture_root(&custody, &mut task, base);
+    let record = relocate_exit_fixture_root(custody, &mut task, base);
     let pin = custody.pin_stage2_record(record).unwrap();
     drop(task);
     assert!(
@@ -8055,12 +8055,12 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut old, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 713, 0x4000, 713, 714, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 713, 0x4000, 713, 714, &kernel, &frames);
     let (mut new, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 715, 0x8000, 715, 716, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 715, 0x8000, 715, 716, &kernel, &frames);
     let base = pool.base_ipa();
-    let predecessor_record = relocate_exit_fixture_root(&custody, &mut old, base);
-    let successor_record = relocate_exit_fixture_root(&custody, &mut new, base + 0x20_0000);
+    let predecessor_record = relocate_exit_fixture_root(custody, &mut old, base);
+    let successor_record = relocate_exit_fixture_root(custody, &mut new, base + 0x20_0000);
     let mut engine = old.page_tables_authority();
     engine
         .install_exec_successor(new.page_tables_authority())
@@ -8071,7 +8071,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     unsafe { successor_owner.ptr().add(0x1000).write(0x79) };
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&old);
     let mut cleanup = PendingExecStage2Cleanup {
-        custody: std::sync::Arc::clone(&custody),
+        custody: std::sync::Arc::clone(custody),
         mappings: TaskMappingIndex::default(),
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
@@ -8123,12 +8123,12 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 701, 0x4000, 701, 702, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 701, 0x4000, 701, 702, &kernel, &frames);
     let (mut second, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 703, 0x8000, 703, 704, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 703, 0x8000, 703, 704, &kernel, &frames);
     let base = pool.base_ipa();
-    let first_record = relocate_exit_fixture_root(&custody, &mut first, base);
-    let second_record = relocate_exit_fixture_root(&custody, &mut second, base + 0x20_0000);
+    let first_record = relocate_exit_fixture_root(custody, &mut first, base);
+    let second_record = relocate_exit_fixture_root(custody, &mut second, base + 0x20_0000);
     assert_eq!(pool.allocated_count(), 2);
     assert_ne!(first_record, second_record);
     let second_owner =
@@ -8176,12 +8176,12 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 721, 0x4000, 721, 722, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 721, 0x4000, 721, 722, &kernel, &frames);
     let (mut peer, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 723, 0x8000, 723, 724, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 723, 0x8000, 723, 724, &kernel, &frames);
     let base = pool.base_ipa();
-    let first_record = relocate_exit_fixture_root(&custody, &mut first, base);
-    let peer_record = relocate_exit_fixture_root(&custody, &mut peer, base + 0x20_0000);
+    let first_record = relocate_exit_fixture_root(custody, &mut first, base);
+    let peer_record = relocate_exit_fixture_root(custody, &mut peer, base + 0x20_0000);
     let parked = std::sync::Arc::clone(&first.stage2.mm_access);
     assert!(pool.allocate_slot_at(base).is_none());
     drop(parked); // The final parked holder has retired.
@@ -8192,8 +8192,8 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
             .is_none()
     );
     let (mut successor, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 725, 0xc000, 725, 726, &kernel, &frames);
-    let successor_record = relocate_exit_fixture_root(&custody, &mut successor, base);
+        exit_task_holding_owned_lease(custody, 725, 0xc000, 725, 726, &kernel, &frames);
+    let successor_record = relocate_exit_fixture_root(custody, &mut successor, base);
     Stage2State::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
     assert!(
         pool.allocate_slot_at(base).is_none(),
@@ -8229,12 +8229,12 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, key, generation, _) =
-        exit_task_holding_owned_lease(&custody, 705, 0x4000, 705, 706, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 705, 0x4000, 705, 706, &kernel, &frames);
     let (mut second, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 707, 0x8000, 707, 708, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 707, 0x8000, 707, 708, &kernel, &frames);
     let base = pool.base_ipa();
-    let record = relocate_exit_fixture_root(&custody, &mut first, base);
-    let other = relocate_exit_fixture_root(&custody, &mut second, base + 0x20_0000);
+    let record = relocate_exit_fixture_root(custody, &mut first, base);
+    let other = relocate_exit_fixture_root(custody, &mut second, base + 0x20_0000);
     let pin = custody.pin_stage2_record(record).unwrap();
     let publisher = first
         .stage2
@@ -8304,12 +8304,12 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, key, generation, _) =
-        exit_task_holding_owned_lease(&custody, 709, 0x4000, 709, 710, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 709, 0x4000, 709, 710, &kernel, &frames);
     let (mut second, _, _, _) =
-        exit_task_holding_owned_lease(&custody, 711, 0x8000, 711, 712, &kernel, &frames);
+        exit_task_holding_owned_lease(custody, 711, 0x8000, 711, 712, &kernel, &frames);
     let base = pool.base_ipa();
-    let record = relocate_exit_fixture_root(&custody, &mut first, base);
-    let peer = relocate_exit_fixture_root(&custody, &mut second, base + 0x20_0000);
+    let record = relocate_exit_fixture_root(custody, &mut first, base);
+    let peer = relocate_exit_fixture_root(custody, &mut second, base + 0x20_0000);
     // An earlier exact physical retirement may finish before MM metadata drops.
     retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
     assert!(pool.allocate_slot_at(base).is_none());

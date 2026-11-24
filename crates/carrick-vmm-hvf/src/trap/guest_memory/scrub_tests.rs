@@ -26,7 +26,7 @@ fn translation_after_hole(
         std::ptr::write_bytes(backing.ptr, 0xa5, LEN);
         std::ptr::write_bytes(translated.ptr, 0xb6, LEN);
     }
-    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(custody);
     let ipa = if reusable {
         carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7840_0000
     } else {
@@ -58,7 +58,7 @@ fn translation_after_hole(
         pt.set_prot_none(VA + PAGE as u64, PAGE, None).unwrap();
     }
     task.page_tables_authority().set_manager(pt);
-    let mut vm = test_vm_state(&custody, task);
+    let mut vm = test_vm_state(custody, task);
     vm.zero_guest_backing(VA, 2 * PAGE).unwrap();
     assert_eq!(
         unsafe { *translated.ptr },

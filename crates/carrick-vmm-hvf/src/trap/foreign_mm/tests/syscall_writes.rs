@@ -14,7 +14,6 @@ impl WriteFixture {
         let transport = CarrierForeignMmTransport::live_fixture();
         let custody = Arc::clone(&transport.custody);
         let installed = install_mm(
-            &custody,
             &transport,
             201,
             0x9a00_6700_0000,
@@ -341,7 +340,7 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     .unwrap();
     let identity = owner.record_identity();
     let custody = &custody;
-    let mut task = hvpatch_neutral_task_state_for_test(&custody);
+    let mut task = hvpatch_neutral_task_state_for_test(custody);
     let mut row = crate::trap::thread_sibling_tests::mapped_region(0x400000, 0x401000, ipa + 4096);
     row.physical_ipa = ipa;
     row.physical_size = size;

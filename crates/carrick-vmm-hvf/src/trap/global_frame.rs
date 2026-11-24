@@ -2684,7 +2684,7 @@ impl StructuralBackingOwner {
             stage2_lease.mark_test_mapped_without_backend();
         }
         Self::new_in(
-            &custody,
+            custody,
             mapping,
             stage2_lease,
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),

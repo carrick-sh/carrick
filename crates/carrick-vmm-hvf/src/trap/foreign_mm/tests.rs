@@ -759,9 +759,9 @@ fn install_owner(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.as_ptr(), length);
     }
     let host_addr = mapping.as_ptr() as usize;
-    let generation = next_global_frame_owner_generation(&custody);
+    let generation = next_global_frame_owner_generation(custody);
     let owner = GlobalFrameHostOwner::new(
-        &custody,
+        custody,
         GlobalFrameStage2Lease::fixed(ipa, length as u64),
         mapping,
         carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
@@ -784,20 +784,16 @@ fn install_owner(
 }
 
 fn install_mm(
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     transport: &CarrierForeignMmTransport,
     ordinal: u64,
     root: u64,
     data_ipa: u64,
     bytes: [u8; 4],
 ) -> InstalledMm {
-    install_mm_with_data_len(
-        &custody, transport, ordinal, root, data_ipa, OWNER_LEN, &bytes,
-    )
+    install_mm_with_data_len(transport, ordinal, root, data_ipa, OWNER_LEN, &bytes)
 }
 
 fn install_mm_with_data_len(
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     transport: &CarrierForeignMmTransport,
     ordinal: u64,
     root: u64,
@@ -806,12 +802,11 @@ fn install_mm_with_data_len(
     bytes: &[u8],
 ) -> InstalledMm {
     install_mm_sparse(
-        &custody, transport, ordinal, root, data_ipa, data_len, data_len, bytes,
+        transport, ordinal, root, data_ipa, data_len, data_len, bytes,
     )
 }
 
 fn install_mm_sparse(
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     transport: &CarrierForeignMmTransport,
     ordinal: u64,
     root: u64,
@@ -820,6 +815,7 @@ fn install_mm_sparse(
     vma_len: usize,
     bytes: &[u8],
 ) -> InstalledMm {
+    let custody = &transport.custody;
     assert!(vma_len >= data_len, "vma_len must be at least data_len");
     assert!(data_len >= bytes.len(), "fixture bytes must fit data owner");
     assert_eq!(
@@ -852,10 +848,10 @@ fn install_mm_sparse(
     // cover the full primary arena that the publication resolver pins.
     let mut table_bytes = tables.as_bytes().to_vec();
     table_bytes.resize(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize, 0);
-    let (table_generation, table_host) = install_owner(&custody, root, &table_bytes);
+    let (table_generation, table_host) = install_owner(custody, root, &table_bytes);
     let mut data_bytes = vec![0_u8; data_len];
     data_bytes[..bytes.len()].copy_from_slice(bytes);
-    let (data_generation, data_host) = install_owner(&custody, data_ipa, &data_bytes);
+    let (data_generation, data_host) = install_owner(custody, data_ipa, &data_bytes);
 
     let table_mapping = carrick_hal::MappingId::from_kernel_allocation(nonzero(ordinal * 10));
     let data_mapping = carrick_hal::MappingId::from_kernel_allocation(nonzero(ordinal * 10 + 1));
@@ -935,7 +931,7 @@ fn install_mm_sparse(
         ],
     };
     let state = MmAccessState::for_foreign_read_test(
-        &custody,
+        custody,
         binding,
         carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
         carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
@@ -1011,7 +1007,7 @@ fn prepare_foreign_cow(
 ) {
     let data_key = installed.owners.0[1];
     let (host_addr, generation) =
-        global_frame_host_owner_identity_in(&custody, data_key.0, data_key.1)
+        global_frame_host_owner_identity_in(custody, data_key.0, data_key.1)
             .expect("foreign COW source owner");
     let backing = installed
         .state
@@ -1078,7 +1074,7 @@ fn prepare_foreign_cow(
                     Arc::downgrade(&installed.state),
                 ),
             ]))),
-            custody: Arc::clone(&custody),
+            custody: Arc::clone(custody),
         }));
     let lease = endpoint
         .retain(&installed.snapshot, deadline)
@@ -1135,7 +1131,7 @@ impl ModelCallerEl1 {
         before_apply: Box<dyn FnMut()>,
     ) -> Self {
         let root_key = installed.owners.0[0];
-        let root_host = global_frame_host_owner_identity_in(&custody, root_key.0, root_key.1)
+        let root_host = global_frame_host_owner_identity_in(custody, root_key.0, root_key.1)
             .expect("fixture root owner")
             .0;
         Self {
@@ -1343,7 +1339,6 @@ fn guest_owned_foreign_cow_without_a_lent_vcpu_refuses_without_mutation() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let child = install_mm(
-        &custody,
         &transport,
         701,
         0x9a01_1800_0000,
@@ -1351,7 +1346,6 @@ fn guest_owned_foreign_cow_without_a_lent_vcpu_refuses_without_mutation() {
         *b"old!",
     );
     let peer = install_mm(
-        &custody,
         &transport,
         702,
         0x9a01_1900_0000,
@@ -1422,7 +1416,6 @@ fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         705,
         0x9a01_1c00_0000,
@@ -1430,7 +1423,6 @@ fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
         *b"old!",
     );
     let peer = install_mm(
-        &custody,
         &transport,
         706,
         0x9a01_1d00_0000,
@@ -1550,7 +1542,6 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
-            &custody,
             &transport,
             710 + u64::from(phase),
             0x9a01_2000_0000 + u64::from(phase) * 0x0200_0000,
@@ -1651,7 +1642,6 @@ fn guest_owned_foreign_cow_el1_refusal_rolls_back_every_stage() {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
-            &custody,
             &transport,
             720 + index as u64,
             0x9a01_4000_0000 + index as u64 * 0x0200_0000,
@@ -1724,7 +1714,6 @@ fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0(
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         740,
         0x9a01_5000_0000,
@@ -1781,7 +1770,6 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
     let _external = ExternalAliasStateRestore::capture();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let target = install_mm(
-        &custody,
         &transport,
         720,
         0x9a01_3000_0000,
@@ -1789,7 +1777,6 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
         *b"targ",
     );
     let other = install_mm(
-        &custody,
         &transport,
         721,
         0x9a01_3200_0000,
@@ -1894,7 +1881,6 @@ fn guest_owned_foreign_pristine_write_publishes_user_writable_through_the_lent_v
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm_sparse(
-        &custody,
         &transport,
         730,
         0x9a01_4000_0000,
@@ -1977,7 +1963,6 @@ fn guest_sparse_publication_executes_before_retirement_and_preserves_old_owner()
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm(
-        &custody,
         &transport,
         703,
         0x9a01_1a00_0000,
@@ -2137,7 +2122,6 @@ fn guest_sparse_plan_refusal_returns_grant_without_retiring_predecessor() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         704,
         0x9a01_1b00_0000,
@@ -2226,7 +2210,6 @@ fn sparse_replacement_failure_preserves_preimage_before_retirement() {
         let stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
-            &custody,
             &transport,
             197,
             0x9a00_6000_0000,
@@ -2301,7 +2284,6 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         121,
         0x9a00_1800_0000,
@@ -2388,10 +2370,9 @@ fn rx_ptrace_text_cow_case(custody: &std::sync::Arc<crate::trap::CarrierVmCustod
     let _stub = guest.then(ScopedStage2MapTestStub::enable);
     let request_va = TEST_VA + 0x100;
     let neighbor_va = TEST_VA + 0x800;
-    let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
+    let transport = CarrierForeignMmTransport::with_custody(Arc::clone(custody));
     let lane = u64::from(guest);
     let mut child = install_mm(
-        &custody,
         &transport,
         132 + lane * 600,
         0x9a00_2300_0000 + lane * 0x0100_0000_0000,
@@ -2409,7 +2390,7 @@ fn rx_ptrace_text_cow_case(custody: &std::sync::Arc<crate::trap::CarrierVmCustod
 
     let old_key = child.owners.0[1];
     let (host_addr, generation) =
-        global_frame_host_owner_identity_in(&custody, old_key.0, old_key.1)
+        global_frame_host_owner_identity_in(custody, old_key.0, old_key.1)
             .expect("RX COW source owner");
     let backing = child
         .state
@@ -2490,7 +2471,7 @@ fn rx_ptrace_text_cow_case(custody: &std::sync::Arc<crate::trap::CarrierVmCustod
                     Arc::downgrade(&child.state),
                 ),
             ]))),
-            custody: Arc::clone(&custody),
+            custody: Arc::clone(custody),
         }));
     let deadline = Instant::now() + Duration::from_secs(1);
     let lease = endpoint
@@ -2531,7 +2512,7 @@ fn rx_ptrace_text_cow_case(custody: &std::sync::Arc<crate::trap::CarrierVmCustod
             calls: 0,
             fail_call: None,
         },
-        caller: guest.then(|| ModelCallerEl1::new(&custody, &child, Box::new(|| {}))),
+        caller: guest.then(|| ModelCallerEl1::new(custody, &child, Box::new(|| {}))),
     };
     if let Some(caller) = invalidator.caller.as_ref() {
         install_test_slots(&child, caller);
@@ -2616,7 +2597,6 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         133,
         0x9a00_2400_0000,
@@ -2752,7 +2732,6 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         134,
         0x9a00_2500_0000,
@@ -2882,7 +2861,6 @@ fn foreign_cow_one_compound_authorizes_distinct_subrange_writes() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         125,
         0x9a00_1c00_0000,
@@ -2956,7 +2934,6 @@ fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm_with_data_len(
-        &custody,
         &transport,
         126,
         0x9a00_1d00_0000,
@@ -3042,7 +3019,6 @@ fn retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm_with_data_len(
-        &custody,
         &transport,
         127,
         0x9a00_1e00_0000,
@@ -3113,7 +3089,6 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         128,
         0x9a00_1f00_0000,
@@ -3180,7 +3155,6 @@ fn foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         129,
         0x9a00_2800_0000,
@@ -3248,7 +3222,6 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         130,
         0x9a00_2900_0000,
@@ -3330,7 +3303,6 @@ fn foreign_cow_prepare_write_rejects_semantic_span_end_plus_one() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         131,
         0x9a00_2a00_0000,
@@ -3397,7 +3369,6 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         132,
         0x9a00_2b00_0000,
@@ -3492,7 +3463,6 @@ fn foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owne
     for phase in 1..=5 {
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
-            &custody,
             &transport,
             121 + u64::from(phase),
             0x9a00_2000_0000 + u64::from(phase) * 0x0200_0000,
@@ -3539,7 +3509,6 @@ fn foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1() 
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         130,
         0x9a00_3000_0000,
@@ -3570,7 +3539,6 @@ fn foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contenti
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm(
-        &custody,
         &transport,
         124,
         0x9a00_1b00_0000,
@@ -3611,7 +3579,6 @@ fn instruction_fetch_carrier_selects_exact_execute_only_mm() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut first = install_mm(
-        &custody,
         &transport,
         211,
         0x9600_1000_0000,
@@ -3619,7 +3586,6 @@ fn instruction_fetch_carrier_selects_exact_execute_only_mm() {
         *b"code",
     );
     let mut second = install_mm(
-        &custody,
         &transport,
         212,
         0x9600_1200_0000,
@@ -3648,7 +3614,6 @@ fn instruction_fetch_carrier_reads_execute_only_deferred_bytes() {
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let len = OWNER_LEN * 2;
     let mut installed = install_mm_sparse(
-        &custody,
         &transport,
         213,
         0x9600_1400_0000,
@@ -3685,7 +3650,6 @@ fn foreign_mm_read_walks_the_target_root_not_the_caller_root() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let caller = install_mm(
-        &custody,
         &transport,
         101,
         0x9a00_0000_0000,
@@ -3693,7 +3657,6 @@ fn foreign_mm_read_walks_the_target_root_not_the_caller_root() {
         *b"call",
     );
     let target = install_mm(
-        &custody,
         &transport,
         102,
         0x9a00_0200_0000,
@@ -3719,7 +3682,6 @@ fn foreign_mm_read_retries_each_stale_revision_domain() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         103,
         0x9a00_0400_0000,
@@ -3757,7 +3719,6 @@ fn foreign_mm_read_rejects_a_missing_descriptor_owner() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         104,
         0x9a00_0600_0000,
@@ -3780,7 +3741,6 @@ fn foreign_mm_retain_pins_covering_owner_for_cow_split_inventory_fragment() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         149,
         0x9a00_4a00_0000,
@@ -3818,7 +3778,6 @@ fn foreign_mm_read_rejects_reused_owner_generation() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         105,
         0x9a00_0800_0000,
@@ -3846,7 +3805,6 @@ fn foreign_mm_read_unmaterialized_remote_page_within_vma_reads_zeros_and_full_le
     let page_size = CowArmedRanges::COMPOUND_SIZE as usize;
     let vma_len = page_size * 2;
     let installed = install_mm_sparse(
-        &custody,
         &transport,
         108,
         0x9600_0800_0000,
@@ -3901,7 +3859,6 @@ fn foreign_mm_read_backed_page_without_stage1_or_recipe_reads_zeros() {
     let page_size = CowArmedRanges::COMPOUND_SIZE as usize;
     let vma_len = page_size * 2;
     let installed = install_mm_sparse(
-        &custody,
         &transport,
         118,
         0x9600_0900_0000,
@@ -3953,7 +3910,6 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         state,
         owners,
     } = install_mm(
-        &custody,
         &transport,
         106,
         0x9a00_0a00_0000,
@@ -4192,7 +4148,6 @@ fn foreign_mm_retain_deadline_bounds_directory_inventory_and_owner_contention() 
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         108,
         0x9a00_0e00_0000,
@@ -4252,7 +4207,6 @@ fn foreign_mm_read_deadline_bounds_mutation_coordinator_contention() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         109,
         0x9a00_1000_0000,
@@ -5776,9 +5730,7 @@ fn production_fork_vvar_refresh(
 ) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
-    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(
-        &custody,
-    )));
+    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(custody)));
     let vvar_ipa = crate::vdso::LINUX_VVAR_BASE;
     let vvar_len = 0x4000_u64;
     let vvar_mapping = GuestMapping {
@@ -5931,7 +5883,7 @@ fn production_fork_vvar_refresh(
     assert_eq!(published_vvar_extent.stage2_owner, vvar_extent.stage2_owner);
     let mut parent = HvfTaskState {
         stage2: Stage2State {
-            custody: std::sync::Arc::clone(&custody),
+            custody: std::sync::Arc::clone(custody),
             mappings: TaskMappingIndex::from_iter([page_tables, vvar, overlay]),
             mm_root_slot: Some((0x9a00_2000_0000, 0x20_0000)),
             container_root: ContainerRootToken::from_raw(1),
@@ -6215,7 +6167,7 @@ fn production_fork_vvar_refresh(
     .expect("reserve child inventory");
     let (carrier, mut prepared) =
         HvfVmState::prepare_task_only_plan_for_test(plan).expect("prepare task-only child");
-    let mut projected = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
+    let mut projected = crate::trap::hvpatch_neutral_task_state_for_test(custody);
     projected.stage2.persistent_vm_lifecycle = true;
     projected.stage2.mappings = prepared
         .mappings
@@ -6306,7 +6258,7 @@ fn production_fork_vvar_refresh(
     };
     let child_live = TestLiveAuthority(Arc::new(parking_lot::RwLock::new(child_snapshot.clone())));
     let cow_authority = Arc::new(TestForeignCowAuthority {
-        custody: std::sync::Arc::clone(&custody),
+        custody: std::sync::Arc::clone(custody),
         live: Arc::clone(&child_live.0),
         old_frame: vvar_extent.frame,
         old_frame_mappings: 2,
@@ -6347,7 +6299,7 @@ fn production_fork_vvar_refresh(
     );
     let mut child_task = HvfTaskState {
         stage2: Stage2State {
-            custody: std::sync::Arc::clone(&custody),
+            custody: std::sync::Arc::clone(custody),
             mappings: prepared
                 .mappings
                 .iter()
@@ -6512,7 +6464,7 @@ fn production_fork_vvar_refresh(
             source: vvar_owner.ptr(),
             source_ipa: vvar_ipa,
             source_len: vvar_len,
-            custody: Arc::clone(&custody),
+            custody: Arc::clone(custody),
         };
         child_task
             .refresh_fork_process_state_in(&transport.custody, &mut service)
@@ -10894,9 +10846,7 @@ fn partial_structural_map_plan(
     }
 
     let later_ipa = root_ipa + 0x20_0000;
-    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(
-        &custody,
-    )));
+    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(custody)));
     let custody = Arc::clone(&transport.custody);
     let plan = ProcessSpecPlan {
         mappings: vec![
@@ -11782,7 +11732,6 @@ fn fresh_sparse_publication_avoids_stage1_maintenance() {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let mut installed = install_mm(
-            &custody,
             &transport,
             197,
             0x9a00_6000_0000,
@@ -11898,7 +11847,6 @@ fn native_code_content_foreign_write_revokes_backing_dependencies() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut child = install_mm(
-        &custody,
         &transport,
         198,
         0x9a00_6100_0000,
@@ -11995,7 +11943,6 @@ fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm(
-        &custody,
         &transport,
         199,
         0x9a00_6300_0000,
@@ -12088,7 +12035,6 @@ fn native_code_content_syscall_copy_revokes_physical_dependencies() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         200,
         0x9a00_6500_0000,
@@ -12142,7 +12088,7 @@ fn live_resolver_retains_exact_owner_pin_and_rejects_nonmatching_generation_and_
     let root = 0x9a00_7700_0000;
     let data_ipa = 0x9b00_7700_0000;
     let ext_ipa = 0x9a00_7720_0000;
-    let mut installed = install_mm(&custody, &transport, 300, root, data_ipa, *b"test");
+    let mut installed = install_mm(&transport, 300, root, data_ipa, *b"test");
     installed.owners.0.push((ext_ipa, 4096));
 
     // Add an extension arena to the frame inventory
@@ -12262,7 +12208,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let root_slot = (root, 0x20_0000_u64);
     let data_ipa = 0x9b00_7800_0000;
     let ext_ipa = 0x9a00_7820_0000;
-    let mut installed = install_mm(&custody, &transport, 301, root, data_ipa, *b"test");
+    let mut installed = install_mm(&transport, 301, root, data_ipa, *b"test");
     installed.owners.0.push((ext_ipa, 4096));
 
     // 1. Install real pooled root structural owner in custody and state
@@ -12506,7 +12452,6 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         302,
         0x9a00_7900_0000,
@@ -12584,10 +12529,10 @@ fn retained_reuse_fixture(
     data_ipa: u64,
     lane: carrick_mmu_core::aarch64::LiveDescriptorOwner,
 ) -> RetainedReuseFixture {
-    let installed = install_mm(&custody, transport, ordinal, root, data_ipa, *b"old!");
+    let installed = install_mm(transport, ordinal, root, data_ipa, *b"old!");
     let root_key = installed.owners.0[0];
     let (root_host, root_generation) =
-        global_frame_host_owner_identity_in(&custody, root_key.0, root_key.1)
+        global_frame_host_owner_identity_in(custody, root_key.0, root_key.1)
             .expect("root table owner");
     let tables = installed.state.page_tables_authority();
     installed
@@ -12599,7 +12544,7 @@ fn retained_reuse_fixture(
     let mut authority = TestForeignCowAuthority::new(&installed);
     authority.allow_quiesce = true;
     let authority = Arc::new(authority);
-    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(custody);
     task.stage2.mm_access = Arc::clone(&installed.state);
     task.stage2.persistent_vm_lifecycle = true;
     task.stage2.mm_root_slot = Some(root_key);
@@ -13176,7 +13121,7 @@ mod guest_cow {
     ) -> *mut u64 {
         let mut table = root;
         for shift in [39, 30, 21] {
-            let entry = model_owner_host(&custody, table + ((va >> shift) & 511) * 8) as *mut u64;
+            let entry = model_owner_host(custody, table + ((va >> shift) & 511) * 8) as *mut u64;
             // SAFETY: the table owner is live for the fixture's lifetime.
             let descriptor = unsafe { entry.read_volatile() };
             assert_eq!(
@@ -13186,7 +13131,7 @@ mod guest_cow {
             );
             table = descriptor & PA;
         }
-        model_owner_host(&custody, table + ((va >> 12) & 511) * 8) as *mut u64
+        model_owner_host(custody, table + ((va >> 12) & 511) * 8) as *mut u64
     }
 
     /// A forked child: its 16 KiB data compound is EL1-private and armed in
@@ -13198,7 +13143,7 @@ mod guest_cow {
         root: u64,
         data: u64,
     ) -> (InstalledMm, &'static CowGrantPool) {
-        forked_guest_child_with(&custody, ordinal, root, data, false)
+        forked_guest_child_with(custody, ordinal, root, data, false)
     }
 
     /// `host_published`: the span's leaves are plain host-published writable
@@ -13212,8 +13157,7 @@ mod guest_cow {
         host_published: bool,
     ) -> (InstalledMm, &'static CowGrantPool) {
         let child = install_mm(
-            &custody,
-            &CarrierForeignMmTransport::with_custody(Arc::clone(&custody)),
+            &CarrierForeignMmTransport::with_custody(Arc::clone(custody)),
             ordinal,
             root,
             data,
@@ -13234,7 +13178,7 @@ mod guest_cow {
             .expect("provision the copy window");
         if host_published {
             for page in 0..4 {
-                let word = leaf_word(&custody, root, TEST_VA + page * 4096);
+                let word = leaf_word(custody, root, TEST_VA + page * 4096);
                 // SAFETY: the table owner is live for the fixture's lifetime.
                 unsafe {
                     let leaf = word.read_volatile();
@@ -13263,7 +13207,7 @@ mod guest_cow {
             if host_published {
                 break;
             }
-            let word = leaf_word(&custody, root, TEST_VA + page * 4096);
+            let word = leaf_word(custody, root, TEST_VA + page * 4096);
             // SAFETY: the table owner is live for the fixture's lifetime.
             unsafe {
                 let leaf = word.read_volatile();
@@ -13271,7 +13215,7 @@ mod guest_cow {
                 word.write_volatile((leaf & !AP) | AP_RO_EL0 | NG | COW | PRIVATE | MAY_WRITE);
             }
         }
-        let (authority, _lease, _invalidator) = prepare_foreign_cow(&custody, &child);
+        let (authority, _lease, _invalidator) = prepare_foreign_cow(custody, &child);
         drop(authority);
         if host_published {
             alias_registry().lock().retain(|alias| {
@@ -13295,7 +13239,7 @@ mod guest_cow {
         let root = child.owners.0[0].0;
         let words = unsafe {
             PrimaryTableWords::new(
-                model_owner_host(&custody, root).cast(),
+                model_owner_host(custody, root).cast(),
                 root,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
                 &Maintenance,
@@ -13317,13 +13261,13 @@ mod guest_cow {
                 // The copy window's live aliases say which frames to copy.
                 // SAFETY: both aliases name live, distinct owner pages.
                 unsafe {
-                    let from = leaf_word(&custody, root, source).read_volatile();
-                    let to = leaf_word(&custody, root, destination).read_volatile();
+                    let from = leaf_word(custody, root, source).read_volatile();
+                    let to = leaf_word(custody, root, destination).read_volatile();
                     assert_ne!(from & 1, 0);
                     assert_ne!(to & 1, 0);
                     std::ptr::copy_nonoverlapping(
-                        model_owner_host(&custody, from & PA),
-                        model_owner_host(&custody, to & PA),
+                        model_owner_host(custody, from & PA),
+                        model_owner_host(custody, to & PA),
                         4096,
                     );
                 }
@@ -13935,9 +13879,9 @@ mod guest_cow {
         };
         let _external = ExternalAliasStateRestore::capture();
         let _stub = ScopedStage2MapTestStub::enable();
-        let (mut child, pool) = forked_guest_child(&custody, ordinal, root, data);
+        let (mut child, pool) = forked_guest_child(custody, ordinal, root, data);
         child.state.cow_armed.lock().restore(Vec::new());
-        let custody = Arc::clone(&custody);
+        let custody = Arc::clone(custody);
         let mm = child.snapshot.mm.get();
         provision_guest_cow_grants(&child.state, &custody, pool, 1, 0).unwrap();
         let grant = pool.ready(mm).next().unwrap();
@@ -14418,7 +14362,6 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
         let _stub = ScopedStage2MapTestStub::enable();
         let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
         let installed = install_mm(
-            &custody,
             &transport,
             297,
             0x9a00_6100_0000,
@@ -14649,7 +14592,6 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm_with_data_len(
-        &custody,
         &transport,
         298,
         0x9a00_6200_0000,
@@ -14888,7 +14830,6 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let mut installed = install_mm(
-        &custody,
         &transport,
         299,
         0x9a00_6300_0000,
@@ -15002,18 +14943,15 @@ fn exercise_retained_import(
     use carrick_el1_linux::mm_portal::test_support::{Region, VA, admit, nodes};
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
-    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(
-        &custody,
-    )));
+    let transport = Arc::new(CarrierForeignMmTransport::with_custody(Arc::clone(custody)));
     let mut installed = install_mm(
-        &custody,
         &transport,
         297,
         0x9a00_6300_0000,
         0x9b00_6300_0000,
         *b"peer",
     );
-    let (authority, _lease, _invalidator) = prepare_foreign_cow(&custody, &installed);
+    let (authority, _lease, _invalidator) = prepare_foreign_cow(custody, &installed);
     let target =
         super::super::user_transfer::UserTransferCustody::from_transport(transport.clone(), None);
     let source_custody = Arc::new(CarrierVmCustody::new_live_fixture());
@@ -15399,7 +15337,7 @@ fn exercise_retained_import(
         )
         .unwrap();
     let root_host = global_frame_host_owner_identity_in(
-        &custody,
+        custody,
         installed.owners.0[0].0,
         installed.owners.0[0].1,
     )
@@ -15450,7 +15388,6 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::with_custody(Arc::clone(&custody));
     let installed = install_mm(
-        &custody,
         &transport,
         297,
         0x9a00_6100_0000,

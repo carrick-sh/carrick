@@ -57,7 +57,7 @@ pub(super) fn test_vm_state(
         _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
         task,
         carrier_foreign_mm_transport: std::sync::Arc::new(CarrierForeignMmTransport::with_custody(
-            std::sync::Arc::clone(&custody),
+            std::sync::Arc::clone(custody),
         )),
         carrier_mappings: None,
         mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
@@ -126,7 +126,7 @@ fn zero_guest_backing_two_mappings_with_host_gap(
     gap_pages: usize,
 ) {
     let _registry = isolated_alias_registry();
-    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(&custody);
+    let mut task = crate::trap::hvpatch_neutral_task_state_for_test(custody);
     let extent1_pages = 128;
     let extent2_pages = 128;
     let total_pages = extent1_pages + extent2_pages;
@@ -166,7 +166,7 @@ fn zero_guest_backing_two_mappings_with_host_gap(
         if gap_pages == 0 { 1 } else { 2 }
     );
 
-    let mut vm = test_vm_state(&custody, task);
+    let mut vm = test_vm_state(custody, task);
 
     unsafe {
         core::ptr::write_bytes(host1, 0x11, extent1_len);

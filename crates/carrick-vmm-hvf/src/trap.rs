@@ -1913,7 +1913,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     HvfTaskState {
         stage2: Stage2State {
-            custody: std::sync::Arc::clone(&custody),
+            custody: std::sync::Arc::clone(custody),
             mappings: TaskMappingIndex::from_region(HvfMappedRegion {
                 start: mapping_start,
                 end: mapping_start + 0x1000,

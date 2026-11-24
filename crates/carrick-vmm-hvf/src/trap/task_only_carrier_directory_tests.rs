@@ -545,7 +545,7 @@ fn prepared_task(
     custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
 ) -> HvpatchPreparedTaskAuthority {
     HvpatchPreparedTaskAuthority {
-        custody: Some(Arc::clone(&custody)),
+        custody: Some(Arc::clone(custody)),
         ..HvpatchPreparedTaskAuthority::default()
     }
 }
