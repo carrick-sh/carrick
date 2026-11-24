@@ -25,7 +25,9 @@ use carrick_el1_abi::{
 
 /// The host waits for a bucket lock by spinning, then yielding. A holder is
 /// either a host thread in a short critical section or a vCPU inside EL1,
-/// which its executor always resumes to completion.
+/// which its executor resumes to completion while the executor pool runs.
+/// After the pool stops no vCPU resumes: an IPC region's own waits
+/// (`el1_ipc::RegionWait`) then refuse instead (#2955).
 pub struct HostLockWait;
 
 /// A carrier-scoped zone (the x86 CPL0 zone in its carrier's guest RAM).
