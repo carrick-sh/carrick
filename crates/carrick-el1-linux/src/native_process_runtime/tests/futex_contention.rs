@@ -1247,14 +1247,14 @@ impl crate::dispatch::GuestDispatchFrame for ExitStatusFrame {
 fn spawn_registered_born_member<C: ProcessContext + 'static>(
     fixture: &Fixture<C>,
     make: &impl Fn(AddressContext<RootGpa>) -> C,
-    slot: SlotId,
-    cpu_id: u32,
     control: &'static ThreadControlSlot,
     stock_index: usize,
-    tid: u32,
-    serial: u64,
 ) -> (&'static CurrentTask, carrick_el1_abi::RecordId) {
     use carrick_el1_abi::{BornRecord, EntryIdentity, Lifecycle, ThreadIdentity};
+    let slot = SlotId::new((stock_index + 1) as u8);
+    let cpu_id = (stock_index + 1) as u32;
+    let tid = 42 + stock_index as u32;
+    let serial = 102 + stock_index as u64;
     let zone = fixture.zone;
     let affinity = 1u64 << cpu_id;
     zone.drive(slot, u64::from(cpu_id + 1));
@@ -1386,10 +1386,8 @@ fn closing_group_raw_exit_retires_in_ring<C, B>(
     ]));
     let control1 = &controls[0];
     let control2 = &controls[1];
-    let (task1, member1) =
-        spawn_registered_born_member(&fixture, &make, slot1, 1, control1, 0, 42, 102);
-    let (task2, member2) =
-        spawn_registered_born_member(&fixture, &make, slot2, 2, control2, 1, 43, 103);
+    let (task1, member1) = spawn_registered_born_member(&fixture, &make, control1, 0);
+    let (task2, member2) = spawn_registered_born_member(&fixture, &make, control2, 1);
     assert_eq!(fixture.page.live(), 3);
 
     struct ClosingRaceVenue<'a, F> {
@@ -1737,8 +1735,7 @@ fn concurrent_raw_exit_floor_race_becomes_process_exit<C, B>(
     let member_slot = SlotId::new(1);
 
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
-    let (task, _member) =
-        spawn_registered_born_member(&fixture, &make, member_slot, 1, control, 0, 42, 102);
+    let (task, _member) = spawn_registered_born_member(&fixture, &make, control, 0);
     assert_eq!(fixture.page.live(), 2);
     assert_eq!(
         zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
