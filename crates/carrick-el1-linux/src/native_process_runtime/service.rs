@@ -1475,31 +1475,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
-    /// The owner refused the memory a retained signal frame needs. As Linux
-    /// does when it cannot write a frame, the delivery is dropped and the
-    /// thread gets SIGSEGV; a SIGSEGV frame that cannot be written kills the
-    /// group with it. Without this the retained delivery would rerun into
-    /// the same refusal forever.
+    /// The owner refused the memory a retained signal frame needs. Mark
+    /// the retained delivery so its rerun takes the frame-failure verdict
+    /// (`force_delivery_fault`: SIGSEGV, or the group's end when the frame
+    /// was SIGSEGV's), with that path's own custody handoff, instead of
+    /// rerunning into the same refusal. A delivery teardown already removed
+    /// has nothing left to refuse.
     #[inline(never)]
     fn refuse_signal_frame_supply(&mut self) -> Result<NativeResume, NativeProcessError> {
-        let Some(retained) = self.take_pending_signal_delivery() else {
-            return Err(NativeProcessError::ServiceQuarantined(
-                NativeServiceQuarantine::SignalDeferralOutcome,
-            ));
-        };
-        let segv = carrick_signal_core::policy::Signal::SEGV;
-        if retained.sig == segv {
-            return match self.exit_with_signal(segv) {
-                Ok(_) => Ok(NativeResume::Left(None)),
-                Err(NativeFailure::GroupExitCustody) => Ok(NativeResume::NoPending),
-                Err(_) => Err(NativeProcessError::Quarantined),
-            };
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key)
+            && let Some(retained) = task
+                .native_mut()
+                .resources_mut()
+                .pending_signal_deliveries
+                .get_mut(&self.record)
+        {
+            retained.frame_refused = true;
         }
-        self.force_sigsegv_info(
-            retained.thread_blocked,
-            carrick_syscall_abi::LinuxSiginfo::kernel(segv.number()),
-        )
-        .map_err(|_| NativeProcessError::Stale)?;
         Ok(NativeResume::NoPending)
     }
 

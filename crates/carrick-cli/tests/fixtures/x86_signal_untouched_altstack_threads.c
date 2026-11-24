@@ -108,11 +108,12 @@ static void worker(void *arg) {
     long ss[3] = {alt, 0, ALT}; // ss_sp, ss_flags, ss_size
     if (sc(131, (long)ss, 0, 0, 0, 0, 0) != 0) __sync_fetch_and_add(&bad, 1);
     __sync_fetch_and_add(&started, 1);
-    // A handler delivered on a syscall return keeps that call's result:
-    // gettid answers this thread's id however its frame setup was served.
+    // A handler delivered on a syscall return keeps that call's result,
+    // however its frame setup was served: the first delivery (the one that
+    // needs the untouched page) lands on one of these two checked returns.
     while (!stop) {
         if (sc(186, 0, 0, 0, 0, 0, 0) != tids[i]) __sync_fetch_and_add(&bad, 1);
-        sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
+        if (sc(24, 0, 0, 0, 0, 0, 0) != 0) __sync_fetch_and_add(&bad, 1); // sched_yield
     }
     __sync_fetch_and_add(&done, 1);
     for (;;) sc(60, 0, 0, 0, 0, 0, 0); // exit this thread only
@@ -143,6 +144,14 @@ void _start(void) {
         sc(234, pid, tids[r % THREADS], SIGURG, 0, 0, 0); // tgkill
         if ((r & 7) == 0) sc(24, 0, 0, 0, 0, 0, 0);
     }
+    // Stop only once every thread's handler has run: order on that event,
+    // not on the burst above (pending SIGURGs coalesce).
+    for (int i = 0; i < THREADS; i++)
+        for (long spin = 0; hits[i] == 0; spin++) {
+            if (spin > 50000000) sc(231, 96, 0, 0, 0, 0, 0);
+            if ((spin & 1023) == 0) sc(234, pid, tids[i], SIGURG, 0, 0, 0);
+            sc(24, 0, 0, 0, 0, 0, 0);
+        }
     stop = 1;
     for (long spin = 0; done < THREADS; spin++) {
         if (spin > 50000000) sc(231, 94, 0, 0, 0, 0, 0);

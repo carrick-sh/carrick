@@ -1308,6 +1308,10 @@ pub(crate) struct PendingSignalDelivery {
     pub(crate) action: carrick_signal_core::policy::Action,
     pub(crate) saved_mask: carrick_signal_core::policy::SigBlockMask,
     pub(crate) thread_blocked: carrick_signal_core::policy::SigBlockMask,
+    /// The owner refused the memory this delivery's frame needs: its rerun
+    /// is the frame-failure verdict (`force_delivery_fault`), not another
+    /// frame attempt (#3004).
+    pub(crate) frame_refused: bool,
 }
 impl PendingSignalDelivery {
     pub(crate) fn new(
@@ -1326,6 +1330,7 @@ impl PendingSignalDelivery {
             action,
             saved_mask,
             thread_blocked,
+            frame_refused: false,
         }
     }
 }

@@ -91,8 +91,25 @@ where
             action,
             saved_mask,
             thread_blocked,
+            frame_refused,
             ..
         } = *retained;
+        if frame_refused {
+            // The owner refused this frame's memory (#3004): Linux cannot
+            // write the frame either, and forces SIGSEGV.
+            return force_delivery_fault(
+                task,
+                slot,
+                process,
+                frame,
+                fpstate,
+                machine,
+                SignalDeliveryFailure {
+                    original: sig,
+                    blocked: thread_blocked,
+                },
+            );
+        }
         (sig, info, action, saved_mask, thread_blocked)
     } else {
         let mut thread_blocked = SigBlockMask::blocking_all_of(
