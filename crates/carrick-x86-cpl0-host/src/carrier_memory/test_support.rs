@@ -1792,4 +1792,84 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
         "a window page is never selected as an inventoried frame (a \
          `MappingGone` here reruns the fork forever)"
     );
+    // A private row over a window, or one naming no parent leaf, is a
+    // broken invariant; a row over ordinary storage is not a window.
+    assert!(
+        memory
+            .select_inherited_window(
+                contexts[0],
+                carrick_el1_abi::PortalForkCustody::Frame {
+                    va: 0x4000,
+                    ipa: base,
+                    len: PAGE,
+                    shared: false,
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        memory
+            .select_inherited_window(
+                contexts[0],
+                carrick_el1_abi::PortalForkCustody::Frame {
+                    va: 0x5000,
+                    ipa: base,
+                    len: PAGE,
+                    shared: true,
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        memory
+            .select_inherited_window(
+                contexts[0],
+                carrick_el1_abi::PortalForkCustody::Frame {
+                    va: 0x4000,
+                    ipa: 0x2000,
+                    len: PAGE,
+                    shared: true,
+                },
+            )
+            .unwrap()
+            .is_none()
+    );
+    // The parent's window leaf is a window edge.
+    let edge = memory
+        .select_inherited_window(contexts[0], selection)
+        .unwrap()
+        .unwrap();
+    assert!(
+        memory.attach_inherited_window(contexts[0], &edge).is_err(),
+        "the parent is never its own child"
+    );
+    memory.attach_inherited_window(contexts[1], &edge).unwrap();
+    let slot = &memory.slots[&window.slot];
+    assert_eq!(slot.alias_count, 2, "parent and child each map the window");
+    assert_eq!(
+        slot.allowed,
+        vec![contexts[0].mm.raw(), contexts[1].mm.raw()]
+    );
+    assert!(
+        memory.attach_inherited_window(contexts[1], &edge).is_err(),
+        "one child leaf is one alias"
+    );
+    // The child exits: it leaves the slot, which stays for the parent.
+    let absence = carrick_hal::fork_stock::SlotAbsence::scan(
+        carrick_el1_abi::ReservationMm::new(child_mm.raw()).unwrap(),
+        [0],
+    )
+    .unwrap();
+    let retired = memory.retire_child(&absence, &*projection).unwrap();
+    assert_eq!(
+        retired,
+        RetiredChild {
+            aliases: 1,
+            revoked_slots: 0
+        }
+    );
+    let slot = memory.record(window).unwrap();
+    assert_eq!(slot.alias_count, 1);
+    assert_eq!(slot.allowed, vec![contexts[0].mm.raw()]);
+    assert!(!memory.is_quarantined());
 }
