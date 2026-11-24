@@ -237,7 +237,6 @@ where
             }
         });
         let mut deferred = None;
-        let mut supply = None;
         let mut invariant_failure = false;
         let setup = machine.backend().setup_signal_frame(
             frame,
@@ -267,16 +266,18 @@ where
                     )
                 }
                 // A valid stack page Linux would make resident on this
-                // write (an untouched alternate stack, #3004): prepare the
-                // range below, outside the frame builder.
+                // write (an untouched alternate stack, #3004): the range is
+                // prepared below, outside the frame builder. The only
+                // `NotYet` that records no deferral, so the delivery frame
+                // (twice on the EL1 chain) holds no second answer.
                 Err(NativeProcessError::NeedsSupply) => {
-                    let request = carrick_core::user_copy::GuestCopyRequest {
-                        address: va,
-                        len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
-                        access: carrick_guest_arch::Access::Write,
-                    };
-                    supply = Some(request);
-                    carrick_core::user_copy::CopyOutcome::NotYet(request)
+                    carrick_core::user_copy::CopyOutcome::NotYet(
+                        carrick_core::user_copy::GuestCopyRequest {
+                            address: va,
+                            len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                            access: carrick_guest_arch::Access::Write,
+                        },
+                    )
                 }
                 Err(NativeProcessError::Stale | NativeProcessError::Quarantined) => {
                     invariant_failure = true;
@@ -292,10 +293,11 @@ where
             Ok(SignalFrameSetup::Installed(published_sp)) => {
                 machine.published_stack(published_sp);
             }
-            Ok(SignalFrameSetup::NotYet(_)) => {
-                let deferral = match (deferred, supply) {
-                    (Some(deferral), None) => deferral,
-                    (None, Some(request)) => match process.prepare_signal_frame(request) {
+            Ok(SignalFrameSetup::NotYet(request)) => {
+                let deferral = match deferred {
+                    Some(deferral) => deferral,
+                    // An unbacked frame page: prepare the stopped range.
+                    None => match process.prepare_signal_frame(request) {
                         Ok(deferral) => deferral,
                         Err(
                             NativeProcessError::Stale
@@ -321,7 +323,6 @@ where
                             );
                         }
                     },
-                    _ => return Some(CompletionRoute::InvalidCompletion),
                 };
                 machine.sync_parked_context(frame, process.resume_context_mut());
                 match process.retain_and_defer_signal_delivery(
