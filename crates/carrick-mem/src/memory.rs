@@ -136,15 +136,6 @@ const fn mailbox_offset(offset: usize) -> u64 {
 /// clock policy, asynchronous exit handling, and mapping protection are wired.
 pub const LINUX_EL0_CLOCK_STUB_BASE: u64 = el1_clock::STUB_BASE;
 pub const LINUX_EL0_CLOCK_STUB_SIZE: u64 = el1_clock::STUB_SIZE;
-// The Linux layout offers an external anonymous hint only at or above the
-// arena's end (`carrick_personality_linux::mm`), so these low carrier
-// apertures must stay below the arena.
-const _: () = {
-    assert!(LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE <= LINUX_MMAP_BASE);
-    assert!(crate::vdso::LINUX_VDSO_BASE + crate::vdso::LINUX_VDSO_SIZE <= LINUX_MMAP_BASE);
-    assert!(crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE <= LINUX_MMAP_BASE);
-    assert!(carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_REGION_SIZE <= LINUX_MMAP_BASE);
-};
 /// Reserved identity-page word; zero means no EL1 clock admission.
 pub const IDENTITY_OFF_CLOCK_GATE: u64 = el1_clock::CLOCK_GATE_OFFSET;
 /// Generated handler phases used to normalize a stopped clock transport.
@@ -10426,3 +10417,56 @@ mod layout_manifest {
         field!(Aarch64SyscallMailbox, portal_mm_generation, u64, 248, 8, 8);
     }
 }
+
+// The ring venue offers an external anonymous hint only at or above
+// `LINUX_HIGH_VA_THRESHOLD` (`carrick_personality_linux::mm`), on both
+// ISAs: every carrier window, on AArch64 and x86 CPL0 alike, must end at
+// or below it (Rosetta, the one window above, is refused by name).
+const _: () = {
+    const fn below(base: u64, size: u64) -> bool {
+        base + size <= LINUX_HIGH_VA_THRESHOLD
+    }
+    assert!(below(LINUX_EL0_CLOCK_STUB_BASE, LINUX_EL0_CLOCK_STUB_SIZE));
+    assert!(below(
+        crate::vdso::LINUX_VDSO_BASE,
+        crate::vdso::LINUX_VDSO_SIZE
+    ));
+    assert!(below(
+        crate::vdso::LINUX_VVAR_BASE,
+        crate::vdso::LINUX_VVAR_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_REGION_BASE,
+        carrick_el1_abi::EL1_REGION_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_IPC_BASE,
+        carrick_el1_abi::EL1_IPC_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::EL1_SERVICE_COPY_BASE,
+        carrick_el1_abi::EL1_SERVICE_COPY_SIZE
+    ));
+    assert!(below(LINUX_KERNEL_REGION_BASE, LINUX_KERNEL_REGION_SIZE));
+    assert!(below(LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE));
+    assert!(below(
+        LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        LINUX_SIGRETURN_TRAMPOLINE_SIZE
+    ));
+    assert!(below(LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE));
+    assert!(below(
+        LINUX_PRIVATE_OVERLAY_BASE,
+        LINUX_PRIVATE_OVERLAY_SIZE
+    ));
+    assert!(below(
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE
+    ));
+    assert!(LINUX_HVPATCH_RESERVED_END <= LINUX_HIGH_VA_THRESHOLD);
+    assert!(LINUX_STACK_TOP <= LINUX_HIGH_VA_THRESHOLD);
+    assert!(LINUX_ROSETTA_VA_BASE >= LINUX_HIGH_VA_THRESHOLD);
+};

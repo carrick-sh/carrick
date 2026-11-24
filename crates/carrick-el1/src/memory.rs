@@ -348,22 +348,31 @@ pub fn decide_reservation_syscall_for_origin<
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
                 // Linux places a free hint at the address asked for
-                // (mmap(2)), inside the layout or in a free carrier aperture
-                // outside it (the token); a descendant relocates any other.
-                // A run root serves the token exactly and keeps its host
-                // venue's VMA checks for every other outside-layout hint.
+                // (mmap(2)): inside the layout, or in an aperture free to the
+                // ring (the token). Any other hint is advisory. A ring-only
+                // MM relocates it into its layout; a run root whose geometry
+                // keeps a host venue forwards it to that venue's VMA checks.
                 None => {
                     let len = frame.arguments()[1];
-                    let external = model.external_anonymous_hint(placement, len, G::USER_VA_END);
-                    match service_origin {
-                        ServiceOrigin::Descendant => model.mmap_with_advisory_hint(
+                    let external = model.external_anonymous_hint(
+                        placement,
+                        len,
+                        G::USER_VA_END,
+                        AnonymousHintVenue::Ring,
+                    );
+                    let venue = match service_origin {
+                        ServiceOrigin::Descendant => AnonymousHintVenue::Ring,
+                        ServiceOrigin::Initial => G::ROOT_HINT_VENUE,
+                    };
+                    match venue {
+                        AnonymousHintVenue::Ring => model.mmap_with_advisory_hint(
                             placement,
                             len,
                             prot,
                             AnonymousHintVenue::Ring,
                             external,
                         ),
-                        ServiceOrigin::Initial => {
+                        AnonymousHintVenue::Host => {
                             match external.map(|hint| model.prepare_external_anonymous(hint, prot))
                             {
                                 Some(Err(
