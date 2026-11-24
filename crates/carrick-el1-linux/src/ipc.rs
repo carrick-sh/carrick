@@ -3848,16 +3848,14 @@ mod tests {
         release: Option<Box<dyn FnOnce() + 'a>>,
     }
     impl ThreadCpu for ReleaseDuringSave<'_> {
-        fn save(
-            &mut self,
-            frame: &TrapFrame,
-            ctx: &mut carrick_el1_abi::Aarch64ParkedContext,
-            exit: crate::sched::CpuExitCause,
-        ) {
-            self.cpu.save(frame, ctx, exit);
+        fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+            self.cpu.save(frame, ctx);
             if let Some(release) = self.release.take() {
                 release();
             }
+        }
+        fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+            self.cpu.publish_user_sp(sp);
         }
         fn load(&mut self, f: &mut TrapFrame, c: &carrick_el1_abi::Aarch64ParkedContext) {
             self.cpu.load(f, c);

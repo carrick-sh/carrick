@@ -281,12 +281,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
             drop(entry);
             let mut peer_service = fixture.process_service();
             let mut peer_context = initial;
-            crate::sched::ThreadCpu::save(
-                &mut cpu,
-                &frame,
-                &mut peer_context,
-                crate::sched::CpuExitCause::Svc,
-            );
+            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut peer_context);
             let mut checkpoints = 0;
             assert_eq!(
                 crate::dispatch::final_user_return(
@@ -396,12 +391,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
                 carrick_el1_abi::Action::Served,
                 |frame| {
                     let mut checkpoint_context = resumed_context;
-                    crate::sched::ThreadCpu::save(
-                        &mut cpu,
-                        frame,
-                        &mut checkpoint_context,
-                        crate::sched::CpuExitCause::Svc,
-                    );
+                    crate::sched::ThreadCpu::save(&mut cpu, frame, &mut checkpoint_context);
                     let mut entry = runtime
                         .enter_registered(
                             registry(),
@@ -666,12 +656,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
     let run_checkpoint = |service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
                           frame: &mut carrick_el1_abi::TrapFrame| {
         let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-        crate::sched::ThreadCpu::save(
-            &mut crate::sched::FakeCpu::default(),
-            frame,
-            &mut saved,
-            crate::sched::CpuExitCause::Svc,
-        );
+        crate::sched::ThreadCpu::save(&mut crate::sched::FakeCpu::default(), frame, &mut saved);
         saved.native.sp_el0 = sp_top.raw();
         crate::dispatch::arm_signal_user_return_entry(
             source,
@@ -1131,12 +1116,7 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
             ..Default::default()
         };
         let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-        crate::sched::ThreadCpu::save(
-            &mut crate::sched::FakeCpu::default(),
-            &frame,
-            &mut saved,
-            crate::sched::CpuExitCause::Svc,
-        );
+        crate::sched::ThreadCpu::save(&mut crate::sched::FakeCpu::default(), &frame, &mut saved);
         saved.native.sp_el0 = bad_sp.raw();
         let action = crate::dispatch::arm_signal_user_return_entry(
             source,
@@ -1594,7 +1574,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                         &mut crate::sched::FakeCpu::default(),
                         &map_frame,
                         &mut peer_saved,
-                        crate::sched::CpuExitCause::Svc,
                     );
                     peer_saved.native.sp_el0 = peer_sp_top.raw();
                     assert_eq!(
@@ -1651,7 +1630,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                     &mut crate::sched::FakeCpu::default(),
                                     &unmap_frame,
                                     &mut peer_saved,
-                                    crate::sched::CpuExitCause::Svc,
                                 );
                                 peer_saved.native.sp_el0 = peer_sp_top.raw();
                                 assert_eq!(
@@ -1807,7 +1785,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     &mut crate::sched::FakeCpu::default(),
                     &frame,
                     &mut saved,
-                    crate::sched::CpuExitCause::Svc,
                 );
                 saved.native.sp_el0 = sp_top.raw();
                 let action = crate::dispatch::arm_signal_user_return_entry(
@@ -2378,12 +2355,7 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
     frame.x[8] = 135; // SYS_rt_sigprocmask
 
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-    crate::sched::ThreadCpu::save(
-        &mut cpu,
-        &frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
         &mut frame,
@@ -2715,10 +2687,14 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
         ..Default::default()
     };
     cpu.regs.sp_el0 = sp_top.raw();
+    // The EL0 IRQ hook stores the interrupted instruction as a resume point.
     let mut frame = carrick_el1_abi::TrapFrame {
         esr: 0,
         elr: IRQ_PC,
         slot: u64::from(env.fixture.slot.raw()),
+        syscall_position: carrick_guest_arch::SavedSyscallPcWord::new(
+            carrick_sched_core::SavedSyscallPc::AtSyscall,
+        ),
         ..Default::default()
     };
     let task_slice = core::slice::from_ref(&env.fixture.task);
@@ -2920,17 +2896,16 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
 
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
+    // The handler's restorer traps: the syscall hook stores "after its SVC".
     frame.esr = 0x5600_0000;
     frame.elr = 0x71_0004;
+    frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(
+        carrick_sched_core::SavedSyscallPc::AfterSyscall,
+    );
     frame.x[8] = 139; // SYS_rt_sigreturn
 
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-    crate::sched::ThreadCpu::save(
-        &mut cpu,
-        &frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
     let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
         &mut frame,
         &counters,

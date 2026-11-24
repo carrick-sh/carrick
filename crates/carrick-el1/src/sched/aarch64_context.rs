@@ -12,6 +12,14 @@ pub(crate) fn load_frame(frame: &mut TrapFrame, ctx: &ThreadCtx) {
     frame.elr = ctx.pc;
     frame.spsr = ctx.pstate;
 }
+/// The frame's position travels with its PC into the parked context (#2900).
+pub(crate) fn save_position(frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+    ctx.replace_saved_pc_word(ctx.native.pc, frame.syscall_position);
+}
+/// A frame loaded from a parked context sits where the context says.
+pub(crate) fn load_position(frame: &mut TrapFrame, ctx: &carrick_el1_abi::Aarch64ParkedContext) {
+    frame.syscall_position = ctx.saved_syscall_pc_word();
+}
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 core::arch::global_asm!(

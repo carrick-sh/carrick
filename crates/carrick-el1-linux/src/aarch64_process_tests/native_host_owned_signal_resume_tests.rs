@@ -951,13 +951,11 @@ struct HostResumeCpu<'a> {
     deferred_return_observed: bool,
 }
 impl crate::sched::ThreadCpu for HostResumeCpu<'_> {
-    fn save(
-        &mut self,
-        f: &carrick_el1_abi::TrapFrame,
-        c: &mut Aarch64ParkedContext,
-        exit: crate::sched::CpuExitCause,
-    ) {
-        self.inner.save(f, c, exit);
+    fn save(&mut self, f: &carrick_el1_abi::TrapFrame, c: &mut Aarch64ParkedContext) {
+        self.inner.save(f, c);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.inner.publish_user_sp(sp);
     }
     fn load(&mut self, f: &mut carrick_el1_abi::TrapFrame, c: &Aarch64ParkedContext) {
         self.inner.load(f, c);

@@ -78,8 +78,11 @@ impl carrick_el1_linux::sched::ThreadCpu for NoCpu {
         &mut self,
         _: &carrick_el1_abi::TrapFrame,
         _: &mut carrick_el1_abi::Aarch64ParkedContext,
-        _: carrick_el1_linux::sched::CpuExitCause,
     ) {
+        panic!("no CPU venue");
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        let _ = sp;
         panic!("no CPU venue");
     }
     fn load(

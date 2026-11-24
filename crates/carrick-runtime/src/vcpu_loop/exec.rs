@@ -7529,8 +7529,11 @@ pub(crate) mod tests {
                 &mut self,
                 _: &carrick_el1_abi::TrapFrame,
                 _: &mut carrick_el1_abi::Aarch64ParkedContext,
-                _: carrick_el1::substrate::sched::CpuExitCause,
             ) {
+                panic!("no scheduler venue")
+            }
+            fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+                let _ = sp;
                 panic!("no scheduler venue")
             }
             fn load(

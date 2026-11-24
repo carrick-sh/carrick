@@ -4988,17 +4988,21 @@ const MAILBOX_HANDLER_SIZE: usize = 0x220;
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
 
 const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
+/// The hooks store each entry's syscall position in its frame (#2900):
+/// `xzr` (after the `SVC`) or the resume-point word.
+const FRAME_POSITION_OFFSET: u64 = carrick_el1_abi::TRAP_FRAME_POSITION_OFFSET;
+const FRAME_POSITION_AT_SYSCALL: u16 = carrick_el1_abi::TRAP_FRAME_AT_SYSCALL_WORD;
 const _: () = assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET);
 /// The current-EL synchronous handler (exception fixups, stack-guard check,
 /// fail-loud report): every vector image's 0x200 slot branches here, in the
 /// last 0x100 bytes before the EL1 hook. The clock transport ends below it.
 const EL1_CUR_EL_SYNC_HANDLER_OFFSET: usize = EL1_VECTOR_HOOK_OFFSET - EL1_CUR_EL_SYNC_HANDLER_SIZE;
 const EL1_CUR_EL_SYNC_HANDLER_SIZE: usize = 0x100;
-// The handler and hooks encode these with `sub/add sp, #32`, `sub #0x120` and
+// The handler and hooks encode these with `sub/add sp, #32`, `sub #0x130` and
 // movz/movk of bits 16..47: keep the encodings tied to their ABI constants.
 const _: () = {
     assert!(carrick_el1_abi::EL1_FAULT_VECTOR_SCRATCH == 32);
-    assert!(carrick_el1_abi::TRAP_FRAME_ALLOCATION == 0x120);
+    assert!(carrick_el1_abi::TRAP_FRAME_ALLOCATION == 0x130);
     assert!(carrick_el1_abi::EL1_STACKS_BASE & 0xFFFF == 0);
     assert!(carrick_el1_abi::EL1_STACKS_BASE < 1 << 48);
     assert!(carrick_el1_abi::EL1_STACKS_SIZE & 0xFFFF == 0);
@@ -5230,7 +5234,7 @@ fn write_el1_hook(
     // 3. Compute per-vCPU stack top and TrapFrame pointer in x16:
     //    stack_top = EL1_STACKS_BASE + STRIDE + (slot << STRIDE_SHIFT): the
     //    top of the slot's usable stack, above its guard (#369)
-    //    frame_ptr = stack_top - 0x120 (size_of::<TrapFrame>() = 280, aligned to 288 = 0x120)
+    //    frame_ptr = stack_top - TRAP_FRAME_ALLOCATION (0x130)
     let stack_first_top = carrick_el1_abi::stack_slot_top(0);
     emit(
         bytes,
@@ -5253,7 +5257,7 @@ fn write_el1_hook(
         &mut cursor,
         0x8B11_0210 | (carrick_el1_abi::EL1_STACK_STRIDE_SHIFT << 10),
     );
-    emit(bytes, &mut cursor, 0xD104_8210); // sub x16, x16, #0x120 (TrapFrame pointer)
+    emit(bytes, &mut cursor, 0xD104_C210); // sub x16, x16, #0x130 (TrapFrame pointer)
 
     // 4. Save x0..x15, x18..x30 to TrapFrame [x16, #(r * 8)]
     for r in 0..=15 {
@@ -5289,6 +5293,26 @@ fn write_el1_hook(
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264)); // esr at offset 264
             emit(bytes, &mut cursor, AARCH64_MRS_FAR_EL1_X17_OPCODE); // mrs x17, far_el1
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280)); // far at offset 280
+            if entry == HookEntry::Syscall {
+                // An SVC's ELR is after its instruction (#2900).
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(31, 16, FRAME_POSITION_OFFSET),
+                );
+            } else {
+                // A fault resumes at the faulting instruction.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_movz_xn(17, FRAME_POSITION_AT_SYSCALL, 0),
+                );
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(17, 16, FRAME_POSITION_OFFSET),
+                );
+            }
         }
         // An interrupt frame: syndrome 0 (an SVC's never is).
         HookEntry::Irq | HookEntry::SignalCheck => {
@@ -5343,9 +5367,26 @@ fn write_el1_hook(
                     enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
                 );
                 emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280));
+                // The host checkpoints a forwarded SVC at its own return.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(31, 16, FRAME_POSITION_OFFSET),
+                );
             } else {
                 emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
                 emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
+                // An interrupt resumes at the interrupted instruction.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_movz_xn(17, FRAME_POSITION_AT_SYSCALL, 0),
+                );
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(17, 16, FRAME_POSITION_OFFSET),
+                );
             }
         }
     }
@@ -5474,6 +5515,17 @@ fn write_el1_hook(
     let reenters_scheduler = scheduler_irq_entry.is_some() || entry == HookEntry::Irq;
     if reenters_scheduler {
         emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
+        // The served frame's ELR is its next instruction: a resume point.
+        emit(
+            bytes,
+            &mut cursor,
+            enc_movz_xn(2, FRAME_POSITION_AT_SYSCALL, 0),
+        );
+        emit(
+            bytes,
+            &mut cursor,
+            enc_str_xt_xn(2, 16, FRAME_POSITION_OFFSET),
+        );
     }
     let late_work_branch = cursor;
     emit(bytes, &mut cursor, 0); // b scheduler IRQ entry or forward target
@@ -8934,9 +8986,49 @@ mod syscall_mailbox_tests {
             "late work must become an IRQ frame before scheduler re-entry"
         );
         assert_eq!(
-            branch_target(&words, pending_load + 6),
+            words[pending_load + 6..pending_load + 8],
+            [
+                enc_movz_xn(2, FRAME_POSITION_AT_SYSCALL, 0),
+                enc_str_xt_xn(2, 16, FRAME_POSITION_OFFSET),
+            ],
+            "the recast frame's ELR is a resume point, never after an SVC (#2900)"
+        );
+        assert_eq!(
+            branch_target(&words, pending_load + 8),
             irq_frame_entry,
             "late work bypassed the scheduler IRQ ownership boundary"
+        );
+    }
+
+    /// Each EL1 hook stores its entry's syscall position in the frame
+    /// (#2900): after the `SVC` for a syscall and a host signal checkpoint,
+    /// a resume point for an interrupt and a fault.
+    #[test]
+    fn every_el1_hook_stores_its_entry_syscall_position() {
+        let bytes = el1_vectors_bytes_mailbox_irq(false, false, true, El1IrqMode::Gic);
+        let words = |range: core::ops::Range<usize>| -> Vec<u32> {
+            bytes[range]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+                .collect()
+        };
+        let after = enc_str_xt_xn(31, 16, FRAME_POSITION_OFFSET);
+        let at = [
+            enc_movz_xn(17, FRAME_POSITION_AT_SYSCALL, 0),
+            enc_str_xt_xn(17, 16, FRAME_POSITION_OFFSET),
+        ];
+        let stores_at = |hook: &[u32]| hook.windows(2).any(|pair| pair == at);
+        let syscall = words(EL1_VECTOR_HOOK_OFFSET..EL0_IRQ_HOOK_OFFSET);
+        let irq = words(EL0_IRQ_HOOK_OFFSET..EL0_SIGNAL_HOOK_OFFSET);
+        let signal = words(EL0_SIGNAL_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET);
+        let fault = words(EL0_FAULT_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET + 0x800);
+        assert!(syscall.contains(&after) && !stores_at(&syscall));
+        assert!(signal.contains(&after) && !stores_at(&signal));
+        assert!(stores_at(&irq) && !irq.contains(&after));
+        assert!(stores_at(&fault) && !fault.contains(&after));
+        assert_eq!(
+            FRAME_POSITION_OFFSET,
+            core::mem::offset_of!(carrick_el1_abi::TrapFrame, syscall_position) as u64
         );
     }
 

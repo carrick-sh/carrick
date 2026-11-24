@@ -664,11 +664,7 @@ impl<
         }
         let zone = self.zone.as_mut()?;
         let mut scratch = Aarch64ParkedContext::ZERO;
-        zone.cpu.save(
-            self.frame.arm_frame()?,
-            &mut scratch,
-            carrick_el1::substrate::sched::CpuExitCause::Svc,
-        );
+        zone.cpu.save(self.frame.arm_frame()?, &mut scratch);
         Some(UserVa::new(scratch.native.sp_el0))
     }
     fn affinity(&self) -> Option<u64> {
@@ -829,8 +825,7 @@ impl<
                 super::dispatch::NativeInvariant::MissingNativeFrame,
             );
         };
-        zone.cpu
-            .save(frame, ctx, carrick_el1::substrate::sched::CpuExitCause::Svc);
+        zone.cpu.save(frame, ctx);
         ctx.native.x[0] = context.result.raw() as u64;
         ctx.native.sp_el0 = context.stack.raw();
         if let Some(tls) = context.tls {
