@@ -1287,9 +1287,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         if let Some(hook) = self.loaded_pre_entry_hook.clone() {
             hook(need_resched, &self.idle_kick);
         }
-        if self.reschedule(task, need_resched)? == Reschedule::Preempt {
-            M::disarm_run_kick(&self.idle_kick);
-            return Ok(ExecutorExit::Preempted);
+        // Disarm on every way out that does not enter the guest, the error
+        // included (the vCPU still revokes its publication before reuse).
+        match self.reschedule(task, need_resched) {
+            Ok(Reschedule::Continue) => {}
+            decision => {
+                M::disarm_run_kick(&self.idle_kick);
+                decision?;
+                return Ok(ExecutorExit::Preempted);
+            }
         }
         let stopped = self.physical.cpu_mut().run_loaded(task);
         M::disarm_run_kick(&self.idle_kick);

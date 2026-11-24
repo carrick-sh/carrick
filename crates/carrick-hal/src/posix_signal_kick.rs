@@ -15,8 +15,34 @@ use std::sync::{
 struct RunExitByte(*mut u8);
 
 // SAFETY: the mapped KVM byte is installed and removed under the run-kick
-// mutex. Its owner does not recycle the vCPU until after removal.
+// mutex. Its owner revokes its publication before the mapping is recycled or
+// unmapped (`arm_run`'s contract, upheld through `RunPublication`).
 unsafe impl Send for RunExitByte {}
+
+/// One run byte that [`PosixSignalKick::arm_run`] published into a thread's
+/// kick window. The byte's owner keeps this beside the mapping and revokes it
+/// before the mapping is recycled or unmapped, so a window can never hold a
+/// byte that is gone, whatever path (error, unwind, recycle) ended the run.
+#[must_use = "the owner of the byte must revoke the publication before the byte goes away"]
+pub struct RunPublication {
+    window: RunWindow,
+    byte: RunExitByte,
+}
+
+impl RunPublication {
+    /// Withdraw the byte from its window, and clear it, if the window still
+    /// holds it. A window since disarmed, or re-armed with another run's
+    /// byte, is left as it is.
+    pub fn revoke(&self) {
+        let mut armed = lock_window(&self.window);
+        if armed.is_some_and(|byte| std::ptr::eq(byte.0, self.byte.0)) {
+            *armed = None;
+            // SAFETY: `arm_run`'s contract keeps the byte mapped until this
+            // publication is revoked; the window lock excludes kicks.
+            unsafe { AtomicU8::from_ptr(self.byte.0).store(0, Ordering::SeqCst) };
+        }
+    }
+}
 
 /// Resolves the signal number to use for `SIG`.
 /// When `SIG == 0`, dynamically resolves `libc::SIGRTMIN()` on Linux.
@@ -188,12 +214,22 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
     /// A kick after this point survives even if its signal precedes KVM_RUN.
     ///
     /// The byte is shared with kicks from other threads, so it is taken only
-    /// as an atomic. The caller keeps it mapped until [`Self::disarm_run`].
-    pub fn arm_run(&self, immediate_exit: &AtomicU8) {
+    /// as an atomic.
+    ///
+    /// # Safety
+    /// `immediate_exit` must stay mapped until the returned publication is
+    /// revoked ([`RunPublication::revoke`]); [`Self::disarm_run`] alone does
+    /// not end that duty, because a failed or unwound run may never reach it.
+    pub unsafe fn arm_run(&self, immediate_exit: &AtomicU8) -> RunPublication {
         let mut armed = lock_window(&self.run_exit);
         // The window lock excludes concurrent kicks while it is cleared.
         immediate_exit.store(0, Ordering::SeqCst);
-        *armed = Some(RunExitByte(immediate_exit.as_ptr()));
+        let byte = RunExitByte(immediate_exit.as_ptr());
+        *armed = Some(byte);
+        RunPublication {
+            window: Arc::clone(&self.run_exit),
+            byte,
+        }
     }
 
     /// Revoke the mapped-byte publication after KVM_RUN returns or entry is cancelled.
@@ -255,7 +291,8 @@ mod tests {
             let other_handle = PosixSignalKick::<0>::for_current_thread();
             handle_tx.send(other_handle).unwrap();
             let first = AtomicU8::new(0);
-            armed_handle.arm_run(&first);
+            // SAFETY: `first` outlives the publication, revoked below.
+            let publication = unsafe { armed_handle.arm_run(&first) };
             armed_handle.disarm_run();
             // The kick lands here, between runs.
             seen_tx.send(()).unwrap();
@@ -269,6 +306,7 @@ mod tests {
             step_rx.recv().unwrap();
             let live = run.exit_requested();
             drop(run);
+            publication.revoke();
             (first.into_inner(), stale, live, second)
         });
         let handle = handle_rx.recv().unwrap();
@@ -291,7 +329,8 @@ mod tests {
     fn a_caller_armed_run_keeps_its_owner() {
         let handle = PosixSignalKick::<0>::for_current_thread();
         let byte = AtomicU8::new(0);
-        handle.arm_run(&byte);
+        // SAFETY: `byte` outlives the publication, revoked below.
+        let publication = unsafe { handle.arm_run(&byte) };
         std::thread::scope(|scope| {
             scope.spawn(|| handle.kick()).join().unwrap();
         });
@@ -302,6 +341,29 @@ mod tests {
         assert_eq!(handle.fixture_run_exit_byte(), Some(1));
         handle.disarm_run();
         assert_eq!(handle.fixture_run_exit_byte(), None);
+        publication.revoke();
         assert_eq!(byte.into_inner(), 0);
+    }
+
+    /// A run that ends without reaching `disarm_run` (an error or an
+    /// unwind) leaves its byte published until its owner revokes it; the
+    /// revocation withdraws it, so a later kick writes nothing.
+    #[test]
+    fn revoking_a_publication_withdraws_a_byte_left_armed() {
+        let handle = PosixSignalKick::<0>::for_current_thread();
+        let byte = AtomicU8::new(0);
+        // SAFETY: `byte` outlives the publication, revoked below.
+        let publication = unsafe { handle.arm_run(&byte) };
+        assert_eq!(handle.fixture_run_exit_byte(), Some(0));
+        publication.revoke();
+        assert_eq!(handle.fixture_run_exit_byte(), None);
+        // A window re-armed with another byte is not the revoker's to clear.
+        let other = AtomicU8::new(0);
+        // SAFETY: `other` outlives the publication, revoked below.
+        let current = unsafe { handle.arm_run(&other) };
+        publication.revoke();
+        assert_eq!(handle.fixture_run_exit_byte(), Some(0));
+        current.revoke();
+        assert_eq!(handle.fixture_run_exit_byte(), None);
     }
 }

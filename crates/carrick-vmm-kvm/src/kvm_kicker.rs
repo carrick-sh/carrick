@@ -50,7 +50,8 @@ mod tests {
     fn armed_run_kick_survives_signal_before_kvm_run() {
         let handle = KvmKickHandle::for_current_thread();
         let immediate_exit = std::sync::atomic::AtomicU8::new(0);
-        handle.arm_run(&immediate_exit);
+        // SAFETY: `immediate_exit` outlives the publication, revoked below.
+        let publication = unsafe { handle.arm_run(&immediate_exit) };
         std::thread::scope(|scope| {
             scope.spawn(|| handle.kick()).join().expect("kick thread");
         });
@@ -65,6 +66,7 @@ mod tests {
             0,
             "the next run must not inherit the prior kick"
         );
+        publication.revoke();
     }
 
     /// A pure-data stand-in for a real `KvmKickHandle`: it records nothing and
