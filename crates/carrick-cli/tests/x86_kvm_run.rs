@@ -919,6 +919,70 @@ fn mounted_static_x86_exec_child_threads_rerun_contended_mapping_edits() {
     );
 }
 
+/// `close_range` in the run root and in a fork child (#2904: a counted
+/// ENOSYS for both). `x86_close_range.c` opens two pipes and prints each
+/// call's return value with `F_GETFD` of its four fds after it: the EINVAL
+/// shapes, `CLOSE_RANGE_CLOEXEC`, a range past the table,
+/// `CLOSE_RANGE_UNSHARE`, an empty range, and a range holding a host file
+/// between ring pipe ends. The root then runs a thread sharing its table
+/// (`CLONE_FILES`): its plain `close_range` closes for both threads, and its
+/// `CLOSE_RANGE_UNSHARE` must never close the root's descriptor. The ring
+/// has no per-thread table yet, so that one call stays unrouted (-38,
+/// nothing closed) until #2930; every other line must match Linux. Last, a
+/// fork child's leader raw-exits beside its one worker thread, whose
+/// `CLOSE_RANGE_UNSHARE` is then a plain range (#2949 review P0-1: the
+/// leader's credential row outlives it, the live count does not). Then a
+/// fork child's plain `close_range` over a host file it holds a record
+/// lock on (#2949 review P0-4): Linux closes it, and a second process's
+/// lock then succeeds. An x86 fork child's record locks are the ring's, so
+/// the range owes no host close effect and must match Linux exactly.
+#[test]
+fn mounted_static_x86_close_range_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("close-range");
+    compile_assembly_with_flags(
+        "x86_close_range.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    // The fixture makes `cr_work` in its working directory.
+    let native = Command::new(&elf)
+        .current_dir(dir.path())
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native close-range oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, "close-range", false);
+    let native_out = String::from_utf8_lossy(&native.stdout);
+    let shared_native = "t shared=0 unshare=0 own=-9 root=0 -9\n";
+    let effects_native = "e lock=0 range=0 fd=-9 peer=0\n";
+    for line in [shared_native, effects_native] {
+        assert!(native_out.contains(line), "native oracle: {native_out}");
+    }
+    // The thread's UNSHARE needs a table published for it alone (#2930):
+    // unrouted, it must leave the shared table as it was.
+    let shared_unrouted = "t shared=0 unshare=-38 own=0 root=0 -9\n";
+    let expected_unrouted = native_out.replace(shared_native, shared_unrouted);
+    let guest_out = String::from_utf8_lossy(&guest.stdout);
+    assert!(
+        guest_out == native_out || guest_out == expected_unrouted,
+        "c is the fork child, r the root, t the root's CLONE_FILES thread, l a \
+         lone worker, e the record-lock child; each \
+         c/r line is a call's return value, then F_GETFD of the four fds (-9 \
+         EBADF, 1 FD_CLOEXEC).\n  left: {guest_out:?}\n right: {native_out:?}\nStderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(guest.status.code(), native.status.code());
+}
+
 /// #2832 record B: the run root and its thread sleep. The sleep family
 /// declined for the run root, leaving the call to a host continuation the
 /// x86 crossing set does not carry, so every root `nanosleep` and
@@ -3480,7 +3544,7 @@ enum ChildCrossingGapKind {
 /// entry is the live ceiling. Lowering is automatic: the witness fails while
 /// the table is shorter than the ceiling, so the same change that serves a
 /// crossing removes its row and lowers the ceiling.
-const CHILD_CROSSING_GAP_CEILING: usize = 30;
+const CHILD_CROSSING_GAP_CEILING: usize = 29;
 const CHILD_CROSSING_GAP_ADMISSIONS: &[(usize, IssueNumber, &str)] = &[(
     CHILD_CROSSING_GAP_CEILING,
     IssueNumber(2581),

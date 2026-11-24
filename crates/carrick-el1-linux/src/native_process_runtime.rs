@@ -9854,6 +9854,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn owns_descriptor_namespace(&self) -> bool {
         self.source.zone.record(self.record.id).is_native_owned()
     }
+    fn shares_descriptor_namespace(&self) -> bool {
+        // Ring threads always share their process's one table (a thread
+        // clone requires CLONE_FILES), so a second live thread shares it.
+        // The lifecycle page's live count is the membership (#2949 review
+        // P0-1): a host-declined sibling counts before its first entry,
+        // and a leader's raw exit leaves its credential row behind. The
+        // neutral lifecycle owner answers.
+        let graph = self.runtime.graph.lock();
+        graph.owner.task(self.key).map_or(true, |row| {
+            row.native().resources().page.has_other_live_member()
+        })
+    }
     fn interrupt_pending_wait(&mut self) -> bool {
         let pending = self.signal_interrupts_current();
         if pending

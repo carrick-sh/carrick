@@ -3649,6 +3649,7 @@ impl<
                 carrick_personality_linux::crossing::nr::DUP,
                 carrick_personality_linux::crossing::nr::DUP3,
                 carrick_personality_linux::crossing::nr::CLOSE,
+                carrick_personality_linux::crossing::nr::CLOSE_RANGE,
             ]
             .iter()
             .any(|nr| nr.raw() == ordinal)
@@ -5491,6 +5492,16 @@ impl<
         // same constructor and zone-description owner for the live root.
         let table = venue.tables.table_of(task);
         let ordinal = self.frame.canonical_ordinal();
+        // close_range names a range, not a descriptor: its first argument
+        // classifies nothing, and a borrowed table may mix host slots with
+        // ring objects across the range (#2949 review P0-3). It keeps the
+        // borrowed table's own route.
+        if matches!(
+            ordinal,
+            carrick_personality_linux::crossing::nr::CLOSE_RANGE
+        ) {
+            return NativeDescriptorNamespace::Legacy;
+        }
         let constructor = matches!(
             ordinal,
             carrick_personality_linux::crossing::nr::PIPE2
@@ -5543,6 +5554,164 @@ impl<
             ));
         }
         Ok(())
+    }
+
+    /// One owned `close` of `old` in the native descriptor table, shared by
+    /// `close` and `close_range`: the table entry, the description's ring
+    /// release, this table's record locks on the file, and the delegated
+    /// host binding. `Ok(None)` when `old` is not open; `Ok(Some(owed))`
+    /// says whether host-owned close effects remain to replay.
+    fn close_owned_ipc<Z: carrick_el1_abi::EntryContext>(
+        &mut self,
+        venue: &ipc::IpcVenue<'_>,
+        task: &CurrentTask,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        file_table: u64,
+        old: carrick_el1_abi::ipc::fd::Fd,
+        zone: Option<(&carrick_sched_core::ZoneTables<Z>, SlotId)>,
+    ) -> Result<Option<bool>, FamilyCompletion> {
+        use carrick_el1_abi::ipc::fd::Error;
+        let close_effects = match venue.region.fd(NativeFdWait).close_effects(table, old) {
+            Ok(effects) => effects,
+            Err(Error::BadFd) => return Ok(None),
+            Err(err) => return Err(map_fd_error(err)),
+        };
+        #[cfg(test)]
+        close_retire_hold::run(&venue.region, table, old);
+        let retired = match close_native_in_ring(&venue.region, table, old) {
+            Ok(retired) => retired,
+            Err(Error::BadFd) => return Ok(None),
+            Err(err) => return Err(map_fd_error(err)),
+        };
+        ipc::settle_native_release(&venue.region, retired.release, zone, task)
+            .map_err(map_ipc_error)?;
+        // The file this close retired, read in the same table
+        // acquisition: its record locks of this table end
+        // (fcntl(2)), whatever another thread did to the number.
+        if let Some(file) = retired.file {
+            ipc::release_record_locks(&venue.region, zone, task, table, file)
+                .map_err(map_ipc_error)?;
+        }
+        let change =
+            super::file_table::close_host_binding(self.fd_map, self.open_table, file_table, old.0);
+        Self::settle_delegated_release(
+            self.frame,
+            self.open_table,
+            task,
+            change.and_then(|c| c.release),
+        )?;
+        Ok(Some(!close_effects.is_empty()))
+    }
+
+    /// Whether the ring serves `close_range` whole (#2904): `None` serves
+    /// it; `Some(Forward)` leaves it unrouted (a counted ENOSYS for a ring
+    /// caller), decided before anything changes, in two cases:
+    /// - `CLOSE_RANGE_UNSHARE` while another thread shares the table: the
+    ///   caller needs a successor table published for it alone, and the
+    ///   ring has no per-thread descriptor table yet (unshare(CLONE_FILES)
+    ///   is unrouted too, #2930). Alone, the private copy Linux makes would
+    ///   be this same table, so the call is a plain range;
+    /// - a closing range holding an open descriptor that owes host close
+    ///   effects (record locks, an epoll registration, an inotify watch):
+    ///   only a host replay runs them, and no venue replays a range
+    ///   (#2949 review P0-4), so nothing closes.
+    fn close_range_route(
+        &self,
+        venue: &ipc::IpcVenue<'_>,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        first: u32,
+        last: u32,
+        flags: u32,
+    ) -> Option<FamilyCompletion> {
+        if flags & carrick_abi::LINUX_CLOSE_RANGE_UNSHARE != 0
+            && self
+                .process
+                .as_deref()
+                .is_none_or(|process| process.shares_descriptor_namespace())
+        {
+            return Some(FamilyCompletion::Forward);
+        }
+        if flags & carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC != 0 {
+            return None;
+        }
+        let fds = venue.region.fd(NativeFdWait);
+        let mut cursor = first;
+        loop {
+            let fd = match fds.next_open(table, cursor, last) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => return None,
+                Err(err) => return Some(map_fd_error(err)),
+            };
+            match fds.close_effects(table, fd) {
+                Ok(effects) if !effects.is_empty() => return Some(FamilyCompletion::Forward),
+                Ok(_) | Err(carrick_el1_abi::ipc::fd::Error::BadFd) => {}
+                Err(err) => return Some(map_fd_error(err)),
+            }
+            cursor = (fd.0 as u32).checked_add(1).filter(|next| *next <= last)?;
+        }
+    }
+
+    /// `close_range(first, last, flags)` (#2904): EINVAL for an inverted
+    /// range or an unknown flag, then each open descriptor of the range, in
+    /// order, through the one owned `close` (or, under
+    /// `CLOSE_RANGE_CLOEXEC`, the `F_SETFD` owner). The walk visits only open
+    /// numbers, bounded by the table's storage, whatever `last` is. A number
+    /// another thread closes meanwhile is skipped, as Linux's walk does.
+    fn close_range_owned_ipc<Z: carrick_el1_abi::EntryContext>(
+        &mut self,
+        venue: &ipc::IpcVenue<'_>,
+        task: &CurrentTask,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        file_table: u64,
+        zone: Option<(&carrick_sched_core::ZoneTables<Z>, SlotId)>,
+    ) -> FamilyCompletion {
+        let first = self.frame.argument(0).unwrap_or(0) as u32;
+        let last = self.frame.argument(1).unwrap_or(0) as u32;
+        let flags = self.frame.argument(2).unwrap_or(0) as u32;
+        let known = carrick_abi::LINUX_CLOSE_RANGE_UNSHARE | carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC;
+        if first > last || flags & !known != 0 {
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+        }
+        let cloexec = flags & carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC != 0;
+        if let Some(done) = self.close_range_route(venue, table, first, last, flags) {
+            return done;
+        }
+        // `owed` is only a close effect a sharer of a description added
+        // after the route's scan: the race a plain `close` answers with
+        // its replay too.
+        let mut owed = false;
+        let mut cursor = first;
+        loop {
+            let fd = match venue.region.fd(NativeFdWait).next_open(table, cursor, last) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => break,
+                Err(err) => return map_fd_error(err),
+            };
+            if cloexec {
+                if let FamilyCompletion::Complete(result) =
+                    self.set_owned_cloexec(venue, table, file_table, fd, true)
+                    && result < 0
+                    && result != carrick_syscall_abi::LINUX_EBADF.guest_retval()
+                {
+                    return FamilyCompletion::Complete(result);
+                }
+            } else {
+                match self.close_owned_ipc(venue, task, table, file_table, fd, zone) {
+                    Ok(Some(effects)) => owed |= effects,
+                    Ok(None) => {}
+                    Err(done) => return done,
+                }
+            }
+            let Some(next) = (fd.0 as u32).checked_add(1).filter(|next| *next <= last) else {
+                break;
+            };
+            cursor = next;
+        }
+        if owed {
+            FamilyCompletion::CommitOwed(0)
+        } else {
+            FamilyCompletion::Complete(0)
+        }
     }
 
     fn duplicate_owned_ipc<Z: carrick_el1_abi::EntryContext>(
@@ -6294,54 +6463,20 @@ impl<
                 }
             }
             nr if nr == carrick_personality_linux::crossing::nr::CLOSE.raw() => {
-                let close_effects = match venue.region.fd(NativeFdWait).close_effects(table, old) {
-                    Ok(effects) => effects,
-                    Err(err) => return map_fd_error(err),
-                };
-                #[cfg(test)]
-                close_retire_hold::run(&venue.region, table, old);
-                let retired = match close_native_in_ring(&venue.region, table, old) {
-                    Ok(retired) => retired,
-                    Err(err) => return map_fd_error(err),
-                };
-                if let Err(err) =
-                    ipc::settle_native_release(&venue.region, retired.release, zone, task)
-                {
-                    return map_ipc_error(err);
-                }
-                // The file this close retired, read in the same table
-                // acquisition: its record locks of this table end
-                // (fcntl(2)), whatever another thread did to the number.
-                if let Some(file) = retired.file
-                    && let Err(err) =
-                        ipc::release_record_locks(&venue.region, zone, task, table, file)
-                {
-                    return map_ipc_error(err);
-                }
-                let change = super::file_table::close_host_binding(
-                    self.fd_map,
-                    self.open_table,
-                    file_table,
-                    old.0,
-                );
-                if let Err(err) = Self::settle_delegated_release(
-                    self.frame,
-                    self.open_table,
-                    task,
-                    change.and_then(|c| c.release),
-                ) {
-                    return err;
-                }
-                if close_effects.is_empty() {
-                    FamilyCompletion::Complete(0)
-                } else {
+                match self.close_owned_ipc(venue, task, table, file_table, old, zone) {
+                    Ok(Some(false)) => FamilyCompletion::Complete(0),
                     // The numeric fd is already gone from the one shared
                     // authority. Replay only the host-owned close effects:
                     // the host FileTable observes the shared BadFd as an
                     // idempotent projection and runs its canonical record-lock,
                     // epoll and inotify teardown exactly once.
-                    FamilyCompletion::CommitOwed(0)
+                    Ok(Some(true)) => FamilyCompletion::CommitOwed(0),
+                    Ok(None) => map_fd_error(carrick_el1_abi::ipc::fd::Error::BadFd),
+                    Err(done) => done,
                 }
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw() => {
+                self.close_range_owned_ipc(venue, task, table, file_table, zone)
             }
             nr if nr == carrick_personality_linux::crossing::nr::FCNTL.raw() => {
                 let cmd = self.frame.argument(1).unwrap_or(u64::MAX);
