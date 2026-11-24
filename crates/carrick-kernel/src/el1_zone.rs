@@ -28,8 +28,10 @@ use carrick_el1_abi::{
 /// which its executor resumes to completion while the executor pool runs.
 /// After the pool stops no vCPU resumes, so it is not a region wait (it does
 /// not implement `RegionLockWait`): an IPC region's object, table and
-/// storage locks take the owner's `el1_ipc::RegionWait`, which refuses
-/// then instead (#2955, #2988).
+/// storage locks, and the zone object-wait queues an IPC wake takes, use
+/// the owner's `el1_ipc::RegionWait`, which refuses then instead (#2955,
+/// #2988). The zone's other host waits still spin after the stop (#3019).
+#[derive(Clone, Copy)]
 pub struct HostLockWait;
 
 /// A carrier-scoped zone (the x86 CPL0 zone in its carrier's guest RAM).
@@ -66,7 +68,14 @@ impl ObjectWakeDelivery {
             collected_in_carrier: false,
         }
     }
-    pub(crate) fn collect(&mut self, wake: carrick_el1_abi::ipc::IpcWake) {
+    /// Collect `wake` from its object's lane queues under the region
+    /// owner's wait (`region`): after guest execution has stopped, a queue a
+    /// cut-off ring section holds is skipped and counted, never spun on.
+    pub(crate) fn collect(
+        &mut self,
+        wake: carrick_el1_abi::ipc::IpcWake,
+        region: crate::el1_ipc::RegionWait<'_>,
+    ) {
         let Self {
             handed,
             len,
@@ -77,7 +86,7 @@ impl ObjectWakeDelivery {
         let collected = if let Some(zone) = zone() {
             collect_object_wake(
                 zone,
-                &HostLockWait,
+                &region,
                 &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
                 wake,
                 handed,
@@ -88,7 +97,7 @@ impl ObjectWakeDelivery {
             *collected_in_carrier = true;
             collect_object_wake(
                 carrier.zone(),
-                &CarrierLockWait(carrier),
+                &region.over(CarrierLockWait(carrier)),
                 &|owned| complete_carrier_object_wake(carrier, owned),
                 wake,
                 handed,
@@ -96,10 +105,10 @@ impl ObjectWakeDelivery {
                 slots,
             )
         } else {
-            Ok(())
+            Ok(0)
         };
         match collected {
-            Ok(()) => {}
+            Ok(refused) => region.quarantine_refused_queues(refused),
             Err(CollectFault::DuplicateDelivery) => {
                 carrick_fatal::carrick_fatal!("ipc::wake", "duplicate object waiter delivery");
             }
@@ -144,6 +153,8 @@ enum CollectFault {
 
 /// Notify the object's own lanes, then the readable lane of every zone
 /// epoll the change queued an item on, collecting into preallocated storage.
+/// Returns how many queues `wait` refused (a region wait refuses only once
+/// guest execution has stopped; the caller counts them).
 fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     wait: &impl LockWait<C>,
@@ -152,7 +163,8 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
     handed: &mut [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
     len: &mut usize,
     slots: &mut [u64; carrick_el1_abi::ZONE_SLOTS / 64],
-) -> Result<(), CollectFault> {
+) -> Result<u64, CollectFault> {
+    let mut refused = 0;
     let lanes = [
         (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
         (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
@@ -169,8 +181,13 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
         let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) else {
             continue;
         };
-        let Ok(queue) = zone.object_wait(key, wait, completion) else {
-            continue;
+        let queue = match zone.object_wait(key, wait, completion) {
+            Ok(queue) => queue,
+            Err(carrick_sched_core::object_wait::ObjectWaitError::Busy) => {
+                refused += 1;
+                continue;
+            }
+            Err(_) => continue,
         };
         let mut duplicate = false;
         queue
@@ -195,7 +212,7 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
             return Err(CollectFault::DuplicateDelivery);
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 /// A host thread waiting for a carrier zone's bucket lock. A holder that
@@ -528,6 +545,23 @@ impl LockWait for TestRegionWait {
 }
 #[cfg(any(test, feature = "test-support"))]
 impl carrick_el1_abi::ipc::RegionLockWait for TestRegionWait {}
+#[cfg(any(test, feature = "test-support"))]
+impl LockWait<carrick_el1_abi::Aarch64ParkedContext> for TestRegionWait {
+    fn complete_object_wake(
+        &self,
+        zone: &ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        complete_object_wake(zone, owned);
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        <HostLockWait as LockWait>::wait(&HostLockWait, attempt)
+    }
+}
 
 impl LockWait<carrick_el1_abi::Aarch64ParkedContext> for HostLockWait {
     fn complete_object_wake(

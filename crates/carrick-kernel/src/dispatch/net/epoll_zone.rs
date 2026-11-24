@@ -237,8 +237,8 @@ impl ZoneEpoll {
         let Some(wake) = wake else {
             return;
         };
-        let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
-        delivery.collect(wake);
+        let mut delivery = self.owner.object_wake_delivery();
+        delivery.collect(wake, self.owner.wait());
         delivery.deliver();
         self.owner.service_wake(&wake);
     }

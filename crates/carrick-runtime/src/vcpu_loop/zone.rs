@@ -1701,8 +1701,15 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
         .set_reg(carrick_hal::Reg::X(0), op.orig_x0)
         .map_err(|error| ipc_error("restore x0", error))?;
     let object = IpcObjectHandle::from_raw(op.object);
-    let snapshots =
-        carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
+    let services = host_ipc::ZoneHostServices::new(context.kernel())
+        .map_err(|error| ipc_error("IPC owner", error))?;
+    let snapshots = carrick_kernel::el1_zone::zone().map(|zone| {
+        host_ipc::lane_snapshots(
+            zone,
+            object,
+            &host_ipc::IpcHostServices::region_wait(&services),
+        )
+    });
     let outcome = host_ipc::complete_handback(
         context,
         &region,
@@ -1710,8 +1717,7 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
         IpcMmKey(zone_mm.unwrap_or(0)),
         engine,
         None,
-        &host_ipc::ZoneHostServices::new(context.kernel())
-            .map_err(|error| ipc_error("IPC owner", error))?,
+        &services,
     )
     .map_err(|error| ipc_error("handback completion", error))?;
     restart_with_remaining(engine, Some(request), &outcome)?;
@@ -1820,8 +1826,15 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E> {
         let object = pending
             .object()
             .map_err(|error| ipc_error("retained object", error))?;
-        let snapshots =
-            carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
+        let services = host_ipc::ZoneHostServices::for_dispatcher(&kernel.dispatcher)
+            .map_err(|error| ipc_error("IPC owner", error))?;
+        let snapshots = carrick_kernel::el1_zone::zone().map(|zone| {
+            host_ipc::lane_snapshots(
+                zone,
+                object,
+                &host_ipc::IpcHostServices::region_wait(&services),
+            )
+        });
         let context = self.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("IPC copyout lost its context".to_owned())
         })?;
@@ -1984,8 +1997,15 @@ where
             .operation(&token)
             .map_err(|error| ipc_error("continuation", error))?;
         let object = IpcObjectHandle::from_raw(op.object);
-        let snapshots =
-            carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
+        let services = host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+            .map_err(|error| ipc_error("IPC owner", error))?;
+        let snapshots = carrick_kernel::el1_zone::zone().map(|zone| {
+            host_ipc::lane_snapshots(
+                zone,
+                object,
+                &host_ipc::IpcHostServices::region_wait(&services),
+            )
+        });
         let context = self
             .kernel
             .dispatcher
@@ -1998,8 +2018,7 @@ where
             IpcMmKey(self.state.zone_mm.unwrap_or(0)),
             engine,
             None,
-            &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
-                .map_err(|error| ipc_error("IPC owner", error))?,
+            &services,
         )
         .map_err(|error| ipc_error("continuation", error))?;
         // Only epoll authorizes an argument rewrite; ppoll retains its operation.
@@ -2152,8 +2171,14 @@ where
                     .dispatcher
                     .capture_kernel_context(self.state.linux_tid)
                     .map_err(|error| ipc_error("interrupt context", error))?;
+                let services = host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+                    .map_err(|error| ipc_error("IPC owner", error))?;
                 let snapshots = carrick_kernel::el1_zone::zone().map(|zone| {
-                    host_ipc::lane_snapshots(zone, IpcObjectHandle::from_raw(op.object))
+                    host_ipc::lane_snapshots(
+                        zone,
+                        IpcObjectHandle::from_raw(op.object),
+                        &host_ipc::IpcHostServices::region_wait(&services),
+                    )
                 });
                 let outcome = host_ipc::interrupt(
                     &context,
@@ -2162,8 +2187,7 @@ where
                     IpcMmKey(self.state.zone_mm.unwrap_or(0)),
                     engine,
                     cause,
-                    &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
-                        .map_err(|error| ipc_error("IPC owner", error))?,
+                    &services,
                 )
                 .map_err(|error| ipc_error("interrupt", error))?;
                 restart_with_remaining(engine, None, &outcome)?;
@@ -2490,7 +2514,8 @@ mod ipc_tests {
             nr: 64,
         };
         // Snapshots taken before the readiness check, both lanes.
-        let snapshots = host_ipc::lane_snapshots(&zone, object);
+        let snapshots =
+            host_ipc::lane_snapshots(&zone, object, &carrick_kernel::el1_zone::TestRegionWait);
         assert!(snapshots.iter().all(Option::is_some));
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
         let mut producer = super::signal_ingress_producer::HostSignalIngressProducer::new();

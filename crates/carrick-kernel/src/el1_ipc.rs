@@ -591,10 +591,36 @@ pub struct HostIpc {
 /// worker (or a worker died), none will: a lock still held then belongs to
 /// a section that was cut off and can never be released.
 #[derive(Debug, Default)]
-struct GuestExecution {
+pub(crate) struct GuestExecution {
     stopped: std::sync::atomic::AtomicBool,
-    /// Tables and extents left in place because a cut-off section held them.
+    /// Tables, extents and steps left in place because a cut-off section
+    /// held them.
     quarantined: AtomicU64,
+    /// Tests order on each quarantine as an event
+    /// ([`HostIpc::await_quarantined`]), never on a poll of the count.
+    #[cfg(any(test, feature = "test-support"))]
+    settled: (std::sync::Mutex<()>, std::sync::Condvar),
+}
+
+impl GuestExecution {
+    /// Count `steps` settled behind a lock a cut-off section holds.
+    fn note_quarantined(&self, steps: u64) {
+        if steps == 0 {
+            return;
+        }
+        self.quarantined.fetch_add(steps, Ordering::Release);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            // Under the event's mutex, so a waiter that read the old count
+            // is already waiting when this notification goes out.
+            let _event = self
+                .settled
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.settled.1.notify_all();
+        }
+    }
 }
 
 /// A live host step met a lock that a cut-off ring section holds, after
@@ -638,52 +664,58 @@ impl From<CarrierGone> for LiveStepError {
 /// [`HostLockWait`]: the holder is a host thread or a vCPU that its executor
 /// resumes. Once guest execution has stopped, the first contention refuses
 /// (`Contended`), and the caller quarantines what the dead holder guards.
+///
+/// The same wait fences the region's zone object-wait queues (#2988): an
+/// object's lane queues live in the guest-shared zone tables, and a ring
+/// section cut off inside one holds its lock forever too. `W` is the
+/// zone's own host wait (the process-global zone's [`HostLockWait`], or a
+/// carrier zone's); only [`HostIpc::wait`] mints one, so every queue wait
+/// an IPC wake takes ([`crate::el1_zone::ObjectWakeDelivery::collect`],
+/// the handback lanes) carries the stop.
 #[derive(Clone, Copy)]
-pub struct RegionWait<'a>(&'a GuestExecution);
+pub struct RegionWait<'a, W = HostLockWait> {
+    guest: &'a GuestExecution,
+    inner: W,
+}
 
-impl carrick_el1_abi::LockWait for RegionWait<'_> {
+impl<'a> RegionWait<'a> {
+    /// The same stop over another zone's host wait (a carrier zone's).
+    pub(crate) fn over<W>(self, inner: W) -> RegionWait<'a, W> {
+        RegionWait {
+            guest: self.guest,
+            inner,
+        }
+    }
+
+    /// `queues` object-wait queues the wake skipped because this wait
+    /// refused (only once guest execution has stopped): their waiters are
+    /// cut-off ring sections, and no guest runs again to observe the wake.
+    pub(crate) fn quarantine_refused_queues(self, queues: u64) {
+        self.guest.note_quarantined(queues);
+    }
+}
+
+impl<C, W> carrick_sched_core::LockWait<C> for RegionWait<'_, W>
+where
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+    W: carrick_sched_core::LockWait<C>,
+{
     fn complete_object_wake(
         &self,
-        zone: &carrick_sched_core::ZoneTables,
-        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        zone: &carrick_sched_core::ZoneTables<C>,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
     ) {
-        <HostLockWait as carrick_el1_abi::LockWait>::complete_object_wake(
-            &HostLockWait,
-            zone,
-            owned,
-        );
+        self.inner.complete_object_wake(zone, owned);
     }
 
     fn wait(&self, attempt: u32) -> bool {
-        !self.0.stopped.load(Ordering::Acquire)
-            && <HostLockWait as carrick_el1_abi::LockWait>::wait(&HostLockWait, attempt)
+        !self.guest.stopped.load(Ordering::Acquire) && self.inner.wait(attempt)
     }
 }
 
 /// The host carrier's only region wait (#2988): it refuses once guest
 /// execution has stopped, where the carrier's zone wait would spin forever.
 impl carrick_el1_abi::ipc::RegionLockWait for RegionWait<'_> {}
-
-impl carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext> for RegionWait<'_> {
-    fn complete_object_wake(
-        &self,
-        zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
-        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-            '_,
-            carrick_el1_abi::Aarch64ParkedContext,
-        >,
-    ) {
-        <HostLockWait as carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext>>::complete_object_wake(
-            &HostLockWait,
-            zone,
-            owned,
-        );
-    }
-
-    fn wait(&self, attempt: u32) -> bool {
-        <Self as carrick_el1_abi::LockWait>::wait(self, attempt)
-    }
-}
 
 struct SocketEpollLockWait<'a>(&'a crate::el1_zone::CarrierZone);
 
@@ -1053,7 +1085,10 @@ impl HostIpc {
     /// This region's lock wait: [`HostLockWait`] until guest execution
     /// stops, then a refusal at the first contention.
     pub(crate) fn wait(&self) -> RegionWait<'_> {
-        RegionWait(&self.guest)
+        RegionWait {
+            guest: &self.guest,
+            inner: HostLockWait,
+        }
     }
 
     /// No executor can run ring code over this region again: the executor
@@ -1083,7 +1118,7 @@ impl HostIpc {
                 )
         );
         if contended && self.guest.stopped.load(Ordering::Acquire) {
-            self.guest.quarantined.fetch_add(1, Ordering::Relaxed);
+            self.guest.note_quarantined(1);
             tracing::warn!(
                 ?error,
                 "IPC teardown left state held by a stopped vCPU in quarantine"
@@ -1107,7 +1142,30 @@ impl HostIpc {
 
     /// Teardown steps quarantined behind a lock a stopped vCPU held.
     pub fn quarantined_teardowns(&self) -> u64 {
-        self.guest.quarantined.load(Ordering::Relaxed)
+        self.guest.quarantined.load(Ordering::Acquire)
+    }
+
+    /// Wait for the quarantine count to reach `at_least`, woken by each
+    /// quarantine as it is counted; `bound` only reports a step that never
+    /// settles (a spin, or a death). Returns the count it saw last.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn await_quarantined(&self, at_least: u64, bound: std::time::Duration) -> u64 {
+        let (event, settled) = &self.guest.settled;
+        let deadline = std::time::Instant::now() + bound;
+        let mut guard = event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            let seen = self.quarantined_teardowns();
+            let now = std::time::Instant::now();
+            if seen >= at_least || now >= deadline {
+                return seen;
+            }
+            guard = settled
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 
     /// A view cannot outlive the mappings it borrows.
@@ -1406,7 +1464,7 @@ impl HostIpc {
         self.region()
             .resize_pipe(object, requested, limit, &self.wait(), |wake| {
                 let mut delivery = self.object_wake_delivery();
-                delivery.collect(wake);
+                delivery.collect(wake, self.wait());
                 delivery.deliver();
             })
             .map_err(Into::into)
@@ -1625,7 +1683,7 @@ impl HostIpc {
     pub(crate) fn deliver_socket_epoll_wakes(&self, wakes: impl IntoIterator<Item = IpcWake>) {
         for wake in wakes {
             let mut delivery = self.object_wake_delivery();
-            delivery.collect(wake);
+            delivery.collect(wake, self.wait());
             delivery.deliver();
             self.service_wake(&wake);
         }
@@ -1814,7 +1872,7 @@ impl HostIpc {
 
     /// Zone wake collection for a host-side object change: the
     /// process-global zone when it serves, else this region's carrier zone.
-    fn object_wake_delivery(&self) -> crate::el1_zone::ObjectWakeDelivery {
+    pub(crate) fn object_wake_delivery(&self) -> crate::el1_zone::ObjectWakeDelivery {
         crate::el1_zone::ObjectWakeDelivery::for_carrier(self.carrier_zone.get().cloned())
     }
 
@@ -1833,7 +1891,7 @@ impl HostIpc {
             let region = self.region();
             if let Ok(guard) = region.lock(wake.object, &self.wait()) {
                 let mut delivery = self.object_wake_delivery();
-                delivery.collect(wake);
+                delivery.collect(wake, self.wait());
                 drop(guard);
                 delivery.deliver();
                 if self
@@ -1876,7 +1934,7 @@ impl HostIpc {
         }
         let wake = locks.released();
         let mut delivery = self.object_wake_delivery();
-        delivery.collect(wake);
+        delivery.collect(wake, self.wait());
         drop(locks);
         delivery.deliver();
         self.service_wake(&wake);

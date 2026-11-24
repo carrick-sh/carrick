@@ -267,8 +267,8 @@ impl EventFdState {
         step: carrick_el1_abi::ipc::pipe::Step<T>,
     ) -> Result<T, LinuxErrno> {
         let wake = guard.publish(step.wake);
-        let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
-        delivery.collect(wake);
+        let mut delivery = self.owner.object_wake_delivery();
+        delivery.collect(wake, self.owner.wait());
         drop(guard);
         delivery.deliver();
         self.owner.service_wake(&wake);

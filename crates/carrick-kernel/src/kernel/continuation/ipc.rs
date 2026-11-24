@@ -160,11 +160,19 @@ impl IpcHostServices for ZoneHostServices {
             let mut handed = Vec::new();
             let mut placed = Vec::new();
             {
-                // A queue never bound to this incarnation has no waiters.
-                let Ok(guard) = zone.object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
+                // A queue never bound to this incarnation has no waiters. The
+                // owner's region wait refuses a queue a ring section cut off
+                // at the stop holds: no guest runs again to take the wake.
+                let wait = self.owner.wait();
+                let guard = match zone.object_wait(key, &wait, &|owned| {
                     crate::el1_zone::complete_object_wake(owned.zone(), owned)
-                }) else {
-                    continue;
+                }) {
+                    Ok(guard) => guard,
+                    Err(ObjectWaitError::Busy) => {
+                        wait.quarantine_refused_queues(1);
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 let _ = guard
                     .notify_object_host(&mut |record| handed.push(record), &mut |placement| {
@@ -236,17 +244,23 @@ pub fn host_region() -> Option<IpcRegion<'static>> {
 /// The wait-queue snapshots of both lanes of `object`, taken BEFORE its
 /// readiness is checked under the object lock (binding each queue to this
 /// incarnation on first use), so a park after a failed check can never miss
-/// a notification in between.
-pub fn lane_snapshots(
+/// a notification in between. The queues are in the guest-shared zone, so
+/// they take the region owner's wait, as its object locks do.
+pub fn lane_snapshots<W>(
     zone: &carrick_el1_abi::ZoneTables,
     object: IpcObjectHandle,
-) -> [Option<ObjectWaitSnapshot>; 2] {
+    wait: &W,
+) -> [Option<ObjectWaitSnapshot>; 2]
+where
+    W: carrick_el1_abi::ipc::RegionLockWait
+        + carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext>,
+{
     [WaitFor::Readable, WaitFor::Writable].map(|lane| {
         let key = wait_key(object, lane)?;
-        let _ = zone.bind_object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
+        let _ = zone.bind_object_wait(key, wait, &|owned| {
             crate::el1_zone::complete_object_wake(owned.zone(), owned)
         });
-        zone.object_wait(key, &crate::el1_zone::HostLockWait, &|owned| {
+        zone.object_wait(key, wait, &|owned| {
             crate::el1_zone::complete_object_wake(owned.zone(), owned)
         })
         .ok()

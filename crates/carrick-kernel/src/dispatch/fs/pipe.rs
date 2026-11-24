@@ -424,8 +424,8 @@ impl PipeInner {
         step: core_pipe::Step<T>,
     ) -> Result<T, LinuxErrno> {
         let wake = guard.publish(step.wake);
-        let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
-        delivery.collect(wake);
+        let mut delivery = self.owner.object_wake_delivery();
+        delivery.collect(wake, self.owner.wait());
         drop(guard);
         delivery.deliver();
         self.owner.service_wake(&wake);
@@ -1081,11 +1081,11 @@ pub(crate) fn transfer_in_memory_pipes(
     } else {
         core_pipe::WakeSet::default()
     };
-    let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+    let mut delivery = source.owner.object_wake_delivery();
     let source_wake = src.publish(source_wake);
     let dest_wake = dst.publish(wakes);
-    delivery.collect(source_wake);
-    delivery.collect(dest_wake);
+    delivery.collect(source_wake, source.owner.wait());
+    delivery.collect(dest_wake, dest.owner.wait());
     drop(src);
     drop(dst);
     delivery.deliver();
