@@ -171,7 +171,6 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     let resumed = sched.take_object_operation().ok().flatten();
     let slot = sched.slot;
     let access = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
-    let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
     let task = sched.task;
     AnonymousCall::from_canonical(CanonicalNr::new(frame.x[8]))?;
     let zone = sched.zone;
@@ -191,64 +190,17 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 )
                 .edit_probe(&mut holder);
             }
-            let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
-                Ok(root) => root,
-                Err(carrick_el1::memory::reservations::Refusal::Busy) => {
-                    return Some(Some(SpaceWaitCause::Reservations));
-                }
-                Err(_) => return None,
-            };
-            use carrick_el1::memory::{
-                ReservationDisposition, decide_reservation_syscall_for_origin,
-            };
-            let decision =
-                decide_reservation_syscall_for_origin(frame, task, &mut root, None, origin);
-            match decision {
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::PreparedConflict,
-                ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::Busy,
-                ) => {
-                    // An owed overlap with no settlement in flight reruns
-                    // (behind the editor probe) and drives one itself.
-                    if let Some(cause) = carrick_el1::memory::busy_root_cause(&root) {
-                        return Some(Some(cause));
-                    }
-                }
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                ) => {
-                    if root.provision_metadata(metadata).is_err() {
-                        return None;
-                    }
-                    return Some(None);
-                }
-                ReservationDisposition::Unavailable(_) => return None,
-                ReservationDisposition::Work(pending) => {
-                    if pending.cancel(&mut root).is_err() {
-                        return None;
-                    }
-                }
-                ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
-            }
-            drop(root);
-            match zone
-                .spaces
-                .try_begin_edit_cause(index, mm.raw(), owner, access.venue())
-            {
-                Ok(editor) => {
-                    drop(editor);
-                    Some(None)
-                }
-                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
-                    Some(Some(SpaceWaitCause::Editor))
-                }
-                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
-                    Some(Some(SpaceWaitCause::Gate))
-                }
-                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
-            }
+            carrick_el1::memory::probe_parked_anonymous_edit(
+                frame,
+                task,
+                access,
+                table,
+                index,
+                mm,
+                slot.index() as u32,
+                origin,
+                metadata,
+            )
         },
         |key, snapshot, token| {
             sched.park_object_rechecked(frame, key, snapshot, resume, token, || {
