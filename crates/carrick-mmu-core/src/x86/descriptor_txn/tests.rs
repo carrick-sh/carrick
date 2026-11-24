@@ -681,6 +681,77 @@ fn guest_unlink_clears_host_map_leaf_and_refuses_private_leaf() {
     );
 }
 
+/// #1338: an mprotect over shared file window pages re-permissions the
+/// host-mapped leaves in place (read-only, then writable again), skips a
+/// hole, and refuses a private leaf, which takes `Protect`.
+#[test]
+fn window_protect_edits_host_map_leaves_and_refuses_private_leaf() {
+    let words = Words::new();
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let host = PageSpan::new(0x4000, PAGE);
+    let private = PageSpan::new(0x6000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(host.va, 0x800000, PAGE, LeafSize::Page),
+            &tables
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(
+                private,
+                0x900000,
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+            ),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let protect = |span, writable| DescriptorOp::ProtectWindow {
+        span,
+        permissions: Permissions {
+            writable,
+            executable: false,
+            user: true,
+        },
+    };
+    let leaf = |va| {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(va))
+            .unwrap()
+            .0
+    };
+    let mapped = leaf(host.va);
+    // The window page and the hole after it.
+    assert!(matches!(
+        apply(
+            &words,
+            protect(PageSpan::new(host.va, 2 * PAGE), false),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf(host.va), mapped & !WRITE);
+    assert_eq!(leaf(host.va + PAGE), 0);
+    assert!(matches!(
+        apply(&words, protect(host, true), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf(host.va), mapped);
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, protect(private, false), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
 #[test]
 fn cow_classifier_names_only_the_faulting_armed_user_page() {
     let words = Words::new();
