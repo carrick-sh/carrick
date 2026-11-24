@@ -317,6 +317,11 @@ impl BackingExtent {
         }
     }
 
+    /// A shared file window chunk (#1338): kept for the run, never private.
+    pub(crate) fn is_host_file_window(&self) -> bool {
+        matches!(self.storage, ExtentStorage::HostFile(_))
+    }
+
     /// Host view of this retained extent; never a guest VA or a GPA.
     pub(crate) fn host_base(&self) -> Result<carrick_guest_mem::HostVa, MemoryError> {
         self.ptr(self.base.raw(), self.len)
@@ -451,6 +456,21 @@ impl InheritedFrameEdge {
     }
     pub fn identity(&self) -> BackingIdentity {
         self.identity
+    }
+}
+
+/// One parent shared file window leaf a fork child keeps (#1338). It names
+/// the window slot and the parent root it was read from; it owns no frame
+/// and carries no inventory identity.
+pub struct InheritedWindowEdge {
+    handle: BackingHandle,
+    parent: AddressContext<RootGpa>,
+    span: PageSpan,
+    gpa: FrameGpa,
+}
+impl InheritedWindowEdge {
+    pub fn span(&self) -> PageSpan {
+        self.span
     }
 }
 
@@ -864,7 +884,13 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 .get(index)
                 .ok_or_else(|| error("retired MM admitted to no carrier slot"))?;
             let remaining = slot.alias_count - held.get(index).copied().unwrap_or(0);
-            if slot.allowed != [mm] || remaining != 0 || slot.bootstrap {
+            // A shared file window slot is one per file chunk, kept for the
+            // run and reused by every later fault (#1338).
+            if slot.allowed != [mm]
+                || remaining != 0
+                || slot.bootstrap
+                || slot.backing.extent.is_host_file_window()
+            {
                 continue;
             }
             // `revoke`'s preconditions, checked now so the revoke cannot
@@ -1146,6 +1172,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         for offset in (0..len).step_by(PAGE as usize) {
             let gpa = FrameGpa::new(ipa + offset);
             let span = PageSpan::new(va + offset, PAGE);
+            if self
+                .locate(gpa, PAGE as usize)
+                .is_some_and(|slot| slot.backing.extent.is_host_file_window())
+            {
+                // A window page has no frame-inventory row: answering
+                // `MappingGone` would rerun the fork forever (#1338).
+                return Err(
+                    error("a shared file window page is inherited as a window edge").into(),
+                );
+            }
             let identity = self.frame_identity(parent.mm.raw(), gpa)?;
             let bound = authority.bind(parent.into());
             if bound
@@ -1246,6 +1282,111 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 slot: edge.handle.slot,
                 span: edge.span,
                 inherited: Some(edge.gpa),
+            },
+        );
+        Ok(())
+    }
+
+    /// Classify one fork custody row against this carrier's shared file
+    /// windows (#1338). `None` means the row names no window slot and is
+    /// selected by [`Self::select_inherited_frames`]. A window page is the
+    /// file's own bytes behind one slot kept for the run, with no frame
+    /// inventory: the child keeps the parent's leaf (never a COW) and is
+    /// admitted to the slot by [`Self::attach_inherited_window`].
+    pub fn select_inherited_window(
+        &self,
+        parent: AddressContext<RootGpa>,
+        selection: carrick_el1_abi::PortalForkCustody,
+    ) -> Result<Option<InheritedWindowEdge>, MemoryError> {
+        self.admit()?;
+        let carrick_el1_abi::PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared,
+        } = selection
+        else {
+            return Ok(None);
+        };
+        let gpa = FrameGpa::new(ipa);
+        let Some(slot) = self
+            .locate(gpa, PAGE as usize)
+            .filter(|slot| slot.backing.extent.is_host_file_window())
+        else {
+            return Ok(None);
+        };
+        if self.root(parent.mm.raw()) != Some(parent) {
+            return Err(error("stale inherited window root"));
+        }
+        let span = PageSpan::new(va, PAGE);
+        // A window leaf is one 4 KiB MapAlias page of a shared mapping.
+        if !shared
+            || len != PAGE
+            || !va.is_multiple_of(PAGE)
+            || !ipa.is_multiple_of(PAGE)
+            || !slot.allowed.contains(&parent.mm.raw())
+            || !self.leaf_names(parent, span, gpa)
+        {
+            return Err(error("inherited window row names no parent window leaf"));
+        }
+        Ok(Some(InheritedWindowEdge {
+            handle: slot.handle,
+            parent,
+            span,
+            gpa,
+        }))
+    }
+
+    /// Admit a fork child to the window slot its kept leaf names, and
+    /// record that leaf as the child's alias, so retirement and unmap count
+    /// it. The guest already copied the leaf; this writes no descriptor.
+    pub fn attach_inherited_window(
+        &mut self,
+        child: AddressContext<RootGpa>,
+        edge: &InheritedWindowEdge,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let slot = self.record(edge.handle)?;
+        if child.mm == edge.parent.mm
+            || self.root(child.mm.raw()) != Some(child)
+            || self.root(edge.parent.mm.raw()) != Some(edge.parent)
+            || !slot.backing.extent.is_host_file_window()
+            || !self.leaf_names(edge.parent, edge.span, edge.gpa)
+            || !self.leaf_names(child, edge.span, edge.gpa)
+        {
+            return Err(error("stale or unauthenticated inherited window edge"));
+        }
+        let end = edge.span.va + PAGE;
+        if self.aliases.get(&child.mm.raw()).is_some_and(|aliases| {
+            aliases
+                .range(..end)
+                .next_back()
+                .is_some_and(|(_, alias)| alias.span.va + alias.span.len > edge.span.va)
+        }) {
+            return Err(error("inherited child alias already occupied"));
+        }
+        let count = slot
+            .alias_count
+            .checked_add(1)
+            .ok_or_else(|| error("inherited window alias count exhausted"))?;
+        let slot = self
+            .slots
+            .get_mut(&edge.handle.slot)
+            .ok_or_else(|| error("missing inherited window registration"))?;
+        slot.alias_count = count;
+        if !slot.allowed.contains(&child.mm.raw()) {
+            slot.allowed.push(child.mm.raw());
+            self.admitted
+                .entry(child.mm.raw())
+                .or_default()
+                .insert(edge.handle.slot);
+        }
+        self.aliases.entry(child.mm.raw()).or_default().insert(
+            edge.span.va,
+            Alias {
+                slot: edge.handle.slot,
+                span: edge.span,
+                inherited: None,
             },
         );
         Ok(())
