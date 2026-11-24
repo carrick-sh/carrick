@@ -1293,7 +1293,6 @@ impl<'s> FaultSupply<'s> {
         mm: u64,
         owner: NonZeroU64,
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, C>> {
-        use carrick_sched_core::spaces::{EditAdmissionRefusal, notification::SpaceWaitCause};
         if matches!(self, Self::Mailbox { .. })
             && let Some(editor) = spaces.try_begin_edit_bounded(
                 index,
@@ -1311,9 +1310,7 @@ impl<'s> FaultSupply<'s> {
                 .try_begin_edit_cause(index, mm, owner, spaces.venue())
             {
                 Ok(editor) => Ok(Some(editor)),
-                Err(EditAdmissionRefusal::Editor) => Err(SpaceWaitCause::Editor),
-                Err(EditAdmissionRefusal::Gate) => Err(SpaceWaitCause::Gate),
-                Err(EditAdmissionRefusal::Stale) => Ok(None),
+                Err(refusal) => refusal.wait_cause().map_or(Ok(None), Err),
             }
         })
         .flatten()
