@@ -1936,7 +1936,7 @@ impl SyscallDispatcher {
             let identity = description
                 .inspect_kind(|open| match open {
                     crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
-                        host_fd.inode_identity()
+                        carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(host_fd))
                     }
                     _ => None,
                 })
@@ -1944,7 +1944,6 @@ impl SyscallDispatcher {
             let Some(identity) = identity else {
                 return Served::Refused;
             };
-            self.fs.window_inodes.record(identity);
             // An in-zone copy of the inode leaves the zone first: its later
             // writeback would rewrite the window's pages from older bytes.
             // Delegation refuses a windowed inode from now on.

@@ -1533,7 +1533,7 @@ fn delegate_transaction(
     if let OpenDescription::HostFile { host_fd, .. } = &*open
         && host_fd
             .inode_identity()
-            .is_some_and(|inode| fs.window_inodes.maps(inode))
+            .is_some_and(carrick_vfs::host_size::maps)
     {
         return Err(NotEligible::Mapped);
     }

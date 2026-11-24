@@ -870,7 +870,8 @@ impl Vfs for InMemoryFileVfs {
                 Ok(())
             }
             Some(InMemNode::HostFd { fd, size: _, .. }) => {
-                let rc = unsafe { libc::ftruncate(*fd, len as i64) };
+                // Through the host size door (#1338 A1).
+                let rc = carrick_vfs::host_size::ftruncate(*fd, len as libc::off_t);
                 if rc == 0 { Ok(()) } else { Err(LINUX_EINVAL) }
             }
             Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),

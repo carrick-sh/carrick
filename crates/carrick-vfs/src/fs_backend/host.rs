@@ -2561,21 +2561,20 @@ impl HostFsBackend {
             return FastGuestOpen::Fallback;
         }
         let trunc_flag = if trunc { libc::O_TRUNC } else { 0 };
-        let raw = match self.openat_for_guest(
-            parent_fd.as_raw_fd(),
-            &name_c,
-            accmode | base | trunc_flag,
-            0,
-        ) {
-            Ok(raw) => raw,
-            Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
-            Err(errno) => {
-                return match host_open_refusal(errno) {
-                    Some(refused) => FastGuestOpen::Refused(refused),
-                    None => FastGuestOpen::Fallback,
-                };
-            }
-        };
+        // An O_TRUNC open goes through the host size door (#1338 A1).
+        let raw =
+            match crate::host_size::open_truncating_with(accmode | base | trunc_flag, |flags| {
+                self.openat_for_guest(parent_fd.as_raw_fd(), &name_c, flags, 0)
+            }) {
+                Ok(raw) => raw,
+                Err(libc::ELOOP) => return FastGuestOpen::SymlinkLeaf,
+                Err(errno) => {
+                    return match host_open_refusal(errno) {
+                        Some(refused) => FastGuestOpen::Refused(refused),
+                        None => FastGuestOpen::Fallback,
+                    };
+                }
+            };
         // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on
         // drop, covering every early return below.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -3323,7 +3322,10 @@ impl HostFsBackend {
             flags |= libc::O_TRUNC;
         }
         use std::os::fd::AsRawFd as _;
-        match self.openat_for_guest(parent_fd.as_raw_fd(), &leaf_c, flags, 0o666) {
+        // An O_TRUNC open goes through the host size door (#1338 A1).
+        match crate::host_size::open_truncating_with(flags, |flags| {
+            self.openat_for_guest(parent_fd.as_raw_fd(), &leaf_c, flags, 0o666)
+        }) {
             Ok(fd) => HostFdOpen::Served(fd),
             Err(errno) => match host_open_refusal(errno) {
                 Some(refused) => HostFdOpen::Refused(refused),
@@ -5560,7 +5562,11 @@ impl FsBackend for HostFsBackend {
         self.coherence.bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600) };
+        // A node created over a guest name truncates it: through the host
+        // size door (#1338 A1).
+        let fd = crate::host_size::open_truncating(flags, |flags| unsafe {
+            host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600)
+        });
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return match io_open_refusal(&err) {
@@ -5599,7 +5605,11 @@ impl FsBackend for HostFsBackend {
         self.coherence.bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600) };
+        // A node created over a guest name truncates it: through the host
+        // size door (#1338 A1).
+        let fd = crate::host_size::open_truncating(flags, |flags| unsafe {
+            host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600)
+        });
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return match io_open_refusal(&err) {
@@ -5658,9 +5668,16 @@ impl FsBackend for HostFsBackend {
         };
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666) };
+        // A rewrite truncates first: through the host size door (#1338 A1).
+        let fd = crate::host_size::open_truncating(flags, |flags| unsafe {
+            host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666)
+        });
         if fd < 0 {
-            return Err(BackendError::Io);
+            let err = std::io::Error::last_os_error();
+            return match io_open_refusal(&err) {
+                Some(refused) => Err(BackendError::Host(refused)),
+                None => Err(BackendError::Io),
+            };
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
@@ -5727,7 +5744,7 @@ impl FsBackend for HostFsBackend {
                 .host_syscall_errno()
                 .map_err(|_| BackendError::Io)?;
             if final_size_i64 > st.st_size {
-                unsafe { libc::ftruncate(host_fd, final_size_i64 as libc::off_t) }
+                crate::host_size::ftruncate(host_fd, final_size_i64 as libc::off_t)
                     .host_syscall_errno()
                     .map_err(|_| BackendError::Io)?;
             }
@@ -6913,7 +6930,7 @@ impl FsBackend for HostFsBackend {
             st.st_size as u64
         };
         let err = if size > cur {
-            let rc = unsafe { libc::ftruncate(host_fd, size as libc::off_t) };
+            let rc = crate::host_size::ftruncate(host_fd, size as libc::off_t);
             if rc < 0 {
                 Err(BackendError::Io)
             } else {
