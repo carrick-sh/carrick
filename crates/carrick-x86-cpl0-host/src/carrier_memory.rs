@@ -1574,7 +1574,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         // for owner scrub. Keep that physical edge until repoint or unlink.
         if matches!(
             txn.op,
-            DescriptorOp::Unmap(_) | DescriptorOp::CowRepoint { .. }
+            DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) | DescriptorOp::CowRepoint { .. }
         ) {
             self.remove_aliases(txn.id.mm_key, txn.op.span(), context);
             if self.quarantined {
@@ -1624,6 +1624,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     if matches!(
                         txn.op,
                         DescriptorOp::Unmap(_)
+                            | DescriptorOp::UnmapWindow(_)
                             | DescriptorOp::Retire(_)
                             | DescriptorOp::ProtectWindow { .. }
                     ) =>
@@ -1699,7 +1700,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
                         || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
                 }
-                DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
+                DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) => {
+                    entry & (PRESENT | PREPARED) == 0
+                }
                 // A window protect skips holes and edits host-mapped leaves.
                 DescriptorOp::ProtectWindow { permissions, .. } => {
                     entry == 0
