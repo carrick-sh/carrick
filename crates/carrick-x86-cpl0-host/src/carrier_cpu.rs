@@ -805,26 +805,31 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 Ordering::Release,
             );
         }
-        if let CarrierRunExit::PhysicalDoorbell { port, .. } = &exit {
+        if self
+            .maintenance_root
+            .is_some_and(|root| root.address().raw() == (image.cr3 & !0xfff))
+            && matches!(
+                &exit,
+                CarrierRunExit::Kick
+                    | CarrierRunExit::PhysicalDoorbell {
+                        port: carrick_x86::cpl0_entry::WORK_PORT
+                            | carrick_el1_abi::NATIVE_EXEC_PORT,
+                        ..
+                    }
+            )
+        {
             // Exit work can be published after the last child has left its
-            // process root. Only the boot-published maintenance root may
-            // serve that work; it is never a task snapshot or a child MM.
-            // An exec settlement crosses after its CPU left the predecessor
-            // and before it loads the successor; the service authenticates
-            // the settling task and its successor's root.
-            if (*port == carrick_x86::cpl0_entry::WORK_PORT
-                || *port == carrick_el1_abi::NATIVE_EXEC_PORT)
-                && self
-                    .maintenance_root
-                    .is_some_and(|root| root.address().raw() == image.cr3)
-            {
-                self.custody = Custody::Loaded {
-                    binding,
-                    resume,
-                    pending_io,
-                };
-                return Ok(StoppedTaskExit { state: None, exit });
-            }
+            // process root, an exec settlement crosses after leaving the
+            // predecessor root, and a kick can interrupt CPL0's idle scheduler
+            // parked at HLT after `leave_space` (#2962). Only the
+            // boot-published maintenance root may stand here; it has no user
+            // task snapshot to save.
+            self.custody = Custody::Loaded {
+                binding,
+                resume,
+                pending_io,
+            };
+            return Ok(StoppedTaskExit { state: None, exit });
         }
         let target_binding = match &exit {
             // CPL0 schedules descendants in-zone without changing the
@@ -935,6 +940,65 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             debug.phase.store(0, Ordering::Release);
         }
         Ok(saved)
+    }
+    /// Whether the loaded CPU currently stands at a user-mode boundary of
+    /// `task`'s own root address space, where [`Self::save_and_detach`] can
+    /// produce a valid reloadable [`X86ArchContext`] for the host root lease.
+    /// When CPL0 is parked on `maintenance_root`, executing a forked child's
+    /// CR3, or mid-CPL0 supervisor code, a non-shutdown kick must re-enter
+    /// CPL0 rather than overwriting the root task's snapshot (#2962).
+    pub fn can_save_loaded(&self, task: TaskIdentity) -> Result<bool, TrapError> {
+        let Custody::Loaded { binding, .. } = self.custody else {
+            return Err(boundary_error(
+                "carrier save check requires its exact loaded task generation",
+            ));
+        };
+        if binding.task() != task {
+            return Err(boundary_error(
+                "carrier save check requires its exact loaded task generation",
+            ));
+        }
+        let image = self.io.read_image()?;
+        let user_ceiling =
+            carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
+                .exclusive_end();
+        Ok(
+            (image.cr3 & !0xfff) == binding.context().root.address().raw()
+                && image.rip < user_ceiling
+                && image.rsp < carrick_x86::cpl0_entry::DIRECT_VA,
+        )
+    }
+    /// Detach and reset the hardware CPU to its neutral image during carrier
+    /// shutdown without requiring the stopped CPU to stand on a user task
+    /// root (`maintenance_root` or in-zone CPL0 state has no reloadable user
+    /// snapshot, and the closing pool cancels dormant leases without reload).
+    pub fn reset_for_shutdown(&mut self, task: TaskIdentity) -> Result<(), TrapError> {
+        let pending_io = match self.custody {
+            Custody::Loaded {
+                binding,
+                pending_io,
+                ..
+            } if binding.task() == task => pending_io,
+            _ => {
+                return Err(boundary_error(
+                    "carrier shutdown reset requires its exact loaded task generation",
+                ));
+            }
+        };
+        self.custody = Custody::Poisoned;
+        if pending_io {
+            self.io.complete_pending_io()?;
+        }
+        self.io.write_image(&self.neutral)?;
+        audit_image(&self.io.read_image()?, &self.neutral)?;
+        self.custody = Custody::Idle;
+        if let Some(debug) = &self.debug {
+            debug.image(&self.neutral);
+            debug.task_serial.store(0, Ordering::Relaxed);
+            debug.task_execution.store(0, Ordering::Release);
+            debug.phase.store(0, Ordering::Release);
+        }
+        Ok(())
     }
     pub fn audit_idle(&self) -> Result<(), TrapError> {
         if !matches!(self.custody, Custody::Idle) {
@@ -1311,6 +1375,13 @@ pub(crate) mod tests {
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert!(stopped.state.is_none());
         assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert!(
+            !cpu.can_save_loaded(root.binding().task()).unwrap(),
+            "maintenance_root state must not claim a saveable user root snapshot"
+        );
+        cpu.reset_for_shutdown(root.binding().task())
+            .expect("shutdown reset from maintenance_root restores neutral idle custody");
+        cpu.audit_idle().expect("shutdown-reset CPU is neutral");
     }
 
     #[test]
