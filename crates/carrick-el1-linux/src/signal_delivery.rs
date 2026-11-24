@@ -74,6 +74,11 @@ where
             _ => CompletionRoute::InvalidCompletion,
         });
     }
+    // A raw `exit` never returns to user mode: its resumed retry reruns the
+    // saved `exit` with no handler, restart or mask change on the way.
+    if process.raw_exit_in_flight() {
+        return None;
+    }
     if !carrick_personality_linux::signal::signal_delivery_before_work(
         CompletionRoute::Served,
         &task.linux,

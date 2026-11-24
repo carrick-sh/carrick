@@ -1827,10 +1827,16 @@ struct MemberWaitState<'a> {
     /// syscall is; a signal frame or teardown discards it with
     /// `relative_futex_wait` (`discard_rerun_answers`).
     thread_stock_reply: Option<carrick_core_abi::service::CarrierWorkReply>,
+    /// This member's raw `exit` parked on a peer's refundable exit
+    /// reservation. It is exiting: until it retires it takes no signal at
+    /// any user-return gate, as an exiting Linux thread never does, so its
+    /// resumed retry reruns `exit` rather than a handler (#2974).
+    raw_exit: bool,
 }
 impl MemberWaitState<'_> {
     fn is_empty(&self) -> bool {
-        self.relative_futex_wait.is_none()
+        !self.raw_exit
+            && self.relative_futex_wait.is_none()
             && self.accepted_epoll_wait.is_none()
             && self.wait.is_none()
             && self.suspend_mask.is_none()
@@ -2101,6 +2107,9 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     /// relative futex wait, its accepted epoll wait and any thread-stock
     /// answer its rerun never read.
     fn retire_member_retained(&mut self, record: &RecordRef) {
+        if let Some(state) = self.pending.member_mut(record) {
+            state.raw_exit = false;
+        }
         let _ = self.take_relative_futex_wait(record);
         let _ = self.take_accepted_epoll_wait(record);
         let _ = self.take_thread_stock_reply(record);
@@ -2125,6 +2134,13 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
             self.pending.remove_member(record);
         }
         reply
+    }
+
+    /// Whether this member's raw exit is in flight (`MemberWaitState::raw_exit`).
+    fn exiting_raw(&self, record: &RecordRef) -> bool {
+        self.pending
+            .member(record)
+            .is_some_and(|state| state.raw_exit)
     }
 
     fn has_member_wait(&self, record: &RecordRef) -> bool {
@@ -5474,6 +5490,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             return true;
         }
         let graph = self.runtime.graph.lock();
+        // An exiting member owes no signal checkpoint (`raw_exit`).
+        if graph.exiting_raw(&self.record) {
+            return false;
+        }
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
         };
@@ -6780,7 +6800,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 // A contended fork or floor-contended raw exit owns its saved
                 // syscall instruction: the execution lane re-enters it with
-                // every original argument.
+                // every original argument. The exiting member's retained
+                // `raw_exit` keeps every signal gate on the way closed.
                 PendingChildContinuation::Fork | PendingChildContinuation::ExitReservation => {
                     Some(LifecycleOutcome::Redispatch)
                 }
@@ -7498,6 +7519,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .flatten()
     }
 
+    /// This member's raw `exit` is in flight: the user-return gate it passes
+    /// before its saved `exit` reruns delivers no signal.
+    pub(crate) fn raw_exit_in_flight(&self) -> bool {
+        self.runtime.graph.lock().exiting_raw(&self.record)
+    }
+
     /// This member's closing group owes its terminal owner this user return.
     pub(crate) fn terminal_user_return_owed(&self) -> bool {
         self.control.host_exit_requested() && self.pending_close_status().is_some()
@@ -7675,11 +7702,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record)
                 .publish_owner_continuation(OwnerEntry::Syscall);
         }
-        self.runtime.graph.lock().pending.insert_child_wait(
-            self.key,
-            owner,
-            PendingChildContinuation::ExitReservation,
-        );
+        {
+            let mut graph = self.runtime.graph.lock();
+            graph.pending.insert_child_wait(
+                self.key,
+                owner,
+                PendingChildContinuation::ExitReservation,
+            );
+            // From this park on the member is exiting: its resumed retry
+            // passes user-return gates that must not deliver a signal.
+            graph.member_wait_state(self.record).raw_exit = true;
+        }
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
@@ -12823,6 +12856,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         carrick_signal_core::policy::Action,
     )> {
         let graph = self.runtime.graph.lock();
+        // An exiting member is never chosen for delivery; a process-directed
+        // signal stays pending for a live sibling.
+        if graph.exiting_raw(&self.record) {
+            return None;
+        }
         let row = graph.owner.task(self.key).ok()?;
         row.native()
             .resources()

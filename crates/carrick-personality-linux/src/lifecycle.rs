@@ -853,11 +853,6 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn retire_sole_surviving_raw_exit(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
-    /// Redispatch the caller's saved raw `exit` syscall when a new contended
-    /// reservation resolved ahead of a fallback park.
-    fn redispatch_raw_exit(&mut self) -> Option<LifecycleOutcome> {
-        None
-    }
     fn exit_reservation_released(
         &mut self,
         _notification: carrick_core::terminal::TerminalNotification,
@@ -1147,49 +1142,43 @@ pub fn invoke<'a>(
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            match serve_exit(thread, native) {
-                Ok(outcome) => return Some(outcome),
-                Err(decline) => {
-                    if let Some(outcome) = native.retire_closing_thread_exit() {
-                        return Some(outcome);
-                    }
-                    if matches!(decline, ServeExitDecline::Floor) {
-                        match native.await_exit_reservation() {
-                            Some(ExitReservationWait::Parked(outcome)) => return Some(outcome),
-                            Some(ExitReservationWait::ProbeOnce) => {
-                                if let Some(outcome) = native.retire_closing_thread_exit() {
-                                    return Some(outcome);
-                                }
-                                if let Some(outcome) =
-                                    native.retire_sole_surviving_raw_exit(args[0] as u8)
-                                {
-                                    return Some(outcome);
-                                }
-                                match serve_exit(thread, native) {
-                                    Ok(outcome) => return Some(outcome),
-                                    Err(ServeExitDecline::Floor) => {
-                                        if let Some(outcome) = native.retire_closing_thread_exit() {
-                                            return Some(outcome);
-                                        }
-                                        if let Some(ExitReservationWait::Parked(outcome)) =
-                                            native.await_exit_reservation()
-                                        {
-                                            return Some(outcome);
-                                        }
-                                        if let Some(outcome) = native.redispatch_raw_exit() {
-                                            return Some(outcome);
-                                        }
-                                    }
-                                    Err(ServeExitDecline::Other) => {
-                                        if let Some(outcome) = native.retire_closing_thread_exit() {
-                                            return Some(outcome);
-                                        }
-                                    }
-                                }
-                            }
-                            None => {}
+            // A raw exit never returns to user mode (`_exit(2)`): its
+            // re-decisions run here, in ring, never by replaying the saved
+            // `exit` through a user return where a signal could run a
+            // handler in the middle of exit. Each further pass follows a
+            // `ProbeOnce`, which saw no refundable peer reservation under the
+            // wait bucket, so the next pass either reserves above the floor,
+            // finds itself the last thread, finds the group closing, or parks.
+            loop {
+                let decline = match serve_exit(thread, native) {
+                    Ok(outcome) => return Some(outcome),
+                    Err(decline) => decline,
+                };
+                if let Some(outcome) = native.retire_closing_thread_exit() {
+                    return Some(outcome);
+                }
+                if !matches!(decline, ServeExitDecline::Floor) {
+                    break;
+                }
+                match native.await_exit_reservation() {
+                    Some(ExitReservationWait::Parked(outcome)) => return Some(outcome),
+                    Some(ExitReservationWait::ProbeOnce) => {
+                        if let Some(outcome) = native.retire_closing_thread_exit() {
+                            return Some(outcome);
+                        }
+                        if let Some(outcome) = native.retire_sole_surviving_raw_exit(args[0] as u8)
+                        {
+                            return Some(outcome);
+                        }
+                        // The same last-thread check a fresh `exit` entry
+                        // makes above, without leaving the ring.
+                        if carrick_core::terminal::raw_exit_is_process(thread.page)
+                            && let Some(outcome) = native.process_exit_group(args[0] as u8)
+                        {
+                            return Some(outcome);
                         }
                     }
+                    None => break,
                 }
             }
             let binding = native.binding()?;
