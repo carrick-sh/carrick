@@ -746,6 +746,10 @@ fn a_zone_vcpu_moved_off_the_mm_is_drained_while_it_stays_in_guest() {
     vcpu.flag.leave_guest();
 }
 
+/// The process-global guest COW settlement is one slot: tests that install
+/// a recorder hold this for as long as they read it (#2947 review).
+static GUEST_COW_RECORDER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Records every settlement: the MM key, and whether its EL1 editor was
 /// already gone and the gate raised in `spaces` when it ran.
 struct RecordingSettlement {
@@ -770,6 +774,7 @@ impl carrick_el1_abi::CowGrantSettlement for RecordingSettlement {
 /// settlement after the admitted editor left and with the gate raised.
 #[test]
 fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
+    let _serial = GUEST_COW_RECORDER.lock();
     let (spaces, occupancy) = space_tables();
     let recorder = Arc::new(RecordingSettlement {
         spaces,
@@ -827,13 +832,16 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
 /// #2947: a fork whose parent has an unsettled guest COW completion is
 /// retained as carrier work, and the answer to that work settles the MM
 /// itself. With no completion it excludes nothing. With one, and the MM's
-/// EL1 editor held on another vCPU, the answer waits for that editor to
-/// leave and then settles under the raised gate: "not now" once, then the
-/// settlement the fork's rerun needs, with no other exclusion of the MM.
+/// EL1 editor held on another vCPU, the answer must not wait for that
+/// editor (the carrier would spin in its acknowledgement for as long as the
+/// sibling holds it): it leaves the completion unsettled, lowers the gate it
+/// raised, and answers at once, so the fork parks on the editor's release.
+/// After the release, the next answer settles under its own exclusion.
 #[test]
-fn carrier_work_answer_settles_the_requesters_unsettled_guest_cow() {
+fn carrier_work_answer_leaves_a_held_editor_to_the_forks_wait() {
     static POOL: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
     const KEY: u64 = 42_311;
+    let _serial = GUEST_COW_RECORDER.lock();
     let (spaces, occupancy) = space_tables();
     let recorder = Arc::new(RecordingSettlement {
         spaces,
@@ -858,7 +866,7 @@ fn carrier_work_answer_settles_the_requesters_unsettled_guest_cow() {
     let mm_fence = fence();
     let publication = publish_for_test(spaces, occupancy, mm(KEY), &mm_fence, 0x3c00).unwrap();
 
-    settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+    let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
     assert!(ours().is_empty(), "nothing unsettled: no exclusion");
 
     let nz = |v| std::num::NonZeroU64::new(v).unwrap();
@@ -890,24 +898,36 @@ fn carrier_work_answer_settles_the_requesters_unsettled_guest_cow() {
         .try_begin_edit(index, KEY, nz(9))
         .expect("a sibling's EL1 edit holds the editor");
     let answer = std::thread::spawn(move || {
-        settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
+        let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
     });
-    for _ in 0..1_000_000 {
-        if spaces.gate(index) != 0 {
-            break;
-        }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !answer.is_finished() && std::time::Instant::now() < deadline {
         std::thread::yield_now();
     }
+    let answered = answer.is_finished();
+    // Let a waiting answer finish before asserting, so a failure joins it.
+    drop(editor);
+    answer.join().unwrap();
+    assert!(
+        answered,
+        "the carrier-work answer waited for the sibling's EL1 editor"
+    );
     assert!(
         ours().is_empty(),
         "no settlement while the sibling's editor may still complete a COW"
     );
-    drop(editor);
-    answer.join().unwrap();
+    assert!(POOL.has_completions_for(KEY), "the completion stays owed");
+    assert_eq!(
+        spaces.gate(index),
+        0,
+        "the answer lowered the gate it raised"
+    );
+
+    let _ = settle_unsettled_guest_cow_in(tables(), Some(&POOL), mm(KEY));
     assert_eq!(
         ours(),
         vec![(KEY, true)],
-        "the answer settled the requester's MM under its own exclusion"
+        "after the release, the answer settled the requester's MM under its own exclusion"
     );
     drop(publication);
 }
