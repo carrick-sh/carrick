@@ -4579,3 +4579,167 @@ fn retirement_refuses_symlink_include_target() {
         );
     }
 }
+
+/// `crates/example` builds `crates/shared/src/mailbox.rs` as a module of its
+/// own through a sibling-crate `#[path]` (carrick-runtime's
+/// `hvf_mailbox_tests`).
+const SIBLING_PATH_MOD: &str =
+    "#[cfg(test)] #[path = \"../../shared/src/mailbox.rs\"] mod mailbox_tests;";
+
+fn path_module_fixture(lib: &str, target: &str) -> tempfile::TempDir {
+    let dir = include_fixture(lib, "");
+    write_source(
+        dir.path(),
+        "crates/shared/Cargo.toml",
+        "[package]\nname = 'shared'\n",
+    );
+    write_source(dir.path(), "crates/shared/src/mailbox.rs", target);
+    dir
+}
+
+#[test]
+fn retirement_follows_a_sibling_crate_path_module() {
+    // The followed file is scanned, so the retirement resolves instead of
+    // refusing the whole crate (#2916's receipt gate).
+    let dir = path_module_fixture(
+        SIBLING_PATH_MOD,
+        "pub fn helper() {} #[cfg(test)] mod tests { #[test] fn kept() {} }",
+    );
+    assert!(!tree_has_test(dir.path(), "example", "gone").unwrap());
+    assert!(tree_has_test(dir.path(), "example", "mailbox_tests::tests::kept").unwrap());
+}
+
+#[test]
+fn retirement_applies_across_a_sibling_crate_path_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(&cand, "crates/example/tests/foo.rs", "");
+    write_source(&cand, "crates/example/src/lib.rs", SIBLING_PATH_MOD);
+    write_source(&cand, "crates/shared/src/mailbox.rs", "pub fn helper() {}");
+    let diff = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .unwrap_or_else(|error| panic!("sibling-crate #[path] refused: {error}"));
+    assert!(
+        !format!("{diff:?}").contains("missing:foo::gone"),
+        "{diff:?}"
+    );
+}
+
+#[test]
+fn retirement_refuses_when_the_path_module_target_still_has_the_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(&cand, "crates/example/tests/foo.rs", "");
+    write_source(&cand, "crates/example/src/lib.rs", SIBLING_PATH_MOD);
+    write_source(
+        &cand,
+        "crates/shared/src/mailbox.rs",
+        "#[cfg(test)] mod tests { #[test] fn gone() {} }",
+    );
+    let error = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .expect_err("a test kept in the #[path] target was excused");
+    assert!(
+        error
+            .to_string()
+            .contains("still exists in candidate source"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retirement_refuses_a_path_module_target_outside_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    write_source(
+        &root,
+        "crates/example/src/lib.rs",
+        "#[path = \"../../../../outside.rs\"] mod outside;",
+    );
+    write_source(dir.path(), "outside.rs", "#[test] fn gone() {}");
+    let error = tree_has_test(&root, "example", "gone").unwrap_err();
+    assert!(
+        error.to_string().contains("cannot resolve #[path] module"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retirement_refuses_a_path_module_target_that_declares_out_of_line_modules() {
+    // `mod more;` in the followed file resolves next to it, outside the
+    // owning crate's scanned files: refuse rather than guess.
+    let dir = path_module_fixture(SIBLING_PATH_MOD, "mod more;");
+    write_source(
+        dir.path(),
+        "crates/shared/src/more.rs",
+        "#[test] fn gone() {}",
+    );
+    let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+    assert!(error.to_string().contains("out-of-line modules"), "{error}");
+}
+
+#[test]
+fn retirement_follows_nested_path_modules_and_refuses_unresolvable_ones() {
+    let dir = path_module_fixture(SIBLING_PATH_MOD, "#[path = \"leaf.rs\"] mod leaf;");
+    write_source(
+        dir.path(),
+        "crates/shared/src/leaf.rs",
+        "#[test] fn gone() {}",
+    );
+    assert!(tree_has_test(dir.path(), "example", "gone").unwrap());
+
+    let dir = path_module_fixture(SIBLING_PATH_MOD, "#[path = \"missing.rs\"] mod leaf;");
+    let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+    assert!(
+        error.to_string().contains("cannot resolve #[path] module"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_refuses_a_symlinked_path_module_target() {
+    for link_dir in [false, true] {
+        let dir = path_module_fixture(SIBLING_PATH_MOD, "");
+        let shared = dir.path().join("crates/shared");
+        std::fs::remove_file(shared.join("src/mailbox.rs")).unwrap();
+        if link_dir {
+            std::fs::rename(shared.join("src"), shared.join("real")).unwrap();
+            write_source(&shared, "real/mailbox.rs", "");
+            std::os::unix::fs::symlink(shared.join("real"), shared.join("src")).unwrap();
+        } else {
+            write_source(&shared, "src/real.rs", "");
+            std::os::unix::fs::symlink(shared.join("src/real.rs"), shared.join("src/mailbox.rs"))
+                .unwrap();
+        }
+        let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot resolve #[path] module"),
+            "{link_dir}: {error}"
+        );
+    }
+}
+
+#[test]
+fn retirement_scan_resolves_the_real_runtime_crate() {
+    // carrick-runtime builds HVF's syscall mailbox as `hvf_mailbox_tests`
+    // through a sibling-crate `#[path]`: its tests must stay retirable.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let found = tree_has_test(&root, "carrick_runtime", "a_test_name_that_does_not_exist")
+        .expect("carrick-runtime sources must resolve for test retirement");
+    assert!(!found);
+}
