@@ -743,6 +743,11 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 (entry & !(PRESENT | PREPARED | COW)) | RETIRED
             }
+            // An unlink drops a host-mapped leaf (a shared file window page,
+            // #1338, or a host alias). Private custody only ever retires.
+            DescriptorOp::Unmap(_) if entry & PRIVATE != 0 => {
+                return Err(DescriptorRefusal::WrongBacking);
+            }
             DescriptorOp::Unmap(_) => 0,
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
         };

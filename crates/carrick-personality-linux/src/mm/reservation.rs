@@ -115,7 +115,9 @@ pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
             custody.union(ReservationNodeFlags::SHARED_READ_ONLY)
         }
         FileMapSharing::SharedReadOnly => return Err(Refusal::Invalid),
-        FileMapSharing::Shared => ReservationNodeFlags::FILE,
+        FileMapSharing::Shared => {
+            ReservationNodeFlags::FILE.union(ReservationNodeFlags::SHARED_WINDOW)
+        }
     };
     if root.has_pending_edit() || root.fork_pending() {
         return Err(Refusal::Busy);
