@@ -395,3 +395,108 @@ fn stage2_state_holds_its_custody_in_tests_too() {
         "test fixtures must own their custody; `legacy_test_carrier_vm_custody` is named {legacy} times"
     );
 }
+
+fn crate_sources(name: &str) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    rust_sources(&workspace().join("crates").join(name).join("src"), &mut out);
+    assert!(!out.is_empty(), "{name} sources not found");
+    out
+}
+
+/// The soft aarch64 carrier hands its own `Stage2Backend` to the same
+/// custody HVF uses (#1236 slice D, M3 of the custody move). The VM
+/// lifecycle and stage-2 record table live in `carrick-aarch64` as
+/// `Stage2Custody`, built with its backend; HVF's `CarrierVmCustody` embeds
+/// one; the soft carrier builds one over its `SoftStage2`; and nothing
+/// outside `carrick-vmm-hvf` names `HvfStage2`.
+#[test]
+fn soft_carrier_custody_holds_its_own_backend() {
+    let neutral = workspace().join("crates/carrick-aarch64/src/stage2/custody.rs");
+    let neutral = std::fs::read_to_string(&neutral).unwrap_or_else(|error| {
+        panic!(
+            "the neutral stage-2 custody must live in {}: {error}",
+            neutral.display()
+        )
+    });
+    let fields = struct_fields(&neutral, "Stage2Custody");
+    for field in ["backend", "state"] {
+        assert!(
+            fields.iter().any(|f| f == field),
+            "`Stage2Custody` must hold `{field}`, has {fields:?}"
+        );
+    }
+    let params =
+        fn_params(&neutral, "new").unwrap_or_else(|| panic!("`Stage2Custody` must have `fn new(`"));
+    assert!(
+        params.contains("Stage2Backend"),
+        "`Stage2Custody::new` must take its backend, has ({params})"
+    );
+    for moved in ["struct CarrierVmCustodyState", "enum CarrierVmLifecycle"] {
+        assert!(
+            !neutral.contains(moved),
+            "the neutral custody names its state for every carrier, not `{moved}`"
+        );
+    }
+
+    let hvf = hvf_sources();
+    let (_, custody_source) = hvf
+        .iter()
+        .find(|(path, _)| path.ends_with("trap/carrier_custody.rs"))
+        .expect("trap/carrier_custody.rs");
+    let hvf_fields = struct_fields(custody_source, "CarrierVmCustody");
+    for retired in ["stage2_backend", "state"] {
+        assert!(
+            !hvf_fields.iter().any(|f| f == retired),
+            "`CarrierVmCustody` must reach `{retired}` through its `Stage2Custody`, has {hvf_fields:?}"
+        );
+    }
+    assert!(
+        custody_source.contains("Stage2Custody"),
+        "`CarrierVmCustody` must embed the neutral `Stage2Custody`"
+    );
+    for moved in ["struct CarrierVmCustodyState", "enum CarrierVmLifecycle"] {
+        assert_eq!(
+            count(&hvf, moved),
+            0,
+            "`{moved}` must move to the neutral custody, not stay in carrick-vmm-hvf"
+        );
+    }
+
+    let soft = crate_sources("carrick-softcpu-aarch64-host");
+    assert!(
+        count(&soft, "Stage2Backend for ") == 1,
+        "the soft carrier must implement `Stage2Backend` exactly once"
+    );
+    assert!(
+        count(&soft, "Stage2Custody::new(") >= 1,
+        "the soft carrier must build its `Stage2Custody` over its own backend"
+    );
+
+    let mut crates: Vec<_> = std::fs::read_dir(workspace().join("crates"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("src").is_dir())
+        .collect();
+    crates.sort();
+    let named: Vec<String> = crates
+        .iter()
+        .filter(|path| !path.ends_with("carrick-vmm-hvf") && !path.ends_with("carrick-xtask"))
+        .flat_map(|path| {
+            let mut sources = Vec::new();
+            rust_sources(&path.join("src"), &mut sources);
+            sources
+        })
+        .flat_map(|(path, source)| {
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("HvfStage2"))
+                .map(|(index, line)| format!("{}:{}: {}", path.display(), index + 1, line.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        named.is_empty(),
+        "only carrick-vmm-hvf may name `HvfStage2`: {named:?}"
+    );
+}
