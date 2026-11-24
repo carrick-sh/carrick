@@ -91,7 +91,6 @@ _start:
     mov %ebx, %edi
     mov $5, %esi
     call dynamic_id
-    call clock_ns
     call user_share
     /* The root thread was parked: its own clock is under half. */
     mov $83, %r14d
@@ -219,7 +218,6 @@ _start:
     mov %ebx, %edi
     mov $1, %esi
     call dynamic_id
-    call clock_ns
     call user_share
     /* The child is not a thread of the root's thread group. */
     mov $65, %r14d
@@ -377,7 +375,6 @@ child:
     xor %edi, %edi
     mov $1, %esi
     call dynamic_id
-    call clock_ns
     call user_share
     mov $2, %edi
     call clock_ns
@@ -425,16 +422,21 @@ reap_child:
     shr $8, %edi
     ret
 
-/* A user-time-only (VIRT) reading %rax against its total %r13: a busy loop
- * is mostly user time. Allow a tick of sampling skew above, and a quarter
- * below. */
+/* The VIRT (user-only) clock %edi, then its PROF (user plus system) clock:
+ * 0 < VIRT <= PROF, for a task that has burned user time. Linux samples
+ * both on the tick, so only their order is exact. */
 user_share:
-    lea 20000000(%r13), %rcx
-    cmp %rcx, %rax
+    push %rdi
+    call clock_ns
+    pop %rdi
+    test %rax, %rax
+    jz wrong
+    push %rax
+    and $-4, %edi
+    call clock_ns
+    pop %rcx
+    cmp %rax, %rcx
     ja wrong
-    shl $2, %rax
-    cmp %r13, %rax
-    jb wrong
     ret
 
 /* ~pid << 3 | bits, as clock_getcpuclockid(3) builds it: %edi pid, %esi bits. */
