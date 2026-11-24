@@ -1094,7 +1094,8 @@ impl SyscallDispatcher {
                         Err(errno) => return Served::errno(errno),
                     };
                 match self.fs_view().fallocate(description, mode, range) {
-                    Ok(outcome) => served_outcome(outcome, Vec::new()),
+                    // ENOSYS is the window shrink fence: a counted refusal.
+                    Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,
                 }
@@ -1927,6 +1928,24 @@ impl SyscallDispatcher {
             Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
             _ => return Served::Refused,
         };
+        // A window maps the host file's own pages: record its inode before
+        // the source exists, so every later shrink of it, by any process of
+        // the run, is fenced (#1338 A1). An inode the fence cannot name is
+        // never windowed.
+        if route == NativeMapRoute::Window {
+            let identity = description
+                .inspect_kind(|open| match open {
+                    crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
+                        host_fd.inode_identity()
+                    }
+                    _ => None,
+                })
+                .flatten();
+            let Some(identity) = identity else {
+                return Served::Refused;
+            };
+            self.fs.window_inodes.record(identity);
+        }
         match self.mem().retain_native_private_source(reference, label) {
             Some((source, identity)) => Served::Source(
                 source,
