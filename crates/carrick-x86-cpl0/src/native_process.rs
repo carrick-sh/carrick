@@ -461,6 +461,10 @@ impl Service {
             return refusal;
         }
         let mm = request.operation.mm;
+        #[cfg(feature = "test-support")]
+        if let Some(zone) = owner.zone {
+            crate::test_support::hold_editor_for_fork_cow_settle(zone, self.worker(), mm.raw());
+        }
         let Some((editor, _)) =
             owner.fork_parent_editor(mm, request.operation.incarnation, self.worker())
         else {
@@ -474,6 +478,8 @@ impl Service {
         if cow.has_completions_for(mm.raw()) {
             NativeProcessError::OwnerWait(editor)
         } else {
+            #[cfg(feature = "test-support")]
+            crate::test_support::record_fork_cow_settled();
             NativeProcessError::Busy
         }
     }

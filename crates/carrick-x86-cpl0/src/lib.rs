@@ -188,6 +188,96 @@ mod test_support {
     pub const INJECT_SELECTED_SERVE_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe40;
     /// Selected-window serves the armed hold refused.
     pub const INJECT_SELECTED_SERVE_BUSY_CENSUS: u64 = 0xffff_ffff_ffff_fe41;
+    /// The next native fork that finds its parent's COW completions
+    /// unsettled (#2947) finds the parent's editor held by a real holder
+    /// across its settlement crossing, so the carrier settles nothing and
+    /// the fork waits for the editor. The holder releases the editor
+    /// through its production release once the fork has parked.
+    pub const INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE: u64 = 0xffff_ffff_ffff_fe34;
+    /// Bits 32..48: settlement crossings the armed editor hold covered;
+    /// 16..32: holds released with their fork parked on the editor;
+    /// 0..16: fork settlement crossings that left the parent settled.
+    pub const INJECT_FORK_COW_SETTLE_CENSUS: u64 = 0xffff_ffff_ffff_fe35;
+    /// The armed member: the fork whose park releases the held editor.
+    static FORK_COW_EDITOR_WAITER: carrick_el1::lock::SpinLock<
+        Option<carrick_sched_core::RecordRef>,
+    > = carrick_el1::lock::SpinLock::new(None);
+    static FORK_COW_EDITOR_HOLDS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static FORK_COW_EDITOR_PARKED_RELEASES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static FORK_COW_SETTLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The editor an injected fork hold names: no member of this zone.
+    const FORK_COW_EDITOR_HOLDER: core::num::NonZeroU64 = core::num::NonZeroU64::MAX;
+    /// The held editor and the fork whose park releases it.
+    struct HeldForkEditor {
+        editor: carrick_sched_core::spaces::SpaceEditor<
+            'static,
+            carrick_sched_core::ParkedContextWords,
+        >,
+        waiter: carrick_sched_core::RecordRef,
+    }
+    // SAFETY: the guard names the one static zone's space entry and its
+    // release venue (a plain function delivery); it moves between this
+    // image's CPUs only under the lock below.
+    unsafe impl Send for HeldForkEditor {}
+    static FORK_COW_EDITOR: carrick_el1::lock::SpinLock<Option<HeldForkEditor>> =
+        carrick_el1::lock::SpinLock::new(None);
+
+    /// Called by a native fork that refused on its parent's unsettled COW
+    /// completions, before it observes the parent's editor and rings the
+    /// settlement crossing, on the forking member's CPU: when armed, take
+    /// the parent's real editor for the forking record's park to release.
+    pub fn hold_editor_for_fork_cow_settle(
+        zone: &'static carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        slot: u32,
+        mm: u64,
+    ) {
+        let Some(waiter) = FORK_COW_EDITOR_WAITER.lock().take() else {
+            return;
+        };
+        let (Some(slot), Some(index)) = (
+            carrick_sched_core::SlotId::from_index(slot as usize),
+            zone.spaces.find(mm),
+        ) else {
+            carrick_x86_carrier::entry::fatal_boot!();
+        };
+        let Some(editor) =
+            carrick_core::wait::space_access(zone, slot, crate::native_process::release)
+                .try_begin_edit(index, mm, FORK_COW_EDITOR_HOLDER)
+        else {
+            carrick_x86_carrier::entry::fatal_boot!();
+        };
+        *FORK_COW_EDITOR.lock() = Some(HeldForkEditor { editor, waiter });
+        FORK_COW_EDITOR_HOLDS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The fork's settlement crossing returned with its parent settled.
+    pub fn record_fork_cow_settled() {
+        FORK_COW_SETTLED.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Called on each scheduler entry: once the fork that met the held
+    /// editor has parked, drop the editor, whose release wakes it.
+    pub fn release_fork_cow_editor_on_park(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    ) {
+        let mut held = FORK_COW_EDITOR.lock();
+        let Some(waiter) = held.as_ref().map(|held| held.waiter) else {
+            return;
+        };
+        if !matches!(
+            source.zone.record(waiter.id).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ) {
+            return;
+        }
+        let released = held.take();
+        drop(held);
+        FORK_COW_EDITOR_PARKED_RELEASES.fetch_add(1, Ordering::AcqRel);
+        drop(released.map(|held| held.editor));
+    }
+
     /// Address of the armed member's current task, or 0.
     static SELECTED_SERVE_BUSY_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -1070,6 +1160,30 @@ mod test_support {
                     });
                 Some(0)
             }
+            INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE => {
+                // The caller is the member whose next fork the hold covers.
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                // A CPU's home thread runs as its slot's host record.
+                let record = zone
+                    .slot(slot)
+                    .current()
+                    .or_else(|| zone.slot(slot).host_record())?;
+                let waiter = zone.record_ref(record);
+                let mut armed = FORK_COW_EDITOR_WAITER.lock();
+                if armed.is_some() || FORK_COW_EDITOR.lock().is_some() {
+                    return None;
+                }
+                *armed = Some(waiter);
+                Some(0)
+            }
+            INJECT_FORK_COW_SETTLE_CENSUS => Some(
+                ((FORK_COW_EDITOR_HOLDS.load(Ordering::Acquire) & 0xffff) << 32)
+                    | ((FORK_COW_EDITOR_PARKED_RELEASES.load(Ordering::Acquire) & 0xffff) << 16)
+                    | (FORK_COW_SETTLED.load(Ordering::Acquire) & 0xffff),
+            ),
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)
                     | (OWNED_COPY_RERUNS.load(Ordering::Acquire) & u64::from(u32::MAX)),
