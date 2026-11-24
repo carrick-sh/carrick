@@ -486,11 +486,6 @@ impl<
     fn retire_sole_surviving_raw_exit(&mut self, status: u8) -> Option<LifecycleOutcome> {
         self.process_venue()?.retire_sole_surviving_raw_exit(status)
     }
-    fn redispatch_raw_exit(&mut self) -> Option<LifecycleOutcome> {
-        let _venue = self.process_venue()?;
-        self.frame.restart_syscall();
-        Some(LifecycleOutcome::Redispatch)
-    }
     fn exit_reservation_released(
         &mut self,
         notification: carrick_core::terminal::TerminalNotification,
