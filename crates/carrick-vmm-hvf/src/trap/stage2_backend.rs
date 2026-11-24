@@ -530,6 +530,8 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfCarrierStage2 {
 
     unsafe fn destroy(&self) -> Stage2Status {
         #[cfg(test)]
+        RAW_STAGE2_DESTROYS.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
         if let Some(scripted) = SCRIPTED_STAGE2_DESTROY.with(|cell| cell.take()) {
             if scripted.is_success() {
                 clear_replay_mappings();
@@ -551,6 +553,15 @@ thread_local! {
     /// calling the hypervisor (test double for a lifecycle test's VM).
     static SCRIPTED_STAGE2_DESTROY: std::cell::Cell<Option<Stage2Status>> =
         const { std::cell::Cell::new(None) };
+    /// How many raw destroys reached the carrier backend on this thread.
+    static RAW_STAGE2_DESTROYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many raw destroys reached the carrier backend on this thread: what a
+/// lifecycle test counts to show a refused transition never destroys.
+#[cfg(test)]
+pub(crate) fn raw_stage2_destroy_count() -> usize {
+    RAW_STAGE2_DESTROYS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

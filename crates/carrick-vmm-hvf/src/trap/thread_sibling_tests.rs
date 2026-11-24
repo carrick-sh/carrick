@@ -1014,7 +1014,7 @@ fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap(
     destroy_vm_with_custody_using(
         &custody,
         "terminal carrier mapping fixture",
-        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        carrick_aarch64::stage2::Stage2Status::SUCCESS,
         || {},
     )
     .expect("exact custody destroy commits");

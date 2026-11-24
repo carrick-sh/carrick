@@ -6590,7 +6590,7 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
     destroy_vm_with_custody_using(
         &transport.custody,
         "structural G1 destroy",
-        || carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        carrick_aarch64::stage2::Stage2Status::SUCCESS,
         || {},
     )
     .expect("destroy G1 structural fixture");
