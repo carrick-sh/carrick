@@ -608,6 +608,15 @@ impl AddressSpaces {
         self.excluded(index)
     }
 
+    /// Host: after [`Self::raise`], the exclusion proof iff no admitted
+    /// guest editor remains. `None` while one holds the space: the caller
+    /// lowers the gate it raised instead of waiting the holder out. SeqCst
+    /// as in [`Self::raise_and_wait_for_editor`]: an editor admitted before
+    /// the raise is seen here, and a later one sees the gate.
+    pub fn excluded_without_editor(&self, index: SpaceIndex) -> Option<ExcludedEditor<'_>> {
+        (self.entry(index).active_editor.load(Ordering::SeqCst) == 0).then(|| self.excluded(index))
+    }
+
     fn excluded(&self, index: SpaceIndex) -> ExcludedEditor<'_> {
         ExcludedEditor {
             key: self.entry(index).key.load(Ordering::SeqCst),
