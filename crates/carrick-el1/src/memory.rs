@@ -4173,6 +4173,139 @@ mod tests {
             }
         }
 
+        /// #2986: a parked call's reprobe tells a counted page-table pause
+        /// from a closed (retiring) space. A raised pause is "not now": the
+        /// call waits on the gate and reruns once the host lowers it. A
+        /// closed gate never opens again for this MM, so the reprobe refuses
+        /// instead of enrolling on a release that never comes, even with a
+        /// pause still counted under it. Both ISA call views reach the one
+        /// shared reprobe and the one delegated admission.
+        #[test]
+        fn two_isa_parked_reprobe_refuses_a_closed_space_and_waits_out_a_counted_pause() {
+            use carrick_guest_arch::{GuestIsa, UserVa};
+            use carrick_sched_core::SlotId;
+            use carrick_sched_core::spaces::notification::SpaceAccess;
+            const SLOT: u32 = 7;
+            for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+                let (spaces, table, counters) =
+                    (AddressSpaces::new(), table(), Counters::default());
+                let task = mm(&spaces, &table, 17, true);
+                let mut editor = Editor::over(RangeBacking::Empty);
+                let (route, _) = syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    mmap_fixed(ARENA, 0x2000),
+                );
+                assert_eq!(route, DelegatedAnonymous::Served);
+                editor.calls.clear();
+                let index = spaces.find(task.key).unwrap();
+                let mm_key = ReservationMm::new(task.key).unwrap();
+                let generation = root(&spaces, &table, &task).generation();
+                let args = [ARENA, 0x1000, 0, 0, 0, 0];
+                let mut native = AnonymousCall::new(
+                    carrick_core::CallOrdinal::from_raw(SYS_MUNMAP),
+                    args,
+                    0,
+                    SlotId::from_index(SLOT as usize).unwrap(),
+                    UserVa::new(0x40004),
+                );
+                let mut arm = TrapFrame {
+                    slot: u64::from(SLOT),
+                    elr: 0x40004,
+                    ..TrapFrame::default()
+                };
+                arm.x[8] = SYS_MUNMAP;
+                arm.x[..6].copy_from_slice(&args);
+                let call: &mut dyn AnonymousCallView = match isa {
+                    GuestIsa::Aarch64 => &mut arm,
+                    GuestIsa::X86_64 => &mut native,
+                };
+                let probe = |call: &dyn AnonymousCallView| {
+                    probe_parked_anonymous_edit(
+                        call,
+                        &task.task,
+                        SpaceAccess::source_free(&spaces),
+                        &*table,
+                        index,
+                        mm_key,
+                        SLOT,
+                        ServiceOrigin::Initial,
+                        &crate::alloc::GLOBAL_ALLOCATOR,
+                    )
+                };
+                let delegated = |call: &mut dyn AnonymousCallView, editor: &mut Editor| {
+                    serve_delegated_anonymous(
+                        call,
+                        &counters,
+                        &task.task,
+                        SpaceAccess::source_free(&spaces),
+                        &*table,
+                        editor,
+                        None,
+                    )
+                };
+
+                // A counted pause: the call parks on the gate, its reprobe
+                // keeps waiting while the pause holds, and reruns after it
+                // lowers.
+                spaces.raise(index);
+                assert_eq!(
+                    delegated(call, &mut editor),
+                    DelegatedAnonymous::Contended(SpaceWaitCause::Gate),
+                    "{isa:?}: a raised pause is contention"
+                );
+                assert_eq!(
+                    probe(call),
+                    Some(Some(SpaceWaitCause::Gate)),
+                    "{isa:?}: the reprobe waits out a raised pause"
+                );
+                spaces.lower(index);
+                assert_eq!(
+                    probe(call),
+                    Some(None),
+                    "{isa:?}: a lowered pause reruns the call"
+                );
+
+                // Permanent closure, with a pause still counted under it and
+                // the entry still naming the MM: no release reopens it.
+                spaces.raise(index);
+                spaces.close(index);
+                assert_eq!(
+                    probe(call),
+                    None,
+                    "{isa:?}: a closed space refuses the parked call, never a gate wait"
+                );
+                spaces.lower(index);
+                assert_eq!(
+                    probe(call),
+                    None,
+                    "{isa:?}: lowering the pause leaves the space closed"
+                );
+                assert_eq!(
+                    delegated(call, &mut editor),
+                    DelegatedAnonymous::Forward,
+                    "{isa:?}: a closed space is a refusal, not contention"
+                );
+                assert_eq!(
+                    counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::NoGrant as usize]
+                        .load(Ordering::Relaxed),
+                    1,
+                    "{isa:?}: the closed space leaves as NoGrant"
+                );
+                assert!(editor.calls.is_empty(), "{isa:?}: no descriptor step");
+                assert_eq!(
+                    root(&spaces, &table, &task).generation(),
+                    generation,
+                    "{isa:?}: neither refusal nor wait proposes an edit"
+                );
+                assert!(root(&spaces, &table, &task).mapping(ARENA).is_some());
+            }
+        }
+
         #[test]
         fn delegated_busy_root_replays_and_unservable_steps_leave_the_root_unchanged() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
