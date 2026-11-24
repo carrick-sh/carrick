@@ -285,6 +285,10 @@
       "issue": 2646
     },
     {
+      "owner": "carrick_kernel::el1_zone::hand_back_carrier_completions",
+      "issue": 2928
+    },
+    {
       "owner": "carrick_softcpu_aarch64_host::rootfs_command::read_head",
       "issue": 1236
     },

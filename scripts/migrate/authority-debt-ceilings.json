@@ -2754,6 +2754,13 @@
     },
     {
       "family": "fatal_carrier_fault",
+      "operation": "fatal:el1_zone::carrier_handback",
+      "owner": "carrick_kernel::el1_zone::hand_back_carrier_completions",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "fatal_carrier_fault",
       "operation": "fatal:kernel::bootstrap_identity",
       "owner": "carrick_kernel::kernel::core::Kernel::bootstrap_root",
       "lane": "shared",
