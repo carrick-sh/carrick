@@ -11,9 +11,18 @@
  * so its copy-on-write is not part of the contention. -DCOW_UNDER_CONTENTION
  * leaves that first write to the churn loop's `call`, where the sibling may
  * hold the MM's editor when the fault's copy is supplied.
+ *
+ * -DKEEP_CHURNING keeps each thread churning after a failed call (it still
+ * keeps the first errno), so the threads stay contended for every round
+ * whatever a call returned (#2763's fault park).
  */
 #define ROUNDS 2000
 #define LEN 0x10000
+#ifdef KEEP_CHURNING
+#define ON_ERROR keep
+#else
+#define ON_ERROR record
+#endif
 #define FUTEX_WAIT 0
 .global _start
 .text
@@ -106,7 +115,7 @@ churn:
     mov $9, %eax
     syscall
     test %rax, %rax
-    js record
+    js ON_ERROR
     mov %rax, %r14
     movb $1, (%r14)
     mov %r14, %rdi
@@ -115,14 +124,14 @@ churn:
     mov $10, %eax
     syscall
     test %eax, %eax
-    jnz record
+    jnz ON_ERROR
     mov %r14, %rdi
     mov $LEN, %esi
     mov $11, %eax
     syscall
     test %eax, %eax
-    jnz record
-    dec %r15d
+    jnz ON_ERROR
+2:  dec %r15d
     jnz 1b
     ret
 /* Keep the first errno; later ones do not replace it. */
@@ -132,4 +141,13 @@ record:
     xor %eax, %eax
     lock cmpxchg %ecx, 0x10(%r12)
     ret
+#ifdef KEEP_CHURNING
+/* As `record`, then the next round. */
+keep:
+    neg %eax
+    mov %eax, %ecx
+    xor %eax, %eax
+    lock cmpxchg %ecx, 0x10(%r12)
+    jmp 2b
+#endif
 .section .note.GNU-stack,"",@progbits

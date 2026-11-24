@@ -7674,6 +7674,51 @@ reservation_shape_witness!(
      committed page and the child reserves 1 GiB more."
 );
 
+/// #2763: two threads of one forked child churn `mmap`, first touch,
+/// `mprotect` and `munmap` on their shared MM for every round, whatever a call
+/// returns. A fault that one cause refused, and whose probe then named
+/// another, parked rechecking the first cause: the recheck never matched, the
+/// CPU spun with interrupts masked and never acknowledged its sibling's TLB
+/// shootdown, and the sender's CPL0 kernel died at the fatal port (`0xcc`).
+///
+/// Scoped to that claim: each run must end without a CPL0 kernel fatal. A run
+/// may still end on a host-owner refusal (#2766) or with a returned errno;
+/// the full contract is the ignored test below.
+#[test]
+fn native_child_threaded_mm_faults_acknowledge_every_shootdown() {
+    let elf = native_exit_fixture_with_flags("native_child_threaded_mm.S", &["-DKEEP_CHURNING"]);
+    let cpl0_fatal = |text: &str| {
+        [
+            "port 0xcc",
+            "doorbell 0xcc",
+            "CPL0 kernel panic",
+            "CPL0 fatal exit",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    };
+    let endings: Vec<String> = (0..3)
+        .map(|_| {
+            match try_run_pool_fixture_with_root_affinity(
+                &elf,
+                1 << 20,
+                kvm_pool_fixture::ROOT_AFFINITY_ANY,
+            ) {
+                Ok(outcome) => format!(
+                    "exit {} signal {:?}",
+                    outcome.run.exit_code, outcome.run.terminating_signal
+                ),
+                Err(error) => format!("{error:?}"),
+            }
+        })
+        .collect();
+    eprintln!("#2763 threaded mm endings: {endings:?}");
+    assert!(
+        !endings.iter().any(|ending| cpl0_fatal(ending)),
+        "a run ended in a CPL0 kernel fatal (an unacknowledged shootdown is #2763): {endings:?}"
+    );
+}
+
 /// #2749 fatal 1: two threads of one forked child run `mmap`, first touch,
 /// `mprotect` and `munmap` at once on their shared MM. They contend for the
 /// MM's reservation root and descriptor editor. Contention is "not now": no
