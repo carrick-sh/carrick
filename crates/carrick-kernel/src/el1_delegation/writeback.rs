@@ -75,7 +75,8 @@ impl InodeWriteback {
             target
                 .sparse
                 .truncate_host_sparse_extents(fd.raw(), self.size);
-            if unsafe { libc::ftruncate(fd.raw(), self.size as libc::off_t) } != 0 {
+            // Through the host size door (#1338 A1).
+            if carrick_vfs::host_size::ftruncate(fd.raw(), self.size as libc::off_t) != 0 {
                 first_error.get_or_insert(last_error());
             }
         }

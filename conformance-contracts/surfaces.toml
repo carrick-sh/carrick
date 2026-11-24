@@ -1415,6 +1415,7 @@ surfaces = [
   { path = "crates/carrick-timer-core/src/timerfd/clock.rs", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-vfs/src/fs_backend/host.rs", contract = "kernel.vfs.immutable-lower-open" },
   { path = "crates/carrick-vfs/src/fs_backend/tests.rs", contract = "kernel.vfs.immutable-lower-open" },
+  { path = "crates/carrick-vfs/src/host_size.rs", contract = "kernel.mm.shared-file-window" },
   { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.mark-race-hotpath" },
   { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.watch" },
   { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.vfs.host-namespace-mutation-work" },
