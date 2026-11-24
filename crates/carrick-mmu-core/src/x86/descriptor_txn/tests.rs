@@ -138,7 +138,9 @@ fn owner_grant_projects_a_shared_file_window_page_as_a_host_map_leaf() {
         panic!("window page grant applies");
     };
     assert_eq!(applied.pages, 1);
-    assert_eq!(applied.resident, PageSpan::new(0x5000, PAGE));
+    // The shared receipt rule (`DescriptorTxn::verify_receipt`): an alias
+    // names no resident span, so the host settlement accepts this receipt.
+    assert_eq!(applied.resident, PageSpan::EMPTY);
     let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x5000))
         .unwrap()
         .0;
