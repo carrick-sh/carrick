@@ -75,9 +75,11 @@ impl InodeWriteback {
             target
                 .sparse
                 .truncate_host_sparse_extents(fd.raw(), self.size);
-            // Through the host size door (#1338 A1).
-            if carrick_vfs::host_size::ftruncate(fd.raw(), self.size as libc::off_t) != 0 {
-                first_error.get_or_insert(last_error());
+            // Through the host size door, on this descriptor (#1338 A1).
+            // SAFETY: `fd` stays open for this call.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.raw()) };
+            if let Err(errno) = carrick_vfs::host_size::resize(borrowed, self.size) {
+                first_error.get_or_insert(crate::host_to_linux_errno(errno));
             }
         }
         for page in &self.pages {
