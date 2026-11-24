@@ -56,6 +56,7 @@ vm_free = [
 embed = [
   "carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native (red on main: every writable MAP_SHARED mmap is ENOSYS)",
   "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_futex_is_fenced_never_hangs (A1 fence, v3 C5: a non-private futex WAIT and WAKE on a window are a counted ENOSYS, never a hang)",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_shrink_is_fenced_before_the_host (A1 interim fence until A3 revokes: ftruncate, fallocate punch and collapse by a forked child, truncate and O_TRUNC by the root, of a window-mapped file are a counted ENOSYS before the host shrinks; growth and an unmapped shrink are served)",
 ]
 
 [bindings.unresolved]
