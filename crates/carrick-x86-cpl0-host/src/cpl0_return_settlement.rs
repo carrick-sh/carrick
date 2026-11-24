@@ -289,19 +289,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Ok(Ok((pause, reply)))
     }
 
-    /// [`Self::settled_pause`] for callers that treat a refused exclusion
-    /// as a carrier fault.
-    pub(super) fn settled_pause_or_fail<'a>(
-        &mut self,
-        release: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
-        mm: u64,
-    ) -> Result<CowPause<'a>, TrapError> {
-        let mm = carrick_el1_abi::ReservationMm::new(mm).ok_or_else(|| fail("owner COW MM"))?;
-        self.settled_pause(release, mm)?
-            .map(|(pause, _)| pause)
-            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))
-    }
-
     /// Every exclusion's settlement: COW completions, then owed returns.
     fn settle_excluded(
         &mut self,
