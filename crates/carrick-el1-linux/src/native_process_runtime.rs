@@ -7543,6 +7543,58 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
     }
 
+    /// Retire a thread whose raw `SYS_exit` raced its group's terminal close
+    /// after passing the entry continuation checkpoint (`#2932`). Keyed on
+    /// `self.key` (`TaskKey`/generation) under the runtime graph lock, so a
+    /// concurrent `begin_closing` has already published its `PendingExit`.
+    #[inline(never)]
+    fn retire_closing_raw_exit(&mut self) -> Option<LifecycleOutcome> {
+        enum ClosingRawExitRole {
+            Owner {
+                status: LinuxWaitStatus,
+                entry: OwnerEntry,
+            },
+            Member(carrick_sched_core::process::TerminationStatus),
+        }
+        let role = {
+            let graph = self.runtime.graph.lock();
+            let pending = graph.pending.exit(&self.key)?;
+            if core::ptr::eq(pending.caller.control(), self.control) {
+                match pending.operation {
+                    PendingCloseOperation::Exit { status, entry } => {
+                        ClosingRawExitRole::Owner { status, entry }
+                    }
+                    PendingCloseOperation::Exec(_) => return None,
+                }
+            } else {
+                let status = match pending.operation {
+                    PendingCloseOperation::Exit { status, .. } => status.to_termination_status(),
+                    PendingCloseOperation::Exec(_) => {
+                        carrick_sched_core::process::TerminationStatus::signaled(9, false)
+                    }
+                };
+                ClosingRawExitRole::Member(status)
+            }
+        };
+        if let Err(error) =
+            self.settle_closing_adapter_operation(service::ClosingAdapterCustody::CancelInstalled)
+        {
+            return Some(self.run_failed(retention_failure(error).run_failure_reason()));
+        }
+        Some(match role {
+            ClosingRawExitRole::Owner { status, entry } => {
+                match self.exit_with_status(status, entry) {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                }
+            }
+            ClosingRawExitRole::Member(status) => match self.retire_closing_member(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            },
+        })
+    }
+
     /// A member that enters new native work after its process's terminal
     /// close has closed the gate never returns to EL0 and publishes no host
     /// work: it retires with the close status through the same transaction
@@ -10365,6 +10417,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             Ok(outcome) => outcome,
             Err(error) => self.run_failed(error.run_failure_reason()),
         }
+    }
+    fn retire_closing_thread_exit(&mut self) -> Option<LifecycleOutcome> {
+        self.retire_closing_raw_exit()
     }
     fn as_identity_venue(
         &mut self,
