@@ -280,14 +280,12 @@ impl<'a> FsView<'a> {
                 };
                 let mut new_metadata = metadata.clone();
                 if flags & LINUX_O_TRUNC != 0 && is_writable {
-                    use std::os::fd::AsRawFd;
+                    use std::os::fd::{AsFd, AsRawFd};
                     // Through the host size door, on the reopened object:
                     // a file a shared file window maps is not truncated
                     // (#1338 A1).
-                    if carrick_vfs::host_size::ftruncate(owned.as_raw_fd(), 0) != 0
-                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
-                    {
-                        return ReopenAction::Errno(carrick_abi::LINUX_ENOSYS);
+                    if let Err(errno) = carrick_vfs::host_size::resize(owned.as_fd(), 0) {
+                        return ReopenAction::Errno(crate::host_to_linux_errno(errno));
                     }
                     new_metadata.size = 0;
                     self.invalidate_dentry_host_fd(owned.as_raw_fd());
