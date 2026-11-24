@@ -1193,3 +1193,712 @@ fn real_mapping_root_contention_keeps_notification_x86() {
     let handle = portal.admitted_handle(mm, 0).unwrap();
     contention_keeps_owner_notification(&portal, zone, handle, UserVa::new(VA));
 }
+
+struct ExitStatusFrame(
+    carrick_personality_linux::crossing::HostCrossingSet,
+    SlotId,
+    u64,
+);
+impl carrick_personality_linux::dispatch::SyscallFrame for ExitStatusFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_syscall_abi::CanonicalNr::new(carrick_personality_linux::lifecycle::SYS_EXIT as u64)
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        Some(if index == 0 { self.2 } else { 0 })
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::NativeReturnWord(0)
+    }
+    fn set_result(&mut self, _: carrick_guest_arch::NativeReturnWord) {}
+    fn slot(&self) -> Option<SlotId> {
+        Some(self.1)
+    }
+    fn task_index(&self) -> usize {
+        0
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        Some(UserVa::new(0x8000))
+    }
+}
+impl crate::dispatch::GuestDispatchFrame for ExitStatusFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(match self.0 {
+            carrick_personality_linux::crossing::HostCrossingSet::X86 => 60,
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => 93,
+        })
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        self.0
+    }
+    fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+fn spawn_registered_born_member<C: ProcessContext + 'static>(
+    fixture: &Fixture<C>,
+    make: &impl Fn(AddressContext<RootGpa>) -> C,
+    slot: SlotId,
+    cpu_id: u32,
+    control: &'static ThreadControlSlot,
+    stock_index: usize,
+    tid: u32,
+    serial: u64,
+) -> (&'static CurrentTask, carrick_el1_abi::RecordId) {
+    use carrick_el1_abi::{BornRecord, EntryIdentity, Lifecycle, ThreadIdentity};
+    let zone = fixture.zone;
+    let affinity = 1u64 << cpu_id;
+    zone.drive(slot, u64::from(cpu_id + 1));
+    zone.publish_slot(slot, 1, Some(cpu_id), affinity);
+    zone.enter_guest(slot);
+    zone.install_space(slot, 1).unwrap();
+
+    let birth = carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(serial).unwrap());
+    let entry = fixture
+        .page
+        .stock(
+            stock_index,
+            EntryIdentity {
+                tid,
+                visible_tid: tid,
+                thread_serial: serial,
+                birth,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+        .unwrap();
+    assert!(control.publish_visible_tid(tid));
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(u64::from(tid)),
+            birth,
+            carrick_core_abi::EntryThreadGeneration::from_raw(serial),
+        )
+        .unwrap(),
+    );
+    let claim = fixture.page.claim(entry).unwrap();
+    fixture
+        .page
+        .record_born(
+            claim,
+            BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x10000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture.page.publish(entry).unwrap();
+
+    let task = Box::leak(Box::new(CurrentTask::new()));
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
+        carrick_core_abi::SnapshotGeneration::from_raw(serial),
+        5,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(serial, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_root_generation(fixture.address.generation);
+    task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    zone.namespace().with_view(&ShortLockSpin, |ns| {
+        ns.reserve_exact(tid as i32, ClaimKind::Thread).unwrap();
+    });
+
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: u64::from(tid),
+            serial,
+            mm: 1,
+            file_table: 5,
+            generation: serial,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity,
+            lifecycle_page: fixture.page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        })
+        .unwrap();
+    assert!(zone.mark_native_owned(record));
+    // SAFETY: this newly allocated record is unpublished and fixture-owned.
+    unsafe {
+        *zone.record(record).ctx_mut() = make(fixture.address);
+    }
+    assert!(zone.requeue_preempted(slot, record).is_queued());
+    assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+    control.bind_zone_record(zone.record_ref(record));
+    fixture
+        .registry
+        .register_thread(
+            BornInZoneSource { zone, slot },
+            task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    assert!(zone.mark_native_owned(record));
+    (task, record)
+}
+
+/// #2932: when a member has already passed `resume_owned_continuation` and
+/// `raw_exit_is_process` (`page.live() == 3`), and its leader concurrently
+/// closes the lifecycle gate in `exit_group(38)` (`page.live() == 2`), the
+/// member's raw `SYS_exit` (`x86` 60 / `aarch64` 93) must retire in ring
+/// (`Suspended`, never `HostCustody`) and wake the closing leader.
+fn closing_group_raw_exit_retires_in_ring<C, B>(
+    make: impl Fn(AddressContext<RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+
+    let fixture = Fixture::<C>::new::<B>(&make);
+    let zone = fixture.zone;
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let slot1 = SlotId::new(1);
+    let slot2 = SlotId::new(2);
+
+    let controls = Box::leak(Box::new([
+        ThreadControlSlot::new(),
+        ThreadControlSlot::new(),
+    ]));
+    let control1 = &controls[0];
+    let control2 = &controls[1];
+    let (task1, member1) =
+        spawn_registered_born_member(&fixture, &make, slot1, 1, control1, 0, 42, 102);
+    let (task2, member2) =
+        spawn_registered_born_member(&fixture, &make, slot2, 2, control2, 1, 43, 103);
+    assert_eq!(fixture.page.live(), 3);
+
+    struct ClosingRaceVenue<'a, F> {
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+        close_group: core::cell::RefCell<Option<F>>,
+        calls: core::cell::Cell<usize>,
+    }
+    impl<F: FnOnce()> crate::thread_setup::LifecycleVenue for ClosingRaceVenue<'_, F> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            let seen = self.calls.get();
+            self.calls.set(seen + 1);
+            if seen == 1
+                && let Some(close) = self.close_group.borrow_mut().take()
+            {
+                close();
+            }
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+
+    let mut service1 = Physical {
+        zone,
+        page: fixture.page,
+        controls: &controls[..],
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: slot1,
+        on_signal_clock: None,
+    };
+
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    {
+        let member1_ref = zone.record_ref(member1);
+        let venue = ClosingRaceVenue {
+            page: fixture.page,
+            control: control1,
+            close_group: core::cell::RefCell::new(Some(|| {
+                let mut leader_service = Physical {
+                    zone,
+                    page: fixture.page,
+                    controls: &controls[..],
+                    copies: Vec::new(),
+                    tid_words: BTreeMap::new(),
+                    tid_wakes: 0,
+                    tid_writes: Vec::new(),
+                    child_copy_error: None,
+                    prepare_copy_error: None,
+                    child_copy_error_at: None,
+                    on_copy_complete: None,
+                    native_ipc: None,
+                    refuse_copy: false,
+                    waker_slot: fixture.slot,
+                    on_signal_clock: None,
+                };
+                let mut leader = fixture
+                    .runtime
+                    .enter_registered(
+                        fixture.registry,
+                        BornInZoneSource {
+                            zone,
+                            slot: fixture.slot,
+                        },
+                        fixture.task,
+                        fixture.address,
+                        &make(fixture.address),
+                        &mut leader_service,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    leader.exit_group(38),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(leader.take_handoff_receipt().is_some());
+                assert!(leader.take_run_failure().is_none());
+                zone.clear_current(fixture.slot);
+                assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
+                assert_eq!(fixture.page.live(), 2);
+            })),
+            calls: core::cell::Cell::new(0),
+        };
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource { zone, slot: slot1 },
+                task1,
+                fixture.address,
+                &make(fixture.address),
+                &mut service1,
+            )
+            .unwrap();
+        {
+            let mut frame = ExitStatusFrame(isa, slot1, 0);
+            let mut pending: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame,
+                counters: &counters,
+                current_tasks: core::slice::from_ref(task1),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue),
+                process: Some(entry.as_mut()),
+                source: Some(BornInZoneSource { zone, slot: slot1 }),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            assert_eq!(
+                dispatch(
+                    carrick_syscall_abi::CanonicalNr::new(
+                        carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                    )
+                    .raw(),
+                    u64::MAX,
+                    &mut pending,
+                ),
+                CompletionRoute::Suspended,
+                "closing-group raw exit on {isa:?} must retire in ring, not host custody"
+            );
+        }
+        assert_eq!(
+            counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitGate as usize]
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(entry.take_handoff_receipt().is_none());
+        assert!(entry.take_run_failure().is_none());
+        drop(entry);
+        assert!(zone.slot(slot1).current().is_none());
+        assert!(zone.live(member1_ref).is_none());
+        assert_eq!(fixture.page.live(), 1);
+    }
+
+    {
+        let member2_ref = zone.record_ref(member2);
+        let venue = ClosingRaceVenue {
+            page: fixture.page,
+            control: control2,
+            close_group: core::cell::RefCell::new(None::<fn()>),
+            calls: core::cell::Cell::new(0),
+        };
+        let mut service2 = Physical {
+            zone,
+            page: fixture.page,
+            controls: &controls[..],
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            child_copy_error: None,
+            prepare_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
+            native_ipc: None,
+            refuse_copy: false,
+            waker_slot: slot2,
+            on_signal_clock: None,
+        };
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource { zone, slot: slot2 },
+                task2,
+                fixture.address,
+                &make(fixture.address),
+                &mut service2,
+            )
+            .unwrap();
+        {
+            let mut frame = ExitStatusFrame(isa, slot2, 0);
+            let mut pending: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                futex_argument0: None,
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame,
+                counters: &counters,
+                current_tasks: core::slice::from_ref(task2),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue),
+                process: Some(entry.as_mut()),
+                source: Some(BornInZoneSource { zone, slot: slot2 }),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            assert_eq!(
+                dispatch(
+                    carrick_syscall_abi::CanonicalNr::new(
+                        carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                    )
+                    .raw(),
+                    u64::MAX,
+                    &mut pending,
+                ),
+                CompletionRoute::Suspended,
+            );
+        }
+        assert!(entry.take_handoff_receipt().is_none());
+        assert!(entry.take_run_failure().is_none());
+        drop(entry);
+        assert!(zone.slot(slot2).current().is_none());
+        assert!(zone.live(member2_ref).is_none());
+        assert_eq!(fixture.page.live(), 0);
+    }
+
+    let woken_slot = [fixture.slot, slot1, slot2]
+        .into_iter()
+        .find(|slot| zone.slot(*slot).queued() != 0)
+        .expect("final member retirement wakes the closing leader");
+    zone.install_space(woken_slot, 1).unwrap();
+    assert_eq!(
+        zone.switch_in_full(woken_slot).unwrap().record,
+        fixture.record.id
+    );
+    let mut leader_service = Physical {
+        zone,
+        page: fixture.page,
+        controls: &controls[..],
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: woken_slot,
+        on_signal_clock: None,
+    };
+    let mut leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone,
+                slot: woken_slot,
+            },
+            fixture.task,
+            fixture.address,
+            &make(fixture.address),
+            &mut leader_service,
+        )
+        .unwrap();
+    let resumed = leader.resume_checkpoint(|_| Ok(None)).unwrap();
+    let NativeResume::Left(Some(status)) = resumed else {
+        panic!("expected closing root exit status");
+    };
+    assert_eq!(
+        status.to_termination_status(),
+        carrick_sched_core::process::TerminationStatus::exited(38)
+    );
+}
+
+#[test]
+fn closing_group_raw_exit_retires_in_ring_x86() {
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::Ring));
+    closing_group_raw_exit_retires_in_ring::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::HostThread));
+}
+
+#[test]
+fn closing_group_raw_exit_retires_in_ring_aarch64() {
+    closing_group_raw_exit_retires_in_ring::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}
+
+/// #2932: if two threads concurrently call raw `SYS_exit`, both observe
+/// `raw_exit_is_process == false` (`page.live() == 2`), and the sibling finishes
+/// reserving the penultimate unit before `serve_exit` reaches `reserve_member`,
+/// the losing caller hits `ExitLast` (`Floor`) with `GateState::Open` and must
+/// transition to `process_exit_group` in ring rather than `HostCustody`.
+fn concurrent_raw_exit_floor_race_becomes_process_exit<C, B>(
+    make: impl Fn(AddressContext<RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
+    C: ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+
+    let fixture = Fixture::<C>::new::<B>(&make);
+    let zone = fixture.zone;
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let member_slot = SlotId::new(1);
+
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let (task, _member) =
+        spawn_registered_born_member(&fixture, &make, member_slot, 1, control, 0, 42, 102);
+    assert_eq!(fixture.page.live(), 2);
+    assert_eq!(
+        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        carrick_sched_core::CurrentRelease::Released
+    );
+
+    struct FloorRaceVenue<'a> {
+        page: &'a ThreadLifecyclePage,
+        caller: &'a ThreadControlSlot,
+        retired_sibling: &'a ThreadControlSlot,
+        calls: core::cell::Cell<usize>,
+    }
+    impl crate::thread_setup::LifecycleVenue for FloorRaceVenue<'_> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            let seen = self.calls.get();
+            self.calls.set(seen + 1);
+            if seen == 1 {
+                // Simulate the sibling completing its nonfinal raw exit right
+                // after `invoke` checked `raw_exit_is_process(thread.page)`.
+                self.page.reserve_nonfinal_exit().unwrap().publish();
+                let birth = self.retired_sibling.host_birth_identity().unwrap();
+                self.page
+                    .publish_exact_host_retirement(self.retired_sibling, birth.retirement());
+            }
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.caller,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+
+    let mut service = Physical {
+        zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(control),
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: member_slot,
+        on_signal_clock: None,
+    };
+    let venue = FloorRaceVenue {
+        page: fixture.page,
+        caller: control,
+        retired_sibling: fixture.control,
+        calls: core::cell::Cell::new(0),
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone,
+                slot: member_slot,
+            },
+            task,
+            fixture.address,
+            &make(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    {
+        let mut frame = ExitStatusFrame(isa, member_slot, 38);
+        let mut pending: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            futex_argument0: None,
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &counters,
+            current_tasks: core::slice::from_ref(task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue),
+            process: Some(entry.as_mut()),
+            source: Some(BornInZoneSource {
+                zone,
+                slot: member_slot,
+            }),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending,
+            ),
+            CompletionRoute::Suspended,
+            "floor-race raw exit on {isa:?} must become process exit in ring, not host custody"
+        );
+    }
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitLast as usize]
+            .load(Ordering::Acquire),
+        1
+    );
+    assert!(entry.take_handoff_receipt().is_none());
+    assert!(entry.take_run_failure().is_none());
+    let status = entry
+        .take_root_exit()
+        .expect("last surviving thread's raw exit publishes process exit");
+    assert_eq!(
+        status.to_termination_status(),
+        carrick_sched_core::process::TerminationStatus::exited(38)
+    );
+    assert_eq!(fixture.page.live(), 0);
+    assert!(zone.slot(member_slot).current().is_none());
+}
+
+#[test]
+fn concurrent_raw_exit_floor_race_becomes_process_exit_x86() {
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::Ring));
+    concurrent_raw_exit_floor_race_becomes_process_exit::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+    );
+    ENTRYLESS_RETIREMENT.with(|owner| owner.set(EntrylessRetirement::HostThread));
+}
+
+#[test]
+fn concurrent_raw_exit_floor_race_becomes_process_exit_aarch64() {
+    concurrent_raw_exit_floor_race_becomes_process_exit::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
+}
