@@ -568,16 +568,39 @@ fn serial_host_native_root_and_child_time_matches_vdso() {
 
 #[test]
 fn serial_host_native_root_and_child_cputime_and_times() {
-    const TEST: &str = "serial_host_native_root_and_child_cputime_and_times";
+    native_oracle_witness(
+        "serial_host_native_root_and_child_cputime_and_times",
+        "native_cputime_times.S",
+    );
+}
+
+/// #2028: MONOTONIC and BOOTTIME keep one epoch across a fork (root T0 <=
+/// child T1 <= root T2), and a CPU clock reads the task it names, sampled as
+/// it asks: a busy child's process clock against its idle parent's, a busy
+/// worker thread's clock against its parked sibling's, a zombie's final time,
+/// and EINVAL for a reaped pid, a missing pid, a non-leader tid as a process,
+/// and another process's thread. Exit 38 or 138 is a counted ENOSYS.
+#[test]
+fn serial_host_native_cpu_clocks_read_the_named_task() {
+    native_oracle_witness(
+        "serial_host_native_cpu_clocks_read_the_named_task",
+        "native_cpu_clock_owners.S",
+    );
+}
+
+/// Run `fixture` natively on this Linux host first (the oracle must exit
+/// 8), then under carrick, bounded in a child test process so a lost wake
+/// fails instead of hanging CI.
+fn native_oracle_witness(test: &str, fixture: &str) {
     const CHILD: &str = "CARRICK_CPUTIME_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "15"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env(CHILD, TEST)
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
             .output()
-            .expect("bounded native cputime witness");
+            .expect("bounded native oracle witness");
         assert!(
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
@@ -588,9 +611,9 @@ fn serial_host_native_root_and_child_cputime_and_times() {
         );
         return;
     }
-    let elf = native_exit_fixture_with_flags("native_cputime_times.S", &[]);
+    let elf = native_exit_fixture_with_flags(fixture, &[]);
     let directory = tempfile::tempdir().expect("oracle directory");
-    let oracle = directory.path().join("native_cputime_times");
+    let oracle = directory.path().join("native_oracle");
     carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let linux_status = std::process::Command::new(&oracle)
         .status()
@@ -598,12 +621,12 @@ fn serial_host_native_root_and_child_cputime_and_times() {
     assert_eq!(
         linux_status.code(),
         Some(8),
-        "native Linux oracle exit code for native_cputime_times.S"
+        "native Linux oracle exit code for {fixture}"
     );
     let outcome = run_pool_fixture(&elf, 512);
     assert_eq!(
         outcome.run.exit_code, 8,
-        "native cputime/times result (38 means ENOSYS)"
+        "{fixture} result under carrick (38 means ENOSYS)"
     );
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());

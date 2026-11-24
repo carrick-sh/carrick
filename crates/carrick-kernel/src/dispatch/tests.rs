@@ -8110,6 +8110,72 @@ mod container_clock_tests {
         memory.write_bytes(address, &bytes).expect("write timespec");
     }
 
+    /// #2028: a CPU clock id names its task and its sample
+    /// (clock_getcpuclockid(3)). VIRT reads user time only, PROF and SCHED
+    /// add system time, the caller's own pid or tid names the caller, and a
+    /// pid or tid naming no task is EINVAL (a native Linux 6.12 probe). The
+    /// dispatcher used to read the caller's total CPU time for all of them.
+    #[test]
+    fn clock_gettime_cpu_clocks_read_their_target_and_sample() {
+        const SYS_GETPID: u64 = 172;
+        const USER: Duration = Duration::from_millis(5);
+        const SYSTEM: Duration = Duration::from_millis(3);
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context.thread().charge_user_ns(USER.as_nanos() as u64);
+        context.thread().charge_system_ns(SYSTEM.as_nanos() as u64);
+        let mut call = |memory: &mut LinearMemory, number: u64, clock: u64| {
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs([clock, TIMESPEC_ADDR, 0, 0, 0, 0])),
+                    memory,
+                    &reporter,
+                )
+                .expect("dispatch")
+        };
+        let DispatchOutcome::Returned { value: pid } = call(&mut memory, SYS_GETPID, 0) else {
+            panic!("getpid");
+        };
+        let pid = pid as u32;
+        let mut read = |clock: u64| match call(&mut memory, SYS_CLOCK_GETTIME, clock) {
+            DispatchOutcome::Returned { value: 0 } => {
+                let bytes = memory.read_bytes(TIMESPEC_ADDR, 16).expect("timespec");
+                let secs = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let nanos = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                Ok(Duration::new(secs as u64, nanos as u32))
+            }
+            DispatchOutcome::Errno { errno } => Err(errno.get()),
+            other => panic!("clock_gettime({clock:#x}): {other:?}"),
+        };
+        // `~pid << 3 | bits`, as clock_getcpuclockid(3) builds it.
+        let dynamic = |pid: u32, bits: u32| u64::from((!pid << 3) | bits);
+        for clock in [
+            dynamic(0, 0b001),
+            dynamic(0, 0b101),
+            dynamic(pid, 0b001),
+            dynamic(pid, 0b101),
+        ] {
+            assert_eq!(read(clock), Ok(USER), "VIRT clock {clock:#x}");
+        }
+        for clock in [
+            LINUX_CLOCK_PROCESS_CPUTIME_ID,
+            LINUX_CLOCK_THREAD_CPUTIME_ID,
+            dynamic(0, 0b000),
+            dynamic(0, 0b110),
+            dynamic(pid, 0b010),
+            dynamic(pid, 0b110),
+        ] {
+            let total = read(clock).expect("caller's CPU clock");
+            assert!(total >= USER + SYSTEM, "clock {clock:#x}: {total:?}");
+        }
+        for clock in [dynamic(0x0fff_ffff, 0b010), dynamic(0x0fff_ffff, 0b110)] {
+            assert_eq!(read(clock), Err(22), "missing target {clock:#x}");
+        }
+    }
+
     #[test]
     fn clock_gettime_realtime_reads_the_callers_container_domain() {
         let mut a = SyscallDispatcher::new();
