@@ -1,9 +1,10 @@
 //! One linked CPL0 image's loaded span against its supervisor extent.
 //!
 //! Shared by `cpl0_build.rs` (the build-time budget report) and
-//! `tests/cpl0_image_inputs.rs` (its witness), both by `#[path]`. Every read
-//! and every offset is checked: a truncated or malformed image is `None`,
-//! never a panic.
+//! `tests/cpl0_image_inputs.rs` (its witness), both by `#[path]`. Every
+//! table is checked whole against the file before any entry is read, and
+//! every name must end in its string table: a truncated or malformed image
+//! is `None`, never a panic and never a budget.
 
 /// The image's own extent symbol: `carrick-x86-carrier` defines it from
 /// `X86_CPL0_SUPERVISOR_IMAGE_BASE + X86_CPL0_SUPERVISOR_IMAGE_SIZE`, and
@@ -26,27 +27,39 @@ pub struct ImageBudget {
     pub extent: u64,
 }
 
-struct Elf<'a>(&'a [u8]);
+/// Little-endian field reads from one bounded slice: a header, a table
+/// entry, or the whole file.
+#[derive(Clone, Copy)]
+struct Fields<'a>(&'a [u8]);
 
-impl Elf<'_> {
-    fn bytes<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
+impl<'a> Fields<'a> {
+    fn bytes<const N: usize>(self, at: usize) -> Option<[u8; N]> {
         self.0.get(at..at.checked_add(N)?)?.try_into().ok()
     }
-    fn u16(&self, at: usize) -> Option<usize> {
+    fn u16(self, at: usize) -> Option<usize> {
         Some(usize::from(u16::from_le_bytes(self.bytes(at)?)))
     }
-    fn u32(&self, at: usize) -> Option<u32> {
+    fn u32(self, at: usize) -> Option<u32> {
         Some(u32::from_le_bytes(self.bytes(at)?))
     }
-    fn u64(&self, at: usize) -> Option<u64> {
+    fn u64(self, at: usize) -> Option<u64> {
         Some(u64::from_le_bytes(self.bytes(at)?))
     }
-    fn offset(&self, at: usize) -> Option<usize> {
+    fn offset(self, at: usize) -> Option<usize> {
         usize::try_from(self.u64(at)?).ok()
     }
-    /// The `index`th fixed-size entry of a table at `base`.
-    fn entry(base: usize, index: usize, len: usize) -> Option<usize> {
-        base.checked_add(index.checked_mul(len)?)
+    /// The bytes `[offset, offset + len)`, wholly inside this slice.
+    fn span(self, offset: usize, len: usize) -> Option<&'a [u8]> {
+        self.0.get(offset..offset.checked_add(len)?)
+    }
+    /// A table of `count` entries of `entsize` bytes at `offset`, wholly
+    /// inside this slice, each at least `min` bytes long.
+    fn table(self, offset: usize, entsize: usize, count: usize, min: usize) -> Option<Vec<Self>> {
+        if entsize < min {
+            return None;
+        }
+        let table = self.span(offset, entsize.checked_mul(count)?)?;
+        Some(table.chunks_exact(entsize).map(Fields).collect())
     }
 }
 
@@ -55,56 +68,42 @@ impl ImageBudget {
     /// size, so `.bss` counts) and [`EXTENT_END_SYMBOL`]'s value from an
     /// ELF64 little-endian image.
     pub fn of(image: &[u8]) -> Option<Self> {
-        let elf = Elf(image);
+        let elf = Fields(image);
         // ELFMAG, ELFCLASS64, ELFDATA2LSB.
         if image.get(..6)? != b"\x7fELF\x02\x01" {
             return None;
         }
-        let (phoff, phentsize, phnum) = (elf.offset(0x20)?, elf.u16(0x36)?, elf.u16(0x38)?);
-        let (shoff, shentsize, shnum) = (elf.offset(0x28)?, elf.u16(0x3a)?, elf.u16(0x3c)?);
-        if phentsize < PHDR_LEN || shentsize < SHDR_LEN {
-            return None;
-        }
+        let programs = elf.table(elf.offset(0x20)?, elf.u16(0x36)?, elf.u16(0x38)?, PHDR_LEN)?;
+        let sections = elf.table(elf.offset(0x28)?, elf.u16(0x3a)?, elf.u16(0x3c)?, SHDR_LEN)?;
         let (mut base, mut end) = (u64::MAX, 0_u64);
-        for index in 0..phnum {
-            let header = Elf::entry(phoff, index, phentsize)?;
-            let memsz = elf.u64(header.checked_add(0x28)?)?;
-            if elf.u32(header)? == PT_LOAD && memsz != 0 {
-                let start = elf.u64(header.checked_add(0x10)?)?;
+        for header in programs {
+            let memsz = header.u64(0x28)?;
+            if header.u32(0)? == PT_LOAD && memsz != 0 {
+                let start = header.u64(0x10)?;
                 base = base.min(start);
                 end = end.max(start.checked_add(memsz)?);
             }
         }
-        let section = |index: usize| Elf::entry(shoff, index, shentsize);
         let mut extent_end = None;
-        for index in 0..shnum {
-            let symtab = section(index)?;
-            if elf.u32(symtab.checked_add(4)?)? != SHT_SYMTAB {
-                continue;
-            }
-            let link = usize::try_from(elf.u32(symtab.checked_add(0x28)?)?).ok()?;
-            if link >= shnum {
+        for symtab in sections.iter().filter(|s| s.u32(4) == Some(SHT_SYMTAB)) {
+            let strtab = sections.get(usize::try_from(symtab.u32(0x28)?).ok()?)?;
+            if strtab.u32(4)? != SHT_STRTAB {
                 return None;
             }
-            let strtab = section(link)?;
-            if elf.u32(strtab.checked_add(4)?)? != SHT_STRTAB {
+            let names = Fields(elf.span(strtab.offset(0x18)?, strtab.offset(0x20)?)?);
+            let (size, entsize) = (symtab.offset(0x20)?, symtab.offset(0x38)?);
+            // A declared size that is not a whole number of entries is a
+            // malformed table, not a table with a short tail.
+            if entsize == 0 || size % entsize != 0 {
                 return None;
             }
-            let names = elf.offset(strtab.checked_add(0x18)?)?;
-            let names =
-                image.get(names..names.checked_add(elf.offset(strtab.checked_add(0x20)?)?)?)?;
-            let symbols = elf.offset(symtab.checked_add(0x18)?)?;
-            let size = elf.offset(symtab.checked_add(0x20)?)?;
-            let entsize = elf.offset(symtab.checked_add(0x38)?)?;
-            if entsize < SYM_LEN {
-                return None;
-            }
-            for symbol in 0..size / entsize {
-                let symbol = Elf::entry(symbols, symbol, entsize)?;
-                let name = usize::try_from(elf.u32(symbol)?).ok()?;
-                let name = names.get(name..)?.split(|&byte| byte == 0).next()?;
+            let symbols = elf.table(symtab.offset(0x18)?, entsize, size / entsize, SYM_LEN)?;
+            for symbol in symbols {
+                let name = names.0.get(usize::try_from(symbol.u32(0)?).ok()?..)?;
+                // The name must end inside its string table.
+                let name = &name[..name.iter().position(|&byte| byte == 0)?];
                 if name == EXTENT_END_SYMBOL {
-                    extent_end = Some(elf.u64(symbol.checked_add(8)?)?);
+                    extent_end = Some(symbol.u64(8)?);
                 }
             }
         }
