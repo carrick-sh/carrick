@@ -1450,6 +1450,12 @@ pub struct TrapFrame {
     pub slot: u64,
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
+    /// Where `elr` sits relative to its `SVC` (#2900). The EL1 hook stores
+    /// the entry's position (after the `SVC` for a syscall or a host signal
+    /// checkpoint, a resume point for an interrupt or a fault); every later
+    /// writer of `elr` (a rewind, a sigreturn, a handler entry, a context
+    /// load) sets it with the PC.
+    pub syscall_position: carrick_guest_arch::SavedSyscallPcWord,
 }
 impl carrick_personality_linux::dispatch::SyscallFrame for TrapFrame {
     fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
@@ -1474,9 +1480,6 @@ impl carrick_personality_linux::dispatch::SyscallFrame for TrapFrame {
     }
 }
 
-/// The EL1 vectors hand-encode this frame's layout, which has no word for
-/// its syscall position yet: its owner tracks the position beside it in a
-/// [`carrick_guest_arch::PositionedFrame`] (#2900).
 impl carrick_guest_arch::SyscallReturnRegisters for TrapFrame {
     const SYSCALL_LEN: u64 = carrick_guest_arch::AARCH64_SVC_LEN;
     fn return_pc(&self) -> u64 {
@@ -1487,6 +1490,16 @@ impl carrick_guest_arch::SyscallReturnRegisters for TrapFrame {
     }
     fn set_entry_word(&mut self, entry_word: u64) {
         self.x[0] = entry_word;
+    }
+}
+
+/// The frame carries its own position word, stored by the EL1 hook (#2900).
+impl carrick_guest_arch::SyscallReturnFrame for TrapFrame {
+    fn syscall_position(&self) -> Option<carrick_guest_arch::SavedSyscallPc> {
+        self.syscall_position.get()
+    }
+    fn set_syscall_position(&mut self, position: carrick_guest_arch::SavedSyscallPc) {
+        self.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(position);
     }
 }
 
@@ -1538,7 +1551,8 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, esr) == 264);
     assert!(core::mem::offset_of!(TrapFrame, slot) == 272);
     assert!(core::mem::offset_of!(TrapFrame, far) == 280);
-    assert!(core::mem::size_of::<TrapFrame>() == 288);
+    assert!(core::mem::offset_of!(TrapFrame, syscall_position) == 288);
+    assert!(core::mem::size_of::<TrapFrame>() == 296);
 };
 
 pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -4290,10 +4304,22 @@ pub fn write_current_tasks_census(
 
 /// Bytes the EL1 hooks reserve at the top of each slot's stack for the
 /// [`TrapFrame`] (its size rounded up to 16 bytes).
-pub const TRAP_FRAME_ALLOCATION: u64 = 0x120;
+pub const TRAP_FRAME_ALLOCATION: u64 = 0x130;
 const _: () = assert!(
     core::mem::size_of::<TrapFrame>() as u64 <= TRAP_FRAME_ALLOCATION
         && TRAP_FRAME_ALLOCATION.is_multiple_of(16)
+);
+
+/// Offset of [`TrapFrame::syscall_position`], which the EL1 hooks store.
+pub const TRAP_FRAME_POSITION_OFFSET: u64 =
+    core::mem::offset_of!(TrapFrame, syscall_position) as u64;
+/// The position word the hooks store for an interrupt, a fault or a late-work
+/// recast (a resume point); they store `xzr`, after the `SVC`, otherwise.
+pub const TRAP_FRAME_AT_SYSCALL_WORD: u16 =
+    carrick_guest_arch::SavedSyscallPc::AtSyscall.word() as u16;
+const _: () = assert!(
+    carrick_guest_arch::SavedSyscallPc::AfterSyscall.word() == 0
+        && carrick_guest_arch::SavedSyscallPc::AtSyscall.word() <= u16::MAX as u64
 );
 
 /// Scratch the current-EL synchronous vector pushes below the faulting SP
@@ -5464,7 +5490,7 @@ mod tests {
 
     #[test]
     fn test_trap_frame_layout() {
-        assert_eq!(core::mem::size_of::<TrapFrame>(), 288);
+        assert_eq!(core::mem::size_of::<TrapFrame>(), 296);
         assert_eq!(core::mem::align_of::<TrapFrame>(), 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, x), 0);
         assert_eq!(core::mem::offset_of!(TrapFrame, elr), 31 * 8);
@@ -5472,6 +5498,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(TrapFrame, esr), 33 * 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, slot), 34 * 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, far), 35 * 8);
+        assert_eq!(core::mem::offset_of!(TrapFrame, syscall_position), 36 * 8);
     }
 
     #[test]
@@ -7199,7 +7226,7 @@ mod layout_manifest {
 
     #[test]
     fn trap_frame() {
-        assert_eq!((size_of::<TrapFrame>(), align_of::<TrapFrame>()), (288, 8));
+        assert_eq!((size_of::<TrapFrame>(), align_of::<TrapFrame>()), (296, 8));
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |TrapFrame {
                      x: _,
@@ -7208,6 +7235,7 @@ mod layout_manifest {
                      esr: _,
                      slot: _,
                      far: _,
+                     syscall_position: _,
                  }: TrapFrame| {};
         field!(TrapFrame, x, [u64; 31], 0, 248, 8);
         field!(TrapFrame, elr, u64, 248, 8, 8);
@@ -7215,6 +7243,14 @@ mod layout_manifest {
         field!(TrapFrame, esr, u64, 264, 8, 8);
         field!(TrapFrame, slot, u64, 272, 8, 8);
         field!(TrapFrame, far, u64, 280, 8, 8);
+        field!(
+            TrapFrame,
+            syscall_position,
+            carrick_guest_arch::SavedSyscallPcWord,
+            288,
+            8,
+            8
+        );
     }
 
     #[test]

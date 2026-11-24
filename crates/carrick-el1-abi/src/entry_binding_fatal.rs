@@ -931,6 +931,7 @@ mod tests {
             esr: u64::MAX,
             slot: u64::MAX,
             far: u64::MAX,
+            syscall_position: carrick_guest_arch::SavedSyscallPcWord::from_stored(u64::MAX),
         };
         let registers = ArmEntryFatalRegisters {
             reason: Some(u64::MAX),

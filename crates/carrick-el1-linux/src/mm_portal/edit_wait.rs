@@ -91,7 +91,11 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
                 .linux
                 .orig_arg0
                 .store(frame.x[0], Ordering::Relaxed);
-            frame.elr = resume.raw();
+            carrick_guest_arch::SyscallReturnFrame::replace_return_pc(
+                frame,
+                resume.raw(),
+                carrick_sched_core::SavedSyscallPc::AtSyscall,
+            );
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Parked(parked) => {
@@ -281,7 +285,11 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => {
-            frame.elr = resume.raw();
+            carrick_guest_arch::SyscallReturnFrame::replace_return_pc(
+                frame,
+                resume.raw(),
+                carrick_sched_core::SavedSyscallPc::AtSyscall,
+            );
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Refused => None,

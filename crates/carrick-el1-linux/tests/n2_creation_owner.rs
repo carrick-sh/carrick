@@ -101,16 +101,15 @@ struct SaveCpu {
 }
 
 impl sched::ThreadCpu for SaveCpu {
-    fn save(
-        &mut self,
-        frame: &TrapFrame,
-        ctx: &mut carrick_el1_abi::Aarch64ParkedContext,
-        _: sched::CpuExitCause,
-    ) {
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
         self.saves += 1;
         ctx.native.x = frame.x;
         ctx.native.pc = frame.elr;
         ctx.native.pstate = frame.spsr;
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        let _ = sp;
+        unreachable!("no switch")
     }
     fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::Aarch64ParkedContext) {
         unreachable!("no switch")

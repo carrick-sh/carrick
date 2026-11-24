@@ -2529,7 +2529,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
     frame.x = a.x;
     let mut saved = Aarch64ParkedContext::ZERO;
-    cpu.save(&frame, &mut saved, CpuExitCause::Svc);
+    cpu.save(&frame, &mut saved);
     assert_eq!(saved.native.x, a.x);
     assert_eq!(saved.native.pc, a.pc);
     assert_eq!(saved.native.pstate, a.pstate);
@@ -2544,7 +2544,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
         &mut frame,
         &Aarch64ParkedContext::from_register(b, TTBR_MM, MM, 1),
     );
-    cpu.save(&frame, &mut saved, CpuExitCause::Interrupted);
+    cpu.save(&frame, &mut saved);
     assert_eq!(saved.native.x, b.x);
     assert_eq!(saved.native.pc, b.pc);
     assert_eq!(saved.native.pstate, b.pstate);

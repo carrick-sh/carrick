@@ -13,13 +13,11 @@ struct ProductionResumeCpu<'a, X: ForkStockCrossing = TestStockCrossing> {
 }
 
 impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ProductionResumeCpu<'_, X> {
-    fn save(
-        &mut self,
-        frame: &carrick_el1_abi::TrapFrame,
-        ctx: &mut Aarch64ParkedContext,
-        exit: crate::sched::CpuExitCause,
-    ) {
-        self.inner.save(frame, ctx, exit);
+    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        self.inner.save(frame, ctx);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.inner.publish_user_sp(sp);
     }
     fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
         self.inner.load(frame, ctx);
@@ -427,12 +425,7 @@ fn signal_checkpoint(
     let mut service = fixture.process_service();
     let ttbr0 = fixture_ttbr0(fixture);
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-    crate::sched::ThreadCpu::save(
-        &mut crate::sched::FakeCpu::default(),
-        frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut crate::sched::FakeCpu::default(), frame, &mut saved);
     super::super::dispatch::arm_signal_user_return_entry(
         BornInZoneSource {
             zone: fixture.zone,
@@ -4498,12 +4491,7 @@ fn env_signal_checkpoint(
     settle_boundary(task);
     let mut service = env.service(slot);
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-    crate::sched::ThreadCpu::save(
-        &mut crate::sched::FakeCpu::default(),
-        frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut crate::sched::FakeCpu::default(), frame, &mut saved);
     super::super::dispatch::arm_signal_user_return_entry(
         BornInZoneSource {
             zone: env.fixture.zone,
@@ -5224,12 +5212,7 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
         // park retains for the rerun.
         // SAFETY: B is vCPU 1's current record; this lane owns its context.
         let words = unsafe { fixture.zone.record(sibling).ctx_mut() };
-        crate::sched::ThreadCpu::save(
-            &mut second.cpu,
-            &clone,
-            words,
-            crate::sched::CpuExitCause::Svc,
-        );
+        crate::sched::ThreadCpu::save(&mut second.cpu, &clone, words);
         second.call_current(fixture, &mut clone);
         let parked = matches!(
             fixture.zone.record(sibling).claim(),

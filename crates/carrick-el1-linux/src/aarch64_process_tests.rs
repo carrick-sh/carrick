@@ -100,13 +100,11 @@ struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
 
 #[cfg(test)]
 impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
-    fn save(
-        &mut self,
-        frame: &carrick_el1_abi::TrapFrame,
-        ctx: &mut Aarch64ParkedContext,
-        exit: crate::sched::CpuExitCause,
-    ) {
-        self.inner.save(frame, ctx, exit);
+    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        self.inner.save(frame, ctx);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.inner.publish_user_sp(sp);
     }
     fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
         self.inner.load(frame, ctx);
@@ -5942,6 +5940,7 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         esr: 0,
         slot: 0,
         far: 0,
+        syscall_position: Default::default(),
     };
     frame.x[8] = 96;
     let counters = Box::new(carrick_el1_abi::Counters::new());
@@ -10967,13 +10966,7 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         frame: &mut carrick_el1_abi::TrapFrame,
         original: &Aarch64ParkedContext,
     ) -> bool {
-        let Some(position) = original.saved_syscall_pc() else {
-            return false;
-        };
-        carrick_guest_arch::rerun_interrupted_syscall(
-            &mut carrick_guest_arch::PositionedFrame { frame, position },
-            original,
-        )
+        carrick_guest_arch::rerun_interrupted_syscall(frame, original)
     }
 
     fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
@@ -11266,12 +11259,7 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
     );
 
     let mut resumed = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
-    crate::sched::ThreadCpu::save(
-        &mut cpu.inner,
-        &frame,
-        &mut resumed,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu.inner, &frame, &mut resumed);
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     {
         let mut entry = runtime
@@ -12023,12 +12011,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         ThreadCtx::ZERO,
         fixture.address,
     ));
-    crate::sched::ThreadCpu::save(
-        &mut cpu.inner,
-        &frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu.inner, &frame, &mut saved);
     assert_eq!(saved.native.sp_el0, user_sp.raw());
     if check_member {
         // A real host-born member of this same process cannot take the
@@ -12240,7 +12223,6 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         &mut crate::sched::FakeCpu::default(),
         &later,
         &mut later_words,
-        crate::sched::CpuExitCause::Svc,
     );
     let mut later_entry = runtime
         .enter_registered(
@@ -17744,12 +17726,7 @@ fn futex_owner_wait_episode(
     frame.x[2] = 0x12345678;
     frame.x[3] = if timed { VA + 8 } else { 0 };
     let mut parked = parked;
-    crate::sched::ThreadCpu::save(
-        &mut cpu,
-        &frame,
-        &mut parked,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     {
         let mut entry = runtime
             .enter_registered(
@@ -17966,12 +17943,7 @@ fn futex_owner_wait_episode(
         }
         drop(entry);
     } else {
-        crate::sched::ThreadCpu::save(
-            &mut cpu,
-            &frame,
-            &mut parked,
-            crate::sched::CpuExitCause::Svc,
-        );
+        crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     }
     // A fresh comparison uses the original syscall arguments retained by
     // the owner continuation, even if a sibling changed the word meanwhile.

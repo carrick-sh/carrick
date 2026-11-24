@@ -86,15 +86,13 @@ struct ArmWfiCpu<'a> {
 }
 
 impl crate::sched::ThreadCpu for ArmWfiCpu<'_> {
-    fn save(
-        &mut self,
-        frame: &carrick_el1_abi::TrapFrame,
-        ctx: &mut Aarch64ParkedContext,
-        exit: crate::sched::CpuExitCause,
-    ) {
-        self.inner.save(frame, ctx, exit);
+    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        self.inner.save(frame, ctx);
     }
 
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.inner.publish_user_sp(sp);
+    }
     fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
         self.inner.load(frame, ctx);
     }
@@ -699,12 +697,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             ttbr: (succ_ttbr0, succ_ttbr0),
             ..Default::default()
         };
-        crate::sched::ThreadCpu::save(
-            &mut fake_cpu,
-            frame,
-            &mut saved,
-            crate::sched::CpuExitCause::Svc,
-        );
+        crate::sched::ThreadCpu::save(&mut fake_cpu, frame, &mut saved);
         let (page_ref, control_ref) = fixture.task.lifecycle_refs().unwrap();
         let mut arm_service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,
@@ -872,12 +865,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         ttbr: (succ_ttbr0, succ_ttbr0),
         ..Default::default()
     };
-    crate::sched::ThreadCpu::save(
-        &mut exit_cpu,
-        &frame,
-        &mut saved,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut exit_cpu, &frame, &mut saved);
     let (page_ref, control_ref) = fixture.task.lifecycle_refs().unwrap();
     let names = carrick_el1_abi::InotifyNameCache::new();
     *crossing.zone.lock().unwrap() = Some(fixture.zone);

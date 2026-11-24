@@ -923,6 +923,16 @@ impl SavedSyscallPcWord {
     pub const fn get(self) -> Option<SavedSyscallPc> {
         SavedSyscallPc::from_word(self.0)
     }
+
+    /// Copy a stored word, corrupt or not, into this typed carrier.
+    pub const fn from_stored(word: u64) -> Self {
+        Self(word)
+    }
+
+    /// The stored word, for a record that keeps it verbatim.
+    pub const fn stored(self) -> u64 {
+        self.0
+    }
 }
 
 /// The ISA register mechanics of a trapped syscall's return frame that
@@ -968,36 +978,6 @@ pub trait SyscallReturnFrame: SyscallReturnRegisters {
         let pc = self.syscall_pc()?;
         self.replace_return_pc(pc, SavedSyscallPc::AtSyscall);
         Some(pc)
-    }
-}
-
-/// A frame whose machine layout has no position word yet, with the
-/// position its owner tracked beside it, so it reruns through the same
-/// [`SyscallReturnFrame`] code as a frame that carries one.
-pub struct PositionedFrame<'a, F> {
-    pub frame: &'a mut F,
-    pub position: SavedSyscallPc,
-}
-
-impl<F: SyscallReturnRegisters> SyscallReturnRegisters for PositionedFrame<'_, F> {
-    const SYSCALL_LEN: u64 = F::SYSCALL_LEN;
-    fn return_pc(&self) -> u64 {
-        self.frame.return_pc()
-    }
-    fn set_return_pc(&mut self, pc: u64) {
-        self.frame.set_return_pc(pc);
-    }
-    fn set_entry_word(&mut self, entry_word: u64) {
-        self.frame.set_entry_word(entry_word);
-    }
-}
-
-impl<F: SyscallReturnRegisters> SyscallReturnFrame for PositionedFrame<'_, F> {
-    fn syscall_position(&self) -> Option<SavedSyscallPc> {
-        Some(self.position)
-    }
-    fn set_syscall_position(&mut self, position: SavedSyscallPc) {
-        self.position = position;
     }
 }
 

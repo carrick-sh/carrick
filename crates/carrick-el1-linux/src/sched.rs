@@ -20,13 +20,11 @@ pub struct HardwareCpu;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(
-        &mut self,
-        frame: &TrapFrame,
-        ctx: &mut carrick_el1_abi::Aarch64ParkedContext,
-        exit: CpuExitCause,
-    ) {
-        carrick_el1::substrate::sched::hw::HardwareCpu.save(frame, ctx, exit);
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+        carrick_el1::substrate::sched::hw::HardwareCpu.save(frame, ctx);
+    }
+    fn publish_user_sp(&mut self, sp: carrick_guest_arch::UserVa) {
+        carrick_el1::substrate::sched::hw::HardwareCpu.publish_user_sp(sp);
     }
     fn load(&mut self, frame: &mut TrapFrame, ctx: &carrick_el1_abi::Aarch64ParkedContext) {
         carrick_el1::substrate::sched::hw::HardwareCpu.load(frame, ctx);

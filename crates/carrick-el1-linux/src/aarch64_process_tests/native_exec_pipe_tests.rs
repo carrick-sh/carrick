@@ -2093,7 +2093,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     );
     // A timer IRQ preempts the resumed reader before its SVC executes. This
     // goes through the production IRQ path (`serve_irq` -> `interrupt` ->
-    // `preempt` -> `ThreadCpu::save(.., CpuExitCause::Interrupted)`), not the
+    // `preempt` -> `ThreadCpu::save(..)`), not the
     // `requeue_preempted` shortcut below, which never saves the context. On
     // the pre-fix `save`, which always wrote `AfterSyscall`, this save
     // replaced the reader's `AtSyscall` position and the next selection
@@ -2408,12 +2408,7 @@ fn child_futex<'a>(
     // A relative timeout must preserve its deadline across owner-copy suspension.
     frame.x[3] = if timed { VA + 16 } else { 0 };
     let mut parked = binding.words;
-    crate::sched::ThreadCpu::save(
-        &mut cpu,
-        &frame,
-        &mut parked,
-        crate::sched::CpuExitCause::Svc,
-    );
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     {
         let mut entry = runtime
             .enter_registered(
