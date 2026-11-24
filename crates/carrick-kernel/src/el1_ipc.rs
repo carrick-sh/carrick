@@ -1609,6 +1609,14 @@ impl HostIpc {
     pub fn retained_host_resources(&self) -> usize {
         self.resources.lock().live.len()
     }
+    /// Settle the completions the ring deferred to the bound carrier zone's
+    /// chain (x86 CPL0, #2928); nothing when no carrier zone is bound.
+    pub(crate) fn hand_back_carrier_completions(&self) {
+        if let Some(carrier) = self.carrier_zone.get() {
+            crate::el1_zone::hand_back_carrier_completions(carrier.as_ref());
+        }
+    }
+
     /// Bind the carrier-scoped zone this region's host releases wake into.
     /// A carrier binds once; a second binding is refused, never replaced.
     pub fn bind_carrier_zone(

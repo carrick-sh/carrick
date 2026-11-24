@@ -241,6 +241,24 @@ fn complete_carrier_object_wake(
     }
 }
 
+/// [`hand_back_completions_in`] for a carrier-scoped zone (x86 CPL0): the
+/// ring defers a completion it could not place to this zone's chain and
+/// rings only its venue's doorbell, so the host boundary that consumes the
+/// doorbell settles the chain here (#2928). Each record goes back to its
+/// native ring owner ([`hand_back_in_carrier`]). A reschedule the carrier
+/// could not deliver leaves a halted CPU with work it never runs: a broken
+/// invariant.
+pub(crate) fn hand_back_carrier_completions(carrier: CarrierZoneRef<'_>) {
+    carrier
+        .zone()
+        .take_completion_handbacks(&CarrierLockWait(carrier), &mut |record| {
+            hand_back_in_carrier(carrier, record)
+        });
+    if let Some(undelivered) = carrier.take_undelivered() {
+        carrick_fatal::carrick_fatal!("el1_zone::carrier_handback", "{}", undelivered.0);
+    }
+}
+
 /// A record a carrier-zone wake handed to the host (no guest slot could
 /// take it: every eligible CPU was stopped, e.g. the one serving the exit
 /// whose drain woke it). A native thread has no host continuation, so its

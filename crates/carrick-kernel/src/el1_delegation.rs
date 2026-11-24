@@ -140,6 +140,10 @@ fn deliver_boundary_wakes(
     }
     if served || pending {
         kernel.deliver_ipc_host_wakes();
+        // The same doorbell stands for a carrier zone's deferred
+        // completions (x86 CPL0, which has no process-global zone): settle
+        // that chain too, or its records stay `Transferring` (#2928).
+        kernel.hand_back_carrier_completions();
         if let Some(zone) = zone_tables() {
             // EL1 defers an object-wait completion it could not place to the
             // carrier chain and rings only this doorbell: consuming the
