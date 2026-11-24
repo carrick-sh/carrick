@@ -1295,6 +1295,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn maintenance_root_kick_does_not_poison_or_require_a_task_root() {
+        let root = context(1);
+        let mut maintenance_image = context(2).hardware_image();
+        maintenance_image.rip = 0xffff_ffff_8010_8539;
+        let maintenance_root = RootGpa::page_aligned(FrameGpa::new(maintenance_image.cr3)).unwrap();
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: maintenance_image,
+            port: 0,
+        })
+        .unwrap();
+        cpu.maintenance_root = Some(maintenance_root);
+        cpu.load(root.clone()).unwrap();
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert!(stopped.state.is_none());
+        assert_eq!(stopped.exit, CarrierRunExit::Kick);
+    }
+
+    #[test]
     fn maintenance_root_cannot_authenticate_other_physical_crossings() {
         let root = context(1);
         let maintenance = context(2);
