@@ -877,9 +877,10 @@ fn mounted_static_x86_exec_child_member_reads_a_host_file() {
 }
 
 /// Rows of the shared file write oracle that belong to another mechanism,
-/// each with its own ignored witness: `MAP_SHARED` of `/dev/zero` (#2958)
-/// and `msync` of a window (#1338 A3, with the shrink revoke).
-const SHARED_FILE_WRITE_GAPS: [&str; 2] = [" dev_zero_", "_msync "];
+/// each with its own ignored witness: `MAP_SHARED` of `/dev/zero` (#2958),
+/// `msync` of a window (#1338 A3, with the shrink revoke) and the window's
+/// `/proc/self/maps` line (the open itself is ENOSYS on x86, #2808).
+const SHARED_FILE_WRITE_GAPS: [&str; 3] = [" dev_zero_", "_msync ", "_maps_rw_s "];
 
 /// The shared file write oracle's rows, native and guest.
 struct SharedFileWriteRows {
@@ -986,6 +987,16 @@ fn mounted_static_x86_shared_dev_zero_mapping_matches_native() {
 fn mounted_static_x86_shared_file_window_msync_matches_native() {
     if let Some(rows) = shared_file_write_rows() {
         rows.assert_matches(Some(SHARED_FILE_WRITE_GAPS[1]));
+    }
+}
+
+/// #2808: a shared file window is `rw-s` in `/proc/self/maps`. A known gap
+/// until x86 serves the open of `/proc/self/maps` (ENOSYS today).
+#[test]
+#[ignore = "open of /proc/self/maps is ENOSYS on x86, see #2808"]
+fn mounted_static_x86_shared_file_window_maps_line_matches_native() {
+    if let Some(rows) = shared_file_write_rows() {
+        rows.assert_matches(Some(SHARED_FILE_WRITE_GAPS[2]));
     }
 }
 
