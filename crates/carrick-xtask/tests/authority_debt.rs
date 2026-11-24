@@ -106,6 +106,39 @@ fn a_reviewed_owner_move_transfers_its_ceiling() {
         "a move that increases the total fails"
     );
 }
+#[test]
+fn a_cross_crate_owner_move_lands_in_the_destination_crate_lane() {
+    // #2916 moves `code_content` from carrick-vmm-hvf (lane `hvf`) into
+    // carrick-aarch64 (lane `shared`): the scanner keys the moved cohort by
+    // its new crate's lane, so the move must settle that key.
+    const FROM: &str = "carrick_vmm_hvf::trap::code_content::ContentPage::leave";
+    const TO: &str = "carrick_aarch64::code_content::ContentPage::leave";
+    let moves = moved(FROM, TO);
+    let mut base = owned(FROM, 2);
+    base.counters[0].lane = Lane::Hvf;
+    assert!(
+        owned(TO, 2).ratchet(&base, &moves).is_ok(),
+        "a cross-crate move settles the destination crate's lane"
+    );
+    let mut kept_lane = owned(TO, 2);
+    kept_lane.counters[0].lane = Lane::Hvf;
+    assert!(
+        kept_lane.ratchet(&base, &moves).is_err(),
+        "the moved cohort cannot keep a lane its crate no longer has"
+    );
+    assert!(
+        owned(TO, 3)
+            .ratchet(&base, &moves)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds what the source gave up"),
+        "a cross-crate move still cannot grow"
+    );
+    for profile in [Lane::MacosHvfDefault, Lane::LinuxCli, Lane::BuildTime] {
+        assert_eq!(profile.moved_to(TO), profile, "a build's lane stays");
+    }
+    assert_eq!(Lane::Shared.moved_to("carrick_vmm_kvm::run"), Lane::Kvm);
+}
 fn pair(first: (&str, u64), second: (&str, u64)) -> AuthorityDebtCeilings {
     let mut policy = owned(first.0, first.1);
     policy
