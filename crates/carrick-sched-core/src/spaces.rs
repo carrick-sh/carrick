@@ -110,9 +110,30 @@ struct JournalSlot {
 /// Refusal from the exact admission observation, never inferred afterward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditAdmissionRefusal {
+    /// The entry no longer names the MM, or its release source is gone.
     Stale,
+    /// The entry names the MM but its gate is [`GATE_CLOSED`]: not yet
+    /// opened, or retiring. Lowering counted pauses never admits it, so no
+    /// gate release ends this refusal for an editor waiting on it.
+    Closed,
+    /// Another editor holds the MM: "not now", wait for its release.
     Editor,
+    /// A counted page-table pause is raised on the open MM: "not now", wait
+    /// for the gate's release.
     Gate,
+}
+
+impl EditAdmissionRefusal {
+    /// The one reading of a refusal for a caller that would park: the
+    /// release source a "not now" waits on, or `None` for a refusal no
+    /// release ends (a stale or closed space).
+    pub fn wait_cause(self) -> Option<SpaceWaitCause> {
+        match self {
+            Self::Editor => Some(SpaceWaitCause::Editor),
+            Self::Gate => Some(SpaceWaitCause::Gate),
+            Self::Stale | Self::Closed => None,
+        }
+    }
 }
 
 /// One published address space.
@@ -878,13 +899,19 @@ impl AddressSpaces {
         if entry.key.load(Ordering::SeqCst) != key {
             return Err(EditAdmissionRefusal::Stale);
         }
+        // One gate read classifies: closure is not a counted pause, even
+        // with pauses still counted under it (RAII publishes rollback).
+        let gate = entry.gate.load(Ordering::SeqCst);
+        if gate & GATE_CLOSED != 0 {
+            return Err(EditAdmissionRefusal::Closed);
+        }
         let admitted = if maintenance {
             self.paused_root_identity(index, key).is_some()
         } else {
-            entry.gate.load(Ordering::SeqCst) == 0
+            gate == 0
         };
         if !admitted {
-            return Err(EditAdmissionRefusal::Gate); // RAII publishes rollback.
+            return Err(EditAdmissionRefusal::Gate);
         }
         Ok(editor)
     }

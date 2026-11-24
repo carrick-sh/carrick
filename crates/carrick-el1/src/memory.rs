@@ -1430,13 +1430,7 @@ pub fn probe_parked_anonymous_edit<
             drop(editor);
             Some(None)
         }
-        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
-            Some(Some(SpaceWaitCause::Editor))
-        }
-        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
-            Some(Some(SpaceWaitCause::Gate))
-        }
-        Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
+        Err(refusal) => refusal.wait_cause().map(Some),
     }
 }
 
@@ -1768,6 +1762,7 @@ fn serve_delegated_anonymous_attempt<
         DelegatedAnonymous::Forward
     };
     use carrick_el1_abi::AnonymousLeave as Leave;
+    use carrick_sched_core::spaces::EditAdmissionRefusal;
     // A competing owner holds the root. Retain the syscall for this MM's
     // release notification; a native child has no host venue to forward to.
     let mut model = match table.lock_in(
@@ -1884,35 +1879,34 @@ fn serve_delegated_anonymous_attempt<
     else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
-    let Some(grant) = spaces.grant(index, mm_key) else {
-        // A raised gate is a host page-table pause of this live space: "not
-        // now", like the editor admission's `Gate` below. Park on the gate's
-        // release (the reprobe re-reads it through the editor admission);
-        // only a closed or re-keyed entry has no grant to wait for.
-        if spaces.table().installed_grant(index, mm_key).is_some() {
-            let _ = pending.cancel(&mut model);
-            return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
-        }
-        return refuse(pending, &mut model, Leave::NoGrant);
-    };
-    let _editor_guard =
+    // The editor admission is the one classifier of the space's gate: a
+    // counted pause (or another editor) is "not now" and parks on its
+    // release; a closed (retiring) space is refused like a missing grant.
+    // The admitted editor supplies the grant it holds for these edits.
+    let editor_guard =
         match spaces
             .table()
             .try_begin_edit_cause(index, mm_key, owner, spaces.venue())
         {
             Ok(editor_guard) => editor_guard,
-            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
-                let _ = pending.cancel(&mut model);
-                return DelegatedAnonymous::Contended(SpaceWaitCause::Editor);
-            }
-            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
-                let _ = pending.cancel(&mut model);
-                return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
-            }
-            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => {
-                return refuse(pending, &mut model, Leave::RootUnavailableStale);
+            Err(refusal) => {
+                if let Some(cause) = refusal.wait_cause() {
+                    let _ = pending.cancel(&mut model);
+                    return DelegatedAnonymous::Contended(cause);
+                }
+                let why = match refusal {
+                    EditAdmissionRefusal::Closed => Leave::NoGrant,
+                    _ => Leave::RootUnavailableStale,
+                };
+                return refuse(pending, &mut model, why);
             }
         };
+    let grant = editor_guard.grant();
+    if grant.ttbr0 == 0 {
+        drop(editor_guard);
+        return refuse(pending, &mut model, Leave::NoGrant);
+    }
+    let _editor_guard = editor_guard;
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {

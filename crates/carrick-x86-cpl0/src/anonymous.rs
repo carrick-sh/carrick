@@ -671,7 +671,6 @@ pub(super) fn park_contended_fault(
         park_object_record_rechecked, space_access,
     };
     use carrick_sched_core::Waker;
-    use carrick_sched_core::spaces::EditAdmissionRefusal;
     if !matches!(
         cause,
         SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
@@ -721,9 +720,7 @@ pub(super) fn park_contended_fault(
                     drop(editor);
                     Some(None)
                 }
-                Err(EditAdmissionRefusal::Editor) => Some(Some(SpaceWaitCause::Editor)),
-                Err(EditAdmissionRefusal::Gate) => Some(Some(SpaceWaitCause::Gate)),
-                Err(EditAdmissionRefusal::Stale) => None,
+                Err(refusal) => refusal.wait_cause().map(Some),
             }
         },
         |key, snapshot, fallback| {
