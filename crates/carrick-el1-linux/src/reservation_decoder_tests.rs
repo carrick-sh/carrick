@@ -533,3 +533,188 @@ fn reservation_carried_attributes_ride_el1_edits() {
         assert!(nodes(&mut g).is_empty());
     }
 }
+
+// ── #2950 review: where a ring-placed outside-layout hint may land ──────────
+
+/// The production Linux layout: the 32 GiB arena at `LINUX_MMAP_BASE`.
+fn linux_layout() -> Layout {
+    use carrick_personality_linux::mm::{
+        LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
+    };
+    Layout {
+        heap: range(LINUX_HEAP_BASE, LINUX_HEAP_BASE + LINUX_HEAP_SIZE),
+        arena: range(LINUX_MMAP_BASE, LINUX_MMAP_BASE + LINUX_MMAP_SIZE),
+        brk: LINUX_HEAP_BASE,
+        address_limit: u64::MAX,
+        data_limit: u64::MAX,
+        external_address_bytes: 0,
+        external_data_bytes: 0,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HintOutcome {
+    Forward,
+    /// The proposal's range, refused afterwards so the root stays empty.
+    Proposed(u64, u64),
+    Return(i64),
+    Other,
+}
+
+/// One non-fixed `mmap(hint, len, RW, MAP_PRIVATE|MAP_ANONYMOUS)` through
+/// the production decision for `origin`.
+fn mmap_hint<
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    model: &mut carrick_core::mm::reservation::Reservations<
+        '_,
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        G,
+        C,
+    >,
+    origin: carrick_core_abi::service::ServiceOrigin,
+    hint: u64,
+    len: u64,
+) -> HintOutcome {
+    use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall_for_origin};
+    let current = CurrentTask::new();
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(model.mm().raw(), Ordering::Relaxed);
+    let mut frame = TrapFrame::default();
+    frame.x[8] = 222;
+    frame.x[..6].copy_from_slice(&[hint, len, 3, 0x22, u64::MAX, 0]);
+    match decide_reservation_syscall_for_origin(&frame, &current, model, None, origin) {
+        ReservationDisposition::Forward => HintOutcome::Forward,
+        ReservationDisposition::Return(result) => HintOutcome::Return(result),
+        ReservationDisposition::Work(mut pending) => {
+            let range = pending.request().range;
+            pending.refuse(&mut frame, &current, model).unwrap();
+            HintOutcome::Proposed(range.start(), range.end())
+        }
+        ReservationDisposition::Unavailable(_) => HintOutcome::Other,
+    }
+}
+
+fn in_arena(outcome: &HintOutcome, len: u64) -> bool {
+    use carrick_personality_linux::mm::{LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
+    matches!(*outcome, HintOutcome::Proposed(start, end)
+        if end - start == len
+            && LINUX_MMAP_BASE <= start
+            && end <= LINUX_MMAP_BASE + LINUX_MMAP_SIZE)
+}
+
+/// P0-1: below 1 TiB an AArch64 HVPatch MM's stage-1 tables keep non-zero
+/// invalidated block descriptors (the HVPatch reserved window, sealed
+/// unowned space), so a ring-placed hint there is refused by the stage-1
+/// editor after the layout's relocation was skipped. A forked child (ring
+/// only) must relocate Go's `0xc000000000` arena hint into its arena, as
+/// it did before the exact-hint change.
+#[test]
+fn reservation_descendant_relocates_a_hint_below_the_high_va_threshold() {
+    use carrick_core_abi::service::ServiceOrigin;
+    let table = table();
+    let mm = ReservationMm::new(17).unwrap();
+    table.publish(0, mm, linux_layout()).unwrap();
+    let mut root = table
+        .lock_with_context::<Aarch64ParkedContext>(0, mm)
+        .unwrap();
+    root.finish_import().unwrap();
+    let outcome = mmap_hint(
+        &mut root,
+        ServiceOrigin::Descendant,
+        0xc0_0000_0000,
+        0x10000,
+    );
+    assert!(in_arena(&outcome, 0x10000), "Go arena hint: {outcome:x?}");
+}
+
+/// P0-2: carrier-owned windows inside the low alias span are never a free
+/// aperture: EL1's stage-1 table pool (`0x9a_0000_0000`) and the private
+/// overlay (`0x98_0000_0000`). A ring MM relocates a hint on either.
+#[test]
+fn reservation_descendant_never_places_a_hint_on_a_carrier_window() {
+    use carrick_core_abi::service::ServiceOrigin;
+    let table = table();
+    let mm = ReservationMm::new(17).unwrap();
+    table.publish(0, mm, linux_layout()).unwrap();
+    let mut root = table
+        .lock_with_context::<Aarch64ParkedContext>(0, mm)
+        .unwrap();
+    root.finish_import().unwrap();
+    for hint in [
+        carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+        carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE,
+    ] {
+        let outcome = mmap_hint(&mut root, ServiceOrigin::Descendant, hint, 0x1000);
+        assert!(in_arena(&outcome, 0x1000), "{hint:#x}: {outcome:x?}");
+    }
+}
+
+/// P0-3: every x86 CPL0 MM, the run root included, is ring-only: no host
+/// venue serves a forwarded mmap. A non-fixed hint the ring cannot place
+/// exactly (outside every free aperture, or colliding inside one) is
+/// advisory (mmap(2)) and relocates, never a counted ENOSYS.
+#[test]
+fn reservation_x86_root_relocates_a_hint_it_cannot_place_exactly() {
+    use carrick_core_abi::service::ServiceOrigin;
+    use carrick_el1::memory::reservations::X86Cpl0Reservations;
+    let table = unsafe {
+        let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<X86Cpl0Reservations>());
+        assert!(!ptr.is_null());
+        Box::<X86Cpl0Reservations>::from_raw(ptr.cast())
+    };
+    let mm = ReservationMm::new(19).unwrap();
+    table.publish(0, mm, linux_layout()).unwrap();
+    let mut root = table
+        .lock_with_context::<carrick_sched_core::ParkedContextWords>(0, mm)
+        .unwrap();
+    root.finish_import().unwrap();
+    // The PIE image base: outside every free aperture.
+    let outcome = mmap_hint(&mut root, ServiceOrigin::Initial, 0x88_0000_1000, 0x1000);
+    assert!(in_arena(&outcome, 0x1000), "PIE-base hint: {outcome:x?}");
+    // A free high hint is exact; the same hint colliding with that
+    // committed mapping relocates.
+    let hint = 0x2517_7424_0000;
+    let current = CurrentTask::new();
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(root.mm().raw(), Ordering::Relaxed);
+    let mut frame = TrapFrame::default();
+    frame.x[8] = 222;
+    frame.x[..6].copy_from_slice(&[hint, 0x10000, 3, 0x22, u64::MAX, 0]);
+    let carrick_el1::memory::ReservationDisposition::Work(mut first) =
+        carrick_el1::memory::decide_reservation_syscall_for_origin(
+            &frame,
+            &current,
+            &mut root,
+            None,
+            ServiceOrigin::Initial,
+        )
+    else {
+        panic!("a free high hint is one ring proposal");
+    };
+    let request = first.request();
+    assert_eq!(
+        request.range,
+        range(hint, hint + 0x10000),
+        "free hint is exact"
+    );
+    let receipt = unsafe {
+        ReservationCompletion::after_descriptor_and_backing_commit(
+            request,
+            ReservationBackingReceipt {
+                receipt: request.sequence.raw(),
+                granted_bytes: 0x10000,
+                returned_bytes: 0,
+            },
+        )
+    }
+    .unwrap();
+    first
+        .complete(&mut frame, &current, &mut root, receipt)
+        .unwrap();
+    let outcome = mmap_hint(&mut root, ServiceOrigin::Initial, hint, 0x10000);
+    assert!(in_arena(&outcome, 0x10000), "colliding hint: {outcome:x?}");
+}
