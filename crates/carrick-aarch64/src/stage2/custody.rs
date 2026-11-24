@@ -185,6 +185,12 @@ pub enum Stage2HookPoint {
     RawDestroyHoldingLock(CarrierVmGeneration),
     /// `begin_destroy` published `Destroying` and released the lock.
     DestroyingPublished(CarrierVmGeneration),
+    /// A thread found the custody lock held and is about to wait for it
+    /// (`operation` names the custody call): the event a race witness waits
+    /// on to know its rival is excluded, with no sleep.
+    LockContended(&'static str),
+    /// A named point in a backend client's own custody transaction.
+    Client(&'static str),
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -368,7 +374,7 @@ thread_local! {
     static STAGE2_INNER_HELD: Cell<usize> = const { Cell::new(0) };
 }
 
-fn assert_no_inner_lock_held(operation: &str) {
+fn assert_no_inner_lock_held(operation: &'static str) {
     let held = STAGE2_INNER_HELD.with(Cell::get);
     assert!(
         held == 0,
@@ -446,8 +452,15 @@ impl<R> Stage2Custody<R> {
         }
     }
 
-    fn lock_state(&self, operation: &str) -> MutexGuard<'_, Stage2CustodyState<R>> {
+    fn lock_state(&self, operation: &'static str) -> MutexGuard<'_, Stage2CustodyState<R>> {
         assert_no_inner_lock_held(operation);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if let Some(state) = self.state.try_lock() {
+                return state;
+            }
+            self.at(Stage2HookPoint::LockContended(operation));
+        }
         self.state.lock()
     }
 
@@ -462,6 +475,13 @@ impl<R> Stage2Custody<R> {
     #[cfg(not(any(test, feature = "test-support")))]
     #[inline(always)]
     fn at(&self, _point: Stage2HookPoint) {}
+
+    /// Mark a named point in a backend client's custody transaction, where a
+    /// test hook can order a race (a no-op outside test builds).
+    #[inline(always)]
+    pub fn at_client_point(&self, name: &'static str) {
+        self.at(Stage2HookPoint::Client(name));
+    }
 
     /// Park the custody's transactions at named points (tests only).
     #[cfg(any(test, feature = "test-support"))]

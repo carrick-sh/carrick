@@ -1530,6 +1530,7 @@ impl CarrierVmCustody {
             }
         };
 
+        self.stage2.at_client_point(RECORD_UNMAP_PREPARED);
         let backend_result = unmap(ipa, len);
         let mut state = self.stage2.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
@@ -1538,6 +1539,11 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::settle_record_retirement(record, identity, backend_result)
     }
 }
+
+/// The custody hook point where a record's retirement has decided to unmap
+/// and is about to call the backend.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const RECORD_UNMAP_PREPARED: &str = "record unmap prepared";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
@@ -1807,6 +1813,83 @@ mod carrier_vm_custody_tests {
             .commit_create(generation)
             .expect("publish VM generation");
         (custody, generation)
+    }
+
+    /// A record's retirement decided to unmap in G1 while a rival destroys G1
+    /// and creates G2. The unmap must reach G1's stage 2 before its raw
+    /// destroy, never G2's after it: the retirement holds G1's guard from its
+    /// decision to its backend call. The hook parks the retirement at that
+    /// point until the rival either finished (nothing excluded it: the bug)
+    /// or reported that it waits for the custody lock (the fix), so the
+    /// order is set by real events, with no sleep.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_record_unmap_never_runs_after_its_generation_is_destroyed_and_recreated() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (custody, g1) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(g1, 1))
+            .expect("G1 record");
+        let rival_done = std::sync::Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let event_rx = std::sync::Mutex::new(event_rx);
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| match point {
+                Stage2HookPoint::Client(super::RECORD_UNMAP_PREPARED) => {
+                    start_tx.send(()).expect("rival alive");
+                    let event = event_rx
+                        .lock()
+                        .expect("event receiver")
+                        .recv()
+                        .expect("rival reports");
+                    assert!(matches!(event, "contended" | "done"));
+                }
+                Stage2HookPoint::LockContended(_) => {
+                    let _ = hook_event_tx.send("contended");
+                }
+                _ => {}
+            })));
+
+        let rival = {
+            let custody = std::sync::Arc::clone(&custody);
+            let rival_done = std::sync::Arc::clone(&rival_done);
+            std::thread::spawn(move || {
+                start_rx.recv().expect("retirement parked");
+                destroy_vm_with_custody_using(
+                    &custody,
+                    "rival G1 destroy",
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                    || {},
+                )
+                .expect("rival destroys G1");
+                let g2 = custody.begin_create().expect("begin G2");
+                custody.commit_create(g2).expect("publish G2");
+                rival_done.store(true, Ordering::SeqCst);
+                let _ = event_tx.send("done");
+                g2
+            })
+        };
+
+        let unmapped_after_rival = AtomicBool::new(false);
+        let outcome = custody.retire_stage2_record_using(identity, |_, _| {
+            unmapped_after_rival.store(rival_done.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        });
+        let g2 = rival.join().expect("rival");
+        custody.stage2.set_hook(None);
+
+        assert_ne!(g2, g1);
+        assert!(
+            !unmapped_after_rival.load(Ordering::SeqCst),
+            "the G1 record's unmap reached the backend after G1 was destroyed and G2 created: \
+             it hit G2's stage 2"
+        );
+        assert_eq!(outcome, CarrierStage2RetireOutcome::RetiredUnmapped);
     }
 
     fn stage2_spec(
