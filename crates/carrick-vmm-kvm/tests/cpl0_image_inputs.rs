@@ -198,18 +198,98 @@ mod image_budget {
     }
 
     #[test]
-    fn a_malformed_cpl0_image_reads_as_no_budget() {
+    fn a_truncated_cpl0_image_reads_as_no_budget() {
         let (_, image) = IMAGES[0];
         // Every header prefix, then coarse steps through the tables.
         for len in (0..0x100).chain((0x100..image.len()).step_by(4093)) {
             assert_eq!(ImageBudget::of(&image[..len]), None, "prefix {len:#x}");
         }
-        let mut big_endian = image.to_vec();
+    }
+
+    #[test]
+    fn a_big_endian_cpl0_image_reads_as_no_budget() {
+        let mut big_endian = IMAGES[0].1.to_vec();
         big_endian[5] = 2;
         assert_eq!(ImageBudget::of(&big_endian), None);
+    }
+
+    /// Table offsets at `u64::MAX`: every offset sum is checked, so the
+    /// read is `None`, not an overflow panic in the build script.
+    #[test]
+    fn cpl0_image_tables_at_the_end_of_the_address_space_read_as_no_budget() {
+        let (_, image) = IMAGES[0];
         let mut huge_offsets = image.to_vec();
         huge_offsets[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
         huge_offsets[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(ImageBudget::of(&huge_offsets), None);
+    }
+
+    /// A minimal ELF64 image: one `PT_LOAD` of 0x300 bytes at 0x1000, and a
+    /// symbol table whose one symbol is the extent end at 0x1800. `nul`
+    /// ends the name inside its string table; `symtab_tail` adds bytes to
+    /// the symbol table's declared size.
+    fn synthetic_image(nul: bool, symtab_tail: u64) -> Vec<u8> {
+        fn put(image: &mut [u8], at: usize, bytes: &[u8]) {
+            image[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let (phoff, symoff, stroff, shoff) = (64, 128, 176, 208);
+        let mut names = vec![0];
+        names.extend_from_slice(super::cpl0_budget::EXTENT_END_SYMBOL);
+        if nul {
+            names.push(0);
+        }
+        let mut image = vec![0_u8; shoff + 3 * 64];
+        put(&mut image, 0, b"\x7fELF\x02\x01\x01");
+        put(&mut image, 0x20, &(phoff as u64).to_le_bytes());
+        put(&mut image, 0x28, &(shoff as u64).to_le_bytes());
+        put(&mut image, 0x36, &56_u16.to_le_bytes());
+        put(&mut image, 0x38, &1_u16.to_le_bytes());
+        put(&mut image, 0x3a, &64_u16.to_le_bytes());
+        put(&mut image, 0x3c, &3_u16.to_le_bytes());
+        put(&mut image, phoff, &1_u32.to_le_bytes());
+        put(&mut image, phoff + 0x10, &0x1000_u64.to_le_bytes());
+        put(&mut image, phoff + 0x28, &0x300_u64.to_le_bytes());
+        put(&mut image, symoff + 24, &1_u32.to_le_bytes());
+        put(&mut image, symoff + 24 + 8, &0x1800_u64.to_le_bytes());
+        put(&mut image, stroff, &names);
+        let (symtab, strtab) = (shoff + 64, shoff + 128);
+        put(&mut image, symtab + 4, &2_u32.to_le_bytes());
+        put(&mut image, symtab + 0x18, &(symoff as u64).to_le_bytes());
+        put(&mut image, symtab + 0x20, &(48 + symtab_tail).to_le_bytes());
+        put(&mut image, symtab + 0x28, &2_u32.to_le_bytes());
+        put(&mut image, symtab + 0x38, &24_u64.to_le_bytes());
+        put(&mut image, strtab + 4, &3_u32.to_le_bytes());
+        put(&mut image, strtab + 0x18, &(stroff as u64).to_le_bytes());
+        put(
+            &mut image,
+            strtab + 0x20,
+            &(names.len() as u64).to_le_bytes(),
+        );
+        image
+    }
+
+    #[test]
+    fn a_well_formed_synthetic_image_reads_its_known_budget() {
+        assert_eq!(
+            ImageBudget::of(&synthetic_image(true, 0)),
+            Some(ImageBudget {
+                loaded: 0x300,
+                extent: 0x800,
+            })
+        );
+    }
+
+    /// The whole symbol table is checked against its entry size: a declared
+    /// size one byte past a whole number of entries is malformed (#3008).
+    #[test]
+    fn a_symbol_table_with_a_partial_entry_reads_as_no_budget() {
+        assert_eq!(ImageBudget::of(&synthetic_image(true, 1)), None);
+    }
+
+    /// A symbol name that runs to the end of its string table without a
+    /// NUL is not a name, even when its bytes spell the extent symbol.
+    #[test]
+    fn an_unterminated_extent_name_reads_as_no_budget() {
+        assert_eq!(ImageBudget::of(&synthetic_image(false, 0)), None);
     }
 }
