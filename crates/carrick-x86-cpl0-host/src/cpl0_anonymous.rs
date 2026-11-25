@@ -1214,15 +1214,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self._vm
             .write(physical, bytes)
             .map_err(|e| fail(e.to_string()))?;
-        self.drain_fork_quarantine(execution)?;
-        self.probe_parked_execs(lease.cpu)
+        self.drain_fork_quarantine(execution)
     }
 
     /// The guest's retired-space drain unpublished at least one closed
     /// space's entry and crossed (#3030). A retired fork child's quarantine
     /// was waiting for exactly that: drain it, which returns its tables to
     /// the stock and wakes every waiter enrolled on the stock's release (a
-    /// parked fault or exec), then probe the parked execs. From a process
+    /// parked fault or exec; the crossing's end probes the execs). From a process
     /// root the stopped execution's MM is excluded, as on every crossing;
     /// from the maintenance root, none is.
     pub fn service_space_retired<I: CarrierCpuIo>(
@@ -1246,7 +1245,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     .ok_or_else(|| fail("space retired off any authenticated root"))?;
             self.drain_fork_quarantine_in(venue)?;
         }
-        self.probe_parked_execs(lease.cpu)
+        Ok(())
     }
 
     /// Counters of the shared fork stock (loans, counted refusals, returns).

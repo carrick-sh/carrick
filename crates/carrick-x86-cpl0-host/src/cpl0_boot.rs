@@ -2970,12 +2970,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let mut pending_file = None;
         let mut pending_exec = None;
         let mut exec_rebind = None;
+        let mut take_work = false;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
                 io,
             };
-            match *port {
+            let served = match *port {
                 OWNER_GRANT_PORT => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
@@ -2990,7 +2991,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     let child_binding = custody.service_fork_stock(&lease)?;
-                    custody.probe_parked_execs(lease.cpu)?;
                     Ok((None, child_binding, None))
                 }
                 carrick_el1_abi::NATIVE_EXEC_PORT => {
@@ -3061,8 +3061,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                             custody.drain_fork_quarantine_in(venue)?;
                         }
                     }
-                    custody.probe_parked_execs(lease.cpu)?;
-                    work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
+                    take_work = true;
                     Ok((None, None, None))
                 }
                 _ => {
@@ -3078,7 +3077,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     );
                     Err(fail(detail))
                 }
+            }?;
+            // Any crossing can advance the fork stock's release, which only
+            // flags a parked exec's row: every crossing ends with the probe.
+            custody.probe_parked_execs(lease.cpu)?;
+            if take_work {
+                work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
             }
+            Ok(served)
         })?;
         if let Some((child_binding, entry_task)) = register_child {
             self.cpu
@@ -3116,7 +3122,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     cpu: carrick_guest_arch::CpuId::new(1),
                     io,
                 };
-                custody.finish_native_exec(&lease, pending, loaded)
+                custody.finish_native_exec(&lease, pending, loaded)?;
+                custody.probe_parked_execs(lease.cpu)
             })?;
         }
         if let Some(mut pending) = pending_file {
@@ -3137,7 +3144,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     cpu: carrick_guest_arch::CpuId::new(1),
                     io,
                 };
-                custody.finish_native_host_file(&lease, *pending, served)
+                custody.finish_native_host_file(&lease, *pending, served)?;
+                custody.probe_parked_execs(lease.cpu)
             })?;
             if accepted {
                 custody.idle_peer_host_files = custody
@@ -3432,9 +3440,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let mut pending_exec = None;
         let mut exec_rebind = None;
         let mut root_exec = None;
+        let mut take_work = false;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
             let lease = StoppedCpuLease { cpu: slot, io };
-            match production_port(*port) {
+            let served = match production_port(*port) {
                 Some(ProductionPort::OwnerGrant) => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
@@ -3449,7 +3458,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     let child_binding = custody.service_fork_stock(&lease)?;
-                    custody.probe_parked_execs(lease.cpu)?;
                     Ok((None, child_binding, None))
                 }
                 Some(ProductionPort::NativeExec) => {
@@ -3515,8 +3523,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                             custody.drain_fork_quarantine_in(venue)?;
                         }
                     }
-                    custody.probe_parked_execs(lease.cpu)?;
-                    work_flags = Some(take_production_work_boundary(custody.task(slot))?);
+                    take_work = true;
                     Ok((None, None, None))
                 }
                 None => {
@@ -3535,7 +3542,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         binding.fault_reason.load(Ordering::Acquire),
                     )))
                 }
+            }?;
+            // Any crossing can advance the fork stock's release, which only
+            // flags a parked exec's row: every crossing ends with the probe.
+            custody.probe_parked_execs(lease.cpu)?;
+            if take_work {
+                work_flags = Some(take_production_work_boundary(custody.task(slot))?);
             }
+            Ok(served)
         })?;
         if let Some((child_binding, entry_task)) = register_child {
             self.cpu
@@ -3580,7 +3594,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 .map_err(|_| fail("physical custody poisoned"))?;
             self.cpu.with_stopped_io(task, |io| {
                 let lease = StoppedCpuLease { cpu: slot, io };
-                custody.finish_native_exec(&lease, pending, loaded)
+                custody.finish_native_exec(&lease, pending, loaded)?;
+                custody.probe_parked_execs(lease.cpu)
             })?;
         }
         if let Some(mut pending) = pending_file {
@@ -3597,7 +3612,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 .map_err(|_| fail("physical custody poisoned"))?;
             self.cpu.with_stopped_io(task, |io| {
                 let lease = StoppedCpuLease { cpu: slot, io };
-                custody.finish_native_host_file(&lease, *pending, served)
+                custody.finish_native_host_file(&lease, *pending, served)?;
+                custody.probe_parked_execs(lease.cpu)
             })?;
         }
         if let Some((served, doorbell)) = work_flags {

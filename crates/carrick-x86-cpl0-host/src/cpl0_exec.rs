@@ -1370,8 +1370,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 
     /// Probe each parked exec once: a cancelled one is acknowledged and
     /// retires; one whose enrolled release fired and found returned tables
-    /// reruns its staging. Called after every crossing that can return stock
-    /// tables.
+    /// reruns its staging. Every physical crossing ends with this probe (both
+    /// dispatchers, and their deferred exec and host-file finishes), so no
+    /// release a crossing advances leaves a woken row unprobed.
     pub(in crate::cpl0_boot) fn probe_parked_execs(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
@@ -1575,7 +1576,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             _ => return Err(fail("native exec crossing operation")),
         };
-        self.probe_parked_execs(lease.cpu)?;
         Ok(crossing)
     }
 
