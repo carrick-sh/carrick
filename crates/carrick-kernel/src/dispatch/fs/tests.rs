@@ -16856,4 +16856,119 @@ mod window_size_door {
             assert_eq!(size(&backing), 16384);
         });
     }
+
+    #[test]
+    fn materialized_ftruncate_serializes_concurrent_pwrite_across_rewrite_and_apply() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let run = Run::new();
+        let plain = run.rootfs_file("/plain", 8192);
+        let desc = OpenDescription::File {
+            path: "/plain".to_string(),
+            contents: FileContents::dense(vec![0x42; 8192]),
+            offset: 0,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/plain"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 8192,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
+            panic!("install_fd");
+        };
+        let fd = fd as u64;
+        struct ReleaseOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_after_tx, b_after_rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let ctx = &ctx;
+        let dispatcher = &run.dispatcher;
+        std::thread::scope(|scope| {
+            let mut proceed_guard = ReleaseOnDrop(Some(proceed_tx));
+            let ha = scope.spawn(move || {
+                super::test_materialized_resize_hook::install(entered_tx, proceed_rx);
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            SYS_FTRUNCATE,
+                            SyscallArgs::from([fd, 4096, 0, 0, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap()
+            });
+            entered_rx.recv().unwrap();
+            let hb = scope.spawn(move || {
+                super::test_materialized_resize_hook::install_lock_signals(b_before_tx, b_after_tx);
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 8192]);
+                let buf_va = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                mem.write_bytes_raw(buf_va, &[0x5au8; 4096]).unwrap();
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            carrick_abi::syscall::nr::PWRITE64.raw(),
+                            SyscallArgs::from([fd, buf_va, 4096, 4096, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap()
+            });
+            let saw_lock_hook = b_before_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_ok();
+            if saw_lock_hook {
+                assert!(
+                    b_after_rx.try_recv().is_err(),
+                    "pwrite64 on OpenDescription::File must wait behind materialized_resize"
+                );
+            }
+            let _ = proceed_guard.0.take().unwrap().send(());
+            let ra = ha.join().unwrap();
+            let rb = hb.join().unwrap();
+            assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
+            assert_eq!(rb, DispatchOutcome::Returned { value: 4096 });
+            let host_len = size(&plain);
+            let file = dispatcher.open_file(fd as i32).unwrap();
+            let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+            let OpenDescription::File {
+                contents, metadata, ..
+            } = &*open
+            else {
+                panic!("materialized");
+            };
+            let copy_len = contents.len().unwrap();
+            assert_eq!(
+                host_len, copy_len,
+                "host backing len != materialized copy len"
+            );
+            assert_eq!(metadata.size as u64, copy_len);
+            assert!(saw_lock_hook, "pwrite64 must take materialized_resize lock");
+        });
+    }
 }

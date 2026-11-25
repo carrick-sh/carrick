@@ -1846,6 +1846,9 @@ impl<'a> FsView<'a> {
             nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
+        if vfs_flags.trunc {
+            crate::el1_delegation::recall_vfs_path(vfs, full_path);
+        }
         // A mount's ENOSYS means "not mine, fall through"; one the host size
         // door answered is the call's own refusal (#1338 A1).
         let (opened, fenced) =

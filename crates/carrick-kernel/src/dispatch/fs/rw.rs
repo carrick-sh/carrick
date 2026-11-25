@@ -951,6 +951,7 @@ impl<'a> FsView<'a> {
                 )
                 .map(CarrierWritten::Done);
         }
+        let _materialized_resize = self.lock_materialized_file_write(description);
         let (mut open, io_lease) = match self.begin_description_write(
             HostFileWriter::<'_, '_, super::super::outcome::LinearMemory>::Carrier(admitted),
             description,
@@ -2490,6 +2491,8 @@ impl<'a> FsView<'a> {
                 (Some(read), true) => WriteSource::Guest(read),
                 _ => WriteSource::Staged(bytes),
             };
+            let materialized_desc = Arc::clone(&open_file.description);
+            let _materialized_resize = this.lock_materialized_file_write(&materialized_desc);
             let (mut open, io_lease) = match this.begin_description_write(
                 HostFileWriter::Task {
                     cx: &mut *cx,
@@ -4413,6 +4416,7 @@ impl<'a> FsView<'a> {
         );
         drop(open);
         if is_inmem_file {
+            let _materialized_resize = self.lock_materialized_file_write(description);
             let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -5501,6 +5505,8 @@ impl<'a> FsView<'a> {
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                let materialized_desc = Arc::clone(&open_file.description);
+                let _materialized_resize = self.lock_materialized_file_write(&materialized_desc);
                 let outcome: DispatchOutcome;
                 let writeback: Option<FileWriteback>;
                 {

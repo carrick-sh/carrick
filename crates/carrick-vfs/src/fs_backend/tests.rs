@@ -3913,4 +3913,64 @@ mod serial_host {
             NofollowParent::MissingBelowContainedAncestor
         ));
     }
+
+    #[test]
+    fn write_file_range_preserves_peer_extension_on_windowed_file() {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+        let _window_guard = crate::host_size::test_resize_hook::lock_window_tests();
+        struct SendOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for SendOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        backend.create_file("/win").unwrap();
+        let raw_pin_fd = backend
+            .open_raw_fd("/win", true, false, false)
+            .into_backend_result()
+            .unwrap();
+        let pin_file = unsafe { OwnedFd::from_raw_fd(raw_pin_fd) };
+        let _pin = crate::host_size::record(pin_file.as_fd()).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let mut proceed_guard = SendOnDrop(Some(proceed_tx));
+            let ha = scope.spawn(|| {
+                super::host::test_write_range_hook::install_pause(entered_tx, proceed_rx);
+                backend.write_file_range("/win", 0, &[0x11u8; 4096], 8192)
+            });
+            entered_rx.recv().unwrap();
+            let raw_peer_fd = backend
+                .open_raw_fd("/win", true, false, false)
+                .into_backend_result()
+                .unwrap();
+            let peer_file = unsafe { OwnedFd::from_raw_fd(raw_peer_fd) };
+            {
+                let _write_guard = crate::host_size::admit_write(peer_file.as_fd());
+                let payload = [0x22u8; 4096];
+                let n = unsafe {
+                    libc::pwrite(
+                        peer_file.as_raw_fd(),
+                        payload.as_ptr().cast(),
+                        payload.len(),
+                        12288,
+                    )
+                };
+                assert_eq!(n, 4096);
+            }
+            let _ = proceed_guard.0.take().unwrap().send(());
+            assert_eq!(
+                ha.join().unwrap(),
+                Ok(()),
+                "write_file_range must preserve concurrent peer extension on a windowed inode"
+            );
+        });
+        let st = backend.metadata("/win").unwrap();
+        assert_eq!(st.size, 16384);
+    }
 }

@@ -1671,6 +1671,7 @@ impl<'a> FsView<'a> {
             {
                 return Ok(DispatchOutcome::errno(errno));
             }
+            crate::el1_delegation::recall_vfs_path(m.vfs, &m.full_path);
             return Ok(match m.vfs.truncate(&m.full_path, length as u64) {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => DispatchOutcome::errno(errno),
@@ -1763,6 +1764,26 @@ impl<'a> FsView<'a> {
             .and_then(|len| usize::try_from(len).ok())
             .unwrap_or(new_len);
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// Serialize `OpenDescription::File` writes and writebacks with two-stage
+    /// materialized `ftruncate`/`fallocate` on the same description (#2975 r34 P0 #3).
+    pub(super) fn lock_materialized_file_write<'d>(
+        &self,
+        description: &'d crate::kernel::FileDescription,
+    ) -> Option<parking_lot::MutexGuard<'d, ()>> {
+        let is_materialized = description
+            .inspect_kind(|open| matches!(open, OpenDescription::File { .. }))
+            .unwrap_or(false);
+        if !is_materialized {
+            return None;
+        }
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_before_lock();
+        let guard = description.common().lock_materialized_resize();
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_after_lock();
+        Some(guard)
     }
 
     // === Normalized shim-wrappers ===

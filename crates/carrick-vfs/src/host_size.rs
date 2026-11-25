@@ -143,19 +143,23 @@ impl RegistryGuard<'_> {
     }
 }
 
+fn lock_window_write() -> RwLockWriteGuard<'static, Registry> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        test_resize_hook::pause_before_resize_lock();
+        test_resize_hook::signal_before_resize_lock();
+    }
+    let registry = WINDOWED.write();
+    #[cfg(any(test, feature = "test-support"))]
+    test_resize_hook::signal_after_resize_lock();
+    registry
+}
+
 fn lock_for_resize(fd: RawFd) -> RegistryGuard<'static> {
     let registry = WINDOWED.read();
     if !registry.is_empty() && is_windowed_or_unstatable(&registry, fd) {
         drop(registry);
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            test_resize_hook::pause_before_resize_lock();
-            test_resize_hook::signal_before_resize_lock();
-        }
-        let registry = WINDOWED.write();
-        #[cfg(any(test, feature = "test-support"))]
-        test_resize_hook::signal_after_resize_lock();
-        return RegistryGuard::Write(registry);
+        return RegistryGuard::Write(lock_window_write());
     }
     RegistryGuard::Read(registry)
 }
@@ -362,9 +366,9 @@ pub fn admit_resize(fd: BorrowedFd<'_>, len: u64) -> Result<Resize<'_>, libc::c_
 /// acquisition without a spurious `ENOSYS`, #2975 r33 P0 #4).
 pub fn extend_to(fd: BorrowedFd<'_>, min_len: u64) -> Result<bool, libc::c_int> {
     let off = libc::off_t::try_from(min_len).map_err(|_| libc::EFBIG)?;
-    let guard = lock_for_resize(fd.as_raw_fd());
+    let registry = lock_window_write();
     let Some(stat) = fstat(fd.as_raw_fd()) else {
-        return Err(if guard.registry().is_empty() {
+        return Err(if registry.is_empty() {
             last_errno()
         } else {
             let _ = refused();
@@ -374,10 +378,7 @@ pub fn extend_to(fd: BorrowedFd<'_>, min_len: u64) -> Result<bool, libc::c_int> 
     if u64::try_from(stat.st_size).is_ok_and(|now| min_len <= now) {
         return Ok(false);
     }
-    if matches!(&guard, RegistryGuard::Write(_)) {
-        check(guard.registry(), fd.as_raw_fd(), Change::Resize(min_len))
-            .map_err(|Fenced| Fenced::ERRNO)?;
-    }
+    check(&registry, fd.as_raw_fd(), Change::Resize(min_len)).map_err(|Fenced| Fenced::ERRNO)?;
     #[cfg(any(test, feature = "test-support"))]
     test_resize_hook::pause_before_ftruncate();
     if unsafe { libc::ftruncate(fd.as_raw_fd(), off) } == 0 {
@@ -461,16 +462,16 @@ fn open_truncating_path_with(
         });
     }
 
-    let (mut dir_fd, mut leaf_c) = split_and_open_parent(libc::AT_FDCWD, raw_bytes)?;
+    let mut cur_path = path.to_path_buf();
+    let mut cur_c = std::ffi::CString::new(raw_bytes).map_err(|_| libc::EINVAL)?;
     const MAX_SYMLINK_HOPS: usize = 40;
     for hop in 0..MAX_SYMLINK_HOPS {
         before_hop(hop);
-        let dir_raw = dir_fd.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
-        match open_path_raw(dir_raw, &leaf_c, flags | libc::O_EXCL, mode) {
+        match open_path_raw(libc::AT_FDCWD, &cur_c, flags | libc::O_EXCL, mode) {
             Ok(fd) => return Ok(fd),
             Err(libc::EEXIST) => match open_path_raw(
-                dir_raw,
-                &leaf_c,
+                libc::AT_FDCWD,
+                &cur_c,
                 flags & !(libc::O_CREAT | libc::O_TRUNC),
                 mode,
             ) {
@@ -478,37 +479,47 @@ fn open_truncating_path_with(
                     return truncate_opened_fd(
                         flags,
                         owned,
-                        &mut |open_flags| open_path_raw(dir_raw, &leaf_c, open_flags, mode),
+                        &mut |open_flags| open_path_raw(libc::AT_FDCWD, &cur_c, open_flags, mode),
                         reopen_writable_self_fd,
                     );
                 }
-                Err(libc::ENOENT) => match readlinkat_os(dir_raw, &leaf_c) {
+                Err(libc::ENOENT) => match readlinkat_os(libc::AT_FDCWD, &cur_c) {
                     Ok(target) => {
                         let target_bytes = target.as_os_str().as_bytes();
                         if target_bytes.is_empty() {
                             return Err(libc::ENOENT);
                         }
+                        let next_path = if target_bytes[0] == b'/' {
+                            std::path::PathBuf::from(&target)
+                        } else {
+                            cur_path
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .map_or_else(
+                                    || std::path::PathBuf::from(&target),
+                                    |p| p.join(&target),
+                                )
+                        };
+                        let next_c = std::ffi::CString::new(next_path.as_os_str().as_bytes())
+                            .map_err(|_| libc::EINVAL)?;
                         if target_bytes.ends_with(b"/") {
-                            let ctarget =
-                                std::ffi::CString::new(target_bytes).map_err(|_| libc::EINVAL)?;
-                            let opened =
-                                open_path_raw(dir_raw, &ctarget, flags & !libc::O_TRUNC, mode)?;
+                            let opened = open_path_raw(
+                                libc::AT_FDCWD,
+                                &next_c,
+                                flags & !libc::O_TRUNC,
+                                mode,
+                            )?;
                             return truncate_opened_fd(
                                 flags,
                                 opened,
                                 &mut |open_flags| {
-                                    open_path_raw(dir_raw, &ctarget, open_flags, mode)
+                                    open_path_raw(libc::AT_FDCWD, &next_c, open_flags, mode)
                                 },
                                 reopen_writable_self_fd,
                             );
                         }
-                        let (next_dir, next_leaf) = split_and_open_parent(dir_raw, target_bytes)?;
-                        if let Some(d) = next_dir {
-                            dir_fd = Some(d);
-                        } else if target_bytes[0] == b'/' {
-                            dir_fd = None;
-                        }
-                        leaf_c = next_leaf;
+                        cur_path = next_path;
+                        cur_c = next_c;
                     }
                     Err(libc::EINVAL) => continue,
                     Err(err) => return Err(err),
@@ -534,40 +545,6 @@ fn open_path_raw(
     } else {
         // SAFETY: `openat` returned a fresh owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-}
-
-fn open_dir_at(base: RawFd, path: &std::ffi::CStr) -> Result<OwnedFd, libc::c_int> {
-    open_path_raw(
-        base,
-        path,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )
-}
-
-fn split_and_open_parent(
-    base: RawFd,
-    bytes: &[u8],
-) -> Result<(Option<OwnedFd>, std::ffi::CString), libc::c_int> {
-    if let Some(slash) = bytes.iter().rposition(|&b| b == b'/') {
-        let parent_bytes = if slash == 0 {
-            &b"/"[..]
-        } else {
-            &bytes[..slash]
-        };
-        let parent_c = std::ffi::CString::new(parent_bytes).map_err(|_| libc::EINVAL)?;
-        let leaf_c = std::ffi::CString::new(&bytes[slash + 1..]).map_err(|_| libc::EINVAL)?;
-        let dir_base = if bytes[0] == b'/' {
-            libc::AT_FDCWD
-        } else {
-            base
-        };
-        let dir = open_dir_at(dir_base, &parent_c)?;
-        Ok((Some(dir), leaf_c))
-    } else {
-        let leaf_c = std::ffi::CString::new(bytes).map_err(|_| libc::EINVAL)?;
-        Ok((None, leaf_c))
     }
 }
 
@@ -1353,6 +1330,116 @@ mod tests {
         assert_eq!(std::fs::read(&win_path).unwrap(), vec![b'W'; 4096]);
     }
 
+    #[test]
+    fn creat_rdonly_trunc_path_succeeds_without_parent_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestoreMode(std::path::PathBuf, u32);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exec_dir = dir.path().join("exec_only");
+        let wx_dir = dir.path().join("wx_only");
+        std::fs::create_dir(&exec_dir).unwrap();
+        std::fs::create_dir(&wx_dir).unwrap();
+        let _r1 = RestoreMode(exec_dir.clone(), 0o755);
+        let _r2 = RestoreMode(wx_dir.clone(), 0o755);
+        let existing = exec_dir.join("existing");
+        std::fs::write(&existing, b"prior-contents").unwrap();
+        std::fs::set_permissions(&exec_dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let flags = libc::O_CREAT | libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC;
+        let fd_existing = open_truncating_path(&existing, flags, 0o644).expect(
+            "O_CREAT|O_RDONLY|O_TRUNC on existing file in --x parent must not require dir read",
+        );
+        drop(fd_existing);
+        assert_eq!(size(&existing), 0);
+
+        let dlink = wx_dir.join("dlink");
+        let dtarget = wx_dir.join("dtarget");
+        std::os::unix::fs::symlink(&dtarget, &dlink).unwrap();
+        std::fs::set_permissions(&wx_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let fresh = wx_dir.join("fresh");
+        let fd_fresh = open_truncating_path(&fresh, flags, 0o444)
+            .expect("O_CREAT|O_RDONLY|O_TRUNC in -wx parent must create 0444 file");
+        drop(fd_fresh);
+        assert!(fresh.exists());
+        #[cfg(target_os = "linux")]
+        {
+            let fd_dlink = open_truncating_path(&dlink, flags, 0o444)
+                .expect("dangling symlink O_CREAT|O_RDONLY|O_TRUNC in -wx parent must succeed");
+            drop(fd_dlink);
+            assert!(dtarget.exists());
+        }
+    }
+
+    #[test]
+    fn extend_to_serializes_unregistered_file_against_concurrent_admit_write() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
+        struct SendOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for SendOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let f1 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let f2 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_after_tx, b_after_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let mut proceed_guard = SendOnDrop(Some(proceed_tx));
+            let ha = scope.spawn(move || {
+                test_resize_hook::install(entered_tx, proceed_rx);
+                extend_to(f1.as_fd(), 8192)
+            });
+            entered_rx.recv().unwrap();
+            let hb = scope.spawn(move || {
+                test_resize_hook::install_write_lock_signals(b_before_tx, b_after_tx);
+                let _w = admit_write(f2.as_fd());
+                let payload = [0x41u8; 4096];
+                let n = unsafe {
+                    libc::pwrite(
+                        f2.as_raw_fd(),
+                        payload.as_ptr().cast(),
+                        payload.len(),
+                        12288,
+                    )
+                };
+                assert_eq!(n, 4096);
+            });
+            b_before_rx.recv().unwrap();
+            assert!(
+                b_after_rx.try_recv().is_err(),
+                "admit_write must wait behind extend_to WINDOWED write lock on unregistered file"
+            );
+            let _ = proceed_guard.0.take().unwrap().send(());
+            b_after_rx.recv().unwrap();
+            assert_eq!(ha.join().unwrap(), Ok(true));
+            hb.join().unwrap();
+            assert_eq!(
+                size(&path),
+                16384,
+                "unregistered extend_to must serialize against concurrent pwrite rather than shrinking 16384->8192"
+            );
+        });
+    }
+
     /// Host tests that temporarily tighten process-wide `RLIMIT_NOFILE`.
     /// Must run with `RUST_TEST_THREADS=1` (as `just test` and
     /// `just test-touched` do for `serial_host` modules) so sibling tests do
@@ -1590,6 +1677,35 @@ mod tests {
             if let Some(h) = writer_thread {
                 h.join().unwrap();
             }
+        }
+
+        #[test]
+        fn creat_rdonly_trunc_path_succeeds_under_single_free_host_fd() {
+            let _guard = TEST_REGISTRY_MUTEX.lock();
+            let dir = tempfile::tempdir().unwrap();
+            let existing = dir.path().join("existing");
+            let fresh = dir.path().join("fresh");
+            let dtarget = dir.path().join("dtarget");
+            let dlink = dir.path().join("dlink");
+            std::fs::write(&existing, b"prior-bytes").unwrap();
+            std::os::unix::fs::symlink(&dtarget, &dlink).unwrap();
+            let flags = libc::O_CREAT | libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC;
+            {
+                let _one_fd = OneFreeFdGuard::arm();
+                let fd = open_truncating_path(&existing, flags, 0o644)
+                    .expect("existing path open_truncating_path must succeed with 1 free host FD");
+                drop(fd);
+                let fd = open_truncating_path(&fresh, flags, 0o444)
+                    .expect("fresh path open_truncating_path must succeed with 1 free host FD");
+                drop(fd);
+                let fd = open_truncating_path(&dlink, flags, 0o444).expect(
+                    "dangling symlink open_truncating_path must succeed with 1 free host FD",
+                );
+                drop(fd);
+            }
+            assert_eq!(size(&existing), 0);
+            assert!(fresh.exists());
+            assert!(dtarget.exists());
         }
     }
 }
