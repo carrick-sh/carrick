@@ -497,21 +497,65 @@ pub(crate) unsafe fn stage2_map_replay(
     lookup: ReplayAliasLookup,
     allow_ipa: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
+    struct ReplayWatchGuard(Option<u64>);
+
+    impl ReplayWatchGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+
+        fn set(&mut self, watch_id: u64) {
+            self.0 = Some(watch_id);
+        }
+
+        fn clear_in(&mut self, registry: &mut super::AliasRegistry) {
+            if let Some(id) = self.0.take() {
+                registry.remove_replay_watch(id);
+            }
+        }
+
+        fn take_dirty_and_remove_in(
+            &mut self,
+            registry: &mut super::AliasRegistry,
+        ) -> Option<bool> {
+            self.0.take().map(|id| registry.take_replay_watch_dirty(id))
+        }
+    }
+
+    impl Drop for ReplayWatchGuard {
+        fn drop(&mut self) {
+            if let Some(id) = self.0.take() {
+                super::alias_registry().lock().remove_replay_watch(id);
+            }
+        }
+    }
+
     const MAX_REPLAY_REVISION_RESTARTS: usize = 8;
     const MAX_REPLAY_PHASE2_RETRIES: usize = 4;
     let mut slice_buf: Vec<(u64, AliasBacking)> = Vec::with_capacity(super::LAZY_REPLAY_ROW_BUDGET);
     let mut candidates: Vec<(u64, AliasBacking)> = Vec::new();
     let mut allowed_ipas: Vec<u64> = Vec::new();
+    let mut watch_guard = ReplayWatchGuard(None);
+    #[cfg(test)]
+    let mut fired_phase1_lookup_hook = false;
+    #[cfg(test)]
+    let mut fired_before_guard_hook = false;
+    #[cfg(test)]
+    let mut fired_looked_up_hook = false;
 
     let (backing, mut stage2, mut registry) = 'retry: {
         let mut attempt = 0_usize;
         loop {
             candidates.clear();
             let mut slice_cursor: Option<super::ReplaySliceCursor> = None;
+            let mut phase1_start_rev = 0_u64;
             let mut restarts = 0_usize;
             loop {
                 let step = {
-                    let registry = super::alias_registry().lock();
+                    let mut registry = super::alias_registry().lock();
+                    if slice_cursor.is_none() {
+                        phase1_start_rev = registry.revision();
+                    }
                     match lookup {
                         ReplayAliasLookup::Ipa { gpa } => registry.collect_replay_ipa_slice(
                             gpa,
@@ -541,8 +585,14 @@ pub(crate) unsafe fn stage2_map_replay(
                     }
                 };
                 candidates.append(&mut slice_buf);
+                if let super::ReplaySliceStep::Continue(next) = step {
+                    watch_guard.set(next.watch_id);
+                } else if matches!(step, super::ReplaySliceStep::RestartFromRevision) {
+                    watch_guard.disarm();
+                }
                 #[cfg(test)]
-                if attempt == 0 && slice_cursor.is_none() {
+                if !fired_phase1_lookup_hook {
+                    fired_phase1_lookup_hook = true;
                     custody
                         .stage2
                         .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
@@ -571,7 +621,7 @@ pub(crate) unsafe fn stage2_map_replay(
             } else {
                 candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
             }
-            let Some((_, backing)) = candidates.iter().copied().find(|&(_, entry)| {
+            let found_live = candidates.iter().copied().find(|&(_, entry)| {
                 let check_addr = match lookup {
                     ReplayAliasLookup::Ipa { .. } => entry.host_addr,
                     ReplayAliasLookup::VaProcess { va, .. }
@@ -582,7 +632,19 @@ pub(crate) unsafe fn stage2_map_replay(
                 super::alias_backing_is_live(check_addr)
                     && (entry.physical_host_addr == check_addr
                         || super::alias_backing_is_live(entry.physical_host_addr))
-            }) else {
+            });
+            let Some((_, backing)) = found_live else {
+                let retry_needed = {
+                    let mut registry = super::alias_registry().lock();
+                    match watch_guard.take_dirty_and_remove_in(&mut registry) {
+                        Some(dirty) => dirty,
+                        None => registry.revision() != phase1_start_rev,
+                    }
+                };
+                if retry_needed && attempt < MAX_REPLAY_PHASE2_RETRIES {
+                    attempt += 1;
+                    continue;
+                }
                 return Ok(None);
             };
             if !allowed_ipas.contains(&backing.physical_ipa) {
@@ -592,7 +654,8 @@ pub(crate) unsafe fn stage2_map_replay(
                 allowed_ipas.push(backing.physical_ipa);
             }
             #[cfg(test)]
-            if attempt == 0 {
+            if !fired_before_guard_hook {
+                fired_before_guard_hook = true;
                 custody
                     .stage2
                     .at_client_point(super::carrier_custody::REPLAY_REMAP_BEFORE_GUARD);
@@ -603,13 +666,15 @@ pub(crate) unsafe fn stage2_map_replay(
                 return Err(Stage2Status::NO_LIVE_VM);
             };
             #[cfg(test)]
-            if attempt == 0 {
+            if !fired_looked_up_hook {
+                fired_looked_up_hook = true;
                 custody
                     .stage2
                     .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
             }
-            let registry =
+            let mut registry =
                 super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
+            watch_guard.clear_in(&mut registry);
             if registry.contains_exact_physical_row(&backing) {
                 break 'retry (backing, stage2, registry);
             }
