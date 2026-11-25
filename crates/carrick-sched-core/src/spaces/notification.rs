@@ -114,29 +114,33 @@ impl NotificationSource {
     pub fn attached(&self) -> bool {
         self.state.load(Ordering::Acquire) & ACTIVE != 0
     }
-    pub(super) fn claim_entry_retirement(&self) {
+    /// Claim the entry's unique retirement and unpublish it at once: from
+    /// here no lookup finds the MM ([`super::AddressSpaces::unpublished`]
+    /// holds), whatever borrowers remain. Only the index's reuse waits for
+    /// the last borrower ([`Self::finish_entry_retirement`]), so a
+    /// borrower's release is never the unpublication a carrier waits for.
+    pub(super) fn claim_entry_retirement(&self, spaces: &super::AddressSpaces, index: SpaceIndex) {
         assert!(
             self.retirement
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok(),
             "entry retirement is unique"
         );
+        spaces.clear_retired_entry(index);
     }
     pub(super) fn reusable(&self) -> bool {
-        self.empty() && matches!(self.retirement.load(Ordering::Acquire), 0 | 3)
+        self.empty() && matches!(self.retirement.load(Ordering::Acquire), 0 | 2)
     }
     pub(super) fn prepare_entry(&self) {
         self.retirement.store(0, Ordering::Release);
     }
-    pub(super) fn finish_entry_retirement(&self, spaces: &super::AddressSpaces, index: SpaceIndex) {
-        if self.empty()
-            && self
+    /// The last borrower of a retired (already unpublished) entry makes
+    /// its index reusable.
+    pub(super) fn finish_entry_retirement(&self) {
+        if self.empty() {
+            let _ = self
                 .retirement
-                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            spaces.clear_retired_entry(index);
-            self.retirement.store(3, Ordering::Release);
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
         }
     }
     fn identity(&self) -> Option<SpaceNotificationIdentity> {
@@ -154,7 +158,7 @@ impl NotificationSource {
         assert!(previous & COUNT != 0, "notification admission underflow");
         if previous & COUNT == 1 {
             self.finish(zone, index);
-            self.finish_entry_retirement(&zone.spaces, index);
+            self.finish_entry_retirement();
         }
     }
     fn finish<C: Copy + Send + Sync + zerocopy::FromZeros>(
@@ -186,7 +190,7 @@ impl NotificationSource {
         // destruction. Preserve it; rebinding requires the exact empty word.
         self.state
             .fetch_and(!(FINISHING | CLOSING), Ordering::Release);
-        self.finish_entry_retirement(&zone.spaces, index);
+        self.finish_entry_retirement();
     }
 }
 fn notification_key(index: SpaceIndex, incarnation: u64, cause: SpaceWaitCause) -> ObjectWaitKey {
@@ -249,8 +253,11 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEntryHandle<'a, C> {
             .borrow_space_notifications(self.index, self.identity(incarnation))
     }
     /// Retire a closed entry without waiting for already admitted source
-    /// borrowers. The last borrower owns cleanup; publication skips it until
-    /// that unique cleanup finishes.
+    /// borrowers. The entry is unpublished before this returns, so the MM's
+    /// retirement is complete for every observer of
+    /// [`super::AddressSpaces::unpublished`] (the carrier's reclaim). The
+    /// last borrower only makes the index reusable; publication skips it
+    /// until then.
     pub fn retire_entry(self, venue: SpaceReleaseVenue<'_, C>) {
         assert!(
             core::ptr::eq(venue.zone, self.zone),
@@ -269,7 +276,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEntryHandle<'a, C> {
             previous & COUNT != COUNT,
             "notification admission exhaustion"
         );
-        source.claim_entry_retirement();
+        source.claim_entry_retirement(&self.zone.spaces, self.index);
         let closing = source.state.fetch_or(CLOSING, Ordering::SeqCst);
         if closing & !COUNT == ACTIVE {
             let Some(identity) = source.identity() else {
@@ -1065,15 +1072,29 @@ mod tests {
         let ticket = lease.reserve(SpaceWaitCause::Editor);
         entry.retire_entry(access(&zone).venue().unwrap());
         assert!(entry.notifications(incarnation).is_err());
+        // rev3022d P0: retirement unpublishes the entry itself; the
+        // borrower's release (which a carrier never observes) only frees
+        // the index for reuse.
         assert_eq!(
             zone.spaces.key(index),
-            77,
-            "borrow retains old entry custody"
+            super::super::FREED,
+            "retirement unpublishes the entry past a live borrow"
         );
-        assert!(!zone.spaces.entry(index).notifications.reusable());
+        assert!(zone.spaces.find(77).is_none());
+        assert!(zone.spaces.unpublished(77).is_some());
+        assert!(
+            !zone.spaces.entry(index).notifications.reusable(),
+            "borrow retains the old index"
+        );
+        assert_ne!(
+            zone.spaces
+                .publish_closed(77 + super::super::ADDRESS_SPACES as u64, 0x60000, 0x60000),
+            Some(index),
+            "a borrowed retired index is not reused"
+        );
         drop(lease);
-        assert_eq!(zone.spaces.key(index), super::super::FREED);
-        let replacement_mm = 77 + super::super::ADDRESS_SPACES as u64;
+        assert!(zone.spaces.entry(index).notifications.reusable());
+        let replacement_mm = 77 + 2 * super::super::ADDRESS_SPACES as u64;
         let replacement = zone
             .spaces
             .publish_closed(replacement_mm, 0x50000, 0x50000)
@@ -1106,11 +1127,10 @@ mod tests {
         // not validated the key or published any base pin yet.
         source.state.store(BINDING, Ordering::Release);
         entry.retire_entry(access(&zone).venue().unwrap());
-        assert_eq!(zone.spaces.key(index), 77);
+        assert_eq!(zone.spaces.key(index), super::super::FREED);
         assert!(!source.reusable());
         source.state.fetch_and(!BINDING, Ordering::Release);
         source.finish(&zone, index);
-        assert_eq!(zone.spaces.key(index), super::super::FREED);
         let complete = |effects: OwnedObjectWakeEffects<'_>| {
             let _ = effects.deliver_handbacks(&mut |_| {});
         };

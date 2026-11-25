@@ -459,20 +459,18 @@ mod queue_witnesses {
         let Refusal::Contended(ticket) = contend(&source, SpaceWaitCause::Gate) else {
             panic!("ticket");
         };
+        let index = zone.spaces.find(77).unwrap();
         zone.space_entry(NonZeroU64::new(77).unwrap())
             .unwrap()
             .retire_entry(venue(&zone));
+        // Retirement unpublishes the entry even while `source` is borrowed.
+        assert!(zone.spaces.find(77).is_none());
         // SAFETY: this adapter transfers the owned operation through the existing
         // scheduler enrollment or returns it; witnesses use the same real queue.
         unsafe { ticket.park_and_rerun((), |(), enrollment| assert!(!enrollment.unchanged())) };
         let answer = source.contend(|| {
             zone.spaces
-                .try_begin_edit_cause(
-                    zone.spaces.find(77).unwrap(),
-                    77,
-                    NonZeroU64::MIN,
-                    Some(venue(&zone)),
-                )
+                .try_begin_edit_cause(index, 77, NonZeroU64::MIN, Some(venue(&zone)))
                 .map_err(|refusal| match refusal {
                     crate::spaces::EditAdmissionRefusal::Stale => {
                         Attempt::Settled(Settled::Guest("retired"))

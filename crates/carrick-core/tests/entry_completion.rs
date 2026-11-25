@@ -2063,10 +2063,9 @@ fn retiring_holder_during_enrollment_cannot_touch_a_recycled_entry() {
                 zone.spaces.close(index);
                 access.retire_entry(index).unwrap();
                 assert!(!still(), "retirement invalidates the enrollment probe");
-                assert_eq!(
-                    zone.spaces.key(index),
-                    mm,
-                    "the coordinator retains its source"
+                assert!(
+                    zone.spaces.find(mm).is_none(),
+                    "retirement unpublishes the entry past the coordinator's borrow"
                 );
                 Err((
                     carrick_sched_core::object_wait::ObjectWaitError::Changed,
@@ -2119,7 +2118,10 @@ fn retiring_holder_during_enrollment_cannot_touch_a_recycled_entry() {
         let exclusion = access.try_exclude_editor(recycled, successor).unwrap();
         drop(next_source);
         access.retire_entry(recycled).unwrap();
-        assert_eq!(zone.spaces.key(recycled), successor);
+        assert!(
+            zone.spaces.find(successor).is_none(),
+            "retirement unpublishes past the exclusion's retained source"
+        );
         drop(exclusion);
         assert!(zone.spaces.find(successor).is_none());
         let third = successor + carrick_sched_core::spaces::ADDRESS_SPACES as u64;
