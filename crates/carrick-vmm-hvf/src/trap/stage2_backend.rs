@@ -547,6 +547,12 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfCarrierStage2 {
     }
 }
 
+/// The carrier's stage-2 generation guard: the custody lock, held for one
+/// generation whose stage 2 exists. It is the only way to map or unmap.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type CarrierStage2<'a> =
+    carrick_aarch64::stage2::custody::Stage2Generation<'a, super::CarrierStage2Records>;
+
 #[cfg(test)]
 thread_local! {
     /// The status the next raw destroy on this thread reports instead of

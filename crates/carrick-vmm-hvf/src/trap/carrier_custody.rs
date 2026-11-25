@@ -10,7 +10,7 @@
 
 use super::*;
 use carrick_aarch64::stage2::custody::{
-    Stage2Custody, Stage2CustodyError, Stage2CustodyState, Stage2Gone, Stage2Lifecycle,
+    Stage2Custody, Stage2CustodyError, Stage2CustodyState, Stage2Gone, Stage2Inner, Stage2Lifecycle,
 };
 use carrick_aarch64::vmm::VcpuDestroyError;
 
@@ -382,8 +382,8 @@ pub struct CarrierVmCustody {
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<((u64, u64), u64)>>,
     pub(crate) pending_global_frame_detached_retries:
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
-    pub(crate) frame_pool: parking_lot::Mutex<CarrierFramePoolState>,
-    pub(crate) root_slot_pool: parking_lot::Mutex<CarrierRootSlotPoolState>,
+    pub(crate) frame_pool: Stage2Inner<CarrierFramePoolState>,
+    pub(crate) root_slot_pool: Stage2Inner<CarrierRootSlotPoolState>,
     /// The exact backend state of every MM whose COW runtime this carrier
     /// bound, by MM id: guest COW settlement must fold an MM's completions
     /// into the state its executors use, never a stale copy found by scan.
@@ -783,8 +783,8 @@ impl CarrierVmCustody {
             pending_global_frame_detached_retries: parking_lot::Mutex::new(
                 PendingGlobalFrameRetirementQueue::default(),
             ),
-            frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
-            root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
+            frame_pool: Stage2Inner::new(CarrierFramePoolState::Uninitialized),
+            root_slot_pool: Stage2Inner::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
             native_exec_services: std::sync::Arc::new(
                 crate::metadata_grant::NativeExecServiceDirectory::default(),
@@ -997,12 +997,11 @@ impl CarrierVmCustody {
         if !crate::frame_pool::is_frame_pool_enabled() {
             return None;
         }
-        // Lock hierarchy: always read state lifecycle first without holding frame_pool,
-        // so commit_destroy (which takes state then frame_pool) never deadlocks with us.
-        let state = self.stage2.lock();
-        match state.lifecycle() {
-            Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
-            _ => return None,
+        // Hold the admitting generation's guard across construction and pool
+        // publication so no destroy_stage2 can race the backend map.
+        let mut stage2 = self.stage2.stage2()?;
+        if !stage2.admits_mappings() {
+            return None;
         }
         self.stage2.at_client_point(FRAME_POOL_ADMITTED);
         let mut guard = self.frame_pool.lock();
@@ -1010,7 +1009,7 @@ impl CarrierVmCustody {
             CarrierFramePoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
             CarrierFramePoolState::Failed => None,
             CarrierFramePoolState::Uninitialized => {
-                match crate::frame_pool::PreMappedFramePool::try_new() {
+                match crate::frame_pool::PreMappedFramePool::try_new(&mut stage2) {
                     Ok(pool) => {
                         let pool = std::sync::Arc::new(pool);
                         *guard = CarrierFramePoolState::Active(std::sync::Arc::clone(&pool));
@@ -1034,12 +1033,11 @@ impl CarrierVmCustody {
         if !crate::frame_pool::is_root_slot_pool_enabled() {
             return None;
         }
-        // Lock hierarchy: always read state lifecycle first without holding root_slot_pool,
-        // so commit_destroy (which takes state then root_slot_pool) never deadlocks with us.
-        let state = self.stage2.lock();
-        match state.lifecycle() {
-            Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
-            _ => return None,
+        // Hold the admitting generation's guard across construction and pool
+        // publication so no destroy_stage2 can race the backend map.
+        let mut stage2 = self.stage2.stage2()?;
+        if !stage2.admits_mappings() {
+            return None;
         }
         self.stage2.at_client_point(ROOT_SLOT_POOL_ADMITTED);
         let mut guard = self.root_slot_pool.lock();
@@ -1047,7 +1045,7 @@ impl CarrierVmCustody {
             CarrierRootSlotPoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
             CarrierRootSlotPoolState::Failed => None,
             CarrierRootSlotPoolState::Uninitialized => {
-                match crate::frame_pool::PreMappedRootSlotPool::try_new() {
+                match crate::frame_pool::PreMappedRootSlotPool::try_new(&mut stage2) {
                     Ok(pool) => {
                         let pool = std::sync::Arc::new(pool);
                         *guard = CarrierRootSlotPoolState::Active(std::sync::Arc::clone(&pool));

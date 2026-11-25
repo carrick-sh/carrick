@@ -83,8 +83,11 @@ impl std::fmt::Debug for PreMappedFramePool {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreMappedFramePool {
-    /// Attempt to create and stage-2 map a new pre-mapped frame pool.
-    pub(crate) fn try_new() -> Result<Self, crate::trap::TrapError> {
+    /// Attempt to create and stage-2 map a new pre-mapped frame pool under
+    /// the admitting generation's guard.
+    pub(crate) fn try_new(
+        stage2: &mut crate::trap::CarrierStage2<'_>,
+    ) -> Result<Self, crate::trap::TrapError> {
         let pool_size = frame_pool_size();
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut lease = crate::trap::GlobalFrameStage2Lease::reserve(pool_size as u64, TWO_MIB)?;
@@ -98,19 +101,22 @@ impl PreMappedFramePool {
         })?;
 
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
-        let map_rc = unsafe {
-            crate::trap::inventory_stage2_map(
+        // SAFETY: `host_mapping` stays live and exclusively owned by this
+        // pool until its lease retires or the VM generation is destroyed.
+        let _mapping = unsafe {
+            stage2.map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
-                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
+                stage2_perms,
             )
-        };
-        if map_rc != 0 {
-            return Err(crate::trap::TrapError::Hypervisor(format!(
-                "map frame pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{map_rc:x}"
-            )));
         }
+        .map_err(|map_rc| {
+            crate::trap::TrapError::Hypervisor(format!(
+                "map frame pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{:x}",
+                map_rc.raw()
+            ))
+        })?;
         lease.mark_mapped();
 
         let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
@@ -389,7 +395,9 @@ unsafe impl Sync for PreMappedRootSlotPool {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreMappedRootSlotPool {
-    pub(crate) fn try_new() -> Result<Self, crate::trap::TrapError> {
+    pub(crate) fn try_new(
+        stage2: &mut crate::trap::CarrierStage2<'_>,
+    ) -> Result<Self, crate::trap::TrapError> {
         let pool_size = root_slot_pool_size();
         let base_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
         let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base_ipa, pool_size as u64);
@@ -402,19 +410,22 @@ impl PreMappedRootSlotPool {
         })?;
 
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
-        let map_rc = unsafe {
-            crate::trap::inventory_stage2_map(
+        // SAFETY: `host_mapping` stays live and exclusively owned by this
+        // pool until its lease retires or the VM generation is destroyed.
+        let _mapping = unsafe {
+            stage2.map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
                 pool_size,
-                carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
+                stage2_perms,
             )
-        };
-        if map_rc != 0 {
-            return Err(crate::trap::TrapError::Hypervisor(format!(
-                "map root slot pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{map_rc:x}"
-            )));
         }
+        .map_err(|map_rc| {
+            crate::trap::TrapError::Hypervisor(format!(
+                "map root slot pool IPA 0x{base_ipa:x} size 0x{pool_size:x}: 0x{:x}",
+                map_rc.raw()
+            ))
+        })?;
         lease.mark_mapped();
 
         const TWO_MIB: usize = 2 * 1024 * 1024;
