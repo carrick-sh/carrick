@@ -96,14 +96,28 @@ pub enum HostBackingReadError {
     Unavailable,
 }
 
+/// `(st_dev, st_ino, st_size)` read from a retained host file via `fstat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFileMetadata {
+    pub device: u64,
+    pub inode: u64,
+    pub len: u64,
+}
+
 pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
     /// Returns a bounded readable prefix; no bytes beyond a backing fault are supplied.
     fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
     /// A duplicate of the retained host file's descriptor, for a carrier that
     /// maps the file's own pages as a shared file window (#1338). `None` for
-    /// a source with no host file (a loaded image, an in-memory file).
+    /// a source with no host file (a loaded image, an in-memory file, or host
+    /// descriptor pressure).
     fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+    /// Device, inode, and byte length read directly via `fstat` without
+    /// duplicating the descriptor (#2975 Codex P0 #4).
+    fn host_file_metadata(&self) -> Option<HostFileMetadata> {
         None
     }
 }

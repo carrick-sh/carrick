@@ -3571,7 +3571,6 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         use carrick_core::mm::window::{WINDOW_CHUNK_BYTES, WindowChunk};
         use carrick_core_abi::host_file::{refuse_written_reply, replied_parts};
         use std::os::fd::AsFd;
-        use std::os::unix::fs::MetadataExt;
 
         let Some((header, _, _)) = replied_parts(bytes) else {
             return Err(fail("replied window record absent"));
@@ -3600,16 +3599,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             return refuse(bytes, carrick_abi::LINUX_EINVAL.guest_retval());
         }
 
-        let file = std::fs::File::from(
-            source
-                .host_file()
-                .ok_or_else(|| fail("shared file window source has no host file"))?,
-        );
-        let metadata = file
-            .metadata()
-            .map_err(|error| fail(format!("shared file window stat: {error}")))?;
-        let device = metadata.dev();
-        let inode = metadata.ino();
+        let Some(metadata) = source.host_file_metadata() else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+        let device = metadata.device;
+        let inode = metadata.inode;
 
         let available = self.custody._vm.available_window_slots();
         let span_chunks = last_chunk - first_chunk + 1;
@@ -3629,10 +3623,10 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
 
         let source_identity = source.identity();
         let source_id = (source_identity.handle(), source_identity.generation());
-        let Some(budget) = self.custody._vm.admit_window_slots(missing.len()) else {
-            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
-        };
         if missing.is_empty() {
+            let Some(budget) = self.custody._vm.admit_window_slots(0) else {
+                return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+            };
             self.custody
                 ._vm
                 .install_window_slots(budget, &[])
@@ -3649,6 +3643,13 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             return Ok(Some(source));
         }
 
+        let Some(owned_fd) = source.host_file() else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+        let Some(budget) = self.custody._vm.admit_window_slots(missing.len()) else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+
         let Some(needed_gpa) = (missing.len() as u64).checked_mul(WINDOW_CHUNK_BYTES) else {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
         };
@@ -3664,7 +3665,7 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
         }
 
-        let Some(inode_lease) = admit_window_inode(file.as_fd()) else {
+        let Some(inode_lease) = admit_window_inode(owned_fd.as_fd()) else {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
         };
 
@@ -3676,7 +3677,7 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             let chunk_start = key.2 * WINDOW_CHUNK_BYTES;
             let Ok(extent) = BackingExtent::host_file_window(
                 base,
-                file.as_fd(),
+                owned_fd.as_fd(),
                 chunk_start,
                 WINDOW_CHUNK_BYTES as usize,
             ) else {
@@ -3813,22 +3814,17 @@ impl FileSupplyRequest {
             .host_backing
             .ok_or_else(|| fail("file source absent"))?;
         if self.shared {
-            use std::os::unix::fs::MetadataExt;
-            let file = std::fs::File::from(
-                self.source
-                    .host_file()
-                    .ok_or_else(|| fail("shared file window source has no host file"))?,
-            );
-            let metadata = file
-                .metadata()
-                .map_err(|error| fail(format!("shared file window stat: {error}")))?;
+            let metadata = self
+                .source
+                .host_file_metadata()
+                .ok_or_else(|| fail("shared file window source has no host metadata"))?;
             return Ok(FileSupply {
                 execution: self.execution,
                 window: self.window,
                 contents: FileContents::Window(WindowFile {
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                    len: metadata.len(),
+                    device: metadata.device,
+                    inode: metadata.inode,
+                    len: metadata.len,
                 }),
             });
         }

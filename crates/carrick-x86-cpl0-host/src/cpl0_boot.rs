@@ -2153,6 +2153,17 @@ mod forward_execution_tests {
             fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
                 self.file.as_fd().try_clone_to_owned().ok()
             }
+            fn host_file_metadata(&self) -> Option<carrick_hal::fork_stock::HostFileMetadata> {
+                use std::os::unix::fs::MetadataExt;
+                self.file
+                    .metadata()
+                    .ok()
+                    .map(|meta| carrick_hal::fork_stock::HostFileMetadata {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                        len: meta.len(),
+                    })
+            }
         }
 
         let path = std::env::temp_dir().join(format!(
@@ -2440,6 +2451,17 @@ mod forward_execution_tests {
             fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
                 self.file.as_fd().try_clone_to_owned().ok()
             }
+            fn host_file_metadata(&self) -> Option<carrick_hal::fork_stock::HostFileMetadata> {
+                use std::os::unix::fs::MetadataExt;
+                self.file
+                    .metadata()
+                    .ok()
+                    .map(|meta| carrick_hal::fork_stock::HostFileMetadata {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                        len: meta.len(),
+                    })
+            }
         }
 
         let path = std::env::temp_dir().join(format!(
@@ -2677,6 +2699,17 @@ mod forward_execution_tests {
             }
             fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
                 self.file.as_fd().try_clone_to_owned().ok()
+            }
+            fn host_file_metadata(&self) -> Option<carrick_hal::fork_stock::HostFileMetadata> {
+                use std::os::unix::fs::MetadataExt;
+                self.file
+                    .metadata()
+                    .ok()
+                    .map(|meta| carrick_hal::fork_stock::HostFileMetadata {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                        len: meta.len(),
+                    })
             }
         }
         fn dummy_entropy(
@@ -2967,6 +3000,355 @@ mod forward_execution_tests {
             "raced window fault must complete as Supplied so the ring retries the user copy (#2975 P0 7)"
         );
         drop(member_custody);
+    }
+
+    #[test]
+    fn complete_host_file_and_fault_supply_handle_unavailable_host_fd_gracefully() {
+        use carrick_core::mm::window::WINDOW_CHUNK_BYTES;
+        use carrick_core_abi::host_file::{
+            HostFileHeader, HostFileOp, HostFileRequestView, MapSourceReply, encode, record_len,
+            reply,
+        };
+        use carrick_core_abi::service::{
+            ServiceBirth, ServiceOperation, ServiceOrigin, ServiceSelector,
+        };
+        use carrick_el1_abi::{
+            PortalOperation, ReservationIncarnation, ReservationMm, ReservationProtection,
+            ReservationRange,
+        };
+        use carrick_guest_arch::FaultInfo;
+        use carrick_hal::fork_stock::{
+            HostBackingRead, HostBackingReadError, HostBackingRetention,
+        };
+        use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
+        use std::os::fd::AsFd;
+
+        struct ToggleDupSource {
+            identity: carrick_el1_abi::HostBackingIdentity,
+            file: std::fs::File,
+            allow_dup: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl HostBackingRetention for ToggleDupSource {
+            fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
+                self.identity
+            }
+            fn read(&self, _: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError> {
+                Err(HostBackingReadError::Unavailable)
+            }
+            fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+                if self.allow_dup.load(std::sync::atomic::Ordering::Acquire) {
+                    self.file.as_fd().try_clone_to_owned().ok()
+                } else {
+                    None
+                }
+            }
+            fn host_file_metadata(&self) -> Option<carrick_hal::fork_stock::HostFileMetadata> {
+                use std::os::unix::fs::MetadataExt;
+                self.file
+                    .metadata()
+                    .ok()
+                    .map(|meta| carrick_hal::fork_stock::HostFileMetadata {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                        len: meta.len(),
+                    })
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "carrick-unavailable-host-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(WINDOW_CHUNK_BYTES).unwrap();
+
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+        let mut fx = ForwardVenueFixture::with_pod();
+        fx.custody.0.bind_grant_portal().unwrap();
+        let context = fx.root_binding.context();
+        let root = context.root;
+        let carrier_id = fx.custody.0._vm.identity().nonzero();
+        let fault_va = 0x1000_0000u64;
+        let pod_va = carrick_guest_arch::KernelVa::new(X86_CPL0_BOOTSTRAP_METADATA_BASE);
+        let pod_gpa = FrameGpa::new(ALLOCATOR_GPA);
+        let control_va = METADATA_VA + CONTROL_OFFSET;
+        let control_gpa = META_GPA + CONTROL_OFFSET;
+        {
+            let mut write_pte = |table: u64, va: u64, shift: u32, entry: u64| {
+                let offset = ((va >> shift) & 0x1ff) * 8;
+                fx.custody
+                    .0
+                    ._vm
+                    .write(FrameGpa::new(table + offset), &entry.to_le_bytes())
+                    .unwrap();
+            };
+            write_pte(
+                root.address().raw(),
+                pod_va.raw(),
+                39,
+                0x3000 | PRESENT | WRITE,
+            );
+            write_pte(0x3000, pod_va.raw(), 30, 0x4000 | PRESENT | WRITE);
+            write_pte(0x4000, pod_va.raw(), 21, 0x5000 | PRESENT | WRITE);
+            write_pte(
+                0x5000,
+                pod_va.raw(),
+                12,
+                pod_gpa.raw() | PRESENT | WRITE | NX,
+            );
+            write_pte(0x4000, control_va, 21, 0x6000 | PRESENT | WRITE);
+            write_pte(0x6000, control_va, 12, control_gpa | PRESENT | WRITE | NX);
+            write_pte(
+                root.address().raw(),
+                fault_va,
+                39,
+                0x7000 | PRESENT | WRITE | USER,
+            );
+            write_pte(0x7000, fault_va, 30, 0x8000 | PRESENT | WRITE | USER);
+            write_pte(0x8000, fault_va, 21, 0x9000 | PRESENT | WRITE | USER);
+            write_pte(0x9000, fault_va, 12, 0x1_0000 | PRESENT | WRITE | USER);
+        }
+
+        let make_record = |handle_num: u64| {
+            let id = carrick_el1_abi::HostBackingIdentity::new(
+                NonZeroU64::new(handle_num).unwrap(),
+                NonZeroU64::MIN,
+                0,
+            );
+            let mut bytes = vec![0u8; record_len(0, MapSourceReply::BYTES).unwrap()];
+            encode(
+                &mut bytes,
+                HostFileHeader {
+                    op: HostFileOp::MapShared,
+                    table: [1, 2, 3],
+                    fd: 4,
+                    flags: 0,
+                    args: [0, WINDOW_CHUNK_BYTES, 0, 0],
+                },
+                &[],
+                MapSourceReply::BYTES,
+            )
+            .unwrap();
+            HostFileRequestView::parse(&mut bytes)
+                .unwrap()
+                .reply(
+                    0,
+                    &MapSourceReply {
+                        handle: id.handle(),
+                        generation: id.generation(),
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            (bytes, id)
+        };
+
+        let allow_dup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut emfile_bytes, emfile_id) = make_record(61);
+        let emfile_source: Arc<dyn HostBackingRetention> = Arc::new(ToggleDupSource {
+            identity: emfile_id,
+            file: file.try_clone().unwrap(),
+            allow_dup: Arc::clone(&allow_dup),
+        });
+        fx.custody.0._vm.write(pod_gpa, &emfile_bytes).unwrap();
+        {
+            let mut io = TestIo {
+                image: context_with_root(1, root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(0),
+                io: &mut io,
+            };
+            let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+            venue
+                .complete_host_file(pod_va, &mut emfile_bytes, Some(emfile_source), |fd| {
+                    dispatcher.admit_window_inode(fd)
+                })
+                .expect(
+                    "EMFILE in host_file() must refuse MapShared with ENOSYS, not trap carrier",
+                );
+        }
+        let guest_bytes = fx.custody.0._vm.read(pod_gpa, emfile_bytes.len()).unwrap();
+        let refused_reply = reply(&guest_bytes).unwrap();
+        assert_eq!(
+            refused_reply.result,
+            carrick_abi::LINUX_ENOSYS.guest_retval()
+        );
+        assert_eq!(fx.custody.0._vm.window_slots(), 0);
+
+        allow_dup.store(true, std::sync::atomic::Ordering::Release);
+        let (mut ok_bytes, ok_id) = make_record(62);
+        let ok_source: Arc<dyn HostBackingRetention> = Arc::new(ToggleDupSource {
+            identity: ok_id,
+            file: file.try_clone().unwrap(),
+            allow_dup: Arc::clone(&allow_dup),
+        });
+        fx.custody.0._vm.write(pod_gpa, &ok_bytes).unwrap();
+        {
+            let mut io = TestIo {
+                image: context_with_root(1, root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(0),
+                io: &mut io,
+            };
+            let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+            venue
+                .complete_host_file(pod_va, &mut ok_bytes, Some(ok_source), |fd| {
+                    dispatcher.admit_window_inode(fd)
+                })
+                .unwrap();
+        }
+        allow_dup.store(false, std::sync::atomic::Ordering::Release);
+        fx.custody.0._vm.write(pod_gpa, &vec![0u8; 4096]).unwrap();
+
+        let mm_key = INITIAL_MM_KEY;
+        let ram = Arc::clone(&fx.custody.0.ram);
+        {
+            let zone_ptr = ram
+                .host_ptr(
+                    META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                    size_of::<X86Cpl0Zone>(),
+                )
+                .unwrap();
+            let zone = unsafe { &*zone_ptr.cast::<X86Cpl0Zone>() };
+            let space_idx = zone
+                .spaces
+                .publish_closed(mm_key, root.address().raw(), root.address().raw())
+                .unwrap();
+            let entry = zone.space_entry(NonZeroU64::new(mm_key).unwrap()).unwrap();
+            entry
+                .admit_notifications(
+                    NonZeroU64::MIN,
+                    &carrick_sched_core::BoundedSpin(0),
+                    &|_| {},
+                )
+                .unwrap();
+            let wake_no_delivery = |_z: &X86Cpl0Zone,
+                                    _w: Waker,
+                                    _o: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| {};
+            carrick_sched_core::spaces::notification::SpaceAccess::notified(SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                    &wake_no_delivery,
+                ),
+            })
+            .open(space_idx);
+            let record_id = zone
+                .alloc_record(carrick_sched_core::ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: mm_key,
+                    file_table: 5,
+                    generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: METADATA_VA,
+                    control_slot: control_va,
+                })
+                .unwrap();
+            let record = zone.record_ref(record_id);
+            let control_ptr = ram
+                .host_ptr(META_GPA + CONTROL_OFFSET, size_of::<ThreadControlSlot>())
+                .unwrap();
+            let control: &ThreadControlSlot = unsafe { &*control_ptr.cast::<ThreadControlSlot>() };
+            control.bind_zone_record(record);
+            let member_custody =
+                carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+            member_custody.commit_registration();
+            member_custody.commit_native_signal_owner();
+            let mm_handle = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    carrier_id,
+                    ReservationMm::new(mm_key).unwrap(),
+                    NonZeroU64::MIN,
+                )
+            };
+            let birth = ServiceBirth {
+                origin: ServiceOrigin::Initial,
+                process: carrick_sched_core::process::TaskKey {
+                    id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                        core::num::NonZeroI32::new(41).unwrap(),
+                    ),
+                    serial: carrick_sched_core::process::TaskSerial::from_raw_u64(7).unwrap(),
+                },
+                thread: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+                record,
+                mm: mm_handle,
+            };
+            control.service.bind(birth).unwrap();
+            let fault_seq = NonZeroU64::MIN;
+            let _req = control
+                .service
+                .publish_with_reply(
+                    birth,
+                    carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                    ServiceOperation::Fault(FaultInfo {
+                        address: UserVa::new(fault_va),
+                        access: carrick_guest_arch::Access::Read,
+                        present: false,
+                    }),
+                    Some(fault_seq),
+                    Some(pod_va),
+                )
+                .unwrap();
+            let window = carrick_el1_abi::PortalGrantWindow {
+                operation: PortalOperation {
+                    carrier: carrier_id,
+                    mm: ReservationMm::new(mm_key).unwrap(),
+                    incarnation: NonZeroU64::MIN,
+                    sequence: fault_seq,
+                },
+                mapping_incarnation: ReservationIncarnation::new(1).unwrap(),
+                range: ReservationRange::new(fault_va, fault_va + 4096).unwrap(),
+                protection: ReservationProtection::READ_WRITE,
+                fault_page: fault_va,
+                host_backing: Some(ok_id),
+                fork_sequence: None,
+            };
+            assert!(
+                fx.custody
+                    .0
+                    .grant_portal()
+                    .unwrap()
+                    .grant(0)
+                    .unwrap()
+                    .publish_fault_selection(fault_seq.get(), window)
+            );
+            fx.custody
+                .0
+                .task(carrick_guest_arch::CpuId::new(0))
+                .service_notice
+                .publish(ServiceSelector::from(_req.identity))
+                .unwrap();
+            let mut io = TestIo {
+                image: context_with_root(1, root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(0),
+                io: &mut io,
+            };
+            let req = fx
+                .custody
+                .0
+                .file_supply_request(&lease, true)
+                .unwrap()
+                .expect("fault notice must select FileSupplyRequest");
+            req.read()
+                .expect("first-touch FileSupplyRequest::read must stat without dup()");
+            drop(member_custody);
+        }
     }
 
     fn execution() -> (carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>) {

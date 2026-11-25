@@ -57,10 +57,10 @@ pub enum DescriptionAccess {
 }
 
 impl DescriptionAccess {
-    const fn writable(self) -> bool {
+    pub const fn writable(self) -> bool {
         matches!(self, Self::WriteOnly | Self::ReadWrite)
     }
-    const fn readable(self) -> bool {
+    pub const fn readable(self) -> bool {
         matches!(self, Self::ReadOnly | Self::ReadWrite)
     }
 }

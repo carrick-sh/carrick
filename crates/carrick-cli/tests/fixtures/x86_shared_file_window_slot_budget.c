@@ -172,6 +172,14 @@ void _start(void) {
 
     long window_shrink = sc(FTRUNCATE, fd, 0, 0, 0, 0, 0);
 
+    long occ_sat = sc(MMAP, 0, 4096, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long post_sat_noreplace = -1;
+    if (!is_err(occ_sat)) {
+        post_sat_noreplace = sc(MMAP, occ_sat, CHUNK, PROT_RW,
+                                MAP_SHARED | MAP_FIXED_NOREPLACE, fd, (long)off);
+        sc(MUNMAP, occ_sat, 4096, 0, 0, 0, 0);
+    }
+
     long anon = sc(MMAP, 0, 4096, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     long anon_val = -1;
     if (!is_err(anon)) {
@@ -200,6 +208,7 @@ void _start(void) {
     row("chunks_gt_zero", total_chunks > 1 ? 1 : 0);
     row("coarse_err", coarse_err);
     row("fine_err", fine_err);
+    row("post_sat_noreplace", post_sat_noreplace);
     row("chunk0_reuse", chunk0_val);
     row("other_mmap", other_mmap);
     row("other_truncate", other_truncate);

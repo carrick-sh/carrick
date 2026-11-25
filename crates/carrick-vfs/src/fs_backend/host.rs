@@ -5755,27 +5755,33 @@ impl FsBackend for HostFsBackend {
             .open_raw_fd(path, true, false, false)
             .into_backend_result()?;
         let result = (|| {
-            let mut written = 0usize;
-            while written < bytes.len() {
-                let write_offset = offset.checked_add(written).ok_or(BackendError::Invalid)?;
-                let write_offset =
-                    i64::try_from(write_offset).map_err(|_| BackendError::Invalid)?;
-                let n = unsafe {
-                    libc::pwrite(
-                        host_fd,
-                        bytes[written..].as_ptr() as *const libc::c_void,
-                        bytes.len() - written,
-                        write_offset as libc::off_t,
-                    )
+            {
+                // SAFETY: `host_fd` is open until the close below; release the
+                // write guard before the post-write `host_size::resize` call.
+                let _write_guard =
+                    crate::host_size::admit_write(unsafe { BorrowedFd::borrow_raw(host_fd) });
+                let mut written = 0usize;
+                while written < bytes.len() {
+                    let write_offset = offset.checked_add(written).ok_or(BackendError::Invalid)?;
+                    let write_offset =
+                        i64::try_from(write_offset).map_err(|_| BackendError::Invalid)?;
+                    let n = unsafe {
+                        libc::pwrite(
+                            host_fd,
+                            bytes[written..].as_ptr() as *const libc::c_void,
+                            bytes.len() - written,
+                            write_offset as libc::off_t,
+                        )
+                    }
+                    .host_syscall_errno()
+                    .map_err(|_| BackendError::Io)?;
+                    if n == 0 {
+                        return Err(BackendError::Io);
+                    }
+                    written = written
+                        .checked_add(n as usize)
+                        .ok_or(BackendError::Invalid)?;
                 }
-                .host_syscall_errno()
-                .map_err(|_| BackendError::Io)?;
-                if n == 0 {
-                    return Err(BackendError::Io);
-                }
-                written = written
-                    .checked_add(n as usize)
-                    .ok_or(BackendError::Invalid)?;
             }
 
             let final_size_i64 = i64::try_from(final_size).map_err(|_| BackendError::Invalid)?;

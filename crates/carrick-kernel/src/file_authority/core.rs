@@ -3428,6 +3428,9 @@ impl FileAuthorityCore {
             if !host.writable {
                 return Err(AuthorityError::BackingReadOnly);
             }
+            let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
+                std::os::fd::BorrowedFd::borrow_raw(host.fd.as_raw_fd())
+            });
             let written = unsafe {
                 libc::pwrite(
                     host.fd.as_raw_fd(),

@@ -192,6 +192,27 @@ impl carrick_hal::fork_stock::HostBackingRetention for HostBackingLease {
             })
             .flatten()
     }
+    fn host_file_metadata(&self) -> Option<carrick_hal::fork_stock::HostFileMetadata> {
+        let PrivateFileBacking::Description(reference) = &self.0.source else {
+            return None;
+        };
+        reference
+            .description()
+            .inspect_kind(|open| match open {
+                crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    (unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0).then(|| {
+                        carrick_hal::fork_stock::HostFileMetadata {
+                            device: st.st_dev as u64,
+                            inode: st.st_ino as u64,
+                            len: st.st_size.max(0) as u64,
+                        }
+                    })
+                }
+                _ => None,
+            })
+            .flatten()
+    }
 }
 impl Drop for Record {
     fn drop(&mut self) {
