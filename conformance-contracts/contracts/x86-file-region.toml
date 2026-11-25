@@ -21,7 +21,7 @@ semantic_authority = ["open(2): distinct open descriptions share an inode", "dup
 fixture = "carrick-x86-cpl0:file_region; carrick-vmm-kvm:cpl0_entry"
 scale_points = [1, 16, 20, 128, 512]
 rationale = """
-#2820: the zone's stdin, stdout and stderr are three descriptions the
+Part of #2820: the zone's stdin, stdout and stderr are three descriptions the
 stopped carrier admits once (StdioDescriptions), before any guest
 instruction runs, into its boot task's table; it renames that unstarted
 table to the issued root's and shares the same descriptions into any other
@@ -29,10 +29,14 @@ table it binds to an initial task. No guest path admits stdio, so every
 other table gets them only by fork (Linux: from the launcher and fork, and
 a closed number stays closed); the closed-stdio tombstones that guarded the
 deleted per-CPU lazy admission are gone. The carrier accepts a guest stdio
-release only for the exact admitted (handle, incarnation), once. Red on
-main 16d20f23d (3 of 3, rc 125 "host object release identity mismatch"):
-x86_kvm_run::mounted_static_x86_fork_children_close_a_pipe_over_stdout,
-three live fork children closing a pipe dup'd over stdout; green after.
+release only for the exact admitted (handle, incarnation), once. On the
+production entry, x86_kvm_run::mounted_static_x86_fork_children_close_a_pipe_over_stdout
+observes boot stdio admission and inheritance across fork, synchronizes
+three live fork children past dup2 across the carrier's two physical CPUs
+(failing deterministically before the fix on rc 125 "host object release
+identity mismatch"), verifies pipe read == 0 EOF from close(1) while all
+children remain alive, and releases the root's last stdout reference. This
+slice does not close #2820's go-real or npm acceptance rows.
 
 One checked venue names the shared ABI object/open/fd/name/cache allocations. KVM retains the exact host mapping with its separately typed supervisor VA and GPA. Guest venue authentication checks same-VM header/binding self-consistency plus a per-carrier identity; foreign, unpublished and retired bindings have distinct refusals. Guest-observed retirement is fixture-only. Descriptor mutation uses one region-resident lock word; host mutations own stopped-carrier execution exclusion and refuse paused CPL0 descriptor transactions. Guest admission never waits on host custody, and poisoning is a typed fatal. This is not inode-lock quiescence: a kicked CPU can hold an inode lock (F3/F4 constraint). Single-step fixtures use exclusive mutable carrier custody; M1 create_stopped has no F2 registration. Two carriers remain independent; real guest fork/dup/child-exit preserves distinct parent/child descriptor references to the inherited inode. Exact shared-open ring-reference counts are 1 before fork, 4 after both dup calls, and 3 after child retirement with the independently admitted idle-peer stdout included; the VM-free twin checks 1, 2, 4, 2 without that peer. Table witnesses do not claim FileService Open or regular-file I/O acceptance.
 
