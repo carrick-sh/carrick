@@ -83,6 +83,55 @@ impl X86PrepareTableSpan {
     }
 }
 
+/// The initial extent's never-issued page-table reserve: every page from the
+/// end of the occupied boot records and grants up to the Prepare working
+/// suffix. Linux takes page tables from ordinary memory, so a process's
+/// tables follow its address space, never the size of the image that
+/// started the carrier (#3017). The host's fork stock draws table pages from
+/// here on demand, and the CPL0 editor licenses these pages as tables. Both
+/// derive the span from the same boot values through this one function, so
+/// neither side can issue or admit a page the other does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct X86TableReserve {
+    start: FrameGpa,
+    end: FrameGpa,
+}
+impl X86TableReserve {
+    /// `occupied_end` is the page-aligned end of the boot records and grants;
+    /// `working` is the suffix [`X86PrepareTableSpan::derive`] placed after
+    /// it in the same extent. The reserve may be empty.
+    pub fn derive(occupied_end: FrameGpa, working: X86PrepareTableSpan) -> Option<Self> {
+        let start = occupied_end.raw();
+        if !start.is_multiple_of(4096)
+            || start < crate::X86_CPL0_INITIAL_EXTENT_GPA
+            || start > working.start().raw()
+        {
+            return None;
+        }
+        Some(Self {
+            start: occupied_end,
+            end: working.start(),
+        })
+    }
+    pub const fn start(self) -> FrameGpa {
+        self.start
+    }
+    pub const fn end(self) -> FrameGpa {
+        self.end
+    }
+    pub fn page_count(self) -> usize {
+        ((self.end.raw() - self.start.raw()) / 4096) as usize
+    }
+    pub fn contains_word(self, address: FrameGpa) -> bool {
+        address.raw().is_multiple_of(8)
+            && address.raw() >= self.start.raw()
+            && address
+                .raw()
+                .checked_add(8)
+                .is_some_and(|end| end <= self.end.raw())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -117,6 +166,21 @@ mod tests {
             base + 0x20000,
         ] {
             assert!(!expected.contains_word(FrameGpa::new(address)));
+        }
+        let reserve = X86TableReserve::derive(FrameGpa::new(base + 0x10000), expected).unwrap();
+        assert_eq!(
+            (reserve.start(), reserve.end(), reserve.page_count()),
+            (FrameGpa::new(base + 0x10000), expected.start(), 4)
+        );
+        assert!(reserve.contains_word(FrameGpa::new(base + 0x13ff8)));
+        assert!(!reserve.contains_word(FrameGpa::new(base + 0x14000)));
+        assert!(!reserve.contains_word(FrameGpa::new(base + 0xfff8)));
+        assert_eq!(
+            X86TableReserve::derive(expected.start(), expected).map(X86TableReserve::page_count),
+            Some(0)
+        );
+        for occupied in [base + 0x15000, base + 0x10001, base - 4096] {
+            assert!(X86TableReserve::derive(FrameGpa::new(occupied), expected).is_none());
         }
         for (extent, occupied) in [
             (0x18000, base + 0x10000),

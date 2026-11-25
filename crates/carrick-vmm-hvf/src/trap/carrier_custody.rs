@@ -4849,6 +4849,7 @@ mod carrier_vm_custody_tests {
                                         .expect("page aligned")
                                 })
                                 .collect(),
+                            carrick_hal::fork_stock::TableReserve::EMPTY,
                             vec![ForkLifecycleLoan::ARM_DEFAULT],
                         )
                         .expect("install fork stock");

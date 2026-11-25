@@ -1779,6 +1779,7 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
         stock
             .install(
                 (0..4).map(|n| page(0x200000 + n * 4096)).collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 vec![
                     carrick_el1_abi::ForkLifecycleLoan::new_for_base(
                         base,

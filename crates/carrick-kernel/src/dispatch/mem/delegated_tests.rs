@@ -914,6 +914,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
     stock
         .install(
             pages.clone(),
+            carrick_hal::fork_stock::TableReserve::EMPTY,
             vec![descendant_lifecycle, ForkLifecycleLoan::ARM_DEFAULT],
         )
         .unwrap();
