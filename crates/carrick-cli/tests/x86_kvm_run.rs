@@ -1178,8 +1178,8 @@ fn mounted_static_x86_shared_file_window_mixed_range_edits_are_served_or_counted
 /// open, where the name is a bind mount of the host directory. The O_TRUNC
 /// open is a counted ENOSYS (-38): the host size door refuses it on the
 /// descriptor the bind mount opened, before anything is truncated. Path
-/// truncate(2) never reaches the mount on main (#3000) and answers EROFS
-/// (-30); it is pinned here so a fix of #3000 must keep it fenced. The
+/// truncate(2) routes through the bind mount (#3000) and is likewise fenced
+/// by the host size door as counted ENOSYS (-38). The
 /// child still reads its byte on the second page (native Linux kills it
 /// with SIGBUS). Red before #2977: the fence asked the rootfs for the
 /// name's inode, found none, and admitted the bind mount's host shrink
@@ -1234,7 +1234,7 @@ fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced()
                 "child_otrunc=ffffffffffffffda",
                 "child_status=0000000000000000",
                 "child_touch=0000000000000042",
-                "child_truncate=ffffffffffffffe2",
+                "child_truncate=ffffffffffffffda",
             ]
         ),
         "stderr: {}",
@@ -1244,6 +1244,82 @@ fn mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced()
         std::fs::metadata(data.path().join("win")).unwrap().len(),
         8192,
         "the host file keeps its size"
+    );
+}
+
+/// #1338 A1 / #2975 P0 3: a shared file window slot is admitted and installed
+/// at `mmap` time under `WindowSlotBudget`, rather than lazily on first touch
+/// without a budget. Exhausting the budget across successive chunks (only one
+/// mapping live at a time) makes `mmap` refuse cleanly with a counted `ENOSYS`
+/// (`-38`), while an already-installed chunk still maps, a refused fresh file is
+/// not pinned in the shrink registry, the windowed file stays fenced, and the
+/// carrier's non-window slot headroom still serves anonymous faults and `fork`.
+/// Red before the fix: `mmap` always succeeds and touching past the carrier
+/// limit fails the run with `TrapError` (`carrier memslot capacity`).
+#[test]
+fn mounted_static_x86_shared_file_window_slot_budget_is_enforced() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("window-slot-budget");
+    compile_assembly_with_flags(
+        "x86_shared_file_window_slot_budget.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let census_dir = dir.path().join("census");
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "window-slot-budget",
+        false,
+        &empty_image_archive(),
+        Some(&census_dir),
+        Duration::from_secs(60),
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&guest.stdout);
+    assert_eq!(
+        (guest.status.code(), stdout.lines().collect::<Vec<_>>(),),
+        (
+            Some(7),
+            vec![
+                "chunks_gt_zero=0000000000000001",
+                "coarse_err=ffffffffffffffda",
+                "fine_err=ffffffffffffffda",
+                "chunk0_reuse=0000000000000042",
+                "other_mmap=ffffffffffffffda",
+                "other_truncate=0000000000000000",
+                "window_shrink=ffffffffffffffda",
+                "anon_after=0000000000000055",
+                "child_status=0000000000000000",
+            ],
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    let census_files: Vec<_> = std::fs::read_dir(&census_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1, "one carrier census emitted");
+    let census: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    assert_eq!(census["refusal_evidence"]["complete"], true);
+    let rows = census["refusal_evidence"]["rows"]
+        .as_array()
+        .expect("refusal rows");
+    assert!(
+        rows.iter().any(|row| {
+            row["nr"] == 9
+                && row["refused"].as_u64().is_some_and(|n| n >= 3)
+                && row["allowlisted"] == false
+        }),
+        "expected counted ENOSYS on x86 mmap (nr 9), got: {rows:?}"
     );
 }
 
