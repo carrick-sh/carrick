@@ -413,3 +413,9 @@ test = "carrick_runtime::vcpu_loop::code_content_test::execution_tests::native_c
 reason = "#1236 M1: `code_content` was a second test build of the same file through #[path] in carrick-runtime; runtime now uses the crate; the test is unchanged at carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference, where it runs on the Linux host unit lanes."
 replaced_by = "carrick_aarch64::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference"
 pr = 2916
+
+[[retired]]
+test = "carrick_el1_linux::file_table::tests::readmitting_a_table_does_not_reopen_explicitly_closed_stdio"
+reason = "Part of #2820: per-CPU lazy `admit_stdio` and its closed-stdio tombstones are replaced by one stopped-carrier `StdioDescriptions` admission shared by reference and inherited only via fork, so the re-admission tombstone witness became `stdio_is_admitted_once_and_shared_by_reference` and `stdout_replaced_by_a_ring_pipe_stays_gone_across_fork`."
+replaced_by = "carrick_el1_linux::file_table::tests::stdio_is_admitted_once_and_shared_by_reference"
+pr = 3020
