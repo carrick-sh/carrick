@@ -3832,3 +3832,51 @@ fn returnable_tables_distinguishes_temporary_custody_and_wakes_when_exhausted() 
         "indeterminate quarantine wakes waiter as returnable_tables reaches 0"
     );
 }
+
+/// rev3022d P1: the search for the fewest reserve pages a take needs is
+/// bounded by the demand, never by the reserve. A 512 MiB reserve
+/// (131,072 pages) behind an empty stock: a small take is served by the
+/// 512-page floor and probes nothing larger; a take just past the floor
+/// probes at most twice its answer; only a take the whole reserve cannot
+/// serve probes the whole reserve.
+#[test]
+fn the_reserve_search_probes_in_proportion_to_the_demand() {
+    const RESERVE_PAGES: u64 = 131_072;
+    let stock = TableStock {
+        reserve: TableReserve::new(
+            FrameGpa::new(RESERVE_BASE),
+            FrameGpa::new(RESERVE_BASE + RESERVE_PAGES * 4096),
+        )
+        .unwrap(),
+        ..TableStock::default()
+    };
+    // (demand, answer, largest probe allowed)
+    for (demand, answer, bound) in [
+        (1, Some(TABLE_RESERVE_DRAW_PAGES), TABLE_RESERVE_DRAW_PAGES),
+        (7, Some(TABLE_RESERVE_DRAW_PAGES), TABLE_RESERVE_DRAW_PAGES),
+        (TABLE_RESERVE_DRAW_PAGES + 1, Some(513), 2 * 513),
+        (1_000, Some(1_000), 2 * 1_000),
+        (
+            RESERVE_PAGES as usize,
+            Some(RESERVE_PAGES as usize),
+            RESERVE_PAGES as usize,
+        ),
+        (RESERVE_PAGES as usize + 1, None, RESERVE_PAGES as usize),
+    ] {
+        let (mut largest, mut probed) = (0usize, 0usize);
+        let found = stock.smallest_serving_draw(|pages| {
+            largest = largest.max(pages.len());
+            probed += pages.len();
+            pages.len() >= demand
+        });
+        assert_eq!(found, answer, "demand {demand}");
+        assert!(
+            largest <= bound,
+            "demand {demand}: probed {largest} pages, bound {bound}"
+        );
+        assert!(
+            probed <= 2 * bound * (usize::BITS as usize),
+            "demand {demand}: {probed} pages materialized in all"
+        );
+    }
+}
