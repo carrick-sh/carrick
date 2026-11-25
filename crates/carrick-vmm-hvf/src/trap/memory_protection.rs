@@ -2383,10 +2383,10 @@ impl AliasRegistry {
         if changed {
             self.bump_revision();
             self.bump_scope_revision(scope);
+            self.index_remove(seq, previous);
+            self.index_insert(seq, updated);
+            self.rebuild_exact_scope(scope);
         }
-        self.index_remove(seq, previous);
-        self.index_insert(seq, updated);
-        self.rebuild_exact_scope(scope);
         true
     }
 
@@ -2696,10 +2696,15 @@ impl AliasRegistry {
         };
         let before = previous.len();
         let replacement = rebuild(previous.clone());
-        if replacement != previous {
-            self.bump_revision();
-            self.bump_scope_revision(scope);
+        if replacement == previous {
+            if let Some(bucket) = self.by_scope.get_mut(&scope) {
+                bucket.rows = replacement;
+            }
+            self.drop_empty_scope(scope);
+            return;
         }
+        self.bump_revision();
+        self.bump_scope_revision(scope);
         self.rows = self
             .rows
             .saturating_sub(before)
@@ -2844,22 +2849,22 @@ impl AliasRegistry {
             if changed {
                 self.bump_revision();
                 self.bump_scope_revision(scope);
+                self.index_remove(seq, previous);
+                self.index_insert(seq, alias);
+                self.exact_first_by_scope
+                    .get_mut(&scope)
+                    .and_then(|rows| rows.get_mut(&(alias.start, alias.ipa)))
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "exact-key index entry disappeared during exclusive upsert: scope={:?} start=0x{:x} ipa=0x{:x}",
+                            scope,
+                            alias.start,
+                            alias.ipa
+                        );
+                    })
+                    .1 = alias;
             }
-            self.index_remove(seq, previous);
-            self.index_insert(seq, alias);
-            self.exact_first_by_scope
-                .get_mut(&scope)
-                .and_then(|rows| rows.get_mut(&(alias.start, alias.ipa)))
-                .unwrap_or_else(|| {
-                    carrick_fatal!(
-                        "hvpatch::host_alias",
-                        "exact-key index entry disappeared during exclusive upsert: scope={:?} start=0x{:x} ipa=0x{:x}",
-                        scope,
-                        alias.start,
-                        alias.ipa
-                    );
-                })
-                .1 = alias;
             return Some(previous);
         }
         self.push(alias);

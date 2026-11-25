@@ -4145,14 +4145,20 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     let (pause_tx, pause_rx) = std::sync::mpsc::channel::<Option<u64>>();
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
     let mutator = std::thread::spawn(move || {
+        let mut toggle = 0_u64;
         while let Ok(Some(k)) = pause_rx.recv() {
+            toggle ^= 1;
+            let next_sole = AliasBacking {
+                inventory_backing: InventoryBackingIdentity::Private(10_002 + toggle),
+                ..sole_global_row
+            };
             mutate_external_alias_state(|registry| {
-                // Sole-row `Global` identical upsert empties + recreates `va_classes_by_scope[Global]`.
+                // Sole-row `Global` mutating upsert empties + recreates `va_classes_by_scope[Global]`.
                 assert_eq!(registry.scope_rows(AliasOwnershipScope::Global).len(), 1);
-                assert_eq!(
-                    registry.upsert_by_key(sole_global_row),
-                    Some(sole_global_row)
-                );
+                let prev = registry
+                    .upsert_by_key(next_sole)
+                    .expect("sole global row present");
+                assert_ne!(prev, next_sole);
                 // On pause 1 alone, push 600 disjoint rows (> 512 single-pause log cap!).
                 let batch = if k == 1 { 600_u64 } else { 1_u64 };
                 for j in 0..batch {
@@ -4729,118 +4735,313 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     );
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_new_pref, 0x4000));
 
-    // Subcase 5d (Codex #19 P0-3): Single-slice fallback (`[older_single_fb, dead_preferred]`)
-    // under continuous disjoint sibling writes must arm a live watch on retry and never hit
-    // `MAX_REPLAY_PHASE2_RETRIES` exhaustion.
-    let (disjoint_ready_tx, disjoint_ready_rx) = std::sync::mpsc::channel::<()>();
-    let stop_disjoint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_disjoint_clone = std::sync::Arc::clone(&stop_disjoint);
-    let sibling = std::thread::spawn(move || {
-        let base_row = AliasBacking {
-            start: 0xa100_0000,
-            ipa: 0x8f00_0000,
-            host_addr: 0,
-            size: 0x4000,
-            physical_ipa: 0x8f00_0000,
-            physical_host_addr: 0,
-            physical_size: 0x4000,
-            perms,
-            guest_writable: true,
-            sharing: GuestMappingSharing::GlobalShared,
-            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(20_000)),
-            inventory_backing: InventoryBackingIdentity::Private(20_000),
-            shared_key_base: None,
-            shared_key_offset: 0,
-            owner_generation: 0,
-        };
-        {
-            alias_registry().lock().push(base_row);
-        }
-        let _ = disjoint_ready_tx.send(());
-        let mut iter_count = 0_u64;
-        while !stop_disjoint_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            iter_count += 1;
-            let toggled = AliasBacking {
-                inventory_backing: InventoryBackingIdentity::Private(20_000 + (iter_count & 1)),
-                ..base_row
-            };
-            {
-                let mut registry = alias_registry().lock();
-                let _ = registry.upsert_by_key(toggled);
-            }
-            if iter_count.is_multiple_of(8) {
-                std::thread::yield_now();
-            }
+    // Subcase 5d (Codex #20 P0-1 & P0-2): Deterministic single-slice fallback
+    // (`[single_fb, single_dead_pref]`) plus multi-slice witness where a helper
+    // thread deterministically executes BOTH a mutating disjoint `upsert_by_key`
+    // AND repeated identical `upsert_by_key` calls on the live target row itself
+    // between Phase 1 and Phase 2 (and across 10 multi-slice pauses).
+    let va_single = 0x5200_0000_u64;
+    let ipa_single_fb = 0x7d40_0000_u64;
+    let single_fb = AliasBacking {
+        start: va_single,
+        ipa: ipa_single_fb,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_single_fb,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(18_000)),
+        inventory_backing: InventoryBackingIdentity::Private(18_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let single_dead_pref = AliasBacking {
+        start: va_single,
+        ipa: ipa_single_fb + 0x1_0000,
+        host_addr: 0,
+        size: 0x4000,
+        physical_ipa: ipa_single_fb + 0x1_0000,
+        physical_host_addr: 0,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(18_001)),
+        inventory_backing: InventoryBackingIdentity::Private(18_001),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let disjoint_toggle_base = AliasBacking {
+        start: 0xa100_0000,
+        ipa: 0x8f00_0000,
+        host_addr: 0,
+        size: 0x4000,
+        physical_ipa: 0x8f00_0000,
+        physical_host_addr: 0,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(20_000)),
+        inventory_backing: InventoryBackingIdentity::Private(20_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let ipa_single_multi = ipa_single_fb + 0x20_0000;
+    let multi_ident_live = AliasBacking {
+        ipa: ipa_single_multi,
+        physical_ipa: ipa_single_multi,
+        ..single_fb
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(single_fb);
+        registry.push(single_dead_pref);
+        registry.push(disjoint_toggle_base);
+        registry.clear_replay_mappings_in();
+    });
+    let (d_step_tx, d_step_rx) = std::sync::mpsc::channel::<Option<u64>>();
+    let (d_done_tx, d_done_rx) = std::sync::mpsc::channel::<()>();
+    let d_helper = std::thread::spawn(move || {
+        while let Ok(Some(step_id)) = d_step_rx.recv() {
+            mutate_external_alias_state(|registry| {
+                assert!(
+                    !registry.active_replay_watches.is_empty(),
+                    "watch must remain armed across single-slice and multi-slice windows"
+                );
+                let toggled = AliasBacking {
+                    inventory_backing: InventoryBackingIdentity::Private(20_000 + step_id),
+                    ..disjoint_toggle_base
+                };
+                assert!(registry.upsert_by_key(toggled).is_some());
+                // Repeated identical upserts of the watched live target row must not dirty its watch.
+                let ident_target = if registry.contains(&multi_ident_live) {
+                    multi_ident_live
+                } else {
+                    single_fb
+                };
+                for _ in 0..10 {
+                    assert_eq!(registry.upsert_by_key(ident_target), Some(ident_target));
+                }
+            });
+            let _ = d_done_tx.send(());
         }
     });
-    disjoint_ready_rx.recv().expect("sibling started");
-    for iter in 0..10_u64 {
-        let va_single = 0x5200_0000 + iter * 0x10_0000;
-        let ipa_single_fb = 0x7d40_0000 + iter * 0x10_0000;
-        let single_fb = AliasBacking {
-            start: va_single,
-            ipa: ipa_single_fb,
-            host_addr: host_16k,
-            size: 0x4000,
-            physical_ipa: ipa_single_fb,
-            physical_host_addr: host_16k,
-            physical_size: 0x4000,
-            perms,
-            guest_writable: true,
-            sharing: GuestMappingSharing::GlobalShared,
-            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
-                18_000 + iter * 2,
-            )),
-            inventory_backing: InventoryBackingIdentity::Private(18_000 + iter * 2),
-            shared_key_base: None,
-            shared_key_offset: 0,
-            owner_generation: 0,
-        };
-        let single_dead_pref = AliasBacking {
-            start: va_single,
-            ipa: ipa_single_fb + 0x1_0000,
-            host_addr: 0,
-            size: 0x4000,
-            physical_ipa: ipa_single_fb + 0x1_0000,
-            physical_host_addr: 0,
-            physical_size: 0x4000,
-            perms,
-            guest_writable: true,
-            sharing: GuestMappingSharing::GlobalShared,
-            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
-                18_001 + iter * 2,
-            )),
-            inventory_backing: InventoryBackingIdentity::Private(18_001 + iter * 2),
-            shared_key_base: None,
-            shared_key_offset: 0,
-            owner_generation: 0,
-        };
-        {
-            let mut registry = alias_registry().lock();
-            registry.push(single_fb);
-            registry.push(single_dead_pref);
-            registry.clear_replay_mappings_in();
+    let d_step_tx_hook = std::sync::Arc::new(parking_lot::Mutex::new(d_step_tx));
+    let d_done_rx_hook = std::sync::Arc::new(parking_lot::Mutex::new(d_done_rx));
+    let d_fires = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d_fires_hook = std::sync::Arc::clone(&d_fires);
+    let d_step_tx_guard = std::sync::Arc::clone(&d_step_tx_hook);
+    let d_done_rx_guard = std::sync::Arc::clone(&d_done_rx_hook);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| match point {
+            carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name)
+                if name == crate::trap::carrier_custody::REPLAY_PHASE1_BEFORE_LIVENESS_PROBE
+                    || name == crate::trap::carrier_custody::REPLAY_REMAP_BEFORE_GUARD
+                    || name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS =>
+            {
+                let step_id = d_fires_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                d_step_tx_guard
+                    .lock()
+                    .send(Some(step_id))
+                    .expect("send step");
+                d_done_rx_guard.lock().recv().expect("recv step ack");
+            }
+            _ => {}
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
+    let before_single_det = alias_state_rows_scanned();
+    let res_single_det = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaAnyScope { va: va_single },
+            &mut |_| true,
+        )
+    };
+    assert_eq!(
+        d_fires.swap(0, std::sync::atomic::Ordering::SeqCst),
+        2,
+        "single-slice fallback must succeed in 1 attempt (before_liveness + before_guard)"
+    );
+    assert_eq!(
+        alias_state_rows_scanned() - before_single_det,
+        2,
+        "disjoint upsert and identical target upsert must cause ZERO retries"
+    );
+    assert_eq!(
+        res_single_det,
+        Ok(Some((
+            single_fb,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
+
+    // Part 2 of Subcase 5d: Multi-slice (`640` dead + `1` live = `641` -> 10 pauses) with
+    // 10 identical upserts of `single_fb` at EVERY pause (> 8 restarts if dirtied).
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        for i in 1..=640_u64 {
+            registry.push(AliasBacking {
+                start: va_single,
+                ipa: 0x7d50_0000 + i * 0x4000,
+                host_addr: 0,
+                size: 0x4000,
+                physical_ipa: 0x7d50_0000 + i * 0x4000,
+                physical_host_addr: 0,
+                physical_size: 0x4000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(21_000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(21_000 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
         }
-        assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
-        let res_single_churn = unsafe {
-            stage2_map_replay(
-                &custody,
-                g1,
-                ReplayAliasLookup::VaAnyScope { va: va_single },
-                &mut |_| true,
-            )
-        };
-        assert_eq!(
-            res_single_churn,
-            Ok(Some((
-                single_fb,
-                carrick_aarch64::stage2::Stage2Status::SUCCESS
-            )))
-        );
-        assert!(ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
-    }
-    stop_disjoint.store(true, std::sync::atomic::Ordering::Release);
-    sibling.join().expect("sibling joined");
+        registry.push(multi_ident_live);
+        registry.push(disjoint_toggle_base);
+        registry.clear_replay_mappings_in();
+    });
+    assert!(!ScopedStage2MapTestStub::is_mapped(
+        ipa_single_multi,
+        0x4000
+    ));
+    let before_multi_ident = alias_state_rows_scanned();
+    let res_multi_ident = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaAnyScope { va: va_single },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    let _ = d_step_tx_hook.lock().send(None);
+    d_helper.join().expect("helper joined");
+    assert_eq!(
+        d_fires.load(std::sync::atomic::Ordering::SeqCst),
+        12,
+        "expected 10 slice pauses + 1 before_liveness + 1 before_guard"
+    );
+    assert_eq!(
+        alias_state_rows_scanned() - before_multi_ident,
+        641,
+        "repeated identical upserts of watched target row must cause ZERO restarts"
+    );
+    assert_eq!(
+        res_multi_ident,
+        Ok(Some((
+            multi_ident_live,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_single_multi, 0x4000));
+
+    // Subcase 5e (Codex #20 P0-3): Attempt-0 single-slice lookup where the FIRST
+    // candidate (`first_va`, `found_idx == 0`) is live. Publishing a NEWER live
+    // alias (`newer_va`) covering the same VA before Phase 2 dirties Attempt 0's
+    // watch, forcing retry and mapping `newer_va` instead of superseded `first_va`.
+    let va_sup = 0x5400_0000_u64;
+    let ipa_sup_old = 0x7cf0_0000_u64;
+    let ipa_sup_new = 0x7cf1_0000_u64;
+    let first_va = AliasBacking {
+        start: va_sup,
+        ipa: ipa_sup_old,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_sup_old,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(22_000)),
+        inventory_backing: InventoryBackingIdentity::Private(22_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let newer_va = AliasBacking {
+        start: va_sup,
+        ipa: ipa_sup_new,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_sup_new,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(22_001)),
+        inventory_backing: InventoryBackingIdentity::Private(22_001),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(first_va);
+        registry.clear_replay_mappings_in();
+    });
+    let (sup_tx, sup_rx) = std::sync::mpsc::channel::<()>();
+    let (sup_ack_tx, sup_ack_rx) = std::sync::mpsc::channel::<()>();
+    let sup_owner = std::thread::spawn(move || {
+        if sup_rx.recv().is_ok() {
+            mutate_external_alias_state(|registry| {
+                assert!(!registry.active_replay_watches.is_empty());
+                registry.push(newer_va);
+                registry.clear_replay_mappings_in();
+            });
+            let _ = sup_ack_tx.send(());
+        }
+    });
+    let sup_tx_hook = std::sync::Arc::new(parking_lot::Mutex::new(Some(sup_tx)));
+    let sup_ack_rx_hook = std::sync::Arc::new(parking_lot::Mutex::new(sup_ack_rx));
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_REMAP_BEFORE_GUARD
+                && let Some(tx) = sup_tx_hook.lock().take()
+            {
+                let _ = tx.send(());
+                let _ = sup_ack_rx_hook.lock().recv();
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_sup_old, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_sup_new, 0x4000));
+    let res_sup = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaAnyScope { va: va_sup },
+            &mut |ipa| {
+                assert_ne!(ipa, ipa_sup_old, "superseded row IPA must not be allowed");
+                ipa == ipa_sup_new
+            },
+        )
+    };
+    custody.stage2.set_hook(None);
+    sup_owner.join().expect("sup_owner joined");
+    assert_eq!(
+        res_sup,
+        Ok(Some((
+            newer_va,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_sup_old, 0x4000));
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_sup_new, 0x4000));
 
     mutate_external_alias_state(|registry| {
         assert!(
