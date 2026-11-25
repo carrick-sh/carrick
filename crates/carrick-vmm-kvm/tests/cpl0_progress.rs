@@ -8,9 +8,12 @@
 mod physical_inventory;
 use physical_inventory::physical_inventory;
 
+use carrick_el1_abi::{
+    X86_CPL0_SUPERVISOR_IMAGE_BASE, X86_CPL0_SUPERVISOR_IMAGE_EXTENT, X86_CPL0_SUPERVISOR_IMAGE_GPA,
+};
 use carrick_vmm_kvm::carrier_interrupts::{KickBoundary, SECOND_ROOT, witness};
 use carrick_x86::cpl0_scheduler::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // inc [rax]; inc rbx; read distinct FS/GS words; store YMM15 and FP controls.
 // AND/OR every control sample so a transient switch leak survives readback.
@@ -49,8 +52,7 @@ struct FpControls {
     saved: (u16, u32),
 }
 
-fn progress(boundary: KickBoundary) {
-    let image = PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
+fn first_program() -> Vec<u8> {
     let mut first = Vec::new();
     // A real common-kernel entry before the syscall-free compute loop.
     for (opcode, value) in [
@@ -74,7 +76,19 @@ fn progress(boundary: KickBoundary) {
         first.extend_from_slice(&value.to_le_bytes());
     }
     first.extend_from_slice(COMPUTE);
-    let observed = witness(physical_inventory(), &image, [&first, COMPUTE], boundary)
+    first
+}
+
+fn progress(boundary: KickBoundary) {
+    progress_with_image(
+        &PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")),
+        boundary,
+    );
+}
+
+fn progress_with_image(image: &Path, boundary: KickBoundary) {
+    let first = first_program();
+    let observed = witness(physical_inventory(), image, [&first, COMPUTE], boundary)
         .expect("bounded live KVM CPL0 progress");
     for turn in 0..PROGRESS_TURNS {
         assert_eq!(
@@ -188,4 +202,131 @@ fn entry_kick_and_timer_preempt_two_private_contexts() {
 #[test]
 fn return_kick_and_timer_preempt_two_private_contexts() {
     progress(KickBoundary::Return);
+}
+
+fn patched_progress_image(
+    dir: &Path,
+    high_trampoline: bool,
+    override_slot: Option<(usize, u64)>,
+) -> (PathBuf, [u64; 3]) {
+    let source = PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
+    let mut bytes = std::fs::read(&source).expect("read fixture ELF");
+    let u16_at = |buf: &[u8], at: usize| u16::from_le_bytes(buf[at..at + 2].try_into().unwrap());
+    let u32_at = |buf: &[u8], at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+    let u64_at = |buf: &[u8], at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+    let phoff = usize::try_from(u64_at(&bytes, 0x20)).unwrap();
+    let phentsize = usize::from(u16_at(&bytes, 0x36));
+    let phnum = usize::from(u16_at(&bytes, 0x38));
+    let phdrs: Vec<usize> = (0..phnum).map(|i| phoff + i * phentsize).collect();
+    let header_va =
+        X86_CPL0_SUPERVISOR_IMAGE_BASE + (PROGRESS_HEADER - X86_CPL0_SUPERVISOR_IMAGE_GPA);
+    let hdr_ph = phdrs
+        .iter()
+        .copied()
+        .find(|&p| {
+            u32_at(&bytes, p) == 1
+                && u64_at(&bytes, p + 0x10) <= header_va
+                && header_va + 32 <= u64_at(&bytes, p + 0x10) + u64_at(&bytes, p + 0x20)
+        })
+        .expect("progress header PT_LOAD");
+    let hdr_off = usize::try_from(
+        u64_at(&bytes, hdr_ph + 0x08) + (header_va - u64_at(&bytes, hdr_ph + 0x10)),
+    )
+    .unwrap();
+    assert_eq!(u64_at(&bytes, hdr_off), PROGRESS_MAGIC);
+    let mut entries = [
+        u64_at(&bytes, hdr_off + 8),
+        u64_at(&bytes, hdr_off + 16),
+        u64_at(&bytes, hdr_off + 24),
+    ];
+    if high_trampoline {
+        let text_ph = phdrs
+            .iter()
+            .copied()
+            .find(|&p| {
+                u32_at(&bytes, p) == 1
+                    && (u32_at(&bytes, p + 4) & 1) != 0
+                    && u64_at(&bytes, p + 0x10) + u64_at(&bytes, p + 0x20) >= 0xffff_ffff_800f_0000
+            })
+            .expect("executable PT_LOAD spanning past 960 KiB");
+        let seg_off = u64_at(&bytes, text_ph + 0x08);
+        let seg_va = u64_at(&bytes, text_ph + 0x10);
+        let seg_filesz = u64_at(&bytes, text_ph + 0x20);
+        let seg_memsz = u64_at(&bytes, text_ph + 0x28);
+        let end_va = seg_va + seg_filesz;
+        let tramp_va = (end_va + 15) & !15;
+        let page_end = (end_va + 0xfff) & !0xfff;
+        assert!(tramp_va >= 0xffff_ffff_800f_0000);
+        assert!(X86_CPL0_SUPERVISOR_IMAGE_EXTENT.contains(&(tramp_va + 23)));
+        assert!(tramp_va + 24 <= page_end, "page padding exhausted");
+        let tramp_off = usize::try_from(seg_off + (tramp_va - seg_va)).unwrap();
+        for &p in &phdrs {
+            if p == text_ph || u32_at(&bytes, p) != 1 {
+                continue;
+            }
+            let o_start = usize::try_from(u64_at(&bytes, p + 0x08)).unwrap();
+            let o_end = o_start + usize::try_from(u64_at(&bytes, p + 0x20)).unwrap();
+            assert!(
+                tramp_off + 24 <= o_start || o_end <= tramp_off,
+                "trampoline overlaps another PT_LOAD file range"
+            );
+        }
+        for (i, target) in entries.iter_mut().enumerate() {
+            let stub_va = tramp_va + (i as u64) * 8;
+            let stub_off = tramp_off + i * 8;
+            let rel = i32::try_from(*target as i128 - (stub_va as i128 + 5))
+                .expect("rel32 jump inside 2 MiB image");
+            bytes[stub_off] = 0xe9;
+            bytes[stub_off + 1..stub_off + 5].copy_from_slice(&rel.to_le_bytes());
+            *target = stub_va;
+        }
+        let new_filesz = tramp_va + 24 - seg_va;
+        let new_memsz = seg_memsz.max(new_filesz);
+        bytes[text_ph + 0x20..text_ph + 0x28].copy_from_slice(&new_filesz.to_le_bytes());
+        bytes[text_ph + 0x28..text_ph + 0x30].copy_from_slice(&new_memsz.to_le_bytes());
+    }
+    if let Some((slot, addr)) = override_slot {
+        entries[slot] = addr;
+    }
+    for (i, addr) in entries.iter().enumerate() {
+        bytes[hdr_off + 8 + i * 8..hdr_off + 16 + i * 8].copy_from_slice(&addr.to_le_bytes());
+    }
+    let out = dir.join("carrick-x86-cpl0-fixture");
+    std::fs::write(&out, &bytes).expect("write patched fixture ELF");
+    (out, entries)
+}
+
+#[test]
+fn entry_and_interrupt_handlers_above_960_kib_progress_under_kvm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (image, entries) = patched_progress_image(dir.path(), true, None);
+    for addr in entries {
+        assert!(
+            addr >= 0xffff_ffff_800f_0000 && X86_CPL0_SUPERVISOR_IMAGE_EXTENT.contains(&addr),
+            "expected patched PC in [0xffffffff800f0000, 0xffffffff80200000), got {addr:#x}"
+        );
+    }
+    progress_with_image(&image, KickBoundary::Entry);
+}
+
+#[test]
+fn exclusive_supervisor_extent_end_is_rejected_before_guest_execution() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = first_program();
+    let end = X86_CPL0_SUPERVISOR_IMAGE_EXTENT.end;
+    for slot in 0..3 {
+        let (image, _) = patched_progress_image(dir.path(), false, Some((slot, end)));
+        let err = witness(
+            physical_inventory(),
+            &image,
+            [&first, COMPUTE],
+            KickBoundary::Entry,
+        )
+        .expect_err("exclusive ABI extent end must be rejected");
+        assert!(
+            err.to_string()
+                .contains("CPL0 progress header/version/entry mismatch"),
+            "slot {slot}: unexpected error: {err}"
+        );
+    }
 }
