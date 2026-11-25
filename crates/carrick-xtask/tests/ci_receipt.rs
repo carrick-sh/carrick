@@ -4912,14 +4912,8 @@ fn retirement_refuses_a_path_module_target_outside_the_tree() {
 
 #[test]
 fn retirement_refuses_a_path_module_target_that_declares_out_of_line_modules() {
-    // `mod more;` in the followed file resolves next to it, outside the
-    // owning crate's scanned files: refuse rather than guess.
+    // An out-of-line declaration with no matching file still refuses retirement.
     let dir = path_module_fixture(SIBLING_PATH_MOD, "mod more;");
-    write_source(
-        dir.path(),
-        "crates/shared/src/more.rs",
-        "#[test] fn gone() {}",
-    );
     let error = tree_has_test(dir.path(), "example", "gone").unwrap_err();
     assert!(error.to_string().contains("out-of-line modules"), "{error}");
 }

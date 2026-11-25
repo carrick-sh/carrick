@@ -614,8 +614,7 @@ struct TestSourceScan {
     /// Canonical targets of plain `#[path]` modules outside the initial scan
     /// (a sibling crate's file built as a module here), to scan as well.
     path_modules: Vec<PathBuf>,
-    /// Reached only through a `#[path]` into a sibling crate, not part of
-    /// the owning crate's own files.
+    /// Reached through a `#[path]` chain outside the owning crate's scan.
     followed: bool,
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
     /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
@@ -645,14 +644,25 @@ struct ModDecl {
     path: Option<String>,
 }
 
+impl ModDecl {
+    fn plain_candidates(&self, child_dir: &Path) -> [(PathBuf, bool); 2] {
+        let dir = self
+            .inline
+            .iter()
+            .fold(child_dir.to_path_buf(), |dir, name| dir.join(name));
+        [
+            (dir.join(format!("{}.rs", self.name)), false),
+            (dir.join(&self.name).join("mod.rs"), true),
+        ]
+    }
+}
+
 impl TestSourceScan {
     /// The canonical target of a plain `#[path = "lit"]` at file level,
     /// resolved against the visiting file's directory with
     /// [`walk_literal_rs`]. The target is either one of the owning crate's
-    /// scanned files, or a file under a sibling workspace crate's `src/` or
-    /// `tests/` ([`sibling_crate_source`]: carrick-runtime builds HVF's
-    /// syscall mailbox that way), which is then scanned too, so neither hides
-    /// a test.
+    /// scanned files or a sibling workspace crate's source (see
+    /// [`sibling_crate_source`]), which is then scanned too.
     /// Anything else stays unresolved: a `cfg_attr` form, a non-literal, a
     /// `#[path]` inside an inline module (rustc resolves it against a
     /// subdirectory), or any other file in the repository (`fixtures/`, a
@@ -736,22 +746,26 @@ fn walk_literal_rs(dir: &Path, relative: &Path, floor: &Path) -> Option<PathBuf>
     candidate.canonicalize().ok()
 }
 
-/// Whether canonical `target` lies under `crates/<name>/src/` or
-/// `crates/<name>/tests/` of the canonical `tree_root`, where
-/// `crates/<name>/Cargo.toml` is a regular manifest declaring a `[package]`:
-/// a sibling workspace crate's own library or test source (carrick-runtime's
-/// integration tests share carrick-kernel's `tests/integration/common`).
+/// Whether canonical `target` is a crate-root Rust file or lies in
+/// `src/` or `tests/` of a workspace crate with a regular package manifest.
 fn sibling_crate_source(tree_root: &Path, target: &Path) -> bool {
     let Ok(relative) = target.strip_prefix(tree_root.join("crates")) else {
         return false;
     };
     let mut components = relative.components();
-    let (Some(std::path::Component::Normal(name)), Some(std::path::Component::Normal(src))) =
+    let (Some(std::path::Component::Normal(name)), Some(std::path::Component::Normal(location))) =
         (components.next(), components.next())
     else {
         return false;
     };
-    if !(src == "src" || src == "tests") || components.next().is_none() {
+    let permitted = if components.next().is_some() {
+        location == "src" || location == "tests"
+    } else {
+        Path::new(location)
+            .extension()
+            .is_some_and(|ext| ext == "rs")
+    };
+    if !permitted {
         return false;
     }
     let crate_dir = tree_root.join("crates").join(name);
@@ -934,7 +948,7 @@ fn scan_crate_sources(
         stack: Vec::new(),
     };
     for file in &files {
-        chains.walk(file, 0)?;
+        chains.walk(file, 0, true)?;
     }
     Ok(chains.scans)
 }
@@ -951,7 +965,7 @@ struct SourceChains<'a> {
     scans: BTreeMap<PathBuf, TestSourceScan>,
     /// The deepest chain depth at which a file's whole sub-chain was walked.
     /// A walk at that depth or shallower reaches nothing deeper.
-    explored: BTreeMap<PathBuf, usize>,
+    explored: BTreeMap<(PathBuf, bool), usize>,
     /// The chain being walked, so a cycle stops instead of looping.
     stack: Vec<PathBuf>,
 }
@@ -960,11 +974,16 @@ impl SourceChains<'_> {
     /// Scan `file` (once) and walk its chain children at `depth + 1`.
     /// Returns whether the walk below `file` was complete, that is, it cut no
     /// cycle short: only a complete walk may be reused for a later chain.
-    fn walk(&mut self, file: &Path, depth: usize) -> Result<bool, ReceiptError> {
+    fn walk(&mut self, file: &Path, depth: usize, mod_rs: bool) -> Result<bool, ReceiptError> {
         if self.stack.iter().any(|on_chain| on_chain == file) {
             return Ok(false);
         }
-        if self.explored.get(file).is_some_and(|&seen| seen >= depth) {
+        let context = (file.to_path_buf(), mod_rs);
+        if self
+            .explored
+            .get(&context)
+            .is_some_and(|&seen| seen >= depth)
+        {
             return Ok(true);
         }
         if !self.scans.contains_key(file) {
@@ -972,28 +991,52 @@ impl SourceChains<'_> {
             self.scans.insert(file.to_path_buf(), scan);
         }
         let scan = &self.scans[file];
-        let children: Vec<PathBuf> = scan
+        let mut children: Vec<_> = scan
             .includes
             .iter()
-            .map(|include| include.file.clone())
-            .chain(scan.path_modules.iter().cloned())
+            .map(|include| (include.file.clone(), true))
+            .chain(scan.path_modules.iter().cloned().map(|file| (file, true)))
             .collect();
+        let mut unresolved = None;
+        // Crate-local files are already scanned. A followed module can reach
+        // more files outside that scan, starting beside the #[path] target.
+        if scan.followed {
+            let child_dir = module_child_dir(file, mod_rs);
+            for decl in scan.mod_decls.iter().filter(|decl| decl.path.is_none()) {
+                let mut candidates = decl
+                    .plain_candidates(&child_dir)
+                    .into_iter()
+                    .filter(|(path, _)| path.is_file());
+                match (candidates.next(), candidates.next()) {
+                    (Some((path, child_mod_rs)), None)
+                        if let Ok(relative) = path.strip_prefix(&scan.file_dir)
+                            && let Some(target) =
+                                walk_literal_rs(&scan.file_dir, relative, &self.tree_root) =>
+                    {
+                        children.push((target, child_mod_rs));
+                    }
+                    _ => unresolved = Some("out-of-line modules in followed source"),
+                }
+            }
+        }
+        if depth == MAX_INCLUDE_DEPTH && children.len() > scan.includes.len() {
+            unresolved = Some("#[path] module depth limit");
+        }
+        if let Some(reason) = unresolved
+            && let Some(scan) = self.scans.get_mut(file)
+        {
+            scan.unresolved.get_or_insert(reason);
+        }
         let mut complete = true;
         if depth < MAX_INCLUDE_DEPTH {
             self.stack.push(file.to_path_buf());
-            for child in &children {
-                complete &= self.walk(child, depth + 1)?;
+            for (child, child_mod_rs) in &children {
+                complete &= self.walk(child, depth + 1, *child_mod_rs)?;
             }
             self.stack.pop();
-        } else if let Some(scan) = self
-            .scans
-            .get_mut(file)
-            .filter(|scan| !scan.path_modules.is_empty())
-        {
-            scan.unresolved.get_or_insert("#[path] module depth limit");
         }
         if complete {
-            self.explored.insert(file.to_path_buf(), depth);
+            self.explored.insert(context, depth);
         }
         Ok(complete)
     }
@@ -1010,15 +1053,10 @@ impl SourceChains<'_> {
             tree_root: self.tree_root.clone(),
             file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
             name_mentioned: self.test_name.is_some_and(|name| source.contains(name)),
+            followed: !self.scanned.contains(file),
             ..Default::default()
         };
         scan.visit_file(&syntax);
-        // A followed out-of-crate `#[path]` file's plain `mod x;` children
-        // live outside the scanned files: refuse rather than guess.
-        scan.followed = !self.scanned.contains(file);
-        if scan.followed && scan.mod_decls.iter().any(|decl| decl.path.is_none()) {
-            scan.unresolved = Some("#[path] module declaring out-of-line modules");
-        }
         Ok(scan)
     }
 }
@@ -1244,6 +1282,15 @@ fn crate_targets(
     Ok(targets)
 }
 
+fn module_child_dir(file: &Path, mod_rs: bool) -> PathBuf {
+    let parent = file.parent().unwrap_or(Path::new(""));
+    if mod_rs {
+        parent.to_path_buf()
+    } else {
+        parent.join(file.file_stem().unwrap_or_default())
+    }
+}
+
 /// Attribute the tests of `file` and of every file it reaches by `mod` to
 /// `bin`, with their module paths. `mod_rs` is whether `file` locates child
 /// module files beside itself (a crate root, `mod.rs`, a `#[path]` target)
@@ -1304,11 +1351,7 @@ fn attribute_module_file(
             .get_or_insert_with(|| format!("{reason} in {}", file.display()));
     }
     let parent = canonical.parent().unwrap_or(Path::new(""));
-    let child_dir = if mod_rs {
-        parent.to_path_buf()
-    } else {
-        parent.join(canonical.file_stem().unwrap_or_default())
-    };
+    let child_dir = module_child_dir(&canonical, mod_rs);
     for decl in &scan.mod_decls {
         let mut module = prefix.to_vec();
         module.extend(decl.inline.iter().cloned());
@@ -1316,16 +1359,7 @@ fn attribute_module_file(
         let candidates: Vec<(PathBuf, bool)> = match &decl.path {
             Some(_) if !decl.inline.is_empty() => Vec::new(),
             Some(path) => vec![(parent.join(path), true)],
-            None => {
-                let dir = decl
-                    .inline
-                    .iter()
-                    .fold(child_dir.clone(), |dir, name| dir.join(name));
-                vec![
-                    (dir.join(format!("{}.rs", decl.name)), false),
-                    (dir.join(&decl.name).join("mod.rs"), true),
-                ]
-            }
+            None => decl.plain_candidates(&child_dir).into(),
         };
         let found = candidates.into_iter().find(|(path, _)| {
             std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
@@ -1683,10 +1717,33 @@ pub fn diff_with_retired(
                 .any(|e| receipt_test_matches(e, b, t))
         })
     };
+    // Recorded execution takes precedence over lane metadata for scope.
+    let observed_bins: BTreeSet<&str> = baseline
+        .steps
+        .iter()
+        .chain(&candidate.steps)
+        .flat_map(|step| {
+            step.finished_binaries
+                .iter()
+                .chain(&step.unfinished_binaries)
+                .map(String::as_str)
+                .chain(
+                    step.started_tests
+                        .iter()
+                        .filter_map(|test| test.split_once("::").map(|(bin, _)| bin)),
+                )
+        })
+        .collect();
     let mut verified_retired: Vec<(&str, &str)> = Vec::with_capacity(retired.len());
     let mut warnings = Vec::new();
     for entry in retired {
         let (bin, test_path) = split_qualified_test(&entry.test, "test")?;
+        if !observed_bins.contains(bin)
+            && !binary_runs_in_receipt_lane(base_tree, bin, baseline)?
+            && !binary_runs_in_receipt_lane(candidate_tree, bin, candidate)?
+        {
+            continue;
+        }
         if !tree_has_test(base_tree, bin, test_path)? {
             warnings.push(format!(
                 "stale retired-test declaration '{}': test is already absent in base source (PR #{}); remove the entry",
