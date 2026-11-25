@@ -2029,6 +2029,28 @@ fn arm_exec_adoption_identity_is_the_sealed_asid_over_the_root() {
     }
 }
 
+/// Assert whether host publication reuses `index` now. The probe key starts
+/// its search at `index` and is published nowhere, so it lands there exactly
+/// when the retired index is reusable; the probe is then freed again.
+/// Retirement unpublishes an entry at once, but its index stays unusable
+/// while a notification borrower of the retired incarnation remains (#3017).
+#[cfg(test)]
+fn assert_publication_reuses(
+    spaces: &carrick_sched_core::spaces::AddressSpaces,
+    index: carrick_sched_core::spaces::SpaceIndex,
+    reuses: bool,
+    why: &str,
+) {
+    let stride = carrick_sched_core::spaces::ADDRESS_SPACES as u64;
+    let probe = (1_u64 << 40) / stride * stride + index.index() as u64;
+    assert!(spaces.find(probe).is_none(), "probe key is unpublished");
+    let landed = spaces
+        .publish_closed(probe, 0, 0)
+        .expect("a free space entry for the probe");
+    assert_eq!(landed == index, reuses, "{why}");
+    spaces.free(landed);
+}
+
 #[test]
 fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     use carrick_core_abi::service::{
@@ -2159,6 +2181,11 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
             )
             .unwrap(),
     );
+    let predecessor_index = fixture
+        .zone
+        .spaces
+        .find(fixture.address.mm.raw().get())
+        .unwrap();
     let predecessor_notifications = fixture
         .zone
         .space_entry(fixture.address.mm.raw())
@@ -2176,21 +2203,31 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
         ),
         Err(NativeProcessError::Unsupported),
     );
+    // Retirement unpublishes the predecessor at once, past the live
+    // borrower; only the index's reuse waits for that borrower.
     assert!(
-        fixture
-            .zone
-            .space_entry(fixture.address.mm.raw())
-            .unwrap()
-            .live_notifications()
-            .is_err()
+        fixture.zone.space_entry(fixture.address.mm.raw()).is_none(),
+        "retired predecessor is unpublished while borrowed"
     );
-    drop(predecessor_notifications);
     assert!(
         fixture
             .zone
             .spaces
             .find(fixture.address.mm.raw().get())
             .is_none()
+    );
+    assert_publication_reuses(
+        &fixture.zone.spaces,
+        predecessor_index,
+        false,
+        "a borrowed retired index is not reused",
+    );
+    drop(predecessor_notifications);
+    assert_publication_reuses(
+        &fixture.zone.spaces,
+        predecessor_index,
+        true,
+        "the last borrower frees the index for reuse",
     );
     assert!(fixture.zone.spaces.is_open(successor_mm.raw()));
     assert_eq!(notifications.observe(cause).revision(), before + 1);
@@ -3973,6 +4010,11 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
 
     // Retain the same counted venue that an admitted anonymous edit borrows.
     // Final exit must close admission now and defer entry reuse until release.
+    let child_index = fixture
+        .zone
+        .spaces
+        .find(child_binding.address.mm.raw().get())
+        .unwrap();
     let child_notifications = (!physical).then(|| {
         fixture
             .zone
@@ -4037,19 +4079,8 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         1,
         "terminal child must retire before parent can reap"
     );
-    if child_notifications.is_some() {
-        assert!(
-            fixture
-                .zone
-                .space_entry(child_binding.address.mm.raw())
-                .unwrap()
-                .live_notifications()
-                .is_err(),
-            "terminal entry rejects new notification borrowers"
-        );
-    }
-    drop(child_notifications);
-
+    // Retirement unpublishes the child's entry at once, past any live
+    // borrower, so no new borrower can find it.
     assert!(
         fixture
             .zone
@@ -4057,6 +4088,28 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
             .find(child_binding.address.mm.raw().get())
             .is_none(),
         "child exit must retire its reservation root without waiting for another fork"
+    );
+    assert!(
+        fixture
+            .zone
+            .space_entry(child_binding.address.mm.raw())
+            .is_none(),
+        "terminal entry is unpublished"
+    );
+    if child_notifications.is_some() {
+        assert_publication_reuses(
+            &fixture.zone.spaces,
+            child_index,
+            false,
+            "a borrowed retired index is not reused",
+        );
+    }
+    drop(child_notifications);
+    assert_publication_reuses(
+        &fixture.zone.spaces,
+        child_index,
+        true,
+        "the retired index is reusable once no borrower remains",
     );
 
     if let Some(physical) = &crossing.physical {
