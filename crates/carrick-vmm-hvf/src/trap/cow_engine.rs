@@ -5370,6 +5370,10 @@ impl HvfVmState {
         let Some(b) = backing else {
             return false;
         };
+        #[cfg(test)]
+        self.carrier_vm_custody()
+            .stage2
+            .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
         // `add_alias`. Replay succeeds only when HVF confirms the installation;
         // an arbitrary nonzero result is never evidence that a racing mapper won.

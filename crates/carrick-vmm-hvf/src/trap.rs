@@ -195,6 +195,8 @@ mod owner_fork;
 mod user_transfer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrier_custody::CarrierVmCustody;
+#[cfg(test)]
+pub(crate) use carrier_custody::{COMMIT_DESTROY_HOLDING_STAGE2, FORK_STOCK_INSTALL_BEFORE_ARENAS};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
 pub use owner_fork::{ForkPhysicalCustody, ForkPhysicalRetention, RetainHostBacking};

@@ -969,6 +969,8 @@ impl CarrierVmCustody {
             if state.lifecycle() != Stage2Lifecycle::Gone(generation) {
                 return Err(Stage2CustodyError::StaleGeneration);
             }
+            #[cfg(test)]
+            self.stage2.at_client_point(COMMIT_DESTROY_HOLDING_STAGE2);
             if let CarrierFramePoolState::Active(pool) = std::mem::replace(
                 &mut *self.frame_pool.lock(),
                 CarrierFramePoolState::Uninitialized,
@@ -1705,6 +1707,12 @@ pub(crate) const ROOT_SLOT_POOL_ADMITTED: &str = "root slot pool admitted";
 pub(crate) const REPLAY_REBIND_ADMITTED: &str = "replay rebind admitted";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const IPC_WINDOW_ADMITTED: &str = "ipc window admitted";
+#[cfg(test)]
+pub(crate) const FORK_STOCK_INSTALL_BEFORE_ARENAS: &str = "fork stock install before arenas";
+#[cfg(test)]
+pub(crate) const COMMIT_DESTROY_HOLDING_STAGE2: &str = "commit destroy holding stage2";
+#[cfg(test)]
+pub(crate) const REPLAY_REMAP_LOOKED_UP: &str = "replay remap looked up";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
@@ -5758,6 +5766,126 @@ mod carrier_vm_custody_tests {
                 .stage2_record_snapshot(second.record_id)
                 .expect("successor remains mapped")
                 .mapped
+        );
+    }
+
+    /// `HvfVmState::try_lazy_alias_remap` resolves an `AliasBacking` from the
+    /// process-global alias registry and previously called raw
+    /// `inventory_stage2_map_replay` with no `Stage2Generation` guard. If a
+    /// rival destroys `G1` and creates `G2` after lookup, the stale `G1`
+    /// replay maps into `G2`. Holding `admitting_stage2` across the replay map
+    /// serializes destruction on `LockContended` instead.
+    #[test]
+    fn try_lazy_alias_remap_holds_generation_guard_across_replay() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stage2_stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let ipa = 0x7d00_2400_0000_u64;
+        let va = 0x6000_2400_0000_u64;
+        let len = 0x4000_usize;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .expect("allocate shared alias replay backing");
+        let host_addr = host_mapping.as_ptr() as usize;
+        let backing = super::AliasBacking {
+            start: va,
+            ipa,
+            host_addr,
+            size: len,
+            physical_ipa: ipa,
+            physical_host_addr: host_addr,
+            physical_size: len,
+            perms: 7,
+            guest_writable: true,
+            sharing: super::GuestMappingSharing::GlobalShared,
+            ownership_scope: super::AliasOwnershipScope::Global,
+            inventory_backing: super::InventoryBackingIdentity::Private(9991),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        super::register_shared_alias(backing);
+        super::forget_replay_extent(ipa, len);
+
+        let mut vm = super::HvfVmState {
+            _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
+            task: super::hvpatch_neutral_task_state_for_test(),
+            carrier_foreign_mm_transport: std::sync::Arc::new(super::CarrierForeignMmTransport {
+                custody: std::sync::Arc::clone(&custody),
+                ..Default::default()
+            }),
+            carrier_mappings: None,
+            mailbox_slots: std::sync::Arc::new(super::MailboxSlotAllocator::new()),
+            syscall_transport: super::HvfSyscallTransport::Mailbox,
+            executor_vcpu: None,
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let mapped_after_rival = std::sync::Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let event_rx = std::sync::Mutex::new(event_rx);
+        {
+            let mapped_after_rival = std::sync::Arc::clone(&mapped_after_rival);
+            custody.stage2.set_hook(Some(std::sync::Arc::new(
+                move |hook_point| match hook_point {
+                    Stage2HookPoint::Client(name) if name == super::REPLAY_REMAP_LOOKED_UP => {
+                        start_tx.send(()).expect("rival alive");
+                        let event = event_rx
+                            .lock()
+                            .expect("event receiver")
+                            .recv()
+                            .expect("rival reports");
+                        assert!(matches!(event, "contended" | "done"));
+                        mapped_after_rival.store(event == "done", Ordering::SeqCst);
+                    }
+                    Stage2HookPoint::LockContended(_) => {
+                        let _ = hook_event_tx.send("contended");
+                    }
+                    _ => {}
+                },
+            )));
+        }
+
+        let rival = {
+            let custody = std::sync::Arc::clone(&custody);
+            std::thread::spawn(move || {
+                start_rx.recv().expect("replay parked");
+                destroy_vm_with_custody_using(
+                    &custody,
+                    "rival G1 destroy",
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                    || {},
+                )
+                .expect("rival destroys G1");
+                let g2 = custody.begin_create().expect("begin G2");
+                custody.commit_create(g2).expect("commit G2");
+                let _ = event_tx.send("done");
+                g2
+            })
+        };
+
+        let remapped = vm.try_lazy_alias_remap(ipa, va);
+        let g2 = rival.join().expect("rival");
+        custody.stage2.set_hook(None);
+        super::mutate_external_alias_state(|registry| {
+            registry.retain(|alias| alias.physical_ipa != ipa);
+        });
+        super::forget_replay_extent(ipa, len);
+        drop(host_mapping);
+
+        assert_ne!(g2, g1);
+        assert!(remapped, "G1 replay map must succeed before G1 destroy");
+        assert!(
+            !mapped_after_rival.load(Ordering::SeqCst),
+            "stale G1 replay reached backend after G1 destroyed and G2 created"
         );
     }
 }

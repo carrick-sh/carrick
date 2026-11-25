@@ -252,6 +252,10 @@ impl ForkStockHostCustody {
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
         let roots = resources.tables.arenas();
+        #[cfg(test)]
+        custody
+            .stage2
+            .at_client_point(crate::trap::FORK_STOCK_INSTALL_BEFORE_ARENAS);
         for root in roots {
             let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
@@ -1277,5 +1281,115 @@ mod tests {
             1,
             "committed child MM retains its stage-2 pin until MM retirement"
         );
+    }
+
+    #[test]
+    fn fork_stock_install_never_inverts_lock_order_with_commit_destroy() {
+        use carrick_aarch64::stage2::custody::{Stage2HookPoint, Stage2Lifecycle};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        struct TestTables(Vec<RootGpa>);
+        impl carrick_hal::fork_stock::NativeForkTableReservation for TestTables {
+            fn arenas(&self) -> &[RootGpa] {
+                &self.0
+            }
+        }
+        struct TestInventory;
+        impl carrick_hal::PhysicalFrameInventory for TestInventory {
+            fn bind(
+                &self,
+                _: carrick_hal::GuestFrameOwner,
+            ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
+                panic!("unused in lock-order witness")
+            }
+            fn allocate_backing_ids(
+                &self,
+            ) -> Result<
+                (carrick_hal::FrameId, carrick_hal::MappingId),
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err("unused in lock-order witness".into())
+            }
+            fn retire_mm(
+                &self,
+                _: carrick_guest_arch::MmGeneration,
+            ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+        }
+
+        let custody = Arc::new(CarrierVmCustody::new());
+        let g1 = custody.begin_create().unwrap();
+        custody.commit_create(g1).unwrap();
+        // Skip allocating the 128 MiB root-slot pool in this isolated witness;
+        // fallback arena creation exercises the production custody path.
+        *custody.root_slot_pool.lock() = crate::trap::CarrierRootSlotPoolState::Failed;
+
+        let (install_entered_tx, install_entered_rx) = mpsc::channel::<()>();
+        let (install_go_tx, install_go_rx) = mpsc::channel::<()>();
+        let install_go_rx = Mutex::new(install_go_rx);
+        let install_go_tx = Mutex::new(Some(install_go_tx));
+        custody
+            .stage2
+            .set_hook(Some(Arc::new(move |point| match point {
+                Stage2HookPoint::Client(name)
+                    if name == crate::trap::FORK_STOCK_INSTALL_BEFORE_ARENAS =>
+                {
+                    let _ = install_entered_tx.send(());
+                    let _ = install_go_rx.lock().unwrap().recv();
+                }
+                Stage2HookPoint::Client(name)
+                    if name == crate::trap::COMMIT_DESTROY_HOLDING_STAGE2 =>
+                {
+                    if let Some(tx) = install_go_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+                _ => {}
+            })));
+
+        let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+        let resources = carrick_hal::fork_stock::NativeForkStockResources {
+            tables: Arc::new(TestTables(vec![page(0x9a00_0000_0000)])),
+            inventory: Arc::new(TestInventory),
+        };
+        let install_custody = Arc::clone(&custody);
+        let install_done = done_tx.clone();
+        let install_thread = std::thread::spawn(move || {
+            let _stub = crate::trap::ScopedStage2MapTestStub::enable();
+            let _ = ForkStockHostCustody::install(&install_custody, resources);
+            let _ = install_done.send("install");
+        });
+
+        install_entered_rx
+            .recv()
+            .expect("install thread reached FORK_STOCK_INSTALL_BEFORE_ARENAS");
+        custody.begin_destroy(g1).expect("begin destroy G1");
+        custody.destroy_stage2_for_test(g1);
+
+        let destroy_custody = Arc::clone(&custody);
+        let destroy_done = done_tx;
+        let destroy_thread = std::thread::spawn(move || {
+            let _ = destroy_custody.commit_destroy(g1);
+            let _ = destroy_done.send("destroy");
+        });
+
+        let mut finished = Vec::new();
+        for _ in 0..2 {
+            let which = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "ForkStockHostCustody::install deadlocked with CarrierVmCustody::commit_destroy                          (finished={finished:?}): {error}"
+                    )
+                });
+            finished.push(which);
+        }
+        install_thread.join().expect("install thread panicked");
+        destroy_thread.join().expect("destroy thread panicked");
+        custody.stage2.set_hook(None);
+        assert_eq!(custody.stage2.lifecycle(), Stage2Lifecycle::Vacant);
     }
 }
