@@ -852,7 +852,7 @@ mod allocator_stats_tests {
         for scale in [1, 8, 64] {
             let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
             let pool = std::sync::Arc::new(
-                crate::frame_pool::PreMappedFramePool::new_test_fixture(scale),
+                crate::frame_pool::PreMappedFramePool::new_test_fixture_in(&custody, scale),
             );
             let before = El1FrameGrantObserver::new(&custody).snapshot();
             let mut owners = Vec::new();
@@ -1170,6 +1170,7 @@ pub(crate) struct GlobalFrameStage2Lease {
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     pub(crate) mapping: Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+    pub(crate) pre_mapped_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1185,6 +1186,7 @@ impl GlobalFrameStage2Lease {
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
             mapping: None,
+            pre_mapped_generation: None,
         })
     }
 
@@ -1207,6 +1209,7 @@ impl GlobalFrameStage2Lease {
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
             mapping: None,
+            pre_mapped_generation: None,
         }
     }
 
@@ -1215,11 +1218,16 @@ impl GlobalFrameStage2Lease {
         debug_assert_eq!(mapping.size() as u64, self.length);
         self.mapped = true;
         self.mapping = Some(mapping);
+        self.pre_mapped_generation = None;
     }
 
-    pub(crate) fn mark_pre_mapped(&mut self) {
+    pub(crate) fn mark_pre_mapped_in(
+        &mut self,
+        generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
+    ) {
         self.mapped = true;
         self.mapping = None;
+        self.pre_mapped_generation = generation;
     }
 
     /// Transfer this reservation into an exact carrier stage-2 record that
@@ -1231,7 +1239,10 @@ impl GlobalFrameStage2Lease {
         pre_mapped: bool,
     ) -> Result<(), TrapError> {
         let valid_lease_state = if pre_mapped {
-            self.mapped && self.mapping.is_none() && !record.backend_map_installed
+            self.mapped
+                && self.mapping.is_none()
+                && self.pre_mapped_generation == Some(record.vm_generation)
+                && !record.backend_map_installed
         } else {
             !self.mapped && self.mapping.is_none() && record.backend_map_installed
         };
@@ -1247,6 +1258,7 @@ impl GlobalFrameStage2Lease {
         self.active = false;
         self.mapped = false;
         self.mapping = None;
+        self.pre_mapped_generation = None;
         self.release_ipa = false;
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         {
@@ -1266,6 +1278,7 @@ impl GlobalFrameStage2Lease {
     pub(crate) fn mark_test_mapped_without_backend(&mut self) {
         self.mapped = true;
         self.mapping = None;
+        self.pre_mapped_generation = None;
     }
 
     pub(crate) fn key(&self) -> (u64, u64) {
@@ -1282,6 +1295,7 @@ impl GlobalFrameStage2Lease {
     pub(crate) fn forget_backend_mapping(&mut self) {
         self.mapped = false;
         self.mapping = None;
+        self.pre_mapped_generation = None;
     }
 
     #[allow(dead_code)]
@@ -2151,7 +2165,16 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
         )));
     }
     let registration = (|| {
-        let mut stage2 = custody.admitting_stage2("global frame owner registration")?;
+        let expected_generation = lease
+            .mapping
+            .as_ref()
+            .map(|mapping| mapping.generation())
+            .or(lease.pre_mapped_generation);
+        let mut stage2 = match expected_generation {
+            Some(expected_generation) => custody
+                .admitting_stage2_in(expected_generation, "global frame owner registration")?,
+            None => custody.admitting_stage2("global frame owner registration")?,
+        };
         let vm_generation = stage2.generation();
         if let Some(ref mapping) = lease.mapping
             && mapping.generation() != vm_generation
@@ -2160,6 +2183,13 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
                 "global frame lease belongs to stage-2 generation {:?}, carrier VM is at {:?}",
                 mapping.generation(),
                 vm_generation
+            )));
+        }
+        if let Some(pre_mapped_generation) = lease.pre_mapped_generation
+            && pre_mapped_generation != vm_generation
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "pre-mapped global frame lease belongs to stage-2 generation {pre_mapped_generation:?}, carrier VM is at {vm_generation:?}"
             )));
         }
         let len = usize::try_from(lease.length).map_err(|_| {
@@ -2211,6 +2241,7 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     lease.active = false;
     lease.mapped = false;
     lease.mapping = None;
+    lease.pre_mapped_generation = None;
     lease.release_ipa = false;
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     {
@@ -2335,10 +2366,16 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     handle: crate::frame_pool::PooledFrameHandle,
     perms: u64,
 ) -> Result<u64, TrapError> {
+    let Some(pool_generation) = handle.vm_generation() else {
+        return Err(TrapError::Hypervisor(
+            "pooled global frame handle is missing its stage-2 VM generation".to_owned(),
+        ));
+    };
     let key = (handle.ipa(), handle.len() as u64);
     let host_addr = handle.as_mut_ptr() as usize;
     let record_identity = {
-        let mut stage2 = custody.admitting_stage2("pooled global frame owner registration")?;
+        let mut stage2 = custody
+            .admitting_stage2_in(pool_generation, "pooled global frame owner registration")?;
         let vm_generation = stage2.generation();
         let logical_owner =
             CarrierVmCustody::allocate_logical_owner_in(&mut stage2).map_err(|error| {
@@ -2872,6 +2909,28 @@ impl StructuralBackingOwner {
                 "structural stage-2 lease ({lease_base:#x}, {lease_len:#x}) does not match physical extent ({physical_ipa:#x}, {physical_size:#x})"
             )));
         }
+        let Some(handle_generation) = handle.vm_generation() else {
+            stage2_lease.try_retire(custody).map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "pooled root structural backing missing VM generation and lease rollback failed: {rollback}"
+                ))
+            })?;
+            return Err(TrapError::Hypervisor(
+                "pooled root structural backing handle is missing its stage-2 VM generation"
+                    .to_owned(),
+            ));
+        };
+        if stage2_lease.pre_mapped_generation != Some(handle_generation) {
+            stage2_lease.try_retire(custody).map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "mismatched pooled root structural VM generation and lease rollback failed: {rollback}"
+                ))
+            })?;
+            return Err(TrapError::Hypervisor(format!(
+                "pooled root structural stage-2 lease generation {:?} does not match handle generation {handle_generation:?}",
+                stage2_lease.pre_mapped_generation
+            )));
+        }
         let host_addr = handle.as_mut_ptr() as usize;
         let identity = transfer_global_frame_stage2_lease_to_custody(
             custody,
@@ -3285,6 +3344,7 @@ pub(crate) struct GlobalFrameReplayExtent {
     pub(crate) length: u64,
     pub(crate) host_addr: usize,
     pub(crate) perms: u64,
+    pub(crate) vm_generation: carrick_core_abi::mm::custody::CarrierVmGeneration,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3405,17 +3465,20 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn acquire_replay_rebind_stage2<'a>(
     custody: &'a CarrierVmCustody,
+    expected_generation: CarrierVmGeneration,
     target_generation: &mut Option<CarrierVmGeneration>,
     context: &str,
 ) -> Result<super::stage2_backend::CarrierStage2<'a>, TrapError> {
-    match *target_generation {
-        Some(generation) => custody.admitting_stage2_in(generation, context),
-        None => {
-            let stage2 = custody.admitting_stage2(context)?;
-            *target_generation = Some(stage2.generation());
-            Ok(stage2)
-        }
+    if let Some(target) = *target_generation
+        && target != expected_generation
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "{context} replay batch mixed stage-2 generations {target:?} and {expected_generation:?}"
+        )));
     }
+    let stage2 = custody.admitting_stage2_in(expected_generation, context)?;
+    *target_generation = Some(expected_generation);
+    Ok(stage2)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3486,6 +3549,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             }
             let mut stage2 = acquire_replay_rebind_stage2(
                 custody,
+                replay.vm_generation,
                 &mut rebind_generation,
                 "global frame replay",
             )?;
@@ -3507,13 +3571,13 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "rebind global frame owner after VM replay: {error:?}"
                 ))
             })?;
-            drop(stage2);
             let successor = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
                 std::sync::Arc::clone(&owner.mapping),
                 std::sync::Arc::clone(custody),
                 new_identity,
             ));
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
+            drop(stage2);
             drop(owners);
             let _ = custody.remove_terminal_stage2_record(owner.record_identity);
             report.rebound += 1;
@@ -3625,8 +3689,18 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     key.0, key.1
                 )));
             }
-            let mut stage2 =
-                acquire_replay_rebind_stage2(custody, &mut rebind_generation, "carrier-MM replay")?;
+            let mut records = custody.carrier_stage2_records.lock();
+            if records.get(&key) != Some(&old_identity) {
+                return Err(TrapError::Hypervisor(
+                    "carrier-MM stage-2 owner changed during replay rebind".to_owned(),
+                ));
+            }
+            let mut stage2 = acquire_replay_rebind_stage2(
+                custody,
+                replay.vm_generation,
+                &mut rebind_generation,
+                "carrier-MM replay",
+            )?;
             let current_generation = stage2.generation();
             if snapshot.vm_generation == current_generation && snapshot.mapped {
                 continue;
@@ -3645,14 +3719,8 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "rebind carrier-MM stage-2 record after VM replay: {error:?}"
                 ))
             })?;
-            drop(stage2);
-            let mut records = custody.carrier_stage2_records.lock();
-            if records.get(&key) != Some(&old_identity) {
-                return Err(TrapError::Hypervisor(
-                    "carrier-MM stage-2 owner changed during replay rebind".to_owned(),
-                ));
-            }
             records.insert(key, new_identity);
+            drop(stage2);
             drop(records);
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
@@ -3727,8 +3795,17 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     key.0, key.1
                 )));
             }
+            let mut retained_by_record = custody.structural_backings.lock();
+            if !retained_by_record.contains_key(&identity.record_id)
+                || *retained.record_identity.lock() != identity
+            {
+                return Err(TrapError::Hypervisor(
+                    "structural backing owner changed during replay rebind".to_owned(),
+                ));
+            }
             let mut stage2 = acquire_replay_rebind_stage2(
                 custody,
+                replay.vm_generation,
                 &mut rebind_generation,
                 "structural backing replay",
             )?;
@@ -3748,11 +3825,10 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "rebind structural backing after VM replay: {error:?}"
                 ))
             })?;
-            drop(stage2);
             *retained.record_identity.lock() = new_identity;
-            let mut retained_by_record = custody.structural_backings.lock();
             retained_by_record.remove(&old_identity.record_id);
             retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
+            drop(stage2);
             drop(retained_by_record);
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
@@ -4653,6 +4729,9 @@ pub(crate) fn replayed_global_frame_owners_for_regions_in<'a>(
         let Some(identity) = mapped_region_stage2_owner_identity(mapping) else {
             continue;
         };
+        let Some(vm_generation) = mapping.stage2_generation else {
+            continue;
+        };
         let key = (mapping.physical_ipa, mapping.physical_size as u64);
         if owners
             .get(&key)
@@ -4663,6 +4742,7 @@ pub(crate) fn replayed_global_frame_owners_for_regions_in<'a>(
                 length: key.1,
                 host_addr: identity.host_addr,
                 perms: carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                vm_generation,
             });
         }
     }

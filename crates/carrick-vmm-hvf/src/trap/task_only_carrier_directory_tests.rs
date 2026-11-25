@@ -1526,6 +1526,7 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: retired.sharing,
         guest_writable: true,

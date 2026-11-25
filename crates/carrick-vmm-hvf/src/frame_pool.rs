@@ -49,6 +49,7 @@ pub(crate) fn frame_pool_size() -> usize {
 /// A pre-mapped, carrier-scoped pool of stage-2 backed 16 KiB memory frames.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PreMappedFramePool {
+    vm_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     base_ipa: u64,
     pool_size: usize,
     host_mapping: crate::host_mapping::OwnedHostMapping,
@@ -88,6 +89,7 @@ impl PreMappedFramePool {
     pub(crate) fn try_new(
         stage2: &mut crate::trap::CarrierStage2<'_>,
     ) -> Result<Self, crate::trap::TrapError> {
+        let vm_generation = Some(stage2.generation());
         let pool_size = frame_pool_size();
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut lease = crate::trap::GlobalFrameStage2Lease::reserve(pool_size as u64, TWO_MIB)?;
@@ -127,6 +129,7 @@ impl PreMappedFramePool {
         }
 
         Ok(Self {
+            vm_generation,
             base_ipa,
             pool_size,
             host_mapping,
@@ -140,6 +143,22 @@ impl PreMappedFramePool {
 
     #[cfg(test)]
     pub(crate) fn new_test_fixture(num_compounds: usize) -> Self {
+        Self::new_test_fixture_with_generation(num_compounds, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test_fixture_in(
+        custody: &crate::trap::CarrierVmCustody,
+        num_compounds: usize,
+    ) -> Self {
+        Self::new_test_fixture_with_generation(num_compounds, custody.live_generation())
+    }
+
+    #[cfg(test)]
+    fn new_test_fixture_with_generation(
+        num_compounds: usize,
+        vm_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
+    ) -> Self {
         let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
         let pool_size = num_compounds * compound_size;
         let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -153,6 +172,7 @@ impl PreMappedFramePool {
             free_compounds.push(i);
         }
         Self {
+            vm_generation,
             base_ipa,
             pool_size,
             host_mapping,
@@ -164,6 +184,12 @@ impl PreMappedFramePool {
             )),
             allocated_count: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn vm_generation(
+        &self,
+    ) -> Option<carrick_core_abi::mm::custody::CarrierVmGeneration> {
+        self.vm_generation
     }
 
     /// The ledger this pool's releases wait for.
@@ -311,6 +337,12 @@ impl PooledFrameHandle {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
+
+    pub(crate) fn vm_generation(
+        &self,
+    ) -> Option<carrick_core_abi::mm::custody::CarrierVmGeneration> {
+        self.pool.vm_generation()
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -366,6 +398,7 @@ struct PooledRootSlotEntry {
 /// A pre-mapped, carrier-scoped pool of stage-2 backed 2 MiB root-slot memory regions.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PreMappedRootSlotPool {
+    vm_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     base_ipa: u64,
     pool_size: usize,
     _host_mapping: crate::host_mapping::OwnedHostMapping,
@@ -398,6 +431,7 @@ impl PreMappedRootSlotPool {
     pub(crate) fn try_new(
         stage2: &mut crate::trap::CarrierStage2<'_>,
     ) -> Result<Self, crate::trap::TrapError> {
+        let vm_generation = Some(stage2.generation());
         let pool_size = root_slot_pool_size();
         let base_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
         let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base_ipa, pool_size as u64);
@@ -445,6 +479,7 @@ impl PreMappedRootSlotPool {
         }
 
         Ok(Self {
+            vm_generation,
             base_ipa,
             pool_size,
             _host_mapping: host_mapping,
@@ -456,6 +491,22 @@ impl PreMappedRootSlotPool {
 
     #[cfg(test)]
     pub(crate) fn new_test_fixture(num_slots: usize) -> Self {
+        Self::new_test_fixture_with_generation(num_slots, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test_fixture_in(
+        custody: &crate::trap::CarrierVmCustody,
+        num_slots: usize,
+    ) -> Self {
+        Self::new_test_fixture_with_generation(num_slots, custody.live_generation())
+    }
+
+    #[cfg(test)]
+    fn new_test_fixture_with_generation(
+        num_slots: usize,
+        vm_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
+    ) -> Self {
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let pool_size = num_slots * TWO_MIB;
         let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -478,6 +529,7 @@ impl PreMappedRootSlotPool {
             });
         }
         Self {
+            vm_generation,
             base_ipa,
             pool_size,
             _host_mapping: host_mapping,
@@ -485,6 +537,12 @@ impl PreMappedRootSlotPool {
             slots: Mutex::new(slots),
             allocated_count: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn vm_generation(
+        &self,
+    ) -> Option<carrick_core_abi::mm::custody::CarrierVmGeneration> {
+        self.vm_generation
     }
 
     pub(crate) fn allocate_slot_at(
@@ -626,6 +684,12 @@ impl PooledRootSlotHandle {
     #[allow(dead_code)]
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.host_ptr
+    }
+
+    pub(crate) fn vm_generation(
+        &self,
+    ) -> Option<carrick_core_abi::mm::custody::CarrierVmGeneration> {
+        self.pool.vm_generation()
     }
 
     pub(crate) fn len(&self) -> usize {

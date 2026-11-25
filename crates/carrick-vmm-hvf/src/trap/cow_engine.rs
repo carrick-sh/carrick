@@ -2666,6 +2666,7 @@ impl HvfTaskState {
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: true,
             sharing,
             guest_writable: true,
@@ -2923,6 +2924,7 @@ impl HvfTaskState {
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: true,
             sharing,
             guest_writable: true,
@@ -4492,6 +4494,7 @@ impl HvfTaskState {
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: source_guest_writable,
@@ -5352,9 +5355,14 @@ impl HvfVmState {
                     "hv_vm_map(ipa=0x{ipa:x}, size={len}) failed: 0x{r:x}"
                 ))
             })?;
-        stage2
-            .untracked_mappings
-            .insert((mapping.ipa(), mapping.size()), mapping);
+        stage2.untracked_mappings.insert(
+            (mapping.ipa(), mapping.size()),
+            super::carrier_custody::UntrackedStage2Mapping {
+                mapping,
+                host_addr: host as usize,
+                perms: perms_raw,
+            },
+        );
         Ok(())
     }
 
@@ -5614,17 +5622,28 @@ impl HvfVmState {
         };
         let ipa = global_lease.as_ref().map_or(ipa, |lease| lease.base);
         let custody = self.carrier_vm_custody();
-        let mut stage2 = custody.admitting_stage2("HVPatch alias stage-2 map")?;
-        let map_result = unsafe {
-            stage2_map(
-                &mut stage2,
-                host.cast(),
-                ipa,
-                physical_size,
-                carrick_aarch64::stage2::stage2_perms_bits(perms),
-            )
+        let (map_result, untracked_generation) = {
+            let mut stage2 = custody.admitting_stage2("HVPatch alias stage-2 map")?;
+            let perms_raw = carrick_aarch64::stage2::stage2_perms_bits(perms);
+            let map_result =
+                unsafe { stage2_map(&mut stage2, host.cast(), ipa, physical_size, perms_raw) };
+            match map_result {
+                Ok(stage2_mapping) if !self.persistent_vm_lifecycle => {
+                    let generation = stage2_mapping.generation();
+                    stage2.untracked_mappings.insert(
+                        (stage2_mapping.ipa(), stage2_mapping.size()),
+                        super::carrier_custody::UntrackedStage2Mapping {
+                            mapping: stage2_mapping,
+                            host_addr: host as usize,
+                            perms: perms_raw,
+                        },
+                    );
+                    (Ok(None), Some(generation))
+                }
+                Ok(stage2_mapping) => (Ok(Some(stage2_mapping)), None),
+                Err(status) => (Err(status), None),
+            }
         };
-        drop(stage2);
         let r = match &map_result {
             Ok(_) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
             Err(status) => *status,
@@ -5644,10 +5663,10 @@ impl HvfVmState {
                 )));
             }
         };
-        if let Some(lease) = global_lease.as_mut() {
+        if let (Some(lease), Some(stage2_mapping)) = (global_lease.as_mut(), stage2_mapping) {
             lease.mark_mapped(stage2_mapping);
         }
-        let (host_mapping, owner_generation) = if self.persistent_vm_lifecycle {
+        let (host_mapping, owner_generation, stage2_generation) = if self.persistent_vm_lifecycle {
             let owner_generation = register_global_frame_host_owner_in(
                 &custody,
                 global_lease.take().ok_or_else(|| {
@@ -5656,9 +5675,9 @@ impl HvfVmState {
                 host_mapping,
                 carrick_aarch64::stage2::stage2_perms_bits(perms),
             )?;
-            (None, owner_generation)
+            (None, owner_generation, None)
         } else {
-            (Some(host_mapping), 0)
+            (Some(host_mapping), 0, untracked_generation)
         };
         // Register EVERY alias (MAP_SHARED file AND private anon — Go's high-VA
         // heap arenas) process-globally in `alias_registry`. Two consumers: the
@@ -5699,6 +5718,7 @@ impl HvfVmState {
             host_mapping: host_mapping.map(RegionHostOwner::Exclusive),
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation,
             is_dynamic_alias: true,
             sharing,
             guest_writable: alias_guest_writable,

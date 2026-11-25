@@ -321,6 +321,7 @@ pub(crate) struct GlobalExecPlan {
 struct PreparedExecBacking {
     plan: GuestMappingPlan,
     regions: Vec<PreparedExecRegion>,
+    expected_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     private_file_artifacts_elapsed_ns: u64,
     map_backings_started: std::time::Instant,
     // Keep the allocator/pool's carrier alive through every retained region.
@@ -632,6 +633,7 @@ impl PreparedExecBacking {
             started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         let map_backings_started = std::time::Instant::now();
         let mut regions = Vec::new();
+        let mut expected_generation = None;
         for mapping in plan.mappings.iter().filter(|mapping| {
             !is_sparse_hvpatch_mmap_mapping(mapping)
                 && !is_persistent_executor_carrier_guest_mapping(mapping)
@@ -646,12 +648,30 @@ impl PreparedExecBacking {
             let pooled_root = mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE
                 && lease.length() > mapping.mapped_size;
             let root = if pooled_root {
-                Some(custody.root_slot_pool()
+                let handle = custody
+                    .root_slot_pool()
                     .and_then(|pool| pool.allocate_slot_at(mapping.ipa_start))
-                    .ok_or_else(|| TrapError::Hypervisor(format!(
-                        "HVPatch exec root slot IPA 0x{:x} is still held by the root-slot pool",
-                        mapping.ipa_start
-                    )))?)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch exec root slot IPA 0x{:x} is still held by the root-slot pool",
+                            mapping.ipa_start
+                        ))
+                    })?;
+                let Some(handle_generation) = handle.vm_generation() else {
+                    return Err(TrapError::Hypervisor(
+                        "HVPatch exec pooled root slot handle is missing its stage-2 VM generation"
+                            .to_owned(),
+                    ));
+                };
+                if let Some(prev) = expected_generation
+                    && prev != handle_generation
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch exec pooled root handles mixed VM generations {prev:?} and {handle_generation:?}"
+                    )));
+                }
+                expected_generation = Some(handle_generation);
+                Some(handle)
             } else {
                 None
             };
@@ -674,6 +694,7 @@ impl PreparedExecBacking {
         Ok(Self {
             plan,
             regions,
+            expected_generation,
             private_file_artifacts_elapsed_ns,
             map_backings_started,
             custody,
@@ -715,12 +736,17 @@ impl PreparedExecBacking {
         let Self {
             plan,
             regions,
+            expected_generation,
             private_file_artifacts_elapsed_ns: _,
             map_backings_started: _,
             custody,
         } = self;
         let mut installed_regions = Vec::new();
-        let mut stage2 = match custody.admitting_stage2("exec successor installation") {
+        let mut stage2 = match if let Some(expected_generation) = expected_generation {
+            custody.admitting_stage2_in(expected_generation, "exec successor installation")
+        } else {
+            custody.admitting_stage2("exec successor installation")
+        } {
             Ok(stage2) => stage2,
             Err(error) => {
                 return Err(fail_exec_install(
@@ -740,8 +766,22 @@ impl PreparedExecBacking {
         } in regions
         {
             let pre_mapped = root.is_some();
-            if pre_mapped {
-                lease.mark_pre_mapped();
+            if let Some(ref handle) = root {
+                if handle.vm_generation() != Some(vm_generation) {
+                    lease.forget_backend_mapping();
+                    drop(stage2);
+                    return Err(fail_exec_install(
+                        plan,
+                        installed_regions,
+                        std::sync::Arc::clone(&custody),
+                        TrapError::Hypervisor(format!(
+                            "HVPatch exec pooled root handle belongs to stage-2 generation {:?}, expected {vm_generation:?}",
+                            handle.vm_generation()
+                        )),
+                        test_unmap,
+                    ));
+                }
+                lease.mark_pre_mapped_in(handle.vm_generation());
             }
             let install = ExecStage2Install {
                 ipa: lease.base,

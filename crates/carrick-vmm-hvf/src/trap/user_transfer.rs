@@ -1643,8 +1643,10 @@ pub(super) mod tests {
     #[test]
     fn dirty_compound_reuse_zeroes_fresh_partial_page_and_preserves_adjacent_owner() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let pool = Arc::new(crate::frame_pool::PreMappedFramePool::new_test_fixture(2));
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let pool = Arc::new(crate::frame_pool::PreMappedFramePool::new_test_fixture_in(
+            &custody, 2,
+        ));
         custody.install_frame_pool(pool.clone());
         let adjacent = pool.allocate_compound().unwrap();
         let adjacent_ipa = adjacent.ipa();

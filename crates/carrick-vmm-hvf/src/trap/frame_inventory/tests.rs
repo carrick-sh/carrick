@@ -2604,6 +2604,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
         host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: Some(lease),
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -3355,6 +3356,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
             host_mapping: None,
             structural_owner: None,
             stage2_lease: Some(GlobalFrameStage2Lease::fixed(key.0, key.1)),
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -3943,6 +3945,7 @@ fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -4165,6 +4168,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -4291,6 +4295,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -4360,6 +4365,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -4429,6 +4435,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -5111,6 +5118,7 @@ fn unowned_retirement_rejects_an_unmapped_local_lease() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: Some(lease),
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -7779,9 +7787,9 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        1,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 1),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -7831,9 +7839,9 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        1,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 1),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -7864,9 +7872,9 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        2,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 2),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -7928,9 +7936,9 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        2,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 2),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -7980,9 +7988,9 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        2,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 2),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -8032,9 +8040,9 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        2,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 2),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
@@ -8096,9 +8104,9 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
-    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        2,
-    ));
+    let pool = std::sync::Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(custody, 2),
+    );
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));

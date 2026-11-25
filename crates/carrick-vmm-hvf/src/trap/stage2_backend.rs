@@ -269,6 +269,44 @@ pub(crate) fn test_stage2_map(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_stage2_map_untracked(
+    custody: &CarrierVmCustody,
+    host: *mut std::ffi::c_void,
+    ipa: u64,
+    size: usize,
+    permissions: u64,
+) {
+    let already_enabled = STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled);
+    let _stub = (!already_enabled).then(ScopedStage2MapTestStub::enable);
+    let mut stage2 = custody
+        .admitting_stage2("test untracked stage-2 map")
+        .expect("test custody must admit stage-2 mappings");
+    // SAFETY: test fixture passes live test host memory for the test extent.
+    let mapping = unsafe { stage2_map(&mut stage2, host, ipa, size, permissions) }
+        .expect("test untracked stage-2 map must succeed");
+    stage2.untracked_mappings.insert(
+        (mapping.ipa(), mapping.size()),
+        super::carrier_custody::UntrackedStage2Mapping {
+            mapping,
+            host_addr: host as usize,
+            perms: permissions,
+        },
+    );
+}
+
+#[cfg(test)]
+fn note_stage2_destroyed() {
+    clear_replay_mappings();
+    STAGE2_AUDIT_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if state.enabled {
+            state.mapped_extents.clear();
+        }
+    });
+}
+
+#[cfg(test)]
 impl Drop for ScopedStage2MapTestStub {
     fn drop(&mut self) {
         STAGE2_AUDIT_STATE.with(|s| {
@@ -453,6 +491,14 @@ pub(crate) unsafe fn stage2_map_replay(
         if registry.contains_replay(&key) {
             return Stage2Status::SUCCESS;
         }
+        let still_registered = registry
+            .oldest_containing_ipa(backing.ipa, |entry| {
+                *entry == backing && super::alias_backing_is_live(entry.host_addr)
+            })
+            .is_some();
+        if !still_registered {
+            return Stage2Status::from_raw(HV_BAD_ARGUMENT);
+        }
         // SAFETY: forwarded from caller; `stage2` guard proves live VM.
         match unsafe {
             stage2_map(
@@ -464,9 +510,14 @@ pub(crate) unsafe fn stage2_map_replay(
             )
         } {
             Ok(mapping) => {
-                stage2
-                    .untracked_mappings
-                    .insert((mapping.ipa(), mapping.size()), mapping);
+                stage2.untracked_mappings.insert(
+                    (mapping.ipa(), mapping.size()),
+                    super::carrier_custody::UntrackedStage2Mapping {
+                        mapping,
+                        host_addr: backing.physical_host_addr,
+                        perms: backing.perms,
+                    },
+                );
                 let bucket = registry
                     .by_scope
                     .entry(backing.ownership_scope)
@@ -480,24 +531,51 @@ pub(crate) unsafe fn stage2_map_replay(
 }
 
 /// Unmap an untracked mapping stored by `map_region_raw_in` / `map_stage2` /
-/// `stage2_map_replay` through the owning custody's generation guard.
+/// `stage2_map_replay` through the owning generation's custody guard.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn stage2_unmap_untracked(
+pub(crate) fn stage2_unmap_untracked_in(
     custody: &CarrierVmCustody,
+    expected_generation: carrick_core_abi::mm::custody::CarrierVmGeneration,
+    expected_host_addr: Option<usize>,
     ipa: u64,
     size: usize,
 ) -> Result<(), TrapError> {
-    let Some(mut stage2) = custody.stage2.stage2() else {
+    let Ok(mut stage2) = custody.stage2.stage2_in(expected_generation) else {
         return Ok(());
     };
-    let Some(mapping) = stage2.untracked_mappings.remove(&(ipa, size)) else {
+    let Some(entry) = stage2.untracked_mappings.get(&(ipa, size)) else {
         return Err(TrapError::Hypervisor(format!(
-            "untracked stage-2 mapping IPA {ipa:#x} size {size} not owned by live custody"
+            "untracked stage-2 mapping IPA {ipa:#x} size {size} not owned by generation {expected_generation:?}"
+        )));
+    };
+    if entry.mapping.generation() != expected_generation {
+        return Err(TrapError::Hypervisor(format!(
+            "untracked stage-2 mapping IPA {ipa:#x} size {size} generation drift"
+        )));
+    }
+    if let Some(expected_host) = expected_host_addr
+        && entry.host_addr != expected_host
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "untracked stage-2 mapping IPA {ipa:#x} size {size} host drift: expected={expected_host:#x} actual={:#x}",
+            entry.host_addr
+        )));
+    }
+    let Some(entry) = stage2.untracked_mappings.remove(&(ipa, size)) else {
+        return Err(TrapError::Hypervisor(format!(
+            "untracked stage-2 mapping IPA {ipa:#x} size {size} disappeared"
         )));
     };
     // SAFETY: caller retires an untracked extent no longer used by guest CPUs.
-    if let Err((mapping, status)) = unsafe { stage2.unmap(mapping) } {
-        stage2.untracked_mappings.insert((ipa, size), mapping);
+    if let Err((mapping, status)) = unsafe { stage2.unmap(entry.mapping) } {
+        stage2.untracked_mappings.insert(
+            (ipa, size),
+            super::carrier_custody::UntrackedStage2Mapping {
+                mapping,
+                host_addr: entry.host_addr,
+                perms: entry.perms,
+            },
+        );
         return Err(TrapError::Hypervisor(format!(
             "hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: {status:#x}"
         )));
@@ -598,13 +676,16 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfCarrierStage2 {
         #[cfg(test)]
         if let Some(scripted) = SCRIPTED_STAGE2_DESTROY.with(|cell| cell.take()) {
             if scripted.is_success() {
-                clear_replay_mappings();
+                note_stage2_destroyed();
             }
             return scripted;
         }
         // SAFETY: forwarded from the trait's contract.
         let result = unsafe { HvfStage2.destroy() };
         if result.is_success() {
+            #[cfg(test)]
+            note_stage2_destroyed();
+            #[cfg(not(test))]
             clear_replay_mappings();
         }
         result
@@ -754,6 +835,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
         host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: if mapping.shared {
             GuestMappingSharing::GlobalShared
@@ -859,6 +941,7 @@ pub(crate) fn prepare_pooled_exec_root_region_in(
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: mapping.perms.write,
@@ -948,6 +1031,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
     // Map at the IPA (identity for all but the Rosetta alias); the guest's
     // stage-1 page tables translate the VIRTUAL `guest_start` to this IPA.
     let mut stage2 = custody.admitting_stage2("raw guest mapping")?;
+    let vm_generation = stage2.generation();
     if emit_exec_backing_census {
         crate::probes::hvpatch_exec_stage2(carrick_observability::probes::HvpatchExecStage2::new(
             carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
@@ -971,7 +1055,11 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             if !retain_structural_owner {
                 stage2.untracked_mappings.insert(
                     (stage2_mapping.ipa(), stage2_mapping.size()),
-                    stage2_mapping,
+                    super::carrier_custody::UntrackedStage2Mapping {
+                        mapping: stage2_mapping,
+                        host_addr: host as usize,
+                        perms: perms_raw,
+                    },
                 );
                 None
             } else {
@@ -1025,6 +1113,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: (!retain_structural_owner).then_some(vm_generation),
         is_dynamic_alias: false,
         // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): HVPatch fork
         // shares the global frame read-only until the writer COWs it.
@@ -1757,8 +1846,18 @@ pub(crate) fn install_ipc_window_using(
             Err(error) => {
                 drop(stage2);
                 for identity in records {
-                    let _ = custody.retire_stage2_record(identity);
-                    let _ = custody.remove_terminal_stage2_record(identity);
+                    match custody.retire_stage2_record(identity) {
+                        super::carrier_custody::CarrierStage2RetireOutcome::RetiredUnmapped
+                        | super::carrier_custody::CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                            let _ = custody.remove_terminal_stage2_record(identity);
+                        }
+                        _ => {
+                            custody.retain_unretired_ipc_backing(
+                                generation,
+                                std::sync::Arc::clone(&backing),
+                            );
+                        }
+                    }
                 }
                 return Err(TrapError::Hypervisor(format!(
                     "IPC window owner identity: {error:?}"
@@ -1783,8 +1882,18 @@ pub(crate) fn install_ipc_window_using(
             Err(error) => {
                 drop(stage2);
                 for identity in records {
-                    let _ = custody.retire_stage2_record(identity);
-                    let _ = custody.remove_terminal_stage2_record(identity);
+                    match custody.retire_stage2_record(identity) {
+                        super::carrier_custody::CarrierStage2RetireOutcome::RetiredUnmapped
+                        | super::carrier_custody::CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                            let _ = custody.remove_terminal_stage2_record(identity);
+                        }
+                        _ => {
+                            custody.retain_unretired_ipc_backing(
+                                generation,
+                                std::sync::Arc::clone(&backing),
+                            );
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -2074,5 +2183,75 @@ mod ipc_window_tests {
             assert_eq!(snap.vm_generation, g1);
             assert!(snap.terminalized_by_vm_destroy && !snap.mapped);
         }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn install_ipc_window_rollback_retains_backing_until_commit_destroy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let g1 = custody.live_generation().expect("G1 live");
+        let stub = ScopedStage2MapTestStub::enable();
+
+        struct DropTrackedBacking {
+            inner: std::sync::Arc<dyn IpcWindowBacking>,
+            dropped: std::sync::Arc<AtomicBool>,
+        }
+        impl Drop for DropTrackedBacking {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        impl IpcWindowBacking for DropTrackedBacking {
+            fn directory_ptr(&self) -> *mut u8 {
+                self.inner.directory_ptr()
+            }
+            fn directory_len(&self) -> usize {
+                self.inner.directory_len()
+            }
+            fn pool_ptr(&self) -> *mut u8 {
+                self.inner.pool_ptr()
+            }
+            fn pool_len(&self) -> usize {
+                self.inner.pool_len()
+            }
+        }
+
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let tracked: std::sync::Arc<dyn IpcWindowBacking> =
+            std::sync::Arc::new(DropTrackedBacking {
+                inner: backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+                dropped: std::sync::Arc::clone(&dropped),
+            });
+        let mut call_index = 0_usize;
+        let err = install_ipc_window_using(
+            &custody,
+            std::sync::Arc::clone(&tracked),
+            |stage2, host, ipa, len, perms| {
+                call_index += 1;
+                if call_index == 2 {
+                    stub.set_fail_next_unmap(true);
+                    return Err(Stage2Status::from_raw(u32::MAX));
+                }
+                unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
+            },
+        )
+        .expect_err("second IPC extent map must fail and roll back");
+        drop(err);
+        drop(tracked);
+        stub.set_fail_next_unmap(false);
+
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "unretired IPC extent 0 must keep backing alive until VM destroy"
+        );
+        custody.begin_destroy(g1).expect("begin destroy G1");
+        custody.destroy_stage2_for_test(g1);
+        custody.commit_destroy(g1).expect("commit destroy G1");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "commit_destroy(G1) must drop retained IPC backing outside custody locks"
+        );
     }
 }

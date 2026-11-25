@@ -1499,11 +1499,22 @@ impl HvfVmState {
             return Ok(());
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        stage2_unmap_untracked(custody, ipa, size).map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
-            ))
-        })?;
+        let Some(expected_generation) = mappings.iter().find_map(|mapping| {
+            (mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
+                .then_some(mapping.stage2_generation)
+                .flatten()
+        }) else {
+            return Err(TrapError::Hypervisor(format!(
+                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} lacks owning VM generation"
+            )));
+        };
+        stage2_unmap_untracked_in(custody, expected_generation, None, ipa, size).map_err(
+            |error| {
+                TrapError::Hypervisor(format!(
+                    "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
+                ))
+            },
+        )?;
         release_retired_stage2_ipa(ipa, length)?;
         Ok(())
     }
@@ -1535,11 +1546,21 @@ impl HvfVmState {
             )));
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        stage2_unmap_untracked(custody, ipa, size).map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
-            ))
-        })?;
+        let Some(expected_generation) = mappings.iter().find_map(|mapping| {
+            (mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
+                .then_some(mapping.stage2_generation)
+                .flatten()
+        }) else {
+            return Err(TrapError::Hypervisor(format!(
+                "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} lacks owning VM generation"
+            )));
+        };
+        stage2_unmap_untracked_in(custody, expected_generation, Some(host_addr), ipa, size)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
+                ))
+            })?;
         Ok(())
     }
 

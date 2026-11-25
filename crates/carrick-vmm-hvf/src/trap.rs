@@ -2189,10 +2189,21 @@ impl HvfTaskState {
                 "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
             ));
         }
-        stage2_unmap_untracked(self.custody(), mapping.physical_ipa, mapping.physical_size)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("unmap HVPatch initial sparse mmap arena: {error}"))
-            })?;
+        let Some(generation) = mapping.stage2_generation else {
+            return Err(TrapError::Hypervisor(
+                "HVPatch initial mmap arena backing lacks owning stage-2 generation".to_owned(),
+            ));
+        };
+        stage2_unmap_untracked_in(
+            self.custody(),
+            generation,
+            Some(mapping.host_addr as usize),
+            mapping.physical_ipa,
+            mapping.physical_size,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("unmap HVPatch initial sparse mmap arena: {error}"))
+        })?;
         self.mappings.remove_range(
             GuestVa::new(crate::memory::LINUX_MMAP_BASE),
             crate::memory::mmap_arena_size() as usize,
@@ -2232,6 +2243,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
@@ -2617,6 +2629,7 @@ pub(crate) struct HvfMappedRegion {
     /// Inherited mappings and dynamic aliases owned by the process-global
     /// host-owner registry carry `None`.
     pub(crate) stage2_lease: Option<GlobalFrameStage2Lease>,
+    pub(crate) stage2_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     /// True only for a post-boot alias published through `add_alias`. Retired
     /// aliases deliberately remain in `mappings` to keep their host/stage-2
     /// owners alive, but the live alias registry decides whether they enter a
@@ -3824,6 +3837,7 @@ impl HvpatchTaskMappingState {
             host_mapping: None,
             structural_owner: self.structural_owner.clone(),
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: self.is_dynamic_alias,
             sharing: self.sharing,
             guest_writable: self.guest_writable,
@@ -7024,9 +7038,9 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+            if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_pre_mapped();
+                    lease.mark_pre_mapped_in(handle.vm_generation());
                 }
             } else if process_mapping_needs_stage2_install(mapping.inherited_frame)
                 && !matches!(
@@ -7508,9 +7522,9 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+            if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_pre_mapped();
+                    lease.mark_pre_mapped_in(handle.vm_generation());
                 }
             } else if process_mapping_needs_stage2_install(mapping.inherited_frame)
                 && !matches!(
@@ -7751,6 +7765,7 @@ impl HvfVmState {
                 host_mapping,
                 structural_owner,
                 stage2_lease,
+                stage2_generation: None,
                 is_dynamic_alias: mapping.is_dynamic_alias,
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,

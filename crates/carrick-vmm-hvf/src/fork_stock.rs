@@ -241,6 +241,7 @@ impl ForkStockHostCustody {
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_hal::TrapError;
         let fail = |message: &str| TrapError::Hypervisor(message.into());
+        let _install_guard = custody.fork_stock_install.lock();
         {
             let stock = custody.fork_stock.lock();
             if let Some(existing) = stock.backing.as_ref() {
@@ -257,7 +258,9 @@ impl ForkStockHostCustody {
         custody
             .stage2
             .at_client_point(crate::trap::FORK_STOCK_INSTALL_BEFORE_ARENAS);
-        let pool = custody.root_slot_pool();
+        let pool = custody
+            .root_slot_pool()
+            .filter(|pool| pool.vm_generation() == Some(generation));
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
         let roots = resources.tables.arenas();
@@ -274,7 +277,7 @@ impl ForkStockHostCustody {
                 // The shared owner can populate every page, so pool recycling
                 // must clear the whole arena rather than a host-observed prefix.
                 arena.record_populated_prefix(len);
-                lease.mark_pre_mapped();
+                lease.mark_pre_mapped_in(arena.vm_generation());
                 crate::trap::StructuralBackingOwner::new_pooled_root_in(
                     custody, arena, lease, perms, epoch, base, len,
                 )?
@@ -287,7 +290,7 @@ impl ForkStockHostCustody {
                 )
                 .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
                 let mut stage2 = custody
-                    .admitting_stage2("native fork arena map")
+                    .admitting_stage2_in(generation, "native fork arena map")
                     .map_err(|error| fail(&format!("native fork arena stage2: {error}")))?;
                 // SAFETY: exclusively reserved physical slot and retained aligned mapping.
                 let stage2_mapping = unsafe {
@@ -1418,7 +1421,11 @@ mod tests {
         let install_done = done_tx.clone();
         let install_thread = std::thread::spawn(move || {
             let _stub = crate::trap::ScopedStage2MapTestStub::enable();
-            let _ = ForkStockHostCustody::install(&install_custody, resources);
+            let result = ForkStockHostCustody::install(&install_custody, resources);
+            assert!(
+                result.is_err(),
+                "install into destroyed G1 must fail closed: {result:?}"
+            );
             let _ = install_done.send("install");
         });
 

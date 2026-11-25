@@ -17,7 +17,7 @@ impl PooledReadFixture {
     fn new(fill: u8) -> Self {
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         // One compound: whatever mm allocates next receives exactly this frame.
-        let pool = Arc::new(PreMappedFramePool::new_test_fixture(1));
+        let pool = Arc::new(PreMappedFramePool::new_test_fixture_in(&custody, 1));
         let handle = pool.allocate_compound().unwrap();
         let key = (handle.ipa(), handle.len() as u64);
         let generation = register_pooled_global_frame_host_owner_in(

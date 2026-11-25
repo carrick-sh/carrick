@@ -168,6 +168,7 @@ pub(crate) fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,

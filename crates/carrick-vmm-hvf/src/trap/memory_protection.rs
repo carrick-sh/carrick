@@ -159,6 +159,7 @@ pub(crate) fn split_local_mapping_rows_for_unmap(
                 host_mapping: None,
                 structural_owner: row.structural_owner.clone(),
                 stage2_lease: None,
+                stage2_generation: row.stage2_generation,
                 is_dynamic_alias: true,
                 sharing: row.sharing,
                 guest_writable: row.guest_writable,

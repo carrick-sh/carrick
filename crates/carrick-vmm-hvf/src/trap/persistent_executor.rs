@@ -188,6 +188,7 @@ impl ThreadMappingDesc {
             host_mapping: None,
             structural_owner: self.structural_owner,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: self.is_dynamic_alias,
             sharing: self.sharing,
             guest_writable: self.guest_writable,
@@ -595,11 +596,19 @@ impl Drop for PersistentCarrierMappings {
                     });
                 }
             } else if !vm_destroyed {
-                if let Err(error) = stage2_unmap_untracked(
-                    &self.custody,
-                    mapping.physical_ipa,
-                    mapping.physical_size,
-                ) {
+                let unmap_result = match mapping.stage2_generation {
+                    Some(generation) => stage2_unmap_untracked_in(
+                        &self.custody,
+                        generation,
+                        Some(mapping.host_addr as usize),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                    ),
+                    None => Err(TrapError::Hypervisor(
+                        "persistent carrier mapping lacks owning stage-2 generation".to_owned(),
+                    )),
+                };
+                if let Err(error) = unmap_result {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
                         "retire persistent carrier stage-2 IPA 0x{:x} size {} failed: {error}",

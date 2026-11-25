@@ -3880,3 +3880,71 @@ fn the_reserve_search_probes_in_proportion_to_the_demand() {
         );
     }
 }
+
+#[test]
+fn reserve_custody_collecting_returns_rejected_loan_via_collector() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalGuard(Arc<AtomicBool>);
+    impl Drop for PhysicalGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let mut stock: ForkStock<UntaggedRoots, PhysicalGuard> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install_control_capacity(vec![ForkControlCapacity::exclusive(0x1_0000_0000).unwrap()])
+        .unwrap();
+    stock
+        .install(
+            (0..2).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            TableReserve::EMPTY,
+            lifecycles(1),
+        )
+        .unwrap();
+    let mut ledger = RecordingLedger::default();
+    let root = execution(41, 0, PARENT_MM, 0x1000);
+    let mut exchange = ForkStockExchange::new(request(root, 302, 1, 1)).unwrap();
+    let granted = stock
+        .loan(&mut ledger, root, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        // SAFETY: test receipt for the exact admitted loan.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 4096,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .expect("reserve settlement");
+    assert!(reserve.accept(granted));
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut rejected = None;
+    let err = stock
+        .reserve_custody_collecting(
+            root,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(PhysicalGuard(Arc::clone(&dropped))),
+            |physical| rejected = Some(physical),
+        )
+        .expect_err("already-replied settlement must fail accept without dropping custody");
+    assert_eq!(err, ForkStockRefusal::Invalid);
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert!(rejected.is_some());
+    drop(rejected);
+    assert!(dropped.load(Ordering::SeqCst));
+}

@@ -3078,6 +3078,30 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             u64,
         ) -> Result<C, ForkStockRefusal>,
     ) -> Result<&AdmittedForkCustody<C>, ForkStockRefusal> {
+        self.reserve_custody_collecting(
+            execution,
+            settlement,
+            is_resolvable,
+            is_clean,
+            retain_physical,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_custody_collecting(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+        is_resolvable: impl Fn(&[RootGpa]) -> bool,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+        retain_physical: impl FnOnce(
+            carrick_el1_abi::PortalForkRequest,
+            carrick_guest_arch::KernelVa,
+            u64,
+        ) -> Result<C, ForkStockRefusal>,
+        mut collect_unused: impl FnMut(C),
+    ) -> Result<&AdmittedForkCustody<C>, ForkStockRefusal> {
         let loan = match self.settlement_loan(execution) {
             Ok(loan) => loan,
             Err(ForkStockServiceError::StaleExecution) => {
@@ -3119,12 +3143,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             Err(refusal) => return Err(self.refuse_settlement(settlement, refusal)),
         };
         if !settlement.accept(loan) {
-            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
-        }
-        if self.pending[index].is_none() {
+            collect_unused(physical);
             return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
         }
         let Some(pending) = self.pending[index].as_mut() else {
+            collect_unused(physical);
             return Err(ForkStockRefusal::Invalid);
         };
         Ok(pending.admitted.insert(AdmittedForkCustody {

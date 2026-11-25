@@ -5625,6 +5625,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         host_mapping: Some(page_tables_host.into()),
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -6591,6 +6592,13 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
     )
     .expect("destroy G1 structural fixture");
     let g2 = transport.custody.begin_create().expect("begin G2");
+    crate::trap::stage2_backend::test_stage2_map_untracked(
+        &transport.custody,
+        host_addr as *mut std::ffi::c_void,
+        ipa,
+        len as usize,
+        perms,
+    );
     let empty_error = reconcile_global_frame_owners_after_replay_in(&transport.custody, &[], false)
         .expect_err("an old-generation structural owner requires exact replay");
     assert!(empty_error.to_string().contains(
@@ -6604,6 +6612,7 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
             length: len,
             host_addr,
             perms: perms ^ 1,
+            vm_generation: g2,
         }],
         false,
     )
@@ -6627,6 +6636,7 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
             length: len,
             host_addr,
             perms,
+            vm_generation: g2,
         }],
         false,
     )
@@ -7731,6 +7741,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: Some(parent_pt_host.into()),
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             shared_key_base: None,
@@ -7751,6 +7762,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: Some(parent_el1_host.into()),
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             shared_key_base: None,
@@ -7772,6 +7784,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: Some(parent_mailbox_host.into()),
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             shared_key_base: None,
@@ -7792,6 +7805,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::GlobalShared,
             shared_key_base: None,
@@ -7812,6 +7826,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::GlobalShared,
             shared_key_base: None,
@@ -7832,6 +7847,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
             host_mapping: None,
             structural_owner: None,
             stage2_lease: None,
+            stage2_generation: None,
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             shared_key_base: None,
@@ -8973,6 +8989,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::GlobalShared,
         guest_writable: true,
@@ -9642,6 +9659,7 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -9887,6 +9905,7 @@ fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -9977,6 +9996,7 @@ fn persistent_reusable_cow_mapping_rejects_zero_owner_generation() {
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
@@ -11830,9 +11850,9 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::new();
-    let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        1,
-    ));
+    let pool = Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(&transport.custody, 1),
+    );
     let root = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
     let root_slot = (root, 0x20_0000_u64);
     let data_ipa = 0x9b00_7800_0000;
@@ -11845,7 +11865,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let original_host = root_mapping.as_mut_ptr();
     let root_epoch = next_structural_epoch().expect("root structural epoch");
     let mut root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    root_lease.mark_pre_mapped();
+    root_lease.mark_pre_mapped_in(root_mapping.vm_generation());
     let root_owner = StructuralBackingOwner::new_pooled_root_in(
         &transport.custody,
         root_mapping,
@@ -11959,7 +11979,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     );
     let root_epoch2 = next_structural_epoch().expect("root structural epoch 2");
     let mut root_lease2 = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    root_lease2.mark_test_mapped_without_backend();
+    root_lease2.mark_pre_mapped_in(root_mapping2.vm_generation());
     let root_owner2 = StructuralBackingOwner::new_pooled_root_in(
         &transport.custody,
         root_mapping2,
@@ -12086,15 +12106,15 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         0x9b00_7900_0000,
         *b"test",
     );
-    let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
-        1,
-    ));
+    let pool = Arc::new(
+        crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(&transport.custody, 1),
+    );
     let handle = pool.allocate_slot().expect("extension slot");
     let base = handle.ipa();
     let len = handle.len();
     let ptr = handle.as_mut_ptr();
     let mut lease = GlobalFrameStage2Lease::fixed(base, len as u64);
-    lease.mark_test_mapped_without_backend();
+    lease.mark_pre_mapped_in(handle.vm_generation());
     let owner = StructuralBackingOwner::new_pooled_root_in(
         &transport.custody,
         handle,
@@ -12194,6 +12214,7 @@ fn retained_reuse_fixture(
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: false,

@@ -279,6 +279,14 @@ pub(crate) use carrick_core::mm::retirement::{
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
+pub(crate) struct UntrackedStage2Mapping {
+    pub(crate) mapping: carrick_aarch64::stage2::custody::Stage2Mapping,
+    pub(crate) host_addr: usize,
+    pub(crate) perms: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
 /// The carrier's stage-2 records, held under its [`Stage2Custody`]'s
 /// lifecycle lock (the custody owns the lifecycle and the generation).
 pub(crate) struct CarrierStage2Records {
@@ -291,8 +299,7 @@ pub(crate) struct CarrierStage2Records {
         CarrierStage2RecordId,
         carrick_aarch64::stage2::custody::Stage2Mapping,
     >,
-    pub(crate) untracked_mappings:
-        std::collections::BTreeMap<(u64, usize), carrick_aarch64::stage2::custody::Stage2Mapping>,
+    pub(crate) untracked_mappings: std::collections::BTreeMap<(u64, usize), UntrackedStage2Mapping>,
     /// One physical index over every record, independent of the authority
     /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
     stage2_extent_index:
@@ -366,6 +373,18 @@ pub(crate) type NativeExecOwner =
 /// the exact generation; a successful destroy must be committed before a later
 /// generation can begin creation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct RetainedIpcWindowBacking(
+    #[allow(dead_code)] std::sync::Arc<dyn super::stage2_backend::IpcWindowBacking>,
+);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ::core::fmt::Debug for RetainedIpcWindowBacking {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.write_str("RetainedIpcWindowBacking(..)")
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
@@ -381,6 +400,9 @@ pub struct CarrierVmCustody {
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub fork_stock:
         carrick_aarch64::stage2::custody::Stage2Inner<crate::fork_stock::ForkStockHostCustody>,
+    pub(crate) fork_stock_install: parking_lot::Mutex<()>,
+    pub(crate) retained_ipc_backings:
+        parking_lot::Mutex<Vec<(CarrierVmGeneration, RetainedIpcWindowBacking)>>,
     /// Serializes every settlement of a native child's owed returns
     /// (#1369 slice 3).
     pub(crate) return_settlement: carrick_hal::return_settlement::SettlementLock,
@@ -792,6 +814,8 @@ impl CarrierVmCustody {
                     asids.clone(),
                 ),
             ),
+            fork_stock_install: parking_lot::Mutex::new(()),
+            retained_ipc_backings: parking_lot::Mutex::new(Vec::new()),
             asids,
             stage2: Stage2Custody::new(
                 super::stage2_backend::HvfCarrierStage2::custody_backend(),
@@ -933,7 +957,7 @@ impl CarrierVmCustody {
             .retain(|_, mapping| mapping.generation() != generation);
         records
             .untracked_mappings
-            .retain(|_, mapping| mapping.generation() != generation);
+            .retain(|_, entry| entry.mapping.generation() != generation);
         for record in records
             .stage2_records
             .values_mut()
@@ -1031,8 +1055,32 @@ impl CarrierVmCustody {
             .lock()
             .release_destroyed_vm()
             .map_err(|_| Stage2CustodyError::UnsettledAfterDestroy)?;
+        let retired_ipc_backings = {
+            let mut retained = self.retained_ipc_backings.lock();
+            let mut retired = Vec::new();
+            let mut idx = 0;
+            while idx < retained.len() {
+                if retained[idx].0 == generation {
+                    retired.push(retained.swap_remove(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            retired
+        };
+        drop(retired_ipc_backings);
         drop(destroyed_stock);
         self.stage2.finish_destroy(generation)
+    }
+
+    pub(crate) fn retain_unretired_ipc_backing(
+        &self,
+        generation: CarrierVmGeneration,
+        backing: std::sync::Arc<dyn super::stage2_backend::IpcWindowBacking>,
+    ) {
+        self.retained_ipc_backings
+            .lock()
+            .push((generation, RetainedIpcWindowBacking(backing)));
     }
 
     pub(crate) fn frame_pool(
@@ -1602,11 +1650,22 @@ impl CarrierVmCustody {
             vm_generation: live_generation,
             logical_owner: old_identity.logical_owner,
         };
+        let untracked_key = (old.snapshot.ipa, old.snapshot.len);
+        let entry = state
+            .untracked_mappings
+            .get(&untracked_key)
+            .ok_or(CarrierStage2RecordError::InvalidExtent)?;
+        if entry.mapping.generation() != live_generation {
+            return Err(CarrierStage2RecordError::VmGenerationMismatch);
+        }
+        if entry.host_addr != host_addr || entry.perms != perms {
+            return Err(CarrierStage2RecordError::RecordIdentityMismatch);
+        }
         let stage2_mapping = state
             .untracked_mappings
-            .remove(&(old.snapshot.ipa, old.snapshot.len))
-            .filter(|mapping| mapping.generation() == live_generation);
-        let backend_map_installed = stage2_mapping.is_some();
+            .remove(&untracked_key)
+            .ok_or(CarrierStage2RecordError::InvalidExtent)?
+            .mapping;
         state.stage2_records.insert(
             record_id,
             CarrierStage2Record {
@@ -1617,7 +1676,7 @@ impl CarrierVmCustody {
                     len: old.snapshot.len,
                     host_addr,
                     mapped: true,
-                    backend_map_installed,
+                    backend_map_installed: true,
                     release_ipa: old.snapshot.release_ipa,
                     perms,
                     logical_owner: old.snapshot.logical_owner,
@@ -1633,9 +1692,7 @@ impl CarrierVmCustody {
                 unmap_in_flight: false,
             },
         );
-        if let Some(mapping) = stage2_mapping {
-            state.installed.insert(record_id, mapping);
-        }
+        state.installed.insert(record_id, stage2_mapping);
         state.index_record(record_id, old.snapshot.ipa, old.snapshot.len);
         let old = state
             .stage2_records
@@ -2316,6 +2373,7 @@ mod carrier_vm_custody_tests {
     fn a_replay_rebind_never_binds_to_a_generation_created_after_it_checked() {
         use carrick_aarch64::stage2::custody::Stage2HookPoint;
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
         let key = (0xa081_b000_0000_u64, 0x4000_u64);
         let spec = CarrierStage2RecordSpec {
@@ -2340,6 +2398,13 @@ mod carrier_vm_custody_tests {
 
         let g2 = custody.begin_create().expect("begin G2");
         custody.commit_create(g2).expect("commit G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            spec.host_addr as *mut std::ffi::c_void,
+            key.0,
+            key.1 as usize,
+            spec.perms,
+        );
 
         let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
         let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
@@ -2387,6 +2452,7 @@ mod carrier_vm_custody_tests {
                 length: key.1,
                 host_addr: spec.host_addr,
                 perms: spec.perms,
+                vm_generation: g2,
             }],
             false,
         );
@@ -3840,6 +3906,7 @@ mod carrier_vm_custody_tests {
     #[test]
     fn vm_rebuild_rebinds_live_owner_to_g2_and_transfers_release_authority_once() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
         let key = (0xa081_4000_0000_u64, 0x4000_u64);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3909,6 +3976,21 @@ mod carrier_vm_custody_tests {
 
         let g2 = custody.begin_create().expect("begin G2 create");
         custody.commit_create(g2).expect("publish G2");
+        let rw_perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            host_addr as *mut std::ffi::c_void,
+            reserved_key.0,
+            reserved_key.1 as usize,
+            rw_perms,
+        );
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            fixed_host as *mut std::ffi::c_void,
+            fixed_key.0,
+            fixed_key.1 as usize,
+            rw_perms,
+        );
         let mut release_calls = 0_u32;
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
@@ -3917,17 +3999,15 @@ mod carrier_vm_custody_tests {
                     ipa: reserved_key.0,
                     length: reserved_key.1,
                     host_addr,
-                    perms: carrick_aarch64::stage2::stage2_perms_bits(
-                        carrick_hal::MemPerms::ReadWrite,
-                    ),
+                    perms: rw_perms,
+                    vm_generation: g2,
                 },
                 super::GlobalFrameReplayExtent {
                     ipa: fixed_key.0,
                     length: fixed_key.1,
                     host_addr: fixed_host,
-                    perms: carrick_aarch64::stage2::stage2_perms_bits(
-                        carrick_hal::MemPerms::ReadWrite,
-                    ),
+                    perms: rw_perms,
+                    vm_generation: g2,
                 },
             ],
             false,
@@ -3981,17 +4061,15 @@ mod carrier_vm_custody_tests {
                     ipa: reserved_key.0,
                     length: reserved_key.1,
                     host_addr,
-                    perms: carrick_aarch64::stage2::stage2_perms_bits(
-                        carrick_hal::MemPerms::ReadWrite,
-                    ),
+                    perms: rw_perms,
+                    vm_generation: g2,
                 },
                 super::GlobalFrameReplayExtent {
                     ipa: fixed_key.0,
                     length: fixed_key.1,
                     host_addr: fixed_host,
-                    perms: carrick_aarch64::stage2::stage2_perms_bits(
-                        carrick_hal::MemPerms::ReadWrite,
-                    ),
+                    perms: rw_perms,
+                    vm_generation: g2,
                 },
             ],
             false,
@@ -4427,6 +4505,7 @@ mod carrier_vm_custody_tests {
     #[test]
     fn late_g1_carrier_mm_retirement_request_cannot_mutate_same_key_g2_record() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
         let key = (0xa081_9000_0000, 0x4000);
         let mut g1_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
@@ -4444,6 +4523,13 @@ mod carrier_vm_custody_tests {
         )
         .expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            owners[&key] as *mut std::ffi::c_void,
+            key.0,
+            key.1 as usize,
+            0,
+        );
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
             &[super::GlobalFrameReplayExtent {
@@ -4451,6 +4537,7 @@ mod carrier_vm_custody_tests {
                 length: key.1,
                 host_addr: owners[&key],
                 perms: 0,
+                vm_generation: g2,
             }],
             false,
             &mut |_, _| panic!("rebind must transfer rather than release IPA authority"),
@@ -4709,6 +4796,7 @@ mod carrier_vm_custody_tests {
     #[test]
     fn carrier_mm_logical_authority_follows_g1_record_rebind_and_retires_g2_once() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
         let key = (0xa081_a000_0000, 0x4000);
         let old_identity = register_test_stage2_record(
@@ -4733,6 +4821,13 @@ mod carrier_vm_custody_tests {
         )
         .expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            0x1234_0000 as *mut std::ffi::c_void,
+            key.0,
+            key.1 as usize,
+            stage2_spec(g1, 93).perms,
+        );
         super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
             &[super::GlobalFrameReplayExtent {
@@ -4740,6 +4835,7 @@ mod carrier_vm_custody_tests {
                 length: key.1,
                 host_addr: 0x1234_0000,
                 perms: stage2_spec(g1, 93).perms,
+                vm_generation: g2,
             }],
             false,
             &mut |_, _| panic!("rebind must not release G1 authority"),
@@ -5144,6 +5240,7 @@ mod carrier_vm_custody_tests {
     #[test]
     fn live_structural_owner_rebinds_exactly_to_g2_before_late_drop() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
         let key = (0x7d00_2000_0000, 0x4000);
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -5178,6 +5275,13 @@ mod carrier_vm_custody_tests {
         .expect("destroy structural G1");
         let g2 = custody.begin_create().expect("begin structural G2");
         custody.commit_create(g2).expect("publish structural G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            host_addr as *mut std::ffi::c_void,
+            key.0,
+            key.1 as usize,
+            perms,
+        );
         let report = super::reconcile_global_frame_owners_after_replay_in_using(
             &custody,
             &[super::GlobalFrameReplayExtent {
@@ -5185,6 +5289,7 @@ mod carrier_vm_custody_tests {
                 length: key.1,
                 host_addr,
                 perms,
+                vm_generation: g2,
             }],
             false,
             &mut |_, _| Ok(()),
@@ -6019,5 +6124,141 @@ mod carrier_vm_custody_tests {
             !mapped_after_rival.load(Ordering::SeqCst),
             "stale G1 replay reached backend after G1 destroyed and G2 created"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn g1_untracked_unmap_after_vm_destroy_never_unmaps_g2() {
+        use super::super::stage2_backend::{
+            ScopedStage2MapTestStub, stage2_unmap_untracked_in, test_stage2_map_untracked,
+        };
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let ipa = 0xa081_e000_0000_u64;
+        let len = 0x4000_usize;
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut g1_backing = vec![0_u8; len];
+        test_stage2_map_untracked(&custody, g1_backing.as_mut_ptr().cast(), ipa, len, perms);
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        let mut g2_backing = vec![0_u8; len];
+        test_stage2_map_untracked(&custody, g2_backing.as_mut_ptr().cast(), ipa, len, perms);
+        assert!(ScopedStage2MapTestStub::is_mapped(ipa, len));
+
+        stage2_unmap_untracked_in(&custody, g1, Some(g1_backing.as_ptr() as usize), ipa, len)
+            .expect("stale G1 untracked unmap returns no-op without touching G2");
+        assert!(
+            ScopedStage2MapTestStub::is_mapped(ipa, len),
+            "stale G1 untracked unmap damaged G2 mapping"
+        );
+        stage2_unmap_untracked_in(&custody, g2, Some(g2_backing.as_ptr() as usize), ipa, len)
+            .expect("owning G2 untracked unmap retires G2 mapping");
+        assert!(!ScopedStage2MapTestStub::is_mapped(ipa, len));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stage2_map_replay_refuses_unregistered_alias_even_in_live_vm() {
+        use super::super::stage2_backend::{ScopedStage2MapTestStub, stage2_map_replay};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (custody, _g1) = live_custody();
+        let len = 0x4000_usize;
+        let backing_mem = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("alias backing");
+        let ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x7e00_0000;
+        let backing = super::super::AliasBacking {
+            start: 0x2000_0000,
+            ipa,
+            host_addr: backing_mem.as_ptr() as usize,
+            size: len,
+            physical_ipa: ipa,
+            physical_host_addr: backing_mem.as_ptr() as usize,
+            physical_size: len,
+            perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: super::super::GuestMappingSharing::GlobalShared,
+            ownership_scope: super::super::AliasOwnershipScope::ContainerRoot(
+                super::super::ContainerRootToken::ROOT,
+            ),
+            inventory_backing: super::super::InventoryBackingIdentity::Private(1),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let rc = unsafe { stage2_map_replay(&custody, backing) };
+        assert_ne!(rc, carrick_aarch64::stage2::Stage2Status::SUCCESS);
+        assert!(!ScopedStage2MapTestStub::is_mapped(ipa, len));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stale_g1_pooled_handles_are_refused_in_g2() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let frame_pool = std::sync::Arc::new(
+            crate::frame_pool::PreMappedFramePool::new_test_fixture_in(&custody, 1),
+        );
+        let root_pool = std::sync::Arc::new(
+            crate::frame_pool::PreMappedRootSlotPool::new_test_fixture_in(&custody, 1),
+        );
+        let frame_handle = frame_pool.allocate_compound().expect("G1 pooled frame");
+        let root_handle = root_pool.allocate_slot().expect("G1 pooled root slot");
+        assert_eq!(frame_handle.vm_generation(), Some(g1));
+        assert_eq!(root_handle.vm_generation(), Some(g1));
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        assert!(
+            super::super::register_pooled_global_frame_host_owner_in(
+                &custody,
+                frame_handle,
+                perms,
+            )
+            .is_err(),
+            "G1 pooled frame handle must not register into G2"
+        );
+        assert!(custody.global_frame_host_owners.lock().is_empty());
+
+        let root_ipa = root_handle.ipa();
+        let root_len = root_handle.len();
+        let mut root_lease = super::super::GlobalFrameStage2Lease::fixed(root_ipa, root_len as u64);
+        root_lease.mark_pre_mapped_in(root_handle.vm_generation());
+        assert!(
+            super::super::StructuralBackingOwner::new_pooled_root_in(
+                &custody,
+                root_handle,
+                root_lease,
+                perms,
+                super::super::next_structural_epoch().expect("epoch"),
+                root_ipa,
+                root_len,
+            )
+            .is_err(),
+            "G1 pooled root handle must not register into G2"
+        );
+        assert!(custody.structural_backings.lock().is_empty());
     }
 }

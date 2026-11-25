@@ -499,6 +499,7 @@ fn publish_frame_grant_backing(
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,
@@ -857,7 +858,7 @@ impl MmAccessState {
                 Some(handle) => {
                     let host_addr = handle.as_mut_ptr();
                     let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
-                    lease.mark_pre_mapped();
+                    lease.mark_pre_mapped_in(handle.vm_generation());
                     (host_addr, None, lease, Some(handle))
                 }
                 None => {
@@ -926,6 +927,7 @@ impl MmAccessState {
                 host_mapping: host_mapping.map(RegionHostOwner::Exclusive),
                 structural_owner: None,
                 stage2_lease: None,
+                stage2_generation: None,
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
@@ -1812,6 +1814,7 @@ pub(super) fn publish_replacing(
         host_mapping: None,
         structural_owner: None,
         stage2_lease: None,
+        stage2_generation: None,
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,

@@ -2081,12 +2081,13 @@ pub(crate) fn service_native_fork_stock(
                         (expected_request, expected_address, expected_count, retained)
                     },
                 );
+                let mut rejected_physical = None;
                 let result = {
                     let stage2 = custody.stage2.lock();
                     let mut stock = custody.fork_stock.lock();
                     let result = stock
                         .owner
-                        .reserve_custody(
+                        .reserve_custody_collecting(
                             execution,
                             settlement,
                             |pages| {
@@ -2113,6 +2114,7 @@ pub(crate) fn service_native_fork_stock(
                                 }
                                 _ => Err(ForkStockRefusal::Invalid),
                             },
+                            |physical| rejected_physical = Some(physical),
                         )
                         .map(|_| ());
                     let accepted = result.is_ok();
@@ -2121,6 +2123,7 @@ pub(crate) fn service_native_fork_stock(
                     }
                     result
                 };
+                drop(rejected_physical);
                 drop(pre_retained);
                 if let Err(refusal) = &result {
                     report_stock_refusal(None, Some(execution), &format!("Reserve: {refusal:?}"));
