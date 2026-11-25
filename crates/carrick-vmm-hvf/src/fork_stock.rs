@@ -259,35 +259,38 @@ impl ForkStockHostCustody {
             let perms =
                 carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
             let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base, len as u64);
-            let owner =
-                if let Some(arena) = pool.as_ref().and_then(|pool| pool.allocate_slot_at(base)) {
-                    // The shared owner can populate every page, so pool recycling
-                    // must clear the whole arena rather than a host-observed prefix.
-                    arena.record_populated_prefix(len);
-                    lease.mark_pre_mapped();
-                    crate::trap::StructuralBackingOwner::new_pooled_root_in(
-                        custody, arena, lease, perms, epoch, base, len,
-                    )?
-                } else {
-                    // Same retained structural backing used by host roots outside
-                    // the optional pre-map (including its existing =0 opt-out).
-                    let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                        len,
-                        crate::host_mapping::HostMappingKind::PerMmKernelState,
-                    )
-                    .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
-                    // SAFETY: exclusively reserved physical slot and retained aligned mapping.
-                    let result = unsafe {
-                        crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms)
-                    };
-                    if result != 0 {
-                        return Err(fail(&format!("native fork arena map: {result:#x}")));
-                    }
-                    lease.mark_mapped();
-                    crate::trap::StructuralBackingOwner::new_in(
-                        custody, mapping, lease, perms, epoch, base, len,
-                    )?
-                };
+            let owner = if let Some(arena) =
+                pool.as_ref().and_then(|pool| pool.allocate_slot_at(base))
+            {
+                // The shared owner can populate every page, so pool recycling
+                // must clear the whole arena rather than a host-observed prefix.
+                arena.record_populated_prefix(len);
+                lease.mark_pre_mapped();
+                crate::trap::StructuralBackingOwner::new_pooled_root_in(
+                    custody, arena, lease, perms, epoch, base, len,
+                )?
+            } else {
+                // Same retained structural backing used by host roots outside
+                // the optional pre-map (including its existing =0 opt-out).
+                let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    len,
+                    crate::host_mapping::HostMappingKind::PerMmKernelState,
+                )
+                .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
+                let mut stage2 = custody
+                    .admitting_stage2("native fork arena map")
+                    .map_err(|error| fail(&format!("native fork arena stage2: {error}")))?;
+                // SAFETY: exclusively reserved physical slot and retained aligned mapping.
+                let stage2_mapping = unsafe {
+                    crate::trap::stage2_map(&mut stage2, mapping.as_ptr().cast(), base, len, perms)
+                }
+                .map_err(|result| fail(&format!("native fork arena map: {result:#x}")))?;
+                drop(stage2);
+                lease.mark_mapped(stage2_mapping);
+                crate::trap::StructuralBackingOwner::new_in(
+                    custody, mapping, lease, perms, epoch, base, len,
+                )?
+            };
             for offset in (0..len).step_by(4096) {
                 tables.push(
                     RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
@@ -345,15 +348,14 @@ impl ForkStockHostCustody {
         .map_err(|error| TrapError::Hypervisor(format!("native fork control backing: {error}")))?;
         let perms =
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+        let mut stage2 = custody.admitting_stage2("native fork control stage-2 map")?;
         // SAFETY: the fresh IPA lease and mapping are retained by the owner.
-        let result =
-            unsafe { crate::trap::inventory_stage2_map(mapping.as_ptr().cast(), base, len, perms) };
-        if result != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "native fork control map: {result:#x}"
-            )));
+        let stage2_mapping = unsafe {
+            crate::trap::stage2_map(&mut stage2, mapping.as_ptr().cast(), base, len, perms)
         }
-        lease.mark_mapped();
+        .map_err(|result| TrapError::Hypervisor(format!("native fork control map: {result:#x}")))?;
+        drop(stage2);
+        lease.mark_mapped(stage2_mapping);
         let epoch = crate::trap::next_structural_epoch()?;
         let owner = crate::trap::StructuralBackingOwner::new_in(
             custody, mapping, lease, perms, epoch, base, len,

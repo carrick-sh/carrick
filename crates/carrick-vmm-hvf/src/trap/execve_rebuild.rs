@@ -724,11 +724,6 @@ impl PreparedExecBacking {
             let pre_mapped = root.is_some();
             if pre_mapped {
                 lease.mark_pre_mapped();
-            } else {
-                // The record presented to publication names the map that the
-                // callback is about to install. Ownership transfers only
-                // after that callback succeeds.
-                lease.mark_mapped();
             }
             let install = ExecStage2Install {
                 ipa: lease.base,
@@ -832,7 +827,7 @@ impl PreparedExecBacking {
                     &mut unmap,
                 ));
             };
-            if let Err(error) = lease.transfer_to_record(snapshot) {
+            if let Err(error) = lease.transfer_to_record(snapshot, pre_mapped) {
                 installed_regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),

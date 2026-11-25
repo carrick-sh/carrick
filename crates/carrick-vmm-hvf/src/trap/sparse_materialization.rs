@@ -233,20 +233,23 @@ pub(super) fn prepare(
         let semantic_ipa = physical_ipa
             .checked_add(physical_offset)
             .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
-        let map_result = unsafe {
-            inventory_stage2_map(
+        let mut stage2 = custody.admitting_stage2("sparse HVPatch mmap stage-2 map")?;
+        let mapping = unsafe {
+            stage2_map(
+                &mut stage2,
                 physical_host.cast(),
                 physical_ipa,
                 physical_size,
                 carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
-        };
-        if map_result != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
-            )));
         }
-        lease.mark_mapped();
+        .map_err(|map_result| {
+            TrapError::Hypervisor(format!(
+                "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
+            ))
+        })?;
+        drop(stage2);
+        lease.mark_mapped(mapping);
         let owner_generation = register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -882,25 +885,27 @@ impl MmAccessState {
                         ))
                     })?;
 
-                    let rc = unsafe {
-                        inventory_stage2_map(
+                    let mut stage2 =
+                        custody.admitting_stage2("stage-1 extension arena stage-2 map")?;
+                    let mapping = unsafe {
+                        stage2_map(
+                            &mut stage2,
                             host_mapping.as_ptr().cast(),
                             base,
                             TWO_MIB,
                             carrick_aarch64::stage2::stage2_perms_bits(root_perms),
                         )
-                    };
-                    if rc != 0 {
-                        return Err(TrapError::ChildMapFailed {
-                            host_addr: host_mapping.as_ptr() as u64,
-                            guest_start: base,
-                            size: TWO_MIB,
-                            code: rc.raw(),
-                        });
                     }
+                    .map_err(|rc| TrapError::ChildMapFailed {
+                        host_addr: host_mapping.as_ptr() as u64,
+                        guest_start: base,
+                        size: TWO_MIB,
+                        code: rc.raw(),
+                    })?;
+                    drop(stage2);
 
                     let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
-                    lease.mark_mapped();
+                    lease.mark_mapped(mapping);
                     let host_addr = host_mapping.as_ptr();
                     (host_addr, Some(host_mapping), lease, None)
                 }
@@ -2341,7 +2346,14 @@ mod arena_pin_tests {
         .unwrap();
         let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
         // Exercise the injected backend callback as a live stage-2 record.
-        lease.mark_mapped();
+        let mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            host.as_ptr().cast(),
+            base,
+            size,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(mapping);
         let owner = StructuralBackingOwner::new_in(
             &custody,
             host,

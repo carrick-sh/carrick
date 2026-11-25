@@ -2362,20 +2362,23 @@ impl HvfTaskState {
             .checked_add(physical_offset)
             .ok_or_else(|| TrapError::Hypervisor("retained reuse IPA overflow".to_owned()))?;
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
-        let map_result = unsafe {
-            inventory_stage2_map(
+        let mut stage2 = custody.admitting_stage2("retained reuse stage-2 map")?;
+        let stage2_mapping = unsafe {
+            stage2_map(
+                &mut stage2,
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
                 carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
-        };
-        if map_result != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "map retained reuse IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
-            )));
         }
-        new_lease.mark_mapped();
+        .map_err(|map_result| {
+            TrapError::Hypervisor(format!(
+                "map retained reuse IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+            ))
+        })?;
+        drop(stage2);
+        new_lease.mark_mapped(stage2_mapping);
         let owner_generation = register_global_frame_host_owner_in(
             custody,
             new_lease,
@@ -3799,20 +3802,23 @@ impl HvfTaskState {
                     CowArmedRanges::COMPOUND_SIZE,
                 )?;
                 let new_physical_ipa = new_lease.base;
-                let map_result = unsafe {
-                    inventory_stage2_map(
+                let mut stage2 = custody.admitting_stage2("frame COW stage-2 map")?;
+                let stage2_mapping = unsafe {
+                    stage2_map(
+                        &mut stage2,
                         new_host_ptr.cast(),
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE as usize,
                         carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
                     )
-                };
-                if map_result != 0 {
-                    return Err(TrapError::Hypervisor(format!(
-                        "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
-                    )));
                 }
-                new_lease.mark_mapped();
+                .map_err(|map_result| {
+                    TrapError::Hypervisor(format!(
+                        "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+                    ))
+                })?;
+                drop(stage2);
+                new_lease.mark_mapped(stage2_mapping);
                 let owner_generation = register_global_frame_host_owner_in(
                     custody,
                     new_lease,
@@ -5603,13 +5609,21 @@ impl HvfVmState {
             None
         };
         let ipa = global_lease.as_ref().map_or(ipa, |lease| lease.base);
-        let r = unsafe {
-            inventory_stage2_map(
+        let custody = self.carrier_vm_custody();
+        let mut stage2 = custody.admitting_stage2("HVPatch alias stage-2 map")?;
+        let map_result = unsafe {
+            stage2_map(
+                &mut stage2,
                 host.cast(),
                 ipa,
                 physical_size,
                 carrick_aarch64::stage2::stage2_perms_bits(perms),
             )
+        };
+        drop(stage2);
+        let r = match &map_result {
+            Ok(_) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            Err(status) => *status,
         };
         crate::probes::hv_vm_map_alias(
             va,
@@ -5618,16 +5632,18 @@ impl HvfVmState {
             r.raw() as i32,
             self.forked_no_exec as i32,
         );
-        if r != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={physical_size} failed: 0x{r:x}"
-            )));
-        }
+        let stage2_mapping = match map_result {
+            Ok(stage2_mapping) => stage2_mapping,
+            Err(r) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={physical_size} failed: 0x{r:x}"
+                )));
+            }
+        };
         if let Some(lease) = global_lease.as_mut() {
-            lease.mark_mapped();
+            lease.mark_mapped(stage2_mapping);
         }
         let (host_mapping, owner_generation) = if self.persistent_vm_lifecycle {
-            let custody = self.carrier_vm_custody();
             let owner_generation = register_global_frame_host_owner_in(
                 &custody,
                 global_lease.take().ok_or_else(|| {

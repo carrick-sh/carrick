@@ -637,11 +637,14 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     )
     .unwrap();
     let host_addr = host.as_ptr() as usize;
-    assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), gpa, length as usize, 7) },
-        0
+    let mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        host.as_ptr().cast(),
+        gpa,
+        length as usize,
+        7,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(mapping);
     let generation = register_global_frame_host_owner_in(&custody, lease, host, 7).unwrap();
     let nz = |n| std::num::NonZeroU64::new(n).unwrap();
     let reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(

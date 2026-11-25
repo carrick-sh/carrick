@@ -287,6 +287,10 @@ pub(crate) struct CarrierStage2Records {
     pub(crate) next_logical_owner_generation: u64,
     pub(crate) stage2_records:
         std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2Record>,
+    pub(crate) installed: std::collections::BTreeMap<
+        CarrierStage2RecordId,
+        carrick_aarch64::stage2::custody::Stage2Mapping,
+    >,
     /// One physical index over every record, independent of the authority
     /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
     stage2_extent_index:
@@ -306,6 +310,7 @@ impl CarrierStage2Records {
         &mut self,
         id: CarrierStage2RecordId,
     ) -> Option<CarrierStage2Record> {
+        let _ = self.installed.remove(&id);
         let removed = self.stage2_records.remove(&id);
         if let Some(record) = &removed {
             let key = (record.snapshot.ipa, record.snapshot.len as u64);
@@ -766,6 +771,7 @@ impl CarrierVmCustody {
                     next_logical_owner_id: 1,
                     next_logical_owner_generation: 1,
                     stage2_records: std::collections::BTreeMap::new(),
+                    installed: std::collections::BTreeMap::new(),
                     stage2_extent_index: std::collections::BTreeMap::new(),
                 },
             ),
@@ -892,6 +898,9 @@ impl CarrierVmCustody {
         records: &mut CarrierStage2Records,
         generation: CarrierVmGeneration,
     ) {
+        records
+            .installed
+            .retain(|_, mapping| mapping.generation() != generation);
         for record in records
             .stage2_records
             .values_mut()
@@ -1322,6 +1331,38 @@ impl CarrierVmCustody {
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
         Self::register_stage2_record_locked(stage2, spec)
+    }
+
+    pub(crate) fn register_stage2_record_with_mapping(
+        stage2: &mut super::stage2_backend::CarrierStage2<'_>,
+        spec: CarrierStage2RecordSpec,
+        mapping: Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+    ) -> Result<
+        CarrierStage2RecordIdentity,
+        (
+            CarrierStage2RecordError,
+            Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+        ),
+    > {
+        if spec.backend_map_installed != mapping.is_some() {
+            return Err((CarrierStage2RecordError::InvalidExtent, mapping));
+        }
+        if let Some(ref installed) = mapping {
+            if installed.generation() != spec.vm_generation {
+                return Err((CarrierStage2RecordError::VmGenerationMismatch, mapping));
+            }
+            if installed.ipa() != spec.ipa || installed.size() != spec.len {
+                return Err((CarrierStage2RecordError::InvalidExtent, mapping));
+            }
+        }
+        let identity = match Self::register_stage2_record_locked(stage2, spec) {
+            Ok(identity) => identity,
+            Err(error) => return Err((error, mapping)),
+        };
+        if let Some(installed) = mapping {
+            stage2.installed.insert(identity.record_id, installed);
+        }
+        Ok(identity)
     }
 
     /// Commit backend mapping and its exact record under a held generation guard.
@@ -2241,11 +2282,14 @@ mod carrier_vm_custody_tests {
         let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
         let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
         let mut backing = vec![0_u8; len];
-        assert_eq!(
-            unsafe { super::inventory_stage2_map(backing.as_mut_ptr().cast(), ipa, len, perms) },
-            0
+        let mapping = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            backing.as_mut_ptr().cast(),
+            ipa,
+            len,
+            perms,
         );
-        lease.mark_mapped();
+        lease.mark_mapped(mapping);
 
         destroy_vm_with_custody_using(
             &custody,
@@ -2292,11 +2336,14 @@ mod carrier_vm_custody_tests {
         let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
         let mut g1_lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
         let mut g1_backing = vec![0_u8; len];
-        assert_eq!(
-            unsafe { super::inventory_stage2_map(g1_backing.as_mut_ptr().cast(), ipa, len, perms) },
-            0
+        let g1_mapping = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            g1_backing.as_mut_ptr().cast(),
+            ipa,
+            len,
+            perms,
         );
-        g1_lease.mark_mapped();
+        g1_lease.mark_mapped(g1_mapping);
 
         destroy_vm_with_custody_using(
             &custody,
@@ -2308,9 +2355,12 @@ mod carrier_vm_custody_tests {
         let g2 = custody.begin_create().expect("begin G2");
         custody.commit_create(g2).expect("commit G2");
         let mut g2_backing = vec![0_u8; len];
-        assert_eq!(
-            unsafe { super::inventory_stage2_map(g2_backing.as_mut_ptr().cast(), ipa, len, perms) },
-            0
+        let _g2_mapping = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            g2_backing.as_mut_ptr().cast(),
+            ipa,
+            len,
+            perms,
         );
         assert!(ScopedStage2MapTestStub::is_mapped(ipa, len));
         ScopedStage2MapTestStub::clear_events();
@@ -2532,7 +2582,14 @@ mod carrier_vm_custody_tests {
         .expect("allocate pinned global owner backing");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2661,7 +2718,14 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate global owner retirement lock-order fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2815,7 +2879,14 @@ mod carrier_vm_custody_tests {
         .expect("allocate exclusive retirement fixture");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2869,7 +2940,14 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate foreign-MM release safe-point fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2938,7 +3016,14 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate foreign-MM transient retry fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -2998,7 +3083,14 @@ mod carrier_vm_custody_tests {
             )
             .expect("allocate removable FIFO fixture");
             let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-            lease.mark_mapped();
+            let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+                &custody,
+                mapping.as_ptr().cast(),
+                key.0,
+                key.1 as usize,
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            );
+            lease.mark_mapped(stage2_mapping);
             let generation = super::register_global_frame_host_owner_in(
                 &custody,
                 lease,
@@ -3080,7 +3172,14 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate concurrent idle-turn fixture");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -3148,7 +3247,14 @@ mod carrier_vm_custody_tests {
         .expect("allocate disappearing retirement slot fixture");
         let host_addr = mapping.as_ptr() as usize;
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -3221,7 +3327,14 @@ mod carrier_vm_custody_tests {
         .expect("allocate colliding global owner backing");
         let candidate_host = candidate_mapping.as_ptr() as usize;
         let mut candidate_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        candidate_lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            candidate_mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        candidate_lease.mark_mapped(stage2_mapping);
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         let mut rollback_calls = 0_u32;
 
@@ -3302,7 +3415,14 @@ mod carrier_vm_custody_tests {
             )
             .expect("allocate fair-retry directory backing");
             let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-            lease.mark_mapped();
+            let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+                &custody,
+                mapping.as_ptr().cast(),
+                key.0,
+                key.1 as usize,
+                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            );
+            lease.mark_mapped(stage2_mapping);
             let generation = super::register_global_frame_host_owner_in(
                 &custody,
                 lease,
@@ -3346,7 +3466,14 @@ mod carrier_vm_custody_tests {
         .expect("allocate fair-retry detached candidate");
         let mut candidate_lease =
             super::GlobalFrameStage2Lease::fixed(collision_key.0, collision_key.1);
-        candidate_lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            candidate_mapping.as_ptr().cast(),
+            collision_key.0,
+            collision_key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        candidate_lease.mark_mapped(stage2_mapping);
         assert!(
             super::register_global_frame_host_owner_in_using(
                 &custody,
@@ -3777,7 +3904,14 @@ mod carrier_vm_custody_tests {
         let mut lease = super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
             .expect("reserve pending rebuild owner IPA");
         let key = lease.key();
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         let generation = super::register_global_frame_host_owner_in(
             &custody,
             lease,
@@ -4516,7 +4650,14 @@ mod carrier_vm_custody_tests {
         )
         .expect("allocate concurrent-retirement owner");
         let mut lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        lease.mark_mapped();
+        let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            mapping.as_ptr().cast(),
+            key.0,
+            key.1 as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        );
+        lease.mark_mapped(stage2_mapping);
         super::register_global_frame_host_owner_in(
             &custody,
             lease,

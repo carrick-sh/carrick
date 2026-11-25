@@ -317,22 +317,25 @@ pub(crate) fn allocate_grant_extent(
     let physical_ipa = lease.base;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
+        let mut stage2 = custody.admitting_stage2("guest COW grant stage-2 map")?;
         // SAFETY: the host mapping outlives its stage-2 record, which the
         // owner registration below transfers into carrier custody.
-        let rc = unsafe {
-            inventory_stage2_map(
+        let mapping = unsafe {
+            stage2_map(
+                &mut stage2,
                 host_ptr.cast(),
                 physical_ipa,
                 length as usize,
                 carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
-        };
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "map guest COW grant IPA 0x{physical_ipa:x}: 0x{rc:x}"
-            )));
         }
-        lease.mark_mapped();
+        .map_err(|rc| {
+            TrapError::Hypervisor(format!(
+                "map guest COW grant IPA 0x{physical_ipa:x}: 0x{rc:x}"
+            ))
+        })?;
+        drop(stage2);
+        lease.mark_mapped(mapping);
     }
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     lease.mark_test_mapped_without_backend();

@@ -3172,7 +3172,7 @@ fn serial_host_process_descriptor_lease_retires_while_host_backing_is_live() {
         .stage2_lease
         .as_mut()
         .expect("descriptor owns its stage-2 lease")
-        .try_retire()
+        .try_retire(legacy_test_carrier_vm_custody())
         .expect("retire the descriptor's stage-2 lease");
     assert!(
         observed.load(Ordering::SeqCst),

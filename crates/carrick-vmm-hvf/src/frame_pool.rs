@@ -103,7 +103,7 @@ impl PreMappedFramePool {
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         // SAFETY: `host_mapping` stays live and exclusively owned by this
         // pool until its lease retires or the VM generation is destroyed.
-        let _mapping = unsafe {
+        let mapping = unsafe {
             stage2.map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
@@ -117,7 +117,7 @@ impl PreMappedFramePool {
                 map_rc.raw()
             ))
         })?;
-        lease.mark_mapped();
+        lease.mark_mapped(mapping);
 
         let compound_size = crate::trap::CowArmedRanges::COMPOUND_SIZE as usize;
         let num_compounds = pool_size / compound_size;
@@ -412,7 +412,7 @@ impl PreMappedRootSlotPool {
         let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
         // SAFETY: `host_mapping` stays live and exclusively owned by this
         // pool until its lease retires or the VM generation is destroyed.
-        let _mapping = unsafe {
+        let mapping = unsafe {
             stage2.map(
                 host_mapping.as_ptr().cast(),
                 base_ipa,
@@ -426,7 +426,7 @@ impl PreMappedRootSlotPool {
                 map_rc.raw()
             ))
         })?;
-        lease.mark_mapped();
+        lease.mark_mapped(mapping);
 
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let num_slots = pool_size / TWO_MIB;

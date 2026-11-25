@@ -23,12 +23,19 @@ fn el1_partial_discard_peer_retention_three_scales() {
         for index in 0..scale {
             let mut lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
             let (base, length) = lease.key();
-            lease.mark_mapped();
             let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 length as usize,
                 crate::host_mapping::HostMappingKind::FrameCow,
             )
             .unwrap();
+            let mapping = crate::trap::stage2_backend::test_stage2_map(
+                &custody,
+                host.as_ptr().cast(),
+                base,
+                length as usize,
+                3,
+            );
+            lease.mark_mapped(mapping);
             let address = host.as_ptr() as usize;
             unsafe {
                 std::ptr::write_bytes(host.as_ptr(), 0x7c, length as usize);
@@ -1245,7 +1252,14 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
     let mut region =
         prepare_exec_region_raw_in(&custody, &mapping).expect("prepare fixed exec root backing");
     let mut lease = GlobalFrameStage2Lease::fixed(root_slot.0, mapping.mapped_size);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        region.host_addr.cast(),
+        root_slot.0,
+        mapping.mapped_size as usize,
+        3,
+    );
+    lease.mark_mapped(stage2_mapping);
 
     publish_exec_region_host_owner_in(&custody, &mut region, lease, Some(root_slot))
         .expect("publish exec root under structural custody");
@@ -2576,7 +2590,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
     .unwrap();
     let host_addr = host_mapping.as_ptr();
     let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
-    lease.mark_mapped();
+    lease.mark_test_mapped_without_backend();
     let mut mapping = HvfMappedRegion {
         start: 0x002d_0000_0000,
         end: 0x002d_0000_4000,
@@ -3974,7 +3988,14 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
     };
 
     let mut region = prepare_exec_region_raw(&guest_mapping).expect("prepare exec region");
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        region.host_addr.cast(),
+        key.0,
+        key.1 as usize,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+    );
+    lease.mark_mapped(stage2_mapping);
     // Call the real production publication helper which registers the global
     // frame host owner and stamps region.owner_generation.
     let owner_generation =
@@ -4073,7 +4094,14 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
     let mut guest_mapping2 = guest_mapping;
     guest_mapping2.ipa_start = key2.0;
     let mut region2 = prepare_exec_region_raw(&guest_mapping2).expect("prepare second region");
-    lease2.mark_mapped();
+    let stage2_mapping2 = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        region2.host_addr.cast(),
+        key2.0,
+        key2.1 as usize,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+    );
+    lease2.mark_mapped(stage2_mapping2);
     let gen2 = publish_exec_region_host_owner(&mut region2, lease2)
         .expect("must register successor owner without collision");
     assert_ne!(gen2, owner_generation);
@@ -4456,9 +4484,14 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
     .expect("allocate kernel state host mapping");
     let host_addr = host.as_ptr() as usize;
 
-    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
-    assert_eq!(rc, 0);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        host.as_ptr().cast(),
+        key.0,
+        key.1 as usize,
+        7,
+    );
+    lease.mark_mapped(stage2_mapping);
 
     let owner_generation = register_global_frame_host_owner(
         lease,
@@ -4608,9 +4641,14 @@ fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_ho
     .expect("allocate kernel state host mapping");
     let host_addr = host.as_ptr() as usize;
 
-    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
-    assert_eq!(rc, 0);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        host.as_ptr().cast(),
+        key.0,
+        key.1 as usize,
+        7,
+    );
+    lease.mark_mapped(stage2_mapping);
 
     let owner_generation = register_global_frame_host_owner(
         lease,
@@ -4686,9 +4724,14 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
     )
     .expect("allocate kernel state host mapping");
 
-    let rc = unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, key.1 as usize, 7) };
-    assert_eq!(rc, 0);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        host.as_ptr().cast(),
+        key.0,
+        key.1 as usize,
+        7,
+    );
+    lease.mark_mapped(stage2_mapping);
 
     let owner_generation = register_global_frame_host_owner(
         lease,
@@ -5013,7 +5056,8 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
 fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_without_drop_hv() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let _stage2 = ScopedStage2MapTestStub::enable();
-    let custody = std::sync::Arc::new(CarrierVmCustody::new());
+    let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+    let g1 = custody.live_generation().expect("live fixture generation");
     let key = (0x7d00_1800_0000, 0x4000);
     let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
@@ -5022,26 +5066,21 @@ fn serial_host_mapped_setup_failure_explicitly_unmaps_before_backing_drop_withou
     .expect("allocate failed-setup backing");
     let host_addr = mapping.as_ptr() as usize;
     let mut lease = GlobalFrameStage2Lease::fixed(key.0, key.1);
-    assert_eq!(
-        unsafe {
-            inventory_stage2_map(
-                mapping.as_ptr().cast(),
-                key.0,
-                key.1 as usize,
-                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
-            )
-        },
-        0
-    );
-    lease.mark_mapped();
-
-    register_global_frame_host_owner_in(
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
         &custody,
-        lease,
-        mapping,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec),
-    )
-    .expect_err("vacant custody rejects mapped publication after explicit rollback");
+        mapping.as_ptr().cast(),
+        key.0,
+        key.1 as usize,
+        perms,
+    );
+    lease.mark_mapped(stage2_mapping);
+    custody
+        .begin_destroy(g1)
+        .expect("begin destroy so custody rejects publication");
+
+    register_global_frame_host_owner_in(&custody, lease, mapping, perms)
+        .expect_err("non-admitting custody rejects mapped publication after explicit rollback");
     assert!(!ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
     assert!(!alias_backing_is_live(host_addr));
 }
@@ -7525,7 +7564,14 @@ fn exit_task_holding_owned_lease(
         private_file_backing: None,
     };
     let mut region = prepare_exec_region_raw(&guest_mapping).expect("prepare exec region");
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        region.host_addr.cast(),
+        key.0,
+        key.1 as usize,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+    );
+    lease.mark_mapped(stage2_mapping);
     let generation =
         publish_exec_region_host_owner(&mut region, lease).expect("publish exec region host owner");
     let stage2_owner = mapped_region_stage2_owner_identity(&region)

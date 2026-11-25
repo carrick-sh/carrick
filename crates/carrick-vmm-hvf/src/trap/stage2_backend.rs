@@ -247,6 +247,27 @@ impl ScopedStage2MapTestStub {
     }
 }
 
+/// Map an extent through the admitting guard in unit tests using the stub
+/// backend if no outer `ScopedStage2MapTestStub` is already active.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_stage2_map(
+    custody: &CarrierVmCustody,
+    host: *mut std::ffi::c_void,
+    ipa: u64,
+    size: usize,
+    permissions: u64,
+) -> carrick_aarch64::stage2::custody::Stage2Mapping {
+    let already_enabled = STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled);
+    let _stub = (!already_enabled).then(ScopedStage2MapTestStub::enable);
+    let mut stage2 = custody
+        .admitting_stage2("test stage-2 map")
+        .expect("test custody must admit stage-2 mappings");
+    // SAFETY: test fixture passes live test host memory for the test extent.
+    unsafe { stage2_map(&mut stage2, host, ipa, size, permissions) }
+        .expect("test stage-2 map must succeed")
+}
+
 #[cfg(test)]
 impl Drop for ScopedStage2MapTestStub {
     fn drop(&mut self) {
@@ -883,6 +904,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
     let perms_raw: u64 = carrick_aarch64::stage2::stage2_perms_bits(perms);
     // Map at the IPA (identity for all but the Rosetta alias); the guest's
     // stage-1 page tables translate the VIRTUAL `guest_start` to this IPA.
+    let mut stage2 = custody.admitting_stage2("raw guest mapping")?;
     if emit_exec_backing_census {
         crate::probes::hvpatch_exec_stage2(carrick_observability::probes::HvpatchExecStage2::new(
             carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
@@ -892,13 +914,19 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             0,
         ));
     }
-    let r = unsafe {
-        inventory_stage2_map(
+    let map_result = unsafe {
+        stage2_map(
+            &mut stage2,
             host.cast::<std::ffi::c_void>(),
             mapping.ipa_start,
             size,
             perms_raw,
         )
+    };
+    drop(stage2);
+    let r = match &map_result {
+        Ok(_) => Stage2Status::SUCCESS,
+        Err(status) => *status,
     };
     if emit_exec_backing_census {
         crate::probes::hvpatch_exec_stage2(carrick_observability::probes::HvpatchExecStage2::new(
@@ -909,12 +937,15 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             r.raw() as i32,
         ));
     }
-    if r != 0 {
-        return Err(TrapError::Hypervisor(format!(
-            "hv_vm_map(ipa=0x{:x}, va=0x{:x}, size={size}) failed: 0x{r:x}",
-            mapping.ipa_start, mapping.guest_start
-        )));
-    }
+    let stage2_mapping = match map_result {
+        Ok(stage2_mapping) => stage2_mapping,
+        Err(r) => {
+            return Err(TrapError::Hypervisor(format!(
+                "hv_vm_map(ipa=0x{:x}, va=0x{:x}, size={size}) failed: 0x{r:x}",
+                mapping.ipa_start, mapping.guest_start
+            )));
+        }
+    };
     let sharing = if mapping.shared {
         GuestMappingSharing::GlobalShared
     } else {
@@ -964,7 +995,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         })?;
         let mut lease =
             GlobalFrameStage2Lease::fixed(region.physical_ipa, region.physical_size as u64);
-        lease.mark_mapped();
+        lease.mark_mapped(stage2_mapping);
         let owner = StructuralBackingOwner::new_in(
             custody,
             host_mapping,

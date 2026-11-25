@@ -2675,18 +2675,22 @@ pub(crate) fn perform_foreign_cow_transaction(
     let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
-        let map_result = unsafe {
-            inventory_stage2_map(
+        let mut stage2 = lease
+            .custody
+            .admitting_stage2("foreign-mm frame stage-2 map")
+            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        let stage2_mapping = unsafe {
+            stage2_map(
+                &mut stage2,
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
                 carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
-        };
-        if map_result != 0 {
-            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
-        new_lease.mark_mapped();
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        drop(stage2);
+        new_lease.mark_mapped(stage2_mapping);
     }
     #[cfg(test)]
     new_lease.mark_test_mapped_without_backend();
@@ -3206,18 +3210,22 @@ fn perform_foreign_guest_cow(
     let stage2_perms = carrick_hal::MemPerms::ReadWriteExec;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
-        let map_result = unsafe {
-            inventory_stage2_map(
+        let mut stage2 = lease
+            .custody
+            .admitting_stage2("foreign-mm frame stage-2 map")
+            .map_err(|_| Error::MutationFailed)?;
+        let stage2_mapping = unsafe {
+            stage2_map(
+                &mut stage2,
                 new_host_ptr.cast(),
                 new_physical_ipa,
                 CowArmedRanges::COMPOUND_SIZE as usize,
                 carrick_aarch64::stage2::stage2_perms_bits(stage2_perms),
             )
-        };
-        if map_result != 0 {
-            return Err(Error::MutationFailed);
         }
-        new_lease.mark_mapped();
+        .map_err(|_| Error::MutationFailed)?;
+        drop(stage2);
+        new_lease.mark_mapped(stage2_mapping);
     }
     #[cfg(test)]
     new_lease.mark_test_mapped_without_backend();

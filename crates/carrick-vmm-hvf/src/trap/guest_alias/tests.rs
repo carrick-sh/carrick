@@ -332,11 +332,14 @@ fn staged_alias(log: &Arc<parking_lot::Mutex<Vec<String>>>, length: u64, mm: u64
     )
     .unwrap();
     let host_addr = host.as_ptr() as usize;
-    assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), gpa, length as usize, 7) },
-        0
+    let mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        host.as_ptr().cast(),
+        gpa,
+        length as usize,
+        7,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(mapping);
     let generation = register_global_frame_host_owner_in(&custody, lease, host, 7).unwrap();
     let provenance = carrick_hal::FrameInventoryProvenance::from_kernel_entropy(PROVENANCE);
     let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(

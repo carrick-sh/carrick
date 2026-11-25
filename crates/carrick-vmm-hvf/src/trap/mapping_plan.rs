@@ -622,21 +622,27 @@ impl HvfVmState {
                         mapping,
                     )?;
                     let install = exec_stage2_install(mapping, &region, false);
-                    let rc = unsafe {
-                        inventory_stage2_map(
+                    let mut stage2 = state
+                        .carrier_foreign_mm_transport
+                        .custody
+                        .admitting_stage2("map carrier root extent")?;
+                    let stage2_mapping = unsafe {
+                        stage2_map(
+                            &mut stage2,
                             install.host.cast(),
                             install.ipa,
                             install.size,
                             install.perms,
                         )
-                    };
-                    if rc != 0 {
-                        return Err(TrapError::Hypervisor(format!(
+                    }
+                    .map_err(|rc| {
+                        TrapError::Hypervisor(format!(
                             "map carrier root IPA 0x{:x} size {} failed: 0x{rc:x}",
                             install.ipa, install.size
-                        )));
-                    }
-                    lease.mark_mapped();
+                        ))
+                    })?;
+                    drop(stage2);
+                    lease.mark_mapped(stage2_mapping);
                     publish_exec_region_host_owner_in(
                         &state.carrier_foreign_mm_transport.custody,
                         &mut region,

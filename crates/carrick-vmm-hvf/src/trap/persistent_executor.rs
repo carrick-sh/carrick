@@ -586,7 +586,7 @@ impl Drop for PersistentCarrierMappings {
                     lease.forget_backend_mapping();
                     drop(lease);
                 } else {
-                    lease.try_retire().unwrap_or_else(|error| {
+                    lease.try_retire(&self.custody).unwrap_or_else(|error| {
                         carrick_fatal!(
                             "hvpatch::host_alias",
                             "retire persistent carrier stage-2 lease failed at IPA 0x{:x} size {}: {error}",

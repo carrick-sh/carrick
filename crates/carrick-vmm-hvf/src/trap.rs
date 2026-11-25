@@ -4618,7 +4618,7 @@ fn abort_prepared_task_and_carrier(
                 "rollback prepared HVPatch inventory before carrier teardown: {error}"
             );
         });
-    let state_result = state.abort();
+    let state_result = state.abort(custody.as_deref());
     let mut owner_rollback_error = None;
     if let Some(custody) = custody.as_ref() {
         for mapping in &task.mappings {
@@ -6815,21 +6815,37 @@ impl HvpatchCarrierTaskStateDirectory {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchCarrierTaskState {
-    fn abort(self) -> Result<(), TrapError> {
+    fn abort(self, custody: Option<&CarrierVmCustody>) -> Result<(), TrapError> {
         match self {
             Self::Sibling { .. } | Self::SharedProcess { .. } => Ok(()),
             Self::Process {
                 mut stage2_leases, ..
             } => {
+                let Some(custody) = custody else {
+                    if stage2_leases.iter().any(|lease| lease.mapping.is_some()) {
+                        return Err(TrapError::Hypervisor(
+                            "cannot retire mapped stage-2 lease without carrier custody".to_owned(),
+                        ));
+                    }
+                    return Ok(());
+                };
                 for lease in &mut stage2_leases {
-                    lease.try_retire()?;
+                    lease.try_retire(custody)?;
                 }
                 Ok(())
             }
             #[cfg(test)]
             Self::LeaseTest { mut stage2_leases } => {
+                let Some(custody) = custody else {
+                    if stage2_leases.iter().any(|lease| lease.mapping.is_some()) {
+                        return Err(TrapError::Hypervisor(
+                            "cannot retire mapped stage-2 lease without carrier custody".to_owned(),
+                        ));
+                    }
+                    return Ok(());
+                };
                 for lease in &mut stage2_leases {
-                    lease.try_retire()?;
+                    lease.try_retire(custody)?;
                 }
                 Ok(())
             }
@@ -7022,50 +7038,60 @@ impl HvfVmState {
                     }
                 )
             {
-                let rc = unsafe {
-                    inventory_stage2_map(
-                        mapping.physical_host_addr.cast(),
-                        mapping.physical_ipa,
-                        mapping.physical_size,
-                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                    )
-                };
-                if rc != 0 {
-                    drop(mapping.stage2_lease.take());
-                    drop(mapped);
-                    report_stage2_map_refusal(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        mapping.physical_host_addr as usize,
-                        mapping.physical_ipa,
-                        mapping.physical_size,
-                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                        rc.raw(),
-                    );
-                    let error = TrapError::ChildMapFailed {
-                        host_addr: mapping.physical_host_addr as u64,
-                        guest_start: mapping.physical_ipa,
-                        size: mapping.physical_size,
-                        code: rc.raw(),
-                    };
-                    drop(mm_root_stage2.take());
-                    if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        &mut stage2_leases,
-                        &registered_global_owners,
-                        &structural_identities,
-                        structural_owners,
-                    ) {
-                        fail_stop_partial_process_stage2_rollback(
-                            "task-only mapping composition",
-                            &TrapError::Hypervisor(format!(
-                                "{error}; exact rollback failed: {rollback_error}"
-                            )),
-                        );
+                let map_result = {
+                    let mut stage2 = plan
+                        .carrier_foreign_mm_transport
+                        .custody
+                        .admitting_stage2("task-only stage-2 map")?;
+                    unsafe {
+                        stage2_map(
+                            &mut stage2,
+                            mapping.physical_host_addr.cast(),
+                            mapping.physical_ipa,
+                            mapping.physical_size,
+                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                        )
                     }
-                    return Err(error);
-                }
+                };
+                let stage2_mapping = match map_result {
+                    Ok(stage2_mapping) => stage2_mapping,
+                    Err(rc) => {
+                        drop(mapping.stage2_lease.take());
+                        drop(mapped);
+                        report_stage2_map_refusal(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            mapping.physical_host_addr as usize,
+                            mapping.physical_ipa,
+                            mapping.physical_size,
+                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                            rc.raw(),
+                        );
+                        let error = TrapError::ChildMapFailed {
+                            host_addr: mapping.physical_host_addr as u64,
+                            guest_start: mapping.physical_ipa,
+                            size: mapping.physical_size,
+                            code: rc.raw(),
+                        };
+                        drop(mm_root_stage2.take());
+                        if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            &mut stage2_leases,
+                            &registered_global_owners,
+                            &structural_identities,
+                            structural_owners,
+                        ) {
+                            fail_stop_partial_process_stage2_rollback(
+                                "task-only mapping composition",
+                                &TrapError::Hypervisor(format!(
+                                    "{error}; exact rollback failed: {rollback_error}"
+                                )),
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped();
+                    lease.mark_mapped(stage2_mapping);
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
@@ -7496,53 +7522,63 @@ impl HvfVmState {
                     }
                 )
             {
-                let rc = unsafe {
-                    inventory_stage2_map(
-                        mapping.physical_host_addr.cast(),
-                        mapping.physical_ipa,
-                        mapping.physical_size,
-                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                    )
-                };
-                if rc != 0 {
-                    report_stage2_map_refusal(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        mapping.physical_host_addr as usize,
-                        mapping.physical_ipa,
-                        mapping.physical_size,
-                        carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                        rc.raw(),
-                    );
-                    let error = TrapError::ChildMapFailed {
-                        host_addr: mapping.physical_host_addr as u64,
-                        guest_start: mapping.physical_ipa,
-                        size: mapping.physical_size,
-                        code: rc.raw(),
-                    };
-                    drop(mapping.stage2_lease.take());
-                    let mut prior_stage2_leases = mapped
-                        .iter_mut()
-                        .filter_map(|mapping| mapping.stage2_lease.take())
-                        .collect::<Vec<_>>();
-                    drop(mapped);
-                    if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        &mut prior_stage2_leases,
-                        &registered_global_owners,
-                        &structural_identities,
-                        structural_owners,
-                    ) {
-                        fail_stop_partial_process_stage2_rollback(
-                            "full-VM mapping composition",
-                            &TrapError::Hypervisor(format!(
-                                "{error}; exact rollback failed: {rollback_error}"
-                            )),
-                        );
+                let map_result = {
+                    let mut stage2 = plan
+                        .carrier_foreign_mm_transport
+                        .custody
+                        .admitting_stage2("full-VM stage-2 map")?;
+                    unsafe {
+                        stage2_map(
+                            &mut stage2,
+                            mapping.physical_host_addr.cast(),
+                            mapping.physical_ipa,
+                            mapping.physical_size,
+                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                        )
                     }
-                    return Err(error);
-                }
+                };
+                let stage2_mapping = match map_result {
+                    Ok(stage2_mapping) => stage2_mapping,
+                    Err(rc) => {
+                        report_stage2_map_refusal(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            mapping.physical_host_addr as usize,
+                            mapping.physical_ipa,
+                            mapping.physical_size,
+                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                            rc.raw(),
+                        );
+                        let error = TrapError::ChildMapFailed {
+                            host_addr: mapping.physical_host_addr as u64,
+                            guest_start: mapping.physical_ipa,
+                            size: mapping.physical_size,
+                            code: rc.raw(),
+                        };
+                        drop(mapping.stage2_lease.take());
+                        let mut prior_stage2_leases = mapped
+                            .iter_mut()
+                            .filter_map(|mapping| mapping.stage2_lease.take())
+                            .collect::<Vec<_>>();
+                        drop(mapped);
+                        if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            &mut prior_stage2_leases,
+                            &registered_global_owners,
+                            &structural_identities,
+                            structural_owners,
+                        ) {
+                            fail_stop_partial_process_stage2_rollback(
+                                "full-VM mapping composition",
+                                &TrapError::Hypervisor(format!(
+                                    "{error}; exact rollback failed: {rollback_error}"
+                                )),
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped();
+                    lease.mark_mapped(stage2_mapping);
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =

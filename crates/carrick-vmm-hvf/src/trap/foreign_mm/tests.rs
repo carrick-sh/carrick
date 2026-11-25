@@ -116,11 +116,14 @@ fn inventoried_cow_source_fixture(
     .expect("allocate COW source host backing");
     let host_addr = host.as_ptr() as usize;
     unsafe { host.as_ptr().write_bytes(0xa5, OWNER_LEN) };
-    assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
-        0,
+    let mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        host.as_ptr().cast(),
+        key.0,
+        OWNER_LEN,
+        3,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(mapping);
     let generation = register_global_frame_host_owner_in(&custody, lease, host, 3)
         .expect("register COW source owner");
 
@@ -4263,11 +4266,14 @@ fn serial_host_global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_r
     .expect("allocate host mapping for test");
     let host_addr = mapping.as_ptr() as usize;
     let mut lease = GlobalFrameStage2Lease::fixed(ipa, size as u64);
-    assert_eq!(
-        unsafe { inventory_stage2_map(mapping.as_ptr().cast(), ipa, size, 7) },
-        0
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        mapping.as_ptr().cast(),
+        ipa,
+        size,
+        7,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(stage2_mapping);
     let generation = register_global_frame_host_owner(lease, mapping, 7)
         .expect("register global frame host owner");
     let owner = global_frame_host_owners()
@@ -6476,7 +6482,9 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         "retire child-private vvar COW fixture: {retired:?}",
     );
     drop(child_private_owner);
-    carrier.abort().expect("retire child carrier fixture");
+    carrier
+        .abort(Some(&transport.custody))
+        .expect("retire child carrier fixture");
     drop(projected);
     drop(parent);
     drop(vvar_owner);
@@ -6905,7 +6913,9 @@ fn initial_fixed_mapping_composes_through_first_fork_preparation() {
     child
         .rollback_unpublished_inventory()
         .expect("rollback first-fork inventory");
-    carrier.abort().expect("retire first-fork fixture leases");
+    carrier
+        .abort(Some(&transport.custody))
+        .expect("retire first-fork fixture leases");
     drop(child);
     drop(projected);
     drop(region);
@@ -7108,7 +7118,9 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
     child
         .rollback_unpublished_inventory()
         .expect("rollback first-fork inventory");
-    carrier.abort().expect("retire first-fork fixture leases");
+    carrier
+        .abort(Some(&transport.custody))
+        .expect("retire first-fork fixture leases");
     drop(child);
     drop(projected);
     drop(region);
@@ -7420,7 +7432,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         .rollback_unpublished_inventory()
         .expect("rollback grandchild fixture inventory");
     grandchild_carrier
-        .abort()
+        .abort(Some(&transport.custody))
         .expect("retire grandchild fixture leases");
     let (ledger, mapping_ids) = match &prepared.inventory {
         HvpatchTaskInventoryAuthority::ProcessPrepared { ledger, staged, .. } => (
@@ -7477,7 +7489,9 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     prepared
         .rollback_unpublished_inventory()
         .expect("rollback copied-child fixture inventory");
-    carrier.abort().expect("retire copied-child fixture leases");
+    carrier
+        .abort(Some(&transport.custody))
+        .expect("retire copied-child fixture leases");
     assert!(
         retained.is_ok(),
         "copied child must retain every authenticated borrowed structural owner: {retained:?}"
@@ -7645,9 +7659,14 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rx_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rx global-frame IPA");
     let parent_rx_ipa = parent_rx_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_rx_addr.cast(), parent_rx_ipa, 0x4000, 5) };
-    assert_eq!(rc, 0);
-    parent_rx_lease.mark_mapped();
+    let parent_rx_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &carrier_foreign_mm_transport.custody,
+        parent_rx_addr.cast(),
+        parent_rx_ipa,
+        0x4000,
+        5,
+    );
+    parent_rx_lease.mark_mapped(parent_rx_mapping);
     let parent_rx_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_rx_lease,
@@ -7669,9 +7688,14 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_rw_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent rw global-frame IPA");
     let parent_rw_ipa = parent_rw_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_rw_addr.cast(), parent_rw_ipa, 0x4000, 3) };
-    assert_eq!(rc, 0);
-    parent_rw_lease.mark_mapped();
+    let parent_rw_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &carrier_foreign_mm_transport.custody,
+        parent_rw_addr.cast(),
+        parent_rw_ipa,
+        0x4000,
+        3,
+    );
+    parent_rw_lease.mark_mapped(parent_rw_mapping);
     let parent_rw_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_rw_lease,
@@ -7693,9 +7717,14 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let mut parent_cow_lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000)
         .expect("reserve parent COW global-frame IPA");
     let parent_cow_ipa = parent_cow_lease.base;
-    let rc = unsafe { inventory_stage2_map(parent_cow_addr.cast(), parent_cow_ipa, 0x4000, 3) };
-    assert_eq!(rc, 0);
-    parent_cow_lease.mark_mapped();
+    let parent_cow_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &carrier_foreign_mm_transport.custody,
+        parent_cow_addr.cast(),
+        parent_cow_ipa,
+        0x4000,
+        3,
+    );
+    parent_cow_lease.mark_mapped(parent_cow_mapping);
     let parent_cow_gen = register_global_frame_host_owner_in(
         &carrier_foreign_mm_transport.custody,
         parent_cow_lease,
@@ -8667,9 +8696,14 @@ fn serial_host_releasable_stage2_lease_lifecycle_and_deterministic_allocator_reu
         std::ptr::copy_nonoverlapping(payload.as_ptr(), mapping.as_ptr(), payload.len());
     }
 
-    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), allocated_ipa, size, 7) };
-    assert_eq!(rc, 0);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        mapping.as_ptr().cast(),
+        allocated_ipa,
+        size,
+        7,
+    );
+    lease.mark_mapped(stage2_mapping);
     assert!(
         ScopedStage2MapTestStub::is_mapped(allocated_ipa, size),
         "stage-2 mapping must be recorded in backend audit state"
@@ -8903,9 +8937,14 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     )
     .expect("allocate backing");
     let host_addr = mapping.as_ptr() as usize;
-    let rc = unsafe { inventory_stage2_map(mapping.as_ptr().cast(), extent_base, size, 7) };
-    assert_eq!(rc, 0);
-    lease.mark_mapped();
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        mapping.as_ptr().cast(),
+        extent_base,
+        size,
+        7,
+    );
+    lease.mark_mapped(stage2_mapping);
     let generation = register_global_frame_host_owner(lease, mapping, 7)
         .expect("register global frame host owner");
 
@@ -9152,11 +9191,14 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
     )
     .expect("allocate host backing b");
     let host_addr_b = host_b.as_ptr() as usize;
-    assert_eq!(
-        unsafe { inventory_stage2_map(host_b.as_ptr().cast(), key_b.0, OWNER_LEN, 3) },
-        0,
+    let stage2_mapping_b = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        host_b.as_ptr().cast(),
+        key_b.0,
+        OWNER_LEN,
+        3,
     );
-    lease_b.mark_mapped();
+    lease_b.mark_mapped(stage2_mapping_b);
     let gen_b = register_global_frame_host_owner_in(&custody, lease_b, host_b, 3)
         .expect("register owner b");
 
@@ -9530,11 +9572,14 @@ fn register_replacement_compound_owner(
     )
     .expect("allocate replacement compound backing");
     let host_addr = host.as_ptr() as usize;
-    assert_eq!(
-        unsafe { inventory_stage2_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
-        0,
+    let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        custody,
+        host.as_ptr().cast(),
+        key.0,
+        OWNER_LEN,
+        3,
     );
-    lease.mark_mapped();
+    lease.mark_mapped(stage2_mapping);
     let generation = register_global_frame_host_owner_in(custody, lease, host, 3)
         .expect("register replacement compound owner");
     (key, host_addr, generation)
@@ -10263,11 +10308,14 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
         .expect("reserve parent global-frame IPA");
     let parent_ipa = parent_lease.base;
     assert!(is_reusable_global_frame_extent(parent_ipa, parent_len));
-    assert_eq!(
-        unsafe { inventory_stage2_map(parent_addr.cast(), parent_ipa, parent_len as usize, 3) },
-        0
+    let parent_stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        parent_addr.cast(),
+        parent_ipa,
+        parent_len as usize,
+        3,
     );
-    parent_lease.mark_mapped();
+    parent_lease.mark_mapped(parent_stage2_mapping);
     let parent_gen = register_global_frame_host_owner_in(&custody, parent_lease, parent_host, 3)
         .expect("register parent heap owner");
     assert_ne!(parent_gen, 0);
@@ -10663,19 +10711,15 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
         crate::host_mapping::HostMappingKind::PrivateAnon,
     )
     .expect("allocate unrelated structural sentinel");
-    assert_eq!(
-        unsafe {
-            inventory_stage2_map(
-                sentinel_host.as_ptr().cast(),
-                sentinel_ipa,
-                sentinel_size,
-                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
-            )
-        },
-        0,
+    let sentinel_mapping = crate::trap::stage2_backend::test_stage2_map(
+        &custody,
+        sentinel_host.as_ptr().cast(),
+        sentinel_ipa,
+        sentinel_size,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
     let mut sentinel_lease = GlobalFrameStage2Lease::fixed(sentinel_ipa, sentinel_size as u64);
-    sentinel_lease.mark_mapped();
+    sentinel_lease.mark_mapped(sentinel_mapping);
     let sentinel_owner = StructuralBackingOwner::new_in(
         &custody,
         sentinel_host,
@@ -11226,10 +11270,14 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     )
     .expect("allocate host mapping for retirement failure test");
     let host_addr_retire = mapping_retire.as_ptr() as usize;
-    let rc =
-        unsafe { inventory_stage2_map(mapping_retire.as_ptr().cast(), ipa_retire, size_retire, 7) };
-    assert_eq!(rc, 0);
-    lease_retire.mark_mapped();
+    let stage2_mapping_retire = crate::trap::stage2_backend::test_stage2_map(
+        legacy_test_carrier_vm_custody(),
+        mapping_retire.as_ptr().cast(),
+        ipa_retire,
+        size_retire,
+        7,
+    );
+    lease_retire.mark_mapped(stage2_mapping_retire);
     let observed_live_retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
     lease_retire.drop_backing_audit = Some((host_addr_retire, Arc::clone(&observed_live_retire)));
 
@@ -11819,7 +11867,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let original_host = root_mapping.as_mut_ptr();
     let root_epoch = next_structural_epoch().expect("root structural epoch");
     let mut root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    root_lease.mark_mapped();
+    root_lease.mark_pre_mapped();
     let root_owner = StructuralBackingOwner::new_pooled_root_in(
         &transport.custody,
         root_mapping,
