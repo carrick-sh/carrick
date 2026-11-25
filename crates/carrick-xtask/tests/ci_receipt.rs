@@ -1475,6 +1475,66 @@ fn an_integration_target_retirement_is_not_checked_in_the_el1_native_receipt() {
 }
 
 #[test]
+fn issue_3027_el1_native_skips_unobserved_host_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
+    for tree in [&base, &cand] {
+        write_el1_linux_tree(tree, "#[test] fn lib_ok() {}", "not Rust !");
+    }
+    let r = el1_native_receipt(&["carrick_el1_linux::lib_ok"]);
+    let entry = retirement("x86_production_forward::old_host_test", None);
+    let diff = diff_with_retired(&r, &r, std::slice::from_ref(&entry), &base, &cand).unwrap();
+    assert!(diff.new.is_empty());
+    assert!(diff.warnings.is_empty());
+
+    let observed = el1_native_receipt(&["x86_production_forward::another_host_test"]);
+    for (baseline, candidate) in [(&observed, &r), (&r, &observed)] {
+        let error = diff_with_retired(
+            baseline,
+            candidate,
+            std::slice::from_ref(&entry),
+            &base,
+            &cand,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot parse"), "{error}");
+    }
+}
+
+#[test]
+fn issue_3027_retirement_finds_tests_in_followed_module_descendants() {
+    let dir = path_module_fixture(SIBLING_PATH_MOD, "mod child;");
+    for (path, source) in [
+        ("child.rs", "mod nested;"),
+        ("child/nested.rs", "#[test] fn nested_test() {}"),
+    ] {
+        write_source(dir.path(), &format!("crates/shared/src/{path}"), source);
+    }
+    let test = "mailbox_tests::child::nested::nested_test";
+    assert!(tree_has_test(dir.path(), "example", test).unwrap());
+    let inventory = example_inventory(dir.path());
+    assert_eq!(inventory.unresolved, None, "{inventory:?}");
+    assert!(
+        inventory
+            .tests
+            .contains_key(&("example".into(), test.into()))
+    );
+}
+
+#[test]
+fn issue_3027_retirement_follows_the_image_build_scripts_modules() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        tree_has_test(
+            &root,
+            "el1_image_sysroot",
+            "image_build::frame_budget::tests::native_backing_reply_keeps_imported_headroom",
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn a_lib_test_retirement_still_needs_its_replacement_in_the_el1_native_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let (base, cand) = (dir.path().join("base"), dir.path().join("cand"));
