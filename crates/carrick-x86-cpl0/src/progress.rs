@@ -66,6 +66,23 @@ core::arch::global_asm!(
     scratch = const PROGRESS_STATE + core::mem::offset_of!(ProgressState, scratch) as u64,
 );
 
+// A reserved, executable 24-byte slot for the KVM high-PC witness
+// (`cpl0_progress.rs`): it patches three 8-byte `jmp rel32` stubs here and
+// points the header's entries at them. `link.ld` places this section after
+// every other `.text` input, so the slot sits at the top of the code segment
+// inside the image's file bytes, rather than in whatever trailing page slack
+// `.text` happens to leave. `int3` fill traps if the slot is ever entered
+// unpatched.
+core::arch::global_asm!(
+    ".section .progress_trampoline, \"ax\"",
+    ".balign 16",
+    ".global carrick_progress_trampoline",
+    ".type carrick_progress_trampoline, @function",
+    "carrick_progress_trampoline:",
+    ".fill 24, 1, 0xcc",
+    ".size carrick_progress_trampoline, 24",
+);
+
 const fn state() -> *mut ProgressState {
     PROGRESS_STATE as *mut ProgressState
 }

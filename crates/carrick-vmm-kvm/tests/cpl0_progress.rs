@@ -240,37 +240,35 @@ fn patched_progress_image(
         u64_at(&bytes, hdr_off + 24),
     ];
     if high_trampoline {
-        let text_ph = phdrs
+        // The fixture reserves this slot (`carrick-x86-cpl0/src/progress.rs`,
+        // placed last in `.text` by `link.ld`), so patching it moves no
+        // segment bounds and depends on no trailing page slack.
+        let elf = goblin::elf::Elf::parse(&bytes).expect("fixture ELF symbols");
+        let slot = elf
+            .syms
             .iter()
-            .copied()
-            .find(|&p| {
-                u32_at(&bytes, p) == 1
-                    && (u32_at(&bytes, p + 4) & 1) != 0
-                    && u64_at(&bytes, p + 0x10) + u64_at(&bytes, p + 0x20) >= 0xffff_ffff_800f_0000
-            })
-            .expect("executable PT_LOAD spanning past 960 KiB");
-        let seg_off = u64_at(&bytes, text_ph + 0x08);
-        let seg_va = u64_at(&bytes, text_ph + 0x10);
-        let seg_filesz = u64_at(&bytes, text_ph + 0x20);
-        let seg_memsz = u64_at(&bytes, text_ph + 0x28);
-        let end_va = seg_va + seg_filesz;
-        let tramp_va = (end_va + 15) & !15;
-        let page_end = (end_va + 0xfff) & !0xfff;
-        assert!(tramp_va >= 0xffff_ffff_800f_0000);
+            .find(|sym| elf.strtab.get_at(sym.st_name) == Some("carrick_progress_trampoline"))
+            .expect("fixture reserves carrick_progress_trampoline");
+        let tramp_va = slot.st_value;
+        assert_eq!(slot.st_size, 24, "three 8-byte jump stubs");
+        assert!(tramp_va >= 0xffff_ffff_800f_0000, "slot above 960 KiB");
         assert!(X86_CPL0_SUPERVISOR_IMAGE_EXTENT.contains(&(tramp_va + 23)));
-        assert!(tramp_va + 24 <= page_end, "page padding exhausted");
-        let tramp_off = usize::try_from(seg_off + (tramp_va - seg_va)).unwrap();
-        for &p in &phdrs {
-            if p == text_ph || u32_at(&bytes, p) != 1 {
-                continue;
-            }
-            let o_start = usize::try_from(u64_at(&bytes, p + 0x08)).unwrap();
-            let o_end = o_start + usize::try_from(u64_at(&bytes, p + 0x20)).unwrap();
-            assert!(
-                tramp_off + 24 <= o_start || o_end <= tramp_off,
-                "trampoline overlaps another PT_LOAD file range"
-            );
-        }
+        let text = elf
+            .program_headers
+            .iter()
+            .find(|p| {
+                p.p_type == goblin::elf::program_header::PT_LOAD
+                    && p.is_executable()
+                    && p.p_vaddr <= tramp_va
+                    && tramp_va + 24 <= p.p_vaddr + p.p_filesz
+            })
+            .expect("slot inside an executable PT_LOAD's file bytes");
+        let tramp_off = usize::try_from(text.p_offset + (tramp_va - text.p_vaddr)).unwrap();
+        assert_eq!(
+            bytes[tramp_off..tramp_off + 24],
+            [0xcc; 24],
+            "reserved slot is int3 fill"
+        );
         for (i, target) in entries.iter_mut().enumerate() {
             let stub_va = tramp_va + (i as u64) * 8;
             let stub_off = tramp_off + i * 8;
@@ -280,10 +278,6 @@ fn patched_progress_image(
             bytes[stub_off + 1..stub_off + 5].copy_from_slice(&rel.to_le_bytes());
             *target = stub_va;
         }
-        let new_filesz = tramp_va + 24 - seg_va;
-        let new_memsz = seg_memsz.max(new_filesz);
-        bytes[text_ph + 0x20..text_ph + 0x28].copy_from_slice(&new_filesz.to_le_bytes());
-        bytes[text_ph + 0x28..text_ph + 0x30].copy_from_slice(&new_memsz.to_le_bytes());
     }
     if let Some((slot, addr)) = override_slot {
         entries[slot] = addr;
