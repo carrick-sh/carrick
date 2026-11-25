@@ -34,24 +34,22 @@ Linux: every MAP_SHARED mapping of a file, in any process, reaches the same
 page-cache pages, so a write through one is at once in the file and in every
 other mapping, with or without msync. Carrick serves these mappings as
 windows: a carrier's view of the host file's page cache in fixed 2 MiB
-chunks, with no copy and no write-back state. One neutral record
-(carrick_core::mm::window) decides who reaches a window and which offsets
-may be published: an edge per MM, counted per mapping, so a chunk mapped
-twice keeps its edge until both go; a fault at or past the file's end is
-SIGBUS; a shrink is a state in which faults past the new size park and a
-second size change is Busy until the host result returns the file to Live
-at the new size, or the old one if the host refused. The KVM fixture runs
-the Go linker's sequence, two live processes sharing one writable file
-mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED with msync and a read by path,
-a chunk mapped twice, a /dev/zero mapping shared with a child, mprotect
-read-only and back over faulted window pages, the window's rw-s maps line
-and SIGBUS past the end of the file, as the root and as a forked child, and
-compares every row with native Linux.
+chunks, with no copy and no write-back state. One neutral model
+(carrick_core::mm::window) specifies chunk geometry, per-mapping edges,
+SIGBUS past EOF, and shrink/park/epoch state transitions; A1 production
+enforces shrink safety through the host-inode size fence (carrick_vfs::host_size)
+and carrier window-slot custody (A3 will wire live shrink revocation). The
+active KVM fixture runs the Go linker's sequence, two live processes sharing
+one writable file mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED with a read by
+path, a chunk mapped twice, mprotect read-only and back over faulted window
+pages, and SIGBUS past EOF (root and forked child), comparing every active
+row with native Linux; the three separate KVM cases for /dev/zero, msync,
+and /proc/self/maps rw-s remain ignored pending #2958, A3, and #2808.
 """
 
 [bindings]
 vm_free = [
-  "carrick-core::mm::window::tests; the neutral record: per-mapping edges (C3), SIGBUS past EOF, Shrinking parks faults past the new size including from a mapping made mid-shrink, a second size change is Busy, a failed shrink keeps the old size, stale epochs are refused",
+  "carrick-core::mm::window::tests; neutral model only: per-mapping edges (C3), SIGBUS past EOF, Shrinking parks faults past the new size including from a mapping made mid-shrink, a second size change is Busy, a failed shrink keeps the old size, stale epochs are refused (production A1 enforces shrink refusal via host_size + slot custody)",
 ]
 embed = [
   "carrick-cli::x86_kvm_run::mounted_static_x86_writable_shared_file_mapping_matches_native (red on main: every writable MAP_SHARED mmap is ENOSYS)",

@@ -5720,6 +5720,9 @@ impl FsBackend for HostFsBackend {
             };
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let _write_guard = crate::host_size::admit_write(std::os::fd::AsFd::as_fd(&file));
+        #[cfg(any(test, feature = "test-support"))]
+        crate::host_size::test_resize_hook::pause_before_write_all();
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         self.clear_whiteout_normalized(&normalized);
         self.coherence.bump_generation();

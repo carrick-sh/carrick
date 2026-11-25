@@ -854,6 +854,20 @@ impl Vfs for InMemoryFileVfs {
         Ok(())
     }
 
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        if self.readonly {
+            return Err(LINUX_EROFS);
+        }
+        let norm = normalize_path(path);
+        let nodes = self.nodes.read();
+        match nodes.get(&norm) {
+            Some(InMemNode::File { .. } | InMemNode::HostFd { .. }) => Ok(()),
+            Some(InMemNode::Directory { .. }) => Err(LINUX_EISDIR),
+            Some(InMemNode::Symlink { .. }) => Err(LINUX_EINVAL),
+            None => Err(LINUX_ENOENT),
+        }
+    }
+
     fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);
@@ -1174,6 +1188,13 @@ impl Vfs for LayeredVfs {
         self.layers[0].set_times(path, atime, mtime, nofollow)
     }
 
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        if self.layers.is_empty() {
+            return Err(LINUX_EROFS);
+        }
+        self.layers[0].check_truncate(path)
+    }
+
     fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
         if self.layers.is_empty() {
             return Err(LINUX_EROFS);
@@ -1441,6 +1462,14 @@ impl Vfs for FilterVfs {
         }
         let mapped = self.map_path(path)?;
         self.inner.set_times(&mapped, atime, mtime, nofollow)
+    }
+
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        if self.readonly {
+            return Err(LINUX_EROFS);
+        }
+        let mapped = self.map_path(path)?;
+        self.inner.check_truncate(&mapped)
     }
 
     fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
@@ -1779,6 +1808,10 @@ impl Vfs for RecordingVfs {
             result: res.map(|_| VfsOpOutcome::Unit),
         });
         res
+    }
+
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        self.inner.check_truncate(path)
     }
 
     fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
@@ -2147,5 +2180,131 @@ mod tests {
         assert_eq!(filtered.read_file("/data.txt").unwrap(), b"HELLO WORLD");
         let meta = filtered.lookup("/data.txt").unwrap();
         assert_eq!(meta.mode, 0o777);
+    }
+
+    #[test]
+    fn writable_embed_mounts_support_sys_truncate_through_dispatcher() {
+        use carrick_guest_mem::GuestMemory;
+        use carrick_kernel::compat::{CompatReporter, SyscallArgs};
+        use carrick_kernel::dispatch::{
+            DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest,
+        };
+
+        const BASE: u64 = 0x1000_0000;
+        const PATH: u64 = BASE + 256;
+        let sys_truncate = carrick_abi::syscall::nr::TRUNCATE.raw();
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mem_vfs = InMemoryFileVfs::new();
+        mem_vfs.add_dir("/mem").unwrap();
+        mem_vfs.add_file("/mem/file.txt", b"abcdefgh").unwrap();
+        mem_vfs.add_dir("/mem/dir").unwrap();
+        dispatcher.register_mount("/mem", Box::new(mem_vfs));
+
+        let ro_mem_rw = InMemoryFileVfs::new();
+        ro_mem_rw.add_dir("/romem").unwrap();
+        ro_mem_rw.add_file("/romem/ro.txt", b"readonly").unwrap();
+        let ro_mem = ro_mem_rw.readonly(true);
+        dispatcher.register_mount("/romem", Box::new(ro_mem));
+
+        let upper = InMemoryFileVfs::new();
+        upper.add_dir("/layered").unwrap();
+        upper.add_file("/layered/top.txt", b"upper-data").unwrap();
+        let lower_rw = InMemoryFileVfs::new();
+        lower_rw.add_dir("/layered").unwrap();
+        lower_rw
+            .add_file("/layered/low.txt", b"lower-data")
+            .unwrap();
+        let layered = LayeredVfs::new(vec![Box::new(upper), Box::new(lower_rw.readonly(true))]);
+        dispatcher.register_mount("/layered", Box::new(layered));
+
+        let ro_top = InMemoryFileVfs::new().readonly(true);
+        let rw_bot = InMemoryFileVfs::new();
+        rw_bot.add_dir("/layered_ro").unwrap();
+        rw_bot
+            .add_file("/layered_ro/bot.txt", b"bottom-data")
+            .unwrap();
+        let layered_ro = LayeredVfs::new(vec![Box::new(ro_top), Box::new(rw_bot)]);
+        dispatcher.register_mount("/layered_ro", Box::new(layered_ro));
+
+        let filtered_inner = InMemoryFileVfs::new();
+        filtered_inner.add_file("/real.txt", b"123456").unwrap();
+        let filtered = FilterVfs::new(Box::new(filtered_inner)).with_path_rewrite(|p| {
+            if p == "/filt/alias.txt" {
+                Some("/real.txt".to_string())
+            } else {
+                Some(p.to_string())
+            }
+        });
+        dispatcher.register_mount("/filt", Box::new(filtered));
+
+        let bind_dir = tempfile::tempdir().unwrap();
+        std::fs::write(bind_dir.path().join("bind.txt"), b"bind-bytes").unwrap();
+        let rec = RecordingVfs::new(
+            Box::new(carrick_vfs::BindVfs::new("/rec", bind_dir.path(), false)),
+            16,
+        );
+        dispatcher.register_mount("/rec", Box::new(rec));
+
+        let mut mem = LinearMemory::new(BASE, vec![0; 4096]);
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        let mut call_truncate = |path: &str, len: u64| -> DispatchOutcome {
+            let mut bytes = path.as_bytes().to_vec();
+            bytes.push(0);
+            mem.write_bytes_raw(PATH, &bytes).unwrap();
+            dispatcher
+                .dispatch(
+                    &ctx,
+                    SyscallRequest::new(sys_truncate, SyscallArgs::from([PATH, len, 0, 0, 0, 0])),
+                    &mut mem,
+                    &CompatReporter::default(),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(
+            call_truncate("/mem/file.txt", 4),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call_truncate("/mem/dir", 0),
+            DispatchOutcome::errno(LINUX_EISDIR)
+        );
+        assert_eq!(
+            call_truncate("/romem/ro.txt", 2),
+            DispatchOutcome::errno(LINUX_EROFS)
+        );
+        assert_eq!(
+            call_truncate("/layered/top.txt", 5),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call_truncate("/layered/low.txt", 5),
+            DispatchOutcome::errno(LINUX_ENOENT)
+        );
+        assert_eq!(
+            call_truncate("/layered_ro/bot.txt", 3),
+            DispatchOutcome::errno(LINUX_EROFS)
+        );
+        assert_eq!(
+            call_truncate("/filt/alias.txt", 3),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call_truncate("/rec/bind.txt", 4),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            std::fs::read(bind_dir.path().join("bind.txt")).unwrap(),
+            b"bind"
+        );
+
+        // Verify RecordingVfs::check_truncate delegates cleanly without logging a spurious Truncate.
+        let direct_rec = RecordingVfs::new(
+            Box::new(carrick_vfs::BindVfs::new("/rec2", bind_dir.path(), false)),
+            16,
+        );
+        direct_rec.check_truncate("/rec2/bind.txt").unwrap();
+        assert!(direct_rec.events().is_empty());
     }
 }

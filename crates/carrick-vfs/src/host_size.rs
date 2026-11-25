@@ -16,13 +16,14 @@
 //! the same `(st_dev, st_ino)`.
 //!
 //! A change is a typed token: [`Resize`] and [`Discard`] are minted only by
-//! the admissions, and a resize is applied only by the door itself. The
-//! registry's read lock is held from the check until the change is applied
-//! (the token borrows it), and [`record`] takes the write lock, so a window
-//! recorded concurrently can never slip between the check and the change.
-//! No lock is held across a host open: an `O_TRUNC` open runs without
-//! `O_TRUNC`, and only its truncation is admitted and applied under the
-//! lock.
+//! the admissions, and a resize is applied only by the door itself. [`admit_write`]
+//! and non-windowed checks hold `WINDOWED.read()`, while [`admit_resize`] upgrades
+//! to `WINDOWED.write()` when `fd` names a windowed (or unstatable) inode in a
+//! non-empty registry (serializing concurrent resizes, [`record`], and in-flight
+//! [`admit_write`] regular-file writes). Normal host opens run unlocked; only the
+//! non-Linux empty-registry fallback and Linux's single-FD `EMFILE` fallback hold
+//! `WINDOWED.read()` across the fallback `open(flags)` after `owned` verified a
+//! regular file so [`record`] cannot intervene.
 //!
 //! The registry is process-wide: a window slot is a host mapping of this
 //! process, so any shrink this process applies to the inode breaks it,
@@ -136,10 +137,10 @@ enum RegistryGuard<'a> {
 }
 
 /// An admitted resize of one descriptor's file to one length. Only
-/// [`admit_resize`] mints one: it holds the registry's read lock when no
-/// window exists in the process, or its write lock when any window exists
-/// (so no concurrent resize, `record`, or regular-file write can interleave
-/// between the EOF check and `ftruncate(2)`). The door applies it itself
+/// [`admit_resize`] mints one: it holds `WINDOWED.write()` when `fd` names a
+/// windowed (or unstatable) inode in a non-empty registry (so no concurrent
+/// resize, [`record`], or regular-file write can interleave between the EOF
+/// check and `ftruncate(2)`), or `WINDOWED.read()` otherwise. The door applies it itself
 /// ([`Resize::apply`]): the admitted length on the admitted descriptor,
 /// nothing else.
 #[must_use = "an admitted resize does nothing until it is applied"]
@@ -163,6 +164,8 @@ pub struct WriteGuard {
 /// `WINDOWED.write()` writers ([`admit_resize`] on a windowed inode and
 /// [`record`]) serialize cleanly with in-flight writes.
 pub fn admit_write(_fd: BorrowedFd<'_>) -> WriteGuard {
+    #[cfg(any(test, feature = "test-support"))]
+    test_resize_hook::record_admit_write_attempt();
     WriteGuard {
         _registry: WINDOWED.read(),
     }
@@ -171,6 +174,7 @@ pub fn admit_write(_fd: BorrowedFd<'_>) -> WriteGuard {
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_resize_hook {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     struct Hook {
@@ -178,16 +182,48 @@ pub mod test_resize_hook {
         proceed: mpsc::Receiver<()>,
     }
 
+    static ADMIT_WRITE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static ADMIT_RESIZE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
     thread_local! {
         static BEFORE_FTRUNCATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_WRITE_ALL: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     pub fn install(entered: mpsc::SyncSender<()>, proceed: mpsc::Receiver<()>) {
         BEFORE_FTRUNCATE.with(|slot| *slot.borrow_mut() = Some(Hook { entered, proceed }));
     }
 
+    pub fn install_write(entered: mpsc::SyncSender<()>, proceed: mpsc::Receiver<()>) {
+        BEFORE_WRITE_ALL.with(|slot| *slot.borrow_mut() = Some(Hook { entered, proceed }));
+    }
+
+    pub fn write_attempts() -> usize {
+        ADMIT_WRITE_ATTEMPTS.load(Ordering::Acquire)
+    }
+
+    pub fn resize_attempts() -> usize {
+        ADMIT_RESIZE_ATTEMPTS.load(Ordering::Acquire)
+    }
+
+    pub(super) fn record_admit_write_attempt() {
+        ADMIT_WRITE_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn record_admit_resize_attempt() {
+        ADMIT_RESIZE_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(super) fn pause_before_ftruncate() {
         let hook = BEFORE_FTRUNCATE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.proceed.recv();
+        }
+    }
+
+    pub(crate) fn pause_before_write_all() {
+        let hook = BEFORE_WRITE_ALL.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             let _ = hook.entered.send(());
             let _ = hook.proceed.recv();
@@ -232,6 +268,8 @@ impl Discard<'_> {
 /// `WINDOWED.write()` across the EOF check and `ftruncate` (#2975 P0 1).
 pub fn admit_resize(fd: BorrowedFd<'_>, len: u64) -> Result<Resize<'_>, libc::c_int> {
     let off = libc::off_t::try_from(len).map_err(|_| libc::EFBIG)?;
+    #[cfg(any(test, feature = "test-support"))]
+    test_resize_hook::record_admit_resize_attempt();
     let registry = WINDOWED.read();
     if !registry.is_empty() && is_windowed_or_unstatable(&registry, fd.as_raw_fd()) {
         drop(registry);
@@ -337,10 +375,29 @@ fn open_truncating_with(
         // `O_RDONLY | O_TRUNC` (Linux truncates when the caller may write, open(2)):
         // open a writable handle via `/proc/self/fd` BEFORE acquiring `WINDOWED`,
         // then admit and truncate under the door while returning the caller's
-        // `O_RDONLY` descriptor intact (#2975 P0 4).
-        let writable = reopen_writable(owned.as_fd(), flags)?;
-        admit_resize(writable.as_fd(), 0)?.apply()?;
-        Ok(owned)
+        // `O_RDONLY` descriptor intact (#2975 P0 4). When the process has only
+        // one free host descriptor (`EMFILE` on the second open), inspect `owned`
+        // under `WINDOWED.read()`: fence windowed targets (`ENOSYS`), or for an
+        // unwindowed regular file drop `owned` and fall back to the single-FD
+        // `open(flags)` under that read guard so `record` cannot intervene
+        // (#2975 r30 P0 #3).
+        match reopen_writable(owned.as_fd(), flags) {
+            Ok(writable) => {
+                admit_resize(writable.as_fd(), 0)?.apply()?;
+                Ok(owned)
+            }
+            Err(libc::EMFILE) => {
+                let registry = WINDOWED.read();
+                check(&registry, owned.as_raw_fd(), Change::Resize(0))
+                    .map_err(|Fenced| Fenced::ERRNO)?;
+                if registry.is_empty() || !is_windowed_or_unstatable(&registry, owned.as_raw_fd()) {
+                    drop(owned);
+                    return open(flags);
+                }
+                Err(libc::EMFILE)
+            }
+            Err(err) => Err(err),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -729,7 +786,11 @@ mod tests {
                 Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
         });
-        assert_eq!(reopen_ro.err(), Some(libc::EACCES));
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(reopen_ro.err(), Some(libc::EACCES));
+        } else {
+            assert!(reopen_ro.is_ok());
+        }
     }
 
     #[test]
@@ -779,16 +840,17 @@ mod tests {
         let (_dir, _path, windowed) = file(4096);
         let _reg = record(windowed.as_fd()).unwrap();
         let write_guard = admit_write(windowed.as_fd());
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let before_resize = test_resize_hook::resize_attempts();
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::scope(|s| {
             let h = s.spawn(|| {
-                let _ = started_tx.send(());
                 let res = resize(windowed.as_fd(), 8192);
                 let _ = done_tx.send(());
                 res
             });
-            started_rx.recv().unwrap();
+            while test_resize_hook::resize_attempts() == before_resize {
+                std::thread::yield_now();
+            }
             assert!(
                 done_rx
                     .recv_timeout(std::time::Duration::from_millis(25))
@@ -844,6 +906,125 @@ mod tests {
         if birth(windowed.as_raw_fd(), &fstat(windowed.as_raw_fd()).unwrap()) != Birth(None) {
             assert_eq!(resize(windowed.as_fd(), 0), Ok(()));
             assert_eq!(size(&path), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod serial_host {
+        use super::*;
+
+        struct OneFreeFdGuard {
+            saved: libc::rlimit,
+        }
+
+        impl OneFreeFdGuard {
+            fn arm() -> Self {
+                let mut saved: libc::rlimit = unsafe { core::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+                    0
+                );
+                let probe = unsafe { libc::dup(0) };
+                assert!(probe >= 0, "probe dup(0): {}", last_errno());
+                unsafe { libc::close(probe) };
+                let guard = Self { saved };
+                let tight = libc::rlimit {
+                    rlim_cur: (probe as libc::rlim_t) + 1,
+                    rlim_max: saved.rlim_max,
+                };
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) },
+                    0,
+                    "setrlimit to {} failed: {}",
+                    tight.rlim_cur,
+                    last_errno()
+                );
+                let first = unsafe { libc::dup(0) };
+                assert_eq!(first, probe, "expected slot {probe} free");
+                let second = unsafe { libc::dup(0) };
+                assert_eq!(second, -1);
+                assert_eq!(last_errno(), libc::EMFILE);
+                unsafe { libc::close(first) };
+                guard
+            }
+        }
+
+        impl Drop for OneFreeFdGuard {
+            fn drop(&mut self) {
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+            }
+        }
+
+        /// Codex r30 P0 3 (#2975): with only one host FD free, opening an
+        /// existing unwindowed file with `O_RDONLY | O_TRUNC` (with or without
+        /// `O_CREAT`) must not fail `EMFILE` on the Linux `/proc/self/fd` reopen.
+        #[test]
+        fn existing_rdonly_trunc_succeeds_with_one_free_host_fd_when_unwindowed() {
+            let _guard = TEST_REGISTRY_MUTEX.lock();
+            let dir = tempfile::tempdir().unwrap();
+            let path_plain = dir.path().join("existing_plain");
+            let path_creat = dir.path().join("existing_creat");
+            let path_sibling = dir.path().join("existing_with_other_windowed");
+            std::fs::write(&path_plain, b"existing-plain-bytes").unwrap();
+            std::fs::write(&path_creat, b"existing-creat-bytes").unwrap();
+            std::fs::write(&path_sibling, b"existing-sibling-bytes").unwrap();
+            let (_win_dir, win_path, win_file) = file(4096);
+            let c_plain = std::ffi::CString::new(path_plain.to_str().unwrap()).unwrap();
+            let c_creat = std::ffi::CString::new(path_creat.to_str().unwrap()).unwrap();
+            let c_sibling = std::ffi::CString::new(path_sibling.to_str().unwrap()).unwrap();
+            let c_win = std::ffi::CString::new(win_path.to_str().unwrap()).unwrap();
+            let opener = |cpath: &std::ffi::CStr, flags: libc::c_int| {
+                let fd = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC, 0o644) };
+                if fd < 0 {
+                    Err(last_errno())
+                } else {
+                    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                }
+            };
+
+            {
+                let _one_fd = OneFreeFdGuard::arm();
+                let opened =
+                    open_truncating(libc::O_RDONLY | libc::O_TRUNC, |f| opener(&c_plain, f))
+                        .expect(
+                            "O_RDONLY|O_TRUNC on existing file must succeed with 1 free host FD",
+                        );
+                let wr = unsafe { libc::write(opened.as_raw_fd(), c"x".as_ptr().cast(), 1) };
+                assert_eq!(wr, -1);
+                assert_eq!(last_errno(), libc::EBADF);
+            }
+            assert_eq!(size(&path_plain), 0);
+
+            {
+                let _one_fd = OneFreeFdGuard::arm();
+                let opened = open_truncating(libc::O_CREAT | libc::O_RDONLY | libc::O_TRUNC, |f| {
+                    opener(&c_creat, f)
+                })
+                .expect(
+                    "O_CREAT|O_RDONLY|O_TRUNC on existing file must succeed with 1 free host FD",
+                );
+                drop(opened);
+            }
+            assert_eq!(size(&path_creat), 0);
+
+            // Even while an unrelated inode in this process is windowed, an unwindowed
+            // file still succeeds under 1 free host FD while the windowed file fences.
+            let _pin = record(win_file.as_fd()).unwrap();
+            {
+                let _one_fd = OneFreeFdGuard::arm();
+                let opened =
+                    open_truncating(libc::O_RDONLY | libc::O_TRUNC, |f| opener(&c_sibling, f))
+                        .expect("unwindowed existing file with unrelated window must succeed with 1 free host FD");
+                drop(opened);
+            }
+            assert_eq!(size(&path_sibling), 0);
+            {
+                let _one_fd = OneFreeFdGuard::arm();
+                let err = open_truncating(libc::O_RDONLY | libc::O_TRUNC, |f| opener(&c_win, f))
+                    .expect_err("windowed existing file must still fence under 1 free host FD");
+                assert_eq!(err, Fenced::ERRNO);
+            }
+            assert_eq!(size(&win_path), 4096);
         }
     }
 }
