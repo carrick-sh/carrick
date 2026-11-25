@@ -1189,9 +1189,12 @@ impl TableStock {
     /// on a copy of the stock plus those pages, serves its demand. `None`:
     /// not even the whole reserve would. A draw moves at least
     /// [`TABLE_RESERVE_DRAW_PAGES`] (or the whole reserve if smaller), so
-    /// only counts from there up are tried, by bisection between the
-    /// smallest count and the whole reserve (accepted, so the answer always
-    /// serves).
+    /// that floor is tried first; a demand it cannot serve then doubles the
+    /// count until one serves and bisects between the last two. Serving is
+    /// monotone in the count (a larger draw holds every smaller one), and
+    /// no probe exceeds twice the answer, so a small shortage never
+    /// materializes the whole reserve: only a demand nothing short of it
+    /// serves, or that it cannot serve at all, probes it.
     fn smallest_serving_draw(
         &self,
         mut accepts: impl FnMut(&mut Vec<RootGpa>) -> bool,
@@ -1205,7 +1208,7 @@ impl TableStock {
                 accepts(&mut pages)
             })
         };
-        if full == 0 || !serves(full) {
+        if full == 0 {
             return None;
         }
         let floor = TABLE_RESERVE_DRAW_PAGES.min(full);
@@ -1213,7 +1216,17 @@ impl TableStock {
             return Some(floor);
         }
         // `refused` never serves, `served` does.
-        let (mut refused, mut served) = (floor, full);
+        let mut refused = floor;
+        let mut served = loop {
+            if refused == full {
+                return None;
+            }
+            let probe = refused.saturating_mul(2).min(full);
+            if serves(probe) {
+                break probe;
+            }
+            refused = probe;
+        };
         while served - refused > 1 {
             let middle = refused + (served - refused) / 2;
             if serves(middle) {
