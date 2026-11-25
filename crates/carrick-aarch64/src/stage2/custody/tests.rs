@@ -428,3 +428,74 @@ fn reentering_a_custody_from_under_its_own_guard_panics_instead_of_hanging() {
     let _guard = custody.lock();
     assert_eq!(other.lifecycle(), Stage2Lifecycle::Vacant);
 }
+
+#[test]
+fn foreign_custody_mapping_is_refused_by_unmap_and_keep_unretired() {
+    let (custody_a, recorder_a) = custody();
+    let gen_a = live(&custody_a);
+    let m1 = map(&custody_a, gen_a, 0x1000_0000);
+    let m2 = map(&custody_a, gen_a, 0x1001_0000);
+    let m3 = map(&custody_a, gen_a, 0x1002_0000);
+    let m4 = map(&custody_a, gen_a, 0x1003_0000);
+
+    // 1. Even a Vacant foreign custody must refuse (not swallow as Stage2Gone).
+    let (custody_b_vacant, recorder_b_vacant) = custody();
+    let err_vacant = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: expected to panic on foreign custody token before reaching backend.
+        let _ = unsafe { custody_b_vacant.unmap(m1) };
+    }))
+    .expect_err("vacant foreign custody must reject foreign mapping");
+    assert!(
+        err_vacant
+            .downcast_ref::<String>()
+            .is_some_and(|s| s.contains("foreign")),
+        "unexpected panic message: {err_vacant:?}"
+    );
+    assert!(recorder_b_vacant.events.lock().is_empty());
+
+    // 2. Live gen-1 foreign custody must refuse both `unmap` and `keep_unretired`.
+    let (custody_b_live, recorder_b_live) = custody();
+    let gen_b = live(&custody_b_live);
+    assert_eq!(gen_b, gen_a);
+    let err_unmap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: expected to panic on foreign custody token before reaching backend.
+        let _ = unsafe { custody_b_live.unmap(m2) };
+    }))
+    .expect_err("live same-gen foreign custody must reject foreign unmap");
+    assert!(
+        err_unmap
+            .downcast_ref::<String>()
+            .is_some_and(|s| s.contains("foreign"))
+    );
+    assert!(recorder_b_live.events.lock().is_empty());
+
+    let err_keep = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard_b = custody_b_live.stage2_in(gen_b).expect("live B");
+        let _ = guard_b.keep_unretired(m3, Box::new(()));
+    }))
+    .expect_err("live same-gen foreign custody must reject foreign keep_unretired");
+    assert!(
+        err_keep
+            .downcast_ref::<String>()
+            .is_some_and(|s| s.contains("foreign"))
+    );
+    assert!(recorder_b_live.events.lock().is_empty());
+
+    // 3. Even after `custody_a` drops, retaining `m4` keeps its custody token
+    // unique so a newly allocated custody still rejects it.
+    drop(custody_a);
+    drop(recorder_a);
+    let (custody_c, recorder_c) = custody();
+    let _gen_c = live(&custody_c);
+    let err_after_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: expected to panic on foreign custody token before reaching backend.
+        let _ = unsafe { custody_c.unmap(m4) };
+    }))
+    .expect_err("newly allocated custody after A drop must still reject m4");
+    assert!(
+        err_after_drop
+            .downcast_ref::<String>()
+            .is_some_and(|s| s.contains("foreign"))
+    );
+    assert!(recorder_c.events.lock().is_empty());
+}

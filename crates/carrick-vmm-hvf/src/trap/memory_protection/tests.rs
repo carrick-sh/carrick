@@ -3222,7 +3222,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
                 carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4003)
             )))
         );
-        assert_eq!(alias_state_rows_scanned() - before_cold_rows, 0);
+        assert_eq!(alias_state_rows_scanned() - before_cold_rows, 1);
         assert_eq!(alias_replay_scopes_probed() - before_cold_scopes, 0);
 
         // 2. Warm target replay entry into replay cache (placed in LAST scope).
@@ -3243,7 +3243,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
         );
 
         // 3. Miss, limiter refusal, and warm cache hit in last scope must NOT clone rows OR probe scopes.
-        let before_rows = alias_state_rows_scanned();
+        let before_miss_rows = alias_state_rows_scanned();
         let before_scopes = alias_replay_scopes_probed();
         let miss = unsafe {
             stage2_map_replay(
@@ -3254,7 +3254,9 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
             )
         };
         assert_eq!(miss, Ok(None));
+        assert_eq!(alias_state_rows_scanned() - before_miss_rows, 0);
 
+        let before_hit_rows = alias_state_rows_scanned();
         let limited = unsafe {
             stage2_map_replay(
                 &custody,
@@ -3280,11 +3282,11 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
             )))
         );
-        let scanned = alias_state_rows_scanned() - before_rows;
+        let scanned = alias_state_rows_scanned() - before_hit_rows;
         let scopes_probed = alias_replay_scopes_probed() - before_scopes;
         assert_eq!(
-            scanned, 0,
-            "stage2_map_replay miss/limit/hit scanned {scanned} rows at population {population}"
+            scanned, 2,
+            "stage2_map_replay limit+hit scanned {scanned} rows at population {population}"
         );
         assert_eq!(
             scopes_probed, 0,
@@ -3294,6 +3296,64 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
     drop(cold_backing);
     mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
     drop(target_backing);
+}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn stage2_map_replay_enforces_candidate_row_budget() {
+    use crate::trap::stage2_backend::{
+        ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
+    };
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let custody = std::sync::Arc::new(CarrierVmCustody::new());
+    let g1 = custody.begin_create().expect("begin G1");
+    custody.commit_create(g1).expect("commit G1");
+
+    let overlap_ipa = 0x7c00_0000_u64;
+    let len = 0x4000_usize;
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        for i in 1..=200_u64 {
+            registry.push(AliasBacking {
+                start: 0x3000_0000 + i * 0x4000,
+                ipa: overlap_ipa,
+                host_addr: 0,
+                size: len,
+                physical_ipa: overlap_ipa,
+                physical_host_addr: 0,
+                physical_size: len,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(9000 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+    });
+
+    let before = alias_state_rows_scanned();
+    let result = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: overlap_ipa },
+            &mut |_| true,
+        )
+    };
+    let scanned = alias_state_rows_scanned() - before;
+    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+
+    assert_eq!(result, Ok(None));
+    assert!(
+        scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
+        "stacked overlapping aliases scanned {scanned} rows beyond budget {}",
+        crate::trap::LAZY_REPLAY_ROW_BUDGET
+    );
 }
 
 mod maintenance_lookup_budget;

@@ -2254,6 +2254,8 @@ pub(crate) const FORK_CONTROL_CAPACITY_BEFORE_INSTALL: &str =
 #[cfg(test)]
 pub(crate) const COMMIT_DESTROY_HOLDING_STAGE2: &str = "commit destroy holding stage2";
 #[cfg(test)]
+pub(crate) const REPLAY_REMAP_DURING_PHASE1_LOOKUP: &str = "replay remap during phase1 lookup";
+#[cfg(test)]
 pub(crate) const REPLAY_REMAP_BEFORE_GUARD: &str = "replay remap before guard";
 #[cfg(test)]
 pub(crate) const REPLAY_REMAP_LOOKED_UP: &str = "replay remap looked up";
@@ -6876,6 +6878,114 @@ mod carrier_vm_custody_tests {
             !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa, len),
             "stale G1 replay mapped into G2"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stage2_map_replay_does_not_hold_stage2_across_alias_lookup_and_revalidates_removal() {
+        use super::super::stage2_backend::{
+            ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
+        };
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let len = 0x4000_usize;
+        let ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x7a00_0000;
+        let va = 0x6200_0000_u64;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate alias backing");
+        let host_addr = host_mapping.as_ptr() as usize;
+        super::register_shared_alias(super::AliasBacking {
+            start: va,
+            ipa,
+            host_addr,
+            size: len,
+            physical_ipa: ipa,
+            physical_host_addr: host_addr,
+            physical_size: len,
+            perms: 7,
+            guest_writable: true,
+            sharing: super::GuestMappingSharing::GlobalShared,
+            ownership_scope: super::AliasOwnershipScope::Global,
+            inventory_backing: super::InventoryBackingIdentity::Private(9993),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        });
+        super::forget_replay_extent(ipa, len);
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (event_tx, event_rx) = mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        custody
+            .stage2
+            .set_hook(Some(Arc::new(move |point| match point {
+                Stage2HookPoint::Client(name)
+                    if name == super::REPLAY_REMAP_DURING_PHASE1_LOOKUP =>
+                {
+                    let _ = entered_tx.send(());
+                    let _ = go_rx.lock().expect("go receiver").recv();
+                }
+                Stage2HookPoint::LockContended(_) => {
+                    let _ = hook_event_tx.send("contended");
+                }
+                _ => {}
+            })));
+
+        let replay_custody = Arc::clone(&custody);
+        let replay_thread = std::thread::spawn(move || {
+            let _stub = ScopedStage2MapTestStub::enable();
+            unsafe {
+                stage2_map_replay(
+                    &replay_custody,
+                    g1,
+                    ReplayAliasLookup::Ipa { gpa: ipa },
+                    &mut |_| true,
+                )
+            }
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replay paused in phase 1");
+
+        // `custody.stage2` must NOT be held during Phase 1 lookup: a concurrent
+        // acquirer succeeds immediately with zero `LockContended`.
+        let probe_custody = Arc::clone(&custody);
+        let probe_event_tx = event_tx.clone();
+        let probe_thread = std::thread::spawn(move || {
+            let guard = probe_custody.stage2.lock();
+            drop(guard);
+            let _ = probe_event_tx.send("acquired");
+        });
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)),
+            Ok("acquired"),
+            "stage2 lock was held during lazy replay Phase 1 lookup"
+        );
+        probe_thread.join().expect("probe joined");
+
+        // Remove the alias while paused before Phase 2; Phase 2's point revalidation
+        // must fail closed cleanly rather than mapping the retired backing.
+        super::mutate_external_alias_state(|registry| {
+            registry.retain(|alias| alias.physical_ipa != ipa);
+        });
+        go_tx.send(()).expect("resume replay");
+        let result = replay_thread.join().expect("replay joined");
+        custody.stage2.set_hook(None);
+        super::forget_replay_extent(ipa, len);
+        drop(host_mapping);
+
+        assert_eq!(result, Ok(None));
+        assert!(!ScopedStage2MapTestStub::is_mapped(ipa, len));
     }
 
     #[test]

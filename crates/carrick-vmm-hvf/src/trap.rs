@@ -195,7 +195,7 @@ mod owner_fork;
 mod user_transfer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrier_custody::CarrierVmCustody;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use carrier_custody::{
     COMMIT_DESTROY_HOLDING_STAGE2, FORK_CONTROL_CAPACITY_BEFORE_INSTALL,
     FORK_STOCK_INSTALL_BEFORE_ARENAS,

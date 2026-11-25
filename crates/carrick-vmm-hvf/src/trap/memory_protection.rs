@@ -593,6 +593,7 @@ impl AliasClassIndex {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn oldest_containing(
         &self,
         probe: u64,
@@ -618,7 +619,57 @@ impl AliasClassIndex {
         }
         oldest.map(|(_, alias)| alias)
     }
+
+    /// Collect matching rows containing `probe` under an explicit row-inspection
+    /// budget (`row_budget`), returning `(seq, row)` candidates plus the exact
+    /// count of inspected rows. When `newest_first` is true, each bucket is
+    /// sampled from its newest tail (`rows` end); otherwise from its oldest head.
+    pub(crate) fn collect_containing_candidates_bounded(
+        &self,
+        probe: u64,
+        newest_first: bool,
+        row_budget: usize,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> (Vec<(u64, AliasBacking)>, usize) {
+        let mut remaining = row_budget;
+        let mut total_scanned = 0_usize;
+        let mut found = Vec::new();
+        for &class in self.class_counts.keys() {
+            if remaining == 0 {
+                break;
+            }
+            let radius = Self::class_radius(class);
+            let lower = probe.saturating_sub(radius.saturating_sub(1));
+            for (&(_class, start_key), rows) in
+                self.by_class_start.range((class, lower)..=(class, probe))
+            {
+                if remaining == 0 {
+                    break;
+                }
+                let take = rows.len().min(remaining);
+                remaining -= take;
+                total_scanned += take;
+                note_alias_state_rows_scanned(take);
+                let window = if newest_first {
+                    &rows[rows.len() - take..]
+                } else {
+                    &rows[..take]
+                };
+                for &(seq, alias) in window {
+                    if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
+                        found.push((seq, alias));
+                    }
+                }
+            }
+        }
+        (found, total_scanned)
+    }
 }
+
+/// Maximum candidate rows inspected per lazy stage-2 replay lookup so stacked
+/// overlapping aliases stay bounded without delaying unrelated stage-2 work.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const LAZY_REPLAY_ROW_BUDGET: usize = 64;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(
@@ -1434,6 +1485,7 @@ impl AliasRegistry {
 
     /// [`Self::newest_matching`] for a predicate that requires the row's
     /// guest-VA window to contain `va`.
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn newest_containing_va(
         &self,
         va: u64,
@@ -1444,6 +1496,7 @@ impl AliasRegistry {
 
     /// [`Self::oldest_matching`] for a predicate that requires the row's IPA
     /// window to contain `ipa`.
+    #[cfg(test)]
     pub(crate) fn oldest_containing_ipa(
         &self,
         ipa: u64,
@@ -1470,6 +1523,39 @@ impl AliasRegistry {
         matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Vec<AliasBacking> {
         self.ipa_classes.containing_candidates(ipa, matches)
+    }
+
+    /// Bounded oldest-first IPA replay candidates; caller verifies host liveness
+    /// outside both `custody.stage2` and `alias_registry`.
+    pub(crate) fn replay_ipa_candidates(&self, gpa: u64, row_budget: usize) -> Vec<AliasBacking> {
+        let (mut found, _) =
+            self.ipa_classes
+                .collect_containing_candidates_bounded(gpa, false, row_budget, |e| {
+                    gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64)
+                });
+        found.sort_by_key(|(seq, _)| *seq);
+        found.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    /// Bounded newest-first global VA replay candidates; caller verifies host
+    /// liveness outside both `custody.stage2` and `alias_registry`.
+    pub(crate) fn replay_any_va_candidates(&self, va: u64, row_budget: usize) -> Vec<AliasBacking> {
+        let (mut found, _) =
+            self.va_classes
+                .collect_containing_candidates_bounded(va, true, row_budget, |entry| {
+                    va >= entry.start
+                        && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+                });
+        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        found.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    /// Point lookup confirming an exact previously selected `AliasBacking` is
+    /// still registered without scanning unrelated scopes or addresses.
+    pub(crate) fn contains_exact_physical_row(&self, backing: &AliasBacking) -> bool {
+        self.by_scope_physical_start
+            .get(&(backing.ownership_scope, backing.physical_ipa))
+            .is_some_and(|rows| rows.iter().any(|(_, row)| row == backing))
     }
 
     /// Private rows owned by one process whose exact physical stage-2 extent
@@ -2623,6 +2709,33 @@ impl AliasRegistry {
             }
         }
         newest.map(|(_, alias)| alias)
+    }
+
+    /// Bounded newest-first process VA replay candidates; caller verifies host
+    /// liveness outside both `custody.stage2` and `alias_registry`.
+    pub(crate) fn replay_process_va_candidates(
+        &self,
+        va: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        row_budget: usize,
+    ) -> Vec<AliasBacking> {
+        let mut remaining = row_budget;
+        let mut found: Vec<(u64, AliasBacking)> = Vec::new();
+        for index in self.process_va_indexes(mm_root_slot, container_root) {
+            if remaining == 0 {
+                break;
+            }
+            let (hits, scanned) =
+                index.collect_containing_candidates_bounded(va, true, remaining, |alias| {
+                    va >= alias.start
+                        && va.saturating_add(1) <= alias.start.saturating_add(alias.size as u64)
+                });
+            remaining = remaining.saturating_sub(scanned);
+            found.extend(hits);
+        }
+        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        found.into_iter().map(|(_, alias)| alias).collect()
     }
 
     /// Candidates for `newest_process_alias_containing_va`, newest first; the

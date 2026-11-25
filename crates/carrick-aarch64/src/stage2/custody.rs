@@ -95,13 +95,39 @@ pub enum Stage2CustodyError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stage2Gone;
 
-/// One installed stage-2 extent, stamped with the generation of the guard
-/// that installed it. Only [`Stage2Generation::map`] makes one, and only an
-/// unmap or its generation's destroy ends it, so a lease can never hold a
-/// mapping without knowing which VM holds it.
+/// In-process unique token identifying one [`Stage2Custody`] instance for as
+/// long as the custody or any [`Stage2Mapping`] it issued stays alive.
+#[derive(Clone)]
+struct CustodyToken(std::sync::Arc<()>);
+
+impl CustodyToken {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+}
+
+impl PartialEq for CustodyToken {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CustodyToken {}
+
+impl core::fmt::Debug for CustodyToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Custody({:p})", std::sync::Arc::as_ptr(&self.0))
+    }
+}
+
+/// One installed stage-2 extent, stamped with the issuing custody and
+/// generation of the guard that installed it. Only [`Stage2Generation::map`]
+/// makes one, and only an unmap or its generation's destroy ends it, so a lease
+/// can never hold a mapping without knowing which custody and VM hold it.
 #[must_use = "a stage-2 mapping must be unmapped or outlived by its VM's destroy"]
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Mapping {
+    custody: CustodyToken,
     generation: CarrierVmGeneration,
     ipa: u64,
     size: usize,
@@ -204,6 +230,7 @@ type Stage2Hook = std::sync::Arc<dyn Fn(Stage2HookPoint) + Send + Sync>;
 
 /// Generation-bound stage-2 custody over one backend.
 pub struct Stage2Custody<R> {
+    custody: CustodyToken,
     backend: Box<dyn Stage2Backend + Send>,
     state: Mutex<Stage2CustodyState<R>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -242,6 +269,7 @@ impl<R> DerefMut for Stage2StateGuard<'_, R> {
 /// lives: the custody lock is held, so no raw destroy can run. It is the only
 /// way to map or unmap.
 pub struct Stage2Generation<'a, R> {
+    custody: &'a CustodyToken,
     state: HeldState<'a, R>,
     backend: &'a (dyn Stage2Backend + Send),
     generation: CarrierVmGeneration,
@@ -298,6 +326,7 @@ impl<R> Stage2Generation<'_, R> {
             return Err(status);
         }
         Ok(Stage2Mapping {
+            custody: self.custody.clone(),
             generation: self.generation,
             ipa,
             size,
@@ -318,6 +347,12 @@ impl<R> Stage2Generation<'_, R> {
         &mut self,
         mapping: Stage2Mapping,
     ) -> Result<(), (Stage2Mapping, Stage2Status)> {
+        assert!(
+            mapping.custody == *self.custody,
+            "stage-2 mapping of {:?} offered to foreign {:?}",
+            mapping.custody,
+            self.custody
+        );
         if mapping.generation != self.generation {
             assert!(
                 mapping.generation.0 < self.generation.0,
@@ -345,6 +380,12 @@ impl<R> Stage2Generation<'_, R> {
         mapping: Stage2Mapping,
         backing: Stage2Backing,
     ) -> Option<Stage2Backing> {
+        assert!(
+            mapping.custody == *self.custody,
+            "stage-2 mapping of {:?} kept on foreign {:?}",
+            mapping.custody,
+            self.custody
+        );
         if mapping.generation != self.generation {
             return Some(backing);
         }
@@ -505,6 +546,7 @@ impl<R> Stage2Custody<R> {
     /// A vacant custody over `backend`, with the backend's own records.
     pub fn new(backend: Box<dyn Stage2Backend + Send>, records: R) -> Self {
         Self {
+            custody: CustodyToken::new(),
             backend,
             state: Mutex::new(Stage2CustodyState {
                 lifecycle: Stage2Lifecycle::Vacant,
@@ -579,6 +621,7 @@ impl<R> Stage2Custody<R> {
             return Err(Stage2Gone);
         }
         Ok(Stage2Generation {
+            custody: &self.custody,
             state,
             backend: &*self.backend,
             generation,
@@ -590,6 +633,7 @@ impl<R> Stage2Custody<R> {
         let state = self.lock_state("stage2");
         let generation = state.lifecycle.stage2_generation()?;
         Some(Stage2Generation {
+            custody: &self.custody,
             state,
             backend: &*self.backend,
             generation,
@@ -606,6 +650,12 @@ impl<R> Stage2Custody<R> {
         &self,
         mapping: Stage2Mapping,
     ) -> Result<(), (Stage2Mapping, Stage2Status)> {
+        assert!(
+            mapping.custody == self.custody,
+            "stage-2 mapping of {:?} offered to foreign {:?}",
+            mapping.custody,
+            self.custody
+        );
         match self.stage2_in(mapping.generation) {
             // SAFETY: forwarded.
             Ok(mut guard) => unsafe { guard.unmap(mapping) },

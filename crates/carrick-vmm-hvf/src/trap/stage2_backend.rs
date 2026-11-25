@@ -487,10 +487,9 @@ pub(crate) enum ReplayAliasLookup {
     },
 }
 
-/// Look up and replay one lazy high-VA alias backing under the caller's exact
-/// VM generation guard before locking the alias registry (preserving
-/// `stage2 -> alias_registry`), validate live registration even on replay-cache
-/// hits, and record its untracked token and replay key once mapped.
+/// Look up bounded replay candidates and probe host liveness OUTSIDE both
+/// `custody.stage2` and `alias_registry`, then acquire `expected_generation`'s
+/// guard to verify exact registration, replay cache/epoch, and stage-2 map.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn stage2_map_replay(
     custody: &CarrierVmCustody,
@@ -498,6 +497,48 @@ pub(crate) unsafe fn stage2_map_replay(
     lookup: ReplayAliasLookup,
     allow_ipa: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
+    let candidates = {
+        let registry = super::alias_registry().lock();
+        match lookup {
+            ReplayAliasLookup::Ipa { gpa } => {
+                registry.replay_ipa_candidates(gpa, super::LAZY_REPLAY_ROW_BUDGET)
+            }
+            ReplayAliasLookup::VaProcess {
+                va,
+                mm_root_slot,
+                container_root,
+            } => registry.replay_process_va_candidates(
+                va,
+                mm_root_slot,
+                container_root,
+                super::LAZY_REPLAY_ROW_BUDGET,
+            ),
+            ReplayAliasLookup::VaAnyScope { va } => {
+                registry.replay_any_va_candidates(va, super::LAZY_REPLAY_ROW_BUDGET)
+            }
+        }
+    };
+    #[cfg(test)]
+    custody
+        .stage2
+        .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
+    let backing = candidates.into_iter().find(|entry| {
+        let check_addr = match lookup {
+            ReplayAliasLookup::Ipa { .. } => entry.host_addr,
+            ReplayAliasLookup::VaProcess { va, .. } | ReplayAliasLookup::VaAnyScope { va } => {
+                entry.host_addr.saturating_add((va - entry.start) as usize)
+            }
+        };
+        super::alias_backing_is_live(check_addr)
+            && (entry.physical_host_addr == check_addr
+                || super::alias_backing_is_live(entry.physical_host_addr))
+    });
+    let Some(backing) = backing else {
+        return Ok(None);
+    };
+    if !allow_ipa(backing.physical_ipa) {
+        return Ok(None);
+    }
     #[cfg(test)]
     custody
         .stage2
@@ -511,35 +552,7 @@ pub(crate) unsafe fn stage2_map_replay(
         .stage2
         .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
     let mut registry = super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
-    let backing = match lookup {
-        ReplayAliasLookup::Ipa { gpa } => registry.oldest_containing_ipa(gpa, |e| {
-            gpa >= e.ipa
-                && gpa < e.ipa.saturating_add(e.size as u64)
-                && super::alias_backing_is_live(e.host_addr)
-        }),
-        ReplayAliasLookup::VaProcess {
-            va,
-            mm_root_slot,
-            container_root,
-        } => registry.newest_process_alias_containing_va(va, mm_root_slot, container_root, |e| {
-            va.saturating_add(1) <= e.start.saturating_add(e.size as u64)
-                && super::alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
-        }),
-        ReplayAliasLookup::VaAnyScope { va } => registry.newest_containing_va(va, |entry| {
-            va >= entry.start
-                && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
-                && super::alias_backing_is_live(
-                    entry.host_addr.saturating_add((va - entry.start) as usize),
-                )
-        }),
-    };
-    let Some(backing) = backing else {
-        return Ok(None);
-    };
-    if !super::alias_backing_is_live(backing.physical_host_addr) {
-        return Ok(None);
-    }
-    if !allow_ipa(backing.physical_ipa) {
+    if !registry.contains_exact_physical_row(&backing) {
         return Ok(None);
     }
     let key = replay_mapping_key(backing);
