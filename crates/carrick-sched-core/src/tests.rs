@@ -4827,6 +4827,61 @@ fn requeue_refusal_reports_the_observed_claim() {
     assert_eq!(zone.record(parked).claim(), claim);
 }
 
+#[test]
+fn requeue_checkpoint_head_clears_woken_handback_and_preserves_head_order() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+
+    // A thread wakes from futex (`Handback::Woken`, `result == 0`), runs
+    // into an inline-completed service checkpoint while a peer waits, and
+    // yields via `requeue_checkpoint_head`.
+    let first = park(&zone, 11, 0x1000);
+    assert_eq!(wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }), [first]);
+    assert_eq!(zone.record(first).handback(), Some(Handback::Woken));
+
+    let peer = park(&zone, 12, 0x2000);
+    assert_eq!(wake(&zone, 0x2000, 1, Waker::El1 { slot: SLOT }), [peer]);
+
+    let switched = zone.switch_in_full(SLOT).unwrap();
+    assert_eq!(switched.record, first);
+    assert_eq!(switched.result, Some(0));
+
+    assert!(zone.requeue_checkpoint_head(SLOT, first).is_queued());
+    assert_eq!(zone.record(first).handback(), Some(Handback::Resumed));
+    assert_eq!(zone.runnable_head(SLOT), Some(first));
+
+    // Next selection pops `first` ahead of `peer` with no stale wake result.
+    let resumed = zone.switch_in_full(SLOT).unwrap();
+    assert_eq!(resumed.record, first);
+    assert_eq!(resumed.result, None);
+    assert_eq!(zone.runnable_head(SLOT), Some(peer));
+
+    // `OnCpuRequested` preserves `host_wanted` across the head requeue while
+    // resetting `handback` to `Handback::Resumed`.
+    assert_eq!(
+        zone.claim_for_host(
+            zone.record_ref(first),
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            }
+        ),
+        HostClaim::El1Held { slot: SLOT }
+    );
+    assert!(zone.requeue_checkpoint_head(SLOT, first).is_queued());
+    assert_eq!(zone.record(first).handback(), Some(Handback::Resumed));
+    assert_eq!(zone.runnable_head(SLOT), Some(first));
+    let mut wanted = Vec::new();
+    assert_eq!(
+        zone.take_host_wanted(SLOT, &mut |record| wanted.push(record)),
+        1
+    );
+    assert_eq!(wanted, [zone.record_ref(first)]);
+    assert_eq!(zone.record(first).handback(), Some(Handback::Resumed));
+}
+
 /// An in-ring syscall's memory wait has no host dispatcher continuation.
 #[test]
 fn host_owned_syscall_memory_wait_requires_ring_resume() {

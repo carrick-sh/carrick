@@ -399,6 +399,7 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
         service: &mut service,
         owner: member.id,
         owner_resumes: 0,
+        expect_left: true,
         expect_initial_deferred: pending_work,
         deferred_return_observed: false,
     };
@@ -580,12 +581,372 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
     assert_eq!(fixture.page.live(), 2);
 }
 
+#[test]
+fn arm_woken_sigsuspend_inline_carrier_ack_preserves_eintr() {
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    registry()
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let owner_record = runtime
+        .task_binding(TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        })
+        .unwrap()
+        .record
+        .id;
+    let member = fixture.zone.record_ref(owner_record);
+    assert!(fixture.zone.record(owner_record).is_native_owned());
+
+    let (peer_control, peer) = imported_thread(fixture);
+    let peer_stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, owner_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        peer.id
+    );
+    run_as(fixture, 42, 12, 102, peer_control);
+    // SAFETY: switch_in_full gave this lane exclusive sibling custody.
+    unsafe {
+        let context = fixture.zone.record(peer.id).ctx_mut();
+        context.native.pc = 0x500004;
+        context.native.sp_el0 = peer_stack.va_at(peer_stack.len()).raw();
+    }
+    registry()
+        .register_thread(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            peer_control,
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, peer.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        owner_record
+    );
+    run_as_leader(fixture);
+    let control = fixture.control;
+    let signal = Signal::PIPE;
+    let mask_bits = carrick_signal_core::SignalSet::EMPTY.with(signal).bits();
+    control.init_blocked(carrick_el1_abi::BlockedMask(mask_bits));
+
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut words = initial;
+    words.native.pc = 0x400004;
+    words.native.sp_el0 = stack.va_at(stack.len()).raw();
+    let mut physical = Physical {
+        zone: fixture.zone,
+        page: fixture.page,
+        controls: &[],
+        copies: Vec::new(),
+        tid_words: Default::default(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
+        on_signal_clock: None,
+    };
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &words,
+                &mut physical,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                signal,
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        entry
+            .tgkill(
+                SignalThreadSelector::from_abi(41),
+                SignalThreadSelector::from_abi(41),
+                SignalRequest::from_abi(13).unwrap(),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+    }
+    control.init_blocked(carrick_el1_abi::BlockedMask(0));
+
+    // Park and wake `owner_record` on a guest futex so its `ZoneRecord`
+    // carries `Handback::Woken` (`result == 0`) while `peer` waits in queue.
+    let futex_addr = 0x9000_u64;
+    let mm = fixture.address.mm.raw().get();
+    {
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(mm, futex_addr),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(owner_record);
+        fixture
+            .zone
+            .enqueue_observed(&guard, owner_record, seq, mm, futex_addr, u32::MAX, 0, None)
+            .unwrap();
+        assert!(
+            fixture
+                .zone
+                .publish_guest_park(&guard, fixture.slot, owner_record, seq)
+        );
+    }
+    fixture.zone.clear_current(fixture.slot);
+    {
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(mm, futex_addr),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        assert_eq!(
+            fixture.zone.wake_placed(
+                &guard,
+                mm,
+                futex_addr,
+                u32::MAX,
+                1,
+                carrick_sched_core::Waker::El1 { slot: fixture.slot },
+                &mut [],
+                &mut effects,
+            ),
+            1
+        );
+    }
+    assert_eq!(
+        fixture.zone.record(owner_record).handback(),
+        Some(carrick_sched_core::Handback::Woken)
+    );
+    // Rotate `peer` behind the freshly woken `owner_record`: `[owner_record, peer]`.
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        peer.id
+    );
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, peer.id)
+            .is_queued()
+    );
+    let switched = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(switched.record, owner_record);
+    assert_eq!(switched.result, Some(0));
+
+    // Simulate `owner_record` consuming 0 from futex_wait and entering a
+    // subsequent `rt_sigsuspend` that completes with `-EINTR` (-4), hits an
+    // untouched-altstack `NeedsSupply` fault, and receives a synchronous
+    // service doorbell completion (`deferred = true` -> `yield_service_checkpoint_as`).
+    let eintr = (-4_i64) as u64;
+    words.native.x[0] = eintr;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x54000000,
+        elr: words.native.pc,
+        ..Default::default()
+    };
+    frame.x[0] = eintr;
+    physical.child_copy_error = Some(NativeProcessError::NeedsSupply);
+    crate::native_process_runtime::host_test_support::on_service_doorbell(Some(Box::new(
+        move || {
+            let notice = fixture.task.service_notice.take().unwrap().unwrap();
+            let queue = fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(member).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+                .unwrap();
+            // SAFETY: claims this exact member's published fault notice under
+            // the production intake queue, then supplies it before park.
+            let ticket = unsafe {
+                carrick_core_abi::service::ServiceCell::claim_notice(
+                    &control.service,
+                    notice,
+                    NonZeroU64::MIN,
+                    fixture.zone.record(member.id).identity(),
+                )
+            }
+            .unwrap();
+            assert!(matches!(
+                ticket.request().operation,
+                carrick_core_abi::service::ServiceOperation::Fault(_)
+            ));
+            drop(queue);
+            ticket
+                .complete(true)
+                .unwrap_or_else(|_| panic!("inline fault supply was refused"));
+            true
+        },
+    )));
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &words,
+                &mut physical,
+            )
+            .unwrap();
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let route = crate::signal_delivery::deliver_signal_on_syscall_return(
+            &fixture.task,
+            control,
+            &mut entry,
+            &mut frame,
+            zerocopy::IntoBytes::as_bytes(&fp),
+            &mut ArmWaitSignalMachine {
+                user_sp: stack.va_at(stack.len()),
+                backend: ArmWaitSignalBackend,
+            },
+        );
+        assert_eq!(
+            route,
+            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+        );
+    }
+    crate::native_process_runtime::host_test_support::on_service_doorbell(None);
+    let mut service = fixture.process_service();
+    assert_eq!(
+        fixture.zone.record(owner_record).handback(),
+        Some(carrick_sched_core::Handback::Resumed),
+        "yield_service_checkpoint_as must replace stale Handback::Woken with Handback::Resumed"
+    );
+    assert_eq!(
+        fixture.zone.runnable_head(fixture.slot),
+        Some(owner_record),
+        "yield_service_checkpoint_as must keep the checkpointed member ahead of queued peers"
+    );
+
+    let counters = carrick_el1_abi::Counters::new();
+    let inner = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let mut cpu = HostResumeCpu {
+        inner,
+        fixture,
+        service: &mut service,
+        owner: owner_record,
+        owner_resumes: 0,
+        expect_left: false,
+        expect_initial_deferred: false,
+        deferred_return_observed: false,
+    };
+    let mut scheduler = crate::sched::Sched {
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+        counters: &counters,
+        handoff: None,
+    };
+    let served = scheduler.run_ready(&mut frame);
+    assert_eq!(
+        served,
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(cpu.owner_resumes, 1);
+    assert_eq!(frame.elr, 0x400004);
+    assert_eq!(
+        frame.x[0], eintr,
+        "stale wake handback must not overwrite completed rt_sigsuspend -EINTR in x0"
+    );
+
+    // Complete the EL0 user-return delivery now that the backing is ready.
+    crate::native_process_runtime::host_test_support::observe_return_copyouts();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &words,
+                &mut service,
+            )
+            .unwrap();
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let route = crate::arm_signal::deliver_on_user_return_with(
+            &fixture.task,
+            control,
+            &mut entry,
+            &mut frame,
+            zerocopy::IntoBytes::as_bytes(&fp),
+            &mut ArmWaitSignalMachine {
+                user_sp: stack.va_at(stack.len()),
+                backend: ArmWaitSignalBackend,
+            },
+        );
+        assert_eq!(route, None);
+    }
+    assert_eq!(frame.elr, 0x700000);
+    assert_eq!(frame.x[0], 13);
+    let writes = crate::native_process_runtime::host_test_support::take_return_copyouts();
+    assert_eq!(writes.len(), 1);
+    let handler_sp = writes[0].0;
+    assert!(handler_sp.raw() < stack.va_at(stack.len()).raw());
+    let offset = usize::try_from(handler_sp.raw() - stack.va().raw()).unwrap();
+    let public: carrick_personality_linux::signal::arm::RtSigframe = stack.read(offset);
+    let saved_pc = public.ucontext.uc_mcontext.pc;
+    let saved_result = public.ucontext.uc_mcontext.regs[0];
+    assert_eq!(saved_pc, 0x400004);
+    assert_eq!(
+        saved_result, eintr,
+        "signal frame must preserve completed rt_sigsuspend -EINTR across yield_service_checkpoint_as"
+    );
+}
+
 struct HostResumeCpu<'a> {
     inner: crate::sched::FakeCpu,
     fixture: &'static Fixture,
     service: &'a mut Aarch64NativeProcessService<'static, TestStockCrossing>,
     owner: RecordId,
     owner_resumes: usize,
+    expect_left: bool,
     expect_initial_deferred: bool,
     deferred_return_observed: bool,
 }
@@ -627,7 +988,9 @@ impl crate::sched::ThreadCpu for HostResumeCpu<'_> {
             std::panic::resume_unwind(payload)
         });
         if record == self.owner {
-            assert_eq!(result, crate::sched::ResumeAction::Left);
+            if self.expect_left {
+                assert_eq!(result, crate::sched::ResumeAction::Left);
+            }
             if self.expect_initial_deferred && self.owner_resumes == 1 {
                 // Observe the first completed production selection before
                 // run_ready can select the already-ACKed continuation again.

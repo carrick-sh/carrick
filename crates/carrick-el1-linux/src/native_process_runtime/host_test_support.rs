@@ -38,6 +38,17 @@ std::thread_local! {
     };
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FAULT_SLOT: core::cell::Cell<Option<(&'static carrick_el1_abi::PortalGrantSlot, u64)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_fault_slot(slot: Option<(&'static carrick_el1_abi::PortalGrantSlot, u64)>) {
+    TEST_FAULT_SLOT.with(|cell| cell.set(slot));
+}
+
 /// The commit effects each exec settlement carried, in order (#2305).
 #[cfg(test)]
 pub(super) fn take_exec_settle_effects() -> Vec<carrick_el1_abi::ExecCommitEffects> {
@@ -609,6 +620,17 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         &self,
         address: UserVa,
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        if let Some((slot, mm)) = TEST_FAULT_SLOT.with(core::cell::Cell::get) {
+            let (sequence, _) = slot.pending_fault_selection(mm, address.raw())?;
+            return Some((
+                carrick_guest_arch::FaultInfo {
+                    address,
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
+                },
+                NonZeroU64::new(sequence)?,
+            ));
+        }
         matches!(self.child_copy_error, Some(NativeProcessError::NeedsSupply)).then_some((
             carrick_guest_arch::FaultInfo {
                 address,
@@ -617,6 +639,15 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             },
             NonZeroU64::MIN,
         ))
+    }
+    #[cfg(test)]
+    fn cancel_copyout_fault(&self, address: UserVa, sequence: NonZeroU64) {
+        if let Some((slot, mm)) = TEST_FAULT_SLOT.with(core::cell::Cell::get)
+            && let Some((generation, window)) = slot.pending_fault_selection(mm, address.raw())
+            && generation == sequence.get()
+        {
+            let _ = slot.cancel_fault_selection(window, generation);
+        }
     }
     #[cfg(test)]
     fn apply_fault_reply(

@@ -4824,8 +4824,20 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// registers as they were. Room was made by the switch that follows (the
     /// caller switched the head in first).
     pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) -> Requeue {
+        self.requeue_resumed(slot, record, false)
+    }
+
+    /// Requeue a checkpointed native owner record back onto the head of `slot`'s
+    /// run queue with [`Handback::Resumed`] so its next selection immediately
+    /// resumes its published context and `OwnerContinuation` without re-applying
+    /// an earlier wait's wake handback.
+    pub fn requeue_checkpoint_head(&self, slot: SlotId, record: RecordId) -> Requeue {
+        self.requeue_resumed(slot, record, true)
+    }
+
+    fn requeue_resumed(&self, slot: SlotId, record: RecordId, push_front: bool) -> Requeue {
         // The claim and queue membership become visible together to a host
-        // requester. It must not observe Queued before push_locked.
+        // requester. It must not observe Queued before push.
         let rec = self.record(record);
         let Some(guard) = self.slot_lock(slot, &SpinForever) else {
             return Requeue::Refused(rec.claim());
@@ -4863,10 +4875,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if s.current.load(Ordering::Acquire) == record.raw() {
             s.current.store(NIL, Ordering::Release);
         }
-        self.push_locked(&guard, record, None);
-        self.counters
-            .el1_preemptions
-            .fetch_add(1, Ordering::Relaxed);
+        if push_front {
+            self.push_front_locked(&guard, record);
+        } else {
+            self.push_locked(&guard, record, None);
+            self.counters
+                .el1_preemptions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Requeue::Queued
     }
 

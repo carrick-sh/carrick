@@ -2408,3 +2408,127 @@ fn x86_abort_retires_object_parked_member() {
         carrick_mmu_core::x86::owner_mmu::X86Mmu,
     >(words, ClosingObjectParkCause::Abort);
 }
+
+fn closing_before_fault_service_publication_withdraws_selection_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    struct ResetTestFaultSlot;
+    impl Drop for ResetTestFaultSlot {
+        fn drop(&mut self) {
+            set_test_fault_slot(None);
+        }
+    }
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert_eq!(fixture.page.live(), 2);
+
+    let slot = Box::leak(Box::new(carrick_el1_abi::PortalGrantSlot::new()));
+    let window = carrick_el1_abi::PortalGrantWindow::decode([
+        1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    let next_window = carrick_el1_abi::PortalGrantWindow::decode([
+        1, 77, 2, 4, 4, 0x6000, 0x7000, 3, 0x6000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    assert!(slot.publish_fault_selection(3, window));
+    assert!(
+        !slot.publish_fault_selection(4, next_window),
+        "occupied grant slot must reject a new selection until withdrawn or taken"
+    );
+    set_test_fault_slot(Some((slot, 77)));
+    let _reset_slot = ResetTestFaultSlot;
+
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = sibling.slot;
+    sibling_service.child_copy_error = Some(NativeProcessError::NeedsSupply);
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &(fixture.make_words)(fixture.address),
+            &mut sibling_service,
+        )
+        .unwrap();
+    let (fault, sequence) = member.service.copyout_fault(UserVa::new(0x4000)).unwrap();
+
+    // A sibling closes the process between prepare_signal_frame selection and fault service publication.
+    {
+        let mut root_service = fixture.service();
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut root_service,
+            )
+            .unwrap();
+        let outcome = root.exit_group(7);
+        assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
+        assert!(root.take_run_failure().is_none());
+    }
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+    let action = carrick_signal_core::policy::Action {
+        disposition: carrick_signal_core::policy::Disposition::Handler(
+            carrick_signal_core::policy::HandlerAddress(0x2000),
+        ),
+        flags: carrick_signal_core::policy::ActionFlags {
+            on_stack: true,
+            siginfo: true,
+            ..Default::default()
+        },
+        ..carrick_signal_core::policy::Action::default()
+    };
+    let outcome = member.retain_and_defer_signal_delivery(
+        carrick_signal_core::policy::Signal::from_number(23).unwrap(),
+        &mut None,
+        action,
+        carrick_signal_core::policy::SigBlockMask::NONE,
+        carrick_signal_core::policy::SigBlockMask::NONE,
+        super::super::SignalCopyDeferral::Supply { fault, sequence },
+    );
+    assert!(
+        outcome.is_ok(),
+        "closing sibling must retire cleanly without stranding selection: {outcome:?}"
+    );
+    assert!(member.take_run_failure().is_none());
+    assert!(
+        slot.publish_fault_selection(4, next_window),
+        "closing before fault publication must withdraw the unpublished selection so the next CPU selection succeeds"
+    );
+}
+
+#[test]
+fn arm_closing_before_fault_service_publication_withdraws_selection() {
+    closing_before_fault_service_publication_withdraws_selection_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_closing_before_fault_service_publication_withdraws_selection() {
+    closing_before_fault_service_publication_withdraws_selection_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
