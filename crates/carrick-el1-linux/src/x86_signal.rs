@@ -204,12 +204,24 @@ impl SignalBackend for LinuxX86Backend {
         &mut self,
         frame: &mut NativeFrame,
         fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameRestore, Self::Error> {
+        fn copy_in_step(
+            copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+            dst: &mut [u8],
+            va: UserVa,
+        ) -> Result<Option<carrick_core::user_copy::GuestCopyRequest>, ArchError> {
+            match copy_in(dst, va) {
+                carrick_core::user_copy::CopyOutcome::Done => Ok(None),
+                carrick_core::user_copy::CopyOutcome::NotYet(request) => Ok(Some(request)),
+                carrick_core::user_copy::CopyOutcome::Fault => Err(ArchError::InvalidFrame),
+            }
+        }
+
         let uc_addr = UserVa::new(frame.rsp);
         let mut uc_bytes = [0u8; core::mem::size_of::<Ucontext>()];
-        if !copy_in(&mut uc_bytes, uc_addr) {
-            return Err(ArchError::InvalidFrame);
+        if let Some(request) = copy_in_step(copy_in, &mut uc_bytes, uc_addr)? {
+            return Ok(carrick_personality_linux::signal::SignalFrameRestore::NotYet(request));
         }
         let Ok(uc) = Ucontext::read_from_bytes(&uc_bytes) else {
             return Err(ArchError::InvalidFrame);
@@ -241,8 +253,10 @@ impl SignalBackend for LinuxX86Backend {
             restored_fp[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
             restored_fp[512..520].copy_from_slice(&3u64.to_le_bytes());
         } else {
-            if !copy_in(&mut restored_fp[..512], UserVa::new(fp_address)) {
-                return Err(ArchError::InvalidFrame);
+            if let Some(request) =
+                copy_in_step(copy_in, &mut restored_fp[..512], UserVa::new(fp_address))?
+            {
+                return Ok(carrick_personality_linux::signal::SignalFrameRestore::NotYet(request));
             }
             let descriptor =
                 carrick_syscall_abi::X8664FpxSwBytes::read_from_bytes(&restored_fp[464..512])
@@ -256,9 +270,13 @@ impl SignalBackend for LinuxX86Backend {
                 }
                 let tail = fp_address.checked_add(512).ok_or(ArchError::InvalidFrame)?;
                 let mut extended = [0u8; FP_BYTES - 512 + 4];
-                if !copy_in(&mut extended, UserVa::new(tail))
-                    || extended[FP_BYTES - 512..]
-                        != carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
+                if let Some(request) = copy_in_step(copy_in, &mut extended, UserVa::new(tail))? {
+                    return Ok(
+                        carrick_personality_linux::signal::SignalFrameRestore::NotYet(request),
+                    );
+                }
+                if extended[FP_BYTES - 512..]
+                    != carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
                 {
                     return Err(ArchError::InvalidFrame);
                 }
@@ -307,11 +325,15 @@ impl SignalBackend for LinuxX86Backend {
         frame.user_rcx = uc.uc_mcontext.rcx;
         frame.rsp = uc.uc_mcontext.rsp;
 
-        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
-            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(uc.uc_sigmask),
+        Ok(
+            carrick_personality_linux::signal::SignalFrameRestore::Restored(
+                carrick_personality_linux::signal::RestoredSignalFrame {
+                    mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(uc.uc_sigmask),
+                    ),
+                    stack,
+                },
             ),
-            stack,
-        })
+        )
     }
 }

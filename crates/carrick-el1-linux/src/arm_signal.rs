@@ -363,10 +363,10 @@ pub(crate) fn apply_restored_context(
 pub(crate) fn restore_live_arm_signal_frame(
     frame: &mut TrapFrame,
     copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
+) -> Result<carrick_personality_linux::signal::SignalFrameRestore, carrick_syscall_abi::LinuxErrno>
 {
     use crate::sched::ThreadCpu;
-    use carrick_personality_linux::signal::SignalBackend;
+    use carrick_personality_linux::signal::{SignalBackend, SignalFrameRestore};
     use zerocopy::IntoBytes;
 
     // The audited switch leaf is the sole reader/writer of EL0 FP/SIMD.
@@ -377,17 +377,20 @@ pub(crate) fn restore_live_arm_signal_frame(
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
-    let mask = LinuxAarch64Backend
+    let outcome = LinuxAarch64Backend
         .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
-            copy_in.copy_in(dst, src).is_done()
+            copy_in.copy_in(dst, src)
         })
         .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    let SignalFrameRestore::Restored(restored) = outcome else {
+        return Ok(outcome);
+    };
     // restore_signal_frame validates and then publishes SP_EL0. Re-read it
-    // only after success; a failed copy leaves the saved hardware untouched.
+    // only after success; a failed or deferred copy leaves saved state untouched.
     let restored_sp = unsafe { carrick_el1::isa::aarch64::signal_stack().raw() };
     apply_restored_context(&mut saved.native, frame, &fp, restored_sp);
     crate::sched::HardwareCpu.load(frame, &saved);
-    Ok(mask)
+    Ok(SignalFrameRestore::Restored(restored))
 }
 
 #[cfg(all(test, not(all(target_os = "none", target_arch = "aarch64"))))]
@@ -410,9 +413,9 @@ pub(crate) fn host_arm_signal_context_for_test() -> Option<carrick_sched_core::T
 pub(crate) fn restore_host_arm_signal_frame(
     frame: &mut TrapFrame,
     copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
+) -> Result<carrick_personality_linux::signal::SignalFrameRestore, carrick_syscall_abi::LinuxErrno>
 {
-    use zerocopy::FromBytes;
+    use carrick_personality_linux::signal::SignalFrameRestore;
     use zerocopy::IntoBytes;
 
     let mut saved = match HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow()) {
@@ -423,25 +426,19 @@ pub(crate) fn restore_host_arm_signal_frame(
     fp.vregs = saved.v;
     fp.fpsr = saved.fpsr as u32;
     fp.fpcr = saved.fpcr as u32;
-    let sp = UserVa::new(saved.sp_el0);
-    let mut bytes =
-        frame_copy_buffer(arm::PUBLIC_FRAME_LEN).map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
-    if !copy_in.copy_in(&mut bytes, sp).is_done() {
-        return Err(carrick_syscall_abi::LINUX_EFAULT);
-    }
-    let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
-        return Err(carrick_syscall_abi::LINUX_EFAULT);
+    let (outcome, saved_sp) = restore_arm_signal_frame_at(
+        frame,
+        UserVa::new(saved.sp_el0),
+        fp.as_mut_bytes(),
+        &mut |dst, src| copy_in.copy_in(dst, src),
+    )
+    .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    let (SignalFrameRestore::Restored(restored), Some(restored_sp)) = (outcome, saved_sp) else {
+        return Ok(outcome);
     };
-    let (mask, saved_sp, stack) = restore(frame, sigframe, fp.as_mut_bytes(), sp)
-        .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
-    apply_restored_context(&mut saved, frame, &fp, saved_sp);
+    apply_restored_context(&mut saved, frame, &fp, restored_sp);
     HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow_mut() = Some(saved));
-    Ok(carrick_personality_linux::signal::RestoredSignalFrame {
-        mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(mask),
-        ),
-        stack,
-    })
+    Ok(SignalFrameRestore::Restored(restored))
 }
 
 #[cfg(any(
@@ -553,8 +550,8 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         &mut self,
         frame: &mut TrapFrame,
         _fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameRestore, Self::Error> {
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
             let _ = (frame, _fpstate, copy_in);
@@ -563,32 +560,67 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let sp_val = unsafe { carrick_el1::isa::aarch64::signal_stack().raw() };
-            let sp = UserVa::new(sp_val);
-            // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
-            // EL1 stack and borrow it throughout decode.
-            let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
-            if !copy_in(&mut bytes, sp) {
-                return Err(ArchError::InvalidFrame);
+            let (outcome, saved_sp) =
+                restore_arm_signal_frame_at(frame, UserVa::new(sp_val), _fpstate, copy_in)?;
+            if let (
+                carrick_personality_linux::signal::SignalFrameRestore::Restored(_),
+                Some(saved_sp),
+            ) = (outcome, saved_sp)
+            {
+                unsafe {
+                    carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
+                }
             }
-            let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
-                return Err(ArchError::InvalidFrame);
-            };
+            Ok(outcome)
+        }
+    }
+}
 
-            let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
+/// Shared frame restoration for the native backend and host-path witnesses.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn restore_arm_signal_frame_at(
+    frame: &mut TrapFrame,
+    sp: UserVa,
+    fpstate: &mut [u8],
+    copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+) -> Result<
+    (
+        carrick_personality_linux::signal::SignalFrameRestore,
+        Option<u64>,
+    ),
+    ArchError,
+> {
+    // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
+    // EL1 stack and borrow it throughout decode.
+    let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
+    match copy_in(&mut bytes, sp) {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(request) => {
+            return Ok((
+                carrick_personality_linux::signal::SignalFrameRestore::NotYet(request),
+                None,
+            ));
+        }
+        carrick_core::user_copy::CopyOutcome::Fault => {
+            return Err(ArchError::InvalidFrame);
+        }
+    }
+    let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
+        return Err(ArchError::InvalidFrame);
+    };
 
-            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-            unsafe {
-                carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
-            }
-
-            Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+    let (mask, saved_sp, stack) = restore(frame, sigframe, fpstate, sp)?;
+    Ok((
+        carrick_personality_linux::signal::SignalFrameRestore::Restored(
+            carrick_personality_linux::signal::RestoredSignalFrame {
                 mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                     carrick_signal_core::SignalSet::from_bits(mask),
                 ),
                 stack,
-            })
-        }
-    }
+            },
+        ),
+        Some(saved_sp),
+    ))
 }
 
 /// Shared frame publication for the native backend and its host-path witness.
@@ -1242,5 +1274,72 @@ mod tests {
         let disabled_flags = disabled_frame.rt.ucontext.uc_stack.ss_flags;
         assert_eq!(disabled_saved_sp, main_sp);
         assert_eq!(disabled_flags, carrick_syscall_abi::LINUX_SS_DISABLE as i32);
+    }
+
+    #[test]
+    fn arm_restore_signal_frame_not_yet_and_fault_leave_registers_and_fpstate_untouched() {
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+        use carrick_guest_arch::Access;
+        use carrick_personality_linux::signal::SignalFrameRestore;
+
+        let mut initial_frame = TrapFrame {
+            elr: 0x40_1234,
+            spsr: 0x3c0,
+            ..Default::default()
+        };
+        initial_frame.x[0] = 0x1111_2222;
+        initial_frame.x[8] = 139;
+        initial_frame.x[30] = 0x71_0000;
+        let expected_elr = initial_frame.elr;
+        let expected_spsr = initial_frame.spsr;
+        let expected_x = initial_frame.x;
+
+        let mut initial_fp = LinuxFpsimdContext::empty();
+        initial_fp.vregs[0] = 0xdead_beef_cafe_babe;
+        initial_fp.fpsr = 7;
+        initial_fp.fpcr = 9;
+        let expected_fp_bytes = initial_fp.as_bytes().to_vec();
+
+        let sp = UserVa::new(0x20_0000);
+        let mut frame = initial_frame;
+        let mut fp = initial_fp;
+        let result =
+            restore_arm_signal_frame_at(&mut frame, sp, fp.as_mut_bytes(), &mut |dst, va| {
+                // Dirty the staging buffer before returning NotYet to verify partial/prefixed
+                // copy writes never leak into machine registers or fpstate.
+                dst.fill(0xa5);
+                CopyOutcome::NotYet(GuestCopyRequest {
+                    address: va,
+                    len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                    access: Access::Read,
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            (
+                SignalFrameRestore::NotYet(GuestCopyRequest {
+                    address: sp,
+                    len: carrick_guest_arch::GuestLen::new(arm::PUBLIC_FRAME_LEN as u64),
+                    access: Access::Read,
+                }),
+                None
+            )
+        );
+        assert_eq!(frame.elr, expected_elr);
+        assert_eq!(frame.spsr, expected_spsr);
+        assert_eq!(frame.x, expected_x);
+        assert_eq!(fp.as_bytes(), expected_fp_bytes.as_slice());
+
+        let fault =
+            restore_arm_signal_frame_at(&mut frame, sp, fp.as_mut_bytes(), &mut |dst, _| {
+                dst.fill(0x5a);
+                CopyOutcome::Fault
+            });
+        assert!(matches!(fault, Err(ArchError::InvalidFrame)));
+        assert_eq!(frame.elr, expected_elr);
+        assert_eq!(frame.spsr, expected_spsr);
+        assert_eq!(frame.x, expected_x);
+        assert_eq!(fp.as_bytes(), expected_fp_bytes.as_slice());
     }
 }

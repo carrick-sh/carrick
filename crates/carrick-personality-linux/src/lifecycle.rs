@@ -186,6 +186,24 @@ pub enum LifecycleOutcome {
     },
 }
 
+/// Outcome of preparing or waiting on an `rt_sigreturn` frame copy-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigreturnCopyOutcome {
+    /// Contention or unbacked frame preparation parked the caller cleanly.
+    Transferred {
+        progress: carrick_core_abi::Served,
+        result: SyscallResult,
+    },
+    /// Contention cleared synchronously; restart `rt_sigreturn` cleanly.
+    RetrySyscall,
+    /// Synchronous reply or thread exit already forced `SIGSEGV` or
+    /// termination; return without restarting `rt_sigreturn` or writing errno.
+    Settled,
+    /// Inline frame validation or mapping lookup failed; caller must force
+    /// `SIGSEGV` without returning `-EFAULT`.
+    Fault,
+}
+
 pub fn lifecycle_effect(outcome: &LifecycleOutcome) -> crate::dispatch::FamilyCompletion {
     use crate::dispatch::FamilyCompletion;
     match *outcome {
@@ -413,6 +431,16 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
         _observe: &mut dyn FnMut(InputPreparationRefusal),
     ) -> LifecycleOutcome {
         self.wait_guest_copy(request)
+    }
+    /// Prepare an unavailable `rt_sigreturn` frame page without translating a
+    /// real fault into `-EFAULT`; faults return `SigreturnCopyOutcome::Fault`
+    /// so the caller forces `SIGSEGV`.
+    fn wait_sigreturn_copy_observed(
+        &mut self,
+        _request: GuestCopyRequest,
+        _observe: &mut dyn FnMut(InputPreparationRefusal),
+    ) -> SigreturnCopyOutcome {
+        SigreturnCopyOutcome::Fault
     }
 
     /// An admitted process may retain an exact-MM write authority (including COW).

@@ -371,6 +371,15 @@ pub trait ProcessSignals {
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+    /// Force `SIGSEGV` only while no terminal process exit has won under the
+    /// process graph lock. Returns `Ok(true)` if forced, `Ok(false)` if already
+    /// exiting (signal state untouched), or `Err` if absent.
+    fn force_sigsegv_unless_exiting(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
+        self.force_sigsegv(blocked).map(|()| true)
+    }
 
     fn raise_sigpipe(&mut self) {}
 
@@ -491,6 +500,12 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
         &mut self,
         request: carrick_core::user_copy::GuestCopyRequest,
     ) -> SignalOutcome;
+    /// Prepare an unavailable signal-frame copy-in on `rt_sigreturn`; a genuine
+    /// fault returns `Err` so `rt_sigreturn` forces `SIGSEGV`, never `-EFAULT`.
+    fn wait_sigreturn_copy(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+    ) -> Result<SignalOutcome, carrick_syscall_abi::LinuxErrno>;
     /// Retain an already attempted output after `NotYet`, without retrying
     /// the user copy before transferring it to the continuation owner.
     fn finish_signal_output(
@@ -511,20 +526,26 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>;
+    ) -> Result<SignalFrameRestore, carrick_syscall_abi::LinuxErrno>;
     fn force_sigsegv(&mut self) -> bool {
         let blocked = self.current_blocked();
-        let forced = self
-            .process_signals()
-            .is_some_and(|p| p.force_sigsegv(blocked).is_ok());
-        if forced {
-            self.set_current_blocked(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                blocked
-                    .signals()
-                    .without(carrick_signal_core::policy::Signal::SEGV),
-            ));
+        let Some(process) = self.process_signals() else {
+            return false;
+        };
+        match process.force_sigsegv_unless_exiting(blocked) {
+            Ok(true) => {
+                self.set_current_blocked(
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        blocked
+                            .signals()
+                            .without(carrick_signal_core::policy::Signal::SEGV),
+                    ),
+                );
+                true
+            }
+            Ok(false) => true,
+            Err(_) => false,
         }
-        forced
     }
 }
 
@@ -701,17 +722,18 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             }
             returned(0, false)
         }
-        SignalCall::RtSigreturn => {
-            let res = native.restore_signal_frame();
-            match res {
-                Ok(restored) => {
-                    native.set_current_altstack(restored.stack);
-                    native.set_current_blocked(restored.mask);
-                    Some(SignalOutcome::Restored)
-                }
-                Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
+        SignalCall::RtSigreturn => match native.restore_signal_frame() {
+            Ok(SignalFrameRestore::Restored(restored)) => {
+                native.set_current_altstack(restored.stack);
+                native.set_current_blocked(restored.mask);
+                Some(SignalOutcome::Restored)
             }
-        }
+            Ok(SignalFrameRestore::NotYet(request)) => match native.wait_sigreturn_copy(request) {
+                Ok(outcome) => Some(outcome),
+                Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
+            },
+            Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
+        },
         SignalCall::Kill => {
             let [pid, sig, _, _, _, _] = args;
             let pid = SignalProcessSelector::from_abi(pid);
@@ -1044,14 +1066,28 @@ pub trait SignalBackend: carrick_guest_arch::ArchTypes {
         &mut self,
         frame: &mut Self::NativeFrame,
         fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], carrick_guest_arch::UserVa) -> bool,
-    ) -> Result<RestoredSignalFrame, Self::Error>;
+        copy_in: &mut dyn FnMut(
+            &mut [u8],
+            carrick_guest_arch::UserVa,
+        ) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<SignalFrameRestore, Self::Error>;
+}
+
+/// Outcome of reading and validating a user signal frame on `rt_sigreturn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalFrameRestore {
+    /// Frame copy and validation succeeded and machine context was restored.
+    Restored(RestoredSignalFrame),
+    /// Frame copy-in could not proceed yet due to address-space or service
+    /// contention or an unbacked readable frame page; machine registers,
+    /// `fpstate`, `altstack`, and blocked mask remain untouched.
+    NotYet(carrick_core::user_copy::GuestCopyRequest),
 }
 
 /// The validated public frame's two thread-level signal settings. ISA
 /// decoders construct this before publishing machine registers; the shared
 /// owner commits both settings after the frame copy succeeds.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestoredSignalFrame {
     pub mask: carrick_signal_core::policy::SigBlockMask,
     pub stack: crate::abi::thread::AltStack,

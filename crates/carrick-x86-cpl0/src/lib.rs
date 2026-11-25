@@ -34,6 +34,7 @@ mod test_support {
     /// Injected grant refusals answered in the high 32 bits; the pages of
     /// the first grant applied after one in the low 32 bits.
     pub const INJECT_GRANT_REFUSAL_CENSUS: u64 = 0xffff_ffff_ffff_fe53;
+    pub const INJECT_SIGRETURN_CONTENTION_CENSUS: u64 = 0xffff_ffff_ffff_fe54;
     pub const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
     pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
@@ -902,6 +903,9 @@ mod test_support {
             INJECT_GRANT_REFUSAL_CENSUS => {
                 let (refusals, pages) = carrick_core::mm::frames::injected_grant_refusal_census();
                 Some(refusals << 32 | pages)
+            }
+            INJECT_SIGRETURN_CONTENTION_CENSUS => {
+                Some(carrick_sched_core::spaces::sigreturn_contention_census())
             }
             INJECT_EDITOR_BUSY_ONCE => {
                 carrick_sched_core::spaces::inject_editor_busy_once().then_some(0)

@@ -49,15 +49,7 @@ impl<
         write: bool,
         reason: carrick_el1_abi::CopyRefusalReason,
     ) {
-        let diagnostic = crate::file::CopyDiagnostic {
-            counters: self.counters,
-            ordinal: self.frame.canonical_ordinal(),
-            arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
-            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
-            presented: self.process.as_deref().map(|venue| venue.binding()),
-            expected: LifecycleNative::binding(self),
-        };
-        diagnostic.record_copy_failure(
+        self.copy_diagnostic().record_copy_failure(
             address,
             carrick_guest_arch::GuestLen::new(len as u64),
             if write {
@@ -86,8 +78,8 @@ impl<
     /// the copy again, as a broken invariant instead of EFAULT.
     #[inline(never)]
     fn copy_owner_reaches(&mut self) -> bool {
-        self.process_venue()
-            .is_some_and(|venue| venue.owner_reaches_memory())
+        let binding = LifecycleNative::binding(self);
+        process_owner_reaches(binding, &mut self.process)
     }
 
     /// The venue that serves this caller's clocks in ring. The ARM root can
@@ -128,6 +120,175 @@ impl<
     }
 }
 
+#[inline(never)]
+fn process_owner_reaches<'a, 'ipc, Context: super::dispatch::DispatchContext>(
+    binding: Option<carrick_el1_abi::ExecutionBinding>,
+    process: &mut Option<&'a mut dyn ProcessNative<'ipc, Context>>,
+) -> bool {
+    let Some(binding) = binding else {
+        return false;
+    };
+    let Some(venue) = process.as_deref_mut() else {
+        return false;
+    };
+    venue.binding() == binding && venue.owner_reaches_memory()
+}
+
+struct DiagnosedCopyIn<'a, 'b, 'ipc, Context> {
+    task: &'a carrick_el1_abi::CurrentTask,
+    binding: Option<carrick_el1_abi::ExecutionBinding>,
+    process: &'b mut Option<&'a mut dyn ProcessNative<'ipc, Context>>,
+    diagnostic: crate::file::CopyDiagnostic<'a>,
+}
+
+impl<Context: super::dispatch::DispatchContext> carrick_personality_linux::lifecycle::UserCopy
+    for DiagnosedCopyIn<'_, '_, '_, Context>
+{
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
+            &mut crate::file::ValidatedCopy {
+                task: self.task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst.raw(),
+            src,
+        ))
+    }
+
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        let copied = crate::file::ValidatedCopy {
+            task: self.task,
+            validator: &crate::file::HardwareValidator,
+        }
+        .copy_in_diagnosed(dst, src.raw());
+        match copied {
+            Ok(()) => CopyOutcome::Done,
+            Err(reason) => {
+                self.diagnostic.record_copy_failure(
+                    src,
+                    carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                    carrick_guest_arch::Access::Read,
+                    reason,
+                );
+                // Resolve owner reachability only after an actual hardware copy
+                // refusal so successful reads avoid acquiring the process graph lock.
+                if reason != carrick_el1_abi::CopyRefusalReason::ForbiddenRange
+                    && process_owner_reaches(self.binding, self.process)
+                {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: src,
+                        len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                        access: carrick_guest_arch::Access::Read,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
+        }
+    }
+}
+
+impl<
+    'a,
+    'ipc,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
+{
+    fn copy_diagnostic(&self) -> crate::file::CopyDiagnostic<'a> {
+        crate::file::CopyDiagnostic {
+            counters: self.counters,
+            ordinal: self.frame.canonical_ordinal(),
+            arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
+            presented: self.process.as_deref().map(|venue| venue.binding()),
+            expected: LifecycleNative::binding(self),
+        }
+    }
+
+    fn diagnosed_copy_inputs(
+        &self,
+    ) -> Option<(
+        &'a carrick_el1_abi::CurrentTask,
+        Option<carrick_el1_abi::ExecutionBinding>,
+        crate::file::CopyDiagnostic<'a>,
+    )> {
+        let task = self.current_tasks.get(self.frame.task_index())?;
+        Some((task, LifecycleNative::binding(self), self.copy_diagnostic()))
+    }
+
+    fn record_wait_refusal(
+        diagnostic: &crate::file::CopyDiagnostic<'a>,
+        request: GuestCopyRequest,
+        refusal: carrick_personality_linux::lifecycle::InputPreparationRefusal,
+    ) {
+        use carrick_personality_linux::lifecycle::InputPreparationRefusal;
+        diagnostic.record(
+            request.address,
+            request.len,
+            request.access,
+            match refusal {
+                InputPreparationRefusal::Fault => carrick_el1_abi::CopyRefusalReason::OwnerFault,
+                InputPreparationRefusal::OwnerBusy => carrick_el1_abi::CopyRefusalReason::OwnerBusy,
+                InputPreparationRefusal::OwnerDependency => {
+                    carrick_el1_abi::CopyRefusalReason::OwnerDependency
+                }
+            },
+        );
+    }
+
+    fn finish_guest_copy_wait(
+        &mut self,
+        diagnostic: &crate::file::CopyDiagnostic<'a>,
+        outcome: &mut LifecycleOutcome,
+    ) {
+        if matches!(outcome, LifecycleOutcome::Redispatch) {
+            self.frame.restart_syscall();
+            if let (Some(frame), Some(binding)) = (self.frame.arm_frame_ref(), diagnostic.presented)
+            {
+                self.counters.record_syscall_frame(
+                    carrick_el1_abi::SyscallFrameSource::OwnerInputRedispatch,
+                    frame,
+                    binding,
+                );
+            }
+        }
+        self.run_ready_after_native_transfer(outcome);
+    }
+
+    fn wait_sigreturn_copy_inner(
+        &mut self,
+        request: GuestCopyRequest,
+    ) -> Result<carrick_personality_linux::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno>
+    {
+        use carrick_personality_linux::lifecycle::SigreturnCopyOutcome;
+        let diagnostic = self.copy_diagnostic();
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut record_refusal = |refusal| Self::record_wait_refusal(&diagnostic, request, refusal);
+        match venue.wait_sigreturn_copy_observed(request, &mut record_refusal) {
+            SigreturnCopyOutcome::Fault => Err(carrick_syscall_abi::LINUX_EFAULT),
+            SigreturnCopyOutcome::Settled => {
+                Ok(carrick_personality_linux::signal::SignalOutcome::Restored)
+            }
+            SigreturnCopyOutcome::RetrySyscall => {
+                let mut outcome = LifecycleOutcome::Redispatch;
+                self.finish_guest_copy_wait(&diagnostic, &mut outcome);
+                Ok(signal_copy_outcome(outcome))
+            }
+            SigreturnCopyOutcome::Transferred { progress, result } => {
+                let mut outcome = LifecycleOutcome::Transferred { progress, result };
+                self.finish_guest_copy_wait(&diagnostic, &mut outcome);
+                Ok(signal_copy_outcome(outcome))
+            }
+        }
+    }
+}
+
 impl<
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
@@ -141,30 +302,16 @@ impl<
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_in(dst, src.raw()));
         }
-        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+        let Some((task, binding, diagnostic)) = self.diagnosed_copy_inputs() else {
             return CopyOutcome::Fault;
         };
-        let copied = crate::file::ValidatedCopy {
+        let mut copy = DiagnosedCopyIn {
             task,
-            validator: &crate::file::HardwareValidator,
-        }
-        .copy_in_diagnosed(dst, src.raw());
-        match copied {
-            Ok(()) => CopyOutcome::Done,
-            Err(reason) => {
-                let owner = self.copy_owner_reaches();
-                self.record_copy_refusal(src, dst.len(), false, reason);
-                if owner {
-                    CopyOutcome::NotYet(GuestCopyRequest {
-                        address: src,
-                        len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
-                        access: carrick_guest_arch::Access::Read,
-                    })
-                } else {
-                    CopyOutcome::Fault
-                }
-            }
-        }
+            binding,
+            process: &mut self.process,
+            diagnostic,
+        };
+        copy.copy_in(dst, src)
     }
 
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
@@ -266,48 +413,13 @@ impl<
     }
 
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
-        let diagnostic = crate::file::CopyDiagnostic {
-            counters: self.counters,
-            ordinal: self.frame.canonical_ordinal(),
-            arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
-            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
-            presented: self.process.as_deref().map(|venue| venue.binding()),
-            expected: LifecycleNative::binding(self),
-        };
+        let diagnostic = self.copy_diagnostic();
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
-        let mut outcome = venue.wait_guest_copy_observed(request, &mut |refusal| {
-            use carrick_personality_linux::lifecycle::InputPreparationRefusal;
-            diagnostic.record(
-                request.address,
-                request.len,
-                request.access,
-                match refusal {
-                    InputPreparationRefusal::Fault => {
-                        carrick_el1_abi::CopyRefusalReason::OwnerFault
-                    }
-                    InputPreparationRefusal::OwnerBusy => {
-                        carrick_el1_abi::CopyRefusalReason::OwnerBusy
-                    }
-                    InputPreparationRefusal::OwnerDependency => {
-                        carrick_el1_abi::CopyRefusalReason::OwnerDependency
-                    }
-                },
-            );
-        });
-        if matches!(outcome, LifecycleOutcome::Redispatch) {
-            self.frame.restart_syscall();
-            if let (Some(frame), Some(binding)) = (self.frame.arm_frame_ref(), diagnostic.presented)
-            {
-                self.counters.record_syscall_frame(
-                    carrick_el1_abi::SyscallFrameSource::OwnerInputRedispatch,
-                    frame,
-                    binding,
-                );
-            }
-        }
-        self.run_ready_after_native_transfer(&mut outcome);
+        let mut record_refusal = |refusal| Self::record_wait_refusal(&diagnostic, request, refusal);
+        let mut outcome = venue.wait_guest_copy_observed(request, &mut record_refusal);
+        self.finish_guest_copy_wait(&diagnostic, &mut outcome);
         outcome
     }
     fn finish_signal_output(
@@ -1210,6 +1322,13 @@ impl<
     ) -> carrick_personality_linux::signal::SignalOutcome {
         signal_copy_outcome(LifecycleNative::wait_guest_copy(self, request))
     }
+    fn wait_sigreturn_copy(
+        &mut self,
+        request: GuestCopyRequest,
+    ) -> Result<carrick_personality_linux::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno>
+    {
+        self.wait_sigreturn_copy_inner(request)
+    }
     fn finish_signal_output(
         &mut self,
         address: UserVa,
@@ -1272,10 +1391,9 @@ impl<
     fn restore_signal_frame(
         &mut self,
     ) -> Result<
-        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_personality_linux::signal::SignalFrameRestore,
         carrick_syscall_abi::LinuxErrno,
     > {
-        let task_idx = self.frame.task_index();
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             struct Adapter<'u>(&'u mut (dyn crate::file::UserCopy + 'u));
@@ -1302,13 +1420,15 @@ impl<
             let mut adapter = Adapter(*user);
             return self.frame.restore_signal_frame(&mut adapter);
         }
-        let Some(task) = self.current_tasks.get(task_idx) else {
-            return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT);
-        };
-        let mut copy = LinuxUserCopy(crate::file::ValidatedCopy {
+        let (task, binding, diagnostic) = self
+            .diagnosed_copy_inputs()
+            .ok_or(carrick_personality_linux::abi::signal::LINUX_EFAULT)?;
+        let mut copy = DiagnosedCopyIn {
             task,
-            validator: &crate::file::HardwareValidator,
-        });
+            binding,
+            process: &mut self.process,
+            diagnostic,
+        };
         self.frame.restore_signal_frame(&mut copy)
     }
 }

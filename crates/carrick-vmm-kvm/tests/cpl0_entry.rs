@@ -5711,7 +5711,11 @@ _start:
     js fail_clone
     jz worker_entry
 
-    /* Wait barrier baseline. */
+    /* Baseline live rt_sigreturn copy-in contention census (low 32 bits). */
+    mov $-428, %rax             /* INJECT_SIGRETURN_CONTENTION_CENSUS */
+    syscall
+    mov %eax, %eax
+    mov %rax, contention_base(%rip)
 
     /* Barrier with sibling so both threads enter the race together. */
     lock incl 0x08(%r12)
@@ -5727,7 +5731,15 @@ _start:
     xor %ebx, %ebx
 leader_loop:
     cmp $64, %rbx
-    jae leader_stop
+    jb 5f
+    mov $-428, %rax             /* INJECT_SIGRETURN_CONTENTION_CENSUS */
+    syscall
+    mov %eax, %eax
+    cmp contention_base(%rip), %rax
+    ja leader_stop
+    cmp $4096, %rbx
+    jae fail_no_contention
+5:
     mov %rbx, %rax
     and $255, %eax
     jnz 6f
@@ -5792,6 +5804,11 @@ verify_counts:
     je fail_worker
     cmpq $64, handler_runs(%rip)
     jb fail_handler_count
+    mov $-428, %rax             /* INJECT_SIGRETURN_CONTENTION_CENSUS */
+    syscall
+    mov %eax, %eax
+    cmp contention_base(%rip), %rax
+    jbe fail_no_contention
     mov $7, %edi
     jmp die
 
@@ -6044,7 +6061,11 @@ _start:
     test %rax, %rax
     jnz fail_setup
 
-
+    /* Record baseline rt_sigreturn Fault supply count before kill(SIGUSR1). */
+    mov $-428, %rax             /* INJECT_SIGRETURN_CONTENTION_CENSUS */
+    syscall
+    shr $32, %rax
+    mov %rax, supply_base(%rip)
 
     mov $11, %edi               /* SIGSEGV */
     lea sigact_segv(%rip), %rsi
@@ -6090,6 +6111,14 @@ segv_handler:
     lea after_sigreturn_syscall(%rip), %rcx
     cmpq %rcx, 0xa8(%rdx)       /* uc_mcontext.rip must not rewind to syscall */
     jne fail_segv
+    /* Confirm unbacked lazy page 0 completed Fault supply before PROT_NONE page 1 faulted. */
+    mov $-428, %rax             /* INJECT_SIGRETURN_CONTENTION_CENSUS */
+    syscall
+    shr $32, %rax
+    mov supply_base(%rip), %rcx
+    inc %rcx
+    cmp %rcx, %rax
+    jne fail_segv
     mov $7, %edi
     jmp die
 
@@ -6110,7 +6139,11 @@ die:
         };
 
         let elf = compile_static_gas_witness(asm);
-        let outcome = run_pool_fixture(&elf, 64);
+        let outcome = if prot_none_fpstate {
+            run_instrumented_pool_fixture(&elf, 64)
+        } else {
+            run_pool_fixture(&elf, 64)
+        };
         assert_eq!(
             outcome.run.exit_code, 7,
             "prot_none_fpstate={prot_none_fpstate} real fault on rt_sigreturn must force SIGSEGV with SI_KERNEL (exit={}, terminating_signal={:?})",

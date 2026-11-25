@@ -44,6 +44,14 @@ impl<'a> SignalNative<'a> for Native {
         panic!("eager test venue cannot suspend guest memory")
     }
     #[allow(clippy::panic)]
+    fn wait_sigreturn_copy(
+        &mut self,
+        _: carrick_core::user_copy::GuestCopyRequest,
+    ) -> Result<carrick_personality_linux::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno>
+    {
+        panic!("eager test venue cannot suspend guest memory")
+    }
+    #[allow(clippy::panic)]
     fn finish_signal_output(
         &mut self,
         address: carrick_guest_arch::UserVa,
@@ -73,7 +81,7 @@ impl<'a> SignalNative<'a> for Native {
     fn restore_signal_frame(
         &mut self,
     ) -> Result<
-        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_personality_linux::signal::SignalFrameRestore,
         carrick_syscall_abi::LinuxErrno,
     > {
         Err(carrick_syscall_abi::LinuxErrno::new(14))
@@ -285,7 +293,7 @@ fn signal_owner_admits_validated_requests_and_selectors() {
     );
     assert_eq!(result.unwrap_err().get(), 22);
     let restored: Result<
-        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_personality_linux::signal::SignalFrameRestore,
         carrick_syscall_abi::LinuxErrno,
     > = native.restore_signal_frame();
     assert_eq!(restored.unwrap_err().get(), 14);

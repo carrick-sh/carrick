@@ -100,6 +100,93 @@ pub(super) fn run_service_published_hook(runtime: usize) {
 std::thread_local! {
     // Inject the other lane's close between notice contention and the park probe.
     pub(super) static SERVICE_NOTICE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    // Inject group close between completion exiting check and forced SIGSEGV publication.
+    pub(super) static SIGRETURN_FAULT_PRE_FORCE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    #[allow(clippy::type_complexity)]
+    static PORTAL_FAULT_SLOTS: std::cell::RefCell<
+        Vec<(
+            SlotId,
+            std::sync::Arc<carrick_el1_abi::PortalGrantSlot>,
+            core::cell::Cell<u64>,
+            core::cell::Cell<u64>,
+        )>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+pub(super) struct PortalFaultSlotGuard;
+
+#[cfg(all(test, not(target_os = "macos")))]
+impl Drop for PortalFaultSlotGuard {
+    fn drop(&mut self) {
+        PORTAL_FAULT_SLOTS.with(|slots| slots.borrow_mut().clear());
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+pub(super) fn install_portal_fault_slots(
+    entries: &[(SlotId, std::sync::Arc<carrick_el1_abi::PortalGrantSlot>)],
+) -> PortalFaultSlotGuard {
+    PORTAL_FAULT_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        assert!(slots.is_empty());
+        for (cpu_slot, slot) in entries {
+            slots.push((
+                *cpu_slot,
+                slot.clone(),
+                core::cell::Cell::new(0),
+                core::cell::Cell::new(0),
+            ));
+        }
+    });
+    PortalFaultSlotGuard
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+pub(super) fn install_portal_fault_slot(
+    slot: std::sync::Arc<carrick_el1_abi::PortalGrantSlot>,
+) -> PortalFaultSlotGuard {
+    install_portal_fault_slots(&[(SlotId::new(0), slot)])
+}
+
+#[cfg(test)]
+fn publish_mock_portal_fault(
+    cpu_slot: SlotId,
+    mm_key: u64,
+    address: UserVa,
+) -> Result<(), NativeProcessError> {
+    PORTAL_FAULT_SLOTS.with(|slots| {
+        let borrowed = slots.borrow();
+        let Some((_, slot, slot_mm, next_seq)) = borrowed.iter().find(|(id, ..)| *id == cpu_slot)
+        else {
+            return Err(NativeProcessError::Unsupported);
+        };
+        let page = address.raw() & !4095;
+        let seq = next_seq.get().saturating_add(1).max(1);
+        next_seq.set(seq);
+        slot_mm.set(mm_key);
+        let window = carrick_el1_abi::PortalGrantWindow::decode([
+            1,
+            mm_key,
+            1,
+            seq,
+            1,
+            page,
+            page + 4096,
+            3,
+            page,
+            0,
+            0,
+            0,
+            0,
+        ])
+        .unwrap();
+        if slot.publish_fault_selection(seq, window) {
+            Err(NativeProcessError::Unsupported)
+        } else {
+            Err(NativeProcessError::Busy)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -598,17 +685,55 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     }
     fn prepare_owned_read(
         &mut self,
-        _: &Self::Mm,
+        mm: &Self::Mm,
         request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
+        let _ = mm;
         assert_eq!(request.access, carrick_guest_arch::Access::Read);
-        self.prepare_copy_error.map_or(Ok(()), Err)
+        if let Some(error) = self.prepare_copy_error {
+            #[cfg(test)]
+            if PREPARE_READ_ERROR_AT.with(|at| {
+                at.get()
+                    .is_some_and(|expected| request.address.raw() != expected)
+            }) {
+                return Ok(());
+            }
+            #[cfg(test)]
+            if error == NativeProcessError::Unsupported {
+                return publish_mock_portal_fault(
+                    self.waker_slot,
+                    mm.mm.raw().get(),
+                    request.address,
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
     }
     #[cfg(test)]
     fn copyout_fault(
         &self,
         address: UserVa,
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        if let Some(selection) = PORTAL_FAULT_SLOTS.with(|slots| {
+            slots
+                .borrow()
+                .iter()
+                .find(|(id, ..)| *id == self.waker_slot)
+                .and_then(|(_, slot, mm_key, _)| {
+                    slot.pending_fault_selection(mm_key.get(), address.raw())
+                        .and_then(|(seq, _)| NonZeroU64::new(seq))
+                })
+        }) {
+            return Some((
+                carrick_guest_arch::FaultInfo {
+                    address,
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
+                },
+                selection,
+            ));
+        }
         matches!(self.child_copy_error, Some(NativeProcessError::Unsupported)).then_some((
             carrick_guest_arch::FaultInfo {
                 address,
@@ -617,6 +742,18 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             },
             NonZeroU64::MIN,
         ))
+    }
+    #[cfg(test)]
+    fn cancel_copyout_fault(&mut self, address: UserVa, sequence: NonZeroU64) {
+        PORTAL_FAULT_SLOTS.with(|slots| {
+            if let Some((_, slot, mm_key, _)) = slots
+                .borrow()
+                .iter()
+                .find(|(id, ..)| *id == self.waker_slot)
+            {
+                let _ = slot.cancel_native_fault_selection(mm_key.get(), address.raw(), sequence);
+            }
+        });
     }
     #[cfg(test)]
     fn apply_fault_reply(
@@ -630,7 +767,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         if let Some(wait) = FAULT_REPLY_WAIT_ONCE.with(|once| once.take()) {
             return Err(carrick_core::mm::transaction::MmError::Wait(wait));
         }
-        if disposition == super::FaultReplyDisposition::Cancel && slot.window().is_none() {
+        if (disposition == super::FaultReplyDisposition::Cancel && slot.window().is_none())
+            || FAULT_REPLY_ALLOW_APPLY.with(|allow| allow.take())
+        {
             Ok(())
         } else {
             Err(carrick_core::mm::transaction::MmError::Core)
@@ -638,9 +777,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     }
     fn prepare_owned_write(
         &mut self,
-        _: &Self::Mm,
+        mm: &Self::Mm,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
+        let _ = mm;
         #[cfg(test)]
         ENTROPY_PREPARES.with(|count| count.set(count.get() + 1));
         #[cfg(test)]
@@ -664,6 +804,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
                 .child_copy_error_at
                 .is_none_or(|at| request.address.raw() == at)
         {
+            #[cfg(test)]
+            if error == NativeProcessError::Unsupported {
+                return publish_mock_portal_fault(
+                    self.waker_slot,
+                    mm.mm.raw().get(),
+                    request.address,
+                );
+            }
             return Err(error);
         }
         if let Some(hook) = &mut self.on_copy_complete {
@@ -1302,8 +1450,8 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
         &mut self,
         _frame: &mut carrick_el1_abi::TrapFrame,
         _fpstate: &mut [u8],
-        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameRestore, Self::Error> {
         Err(carrick_el1::isa::ArchError::Unbound)
     }
 }
@@ -12131,6 +12279,8 @@ std::thread_local! {
     static FAULT_REPLY_WAIT_ONCE: core::cell::Cell<Option<carrick_core_abi::PortalOwnerWait>> = const { core::cell::Cell::new(None) };
     static FAULT_REPLY_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static FAULT_REPLY_LAST_CANCEL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    pub(super) static FAULT_REPLY_ALLOW_APPLY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    pub(super) static PREPARE_READ_ERROR_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
 }
 
 #[test]

@@ -387,6 +387,39 @@ impl PortalGrantSlot {
         self.state.store(0, Ordering::Release);
         true
     }
+    /// Withdraw an unpublished fault selection (backing, COW, or prepared)
+    /// before any service ticket claims it, matching the exact MM, page,
+    /// and request generation.
+    pub fn cancel_native_fault_selection(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        sequence: core::num::NonZeroU64,
+    ) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, 3 | 4 | Self::PREPARED_SELECTION_STATE) {
+            return false;
+        }
+        if self
+            .state
+            .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let matches_selection = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))
+        .is_some_and(|window| {
+            window.operation.sequence == sequence
+                && self.fault_generation.load(Ordering::Relaxed) == sequence.get()
+                && window.operation.mm.raw() == mm_key
+                && window.fault_page == fault_va & !4095
+        });
+        self.state
+            .store(if matches_selection { 0 } else { state }, Ordering::Release);
+        matches_selection
+    }
     pub fn has_outstanding_for(&self, mm_key: u64) -> bool {
         let state = self.state.load(Ordering::Acquire);
         state != 0
@@ -554,6 +587,30 @@ mod layout_manifest {
         assert!(slot.publish_fault_selection(4, window));
         assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
         assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
+        let seq3 = core::num::NonZeroU64::new(3).unwrap();
+        let seq4 = core::num::NonZeroU64::new(4).unwrap();
+        let seq5 = core::num::NonZeroU64::new(5).unwrap();
+        let mut backing = window;
+        backing.operation.sequence = seq4;
+        assert!(slot.cancel_fault_selection(window, 4));
+        assert!(slot.publish_fault_selection(4, backing));
+        assert!(!slot.cancel_native_fault_selection(77, 0x4000, seq5));
+        assert!(!slot.cancel_native_fault_selection(78, 0x4000, seq4));
+        assert!(!slot.cancel_native_fault_selection(77, 0x5000, seq4));
+        assert!(slot.cancel_native_fault_selection(77, 0x4000, seq4));
+        assert!(slot.pending_fault_selection(77, 0x4000).is_none());
+
+        // State 5 (prepared) and state 4 (COW) selections also withdraw cleanly.
+        let mut prepared = window;
+        prepared.operation.sequence = seq5;
+        assert!(slot.publish_prepared_fault_selection(5, prepared));
+        assert!(slot.cancel_native_fault_selection(77, 0x4000, seq5));
+        assert!(slot.pending_prepared_fault_selection(77, 0x4000).is_none());
+
+        assert!(slot.publish_cow_fault_selection(3, window));
+        assert!(slot.cancel_native_fault_selection(77, 0x4000, seq3));
+        assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
+        assert!(slot.publish_fault_selection(4, window));
     }
 
     #[test]

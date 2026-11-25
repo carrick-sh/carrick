@@ -11414,8 +11414,8 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
         &mut self,
         _frame: &mut carrick_el1_abi::TrapFrame,
         _fpstate: &mut [u8],
-        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameRestore, Self::Error> {
         Err(carrick_el1::isa::ArchError::Unbound)
     }
 }

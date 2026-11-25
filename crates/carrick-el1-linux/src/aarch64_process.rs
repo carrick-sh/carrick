@@ -2867,6 +2867,25 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             None
         }
     }
+    fn cancel_copyout_fault(&mut self, address: UserVa, sequence: NonZeroU64) {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            // SAFETY: the running carrier retains the fixed atomic portal
+            // slots until this native checkpoint finishes.
+            let slots = unsafe {
+                &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+            };
+            let Some(slot) = slots.grant(usize::from(self.slot.raw())) else {
+                return;
+            };
+            let mm = self.task.mm.key.load(Ordering::Acquire);
+            let _ = slot.cancel_native_fault_selection(mm, address.raw(), sequence);
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (address, sequence);
+        }
+    }
     fn copy_syscall_output(
         &mut self,
         mm: &Self::Mm,

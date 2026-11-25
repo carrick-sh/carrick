@@ -2534,6 +2534,13 @@ mod ring_first_tests {
             panic!("eager test venue cannot suspend guest memory")
         }
         #[allow(clippy::panic)]
+        fn wait_sigreturn_copy(
+            &mut self,
+            _: carrick_core::user_copy::GuestCopyRequest,
+        ) -> Result<crate::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno> {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+        #[allow(clippy::panic)]
         fn finish_signal_output(
             &mut self,
             address: carrick_guest_arch::UserVa,
@@ -2564,12 +2571,14 @@ mod ring_first_tests {
         }
         fn restore_signal_frame(
             &mut self,
-        ) -> Result<crate::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
+        ) -> Result<crate::signal::SignalFrameRestore, carrick_syscall_abi::LinuxErrno> {
             self.signal_restore_calls += 1;
-            Ok(crate::signal::RestoredSignalFrame {
-                mask: self.current_blocked(),
-                stack: crate::abi::thread::AltStack::DISABLED,
-            })
+            Ok(crate::signal::SignalFrameRestore::Restored(
+                crate::signal::RestoredSignalFrame {
+                    mask: self.current_blocked(),
+                    stack: crate::abi::thread::AltStack::DISABLED,
+                },
+            ))
         }
     }
 

@@ -1039,6 +1039,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
         None
     }
+    /// Withdraw an unpublished per-CPU fault selection when `begin_service_inner`
+    /// does not reach publication (closing gate, busy, or stale).
+    fn cancel_copyout_fault(&mut self, _address: UserVa, _sequence: NonZeroU64) {}
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
     /// staging step already made the range writable (fault supply first), so
@@ -5801,6 +5804,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// settles. The syscall then reruns from its saved registers, so only a
     /// call that has committed nothing may use this. `None` means the owner
     /// released before enrolment: the caller reruns its operation in place.
+    #[inline(never)]
     fn retain_syscall(
         &mut self,
         contention: NativeContention,
@@ -6342,20 +6346,54 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         signal: carrick_signal_core::policy::Signal,
         blocked: carrick_signal_core::policy::SigBlockMask,
-        mut info: carrick_syscall_abi::LinuxSiginfo,
+        info: carrick_syscall_abi::LinuxSiginfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        self.force_fault_info_inner(signal, blocked, info, false)
+            .map(|_| ())
+    }
+    /// Force `SIGSEGV` only while no terminal process exit has won, checking
+    /// `pending.has_exit` and the open lifecycle gate under the same `graph`
+    /// critical section that mutates signal state.
+    pub(super) fn force_sigsegv_info_unless_exiting(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+        info: carrick_syscall_abi::LinuxSiginfo,
+    ) -> bool {
+        matches!(
+            self.force_fault_info_inner(
+                carrick_signal_core::policy::Signal::SEGV,
+                blocked,
+                info,
+                true,
+            ),
+            Ok(true)
+        )
+    }
+    fn force_fault_info_inner(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+        mut info: carrick_syscall_abi::LinuxSiginfo,
+        abort_on_exit: bool,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
         info.si_signo = signal.number();
         let graph = self.runtime.graph.lock();
+        if abort_on_exit && graph.pending.has_exit(&self.key) {
+            return Ok(false);
+        }
         let row = graph
             .owner
             .task(self.key)
             .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
         let resources = row.native().resources();
+        if abort_on_exit && resources.page.gate() != carrick_el1_abi::GateState::Open {
+            return Ok(false);
+        }
         resources
             .signals()
             .force_fault(self.record, signal, blocked, Some(info));
         resources.sync_non_interrupting_signals();
-        Ok(())
+        Ok(true)
     }
 
     /// Copy a signal frame through the same exact-MM COW authority as wait status.
@@ -7818,13 +7856,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let outcome = self.retire_closing_member(status)?;
         match outcome {
             LifecycleOutcome::HostCustody => {
-                // An adopted host member retires on its exact host owner.
-                if !self.yield_terminal_host_custody() {
-                    return Err(NativeProcessError::ServiceQuarantined(
+                let lane = self.source.zone.slot(self.source.slot);
+                if lane.current().is_none() && lane.host_record() == Some(self.record.id) {
+                    self.current.linux.mark_pending_host_work();
+                    Ok(NativeResume::NoPending)
+                } else if self.yield_terminal_host_custody() {
+                    // An adopted host member retires on its exact host owner.
+                    Ok(NativeResume::Left(None))
+                } else {
+                    Err(NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::ClosingHostCustody,
-                    ));
+                    ))
                 }
-                Ok(NativeResume::Left(None))
             }
             LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
@@ -10299,6 +10342,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         self.prepare_guest_input(request, observe)
             .unwrap_or_else(|error| self.run_failed(retention_failure(error).run_failure_reason()))
     }
+    fn wait_sigreturn_copy_observed(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+        observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
+    ) -> carrick_personality_linux::lifecycle::SigreturnCopyOutcome {
+        self.prepare_sigreturn_input(request, observe)
+            .unwrap_or_else(|error| {
+                let _ = self.run_failed(retention_failure(error).run_failure_reason());
+                carrick_personality_linux::lifecycle::SigreturnCopyOutcome::Settled
+            })
+    }
     fn copy_out_owned(
         &mut self,
         dst: UserVa,
@@ -10572,7 +10626,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .map(|key| key.is_some())
     }
     fn drain_owned_preparation(&mut self) {
-        let Some(preparation) = self.adapter_ready.take() else {
+        let Some(mut preparation) = self.adapter_ready.take() else {
             return;
         };
         match self.begin_adapter_service(
@@ -10582,6 +10636,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         ) {
             Ok(NativeResume::Left(None)) => {}
             Err(NativeProcessError::Busy | NativeProcessError::Exhausted) => {
+                if let (carrick_core_abi::service::ServiceOperation::Fault(fault), Some(sequence)) =
+                    (preparation.service, preparation.sequence.take())
+                {
+                    self.service.cancel_copyout_fault(fault.address, sequence);
+                    preparation.service =
+                        carrick_core_abi::service::ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                        };
+                }
                 // Admission has not consumed the installed operation. Keep
                 // preparation owed and release this executor; the selected
                 // record retries through its existing adapter checkpoint.
@@ -10602,6 +10666,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 }
             }
             _ => {
+                if let (carrick_core_abi::service::ServiceOperation::Fault(fault), Some(sequence)) =
+                    (preparation.service, preparation.sequence)
+                {
+                    self.service.cancel_copyout_fault(fault.address, sequence);
+                }
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
             }
         }
@@ -12413,6 +12482,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_syscall_abi::LinuxSiginfo::kernel(
                 carrick_signal_core::policy::Signal::SEGV.number(),
             ),
+        )
+    }
+
+    fn force_sigsegv_unless_exiting(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
+        self.force_fault_info_inner(
+            carrick_signal_core::policy::Signal::SEGV,
+            blocked,
+            carrick_syscall_abi::LinuxSiginfo::kernel(
+                carrick_signal_core::policy::Signal::SEGV.number(),
+            ),
+            true,
         )
     }
     #[inline(never)]

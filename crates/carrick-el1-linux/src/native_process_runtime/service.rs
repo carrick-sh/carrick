@@ -481,6 +481,7 @@ struct RefusedStagePrefix<'a> {
 enum ServicePayload<'a> {
     None,
     Copyin,
+    SigreturnCopyin,
     EntropyPreparation(EntropyPreparation),
     StagePrefix(RefusedStagePrefix<'a>),
     Copyout(OwnedCopyout<'a>),
@@ -506,12 +507,14 @@ pub(super) struct PendingService<'a> {
     entropy_preparation: Option<EntropyPreparation>,
     stage_prefix: Option<RefusedStagePrefix<'a>>,
     fault_reply_cancelling: bool,
+    fault_selection_withdrawn: bool,
     /// Zero until the group's first default-fatal signal cancels this exec.
     /// The queue entry may be consumed by a sibling before the service ACK.
     pub(super) exec_fatal_signal: core::sync::atomic::AtomicU8,
     clock_sample: Option<PendingClockSample>,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
+    sigreturn_copyin: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
@@ -1500,13 +1503,77 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         request: carrick_core::user_copy::GuestCopyRequest,
         observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let Some(resume) =
+            self.prepare_guest_input_resume(request, ServicePayload::Copyin, observe)?
+        else {
+            return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+        };
+        self.lifecycle_for_guest_input_resume(resume)
+    }
+
+    /// Supply or wait for `rt_sigreturn` frame memory without converting an
+    /// unreadable page to `-EFAULT` or quarantining synchronous fault/exit settlement.
+    pub(super) fn prepare_sigreturn_input(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+        observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
+    ) -> Result<carrick_personality_linux::lifecycle::SigreturnCopyOutcome, NativeProcessError>
+    {
+        use carrick_personality_linux::lifecycle::SigreturnCopyOutcome;
+        let mut observe_with_census = |refusal| {
+            #[cfg(feature = "test-support")]
+            if matches!(
+                refusal,
+                carrick_personality_linux::lifecycle::InputPreparationRefusal::OwnerDependency
+                    | carrick_personality_linux::lifecycle::InputPreparationRefusal::OwnerBusy
+            ) {
+                carrick_sched_core::spaces::record_sigreturn_contention_hit();
+            }
+            observe(refusal);
+        };
+        let Some(resume) = self.prepare_guest_input_resume(
+            request,
+            ServicePayload::SigreturnCopyin,
+            &mut observe_with_census,
+        )?
+        else {
+            return Ok(SigreturnCopyOutcome::Fault);
+        };
+        match resume {
+            NativeResume::RetrySyscall => Ok(SigreturnCopyOutcome::RetrySyscall),
+            NativeResume::Left(status) => {
+                if let Some(status) = status {
+                    self.root_exit = Some(status);
+                }
+                Ok(SigreturnCopyOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                })
+            }
+            NativeResume::NoPending => Ok(SigreturnCopyOutcome::Settled),
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ServiceOutcome,
+            )),
+        }
+    }
+
+    fn prepare_guest_input_resume(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+        payload: ServicePayload<'a>,
+        observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
+    ) -> Result<Option<NativeResume>, NativeProcessError> {
         use carrick_personality_linux::lifecycle::InputPreparationRefusal;
         // Bad user ranges are an ABI fault before they can be confused
         // with an invalid owner operation or overflowing transfer record.
         if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
             observe(InputPreparationRefusal::Fault);
-            return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            return Ok(None);
         }
+        let Some(end) = request.address.raw().checked_add(request.len.raw()) else {
+            observe(InputPreparationRefusal::Fault);
+            return Ok(None);
+        };
         let mm = self
             .runtime
             .graph
@@ -1518,59 +1585,117 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .mm
             .clone();
-        // A refused output (a thread exit's clear-child-tid word, #2359) is
-        // prepared for the access its rerun needs: a page made only
-        // readable would refuse the same write again.
-        let prepared = if request.access == carrick_guest_arch::Access::Write {
-            self.service.prepare_owned_write(
-                &mm,
-                carrick_core::mm::transaction::CopyoutRequest {
-                    address: request.address,
-                    len: request.len,
-                },
-            )
-        } else {
-            self.service.prepare_owned_read(&mm, request)
-        };
-        let (operation, sequence, wait) = match prepared {
-            Ok(()) => return Ok(LifecycleOutcome::Redispatch),
-            Err(NativeProcessError::Fault) => {
-                observe(InputPreparationRefusal::Fault);
-                return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
-            }
-            Err(NativeProcessError::OwnerWait(wait)) => {
-                observe(InputPreparationRefusal::OwnerDependency);
-                (
-                    ServiceOperation::CarrierWork {
-                        entry: OwnerEntry::Syscall,
-                        demand: carrick_core_abi::service::CarrierDemand::Work,
+        // Walk the requested range page-by-page so a multi-page signal frame or
+        // buffer never binds `copyout_fault` to page 0 when page >0 needs
+        // supply, and a subsequent unreadable page still reports Fault.
+        let mut cursor = request.address.raw();
+        while cursor < end {
+            let page_end = (cursor & !4095).saturating_add(4096).min(end);
+            let page_len = carrick_guest_arch::GuestLen::new(page_end - cursor);
+            let page_va = UserVa::new(cursor);
+            // A refused output (a thread exit's clear-child-tid word, #2359) is
+            // prepared for the access its rerun needs: a page made only
+            // readable would refuse the same write again.
+            let prepared = if request.access == carrick_guest_arch::Access::Write {
+                self.service.prepare_owned_write(
+                    &mm,
+                    carrick_core::mm::transaction::CopyoutRequest {
+                        address: page_va,
+                        len: page_len,
                     },
-                    None,
-                    Some(wait),
                 )
-            }
-            Err(NativeProcessError::Busy) => {
-                observe(InputPreparationRefusal::OwnerBusy);
-                (
-                    ServiceOperation::CarrierWork {
-                        entry: OwnerEntry::Syscall,
-                        demand: carrick_core_abi::service::CarrierDemand::Work,
+            } else {
+                self.service.prepare_owned_read(
+                    &mm,
+                    carrick_core::user_copy::GuestCopyRequest {
+                        address: page_va,
+                        len: page_len,
+                        access: request.access,
                     },
-                    None,
-                    None,
                 )
+            };
+            let (operation, sequence, wait) = match prepared {
+                Ok(()) => {
+                    cursor = page_end;
+                    continue;
+                }
+                Err(NativeProcessError::Fault) => {
+                    observe(InputPreparationRefusal::Fault);
+                    return Ok(None);
+                }
+                Err(NativeProcessError::OwnerWait(wait)) => {
+                    observe(InputPreparationRefusal::OwnerDependency);
+                    (
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                        },
+                        None,
+                        Some(wait),
+                    )
+                }
+                Err(NativeProcessError::Busy) => {
+                    observe(InputPreparationRefusal::OwnerBusy);
+                    (
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                        },
+                        None,
+                        None,
+                    )
+                }
+                Err(NativeProcessError::Unsupported) => {
+                    let (mut fault, sequence) = self
+                        .service
+                        .copyout_fault(page_va)
+                        .ok_or(NativeProcessError::Unsupported)?;
+                    fault.access = request.access;
+                    (ServiceOperation::Fault(fault), Some(sequence), None)
+                }
+                Err(error) => return Err(error),
+            };
+            return self
+                .begin_service_inner(
+                    operation,
+                    sequence,
+                    wait,
+                    payload,
+                    ServiceCompletion::RetrySyscall,
+                )
+                .map(Some);
+        }
+        Ok(Some(NativeResume::RetrySyscall))
+    }
+
+    fn lifecycle_for_guest_input_resume(
+        &mut self,
+        result: NativeResume,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        match result {
+            NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
+            NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
+                result,
+                work: false,
+            }),
+            NativeResume::NoPending
+                if self.control.host_exit_requested() && self.pending_close_status().is_some() =>
+            {
+                Ok(LifecycleOutcome::HostCustody)
             }
-            Err(NativeProcessError::Unsupported) => {
-                let (mut fault, sequence) = self
-                    .service
-                    .copyout_fault(request.address)
-                    .ok_or(NativeProcessError::Unsupported)?;
-                fault.access = request.access;
-                (ServiceOperation::Fault(fault), Some(sequence), None)
+            NativeResume::Left(status) => {
+                if let Some(status) = status {
+                    self.root_exit = Some(status);
+                }
+                Ok(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                })
             }
-            Err(error) => return Err(error),
-        };
-        self.retry_guest_input(operation, sequence, wait)
+            _ => Err(NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::ServiceOutcome,
+            )),
+        }
     }
 
     // Mapping authentication and physical operand supply share the same
@@ -1589,20 +1714,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::Copyin,
             ServiceCompletion::RetrySyscall,
         )?;
-        match result {
-            NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
-            NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
-                result,
-                work: false,
-            }),
-            NativeResume::Left(None) => Ok(LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
-            }),
-            _ => Err(NativeProcessError::ServiceQuarantined(
-                NativeServiceQuarantine::ServiceOutcome,
-            )),
-        }
+        self.lifecycle_for_guest_input_resume(result)
     }
 
     /// Supply user memory a staged call needs, then retry its exact SVC. A
@@ -2363,14 +2475,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Publish into the existing boxed pending owner before descending into
         // completion. Admission's payload/manifests and rollback locals must
         // unwind before a ready reply walks four descriptor-table levels.
-        let prepared = self.prepare_service_inner(
+        let prepared = match self.prepare_service_inner(
             operation,
             fault_sequence,
             owner_wait,
             payload,
             completion.retries_syscall(),
             completion.checkpoints_owner(),
-        )?;
+        ) {
+            Ok(prepared)
+                if matches!(
+                    prepared,
+                    PreparedService::WithPortalWait(..)
+                        | PreparedService::Published(..)
+                        | PreparedService::NoticeWait(..)
+                ) =>
+            {
+                prepared
+            }
+            other => {
+                self.cancel_unpublished_fault(operation, fault_sequence);
+                other?
+            }
+        };
         let outcome = match prepared {
             PreparedService::WithPortalWait(request, wait) => self
                 .park_owner_wait(&request, wait)
@@ -2427,9 +2554,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::StagePrefix(prefix) => (ServicePayload::None, None, Some(prefix)),
             payload => (payload, None, None),
         };
-        let copyin = matches!(&payload, ServicePayload::Copyin);
+        let sigreturn_copyin = matches!(&payload, ServicePayload::SigreturnCopyin);
+        let copyin = matches!(
+            &payload,
+            ServicePayload::Copyin | ServicePayload::SigreturnCopyin
+        );
         let (payload, copyout, adapter) = match payload {
-            ServicePayload::Copyin => (ServicePayload::None, None, false),
+            ServicePayload::Copyin | ServicePayload::SigreturnCopyin => {
+                (ServicePayload::None, None, false)
+            }
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
@@ -2487,6 +2620,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _,
                 ServicePayload::Copyout(_)
                 | ServicePayload::Copyin
+                | ServicePayload::SigreturnCopyin
                 | ServicePayload::Adapter
                 | ServicePayload::EntropyPreparation(_)
                 | ServicePayload::ClockSample(_)
@@ -2760,10 +2894,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 entropy_preparation,
                 stage_prefix,
                 fault_reply_cancelling: false,
+                fault_selection_withdrawn: false,
                 exec_fatal_signal: core::sync::atomic::AtomicU8::new(0),
                 clock_sample,
                 copyout,
                 copyin,
+                sigreturn_copyin,
                 adapter,
                 exec_successor,
                 retry_syscall_after_supply,
@@ -3544,12 +3680,37 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.finish_service(request, result, pending)
     }
 
-    #[inline(never)]
-    fn abort_unpublished_service<T>(
+    fn cancel_unpublished_fault(
         &mut self,
-        request: ServiceRequest,
-        error: NativeProcessError,
-    ) -> Result<T, NativeProcessError> {
+        operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+    ) {
+        if let (ServiceOperation::Fault(fault), Some(sequence)) = (operation, fault_sequence) {
+            self.service.cancel_copyout_fault(fault.address, sequence);
+        }
+    }
+
+    fn withdraw_fault_selection(
+        &mut self,
+        operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+    ) -> bool {
+        if let (ServiceOperation::Fault(fault), Some(sequence)) = (operation, fault_sequence) {
+            self.service.cancel_copyout_fault(fault.address, sequence);
+            if let Some(pending) = self.runtime.graph.lock().service_wait_mut(&self.record) {
+                pending.fault_selection_withdrawn = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn take_unpublished_service_wait(
+        &mut self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+        wait_error: NativeProcessError,
+        cleanup_error: NativeProcessError,
+    ) -> Result<(ServiceResult, Box<PendingService<'a>>), NativeProcessError> {
         let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
         let guard = self
             .source
@@ -3557,30 +3718,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                 crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             })
-            .map_err(|_| {
-                NativeProcessError::ServiceQuarantined(
-                    NativeServiceQuarantine::DuplicateNoticeQueue,
-                )
-            })?;
-        // SAFETY: notice publication failed, so no transport can hold
-        // this identity. The queue also excludes concurrent cancellation.
-        unsafe { self.control.service.abort_unpublished(request.identity) }
+            .map_err(|_| wait_error)?;
+        // SAFETY: this identity never published a notice into `service_notice`,
+        // so no carrier ticket exists; `guard` excludes `cancel_service`.
+        unsafe { self.control.service.abort_unpublished(identity) }
             .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
-        self.control
-            .service
-            .consume(request.identity)
-            .map_err(|err| {
-                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
-            })?;
+        let result = self.control.service.consume(identity).map_err(|err| {
+            service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
+        })?;
         let pending = self
             .runtime
             .graph
             .lock()
             .remove_service_wait(&self.record)
-            .ok_or(NativeProcessError::ServiceQuarantined(
-                NativeServiceQuarantine::DuplicateNoticeCleanup,
-            ))?;
+            .ok_or(cleanup_error)?;
         drop(guard);
+        Ok((result, pending))
+    }
+
+    #[inline(never)]
+    fn abort_unpublished_service<T>(
+        &mut self,
+        request: ServiceRequest,
+        error: NativeProcessError,
+    ) -> Result<T, NativeProcessError> {
+        let (_, pending) = self.take_unpublished_service_wait(
+            request.identity,
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::DuplicateNoticeQueue),
+            NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::DuplicateNoticeCleanup),
+        )?;
+        if !pending.fault_selection_withdrawn {
+            self.cancel_unpublished_fault(request.operation, request.fault_sequence);
+        }
         self.release_service_claim(pending.claim)?;
         Err(error)
     }
@@ -3590,32 +3759,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: &ServiceRequest,
     ) -> Result<NativeResume, NativeProcessError> {
-        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
-        let guard = self
-            .source
-            .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            })
-            .map_err(|_| NativeProcessError::Stale)?;
-        // SAFETY: this identity never published a notice into `service_notice`,
-        // so no carrier ticket exists; `guard` excludes `cancel_service`.
-        unsafe { self.control.service.abort_unpublished(request.identity) }
-            .map_err(|err| service_protocol_error(err, NativeServiceQuarantine::NoticeAbortBusy))?;
-        let result = self
-            .control
-            .service
-            .consume(request.identity)
-            .map_err(|err| {
-                service_protocol_error(err, NativeServiceQuarantine::NoticeConsumeBusy)
-            })?;
-        let pending = self
-            .runtime
-            .graph
-            .lock()
-            .remove_service_wait(&self.record)
-            .ok_or(NativeProcessError::Stale)?;
-        drop(guard);
+        let (result, pending) = self.take_unpublished_service_wait(
+            request.identity,
+            NativeProcessError::Stale,
+            NativeProcessError::Stale,
+        )?;
+        if !pending.fault_selection_withdrawn {
+            self.cancel_unpublished_fault(request.operation, request.fault_sequence);
+        }
         self.finish_service(request, result, pending)
     }
 
@@ -3697,6 +3848,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut cancelled = false;
         let mut published = None;
         let mut holder_changed = false;
+        let mut withdrawn_fault = false;
         let mut failure = None;
         let parked = carrick_core::wait::park_object_record(
             zone,
@@ -3725,6 +3877,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Err(ObjectWaitError::Changed)
                     }
                     Err(ServiceNoticeBusy::Held(live)) if live == holder => {
+                        // Withdraw this CPU's per-CPU `PortalGrantSlot` selection
+                        // before releasing CPU A so it cannot remain stranded if
+                        // this unhomed waiter wakes on another CPU.
+                        withdrawn_fault = self
+                            .withdraw_fault_selection(request.operation, request.fault_sequence);
                         // SAFETY: this slot still owns the exact OnCpu record.
                         unsafe {
                             *zone.record(self.record.id).ctx_mut() = *self.words;
@@ -3790,16 +3947,189 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     && !holder_changed
                     && self.host_requested_current();
                 if holder_changed || holder_retired || host_contended {
+                    if !withdrawn_fault {
+                        let _ = self
+                            .withdraw_fault_selection(request.operation, request.fault_sequence);
+                    }
                     self.retain_record_operation(operation)?;
                     return Ok(NoticeParkOutcome::Resumed(
                         self.yield_service_checkpoint_as(entry)?,
                     ));
+                }
+                if !withdrawn_fault {
+                    self.cancel_unpublished_fault(request.operation, request.fault_sequence);
                 }
                 self.restore_preparation_operation(operation)?;
                 Err(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::ParkRefused,
                 ))
             }
+        }
+    }
+
+    #[inline(never)]
+    fn reselect_withdrawn_fault_wait(
+        &mut self,
+        request: &ServiceRequest,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let (_, mut pending) = self.take_unpublished_service_wait(
+            request.identity,
+            NativeProcessError::Stale,
+            NativeProcessError::Stale,
+        )?;
+        // SAFETY: `resume_service` owns this exact selected record's old
+        // continuation before draining or publishing its replacement.
+        unsafe {
+            self.source
+                .zone
+                .record(self.record.id)
+                .consume_owner_continuation();
+        }
+        let mut stage_prefix = pending.stage_prefix.take();
+        let mut entropy_preparation = pending.entropy_preparation.take();
+        let copyout = pending.copyout.take();
+        let retry_syscall_after_supply = pending.retry_syscall_after_supply;
+        let sigreturn_copyin = pending.sigreturn_copyin;
+        let copyin = pending.copyin;
+        let adapter = pending.adapter;
+        self.release_service_claim(pending.claim)?;
+        if let Some(output) = copyout {
+            self.copyout_ready = Some(output);
+            return Ok(NativeResume::NoPending);
+        }
+        if stage_prefix.is_none() && !retry_syscall_after_supply {
+            return Ok(NativeResume::NoPending);
+        }
+        let ServiceOperation::Fault(fault) = request.operation else {
+            return Err(NativeProcessError::Stale);
+        };
+        let mm = self.process_mm()?;
+        let probed = if fault.access == carrick_guest_arch::Access::Write {
+            self.service.prepare_owned_write(
+                &mm,
+                carrick_core::mm::transaction::CopyoutRequest {
+                    address: fault.address,
+                    len: carrick_guest_arch::GuestLen::new(1),
+                },
+            )
+        } else {
+            self.service.prepare_owned_read(
+                &mm,
+                carrick_core::user_copy::GuestCopyRequest {
+                    address: fault.address,
+                    len: carrick_guest_arch::GuestLen::new(1),
+                    access: fault.access,
+                },
+            )
+        };
+        let make_payload =
+            |stage_prefix: &mut Option<RefusedStagePrefix<'a>>,
+             entropy_preparation: &mut Option<EntropyPreparation>| {
+                if let Some(prefix) = stage_prefix.take() {
+                    ServicePayload::StagePrefix(prefix)
+                } else if let Some(preparation) = entropy_preparation.take() {
+                    ServicePayload::EntropyPreparation(preparation)
+                } else if sigreturn_copyin {
+                    ServicePayload::SigreturnCopyin
+                } else if copyin {
+                    ServicePayload::Copyin
+                } else if adapter {
+                    ServicePayload::Adapter
+                } else {
+                    ServicePayload::None
+                }
+            };
+        let completion = if retry_syscall_after_supply {
+            ServiceCompletion::RetrySyscall
+        } else {
+            ServiceCompletion::Inline
+        };
+        match probed {
+            Ok(()) => Ok(NativeResume::RetrySyscall),
+            Err(NativeProcessError::Unsupported) => {
+                let (mut next_fault, sequence) = self
+                    .service
+                    .copyout_fault(fault.address)
+                    .ok_or(NativeProcessError::Unsupported)?;
+                next_fault.access = fault.access;
+                let payload = make_payload(&mut stage_prefix, &mut entropy_preparation);
+                self.begin_service_inner(
+                    ServiceOperation::Fault(next_fault),
+                    Some(sequence),
+                    None,
+                    payload,
+                    completion,
+                )
+            }
+            Err(NativeProcessError::OwnerWait(wait)) => {
+                if let Some(prefix) = stage_prefix.take() {
+                    self.begin_exec_stage_fault_service(
+                        fault,
+                        None,
+                        Some(wait),
+                        Some((prefix.record, prefix.output, prefix.call)),
+                    )
+                } else {
+                    let payload = make_payload(&mut stage_prefix, &mut entropy_preparation);
+                    self.begin_service_inner(
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                        },
+                        None,
+                        Some(wait),
+                        payload,
+                        completion,
+                    )
+                }
+            }
+            Err(NativeProcessError::Busy) => {
+                let payload = make_payload(&mut stage_prefix, &mut entropy_preparation);
+                self.begin_service_inner(
+                    ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
+                    },
+                    None,
+                    None,
+                    payload,
+                    completion,
+                )
+            }
+            Err(NativeProcessError::Fault) => {
+                if let Some(prefix) = stage_prefix.take() {
+                    self.begin_host_file_service(
+                        prefix.record,
+                        prefix.output,
+                        false,
+                        None,
+                        false,
+                        prefix.call,
+                    )
+                } else if let Some(preparation) = entropy_preparation.take()
+                    && preparation.prepared != 0
+                {
+                    self.begin_entropy_service(
+                        preparation.address,
+                        preparation.prepared,
+                        preparation.flags,
+                        preparation.requested,
+                    )
+                } else if sigreturn_copyin {
+                    self.force_sigreturn_fault_sigsegv();
+                    Ok(NativeResume::NoPending)
+                } else if adapter {
+                    self.retire_adapter_result(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    ))
+                    .map(NativeResume::Returned)
+                } else {
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    )))
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -3814,6 +4144,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.should_cancel_unpublished(request.identity) {
             return self
                 .cancel_unpublished_service(request)
+                .map(NoticeFinishOutcome::Resumed);
+        }
+        if self
+            .runtime
+            .graph
+            .lock()
+            .service_wait(&self.record)
+            .is_some_and(|pending| pending.fault_selection_withdrawn)
+        {
+            return self
+                .reselect_withdrawn_fault_wait(request)
                 .map(NoticeFinishOutcome::Resumed);
         }
         match publish_service_notice(&self.current.service_notice, request.identity.into()) {
@@ -4743,6 +5084,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // Fault application above must not retain exec-close or host-file result
     // locals. Pending payloads stay in their existing box across this boundary.
     #[inline(never)]
+    fn force_sigreturn_fault_sigsegv(&mut self) {
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        let forced = self.force_sigsegv_info_unless_exiting(
+            blocked,
+            carrick_syscall_abi::LinuxSiginfo::kernel(
+                carrick_signal_core::policy::Signal::SEGV.number(),
+            ),
+        );
+        if forced {
+            let unblocked = carrick_personality_linux::abi::thread::BlockedMask(
+                blocked
+                    .signals()
+                    .without(carrick_signal_core::policy::Signal::SEGV)
+                    .bits(),
+            );
+            let _ = self
+                .control
+                .store_blocked_then_read_pending(unblocked, self.control.pending());
+        }
+    }
+
+    #[inline(never)]
     fn finish_service_result(
         &mut self,
         request: &ServiceRequest,
@@ -4925,6 +5290,65 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         );
                     }
                     return Ok(NativeResume::RetrySyscall);
+                }
+                if pending.sigreturn_copyin {
+                    let is_carrier_work = matches!(
+                        request.operation,
+                        ServiceOperation::CarrierWork {
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                            ..
+                        }
+                    );
+                    let exiting = pending.claim.cancellation().is_some()
+                        || self.runtime.graph.lock().pending.has_exit(&self.key);
+                    #[cfg(feature = "test-support")]
+                    if matches!(request.operation, ServiceOperation::Fault(_))
+                        && result == ServiceResult::Supplied
+                    {
+                        carrick_sched_core::spaces::record_sigreturn_fault_supply();
+                    }
+                    return match result {
+                        ServiceResult::Supplied | ServiceResult::Cancelled => Ok(if exiting {
+                            NativeResume::NoPending
+                        } else {
+                            NativeResume::RetrySyscall
+                        }),
+                        ServiceResult::Refused if is_carrier_work => Ok(if exiting {
+                            NativeResume::NoPending
+                        } else {
+                            NativeResume::RetrySyscall
+                        }),
+                        ServiceResult::BackingFault if is_carrier_work => {
+                            Err(NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::UnexpectedBackingFault,
+                            ))
+                        }
+                        ServiceResult::Failed(_) if is_carrier_work => {
+                            Err(NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RelativeFutexReply,
+                            ))
+                        }
+                        ServiceResult::Refused
+                        | ServiceResult::BackingFault
+                        | ServiceResult::Failed(_) => {
+                            if !exiting {
+                                #[cfg(test)]
+                                if let Some(hook) =
+                                    super::host_test_support::SIGRETURN_FAULT_PRE_FORCE_HOOK
+                                        .with(|hook| hook.borrow_mut().take())
+                                {
+                                    hook();
+                                }
+                                self.force_sigreturn_fault_sigsegv();
+                            }
+                            Ok(NativeResume::NoPending)
+                        }
+                        ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
+                            Err(NativeProcessError::ServiceQuarantined(
+                                NativeServiceQuarantine::RelativeFutexReply,
+                            ))
+                        }
+                    };
                 }
                 if result != ServiceResult::Supplied {
                     let _ = ProcessNative::take_relative_futex_wait(self);

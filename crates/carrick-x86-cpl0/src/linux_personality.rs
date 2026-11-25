@@ -370,13 +370,13 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, LinuxErrno> {
+    ) -> Result<carrick_personality_linux::signal::SignalFrameRestore, LinuxErrno> {
         let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
         carrick_personality_linux::signal::SignalBackend::restore_signal_frame(
             &mut backend,
             self.frame,
             &mut self.fpstate.0,
-            &mut |dst, va| copy_in.copy_in(dst, va).is_done(),
+            &mut |dst, va| copy_in.copy_in(dst, va),
         )
         .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }

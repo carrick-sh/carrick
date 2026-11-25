@@ -42,6 +42,31 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-support")]
 static INJECT_EDITOR_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+#[cfg(feature = "test-support")]
+static SIGRETURN_CONTENTION_HITS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "test-support")]
+static SIGRETURN_FAULT_SUPPLIES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one live `rt_sigreturn` copy-in contention (`OwnerWait` or `Busy`).
+#[cfg(feature = "test-support")]
+pub fn record_sigreturn_contention_hit() {
+    SIGRETURN_CONTENTION_HITS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Record one completed `rt_sigreturn` fault supply (`ServiceResult::Supplied`).
+#[cfg(feature = "test-support")]
+pub fn record_sigreturn_fault_supply() {
+    SIGRETURN_FAULT_SUPPLIES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Packed `rt_sigreturn` census: `(fault_supplies << 32) | contention_hits`.
+#[cfg(feature = "test-support")]
+pub fn sigreturn_contention_census() -> u64 {
+    (SIGRETURN_FAULT_SUPPLIES.load(Ordering::Acquire) << 32)
+        | (SIGRETURN_CONTENTION_HITS.load(Ordering::Acquire) & u64::from(u32::MAX))
+}
+
 /// Hold the next shared editor acquisition until its waiter enrolls.
 #[cfg(feature = "test-support")]
 pub fn inject_editor_busy_once() -> bool {

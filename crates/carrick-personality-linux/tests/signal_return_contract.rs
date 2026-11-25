@@ -7,10 +7,30 @@ use carrick_signal_core::{SignalSet, policy::SigBlockMask};
 struct Native {
     accumulator: u64,
     invalid: bool,
+    not_yet: Option<carrick_core::user_copy::GuestCopyRequest>,
+    wait_fault: bool,
+    waited_on: Option<carrick_core::user_copy::GuestCopyRequest>,
+    wait_outcome: Option<SignalOutcome>,
     forced: bool,
     blocked: SigBlockMask,
     altstack: carrick_personality_linux::abi::thread::AltStack,
     arm_frame: Option<arm::RtSigframe>,
+}
+impl Default for Native {
+    fn default() -> Self {
+        Self {
+            accumulator: 139,
+            invalid: false,
+            not_yet: None,
+            wait_fault: false,
+            waited_on: None,
+            wait_outcome: None,
+            forced: false,
+            blocked: SigBlockMask::NONE,
+            altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
+            arm_frame: None,
+        }
+    }
 }
 impl UserCopy for Native {
     fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> carrick_core::user_copy::CopyOutcome {
@@ -27,6 +47,20 @@ impl<'a> SignalNative<'a> for Native {
         _: carrick_core::user_copy::GuestCopyRequest,
     ) -> carrick_personality_linux::signal::SignalOutcome {
         panic!("eager test venue cannot suspend guest memory")
+    }
+    fn wait_sigreturn_copy(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+    ) -> Result<carrick_personality_linux::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno>
+    {
+        self.waited_on = Some(request);
+        if self.wait_fault {
+            Err(carrick_syscall_abi::LinuxErrno::new(14))
+        } else {
+            Ok(self
+                .wait_outcome
+                .unwrap_or(carrick_personality_linux::signal::SignalOutcome::Restored))
+        }
     }
     #[allow(clippy::panic)]
     fn finish_signal_output(
@@ -61,11 +95,19 @@ impl<'a> SignalNative<'a> for Native {
     }
     fn force_sigsegv(&mut self) -> bool {
         self.forced = true;
+        self.blocked = SigBlockMask::blocking_all_of(
+            self.blocked
+                .signals()
+                .without(carrick_signal_core::policy::Signal::SEGV),
+        );
         true
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<SignalFrameRestore, carrick_syscall_abi::LinuxErrno> {
+        if let Some(request) = self.not_yet {
+            return Ok(SignalFrameRestore::NotYet(request));
+        }
         if let Some(frame) = &self.arm_frame {
             use zerocopy::IntoBytes;
             let resume = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true)
@@ -73,30 +115,26 @@ impl<'a> SignalNative<'a> for Native {
             self.accumulator = resume.regs[0];
             let stack = restored_altstack(resume.stack, carrick_guest_arch::GuestIsa::Aarch64)
                 .ok_or(carrick_syscall_abi::LinuxErrno::new(14))?;
-            return Ok(RestoredSignalFrame {
+            return Ok(SignalFrameRestore::Restored(RestoredSignalFrame {
                 mask: resume.mask,
                 stack,
-            });
+            }));
         }
         if self.invalid {
             return Err(carrick_syscall_abi::LinuxErrno::new(14));
         }
         self.accumulator = 0x1234_5678;
-        Ok(RestoredSignalFrame {
+        Ok(SignalFrameRestore::Restored(RestoredSignalFrame {
             mask: SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9)),
             stack: self.altstack,
-        })
+        }))
     }
 }
 #[test]
 fn restored_context_has_no_syscall_result() {
     let mut native = Native {
-        accumulator: 139,
-        invalid: false,
-        forced: false,
         blocked: SigBlockMask::blocking_all_of(SignalSet::default()),
-        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
-        arm_frame: None,
+        ..Default::default()
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
     assert!(!matches!(outcome, SignalOutcome::Returned { .. }));
@@ -133,12 +171,8 @@ fn sigreturn_restores_saved_autodisarm_stack_after_handler() {
     arm::encode(&mut frame, Some(&LinuxFpsimdContext::empty()), None).unwrap();
     let frame = frame.rt;
     let mut native = Native {
-        accumulator: 139,
-        invalid: false,
-        forced: false,
-        blocked: SigBlockMask::NONE,
-        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: Some(frame),
+        ..Default::default()
     };
     assert_eq!(
         invoke(SignalCall::RtSigreturn, &mut native),
@@ -176,12 +210,8 @@ fn restored_context_finishes_same_entry_and_retains_return_work() {
 #[test]
 fn invalid_signal_frame_is_not_an_errno_return() {
     let mut native = Native {
-        accumulator: 139,
         invalid: true,
-        forced: false,
-        blocked: SigBlockMask::NONE,
-        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
-        arm_frame: None,
+        ..Default::default()
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native);
     assert_eq!(outcome, Some(SignalOutcome::Restored));
@@ -192,11 +222,7 @@ fn invalid_signal_frame_is_not_an_errno_return() {
 fn pidfd_send_signal_retains_host_owner() {
     let mut native = Native {
         accumulator: 434,
-        invalid: false,
-        forced: false,
-        blocked: SigBlockMask::NONE,
-        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
-        arm_frame: None,
+        ..Default::default()
     };
     assert_eq!(invoke(SignalCall::PidfdSendSignal, &mut native), None);
 }
@@ -243,7 +269,10 @@ fn frame_masks_cross_as_blocked_domains() {
         params.mask
     }
     fn restored_mask(native: &mut Native) -> Result<SigBlockMask, carrick_syscall_abi::LinuxErrno> {
-        Ok(native.restore_signal_frame()?.mask)
+        let SignalFrameRestore::Restored(restored) = native.restore_signal_frame()? else {
+            return Err(carrick_syscall_abi::LinuxErrno::new(14));
+        };
+        Ok(restored.mask)
     }
     let mask = SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9));
     let params = carrick_personality_linux::signal::SignalFrameParams {
@@ -259,11 +288,7 @@ fn frame_masks_cross_as_blocked_domains() {
     };
     let mut native = Native {
         accumulator: 15,
-        invalid: false,
-        forced: false,
-        blocked: SigBlockMask::NONE,
-        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
-        arm_frame: None,
+        ..Default::default()
     };
     assert_eq!(frame_mask(params), restored_mask(&mut native).unwrap());
 }
@@ -305,12 +330,8 @@ fn public_arm_frame_preserves_same_entry_completion() {
                 .copy_within(0..528, 528);
         }
         let mut native = Native {
-            accumulator: 139,
-            invalid: false,
-            forced: false,
-            blocked: SigBlockMask::NONE,
-            altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
             arm_frame: Some(public),
+            ..Default::default()
         };
         let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
         assert_eq!(outcome, SignalOutcome::Restored);
@@ -329,4 +350,87 @@ fn public_arm_frame_preserves_same_entry_completion() {
             CompletionRoute::WithWork
         );
     }
+}
+
+#[test]
+fn not_yet_frame_copy_waits_without_forcing_sigsegv_or_mutating_state() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_guest_arch::{Access, GuestLen};
+    use carrick_personality_linux::dispatch::{
+        CompletionRoute, FamilyCompletion, completion_route,
+    };
+    let request = GuestCopyRequest {
+        address: UserVa::new(0x7000_0f00),
+        len: GuestLen::new(512),
+        access: Access::Read,
+    };
+    let initial_altstack = carrick_personality_linux::abi::thread::AltStack {
+        sp: 0x8000_0000,
+        size: 0x4000,
+        flags: 0,
+    };
+    let initial_blocked = SigBlockMask::blocking_all_of(SignalSet::from_bits(1 << 9));
+    let mut native = Native {
+        not_yet: Some(request),
+        wait_outcome: Some(SignalOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: carrick_personality_linux::abi::entry::SyscallResult::new(0),
+        }),
+        blocked: initial_blocked,
+        altstack: initial_altstack,
+        ..Default::default()
+    };
+    let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
+    assert_eq!(native.waited_on, Some(request));
+    assert!(!native.forced, "NotYet frame copy must never force SIGSEGV");
+    assert_eq!(
+        native.accumulator, 139,
+        "interrupted register must stay untouched"
+    );
+    assert_eq!(native.blocked, initial_blocked);
+    assert_eq!(native.altstack, initial_altstack);
+    assert_eq!(signal_effect(&outcome), FamilyCompletion::Suspended);
+    assert_eq!(
+        completion_route(signal_effect(&outcome), false),
+        CompletionRoute::Suspended
+    );
+
+    // Once contention resolves, retry completes without forcing SIGSEGV.
+    native.not_yet = None;
+    let retry = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
+    assert_eq!(retry, SignalOutcome::Restored);
+    assert!(!native.forced);
+    assert_eq!(native.accumulator, 0x1234_5678);
+}
+
+#[test]
+fn not_yet_frame_copy_whose_preparation_faults_forces_sigsegv_without_efault() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_guest_arch::{Access, GuestLen};
+    let request = GuestCopyRequest {
+        address: UserVa::new(0x7000_0000),
+        len: GuestLen::new(304),
+        access: Access::Read,
+    };
+    let initial_blocked = SigBlockMask::blocking_all_of(SignalSet::from_bits(1 << 10)); // SEGV masked
+    let mut native = Native {
+        not_yet: Some(request),
+        wait_fault: true,
+        blocked: initial_blocked,
+        ..Default::default()
+    };
+    let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
+    assert_eq!(native.waited_on, Some(request));
+    assert_eq!(
+        outcome,
+        SignalOutcome::Restored,
+        "faulted rt_sigreturn must never return -EFAULT"
+    );
+    assert!(native.forced, "faulted rt_sigreturn must force SIGSEGV");
+    assert_eq!(native.accumulator, 139);
+    assert_eq!(
+        native.blocked,
+        SigBlockMask::NONE,
+        "forced SIGSEGV must unmask SEGV without mutating anything from frame"
+    );
 }
