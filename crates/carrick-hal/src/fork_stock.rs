@@ -1034,6 +1034,19 @@ pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Opti
     Some(taken)
 }
 
+/// What a table demand the stock and its reserve could not meet means
+/// ([`ForkStock::table_shortage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableShortage {
+    /// Returnable custody (a successor reservation, a pending fork loan,
+    /// unsettled descriptor or COW tables, an exec predecessor or a
+    /// determinate quarantine) holds tables, or a return already landed:
+    /// contention, "not now".
+    Returnable,
+    /// Every table is in live committed MM custody: the window is spent.
+    Spent,
+}
+
 /// The revision of the fork stock's table returns. Every page that comes
 /// back to the reusable stock (an aborted or partly used loan, a reclaimed
 /// child, unused descriptor grants, a returned successor reservation)
@@ -1171,6 +1184,13 @@ impl TableStock {
     fn capacity(&self) -> usize {
         self.pages.len().saturating_add(self.reserve.pages())
     }
+
+    fn release(&mut self) {
+        self.returns = self.returns.saturating_add(1);
+        for waiter in core::mem::take(&mut self.waiters) {
+            waiter.deliver();
+        }
+    }
 }
 
 impl core::ops::Deref for TableStock {
@@ -1185,10 +1205,7 @@ impl Extend<RootGpa> for TableStock {
         let before = self.pages.len();
         self.pages.extend(pages);
         if self.pages.len() != before {
-            self.returns = self.returns.saturating_add(1);
-            for waiter in core::mem::take(&mut self.waiters) {
-                waiter.deliver();
-            }
+            self.release();
         }
     }
 }
@@ -1302,6 +1319,8 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     /// Quarantined children; `true` once their carrier release succeeded,
     /// so a later reclaim never releases the same MM twice.
     quarantine: BTreeMap<MmKey, QuarantinedChild>,
+    /// Table pages currently held in [`SuccessorTables`] reservations.
+    reserved_successor_tables: usize,
     last_refusal: Option<ForkAdmissionRefusal>,
     tags: T,
     counters: ForkStockCounters,
@@ -1328,6 +1347,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             pending_descriptor_tables: BTreeMap::new(),
             pending_cow_tables: BTreeMap::new(),
             quarantine: BTreeMap::new(),
+            reserved_successor_tables: 0,
             last_refusal: None,
             tags,
             counters: ForkStockCounters::default(),
@@ -1364,6 +1384,81 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// Table pages the stock can issue: its reusable pages and its reserve.
     pub fn table_capacity(&self) -> usize {
         self.tables.capacity()
+    }
+
+    /// Table pages currently held in transient, unsettled or reclaimable
+    /// custody that will either return to the reusable stock or settle into
+    /// committed MM custody: staged exec successor reservations, in-flight
+    /// fork loans, unsettled descriptor or COW table reservations, exec
+    /// predecessors awaiting post-switch settlement, and retired MMs in
+    /// determinate quarantine awaiting reclaim.
+    pub fn returnable_tables(&self) -> usize {
+        let pending_loans: usize = self
+            .pending
+            .iter()
+            .flatten()
+            .map(|loan| {
+                loan.child_tables
+                    .len()
+                    .saturating_add(loan.parent_tables.len())
+            })
+            .sum();
+        let pending_descriptors: usize = self
+            .pending_descriptor_tables
+            .values()
+            .map(|pending| pending.pages.len())
+            .sum();
+        let pending_cow: usize = self
+            .pending_cow_tables
+            .values()
+            .map(|pending| pending.pages.len())
+            .sum();
+        let predecessors: usize = self
+            .exec_predecessors
+            .values()
+            .map(|pending| pending.tables.len())
+            .sum();
+        let quarantined: usize = self
+            .quarantine
+            .iter()
+            .filter(|(_, state)| !state.supply_indeterminate)
+            .filter_map(|(key, _)| self.committed_tables.get(key))
+            .map(Vec::len)
+            .sum();
+        self.reserved_successor_tables
+            .saturating_add(pending_loans)
+            .saturating_add(pending_descriptors)
+            .saturating_add(pending_cow)
+            .saturating_add(predecessors)
+            .saturating_add(quarantined)
+    }
+
+    /// Classify a table demand the stock and its reserve could not meet,
+    /// against the release epoch `observed` before that probe. A holder of
+    /// returnable custody, or a return that landed since `observed`, makes
+    /// it [`TableShortage::Returnable`]: the caller enrols on the release
+    /// ([`Self::enrol_release`] with the same `observed`) and reruns. Only
+    /// when nothing can come back is the window [`TableShortage::Spent`].
+    pub fn table_shortage(&self, observed: StockRelease) -> TableShortage {
+        if self.has_returnable_tables() || self.released_since(observed) {
+            TableShortage::Returnable
+        } else {
+            TableShortage::Spent
+        }
+    }
+
+    fn has_returnable_tables(&self) -> bool {
+        self.returnable_tables() != 0
+    }
+
+    /// When the last returnable custody settles into committed or
+    /// indeterminate state with zero unused pages returned, advance the
+    /// release epoch so waiters parked on that transient holder wake once and
+    /// observe terminal exhaustion instead of waiting forever.
+    fn wake_if_exhausted(&mut self) {
+        if !self.has_returnable_tables() {
+            self.tables.release();
+        }
     }
 
     /// Draw at least `pages` from the reserve into the reusable stock,
@@ -1440,6 +1535,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.committed_tables.is_empty()
             || !self.pending_descriptor_tables.is_empty()
             || !self.pending_cow_tables.is_empty()
+            || self.reserved_successor_tables != 0
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
@@ -1721,7 +1817,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         for page in &unused {
             ledger.give_back(*page, pending.mm);
         }
+        let returned = !unused.is_empty();
         self.tables.extend(unused);
+        if !returned {
+            self.wake_if_exhausted();
+        }
         Ok(())
     }
 
@@ -1819,7 +1919,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         for page in &unused {
             ledger.give_back(*page, pending.mm);
         }
+        let returned = !unused.is_empty();
         self.tables.extend(unused);
+        if !returned {
+            self.wake_if_exhausted();
+        }
         Ok(())
     }
 
@@ -2326,7 +2430,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         for page in &pending.tables {
             ledger.give_back(*page, pending.predecessor);
         }
+        let returned = !pending.tables.is_empty();
         self.tables.extend(pending.tables);
+        if !returned {
+            self.wake_if_exhausted();
+        }
         drop(pending.physical);
         Ok(())
     }
@@ -2354,6 +2462,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::StaleExecution);
         }
         self.quarantine.entry(key).or_default().supply_indeterminate = true;
+        self.wake_if_exhausted();
         Ok(())
     }
 
@@ -2412,11 +2521,15 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 self.counters.successor_table_refusals.saturating_add(1);
             return Err(ForkStockServiceError::SuccessorTableCapacity);
         };
+        self.reserved_successor_tables = self.reserved_successor_tables.saturating_add(pages.len());
         Ok(SuccessorTables { pages })
     }
 
     /// Return an unused successor reservation to the reusable stock.
     pub fn return_successor_tables(&mut self, tables: SuccessorTables) {
+        self.reserved_successor_tables = self
+            .reserved_successor_tables
+            .saturating_sub(tables.pages.len());
         self.tables.extend(tables.pages);
     }
 
@@ -2432,9 +2545,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if used == 0 || used > tables.pages.len() {
             return Err(tables);
         }
+        self.reserved_successor_tables = self
+            .reserved_successor_tables
+            .saturating_sub(tables.pages.len());
         let unused = tables.pages.split_off(used);
         if !unused.is_empty() {
             self.tables.extend(unused);
+        } else {
+            self.wake_if_exhausted();
         }
         Ok(tables.pages)
     }
@@ -2465,6 +2583,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.committed_tables.is_empty()
             || !self.pending_descriptor_tables.is_empty()
             || !self.pending_cow_tables.is_empty()
+            || self.reserved_successor_tables != 0
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
@@ -2949,8 +3068,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         for page in &unused_parent {
             ledger.give_back(*page, loan.request.operation.mm);
         }
+        let returned = !unused_child.is_empty() || !unused_parent.is_empty();
         self.tables.extend(unused_child);
         self.tables.extend(unused_parent);
+        if !returned {
+            self.wake_if_exhausted();
+        }
     }
 
     /// Consume the [`AdmittedForkCustody`] token reserved during preparation
@@ -3194,6 +3317,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             }
             self.quarantine.remove(&key);
             reclaimed += 1;
+        }
+        if reclaimed != 0 {
+            self.wake_if_exhausted();
         }
         Ok(reclaimed)
     }

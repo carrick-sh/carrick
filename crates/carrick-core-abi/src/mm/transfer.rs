@@ -128,6 +128,19 @@ impl PortalOwnerWait {
             revision,
         }
     }
+    /// A member's wait on its carrier's reservation-pool release queue
+    /// (#3017). `revision` is that queue's epoch, sampled by the carrier
+    /// before the table probe that found returnable custody holding the
+    /// tables; no MM resource state backs it, and the ring parks only the
+    /// faulting member on the carrier's pool queue, which every table
+    /// return after that probe notifies.
+    pub const fn reservation_pool(handle: El1MmHandle, revision: u64) -> Self {
+        Self {
+            handle,
+            cause: PortalWaitCause::ReservationPool,
+            revision,
+        }
+    }
     pub const fn handle(self) -> El1MmHandle {
         self.handle
     }
