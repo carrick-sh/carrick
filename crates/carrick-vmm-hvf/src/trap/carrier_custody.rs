@@ -1145,10 +1145,66 @@ impl CarrierVmCustody {
             .collect()
     }
 
+    /// The guard of the generation that admits mappings now (`Creating` or
+    /// `Live`): what every stage-2 map holds across the map and its record.
+    pub(crate) fn admitting_stage2(
+        &self,
+        context: &str,
+    ) -> Result<super::stage2_backend::CarrierStage2<'_>, TrapError> {
+        let stage2 = self.stage2.stage2();
+        if let Some(stage2) = stage2 {
+            if stage2.admits_mappings() {
+                return Ok(stage2);
+            }
+            let lifecycle = stage2.lifecycle();
+            drop(stage2);
+            return Err(TrapError::Hypervisor(format!(
+                "{context}: carrier VM admits no stage-2 mapping (lifecycle {lifecycle:?})"
+            )));
+        }
+        Err(TrapError::Hypervisor(format!(
+            "{context}: carrier VM has no stage 2"
+        )))
+    }
+
+    /// The admitting guard of exact generation `generation`, failing if its
+    /// stage 2 is already gone or no longer admits mappings.
+    pub(crate) fn admitting_stage2_in(
+        &self,
+        generation: CarrierVmGeneration,
+        context: &str,
+    ) -> Result<super::stage2_backend::CarrierStage2<'_>, TrapError> {
+        let stage2 = self.stage2.stage2_in(generation).map_err(|_| {
+            TrapError::Hypervisor(format!(
+                "{context}: carrier VM generation {generation:?} is gone"
+            ))
+        })?;
+        if stage2.admits_mappings() {
+            return Ok(stage2);
+        }
+        let lifecycle = stage2.lifecycle();
+        drop(stage2);
+        Err(TrapError::Hypervisor(format!(
+            "{context}: carrier VM admits no stage-2 mapping (lifecycle {lifecycle:?})"
+        )))
+    }
+
+    #[cfg(test)]
     pub(crate) fn allocate_logical_owner(
         &self,
     ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
-        let mut state = self.stage2.lock();
+        Self::allocate_logical_owner_locked(&mut self.stage2.lock())
+    }
+
+    pub(crate) fn allocate_logical_owner_in(
+        stage2: &mut super::stage2_backend::CarrierStage2<'_>,
+    ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
+        Self::allocate_logical_owner_locked(stage2)
+    }
+
+    fn allocate_logical_owner_locked(
+        state: &mut Stage2CustodyState<CarrierStage2Records>,
+    ) -> Result<CarrierLogicalOwner, CarrierStage2RecordError> {
         let next_id = state
             .next_logical_owner_id
             .checked_add(1)
@@ -1262,32 +1318,52 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn register_stage2_record(
-        &self,
+        stage2: &mut super::stage2_backend::CarrierStage2<'_>,
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        Self::register_stage2_record_locked(&mut self.stage2.lock(), spec)
+        Self::register_stage2_record_locked(stage2, spec)
     }
 
-    /// Commit backend mapping and its exact record under one lifecycle lock.
+    /// Commit backend mapping and its exact record under a held generation guard.
     /// The backend callback must not re-enter custody. All fallible record
     /// admission happens before map; a failed map removes the unpublished record.
-    pub(crate) fn publish_stage2_record_using(
-        &self,
+    pub(crate) fn publish_stage2_record_in(
+        stage2: &mut super::stage2_backend::CarrierStage2<'_>,
         spec: CarrierStage2RecordSpec,
-        map: impl FnOnce(CarrierStage2RecordIdentity) -> carrick_aarch64::stage2::Stage2Status,
+        map: impl FnOnce(
+            &mut super::stage2_backend::CarrierStage2<'_>,
+            CarrierStage2RecordIdentity,
+        ) -> carrick_aarch64::stage2::Stage2Status,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
-        let mut state = self.stage2.lock();
-        let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
+        let identity = Self::register_stage2_record_locked(stage2, spec).map_err(|error| {
             TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
         })?;
-        let rc = map(identity);
+        let rc = map(stage2, identity);
         if rc != 0 {
-            let _ = state.remove_record(identity.record_id);
+            let _ = stage2.remove_record(identity.record_id);
             return Err(TrapError::Hypervisor(format!(
                 "stage-2 map failed: {rc:#x}"
             )));
         }
         Ok(identity)
+    }
+
+    /// Commit backend mapping and its exact record under one generation guard.
+    /// The backend callback receives `&mut CarrierStage2<'_>` so it can map
+    /// without re-entering custody. All fallible record admission happens
+    /// before map; a failed map removes the unpublished record.
+    pub(crate) fn publish_stage2_record_using(
+        &self,
+        spec: CarrierStage2RecordSpec,
+        map: impl FnOnce(
+            &mut super::stage2_backend::CarrierStage2<'_>,
+            CarrierStage2RecordIdentity,
+        ) -> carrick_aarch64::stage2::Stage2Status,
+    ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+        let mut stage2 = self
+            .admitting_stage2_in(spec.vm_generation, "stage-2 record admission")
+            .map_err(|_| TrapError::Hypervisor("stage-2 record admission: NoLiveVm".to_owned()))?;
+        Self::publish_stage2_record_in(&mut stage2, spec, map)
     }
 
     fn register_stage2_record_locked(
@@ -1349,12 +1425,12 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn rebind_terminal_stage2_record(
-        &self,
+        stage2: &mut super::stage2_backend::CarrierStage2<'_>,
         old_identity: CarrierStage2RecordIdentity,
         host_addr: usize,
         perms: u64,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
-        let mut state = self.stage2.lock();
+        let state = &mut **stage2;
         let live_generation = match state.lifecycle() {
             Stage2Lifecycle::Creating(generation) | Stage2Lifecycle::Live(generation) => generation,
             Stage2Lifecycle::Vacant | Stage2Lifecycle::Gone(_) | Stage2Lifecycle::Destroying(_) => {
@@ -1432,8 +1508,21 @@ impl CarrierVmCustody {
         &self,
         record_id: CarrierStage2RecordId,
     ) -> Option<CarrierStage2RecordSnapshot> {
-        self.stage2
-            .lock()
+        Self::stage2_record_snapshot_locked(&self.stage2.lock(), record_id)
+    }
+
+    pub(crate) fn stage2_record_snapshot_in(
+        stage2: &super::stage2_backend::CarrierStage2<'_>,
+        record_id: CarrierStage2RecordId,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        Self::stage2_record_snapshot_locked(stage2, record_id)
+    }
+
+    fn stage2_record_snapshot_locked(
+        state: &Stage2CustodyState<CarrierStage2Records>,
+        record_id: CarrierStage2RecordId,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        state
             .stage2_records
             .get(&record_id)
             .map(|record| record.snapshot)
@@ -1860,9 +1949,8 @@ mod carrier_vm_custody_tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(g1, 1))
-            .expect("G1 record");
+        let identity =
+            register_test_stage2_record(&custody, stage2_spec(g1, 1)).expect("G1 record");
         let rival_done = std::sync::Arc::new(AtomicBool::new(false));
         let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
         let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
@@ -2053,9 +2141,8 @@ mod carrier_vm_custody_tests {
             release_ipa: false,
             ..stage2_spec(g1, 101)
         };
-        let old_identity = custody
-            .register_stage2_record(spec)
-            .expect("register G1 carrier-MM record");
+        let old_identity =
+            register_test_stage2_record(&custody, spec).expect("register G1 carrier-MM record");
         custody
             .carrier_stage2_records
             .lock()
@@ -2135,6 +2222,17 @@ mod carrier_vm_custody_tests {
         );
         assert_eq!(snapshot.vm_generation, g2);
         assert!(snapshot.terminalized_by_vm_destroy && !snapshot.mapped);
+    }
+
+    fn register_test_stage2_record(
+        custody: &CarrierVmCustody,
+        spec: CarrierStage2RecordSpec,
+    ) -> Result<CarrierStage2RecordIdentity, super::CarrierStage2RecordError> {
+        let mut stage2 = custody
+            .stage2
+            .stage2_in(spec.vm_generation)
+            .map_err(|_| super::CarrierStage2RecordError::NoLiveVm)?;
+        CarrierVmCustody::register_stage2_record(&mut stage2, spec)
     }
 
     fn stage2_spec(
@@ -3885,8 +3983,7 @@ mod carrier_vm_custody_tests {
         for stage in ["initial-vcpu", "shared-wait-map", "exec-reconcile"] {
             let custody = CarrierVmCustody::new();
             let generation = custody.begin_create().expect("begin injected create");
-            let identity = custody
-                .register_stage2_record(stage2_spec(generation, 70))
+            let identity = register_test_stage2_record(&custody, stage2_spec(generation, 70))
                 .expect("setup may register exact Creating-generation records");
             assert_eq!(
                 custody.live_generation(),
@@ -3999,9 +4096,11 @@ mod carrier_vm_custody_tests {
     fn terminal_release_claim_blocks_generation_rebind_until_abort() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(custody.live_generation().expect("G1 live"), 91))
-            .expect("register G1 record");
+        let identity = register_test_stage2_record(
+            &custody,
+            stage2_spec(custody.live_generation().expect("G1 live"), 91),
+        )
+        .expect("register G1 record");
         destroy_vm_with_custody_using(
             &custody,
             "G1 destroy",
@@ -4016,24 +4115,31 @@ mod carrier_vm_custody_tests {
                 .expect("claim exact terminal release")
                 .is_some()
         );
-        assert_eq!(
-            custody.rebind_terminal_stage2_record(
-                identity,
-                0x1234_0000,
-                stage2_spec(identity.vm_generation, 91).perms
-            ),
-            Err(super::CarrierStage2RecordError::ReleaseInFlight)
-        );
+        {
+            let mut stage2 = custody.admitting_stage2("test rebind").expect("admitting");
+            assert_eq!(
+                CarrierVmCustody::rebind_terminal_stage2_record(
+                    &mut stage2,
+                    identity,
+                    0x1234_0000,
+                    stage2_spec(identity.vm_generation, 91).perms
+                ),
+                Err(super::CarrierStage2RecordError::ReleaseInFlight)
+            );
+        }
         custody.abort_terminal_stage2_release(identity);
-        assert!(
-            custody
-                .rebind_terminal_stage2_record(
+        {
+            let mut stage2 = custody.admitting_stage2("test rebind").expect("admitting");
+            assert!(
+                CarrierVmCustody::rebind_terminal_stage2_record(
+                    &mut stage2,
                     identity,
                     0x1234_0000,
                     stage2_spec(identity.vm_generation, 91).perms,
                 )
                 .is_ok()
-        );
+            );
+        }
     }
 
     #[test]
@@ -4041,8 +4147,7 @@ mod carrier_vm_custody_tests {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().expect("begin Creating VM");
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 92))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 92))
             .expect("register setup record");
         let id = super::CarrierVcpuId::from_raw(41);
         let mut vcpu_id = Some(id);
@@ -4223,12 +4328,14 @@ mod carrier_vm_custody_tests {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0xa081_a000_0000, 0x4000);
-        let old_identity = custody
-            .register_stage2_record(CarrierStage2RecordSpec {
+        let old_identity = register_test_stage2_record(
+            &custody,
+            CarrierStage2RecordSpec {
                 ipa: key.0,
                 ..stage2_spec(g1, 93)
-            })
-            .expect("register G1 carrier-MM record");
+            },
+        )
+        .expect("register G1 carrier-MM record");
         custody
             .carrier_stage2_records
             .lock()
@@ -4936,16 +5043,17 @@ mod carrier_vm_custody_tests {
     fn persistent_unmap_failure_retains_the_exact_record_for_retry() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 11))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 11))
             .expect("register exact stage-2 record");
-        let second = custody
-            .register_stage2_record(CarrierStage2RecordSpec {
+        let second = register_test_stage2_record(
+            &custody,
+            CarrierStage2RecordSpec {
                 ipa: 0x8000,
                 host_addr: 0x5678_0000,
                 ..stage2_spec(generation, 12)
-            })
-            .expect("register second exact stage-2 record");
+            },
+        )
+        .expect("register second exact stage-2 record");
         assert_ne!(identity.record_id, second.record_id);
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
 
@@ -4981,8 +5089,7 @@ mod carrier_vm_custody_tests {
     fn carrier_safe_point_failure_retains_directory_identity_until_exact_retry_finishes() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 13))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 13))
             .expect("register carrier stage-2 record");
         let key = (0x4000, 0x4000);
         custody.carrier_stage2_records.lock().insert(key, identity);
@@ -5029,8 +5136,7 @@ mod carrier_vm_custody_tests {
     fn last_pin_drop_is_non_panicking_and_only_marks_retry_eligibility() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 21))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 21))
             .expect("register pinned record");
         let pin = custody
             .pin_stage2_record(identity)
@@ -5070,8 +5176,7 @@ mod carrier_vm_custody_tests {
     #[test]
     fn retained_stage2_pin_does_not_keep_its_carrier_alive() {
         let (custody, generation) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 71))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 71))
             .expect("register stage-2 record");
         let pin = custody.pin_stage2_record(identity).expect("pin record");
         let weak = std::sync::Arc::downgrade(&custody);
@@ -5288,16 +5393,17 @@ mod carrier_vm_custody_tests {
     fn successful_vm_destroy_terminalizes_generation_without_post_destroy_unmap() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
-        let first = custody
-            .register_stage2_record(stage2_spec(generation, 31))
+        let first = register_test_stage2_record(&custody, stage2_spec(generation, 31))
             .expect("register first record");
-        let second = custody
-            .register_stage2_record(CarrierStage2RecordSpec {
+        let second = register_test_stage2_record(
+            &custody,
+            CarrierStage2RecordSpec {
                 ipa: 0xc000,
                 host_addr: 0x9abc_0000,
                 ..stage2_spec(generation, 32)
-            })
-            .expect("register second record");
+            },
+        )
+        .expect("register second record");
 
         destroy_vm_with_custody_using(
             &custody,
@@ -5323,8 +5429,7 @@ mod carrier_vm_custody_tests {
     fn failed_vm_destroy_preserves_records_and_live_generation() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
-        let identity = custody
-            .register_stage2_record(stage2_spec(generation, 41))
+        let identity = register_test_stage2_record(&custody, stage2_spec(generation, 41))
             .expect("register record");
         let before = custody
             .stage2_record_snapshot(identity.record_id)
@@ -5355,8 +5460,7 @@ mod carrier_vm_custody_tests {
     fn cross_generation_same_key_rejects_old_vm_and_owner_identities() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, first_generation) = live_custody();
-        let first = custody
-            .register_stage2_record(stage2_spec(first_generation, 51))
+        let first = register_test_stage2_record(&custody, stage2_spec(first_generation, 51))
             .expect("register predecessor record");
         destroy_vm_with_custody_using(
             &custody,
@@ -5369,8 +5473,7 @@ mod carrier_vm_custody_tests {
         custody
             .commit_create(second_generation)
             .expect("publish successor generation");
-        let second = custody
-            .register_stage2_record(stage2_spec(second_generation, 52))
+        let second = register_test_stage2_record(&custody, stage2_spec(second_generation, 52))
             .expect("register same-key successor");
         assert_ne!(first.record_id, second.record_id);
         let unmap_calls = std::cell::Cell::new(0_u32);

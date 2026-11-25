@@ -553,6 +553,29 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfCarrierStage2 {
 pub(crate) type CarrierStage2<'a> =
     carrick_aarch64::stage2::custody::Stage2Generation<'a, super::CarrierStage2Records>;
 
+/// Install `[host, host + size)` at `[ipa, ipa + size)` in the guard's
+/// generation, with the recorded stage-2 permission word. The mapping it
+/// returns is the only authority to unmap the extent.
+///
+/// # Safety
+///
+/// The host range stays mapped and unused for anything else until the
+/// mapping is unmapped or its generation is destroyed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn stage2_map(
+    stage2: &mut CarrierStage2<'_>,
+    host: *mut std::ffi::c_void,
+    ipa: u64,
+    size: usize,
+    permissions: u64,
+) -> Result<carrick_aarch64::stage2::custody::Stage2Mapping, Stage2Status> {
+    let Some(perms) = stage2_perms_from_bits(permissions) else {
+        return Err(Stage2Status::from_raw(HV_BAD_ARGUMENT));
+    };
+    // SAFETY: forwarded from this function's contract.
+    unsafe { stage2.map(host, ipa, size, perms) }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The status the next raw destroy on this thread reports instead of
@@ -1561,13 +1584,30 @@ impl std::fmt::Debug for IpcWindowInstallation {
 pub(crate) fn install_ipc_window_using(
     custody: &CarrierVmCustody,
     backing: std::sync::Arc<dyn IpcWindowBacking>,
-    mut map: impl FnMut(*mut u8, u64, usize, u64) -> carrick_aarch64::stage2::Stage2Status,
+    mut map: impl FnMut(
+        &mut CarrierStage2<'_>,
+        *mut u8,
+        u64,
+        usize,
+        u64,
+    ) -> carrick_aarch64::stage2::Stage2Status,
     mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> Result<IpcWindowInstallation, TrapError> {
     let (directory_len, pool_len) = ipc_window_geometry(backing.as_ref())?;
-    let generation = custody.live_generation().ok_or_else(|| {
-        TrapError::Hypervisor("IPC window installation without a live carrier VM".to_owned())
-    })?;
+    let mut stage2 = custody
+        .admitting_stage2("IPC window installation")
+        .map_err(|_| {
+            TrapError::Hypervisor("IPC window installation without a live carrier VM".to_owned())
+        })?;
+    if !matches!(
+        stage2.lifecycle(),
+        carrick_aarch64::stage2::custody::Stage2Lifecycle::Live(_)
+    ) {
+        return Err(TrapError::Hypervisor(
+            "IPC window installation without a live carrier VM".to_owned(),
+        ));
+    }
+    let generation = stage2.generation();
     custody
         .stage2
         .at_client_point(super::carrier_custody::IPC_WINDOW_ADMITTED);
@@ -1585,9 +1625,19 @@ pub(crate) fn install_ipc_window_using(
             pool_len,
         ),
     ] {
-        let owner = custody.allocate_logical_owner().map_err(|error| {
-            TrapError::Hypervisor(format!("IPC window owner identity: {error:?}"))
-        })?;
+        let owner = match CarrierVmCustody::allocate_logical_owner_in(&mut stage2) {
+            Ok(owner) => owner,
+            Err(error) => {
+                drop(stage2);
+                for identity in records {
+                    let _ = custody.retire_stage2_record_using(identity, &mut unmap);
+                    let _ = custody.remove_terminal_stage2_record(identity);
+                }
+                return Err(TrapError::Hypervisor(format!(
+                    "IPC window owner identity: {error:?}"
+                )));
+            }
+        };
         let spec = CarrierStage2RecordSpec {
             vm_generation: generation,
             ipa,
@@ -1599,9 +1649,12 @@ pub(crate) fn install_ipc_window_using(
             perms: READ_WRITE,
             logical_owner: Some(owner),
         };
-        match custody.publish_stage2_record_using(spec, |_| map(host, ipa, len, READ_WRITE)) {
+        match CarrierVmCustody::publish_stage2_record_in(&mut stage2, spec, |stage2, _| {
+            map(stage2, host, ipa, len, READ_WRITE)
+        }) {
             Ok(identity) => records.push(identity),
             Err(error) => {
+                drop(stage2);
                 for identity in records {
                     let _ = custody.retire_stage2_record_using(identity, &mut unmap);
                     let _ = custody.remove_terminal_stage2_record(identity);
@@ -1668,7 +1721,12 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         backing,
         // SAFETY: the backing is validated host memory retained by the
         // installation for as long as the VM maps it.
-        |host, ipa, len, perms| unsafe { inventory_stage2_map(host.cast(), ipa, len, perms) },
+        |stage2, host, ipa, len, perms| match unsafe {
+            stage2_map(stage2, host.cast(), ipa, len, perms)
+        } {
+            Ok(_mapping) => Stage2Status::SUCCESS,
+            Err(status) => status,
+        },
         |ipa, len| {
             // SAFETY: unmapping exactly the extent this installation mapped.
             let rc = unsafe { inventory_stage2_unmap(ipa, len) };
@@ -1757,7 +1815,7 @@ mod ipc_window_tests {
         let installed = install_ipc_window_using(
             &custody,
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-            |host, ipa, len, perms| {
+            |_stage2, host, ipa, len, perms| {
                 calls.push((host as usize, ipa, len, perms));
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
             },
@@ -1781,7 +1839,7 @@ mod ipc_window_tests {
         let wrong_pool = install_ipc_window_using(
             &custody,
             backing(0x10_0000),
-            |_, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            |_, _, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
             |_, _| Ok(()),
         );
         assert!(wrong_pool.is_err(), "a pool of another length fails closed");
@@ -1790,7 +1848,7 @@ mod ipc_window_tests {
         let failed = install_ipc_window_using(
             &custody,
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 maps += 1;
                 if maps == 2 {
                     carrick_aarch64::stage2::Stage2Status::from_raw(1)
@@ -1815,7 +1873,7 @@ mod ipc_window_tests {
             install_ipc_window_using(
                 &no_vm,
                 backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-                |_, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                |_, _, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
                 |_, _| Ok(())
             )
             .is_err()
@@ -1869,15 +1927,19 @@ mod ipc_window_tests {
             })
         };
 
+        let _stub = ScopedStage2MapTestStub::enable();
         let mapped_after_rival = AtomicBool::new(false);
         let installed = install_ipc_window_using(
             &custody,
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-            |_, _, _, _| {
+            |stage2, host, ipa, len, perms| {
                 if rival_done.load(Ordering::SeqCst) {
                     mapped_after_rival.store(true, Ordering::SeqCst);
                 }
-                Stage2Status::SUCCESS
+                match unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) } {
+                    Ok(_mapping) => Stage2Status::SUCCESS,
+                    Err(status) => status,
+                }
             },
             |_, _| Ok(()),
         );

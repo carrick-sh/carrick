@@ -2095,22 +2095,20 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
         )));
     }
     let registration = (|| {
-        let vm_generation = custody.setup_generation().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "global frame owner registration has no creating/live carrier VM".to_owned(),
-            )
-        })?;
+        let mut stage2 = custody.admitting_stage2("global frame owner registration")?;
+        let vm_generation = stage2.generation();
         let logical_owner = match logical_owner {
             Some(owner) => owner,
-            None => custody.allocate_logical_owner().map_err(|error| {
+            None => CarrierVmCustody::allocate_logical_owner_in(&mut stage2).map_err(|error| {
                 TrapError::Hypervisor(format!(
                     "allocate carrier-local global frame owner identity: {error:?}"
                 ))
             })?,
         };
         let backend_map_installed = lease.backend_map_installed;
-        custody
-            .register_stage2_record(CarrierStage2RecordSpec {
+        CarrierVmCustody::register_stage2_record(
+            &mut stage2,
+            CarrierStage2RecordSpec {
                 vm_generation,
                 ipa: lease.base,
                 len: usize::try_from(lease.length).map_err(|_| {
@@ -2122,12 +2120,13 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
                 release_ipa: lease.release_ipa,
                 perms,
                 logical_owner: Some(logical_owner),
-            })
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "transfer global frame lease into carrier custody: {error:?}"
-                ))
-            })
+            },
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "transfer global frame lease into carrier custody: {error:?}"
+            ))
+        })
     })();
     let identity = match registration {
         Ok(identity) => identity,
@@ -2260,33 +2259,35 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
 ) -> Result<u64, TrapError> {
     let key = (handle.ipa(), handle.len() as u64);
     let host_addr = handle.as_mut_ptr() as usize;
-    let vm_generation = custody.setup_generation().ok_or_else(|| {
-        TrapError::Hypervisor(
-            "pooled global frame owner registration has no creating/live carrier VM".to_owned(),
+    let record_identity = {
+        let mut stage2 = custody.admitting_stage2("pooled global frame owner registration")?;
+        let vm_generation = stage2.generation();
+        let logical_owner =
+            CarrierVmCustody::allocate_logical_owner_in(&mut stage2).map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "allocate carrier-local global frame owner identity: {error:?}"
+                ))
+            })?;
+        CarrierVmCustody::register_stage2_record(
+            &mut stage2,
+            CarrierStage2RecordSpec {
+                vm_generation,
+                ipa: key.0,
+                len: handle.len(),
+                host_addr,
+                mapped: true,
+                backend_map_installed: false,
+                release_ipa: false,
+                perms,
+                logical_owner: Some(logical_owner),
+            },
         )
-    })?;
-    let logical_owner = custody.allocate_logical_owner().map_err(|error| {
-        TrapError::Hypervisor(format!(
-            "allocate carrier-local global frame owner identity: {error:?}"
-        ))
-    })?;
-    let record_identity = custody
-        .register_stage2_record(CarrierStage2RecordSpec {
-            vm_generation,
-            ipa: key.0,
-            len: handle.len(),
-            host_addr,
-            mapped: true,
-            backend_map_installed: false,
-            release_ipa: false,
-            perms,
-            logical_owner: Some(logical_owner),
-        })
         .map_err(|error| {
             TrapError::Hypervisor(format!(
                 "register pooled global frame record into carrier custody: {error:?}"
             ))
-        })?;
+        })?
+    };
     let generation = record_identity
         .logical_owner
         .map_or(0, |owner| owner.generation);
@@ -3267,6 +3268,22 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn acquire_replay_rebind_stage2<'a>(
+    custody: &'a CarrierVmCustody,
+    target_generation: &mut Option<CarrierVmGeneration>,
+    context: &str,
+) -> Result<super::stage2_backend::CarrierStage2<'a>, TrapError> {
+    match *target_generation {
+        Some(generation) => custody.admitting_stage2_in(generation, context),
+        None => {
+            let stage2 = custody.admitting_stage2(context)?;
+            *target_generation = Some(stage2.generation());
+            Ok(stage2)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     replayed: &[GlobalFrameReplayExtent],
@@ -3287,6 +3304,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         .iter()
         .map(|(&key, entry)| (key, entry.is_live(), std::sync::Arc::clone(entry.owner())))
         .collect::<Vec<_>>();
+    let mut rebind_generation = None;
     let mut report = GlobalFrameReplayReconcileReport::default();
 
     for (key, was_live, owner) in entries {
@@ -3322,16 +3340,6 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     key.0, key.1, old_snapshot.perms, replay.perms
                 )));
             }
-            if old_snapshot.vm_generation
-                == custody.setup_generation().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "global frame replay has no creating/live VM generation".to_owned(),
-                    )
-                })?
-                && old_snapshot.mapped
-            {
-                continue;
-            }
             let mut owners = custody.global_frame_host_owners.lock();
             let current = owners.get(&key).ok_or_else(|| {
                 TrapError::Hypervisor("global frame owner disappeared during rebind".to_owned())
@@ -3341,17 +3349,30 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "global frame owner changed during replay rebind".to_owned(),
                 ));
             }
-            let new_identity = custody
-                .rebind_terminal_stage2_record(
-                    owner.record_identity,
-                    replay.host_addr,
-                    replay.perms,
-                )
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "rebind global frame owner after VM replay: {error:?}"
-                    ))
-                })?;
+            let mut stage2 = acquire_replay_rebind_stage2(
+                custody,
+                &mut rebind_generation,
+                "global frame replay",
+            )?;
+            if CarrierVmCustody::stage2_record_snapshot_in(&stage2, owner.record_identity.record_id)
+                .is_some_and(|snapshot| {
+                    snapshot.vm_generation == stage2.generation() && snapshot.mapped
+                })
+            {
+                continue;
+            }
+            let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
+                &mut stage2,
+                owner.record_identity,
+                replay.host_addr,
+                replay.perms,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "rebind global frame owner after VM replay: {error:?}"
+                ))
+            })?;
+            drop(stage2);
             let successor = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
                 std::sync::Arc::clone(&owner.mapping),
                 std::sync::Arc::clone(custody),
@@ -3469,24 +3490,27 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     key.0, key.1
                 )));
             }
-            let current_generation = custody.setup_generation().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "carrier-MM replay has no creating/live VM generation".to_owned(),
-                )
-            })?;
+            let mut stage2 =
+                acquire_replay_rebind_stage2(custody, &mut rebind_generation, "carrier-MM replay")?;
+            let current_generation = stage2.generation();
             if snapshot.vm_generation == current_generation && snapshot.mapped {
                 continue;
             }
             custody
                 .stage2
                 .at_client_point(super::carrier_custody::REPLAY_REBIND_ADMITTED);
-            let new_identity = custody
-                .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "rebind carrier-MM stage-2 record after VM replay: {error:?}"
-                    ))
-                })?;
+            let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
+                &mut stage2,
+                old_identity,
+                replay.host_addr,
+                replay.perms,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "rebind carrier-MM stage-2 record after VM replay: {error:?}"
+                ))
+            })?;
+            drop(stage2);
             let mut records = custody.carrier_stage2_records.lock();
             if records.get(&key) != Some(&old_identity) {
                 return Err(TrapError::Hypervisor(
@@ -3568,22 +3592,28 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     key.0, key.1
                 )));
             }
-            let current_generation = custody.setup_generation().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "structural backing replay has no creating/live VM generation".to_owned(),
-                )
-            })?;
+            let mut stage2 = acquire_replay_rebind_stage2(
+                custody,
+                &mut rebind_generation,
+                "structural backing replay",
+            )?;
+            let current_generation = stage2.generation();
             if snapshot.vm_generation == current_generation && snapshot.mapped {
                 continue;
             }
             let old_identity = identity;
-            let new_identity = custody
-                .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "rebind structural backing after VM replay: {error:?}"
-                    ))
-                })?;
+            let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
+                &mut stage2,
+                old_identity,
+                replay.host_addr,
+                replay.perms,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "rebind structural backing after VM replay: {error:?}"
+                ))
+            })?;
+            drop(stage2);
             *retained.record_identity.lock() = new_identity;
             let mut retained_by_record = custody.structural_backings.lock();
             retained_by_record.remove(&old_identity.record_id);

@@ -688,6 +688,7 @@ impl PreparedExecBacking {
     fn install_using(
         self,
         mut map: impl FnMut(
+            &mut super::stage2_backend::CarrierStage2<'_>,
             ExecStage2Install,
             CarrierStage2RecordIdentity,
         ) -> carrick_aarch64::stage2::Stage2Status,
@@ -700,11 +701,20 @@ impl PreparedExecBacking {
             map_backings_started: _,
             custody,
         } = self;
-        let mut installed = InstalledExecBacking {
-            plan,
-            regions: Vec::new(),
-            custody,
+        let mut installed_regions = Vec::new();
+        let mut stage2 = match custody.admitting_stage2("exec successor installation") {
+            Ok(stage2) => stage2,
+            Err(error) => {
+                return Err(fail_exec_install(
+                    plan,
+                    installed_regions,
+                    std::sync::Arc::clone(&custody),
+                    error,
+                    &mut unmap,
+                ));
+            }
         };
+        let vm_generation = stage2.generation();
         for PreparedExecRegion {
             region,
             mut lease,
@@ -728,19 +738,6 @@ impl PreparedExecBacking {
                 replay_registered: false,
                 pre_mapped,
             };
-            let vm_generation = match installed.custody.setup_generation() {
-                Some(generation) => generation,
-                None => {
-                    lease.forget_backend_mapping();
-                    let error = TrapError::Hypervisor(
-                        "exec successor installation has no creating/live carrier".to_owned(),
-                    );
-                    return Err(ExecBackingInstallError {
-                        error,
-                        retained: rollback_after_install_failure(installed, &mut unmap),
-                    });
-                }
-            };
             let structural_epoch =
                 if is_reusable_global_frame_extent(install.ipa, install.size as u64) {
                     None
@@ -749,10 +746,14 @@ impl PreparedExecBacking {
                         Ok(epoch) => Some(epoch),
                         Err(error) => {
                             lease.forget_backend_mapping();
-                            return Err(ExecBackingInstallError {
+                            drop(stage2);
+                            return Err(fail_exec_install(
+                                plan,
+                                installed_regions,
+                                custody,
                                 error,
-                                retained: rollback_after_install_failure(installed, &mut unmap),
-                            });
+                                &mut unmap,
+                            ));
                         }
                     }
                 };
@@ -761,17 +762,21 @@ impl PreparedExecBacking {
                     id: epoch.raw(),
                     generation: epoch.raw(),
                 },
-                None => match installed.custody.allocate_logical_owner() {
+                None => match CarrierVmCustody::allocate_logical_owner_in(&mut stage2) {
                     Ok(owner) => owner,
                     Err(reason) => {
                         lease.forget_backend_mapping();
+                        drop(stage2);
                         let error = TrapError::Hypervisor(format!(
                             "allocate exec successor physical owner: {reason:?}"
                         ));
-                        return Err(ExecBackingInstallError {
+                        return Err(fail_exec_install(
+                            plan,
+                            installed_regions,
+                            custody,
                             error,
-                            retained: rollback_after_install_failure(installed, &mut unmap),
-                        });
+                            &mut unmap,
+                        ));
                     }
                 },
             };
@@ -786,68 +791,99 @@ impl PreparedExecBacking {
                 perms: install.perms,
                 logical_owner: Some(logical_owner),
             };
-            let record = match installed
-                .custody
-                .publish_stage2_record_using(spec, |identity| map(install, identity))
-            {
+            let record = match CarrierVmCustody::publish_stage2_record_in(
+                &mut stage2,
+                spec,
+                |stage2, identity| map(stage2, install, identity),
+            ) {
                 Ok(record) => record,
                 Err(error) => {
                     // A failed callback removed its unpublished record. It did
                     // not install a map, so ordinary lease rollback is sound.
                     lease.forget_backend_mapping();
-                    return Err(ExecBackingInstallError {
+                    drop(stage2);
+                    return Err(fail_exec_install(
+                        plan,
+                        installed_regions,
+                        custody,
                         error,
-                        retained: rollback_after_install_failure(installed, &mut unmap),
-                    });
+                        &mut unmap,
+                    ));
                 }
             };
-            let Some(snapshot) = installed.custody.stage2_record_snapshot(record.record_id) else {
+            let Some(snapshot) =
+                CarrierVmCustody::stage2_record_snapshot_in(&stage2, record.record_id)
+            else {
+                drop(stage2);
                 let error = TrapError::Hypervisor(
                     "exec successor stage-2 record disappeared after map".to_owned(),
                 );
-                installed.regions.push(InstalledExecRegion {
+                installed_regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),
                     root,
                     structural_epoch,
                 });
-                return Err(ExecBackingInstallError {
+                return Err(fail_exec_install(
+                    plan,
+                    installed_regions,
+                    custody,
                     error,
-                    retained: rollback_after_install_failure(installed, &mut unmap),
-                });
+                    &mut unmap,
+                ));
             };
             if let Err(error) = lease.transfer_to_record(snapshot) {
-                installed.regions.push(InstalledExecRegion {
+                installed_regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),
                     root,
                     structural_epoch,
                 });
-                return Err(ExecBackingInstallError {
+                drop(stage2);
+                return Err(fail_exec_install(
+                    plan,
+                    installed_regions,
+                    custody,
                     error,
-                    retained: rollback_after_install_failure(installed, &mut unmap),
-                });
+                    &mut unmap,
+                ));
             }
-            installed.regions.push(InstalledExecRegion {
+            installed_regions.push(InstalledExecRegion {
                 region,
                 record: Some(record),
                 root,
                 structural_epoch,
             });
         }
-        Ok(installed)
+        drop(stage2);
+        Ok(InstalledExecBacking {
+            plan,
+            regions: installed_regions,
+            custody,
+        })
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn rollback_after_install_failure(
-    installed: InstalledExecBacking,
+fn fail_exec_install(
+    plan: GuestMappingPlan,
+    regions: Vec<InstalledExecRegion>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    error: TrapError,
     unmap: &mut impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
-) -> Option<Box<InstalledExecBacking>> {
-    installed
-        .rollback_using(unmap)
-        .err()
-        .map(|failure| failure.installed)
+) -> ExecBackingInstallError {
+    let installed = InstalledExecBacking {
+        plan,
+        regions,
+        custody,
+    };
+    ExecBackingInstallError {
+        error,
+        retained: installed
+            .rollback_using(unmap)
+            .err()
+            .map(|failure| failure.installed),
+    }
 }
 
 /// Install and publish one completely prepared successor using only its
@@ -863,7 +899,7 @@ fn install_prepared_exec_backing(
     let fail_after = exec_stage2_fail_after_maps();
     let mut maps_completed = 0usize;
     let installed = prepared.install_using(
-        |extent, _record| {
+        |stage2, extent, _record| {
             if extent.pre_mapped {
                 return carrick_aarch64::stage2::Stage2Status::SUCCESS;
             }
@@ -879,8 +915,17 @@ fn install_prepared_exec_backing(
                     0,
                 ),
             );
-            let rc = unsafe {
-                inventory_stage2_map(extent.host.cast(), extent.ipa, extent.size, extent.perms)
+            let rc = match unsafe {
+                stage2_map(
+                    stage2,
+                    extent.host.cast(),
+                    extent.ipa,
+                    extent.size,
+                    extent.perms,
+                )
+            } {
+                Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                Err(status) => status,
             };
             if rc == 0
                 && let Some(replay_key) = extent.replay_key()
@@ -2664,7 +2709,7 @@ mod backing_preparation_tests {
         let mut map_saw_record = false;
         let installed = prepared
             .install_using(
-                |_install, identity| {
+                |_stage2, _install, identity| {
                     map_saw_record = identity.record_id.0 != 0;
                     carrick_aarch64::stage2::Stage2Status::SUCCESS
                 },
@@ -2693,7 +2738,7 @@ mod backing_preparation_tests {
         let mut maps = 0;
         let mut unmaps = Vec::new();
         let failure = match transaction.install_using(
-            |_install, _identity| {
+            |_stage2, _install, _identity| {
                 maps += 1;
                 if maps == 2 {
                     carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX)

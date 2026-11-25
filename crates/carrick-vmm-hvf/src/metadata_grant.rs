@@ -710,7 +710,10 @@ impl HostApertureState {
         custody: &crate::trap::CarrierVmCustody,
         generation: crate::trap::CarrierVmGeneration,
         backing: Arc<dyn RetainedMetadataBacking>,
-        map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> carrick_aarch64::stage2::Stage2Status,
+        map: impl FnOnce(
+            &mut crate::trap::CarrierStage2<'_>,
+            crate::trap::CarrierStage2RecordSpec,
+        ) -> carrick_aarch64::stage2::Stage2Status,
     ) -> Result<MetadataExtent, MetadataResolutionError> {
         if !request_has_live_vm(custody, Some(generation)) {
             return Err(MetadataResolutionError::StaleOwner);
@@ -1028,7 +1031,10 @@ fn allocate_metadata_backing(size: usize) -> Result<OwnedHostMapping, std::io::E
 fn publish_metadata_mapping_using(
     custody: &crate::trap::CarrierVmCustody,
     spec: crate::trap::CarrierStage2RecordSpec,
-    map: impl FnOnce(crate::trap::CarrierStage2RecordIdentity) -> carrick_aarch64::stage2::Stage2Status,
+    map: impl FnOnce(
+        &mut crate::trap::CarrierStage2<'_>,
+        crate::trap::CarrierStage2RecordIdentity,
+    ) -> carrick_aarch64::stage2::Stage2Status,
 ) -> Result<crate::trap::CarrierStage2RecordIdentity, TrapError> {
     custody.publish_stage2_record_using(spec, map)
 }
@@ -1075,17 +1081,22 @@ pub(crate) fn install_fork_lifecycle(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn map_metadata_backing(
+    stage2: &mut crate::trap::CarrierStage2<'_>,
     spec: crate::trap::CarrierStage2RecordSpec,
 ) -> carrick_aarch64::stage2::Stage2Status {
     // SAFETY: the aperture owner retains the validated backing and reservation
     // through the inventory's rollback-capable stage-2 publication.
-    unsafe {
-        crate::trap::inventory_stage2_map(
+    match unsafe {
+        crate::trap::stage2_map(
+            stage2,
             spec.host_addr as *mut std::ffi::c_void,
             spec.ipa,
             spec.len,
             spec.perms,
         )
+    } {
+        Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        Err(status) => status,
     }
 }
 
@@ -1097,7 +1108,10 @@ fn publish_backing_using(
     ipa: u64,
     len: usize,
     token: u64,
-    map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> carrick_aarch64::stage2::Stage2Status,
+    map: impl FnOnce(
+        &mut crate::trap::CarrierStage2<'_>,
+        crate::trap::CarrierStage2RecordSpec,
+    ) -> carrick_aarch64::stage2::Stage2Status,
 ) -> Result<MetadataPublication, MetadataResolutionError> {
     let spec = crate::trap::CarrierStage2RecordSpec {
         vm_generation: generation,
@@ -1113,7 +1127,7 @@ fn publish_backing_using(
             generation: token,
         }),
     };
-    publish_metadata_mapping_using(custody, spec, |_| map(spec))
+    publish_metadata_mapping_using(custody, spec, |stage2, _| map(stage2, spec))
         .map(|identity| MetadataPublication { identity })
         .map_err(|_| MetadataResolutionError::Busy)
 }
@@ -1270,13 +1284,19 @@ pub(crate) fn service_metadata_operation(
             }),
         };
         let mut state = aperture.lock();
-        let publication = publish_metadata_mapping_using(custody, spec, |_| unsafe {
-            crate::trap::inventory_stage2_map(
-                backing.as_ptr().cast(),
-                ipa,
-                extent_size,
-                permissions,
-            )
+        let publication = publish_metadata_mapping_using(custody, spec, |stage2, _| {
+            match unsafe {
+                crate::trap::stage2_map(
+                    stage2,
+                    backing.as_ptr().cast(),
+                    ipa,
+                    extent_size,
+                    permissions,
+                )
+            } {
+                Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                Err(status) => status,
+            }
         });
         let identity = match publication {
             Ok(identity) => identity,
@@ -2787,7 +2807,7 @@ mod ownership_tests {
             generation
         };
         let publish = |host, ipa, len, token| {
-            publish_backing_using(&custody, generation, host, ipa, len, token, |_| {
+            publish_backing_using(&custody, generation, host, ipa, len, token, |_, _| {
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
             })
         };
@@ -3321,7 +3341,7 @@ mod tests {
                     generation: token,
                 }),
             },
-            |_| carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            |_, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
         )
         .expect("publish fake backend record")
     }
@@ -3395,7 +3415,7 @@ mod tests {
         };
         let mut calls = 0;
         assert!(
-            publish_metadata_mapping_using(&custody, spec, |_| {
+            publish_metadata_mapping_using(&custody, spec, |_, _| {
                 calls += 1;
                 carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX)
             })
@@ -3409,11 +3429,13 @@ mod tests {
         let mut stale = spec;
         stale.vm_generation = crate::trap::CarrierVmGeneration(generation.0 + 1);
         assert!(
-            publish_metadata_mapping_using(&custody, stale, |_| panic!("stale VM must not map"))
-                .is_err()
+            publish_metadata_mapping_using(&custody, stale, |_, _| {
+                panic!("stale VM must not map")
+            })
+            .is_err()
         );
         assert!(custody.stage2_record_identities().is_empty());
-        let identity = publish_metadata_mapping_using(&custody, spec, |_| {
+        let identity = publish_metadata_mapping_using(&custody, spec, |_, _| {
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         })
         .expect("map");
@@ -3641,7 +3663,7 @@ mod tests {
                 allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE).unwrap(),
             ));
             aperture
-                .install_retained_using(&custody, generation, backing, |_| {
+                .install_retained_using(&custody, generation, backing, |_, _| {
                     carrick_aarch64::stage2::Stage2Status::SUCCESS
                 })
                 .unwrap();
@@ -3652,7 +3674,7 @@ mod tests {
             allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE).unwrap(),
         ));
         assert_eq!(
-            aperture.install_retained_using(&custody, generation, backing, |_| {
+            aperture.install_retained_using(&custody, generation, backing, |_, _| {
                 panic!("exhaustion must decline before backend publication")
             }),
             Err(MetadataResolutionError::Busy)
@@ -3678,7 +3700,7 @@ mod tests {
         let mut state = metadata_aperture(&first).lock();
         assert!(
             state
-                .install_retained_using(&first, a, backing.clone(), |_| {
+                .install_retained_using(&first, a, backing.clone(), |_, _| {
                     carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX)
                 })
                 .is_err()
@@ -3686,7 +3708,7 @@ mod tests {
         assert!(first.stage2_record_identities().is_empty());
         assert!(state.occupied_bitmap.iter().all(|bits| *bits == 0));
         let extent = state
-            .install_retained_using(&first, a, backing.clone(), |spec| {
+            .install_retained_using(&first, a, backing.clone(), |_, spec| {
                 assert_eq!(spec.host_addr, host as usize);
                 assert_eq!(spec.len, 16384);
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
@@ -3701,7 +3723,7 @@ mod tests {
         let other_weak = Arc::downgrade(&other);
         let other_extent = metadata_aperture(&second)
             .lock()
-            .install_retained_using(&second, b, other, |_| {
+            .install_retained_using(&second, b, other, |_, _| {
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
             })
             .unwrap();
