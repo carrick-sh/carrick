@@ -1776,12 +1776,16 @@ impl CarrierVmCustody {
                 };
                 return match prepare_record_retirement(record, identity) {
                     RecordRetirement::Complete(outcome) => outcome,
-                    RecordRetirement::Unmap { ipa, len } => carrick_fatal::carrick_fatal!(
-                        "hvpatch::stage2_custody",
-                        "record {:?} at IPA {ipa:#x}/{len:#x} still owes an unmap, but its \
-                         generation's stage 2 is gone and was not terminalized",
-                        identity.record_id
-                    ),
+                    RecordRetirement::Unmap { .. } => {
+                        // Every record created under a generation is terminalized by
+                        // commit_destroy before its stage 2 leaves stage2_in; fail closed
+                        // without dropping host backing if an invariant violation arrives here.
+                        settle_record_retirement(
+                            record,
+                            identity,
+                            Err(CarrierStage2BackendError::HvReturn(0xfae9_4001)),
+                        )
+                    }
                 };
             }
         };

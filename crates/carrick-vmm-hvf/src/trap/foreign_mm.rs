@@ -1410,14 +1410,12 @@ impl MmAccessState {
             // pool here rather than at the last `Arc` drop of the retained mapping.
             authority.owner.release_pooled_root_slot();
 
-            let authority = slot.take().unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
+            let authority = slot.take().ok_or_else(|| {
+                TrapError::Hypervisor(format!(
                     "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
-                    expected_root_slot.0,
-                    expected_root_slot.1
-                );
-            });
+                    expected_root_slot.0, expected_root_slot.1
+                ))
+            })?;
             let key = authority.physical_extent;
             let owner = InventoryStage2OwnerIdentity {
                 host_addr: authority.owner.ptr() as usize,
