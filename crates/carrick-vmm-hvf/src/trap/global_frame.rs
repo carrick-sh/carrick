@@ -2285,6 +2285,10 @@ pub(crate) const CARRIER_BATCH_PREFIX_BEFORE_DETACH: &str = "carrier batch prefi
 pub(crate) const CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE: &str =
     "carrier batch rollback before retire";
 
+#[cfg(test)]
+pub(crate) const IDLE_STRUCTURAL_PINNED_BEFORE_COMPLETE: &str =
+    "idle structural pinned before complete";
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_carrier_stage2_record_at_safe_point(
     custody: &CarrierVmCustody,
@@ -5358,7 +5362,7 @@ fn retry_pending_global_frame_retirements_at_idle_with(
         report.inspected_structural += 1;
         let identity = {
             let retained_by_record = custody.structural_backings.lock();
-            retained_by_record
+            let identity = retained_by_record
                 .get(&record_id)
                 .filter(|retained| {
                     retained
@@ -5366,44 +5370,70 @@ fn retry_pending_global_frame_retirements_at_idle_with(
                         .load(std::sync::atomic::Ordering::Acquire)
                 })
                 .map(|retained| *retained.record_identity.lock())
-                .filter(|id| id.record_id == record_id)
+                .filter(|id| id.record_id == record_id);
+            if identity.is_none() {
+                custody
+                    .pending_structural_retries
+                    .lock()
+                    .complete(record_id);
+            }
+            identity
         };
         let Some(identity) = identity else {
-            custody
-                .pending_structural_retries
-                .lock()
-                .complete(record_id);
             continue;
         };
-        let Some(snapshot) = custody.stage2_record_snapshot(record_id) else {
-            custody
-                .pending_structural_retries
-                .lock()
-                .complete(record_id);
-            continue;
+        let completed_missing_or_pinned = {
+            let state = custody.stage2.lock();
+            let missing_or_pinned = match state.stage2_records.get(&record_id) {
+                None => true,
+                Some(record) => {
+                    record.snapshot.pin_count != 0
+                        || state
+                            .pinned_structural_predecessors
+                            .contains_key(&record_id)
+                }
+            };
+            if missing_or_pinned {
+                #[cfg(test)]
+                custody
+                    .stage2
+                    .at_client_point(IDLE_STRUCTURAL_PINNED_BEFORE_COMPLETE);
+                custody
+                    .pending_structural_retries
+                    .lock()
+                    .complete(record_id);
+            }
+            missing_or_pinned
         };
-        if snapshot.pin_count != 0 || custody.has_pinned_structural_predecessor(record_id) {
-            custody
-                .pending_structural_retries
-                .lock()
-                .complete(record_id);
+        if completed_missing_or_pinned {
             continue;
         }
-        if retry_structural_backing_identities_with(
+        let retry_ok = retry_structural_backing_identities_with(
             custody,
             &[identity],
             retire,
             &mut release_retired_stage2_ipa,
         )
-        .is_ok()
-            && custody.stage2_record_snapshot(record_id).is_none()
+        .is_ok();
         {
-            custody
-                .pending_structural_retries
-                .lock()
-                .complete(record_id);
-        } else {
-            custody.pending_structural_retries.lock().requeue(record_id);
+            let state = custody.stage2.lock();
+            let finished_or_pinned = match state.stage2_records.get(&record_id) {
+                None => true,
+                Some(record) => {
+                    record.snapshot.pin_count != 0
+                        || state
+                            .pinned_structural_predecessors
+                            .contains_key(&record_id)
+                }
+            };
+            if retry_ok && finished_or_pinned {
+                custody
+                    .pending_structural_retries
+                    .lock()
+                    .complete(record_id);
+            } else {
+                custody.pending_structural_retries.lock().requeue(record_id);
+            }
         }
     }
 

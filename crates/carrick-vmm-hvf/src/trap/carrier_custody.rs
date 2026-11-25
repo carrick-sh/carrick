@@ -535,6 +535,8 @@ pub struct CarrierVmCustody {
         Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
     >,
     pub(crate) guest_capture: std::sync::Arc<crate::guest_capture::GuestCapture>,
+    #[cfg(test)]
+    pub(crate) metadata_residency_resolutions: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -941,6 +943,8 @@ impl CarrierVmCustody {
             native_exec_preparations: parking_lot::Mutex::new(NativeExecOwner::default()),
             native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
             guest_capture: std::sync::Arc::new(crate::guest_capture::GuestCapture::new()),
+            #[cfg(test)]
+            metadata_residency_resolutions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -9037,6 +9041,188 @@ mod carrier_vm_custody_tests {
         super::retry_structural_backing_retirements_in(&custody)
             .expect("retire unrelated structural test owners");
         assert!(custody.structural_backings.lock().is_empty());
+        std::mem::forget(vm);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn idle_structural_pinned_disposition_never_erases_concurrent_last_unpin_retry() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::{Arc, atomic::Ordering, mpsc};
+        use std::time::Duration;
+
+        const ARENA: usize = 2 * 1024 * 1024;
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let non_pooled_ipa = 0x2800_0000_u64;
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+        let vm = make_fork_test_vm(&custody, g1);
+        let state = vm.task.mm_access_authority();
+        let returned = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut req = carrick_hal::ProcessForkRequest {
+            entry: carrick_hal::GuestEntryRegs::default(),
+            child_ttbr0: non_pooled_ipa + 0x1000,
+            root_slot_base: non_pooled_ipa,
+            root_slot_size: ARENA as u64,
+            plan: carrick_hal::ForkProjectionPlan::Copied {
+                parent_mm: 41,
+                child_mm: 47,
+                ranges: Arc::from([]),
+            },
+            child_tid: carrick_hal::ThreadId::synthetic_for_tests(47),
+            forking_tid: carrick_hal::ThreadId::synthetic_for_tests(41),
+            table_arena_source: Some(Box::new(RecordingTableArenaSource {
+                arenas: std::collections::VecDeque::from([
+                    carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
+                ]),
+                returned,
+            })),
+        };
+        let pin_slot = Arc::new(parking_lot::Mutex::new(None));
+        let hc = Arc::clone(&custody);
+        let hp = Arc::clone(&pin_slot);
+        custody.stage2.set_hook(Some(Arc::new(move |point| {
+            if matches!(
+                point,
+                Stage2HookPoint::Client(super::owner_fork::FORK_PREPARE_BEFORE_ROLLBACK)
+            ) {
+                let id = hc
+                    .stage2_record_covering(non_pooled_ipa, ARENA)
+                    .expect("non_pooled_ipa published");
+                *hp.lock() = Some(hc.pin_stage2_record(id).expect("pin non_pooled"));
+            }
+        })));
+        let _ = vm
+            .prepare_owner_fork_builder(&mut req)
+            .err()
+            .expect("rollback");
+        custody.stage2.set_hook(None);
+        let pin0 = pin_slot.lock().take().expect("pin captured");
+        let host_ptr = state
+            .structural_owner_host_ptr(non_pooled_ipa, ARENA)
+            .expect("host ptr") as usize;
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1 before replayed structural idle-vs-unpin race",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            host_ptr as *mut std::ffi::c_void,
+            non_pooled_ipa,
+            ARENA,
+            perms,
+        );
+        let report = super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa: non_pooled_ipa,
+                length: ARENA as u64,
+                host_addr: host_ptr,
+                perms,
+                vm_generation: g2,
+            }],
+            false,
+            &mut super::release_retired_stage2_ipa,
+        )
+        .expect("rebind deferred structural owner across G2");
+        assert_eq!(report.deferred, 1);
+        let new_id = {
+            let sb = custody.structural_backings.lock();
+            assert_eq!(sb.len(), 1);
+            let (&id, retained) = sb.iter().next().expect("entry");
+            let nid = *retained.record_identity.lock();
+            assert_eq!(nid.record_id, id);
+            nid
+        };
+        assert!(custody.has_pinned_structural_predecessor(new_id.record_id));
+        assert!(custody.has_deferred_structural_logical_release(new_id.record_id));
+        assert!(super::alias_backing_is_live(host_ptr));
+
+        custody.enqueue_structural_retirement_retry(new_id.record_id);
+        assert_eq!(custody.pending_structural_retries.lock().storage_len(), 1);
+
+        let (idle_entered_tx, idle_entered_rx) = mpsc::channel::<()>();
+        let (idle_go_tx, idle_go_rx) = mpsc::channel::<()>();
+        let (contended_tx, contended_rx) = mpsc::channel::<()>();
+        let idle_go_rx = parking_lot::Mutex::new(idle_go_rx);
+        custody
+            .stage2
+            .set_hook(Some(Arc::new(move |point| match point {
+                Stage2HookPoint::Client(name)
+                    if name == super::IDLE_STRUCTURAL_PINNED_BEFORE_COMPLETE =>
+                {
+                    let _ = idle_entered_tx.send(());
+                    let _ = idle_go_rx.lock().recv();
+                }
+                Stage2HookPoint::LockContended(_) => {
+                    let _ = contended_tx.send(());
+                }
+                _ => {}
+            })));
+
+        let idle_custody = Arc::clone(&custody);
+        let idle_thread = std::thread::spawn(move || {
+            let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+            super::retry_pending_global_frame_retirements_at_idle_in(&idle_custody)
+        });
+        idle_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle turn paused holding stage2 across pinned disposition");
+
+        let unpin_thread = std::thread::spawn(move || {
+            let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+            stub.set_fail_next_unmap(true);
+            drop(pin0);
+        });
+        contended_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("last-unpin contended on stage2 while idle checked pinned disposition");
+
+        idle_go_tx.send(()).expect("resume idle turn");
+        let turn1 = idle_thread.join().expect("idle thread panicked");
+        unpin_thread.join().expect("unpin thread panicked");
+        custody.stage2.set_hook(None);
+
+        assert_eq!(turn1.inspected_structural, 1);
+        assert_eq!(
+            custody.pending_structural_retries.lock().storage_len(),
+            1,
+            "idle pinned complete() must finish before last-unpin re-enqueues failed retirement"
+        );
+        assert!(
+            custody
+                .pending_global_frame_retirement_retry
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(new_id.record_id)
+                .is_some_and(|s| s.mapped && s.retry_eligible)
+        );
+        assert!(custody.has_deferred_structural_logical_release(new_id.record_id));
+        assert!(super::alias_backing_is_live(host_ptr));
+
+        let turn2 = super::retry_pending_global_frame_retirements_at_idle_in(&custody);
+        assert_eq!(turn2.inspected_structural, 1);
+        assert_eq!(turn2.remaining, 0);
+        assert_eq!(custody.pending_structural_retries.lock().storage_len(), 0);
+        assert!(custody.stage2_record_snapshot(new_id.record_id).is_none());
+        assert!(custody.structural_backings.lock().is_empty());
+        assert!(!custody.has_deferred_structural_logical_release(new_id.record_id));
+        assert!(
+            state
+                .structural_owner_host_ptr(non_pooled_ipa, ARENA)
+                .is_none()
+        );
+        assert!(!super::alias_backing_is_live(host_ptr));
         std::mem::forget(vm);
     }
 

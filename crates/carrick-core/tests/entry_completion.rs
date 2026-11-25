@@ -1914,6 +1914,7 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
         };
         let finish_loan = || {
             let mut abort = carrick_el1_abi::ForkStockSettlement::abort(loan);
+            let mut retired = Vec::new();
             stock
                 .borrow_mut()
                 .settle(
@@ -1923,8 +1924,10 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
                     |_| true,
                     |_| true,
                     |_| true,
+                    &mut retired,
                 )
                 .unwrap();
+            drop(retired);
             assert!(!stock.borrow().loan_names(mm));
             release.publish(source.reserve(SpaceWaitCause::PendingEdit));
         };

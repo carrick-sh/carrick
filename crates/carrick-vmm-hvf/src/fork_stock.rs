@@ -1355,9 +1355,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn service_native_fork_stock_reclaims_quarantined_child_without_custody_lock_reentry() {
-        use carrick_hal::fork_stock::{ForkControlCapacity, NativeForkTableReservation};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn init_native_fork_crossing_fixture<'a>(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        generation: crate::trap::CarrierVmGeneration,
+        region_ptr: *mut u8,
+        physical_ptr: *mut u8,
+    ) -> (
+        carrick_hal::fork_stock::GrantExecution,
+        u64,
+        &'a carrick_el1_abi::ZoneTables,
+        crate::metadata_grant::RetainedAbiRegion<'a>,
+    ) {
+        use carrick_hal::fork_stock::NativeForkTableReservation;
         use std::sync::Arc;
 
         #[derive(Debug)]
@@ -1391,14 +1401,6 @@ mod tests {
             }
         }
 
-        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let custody = Arc::new(CarrierVmCustody::new());
-        let generation = custody.begin_create().unwrap();
-        custody.commit_create(generation).unwrap();
-        let mut region = carrick_test_support::TestEl1Region::zeroed();
-        let region_ptr = region.as_mut_ptr();
-        let mut physical = carrick_test_support::TestEl1Region::zeroed();
-        let physical_ptr = physical.as_mut_ptr();
         let mut exec = test_execution(41, 0, 301);
         exec.context.root = page(carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE);
         let ttbr0 = (1 << 48) | exec.context.root.address().raw();
@@ -1483,6 +1485,36 @@ mod tests {
                 _arenas: Vec::new(),
             });
         }
+        // SAFETY: `region_ptr` points to the exclusively owned `TestEl1Region`.
+        let bytes = unsafe {
+            crate::metadata_grant::RetainedAbiRegion::new(
+                region_ptr,
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .unwrap()
+        };
+        (exec, ttbr0, zone, bytes)
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn service_native_fork_stock_reclaims_quarantined_child_without_custody_lock_reentry() {
+        use carrick_hal::fork_stock::ForkControlCapacity;
+        use std::sync::Arc;
+
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let region_ptr = region.as_mut_ptr();
+        let mut physical = carrick_test_support::TestEl1Region::zeroed();
+        let (exec, ttbr0, zone, bytes) = init_native_fork_crossing_fixture(
+            &custody,
+            generation,
+            region_ptr,
+            physical.as_mut_ptr(),
+        );
 
         // Loan, reserve, commit, then retire child 302 into quarantine.
         let mut req1 = test_request(exec, 302, 4, 1);
@@ -1494,13 +1526,6 @@ mod tests {
         unsafe {
             record.write(ForkStockExchange::new(req1).unwrap());
         }
-        let bytes = unsafe {
-            crate::metadata_grant::RetainedAbiRegion::new(
-                region_ptr,
-                carrick_el1_abi::EL1_REGION_SIZE as usize,
-            )
-            .unwrap()
-        };
         assert_eq!(
             crate::metadata_grant::service_native_fork_stock(
                 &custody,
@@ -1641,10 +1666,95 @@ mod tests {
             .unwrap()[0],
             carrick_el1_abi::METADATA_GRANT_SUCCESS
         );
+        assert_eq!(
+            custody
+                .metadata_residency_resolutions
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "quarantined Loan resolves residency once during pre-reclaim and skips pass-2 resolution"
+        );
         let _ = ForkControlCapacity::unused;
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn empty_quarantine_fork_loan_skips_residency_resolution() {
+        use std::sync::Arc;
+
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let region_ptr = region.as_mut_ptr();
+        let mut physical = carrick_test_support::TestEl1Region::zeroed();
+        let (exec, ttbr0, _zone, bytes) = init_native_fork_crossing_fixture(
+            &custody,
+            generation,
+            region_ptr,
+            physical.as_mut_ptr(),
+        );
+        custody
+            .metadata_residency_resolutions
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+
+        let mut req = test_request(exec, 304, 4, 1);
+        req.operation.carrier = custody.transfer_carrier;
+        let address = KernelVa::new(carrick_el1_abi::stack_slot_usable_base(0));
+        let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
+        // SAFETY: aligned complete record on this CPU's retained fixture stack.
+        let record = unsafe { region_ptr.add(offset).cast::<ForkStockExchange>() };
+        unsafe {
+            record.write(ForkStockExchange::new(req).unwrap());
+        }
+        assert_eq!(
+            crate::metadata_grant::service_native_fork_stock(
+                &custody,
+                Some(generation),
+                exec.cpu,
+                address,
+                0,
+                ttbr0,
+                bytes,
+            )
+            .unwrap(),
+            [carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0]
+        );
+        assert_eq!(
+            custody
+                .metadata_residency_resolutions
+                .load(core::sync::atomic::Ordering::Relaxed),
+            0,
+            "empty-quarantine ForkStockKind::Loan must not resolve residency"
+        );
+        let loan = unsafe { &mut *record }.take(req).unwrap().unwrap();
+        let settlement = record.cast::<carrick_el1_abi::ForkStockSettlement>();
+        unsafe {
+            settlement.write(carrick_el1_abi::ForkStockSettlement::abort(loan));
+        }
+        assert_eq!(
+            crate::metadata_grant::service_native_fork_stock(
+                &custody,
+                Some(generation),
+                exec.cpu,
+                address,
+                0,
+                ttbr0,
+                bytes,
+            )
+            .unwrap()[0],
+            carrick_el1_abi::METADATA_GRANT_SUCCESS
+        );
+        assert_eq!(
+            custody
+                .metadata_residency_resolutions
+                .load(core::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn fork_stock_install_never_inverts_lock_order_with_commit_destroy() {
         use carrick_aarch64::stage2::custody::{Stage2HookPoint, Stage2Lifecycle};
         use std::sync::{Arc, Mutex, mpsc};
@@ -1759,6 +1869,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn ensure_control_capacity_refuses_stale_g1_arena_against_g2() {
         use carrick_aarch64::stage2::custody::Stage2HookPoint;
         use std::sync::{Arc, mpsc};

@@ -163,29 +163,11 @@ impl ExclusionSettlement for NativeExclusion<'_> {
         ) else {
             return Ok(());
         };
-        let resolved_residency =
-            super::resolve_custody_residency_with_generation(self.custody, region);
-        let mut retired = Vec::new();
-        let reclaimed = {
-            let stage2 = self.custody.stage2.lock();
-            let mut stock = self.custody.fork_stock.lock();
-            let mut ledger = crate::fork_stock::fork_table_accounting(self.custody);
-            reclaim_fork_stock_in(
-                &stage2,
-                resolved_residency.as_ref(),
-                &mut stock,
-                &mut ledger,
-                region,
-                zone,
-                active.into(),
-                &mut retired,
-            )
-        };
-        drop(retired);
-        drop(resolved_residency);
-        reclaimed.map(|_| ()).map_err(|error| {
-            TrapError::Hypervisor(format!("settlement fork quarantine: {error:?}"))
-        })
+        super::reclaim_custody_fork_stock(self.custody, region, zone, active.into())
+            .map(|_| ())
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("settlement fork quarantine: {error:?}"))
+            })
     }
     fn settle_owed_returns(
         &mut self,
