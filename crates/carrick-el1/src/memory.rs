@@ -1870,9 +1870,11 @@ pub struct NativeMapping {
 /// receipt at its next boundary. Everything else refuses the proposal and
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
 /// Serve a delegated anonymous-memory syscall in ring. `file` is a retained
-/// private file byte source for this exact `mmap` (see
-/// [`decide_reservation_syscall`]); `None` everywhere else. A source the
-/// call did not consume is retired for the carrier to release.
+/// file source (`Copied` private bytes or `Window` shared file window) for
+/// this exact `mmap` (see [`decide_reservation_syscall`]); `None` everywhere
+/// else. An unconsumed `Copied` source is queued onto the MM retirement
+/// stream for the carrier to release; an unconsumed `Window` rolls back
+/// synchronously via `HostFileOp::ReleaseWindow`.
 pub fn serve_delegated_mapping<
     E: AnonymousDescriptorEditor,
     G: ReservationGeometry,

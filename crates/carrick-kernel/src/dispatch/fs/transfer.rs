@@ -704,6 +704,7 @@ impl<'a> FsView<'a> {
             // directly. This is what makes splice/copy_file_range/sendfile to a
             // regular file (off_out at the fd's current position) work, matching
             // real Linux (splice pipe->file).
+            let _materialized_resize = self.lock_materialized_file_write(&open_file.description);
             let outcome: DispatchOutcome;
             let writeback: Option<super::rw::FileWriteback>;
             {

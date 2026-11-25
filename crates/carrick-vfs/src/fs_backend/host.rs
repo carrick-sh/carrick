@@ -5787,17 +5787,18 @@ impl FsBackend for HostFsBackend {
                 }
             }
 
-            let final_size_i64 = i64::try_from(final_size).map_err(|_| BackendError::Invalid)?;
-            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            unsafe { host_fstat!(host_fd, &mut st) }
-                .host_syscall_errno()
-                .map_err(|_| BackendError::Io)?;
-            if final_size_i64 > st.st_size {
-                // SAFETY: `host_fd` is open until the close below.
-                let borrowed = unsafe { BorrowedFd::borrow_raw(host_fd) };
-                crate::host_size::resize(borrowed, final_size as u64)
-                    .map_err(|_| BackendError::Io)?;
-            }
+            let _ = libc::off_t::try_from(final_size).map_err(|_| BackendError::Invalid)?;
+            #[cfg(test)]
+            test_write_range_hook::pause_before_extend();
+            // SAFETY: `host_fd` is open until the close below.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(host_fd) };
+            crate::host_size::extend_to(borrowed, final_size as u64).map_err(|err| {
+                if err == libc::EFBIG {
+                    BackendError::Invalid
+                } else {
+                    BackendError::Io
+                }
+            })?;
             Ok(())
         })();
         unsafe {
@@ -8134,5 +8135,27 @@ fn joined(base: &str, name: &str) -> String {
         format!("/{name}")
     } else {
         format!("{}/{name}", base.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_write_range_hook {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    thread_local! {
+        static PAUSE: RefCell<Option<(SyncSender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn install_pause(entered: SyncSender<()>, proceed: Receiver<()>) {
+        PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, proceed)));
+    }
+
+    pub(super) fn pause_before_extend() {
+        let pair = PAUSE.with(|slot| slot.borrow_mut().take());
+        if let Some((entered, proceed)) = pair {
+            let _ = entered.send(());
+            let _ = proceed.recv();
+        }
     }
 }

@@ -834,6 +834,19 @@ pub(crate) fn recall_path(fs: &FsState, path: &str) -> bool {
     }
 }
 
+/// Recall whatever delegation covers the host inode named by a mounted VFS
+/// path, if any; returns true when one was recalled (#2975 r34 P0 #4).
+#[track_caller]
+pub(crate) fn recall_vfs_path(vfs: &dyn carrick_vfs::Vfs, full_path: &str) -> bool {
+    if no_active_delegations() {
+        return false;
+    }
+    match vfs.host_inode_identity(full_path) {
+        Some(identity) => recall_inode(identity),
+        None => false,
+    }
+}
+
 /// Write back the zone's copy of `identity` when the zone owns it, so a host
 /// read of the inode's metadata (a path stat) sees every in-zone write. The
 /// file stays in the zone. True when the zone owned the inode: the caller's
@@ -4185,6 +4198,105 @@ mod tests {
                 1
             );
             fd_map_clear_handle(region, 8);
+        }
+
+        #[test]
+        fn bind_truncate_and_open_trunc_recall_delegated_inode_before_host_mutation() {
+            use crate::compat::CompatReporter;
+            use crate::dispatch::{SyscallArgs, SyscallRequest, ThreadCtx};
+            use carrick_guest_mem::GuestMemory;
+
+            let _region = Region::new();
+            let bind_dir = tempfile::tempdir().unwrap();
+            let mut tmp = tempfile::NamedTempFile::new_in(bind_dir.path()).unwrap();
+            tmp.write_all(b"abcdef").unwrap();
+            tmp.flush().unwrap();
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).unwrap();
+
+            let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+            dispatcher.register_mount(
+                "/bind",
+                Box::new(carrick_vfs::BindVfs::new("/bind", bind_dir.path(), false)),
+            );
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            let name = tmp.path().file_name().unwrap().to_str().unwrap();
+            let guest_path = format!("/bind/{name}\0");
+            let mut mem = crate::dispatch::outcome::LinearMemory::new(0x1000, vec![0; 4096]);
+            mem.write_bytes_raw(0x1000, b"DIRTY!").unwrap();
+            mem.write_bytes_raw(0x1100, guest_path.as_bytes()).unwrap();
+            assert_eq!(
+                serve_on_host(&ctx, &open.description, 64, [0x1000, 6, 0], &mut mem),
+                Some(crate::dispatch::DispatchOutcome::Returned { value: 6 })
+            );
+            assert_eq!(host_bytes(&tmp), b"abcdef");
+
+            let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+            let reg = crate::thread::ThreadRegistry::new(tid);
+            let futex = crate::thread::FutexTable::new();
+            let trunc_out = dispatcher
+                .dispatch_threaded(
+                    &ctx,
+                    SyscallRequest::new(
+                        carrick_abi::syscall::nr::TRUNCATE.raw(),
+                        SyscallArgs::from([0x1100, 2, 0, 0, 0, 0]),
+                    ),
+                    &mut mem,
+                    &CompatReporter::default(),
+                    ThreadCtx::new(tid, &reg, &futex),
+                )
+                .unwrap();
+            assert_eq!(
+                trunc_out,
+                crate::dispatch::DispatchOutcome::Returned { value: 0 }
+            );
+            recall(&open.description).unwrap();
+            assert_eq!(
+                host_bytes(&tmp),
+                b"DI",
+                "bind truncate must recall delegated inode first so writeback cannot overwrite truncation"
+            );
+            open.description.release_fd_ref();
+            drop(open);
+
+            let open2 = open_host(&tmp);
+            delegate_default(&open2, 4).unwrap();
+            mem.write_bytes_raw(0x1000, b"SECOND").unwrap();
+            assert_eq!(
+                serve_on_host(&ctx, &open2.description, 64, [0x1000, 6, 0], &mut mem),
+                Some(crate::dispatch::DispatchOutcome::Returned { value: 6 })
+            );
+            let open_out = dispatcher
+                .dispatch_threaded(
+                    &ctx,
+                    SyscallRequest::new(
+                        carrick_abi::syscall::nr::OPENAT.raw(),
+                        SyscallArgs::from([
+                            (-100_i64) as u64,
+                            0x1100,
+                            (crate::linux_abi::LINUX_O_RDWR | crate::linux_abi::LINUX_O_TRUNC)
+                                as u64,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut mem,
+                    &CompatReporter::default(),
+                    ThreadCtx::new(tid, &reg, &futex),
+                )
+                .unwrap();
+            assert!(
+                matches!(open_out, crate::dispatch::DispatchOutcome::Returned { value } if value >= 0)
+            );
+            recall(&open2.description).unwrap();
+            open2.description.release_fd_ref();
+            drop(open2);
+            assert_eq!(
+                host_bytes(&tmp),
+                b"",
+                "bind open(O_TRUNC) must recall delegated inode first so writeback cannot overwrite O_TRUNC"
+            );
         }
 
         #[test]
