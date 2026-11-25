@@ -1185,6 +1185,46 @@ impl TableStock {
         count
     }
 
+    /// The fewest pages [`Self::draw`] can move with which `accepts`, run
+    /// on a copy of the stock plus those pages, serves its demand. `None`:
+    /// not even the whole reserve would. A draw moves at least
+    /// [`TABLE_RESERVE_DRAW_PAGES`] (or the whole reserve if smaller), so
+    /// only counts from there up are tried, by bisection between the
+    /// smallest count and the whole reserve (accepted, so the answer always
+    /// serves).
+    fn smallest_serving_draw(
+        &self,
+        mut accepts: impl FnMut(&mut Vec<RootGpa>) -> bool,
+    ) -> Option<usize> {
+        let full = self.reserve.pages();
+        let mut serves = |count: usize| {
+            let mut reserve = self.reserve;
+            reserve.take(count).is_some_and(|drawn| {
+                let mut pages = self.pages.clone();
+                pages.extend(drawn);
+                accepts(&mut pages)
+            })
+        };
+        if full == 0 || !serves(full) {
+            return None;
+        }
+        let floor = TABLE_RESERVE_DRAW_PAGES.min(full);
+        if serves(floor) {
+            return Some(floor);
+        }
+        // `refused` never serves, `served` does.
+        let (mut refused, mut served) = (floor, full);
+        while served - refused > 1 {
+            let middle = refused + (served - refused) / 2;
+            if serves(middle) {
+                served = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        Some(served)
+    }
+
     /// Pages the stock can issue: its reusable pages and its reserve.
     fn capacity(&self) -> usize {
         self.pages.len().saturating_add(self.reserve.pages())
@@ -1492,20 +1532,23 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 
     /// Take with `take`, which leaves the stock unchanged when it cannot
-    /// serve; when the stock alone cannot, draw at least `draw` pages from
-    /// the reserve and take once more. `draw` is what the second take needs
-    /// fresh: a demand of whole contiguous runs draws all of it (the fresh
-    /// run then holds it), a demand of loose pages only its shortfall.
+    /// serve. When the stock alone cannot, draw the fewest reserve pages
+    /// with which it can ([`TableStock::smallest_serving_draw`]: a run the
+    /// stock lacks, a loose shortfall, or a fresh run holding everything)
+    /// and take once more. It refuses, drawing nothing, only when the
+    /// whole reserve would not serve it.
     fn take_tables<R>(
         &mut self,
         demand: TableDemand,
-        draw: usize,
         mut take: impl FnMut(&mut Vec<RootGpa>) -> Option<R>,
     ) -> Option<R> {
         if let Some(taken) = take(self.tables.taking()) {
             return Some(taken);
         }
-        if !self.draw_tables(demand, draw.max(1)) {
+        let draw = self
+            .tables
+            .smallest_serving_draw(|pages| take(pages).is_some())?;
+        if !self.draw_tables(demand, draw) {
             return None;
         }
         take(self.tables.taking())
@@ -2544,8 +2587,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         count: usize,
     ) -> Result<SuccessorTables, ForkStockServiceError> {
-        let short = count.saturating_sub(self.tables.len());
-        let Some(pages) = self.take_tables(TableDemand::ExecSuccessor, short, |stock| {
+        let Some(pages) = self.take_tables(TableDemand::ExecSuccessor, |stock| {
             take_successor_table_runs(stock, count)
         }) else {
             self.counters.successor_table_refusals =
@@ -2747,13 +2789,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if self.controls.is_empty() && self.unused_control.is_none() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
         }
-        let demand = request
-            .child_bytes
-            .checked_add(request.parent_bytes)
-            .and_then(|bytes| usize::try_from(bytes / TABLE_PAGE_BYTES).ok())
-            .unwrap_or(usize::MAX);
-        let Some((child_tables, parent_tables)) =
-            self.take_tables(TableDemand::ForkLoan, demand, |stock| {
+        let Some((child_tables, parent_tables)) = self
+            .take_tables(TableDemand::ForkLoan, |stock| {
                 take_fork_table_stock(stock, request.child_bytes, request.parent_bytes)
             })
         else {
