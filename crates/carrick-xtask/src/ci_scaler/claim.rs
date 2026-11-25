@@ -348,7 +348,7 @@ impl Claims {
 }
 
 /// The claiming host of this process's claim-enabled controller, set once
-/// at start-up; unset (tests, the pilot, `CARRICK_JOB_CLAIMS=0`) means
+/// at start-up; unset (tests, `CARRICK_JOB_CLAIMS=0`) means
 /// row teardown releases nothing.
 static ACTIVE_HOST: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 pub(super) fn activate(host: &'static str) {

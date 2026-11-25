@@ -121,7 +121,7 @@ runner assigned another job neither holds A nor consumes one of A's serves.
 A refused actual assignment is recorded once and never approved.
 The decision (`serve_assignment` in `ci_scaler/assignment.rs`) is shared with
 the standing KVM controller ([willow-pilot.md](willow-pilot.md#standing-mode-main-pushes-and-owner-dispatch),
-#333); only the transport differs. The historical pilot remains bound.
+#333); only the transport differs.
 
 This is Option A for [#256](https://github.com/carrick-sh/carrick/issues/256).
 A hook rejection fails the assigned job; it is not a release-to-queue API.

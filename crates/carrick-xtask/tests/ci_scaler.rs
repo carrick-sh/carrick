@@ -348,42 +348,6 @@ fn successful_owned_clone_is_resumed_in_place_without_another_reservation() {
     assert_eq!(ledger.rows.len(), 1);
 }
 
-#[test]
-fn pilot_job_start_rejects_wrong_repository_event_ref_and_sha() {
-    let sha = "a".repeat(40);
-    let pilot = Admission::pilot(&sha).unwrap();
-    let mut context = JobContext {
-        repository: "carrick-sh/carrick".into(),
-        actor: "tjfontaine".into(),
-        triggering_actor: "tjfontaine".into(),
-        event: "workflow_dispatch".into(),
-        workflow_ref:
-            "carrick-sh/carrick/.github/workflows/willow-pilot.yml@refs/heads/work/willow-pilot"
-                .into(),
-        git_ref: "refs/heads/work/willow-pilot".into(),
-        sha: sha.clone(),
-        run_id: 1,
-        run_attempt: 1,
-    };
-    assert!(pilot.authorize(&context).is_ok());
-    assert!(
-        Admission::pilot(&"b".repeat(40))
-            .unwrap()
-            .authorize(&context)
-            .is_err()
-    );
-    // The pilot is not a standing policy and vice versa.
-    assert!(Admission::Standing.authorize(&context).is_err());
-    context.event = "pull_request".into();
-    assert!(pilot.authorize(&context).is_err());
-    context.event = "workflow_dispatch".into();
-    context.repository = "fork/carrick".into();
-    assert!(pilot.authorize(&context).is_err());
-    context.repository = "carrick-sh/carrick".into();
-    context.workflow_ref = "carrick-sh/carrick/.github/workflows/other.yml@refs/heads/main".into();
-    assert!(pilot.authorize(&context).is_err());
-}
-
 fn standing_context(event: &str, git_ref: &str) -> JobContext {
     JobContext {
         repository: REPOSITORY.into(),
@@ -476,8 +440,6 @@ fn standing_job_start_rejects_a_foreign_workflow_repository_or_sha() {
     let mut context = standing_context("push", "refs/heads/main");
     context.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@refs/heads/main");
     assert!(Admission::Standing.authorize(&context).is_err());
-    context.workflow_ref = format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/main");
-    assert!(Admission::Standing.authorize(&context).is_err());
     // The workflow file must be read at the very ref being run.
     context.workflow_ref = format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/other");
     assert!(Admission::Standing.authorize(&context).is_err());
@@ -532,23 +494,11 @@ fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
     let mut fork = standing_run("push", "main");
     fork["head_repository"]["full_name"] = "fork/carrick".into();
     assert!(!Admission::Standing.identifies_run(&fork));
-    // The pilot never serves kernel-runtime demand.
-    assert!(
-        !Admission::pilot(&"d".repeat(40))
-            .unwrap()
-            .identifies_run(&standing_run("push", "main"))
-    );
 }
 
 #[test]
 fn job_policy_file_round_trips_and_rejects_unknown_text() {
-    for policy in [
-        bound(),
-        JobPolicy::Standing,
-        JobPolicy::Pilot {
-            sha: "e".repeat(40),
-        },
-    ] {
+    for policy in [bound(), JobPolicy::Standing] {
         assert_eq!(JobPolicy::parse(&policy.render()).unwrap(), policy);
     }
     assert_eq!(
@@ -562,6 +512,7 @@ fn job_policy_file_round_trips_and_rejects_unknown_text() {
         "agent".to_owned(),
         "pilot".to_owned(),
         "pilot short".to_owned(),
+        format!("pilot {sha}"),
         format!("standing run=x attempt=1 sha={sha}"),
         format!("standing run=1 attempt=0 sha={sha}"),
         "standing run=1 attempt=1 sha=short".to_owned(),
@@ -715,10 +666,8 @@ fn runs_on(workflow: &str, job: &str) -> Vec<String> {
 #[test]
 fn workflow_runner_labels_are_the_controller_label_constants() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
-    let pilot = include_str!("../../../.github/workflows/willow-pilot.yml");
     // Willow serves the post-landing KVM lane.
     assert_eq!(runs_on(kernel, "kvm-tests-willow"), LABELS);
-    assert_eq!(runs_on(pilot, "kvm"), LABELS);
     assert_eq!(runs_on(kernel, "hvf-kernel"), HVF_LABELS);
     // The closure job never takes the merge-queue runner.
     assert_eq!(runs_on(kernel, "hvf-closure"), HVF_CLOSURE_LABELS);
