@@ -436,6 +436,40 @@ impl ObjectParkRequest {
             deadline,
         })
     }
+    /// A park on the carrier's reservation-pool release queue
+    /// ([`crate::PortalWaitCause::ReservationPool`]). The carrier sampled the
+    /// receipt's revision from this exact queue before the non-blocking probe
+    /// that found a temporary pool or table shortage, and enrolled its release
+    /// wakeup against the stock's pre-probe release epoch, so any return after
+    /// that probe makes this park rerun at once.
+    pub fn reservation_pool_owner(
+        expected: crate::El1MmHandle,
+        receipt: crate::PortalOwnerWait,
+        operation: OperationToken,
+    ) -> Result<Self, OperationToken> {
+        if receipt.handle() != expected
+            || receipt.cause() != crate::PortalWaitCause::ReservationPool
+        {
+            return Err(operation);
+        }
+        let key = ObjectWaitKey::reservation_pool(expected.carrier());
+        // SAFETY: the handle names this exact carrier pool queue, and the
+        // carrier sampled the receipt's revision from it before its failed
+        // probe.
+        let snapshot = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_owner_state_lock(
+                key,
+                receipt.revision(),
+            )
+        };
+        Ok(Self {
+            key,
+            snapshot: Some(snapshot.observed()),
+            owner_entry: Some(carrick_sched_core::object_wait::OwnerEntry::Exception),
+            operation,
+            deadline: None,
+        })
+    }
     pub const fn observed(&self) -> Option<ObjectWaitSnapshot> {
         self.snapshot
     }

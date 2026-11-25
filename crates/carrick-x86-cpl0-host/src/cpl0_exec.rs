@@ -579,20 +579,36 @@ where
     let (bound, ()) = rooted.bind_zone(|| ());
     // Enrolled under the phase that refused, before its one probe, so the
     // holder's return cannot land between the refusal and the enrolment.
-    let reserved = bound.fork_stock(|stock| {
-        let reserved = stock.reserve_successor_tables(demand.tables);
-        if let Err(ForkStockServiceError::SuccessorTableCapacity) = reserved {
-            stock.enrol_release(observed, wake);
+    // Only returnable table custody parks the exec ("not now"); genuine
+    // terminal exhaustion (`returnable_tables == 0`) answers ENOMEM (#3017).
+    enum ExecTableShortage {
+        Temporary,
+        Terminal,
+        Service(ForkStockServiceError),
+    }
+    let reserved = bound.fork_stock(|stock| match stock.reserve_successor_tables(demand.tables) {
+        Ok(tables) => Ok(tables),
+        Err(ForkStockServiceError::SuccessorTableCapacity) => {
+            if stock.has_returnable_tables() || stock.released_since(observed) {
+                stock.enrol_release(observed, wake);
+                Err(ExecTableShortage::Temporary)
+            } else {
+                Err(ExecTableShortage::Terminal)
+            }
         }
-        reserved
+        Err(error) => Err(ExecTableShortage::Service(error)),
     });
     let tables = match reserved {
         Ok(tables) => tables,
-        Err(ForkStockServiceError::SuccessorTableCapacity) => {
+        Err(ExecTableShortage::Temporary) => {
             root.abort().map_err(root_fault)?;
             return Ok(X86ExecStage::Parked(StockParked::new(request, observed)));
         }
-        Err(error) => {
+        Err(ExecTableShortage::Terminal) => {
+            root.abort().map_err(root_fault)?;
+            return Ok(X86ExecStage::Refused(LINUX_ENOMEM));
+        }
+        Err(ExecTableShortage::Service(error)) => {
             root.abort().map_err(root_fault)?;
             return Err(fail(format!("exec successor tables: {error:?}")));
         }

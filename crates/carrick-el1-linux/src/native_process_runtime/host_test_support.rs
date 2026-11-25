@@ -6680,8 +6680,18 @@ fn a_native_fault_waits_on_the_reservation_pool_and_reruns_for<
         .unwrap()
         .notify_object(fixture.slot, &mut WakeEffects::default())
         .unwrap();
-    let (_, republished) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
-    assert!(matches!(republished, Ok(NativeResume::Left(None))));
+    let (_, rerun) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert!(
+        matches!(rerun, Ok(NativeResume::RetrySyscall)),
+        "pool notification wakes the fault wait into RetrySyscall so the access re-selects"
+    );
+    wait.enter_loaded(|child| {
+        assert!(matches!(
+            child.begin_exec_stage_fault_service(fault, None, None, None),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+    });
     {
         let (queue, ticket) = claim_fault_ticket();
         assert!(ticket.complete(true).is_ok());

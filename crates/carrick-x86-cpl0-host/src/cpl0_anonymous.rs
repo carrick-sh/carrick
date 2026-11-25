@@ -176,20 +176,29 @@ pub fn initial_table_reserve(
 
 /// What preparing an owner-selected window produced.
 pub(super) enum BackingPreparation {
-    /// Submitted (`Some`), or left pending for its backing-fault signal.
-    Prepared(Option<Box<PendingPrepare>>),
+    /// Submitted to the slot for the ring to apply and settle.
+    Prepared(Box<PendingPrepare>),
+    /// Selected page lies at or past the file's end: leave a user fault's
+    /// selection pending so the guest cancels it into `SIGBUS`, or answer
+    /// `false` on a staged syscall copy.
+    FilePastEnd,
+    /// The carrier's table stock and reserve are genuinely spent into live
+    /// committed MM custody (`returnable_tables == 0`): counted refusal.
+    TablesExhausted,
     /// The read-only plan met another CPU's publication in the selected
     /// window (the shared policy's inherited-Prepared or MM-release decline).
     Raced(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
 }
 
-/// The table plan's own exclusion of the MM met its EL1 editor held, under
-/// the caller's outer exclusion: a refused admission backing out of its
-/// editor word, or a maintenance borrow admitted under the raised gate
-/// (#2941). The prepared backing was cancelled; the caller waits for the
-/// editor's release, never fails the carrier.
+/// Why preparing an owner-selected window must wait and rerun ("not now")
+/// rather than refuse or fail: either the MM's EL1 editor was held under the
+/// outer exclusion (#2941), or returnable custody in [`ForkStock`] temporarily
+/// holds the remaining page tables (#3017).
 #[derive(::core::fmt::Debug)]
-pub(super) struct EditorBusy;
+pub(super) enum PlanBusy {
+    Editor,
+    TableStock,
+}
 
 /// Why the read-only table plan made nothing guest-visible.
 enum PlanDecline {
@@ -2436,13 +2445,32 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let reply = unsafe { &*reply };
         match self.prepare_native_backing_grant(execution, window, file, reply)? {
             Ok(BackingPreparation::Prepared(pending)) => {
-                self.anonymous_pending[index] = pending.map(|pending| *pending);
+                self.anonymous_pending[index] = Some(*pending);
+            }
+            Ok(BackingPreparation::FilePastEnd) => {
+                // Leave the authenticated file selection pending so the ring
+                // cancels it into SIGBUS (BUS_ADRERR).
+            }
+            Ok(BackingPreparation::TablesExhausted) => {
+                if !reply.refuse_fault_selection(window, generation) {
+                    return Err(fail("exhausted owner fault selection changed"));
+                }
             }
             // Another CPU holds this MM's editor, or published into this
             // window after its selection: the selection is returned unserved
             // and its member reruns the access after that editor's release.
-            Ok(BackingPreparation::Raced(_)) | Err(_) => {
+            Ok(BackingPreparation::Raced(_)) => {
                 if !reply.cancel_fault_selection(window, generation) {
+                    return Err(fail("contended owner fault selection changed"));
+                }
+            }
+            Err(wait) if wait.cause() == carrick_core_abi::PortalWaitCause::Editor => {
+                if !reply.cancel_fault_selection(window, generation) {
+                    return Err(fail("contended owner fault selection changed"));
+                }
+            }
+            Err(wait) => {
+                if !reply.complete_fault_wait(window, generation, wait) {
                     return Err(fail("contended owner fault selection changed"));
                 }
             }
@@ -2693,25 +2721,29 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .notifications(window.operation.incarnation)
             .map_err(|_| fail("native preparation source"))?
             .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
-        let editor_wait = || {
-            let handle = unsafe {
-                // SAFETY: the ticket retains this exact admitted window;
-                // the source above authenticates its MM incarnation.
-                carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                    window.operation.carrier,
-                    window.operation.mm,
-                    window.operation.incarnation,
-                )
-            };
-            unsafe {
-                // SAFETY: this Editor observation preceded every probe of
-                // this call, the outer exclusion's and the table plan's.
-                carrick_core_abi::PortalOwnerWait::from_owner(
-                    handle,
-                    carrick_core_abi::PortalWaitCause::Editor,
-                    observed.revision(),
-                )
-            }
+        let pool_key = carrick_sched_core::object_wait::ObjectWaitKey::reservation_pool(
+            window.operation.carrier,
+        );
+        let sink = self.carrier_zone_wake()?;
+        let pool_revision = sample_carrier_pool_revision(zone, pool_key, &*sink)?;
+        let stock_observed = self.fork_stock.table_release();
+        let make_handle = || unsafe {
+            // SAFETY: the ticket retains this exact admitted window;
+            // the source above authenticates its MM incarnation.
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
+        let editor_wait = || unsafe {
+            // SAFETY: this Editor observation preceded every probe of
+            // this call, the outer exclusion's and the table plan's.
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                make_handle(),
+                carrick_core_abi::PortalWaitCause::Editor,
+                observed.revision(),
+            )
         };
         let pause = match self.settled_pause(release, window.operation.mm)? {
             Ok((pause, _)) => pause,
@@ -2723,12 +2755,36 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         // Keep this exclusion through allocation and the read-only table plan:
         // a contended native call waits before creating any physical journal.
-        let pending = self.prepare_backing_grant(execution, window, file, reply)?;
+        let pending =
+            self.prepare_backing_grant(execution, window, file, reply, stock_observed)?;
         drop(pause);
         wake.finish()?;
-        // The plan's own exclusion met the editor held: the same wait as a
-        // busy outer exclusion. A release since `observed` reruns at once.
-        Ok(pending.map_err(|EditorBusy| editor_wait()))
+        match pending {
+            Ok(prepared) => Ok(Ok(prepared)),
+            // The plan's own exclusion met the editor held: the same wait as a
+            // busy outer exclusion. A release since `observed` reruns at once.
+            Err(PlanBusy::Editor) => Ok(Err(editor_wait())),
+            // Returnable table custody holds the remaining stock: release the
+            // MM editor above, enrol on the holder's release, probe once, and
+            // park on the carrier's reservation-pool queue (#3017).
+            Err(PlanBusy::TableStock) => {
+                let stock_wake = carrier_pool_release_wake(pool_key, Arc::clone(&sink));
+                self.fork_stock.enrol_release(stock_observed, stock_wake);
+                if sink.take_undelivered().is_some() {
+                    return Err(fail("reservation pool reschedule not delivered"));
+                }
+                Ok(Err(unsafe {
+                    // SAFETY: `pool_revision` was sampled from `pool_key` before
+                    // the table probe, and `enrol_release` probes `stock_observed`
+                    // once so any table return after that probe bumps `pool_key`.
+                    carrick_core_abi::PortalOwnerWait::from_owner(
+                        make_handle(),
+                        carrick_core_abi::PortalWaitCause::ReservationPool,
+                        pool_revision,
+                    )
+                }))
+            }
+        }
     }
 
     pub(super) fn prepare_backing_grant(
@@ -2737,7 +2793,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         window: PortalGrantWindow,
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
-    ) -> Result<Result<BackingPreparation, EditorBusy>, TrapError> {
+        stock_observed: carrick_hal::fork_stock::StockRelease,
+    ) -> Result<Result<BackingPreparation, PlanBusy>, TrapError> {
         let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();
@@ -2788,7 +2845,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // Leave the authenticated selection pending. The guest observes
             // no backing reply, cancels this exact selection and delivers its
             // normal backing-fault signal; EOF is not a carrier invariant.
-            return Ok(Ok(BackingPreparation::Prepared(None)));
+            return Ok(Ok(BackingPreparation::FilePastEnd));
         }
         let root = context.root;
         let gpa = self.anonymous_next_gpa;
@@ -2925,7 +2982,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 // Nothing made this fresh backing guest-visible.
                 unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                     .map_err(|error| fail(error.to_string()))?;
-                return Ok(Err(EditorBusy));
+                return Ok(Err(PlanBusy::Editor));
             }
             Ok(Err(PlanDecline::Refused(refusal))) => {
                 // Neither the read-only planner nor the release venue made
@@ -2942,17 +2999,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     | PublicationDecline::NotNow(PublicationNotNow::MmRelease) => {
                         Ok(Ok(BackingPreparation::Raced(refusal)))
                     }
-                    // The candidates were the whole stock and its reserve:
-                    // the carrier's page-table window is spent. That is the
-                    // guest running out of memory, never a carrier fault.
-                    // Leave the selection unserved, counted: the guest
-                    // cancels it and its fault owner answers as for any
-                    // unbackable access (#3017).
+                    // When returnable custody still holds tables, shortage is
+                    // temporary contention ("not now", never fatal or an errno):
+                    // enrol on the holder's release and rerun. Only when zero
+                    // returnable tables remain is the carrier's page-table
+                    // window genuinely spent (#3017).
                     PublicationDecline::NotNow(PublicationNotNow::Capacity(
                         carrick_mmu_core::descriptor_refusal::DescriptorRefusal::TablesExhausted,
                     )) => {
-                        self.fork_stock.refuse_descriptor_capacity();
-                        Ok(Ok(BackingPreparation::Prepared(None)))
+                        if self.fork_stock.has_returnable_tables()
+                            || self.fork_stock.released_since(stock_observed)
+                        {
+                            Ok(Err(PlanBusy::TableStock))
+                        } else {
+                            self.fork_stock.refuse_descriptor_capacity();
+                            Ok(Ok(BackingPreparation::TablesExhausted))
+                        }
                     }
                     _ => Err(fail(format!(
                         "owner grant physical table plan refused: {refusal:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}",
@@ -3036,20 +3098,110 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
         inventory.guest_exposed = true;
-        Ok(Ok(BackingPreparation::Prepared(Some(Box::new(
-            PendingPrepare {
-                peer: crate::cpl0_private_witness::PeerActivity::observe(
-                    &self.actual_run[1 - index],
-                ),
-                window,
-                txn,
-                inventory,
-                handle,
-                execution,
-                owner,
-            },
-        )))))
+        Ok(Ok(BackingPreparation::Prepared(Box::new(PendingPrepare {
+            peer: crate::cpl0_private_witness::PeerActivity::observe(&self.actual_run[1 - index]),
+            window,
+            txn,
+            inventory,
+            handle,
+            execution,
+            owner,
+        }))))
     }
+}
+
+fn complete_carrier_pool_wake(
+    sink: &dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >,
+) {
+    let zone = owned.zone();
+    let (waker, effects) = owned.deliver_handbacks(&mut |record| {
+        zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot));
+    });
+    let own = match waker {
+        Waker::El1 { slot } => Some(slot),
+        Waker::Host => None,
+    };
+    for slot in effects
+        .sgi_slots()
+        .chain(own.filter(|_| effects.queued_own || effects.misplaced))
+    {
+        zone.owe_resched(slot);
+        sink.resched(slot);
+    }
+}
+
+fn sample_carrier_pool_revision(
+    zone: &X86Cpl0Zone,
+    pool_key: carrick_sched_core::object_wait::ObjectWaitKey,
+    sink: &dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>,
+) -> Result<u64, TrapError> {
+    let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >| complete_carrier_pool_wake(sink, owned);
+    let observe = || {
+        zone.object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
+            .map(|queue| queue.snapshot().revision())
+    };
+    match observe() {
+        Ok(revision) => Ok(revision),
+        Err(carrick_sched_core::object_wait::ObjectWaitError::Stale) => {
+            let _ = zone.bind_object_wait(
+                pool_key,
+                &carrick_sched_core::ShortLockSpin,
+                &completion,
+            );
+            observe().map_err(|_| fail("native reservation pool queue"))
+        }
+        Err(_) => Err(fail("native reservation pool queue")),
+    }
+}
+
+fn carrier_pool_release_wake(
+    pool_key: carrick_sched_core::object_wait::ObjectWaitKey,
+    sink: Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
+) -> carrick_hal::fork_stock::StockReleaseWake {
+    carrick_hal::fork_stock::StockReleaseWake::new(move || {
+        let zone = sink.zone();
+        let mut handed = Vec::new();
+        let mut resched_slots = [0u64; 4];
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| complete_carrier_pool_wake(&*sink, owned);
+        if let Ok(queue) =
+            zone.object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
+        {
+            let _ = queue.notify_object_host(
+                &mut |record| handed.push(record),
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        if let Some(word) = resched_slots.get_mut(index / 64) {
+                            *word |= 1 << (index % 64);
+                        }
+                    }
+                },
+            );
+        }
+        for record in handed {
+            zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot));
+        }
+        for (word, mut bits) in resched_slots.into_iter().enumerate() {
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(slot) = SlotId::from_index(index) {
+                    zone.owe_resched(slot);
+                    sink.resched(slot);
+                }
+            }
+        }
+    })
 }
 
 impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {

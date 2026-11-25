@@ -1354,6 +1354,20 @@ fn serve_selected_window(
         // The carrier prepares and submits the selected window.
         cross_owner_grant(cpu, fault.address);
         let Some(window) = grant_slot.window() else {
+            if let Some(wait) = grant_slot.take_fault_wait(mm_key, fault.address.raw()) {
+                return UserFaultSupply::TypedRelease(wait);
+            }
+            if grant_slot.take_refused_fault_selection(mm_key, fault.address.raw()) {
+                return UserFaultSupply::Signal {
+                    signum: LINUX_SIGSEGV,
+                    code: if fault.present {
+                        LINUX_SEGV_ACCERR
+                    } else {
+                        LINUX_SEGV_MAPERR
+                    },
+                    address: fault.address,
+                };
+            }
             // No physical backing for a still-authenticated file selection:
             // EOF/truncation follows Linux backing-fault signal policy.
             let Some((generation, selected)) =

@@ -880,3 +880,118 @@ fn the_carrier_exit_drain_counts_the_failures_after_the_first() {
         "the first failure, and the count after it: {text}"
     );
 }
+
+/// #3017 review P0-1: when no returnable custody holds tables, exec staging
+/// refuses immediately with ENOMEM instead of parking forever; and when an
+/// in-flight fork holds the tables and commits 100% of them, the parked exec
+/// wakes once and reruns to ENOMEM.
+#[test]
+fn terminal_table_exhaustion_refuses_exec_with_enomem_and_committed_fork_wakes_parked_exec() {
+    let mut fixture = Fixture::new(8);
+    let _ = fixture.claimed();
+    let (_, wake) = ExecParkWake::new();
+    assert!(
+        matches!(
+            fixture.stage_waking(request(image(argv(), vec![]).unwrap()), wake),
+            X86ExecStage::Refused(errno) if errno.get() == 12
+        ),
+        "zero returnable tables answers ENOMEM without parking"
+    );
+    assert_eq!(fixture.stock.release_waiters(), 0);
+    assert_eq!(fixture.imported(), 0);
+
+    // Now install 11 tables, hold 3 in a pending fork loan, park exec, and
+    // commit 100% of the fork's tables so zero pages return.
+    let mut fixture = Fixture::new(11);
+    let parent = GrantExecution::new(
+        CpuId::new(1),
+        ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: SnapshotGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        },
+        AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(301).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        },
+    );
+    let mut exchange = ForkStockExchange::new(ForkStockRequest {
+        binding: parent.binding,
+        context: parent.context,
+        operation: PortalOperation {
+            carrier: CARRIER,
+            mm: ReservationMm::new(301).unwrap(),
+            incarnation: NonZeroU64::MIN,
+            sequence: NonZeroU64::new(2).unwrap(),
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_mm: ReservationMm::new(302).unwrap(),
+        child_bytes: 2 * 4096,
+        parent_bytes: 4096,
+    })
+    .unwrap();
+    let fork: ForkStockLoan = fixture
+        .stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let receipt = fixture.claimed();
+    let (woken, wake) = ExecParkWake::new();
+    let X86ExecStage::Parked(parked) =
+        fixture.stage_waking(request(image(argv(), vec![]).unwrap()), wake)
+    else {
+        panic!("pending fork holds returnable tables: not now");
+    };
+    fixture.preparations.park(receipt, parked, woken).unwrap();
+    assert_eq!(fixture.stock.release_waiters(), 1);
+
+    // Commit 100% of the fork's tables (2 child, 1 parent): zero unused pages
+    // return, yet returnable_tables drops to 0 and wakes the parked exec.
+    let child_handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            CARRIER,
+            ReservationMm::new(302).unwrap(),
+            NonZeroU64::MIN,
+        )
+    };
+    let completion = carrick_el1_abi::PortalForkCompletion {
+        request: fork.request,
+        child: child_handle,
+        parent_generation: ReservationGeneration::new(2).unwrap(),
+        child_tables_used: 2 * 4096,
+        parent_tables_used: 4096,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(fork, completion, carrick_guest_arch::KernelVa::new(0), 0)
+            .unwrap();
+    fixture
+        .stock
+        .reserve_custody(parent, &mut reserve, |_| true, |_| true, |_, _, _| Ok(()))
+        .unwrap();
+    let mut commit_settlement = ForkStockSettlement::commit_reserved(fork, completion).unwrap();
+    fixture
+        .stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut commit_settlement,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(fixture.stock.returnable_tables(), 0);
+    assert_eq!(fixture.stock.release_waiters(), 0, "woken on exhaustion");
+    let ParkedProbe::Rerun(_claim, rerun) = fixture
+        .preparations
+        .probe_parked(receipt, &fixture.stock, |_: &X86ExecRequest| Ok::<_, ()>(false))
+        .unwrap()
+    else {
+        panic!("100%-committed fork wakes parked exec to rerun");
+    };
+    assert!(matches!(
+        fixture.stage(rerun),
+        X86ExecStage::Refused(errno) if errno.get() == 12
+    ));
+}

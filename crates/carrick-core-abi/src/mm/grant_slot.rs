@@ -26,6 +26,12 @@ impl Default for PortalGrantSlot {
 impl PortalGrantSlot {
     /// Included in the image ABI hash: older hosts cannot serve this demand.
     pub const PREPARED_SELECTION_STATE: u64 = 5;
+    /// Terminal backing-capacity refusal for an authenticated fault selection.
+    pub const REFUSED_SELECTION_STATE: u64 = 6;
+    /// Base state encoding an authenticated [`crate::PortalOwnerWait`] reply
+    /// (`FAULT_WAIT_STATE_BASE + wait.cause().encode()`), with the wait's
+    /// 64-bit producer revision carried in `fault_generation`.
+    pub const FAULT_WAIT_STATE_BASE: u64 = 16;
 
     pub fn publish_prepared_fault_selection(
         &self,
@@ -256,6 +262,131 @@ impl PortalGrantSlot {
             .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+    /// Complete a pending fault selection with a typed owner wait (such as a
+    /// temporary carrier table shortage on [`crate::PortalWaitCause::ReservationPool`]),
+    /// keeping the slot's window identity intact until the faulting ring lane
+    /// consumes it with [`Self::take_fault_wait`].
+    pub fn complete_fault_wait(
+        &self,
+        window: PortalGrantWindow,
+        request_generation: u64,
+        wait: crate::PortalOwnerWait,
+    ) -> bool {
+        let handle = wait.handle();
+        if handle.carrier() != window.operation.carrier
+            || handle.mm() != window.operation.mm
+            || handle.incarnation() != window.operation.incarnation
+            || self
+                .state
+                .compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        let matches = self.fault_generation.load(Ordering::Relaxed) == request_generation
+            && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                self.window[i].load(Ordering::Relaxed)
+            })) == Some(window);
+        if !matches {
+            self.state.store(3, Ordering::Release);
+            return false;
+        }
+        self.fault_generation
+            .store(wait.revision(), Ordering::Relaxed);
+        self.state.store(
+            Self::FAULT_WAIT_STATE_BASE + wait.cause().encode(),
+            Ordering::Release,
+        );
+        true
+    }
+    /// Consume a typed owner wait published by [`Self::complete_fault_wait`]
+    /// and return this slot to idle (`0`).
+    pub fn take_fault_wait(&self, mm_key: u64, fault_va: u64) -> Option<crate::PortalOwnerWait> {
+        let state = self.state.load(Ordering::Acquire);
+        let cause = state
+            .checked_sub(Self::FAULT_WAIT_STATE_BASE)
+            .and_then(crate::PortalWaitCause::decode)?;
+        self.state
+            .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let selected = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))
+        .filter(|window| window.operation.mm.raw() == mm_key && window.fault_page == fault_va & !4095);
+        let Some(window) = selected else {
+            self.state.store(state, Ordering::Release);
+            return None;
+        };
+        let revision = self.fault_generation.load(Ordering::Relaxed);
+        // SAFETY: `complete_fault_wait` authenticated an exact `PortalOwnerWait`
+        // whose `El1MmHandle` matched `window.operation.{carrier, mm, incarnation}`
+        // and whose `revision` came from that cause's producer before probing.
+        let wait = unsafe {
+            let handle = crate::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            );
+            crate::PortalOwnerWait::from_owner(handle, cause, revision)
+        };
+        self.state.store(0, Ordering::Release);
+        Some(wait)
+    }
+    /// Mark a pending fault selection terminally refused for backing capacity
+    /// so the faulting ring lane delivers `SIGSEGV` and resets the slot.
+    pub fn refuse_fault_selection(
+        &self,
+        window: PortalGrantWindow,
+        request_generation: u64,
+    ) -> bool {
+        if self
+            .state
+            .compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let matches = self.fault_generation.load(Ordering::Relaxed) == request_generation
+            && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                self.window[i].load(Ordering::Relaxed)
+            })) == Some(window);
+        if !matches {
+            self.state.store(3, Ordering::Release);
+            return false;
+        }
+        self.state
+            .store(Self::REFUSED_SELECTION_STATE, Ordering::Release);
+        true
+    }
+    /// Consume a terminal backing-capacity refusal published by
+    /// [`Self::refuse_fault_selection`] and return this slot to idle (`0`).
+    pub fn take_refused_fault_selection(&self, mm_key: u64, fault_va: u64) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                Self::REFUSED_SELECTION_STATE,
+                1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let matches = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))
+        .is_some_and(|window| {
+            window.operation.mm.raw() == mm_key && window.fault_page == fault_va & !4095
+        });
+        if !matches {
+            self.state
+                .store(Self::REFUSED_SELECTION_STATE, Ordering::Release);
+            return false;
+        }
+        self.state.store(0, Ordering::Release);
+        true
+    }
     pub fn has_outstanding_for(&self, mm_key: u64) -> bool {
         let state = self.state.load(Ordering::Acquire);
         state != 0
@@ -423,6 +554,47 @@ mod layout_manifest {
         assert!(slot.publish_fault_selection(4, window));
         assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
         assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
+    }
+
+    #[test]
+    fn fault_wait_and_refused_selection_preserve_identity_and_consume_once() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let slot = PortalGrantSlot::new();
+        assert!(slot.publish_fault_selection(3, window));
+        // SAFETY: test fixture matches window.operation identity.
+        let wait = unsafe {
+            let handle = crate::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            );
+            crate::PortalOwnerWait::from_owner(
+                handle,
+                crate::PortalWaitCause::ReservationPool,
+                0xdead_beef_cafe_1234,
+            )
+        };
+        assert!(!slot.complete_fault_wait(window, 99, wait));
+        assert!(slot.complete_fault_wait(window, 3, wait));
+        assert!(slot.has_outstanding_for(77));
+        assert!(!slot.has_outstanding_for(78));
+        assert!(slot.take_fault_wait(78, 0x4003).is_none());
+        assert!(slot.take_fault_wait(77, 0x5000).is_none());
+        assert_eq!(slot.take_fault_wait(77, 0x4003), Some(wait));
+        assert!(slot.take_fault_wait(77, 0x4003).is_none());
+        assert!(!slot.has_outstanding_for(77));
+
+        assert!(slot.publish_fault_selection(5, window));
+        assert!(!slot.refuse_fault_selection(window, 99));
+        assert!(slot.refuse_fault_selection(window, 5));
+        assert!(slot.has_outstanding_for(77));
+        assert!(!slot.take_refused_fault_selection(78, 0x4003));
+        assert!(!slot.take_refused_fault_selection(77, 0x5000));
+        assert!(slot.take_refused_fault_selection(77, 0x4003));
+        assert!(!slot.take_refused_fault_selection(77, 0x4003));
+        assert!(!slot.has_outstanding_for(77));
     }
 
     #[test]
