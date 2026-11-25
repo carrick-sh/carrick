@@ -185,6 +185,11 @@
       "from": "carrick_vmm_hvf::trap::code_content::PendingContentWrite<O>::new",
       "to": "carrick_aarch64::code_content::PendingContentWrite<O>::new",
       "issue": 1236
+    },
+    {
+      "from": "carrick_vmm_kvm::kvm::KvmVcpu::fd",
+      "to": "carrick_vmm_kvm::kvm::KvmVcpu::vcpu_fd",
+      "issue": 2962
     }
   ],
   "authority_debt_admissions": [
