@@ -1987,7 +1987,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
         demand.tables >= bare.tables && demand.data >= bare.data + 2,
         "the staged successor carries the vvar and vDSO pages: {demand:?} over {bare:?}"
     );
-    let stock = carrier.fork_table_stock();
+    let stock = carrier.fork_table_capacity();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
     let receipt = carrier
@@ -2004,11 +2004,11 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     assert_eq!(data.len(), demand.data);
     assert_eq!(backing.root, tables[0]);
     assert_eq!(entry.entry, request().image.entry().entry);
-    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+    assert_eq!(carrier.fork_table_capacity(), stock - demand.tables);
     carrier
         .release_exec_successor(receipt)
         .expect("unused preparation returns");
-    assert_eq!(carrier.fork_table_stock(), stock);
+    assert_eq!(carrier.fork_table_capacity(), stock);
     assert!(carrier.exec_reservation(successor).is_none());
 
     let held = carrier
@@ -2027,7 +2027,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     else {
         panic!("a holder has the stock: not now");
     };
-    assert_eq!(carrier.fork_table_stock(), demand.tables - 1);
+    assert_eq!(carrier.fork_table_capacity(), demand.tables - 1);
     assert!(carrier.exec_reservation(successor).is_none());
     assert_eq!(carrier.fork_stock_release_waiters(), 1, "enrolled");
     assert!(wakes.try_recv().is_err(), "nothing has returned yet");
@@ -2050,7 +2050,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
             .expect("service"),
         X86ExecStage::Staged(..)
     ));
-    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+    assert_eq!(carrier.fork_table_capacity(), stock - demand.tables);
 }
 
 fn run_to_marker(

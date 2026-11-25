@@ -219,6 +219,7 @@ impl Fixture {
                 (0..pages)
                     .map(|n| RootGpa::page_aligned(FrameGpa::new(0x20_0000 + n * 4096)).unwrap())
                     .collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 vec![
                     ForkLifecycleLoan::new_for_base(
                         EL1_DYNAMIC_METADATA_BASE,

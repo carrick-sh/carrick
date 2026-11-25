@@ -273,7 +273,13 @@ impl PhysicalStock {
                 );
             }
         }
-        self.owner.install(table_stock, vec![lifecycle]).unwrap();
+        self.owner
+            .install(
+                table_stock,
+                carrick_hal::fork_stock::TableReserve::EMPTY,
+                vec![lifecycle],
+            )
+            .unwrap();
         let aliases = window.prepare_affinity_aliases(lifecycle).unwrap();
         let loan = self
             .owner

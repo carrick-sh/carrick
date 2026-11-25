@@ -128,6 +128,7 @@ fn native_exclusion_reclaims_a_full_table_of_exited_fork_holders() {
         .owner
         .install(
             (0..16).map(|i| page(stock_base + i * 4096)).collect(),
+            carrick_hal::fork_stock::TableReserve::EMPTY,
             (0..8)
                 .map(|i| {
                     ForkLifecycleLoan::new(
