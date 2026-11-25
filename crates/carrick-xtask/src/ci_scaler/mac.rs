@@ -488,7 +488,9 @@ fn launch(
 ) -> Result<Launch, ScalerError> {
     let (key, policy) = vetted;
     let JobPolicy::Bound(binding) = policy else {
-        return Err(ScalerError::Guard("standing vet returned a pilot policy"));
+        return Err(ScalerError::Guard(
+            "standing vet did not return a bound policy",
+        ));
     };
     let mut row = ledger.reserve(key, now()?)?;
     ledger.save(path)?; // Registration intent is durable before the JIT request.

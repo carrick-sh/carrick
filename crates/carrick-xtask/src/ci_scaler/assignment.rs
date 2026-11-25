@@ -370,7 +370,6 @@ pub(super) fn pending_assignment_locked(state: &Path) -> Result<Option<JobContex
         .open(state.join("assignment.json"))
     {
         Ok(file) => file,
-        // Older pilot state has no controller rendezvous.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };

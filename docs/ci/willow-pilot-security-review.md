@@ -3,8 +3,8 @@
 All five findings have a red-first regression and a separate fix commit.
 This review used local tests and mock APIs. No Willow SSH/API operation,
 deployment, clone, registration or workflow dispatch was performed. The
-[historical live receipt](willow-pilot-evidence.md) belongs to its recorded
-older controller artifact; it does not confer live qualification on these
+historical one-job pilot has since been retired (#3016); its recorded
+older controller artifact did not confer live qualification on these
 fixes. Any subsequent live run must retain the pool, VMID, admission and
 one-clone limits.
 
@@ -98,21 +98,21 @@ are in `/tmp/willow-pilot-review/`.
 
 ## Standing admission surface
 
-The pilot admitted one workflow (`willow-pilot.yml`, `workflow_dispatch`,
-`work/willow-pilot`, one approved SHA). The main-push hardware workflow uses a bounded
-standing policy for Willow (`ci-scaler standing`) and cloudmac
-(`ci-scaler mac-jit`). Demand uses `Admission::Standing`; each runner is then
-bound by `JobPolicy::Bound` to the one run the controller re-vetted. Both are
-in `crates/carrick-xtask/src/ci_scaler.rs`; there is no second copy.
+The main-push hardware workflow uses a bounded standing policy for Willow
+(`ci-scaler standing`) and cloudmac (`ci-scaler mac-jit`). Demand uses
+`Admission::Standing`; each runner is then bound by `JobPolicy::Bound` to the
+one run the controller re-vetted. Both are in
+`crates/carrick-xtask/src/ci_scaler.rs`; there is no second copy. (The
+historical one-job pilot was retired in #3016.)
 
-| Check | Pilot | Standing |
-|---|---|---|
-| Repository (run and head repository) | `carrick-sh/carrick` | `carrick-sh/carrick` |
-| Workflow file | `willow-pilot.yml` | `kernel-runtime.yml`, at the ref being run |
-| Events and refs | `workflow_dispatch` on `work/willow-pilot` | `push` or owner `workflow_dispatch` on `main`; merge groups refused |
-| Hook binding | one approved SHA | the vetted run id, attempt and SHA |
-| Labels | `ci_scaler::LABELS` | `LABELS` (Willow), `HVF_LABELS` (cloudmac); closure uses `HVF_CLOSURE_LABELS`, never served |
-| Concurrency | one clone | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
+| Check | Standing |
+|---|---|
+| Repository (run and head repository) | `carrick-sh/carrick` |
+| Workflow file | `kernel-runtime.yml`, at the ref being run |
+| Events and refs | `push`, `schedule`, or owner `workflow_dispatch` on `main`; merge groups refused |
+| Hook binding | the vetted run id, attempt and SHA |
+| Labels | `LABELS` (Willow), `HVF_LABELS` (cloudmac); closure uses `HVF_CLOSURE_LABELS`, never served |
+| Concurrency | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
 
 Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including one
 claiming `refs/heads/main`), `pull_request_target`, `schedule`, other branches

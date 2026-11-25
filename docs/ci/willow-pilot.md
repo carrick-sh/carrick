@@ -1,14 +1,11 @@
-# Willow one-job runner pilot
+# Willow KVM JIT runner controller
 
-This is the owner-approved phase-two pilot from design PR #4, not an elastic
-production service. It admits one clone (2 vCPU, 4 GiB, 64 GiB), leaves VM 210
-and every protected machine alone, and installs no host service or network
-configuration. The foreground controller runs **on Willow** through SSH from
-the Mac: the PVE secret remains in `/root/carrick-ci-token.json` and on-host
-memory/pipes. Jobs receive only one-use JIT material.
-
-The [pilot receipt](willow-pilot-evidence.md) records the successful job,
-artifact digest, scoped API teardown and unchanged protected VM census.
+This controller serves one-use JIT ephemeral KVM clones (on Willow, 2 vCPU,
+4 GiB, 64 GiB; leaving VM 210 and every protected machine alone, and installing
+no host service or network configuration). The foreground controller runs **on
+the hypervisor** through SSH from the director Mac (or as a systemd service on
+Contabo/Hetzner): the PVE secret remains in `/root/carrick-ci-token.json` and
+on-host memory/pipes. Jobs receive only one-use JIT material.
 
 ## Build and supervise
 
@@ -45,22 +42,7 @@ runner nor GitHub/PVE credentials. Package versions are recorded after install;
 apt packages are not snapshot-pinned, so a rebuild needs fresh qualification.
 
 Put a checksum-verified official `gh` binary in `/root/carrick-ci/bin` without
-installing a system package/service. Forward the director's GitHub credential
-through SSH stdin into the foreground controller's environment; never place
-it in command arguments, a seed disk, a job, or a log. Example, with a literal
-reviewed commit substituted for `FULL_APPROVED_SHA`:
-
-```sh
-gh auth token | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler pilot --approved-sha FULL_APPROVED_SHA --runner-group-id 1 --one-job'
-```
-
-Runner group 1 is the GitHub default group; the JIT endpoint must accept that
-ID for this repository. No organization settings or credential scope expansion
-is performed by the controller. Dispatch exactly:
-
-```sh
-gh workflow run willow-pilot.yml --ref work/willow-pilot
-```
+installing a system package/service.
 
 ## Standing mode (main pushes and owner dispatch)
 
@@ -149,21 +131,21 @@ cancellation. The owner creates it:
    never write it on Willow. If the organization requires approval for
    fine-grained tokens, approve it for this repository only.
 
-Forward it only through SSH stdin, exactly like the pilot:
+Forward it only through SSH stdin:
 
 ```sh
 read -rs WILLOW_GH_TOKEN   # paste the fine-grained token
 printf '%s\n' "$WILLOW_GH_TOKEN" | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
 ```
 
-The parent receipt comparison runs in a hosted job, so guests need no `gh`. The pilot (`ci-scaler pilot`) writes `pilot
-<sha>` to the same file and keeps its one-clone, one-job contract. Every
-budget, ownership, recovery and hook rule below applies to both modes.
+Runner group 1 is the GitHub default group; no organization settings or
+credential scope expansion is performed by the controller. The parent receipt
+comparison runs in a hosted job, so guests need no `gh`.
 
 ## Authority and recovery
 
-Demand requires the complete four-label set, `workflow_dispatch`, this
-repository's `willow-pilot.yml`, `work/willow-pilot`, and the approved SHA.
+Demand requires the complete four-label set (`ci_scaler::LABELS`) and an
+admitted `kernel-runtime.yml` run (`Admission::Standing`).
 GitHub can assign a different compatible job; the reservation never binds a
 job ID. A guest job-start hook checks repository/event/workflow ref/SHA before
 workflow steps. The launcher isolates listener/worker/hook in a fresh process
@@ -212,9 +194,7 @@ recorded tasks and absent reservations are distinguished from ambiguous clone
 POST outcomes. A successful recorded clone resumes preparation in place only
 for the same queued job/attempt, labels and approved SHA, using its live
 configuration and existing transport key. Historical failures stay in the
-ledger; a successful one-job controller exit requires an actual recorded
-assignment and teardown. Check the GitHub job conclusion separately: that
-exit does not assert that the workflow passed.
+ledger.
 An ambiguous submission with neither an observable VM nor a
 recorded task deliberately freezes admission for owner investigation; it is
 never silently retried or released. API errors while a VM is active also
@@ -224,7 +204,7 @@ The clone firewall is guest-local: established connections, loopback and
 DHCP/DNS are allowed; new private/link-local destination traffic is rejected.
 Cloud-init administrative grants are removed before runner qualification.
 This remains trusted-workflow infrastructure, not an adversarial isolation
-claim. No load generator or Docker oracle is part of the pilot.
+claim.
 
 Authenticated curl calls use `--disable` as the first argument to prevent an
 ambient `.curlrc` from tracing Authorization headers. Cloud-init exit 2 must
@@ -232,5 +212,4 @@ include at least one exact allowlisted Proxmox deprecation; an empty warning
 map is not qualified. Template boot uses the same 80% CPU ceiling as clones.
 
 The [security review regressions](willow-pilot-security-review.md) cover these
-controls locally. The historical live receipt predates these fixes; no new
-live Willow operations or deployment were performed for this review.
+controls locally.

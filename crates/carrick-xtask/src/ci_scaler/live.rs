@@ -217,8 +217,7 @@ const GUEST_SCRIPTS: [GuestScript; 2] = [
     },
 ];
 /// The bytes installed at `script.path`. A standing clone's hook falls back
-/// to the controller's re-vet of the actual assignment (#333); the pilot's
-/// hook admits only its approved SHA.
+/// to the controller's re-vet of the actual assignment (#333).
 fn guest_script_source(script: &GuestScript, admission: &Admission) -> Result<String, ScalerError> {
     match admission {
         Admission::Standing if script.path == HOOK_PATH => standing_hook_script(),
@@ -1558,7 +1557,7 @@ fn clone_call(site: Site, row: &Record) -> Result<(PveCall, String), ScalerError
     Ok((
         PveCall::Post(json!({
             "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
-            "description":format!("Carrick pilot ledger identity {}", row.name)
+            "description":format!("Carrick ledger identity {}", row.name)
         })),
         format!("{}/clone", site.qemu(template)),
     ))
@@ -1706,46 +1705,40 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
-    let standing = matches!(admission, Admission::Standing);
-    if standing {
-        // The re-vet half of the hook runs the template's own xtask; refuse a
-        // template whose xtask predates it rather than fail a job at set-up.
-        let help = pve.agent(
-            row,
-            &[
-                "/usr/local/bin/carrick-xtask",
-                "ci-scaler",
-                "admit-job",
-                "--help",
-            ],
-        )?;
-        if !help.contains("--controller") {
-            return Err(ScalerError::Guard(
-                "template xtask lacks admit-job --controller; rebuild template 300",
-            ));
-        }
-        // The hook's event policy is the template xtask's too (#2580).
-        let events = pve.agent_output(
-            row,
-            &[
-                "/usr/local/bin/carrick-xtask",
-                "ci-scaler",
-                "standing-events",
-            ],
-        )?;
-        template_admits_controller_events(events.exit == GuestExit(0), &events.stdout)?;
+    // The re-vet half of the hook runs the template's own xtask; refuse a
+    // template whose xtask predates it rather than fail a job at set-up.
+    let help = pve.agent(
+        row,
+        &[
+            "/usr/local/bin/carrick-xtask",
+            "ci-scaler",
+            "admit-job",
+            "--help",
+        ],
+    )?;
+    if !help.contains("--controller") {
+        return Err(ScalerError::Guard(
+            "template xtask lacks admit-job --controller; rebuild template 300",
+        ));
     }
+    // The hook's event policy is the template xtask's too (#2580).
+    let events = pve.agent_output(
+        row,
+        &[
+            "/usr/local/bin/carrick-xtask",
+            "ci-scaler",
+            "standing-events",
+        ],
+    )?;
+    template_admits_controller_events(events.exit == GuestExit(0), &events.stdout)?;
     // Re-vet the reserved run now and bind the runner to it: the hook admits
     // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
     // GitHub assigns another job asks the controller to re-vet that one.
     let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
     // Only the runner-owned rendezvous request is writable by the hook.
-    let rendezvous = if standing {
-        format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json")
-    } else {
-        String::new()
-    };
+    let rendezvous =
+        format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json");
     pve.agent(
         row,
         &[
@@ -1933,6 +1926,7 @@ fn cleanup(
 
 /// One reconciliation pass over every active clone.
 struct Pass {
+    #[cfg_attr(not(test), allow(dead_code))]
     finished: usize,
     /// Unknown outcomes freeze admission; storage contention retains only its operation.
     frozen: Option<ScalerError>,
@@ -2313,15 +2307,6 @@ fn pending_owned_job(row: &Record, job: &Value, run: &Value, admission: &Admissi
         && run["id"].as_u64() == Some(row.key.run.0)
         && run["run_attempt"].as_u64() == Some(u64::from(row.key.attempt))
         && admission.identifies_run(run)
-}
-fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
-    if row.is_some_and(|r| r.assigned.is_some()) {
-        Ok(())
-    } else {
-        Err(ScalerError::External(
-            "pilot finished without an assigned job; cleanup completed",
-        ))
-    }
 }
 
 /// The datacenter firewall must be on for any VM firewall to apply. Read
@@ -2761,36 +2746,24 @@ fn verify_startup(
     Ok(())
 }
 
-/// Foreground Willow controller. The pilot admission always runs with one
-/// clone; standing mode is bounded by `limit` (at most two clones).
+/// Foreground Willow controller; standing mode is bounded by `budget` (at
+/// most two clones).
 pub(super) fn controller(
     admission: &Admission,
     dir: &Path,
     group: u64,
-    one_job: bool,
     budget: CloneBudget,
     intake: Intake,
     role: super::claim::Role,
 ) -> Result<(), ScalerError> {
-    if matches!(admission, Admission::Pilot { .. }) && budget.kvm != Concurrency::ONE {
-        return Err(ScalerError::Guard("the pilot admission is one clone only"));
-    }
-    if !intake.admits() && !matches!(admission, Admission::Standing) {
-        return Err(ScalerError::Guard("only a standing controller drains"));
-    }
     let pve = Pve::local()?;
     let _lock = super::acquire_controller_lock(dir)?;
     let inventory = pve.inventory()?;
-    let enabled = Lanes::select(
-        pve.site.serves_agents(),
-        matches!(admission, Admission::Standing),
-        |name| std::env::var(name).ok(),
-    )?;
+    let enabled = Lanes::select(pve.site.serves_agents(), |name| std::env::var(name).ok())?;
     // Cross-host claims (#1597) are on for every standing controller, with
     // an exact `CARRICK_JOB_CLAIMS=0` opt-out; a follower needs them.
-    let mut claims = (matches!(admission, Admission::Standing)
-        && std::env::var("CARRICK_JOB_CLAIMS").as_deref() != Ok("0"))
-    .then(|| super::claim::Claims::new(role, pve.site.node));
+    let mut claims = (std::env::var("CARRICK_JOB_CLAIMS").as_deref() != Ok("0"))
+        .then(|| super::claim::Claims::new(role, pve.site.node));
     if claims.is_none() && role == super::claim::Role::Follower {
         return Err(ScalerError::Guard("a follower needs cross-host job claims"));
     }
@@ -2831,12 +2804,12 @@ pub(super) fn controller(
     let mut drained_from = None;
     let publication = assignment::Publication::new(ledger.clone());
     ledger.publication = Some(publication.clone());
-    let _assignments = if matches!(admission, Admission::Standing) {
+    let _assignments = {
         let publication = publication.worker();
         let path = path.clone();
         let assignment_pve = Pve::local()?;
         let mut settled = Vec::new();
-        Some(assignment::AssignmentService::start(move || {
+        assignment::AssignmentService::start(move || {
             let pass = (|| -> Result<(), ScalerError> {
                 let mut ledger = publication.snapshot()?;
                 ledger.publication = Some(publication.clone());
@@ -2846,9 +2819,7 @@ pub(super) fn controller(
             if let Err(error) = pass {
                 eprintln!("assignment worker failed: {error}");
             }
-        }))
-    } else {
-        None
+        })
     };
     loop {
         ledger.refresh()?;
@@ -2862,10 +2833,6 @@ pub(super) fn controller(
                 (group, admission),
                 Some(&provisioners),
             )?;
-            if pass.finished > 0 && one_job {
-                ledger.refresh()?;
-                return one_job_result(ledger.rows.last());
-            }
             gate.frozen = match pass.frozen {
                 Some(error) => {
                     eprintln!("reconcile failed: {error}; admission frozen for active ledger");
@@ -2895,10 +2862,8 @@ pub(super) fn controller(
         // cancels superseded runs) KVM demand: the KVM host owns it.
         let demand = if !enabled.kvm {
             Ok(Vec::new())
-        } else if matches!(admission, Admission::Standing) {
-            gh.coalesced_demand(&mut ledger, &path, &LABELS)
         } else {
-            gh.demand(admission, &LABELS)
+            gh.coalesced_demand(&mut ledger, &path, &LABELS)
         };
         if let Err(error) = &demand {
             eprintln!("queued push coalescing failed: {error}");
@@ -3796,28 +3761,24 @@ mod tests {
     #[test]
     fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
         let dir = tempfile::tempdir().unwrap();
-        let pilot = Admission::pilot(&"a".repeat(40)).unwrap();
-        for admission in [pilot, Admission::Standing] {
-            for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
-                let source = guest_script_source(script, &admission).unwrap();
-                let path = dir.path().join(format!("payload-{i}"));
-                let status = Command::new("/bin/sh")
-                    .args([
-                        "-c",
-                        &script_install_command(path.to_str().unwrap(), &source),
-                    ])
-                    .status()
-                    .unwrap();
-                assert!(status.success());
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
-                assert_eq!(
-                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                    0o755
-                );
-                // Only a standing clone's hook may fall back to a re-vet.
-                let revet = script.path == HOOK_PATH && matches!(admission, Admission::Standing);
-                assert_eq!(source.contains("admit-job --controller"), revet);
-            }
+        for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
+            let source = guest_script_source(script, &Admission::Standing).unwrap();
+            let path = dir.path().join(format!("payload-{i}"));
+            let status = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &script_install_command(path.to_str().unwrap(), &source),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            let revet = script.path == HOOK_PATH;
+            assert_eq!(source.contains("admit-job --controller"), revet);
         }
     }
     /// Run a guest rendezvous script in `state` (standing in for
@@ -4025,38 +3986,32 @@ mod tests {
         }
     }
     #[test]
-    fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
-        let mut row = row();
-        row.failure = Some("missing cached display".into());
-        assert!(one_job_result(Some(&row)).is_err());
-        row.assigned = Some(row.key.job);
-        assert!(one_job_result(Some(&row)).is_ok());
-        assert_eq!(row.failure.as_deref(), Some("missing cached display"));
-    }
-    #[test]
     fn resumed_clone_requires_the_same_queued_job_attempt_labels_and_approval() {
         let row = row();
         let sha = "a".repeat(40);
         let mut job = json!({"id":row.key.job.0,"status":"queued","labels":LABELS});
-        let mut run = json!({"id":row.key.run.0,"run_attempt":row.key.attempt,"event":"workflow_dispatch","head_sha":sha,"head_branch":"work/willow-pilot","path":".github/workflows/willow-pilot.yml","repository":{"full_name":REPOSITORY}});
-        let approved = Admission::pilot(&sha).unwrap();
-        assert!(pending_owned_job(&row, &job, &run, &approved));
+        let mut run = json!({
+            "id": row.key.run.0,
+            "run_attempt": row.key.attempt,
+            "event": "push",
+            "head_sha": sha,
+            "head_branch": "main",
+            "path": KERNEL_RUNTIME_WORKFLOW,
+            "repository": {"full_name": REPOSITORY},
+            "head_repository": {"full_name": REPOSITORY},
+        });
+        assert!(pending_owned_job(&row, &job, &run, &Admission::Standing));
         job["status"] = json!("completed");
-        assert!(!pending_owned_job(&row, &job, &run, &approved));
+        assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
         job["status"] = json!("queued");
         run["run_attempt"] = json!(row.key.attempt + 1);
-        assert!(!pending_owned_job(&row, &job, &run, &approved));
-        run["run_attempt"] = json!(row.key.attempt);
-        assert!(!pending_owned_job(
-            &row,
-            &job,
-            &run,
-            &Admission::pilot(&"b".repeat(40)).unwrap()
-        ));
-        // A standing controller never resumes a pilot clone's job.
         assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
+        run["run_attempt"] = json!(row.key.attempt);
+        run["event"] = json!("pull_request");
+        assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
+        run["event"] = json!("push");
         job["labels"] = json!(["self-hosted", "Linux", "X64", "willow-kvm", "extra"]);
-        assert!(!pending_owned_job(&row, &job, &run, &approved));
+        assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
     }
     #[test]
     fn director_cpu_ceiling_is_a_stop_condition_above_eighty_percent() {
@@ -4432,20 +4387,25 @@ printf '{"data":%s}\n200' "$body"
         let gh = dir.join("gh");
         std::fs::write(&gh, "#!/bin/sh\nprintf '[{\"runners\":[]}]'\n").unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let approval = if case == "clone_busy" {
+        if case == "clone_busy" {
             let sha = "a".repeat(40);
             let job = json!({"id":2,"status":"queued","labels":LABELS});
-            let run = json!({"id":1,"run_attempt":1,"event":"workflow_dispatch",
-                "head_branch":PILOT_BRANCH,"head_sha":sha,"path":PILOT_WORKFLOW,
-                "repository":{"full_name":REPOSITORY}});
+            let run = json!({
+                "id": 1,
+                "run_attempt": 1,
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": sha,
+                "path": KERNEL_RUNTIME_WORKFLOW,
+                "repository": {"full_name": REPOSITORY},
+                "head_repository": {"full_name": REPOSITORY},
+            });
             let quote = crate::remote_accept::shell_quote;
             std::fs::write(&gh, format!(
                 "#!/bin/sh\ncase \"$*\" in *actions/jobs/2*) printf '%s' {} ;; *) printf '%s' {} ;; esac\n",
                 quote(&job.to_string()), quote(&run.to_string()))).unwrap();
-            Admission::pilot(&sha).unwrap()
-        } else {
-            Admission::Standing
-        };
+        }
+        let approval = Admission::Standing;
         let pvesh = dir.join("pvesh");
         std::fs::write(&pvesh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
         std::fs::set_permissions(&pvesh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -5824,7 +5784,7 @@ printf '{"data":%s}\n200' "$body"
             kvm: Concurrency::ONE,
             agents: AgentClones::DEFAULT,
         };
-        let enabled = Lanes::select(false, true, |_| None).unwrap();
+        let enabled = Lanes::select(false, |_| None).unwrap();
         let job = JobKey {
             run: RunId(1),
             attempt: 1,

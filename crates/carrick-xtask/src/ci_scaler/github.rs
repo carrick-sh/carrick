@@ -95,21 +95,6 @@ impl Github {
         )?;
         pages(&data, "jobs")
     }
-    /// Queued jobs with exactly `labels` in runs `admission` serves.
-    pub(super) fn demand(
-        &self,
-        admission: &Admission,
-        labels: &[&str],
-    ) -> Result<Vec<JobKey>, ScalerError> {
-        let mut demand: Vec<_> = self
-            .queued_demand(admission, labels)?
-            .into_iter()
-            .map(|job| job.key)
-            .collect();
-        demand.sort_by_key(|key| key.job.0);
-        demand.dedup();
-        Ok(demand)
-    }
     pub(super) fn coalesced_demand(
         &self,
         ledger: &mut impl assignment::Refusals,
@@ -339,7 +324,6 @@ impl Github {
             .ok_or(ScalerError::External("run head SHA"))?
             .to_ascii_lowercase();
         Ok(match admission {
-            Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
             Admission::Standing => JobPolicy::Bound(RunBinding {
                 run: key.run,
                 attempt: key.attempt,

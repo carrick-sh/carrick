@@ -419,3 +419,19 @@ test = "carrick_el1_linux::file_table::tests::readmitting_a_table_does_not_reope
 reason = "Part of #2820: per-CPU lazy `admit_stdio` and its closed-stdio tombstones are replaced by one stopped-carrier `StdioDescriptions` admission shared by reference and inherited only via fork, so the re-admission tombstone witness became `stdio_is_admitted_once_and_shared_by_reference` and `stdout_replaced_by_a_ring_pipe_stays_gone_across_fork`."
 replaced_by = "carrick_el1_linux::file_table::tests::stdio_is_admitted_once_and_shared_by_reference"
 pr = 3020
+
+[[retired]]
+test = "ci_scaler::pilot_job_start_rejects_wrong_repository_event_ref_and_sha"
+reason = "#3016: the dead one-job Willow pilot workflow and admission were retired, so its pilot authorization test was removed."
+pr = 3016
+
+[[retired]]
+test = "carrick_xtask::ci_scaler::live::tests::recovered_one_job_preserves_error_history_and_requires_actual_assignment"
+reason = "#3016: the dead one-job Willow pilot (ScalerAction::Pilot, live::controller one_job / one_job_result) was retired, so its pilot one-job recovery test was removed."
+pr = 3016
+
+[[retired]]
+test = "carrick_xtask::ci_scaler::lane_tests::agents_need_a_standing_controller_on_an_agent_site"
+reason = "#3016: non-standing (pilot) controllers were retired, so Lanes::select dropped its standing parameter and the test was renamed for what remains (agents need an agent site)."
+replaced_by = "carrick_xtask::ci_scaler::lane_tests::agents_need_an_agent_site"
+pr = 3016

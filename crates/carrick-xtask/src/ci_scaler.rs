@@ -1,5 +1,5 @@
 //! Owner-approved JIT ephemeral runners: the Willow KVM clone controller
-//! (one-job pilot or bounded standing mode) and the cloudmac HVF controller.
+//! (bounded standing mode) and the cloudmac HVF controller.
 //! No general-purpose VM authority; every runner is one-use JIT material.
 
 use serde::{Deserialize, Serialize};
@@ -56,8 +56,6 @@ pub const MAX_SERVES_PER_JOB: usize = 3;
 /// stops retrying and closes or reaps cleanly.
 pub const MAX_BUSY_RETRIES: u32 = 5;
 pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
-pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
-const PILOT_BRANCH: &str = "work/willow-pilot";
 
 /// Transport failures are uncertainty, never evidence that a clone is absent.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -598,9 +596,8 @@ impl Intake {
 /// (`CARRICK_KVM_CLONES`, `CARRICK_AGENT_CLONES`), so two hosts can split the
 /// lanes between them (#1590): KVM and agent jobs carry different runner
 /// labels, so hosts serving disjoint lanes never claim the same job. Agents
-/// additionally need a standing controller on an agent site. The agent lane
-/// admits no job since Actions dispatch was retired; it only reconciles and
-/// reaps its earlier rows.
+/// additionally need an agent site. The agent lane admits no job since Actions
+/// dispatch was retired; it only reconciles and reaps its earlier rows.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Lanes {
     pub kvm: bool,
@@ -609,13 +606,12 @@ pub struct Lanes {
 impl Lanes {
     pub fn select(
         serves_agents: bool,
-        standing: bool,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ScalerError> {
         let off = |name: &str| env(name).as_deref() == Some("0");
         let lanes = Self {
             kvm: !off("CARRICK_KVM_CLONES"),
-            agents: serves_agents && standing && !off("CARRICK_AGENT_CLONES"),
+            agents: serves_agents && !off("CARRICK_AGENT_CLONES"),
         };
         if !lanes.kvm && !lanes.agents {
             return Err(ScalerError::Guard("no clone lane is enabled"));
@@ -698,9 +694,6 @@ pub fn eligible_labels(labels: &[&str]) -> bool {
 /// runner-owned policy file written by the controller, never from the job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// The historical one-job pilot: `willow-pilot.yml`, dispatched from
-    /// `work/willow-pilot` at one approved SHA.
-    Pilot { sha: String },
     /// `kernel-runtime.yml` on this repository for a push to main, the
     /// nightly schedule on main, or an owner workflow_dispatch on main.
     /// Never pull_request.
@@ -710,18 +703,9 @@ pub(crate) fn full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())
 }
 impl Admission {
-    pub fn pilot(sha: &str) -> Result<Self, ScalerError> {
-        if !full_sha(sha) {
-            return Err(ScalerError::Guard("approved SHA must be full commit hash"));
-        }
-        Ok(Self::Pilot {
-            sha: sha.to_ascii_lowercase(),
-        })
-    }
     /// The workflow file (basename) whose runs this admission serves.
     pub fn workflow_file(&self) -> &'static str {
         let path = match self {
-            Self::Pilot { .. } => PILOT_WORKFLOW,
             Self::Standing => KERNEL_RUNTIME_WORKFLOW,
         };
         path.rsplit('/').next().unwrap_or(path)
@@ -735,12 +719,6 @@ impl Admission {
             return false;
         }
         match self {
-            Self::Pilot { sha } => {
-                event == "workflow_dispatch"
-                    && run["head_sha"] == sha.as_str()
-                    && branch == PILOT_BRANCH
-                    && run["path"] == PILOT_WORKFLOW
-            }
             Self::Standing => {
                 run["head_repository"]["full_name"] == REPOSITORY
                     && run["path"] == KERNEL_RUNTIME_WORKFLOW
@@ -759,13 +737,6 @@ impl Admission {
             && context.repository == REPOSITORY
             && !context.git_ref.contains('@')
             && match self {
-                Self::Pilot { sha } => {
-                    context.sha == *sha
-                        && context.event == "workflow_dispatch"
-                        && branch == PILOT_BRANCH
-                        && context.workflow_ref
-                            == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
-                }
                 Self::Standing => {
                     standing_event_ref(&context.event, branch)
                         && (context.event != "workflow_dispatch"
@@ -1020,8 +991,6 @@ pub struct RunBinding {
 /// file before the runner starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPolicy {
-    /// The historical pilot: [`Admission::Pilot`] for one approved SHA.
-    Pilot { sha: String },
     /// [`Admission::Standing`] for a persistent self-hosted runner.
     Standing,
     /// [`Admission::Standing`] restricted to the one run the controller
@@ -1033,10 +1002,6 @@ impl JobPolicy {
         let words: Vec<&str> = text.split_whitespace().collect();
         let field = |word: &str, name: &str| word.strip_prefix(name).map(str::to_owned);
         match words.as_slice() {
-            ["pilot", sha] => match Admission::pilot(sha)? {
-                Admission::Pilot { sha } => Ok(Self::Pilot { sha }),
-                _ => Err(ScalerError::Guard("pilot policy")),
-            },
             ["standing"] => Ok(Self::Standing),
             ["standing", run, attempt, sha] => {
                 let run = field(run, "run=")
@@ -1061,7 +1026,6 @@ impl JobPolicy {
     }
     pub fn render(&self) -> String {
         match self {
-            Self::Pilot { sha } => format!("pilot {sha}"),
             Self::Standing => "standing".to_owned(),
             Self::Bound(b) => format!(
                 "standing run={} attempt={} sha={}",
@@ -1072,7 +1036,6 @@ impl JobPolicy {
     /// Job-start side: runs in the hook before any workflow step.
     pub fn authorize(&self, context: &JobContext) -> Result<(), ScalerError> {
         match self {
-            Self::Pilot { sha } => Admission::Pilot { sha: sha.clone() }.authorize(context),
             Self::Standing => Admission::Standing.authorize(context),
             Self::Bound(binding) => {
                 Admission::Standing.authorize(context)?;
@@ -1180,18 +1143,6 @@ pub struct ScalerArgs {
 }
 #[derive(clap::Subcommand, Debug)]
 pub enum ScalerAction {
-    /// Run in the foreground ON Willow; the PVE secret never leaves the host.
-    Pilot {
-        #[arg(long)]
-        approved_sha: String,
-        #[arg(long, default_value = "/root/carrick-ci/state")]
-        state_dir: PathBuf,
-        #[arg(long, default_value_t = 1)]
-        runner_group_id: u64,
-        /// Exit after one completed or failed lifecycle has been cleaned up.
-        #[arg(long)]
-        one_job: bool,
-    },
     /// Standing Willow mode ON Willow: serve kernel-runtime.yml KVM jobs for
     /// pushes to main and owner dispatches on main.
     Standing {
@@ -1363,10 +1314,6 @@ pub fn admit_job_context(
         admit_assigned(state_dir, context, owner, assignment::APPROVAL_LIMIT)?;
     } else {
         match read_policy(policy_file, Some(owner))? {
-            JobPolicy::Pilot { sha } => {
-                JobPolicy::Pilot { sha }.authorize(context)?;
-                mark_job_started(state_dir)?;
-            }
             JobPolicy::Standing => Admission::Standing.authorize(context)?,
             JobPolicy::Bound(_) => {
                 return Err(ScalerError::Guard(
@@ -1468,23 +1415,6 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             println!("{:?}", quiesce_guest(&state_dir)?);
             Ok(())
         }
-        ScalerAction::Pilot {
-            approved_sha,
-            state_dir,
-            runner_group_id,
-            one_job,
-        } => live::controller(
-            &Admission::pilot(&approved_sha)?,
-            &state_dir,
-            runner_group_id,
-            one_job,
-            CloneBudget {
-                kvm: Concurrency::ONE,
-                agents: AgentClones::DEFAULT,
-            },
-            Intake::Open,
-            claim::Role::Leader,
-        ),
         ScalerAction::Standing {
             state_dir,
             runner_group_id,
@@ -1496,7 +1426,6 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             &Admission::Standing,
             &state_dir,
             runner_group_id,
-            false,
             CloneBudget {
                 kvm: max_concurrency,
                 agents: max_agent_clones,
@@ -2112,7 +2041,7 @@ mod lane_tests {
 
     #[test]
     fn both_lanes_are_on_by_default_on_a_standing_agent_site() {
-        let lanes = Lanes::select(true, true, env(&[])).unwrap();
+        let lanes = Lanes::select(true, env(&[])).unwrap();
         assert_eq!(lanes.list(), vec![CloneLane::Kvm, CloneLane::Agent]);
         let budget = CloneBudget {
             kvm: Concurrency::try_from(2).unwrap(),
@@ -2128,11 +2057,11 @@ mod lane_tests {
             agents: AgentClones::try_from(6).unwrap(),
         };
         // The KVM host (carrick-hz in the #1590 split).
-        let kvm_host = Lanes::select(true, true, env(&[("CARRICK_AGENT_CLONES", "0")])).unwrap();
+        let kvm_host = Lanes::select(true, env(&[("CARRICK_AGENT_CLONES", "0")])).unwrap();
         assert_eq!(kvm_host.list(), vec![CloneLane::Kvm]);
         assert_eq!(kvm_host.cap(budget), 2);
         // The agent host (ctb in the #1590 split).
-        let agent_host = Lanes::select(true, true, env(&[("CARRICK_KVM_CLONES", "0")])).unwrap();
+        let agent_host = Lanes::select(true, env(&[("CARRICK_KVM_CLONES", "0")])).unwrap();
         assert_eq!(agent_host.list(), vec![CloneLane::Agent]);
         assert!(!agent_host.admits(CloneLane::Kvm));
         assert_eq!(agent_host.cap(budget), 6);
@@ -2140,41 +2069,32 @@ mod lane_tests {
         for value in ["", "false", "00", "no"] {
             let pairs: &'static [(&'static str, &'static str)] =
                 Box::leak(vec![("CARRICK_KVM_CLONES", value)].into_boxed_slice());
-            assert!(
-                Lanes::select(true, true, env(pairs)).unwrap().kvm,
-                "{value:?}"
-            );
+            assert!(Lanes::select(true, env(pairs)).unwrap().kvm, "{value:?}");
         }
     }
 
     #[test]
-    fn agents_need_a_standing_controller_on_an_agent_site() {
+    fn agents_need_an_agent_site() {
         assert_eq!(
-            Lanes::select(false, true, env(&[])).unwrap().list(),
-            vec![CloneLane::Kvm]
-        );
-        assert_eq!(
-            Lanes::select(true, false, env(&[])).unwrap().list(),
+            Lanes::select(false, env(&[])).unwrap().list(),
             vec![CloneLane::Kvm]
         );
     }
 
     #[test]
     fn a_controller_with_no_lane_left_refuses_to_start() {
-        for (serves_agents, standing, pairs) in [
+        for (serves_agents, pairs) in [
             (
-                true,
                 true,
                 &[("CARRICK_KVM_CLONES", "0"), ("CARRICK_AGENT_CLONES", "0")][..],
             ),
-            // Willow (no agent site) or the pilot with KVM switched off.
-            (false, true, &[("CARRICK_KVM_CLONES", "0")][..]),
-            (true, false, &[("CARRICK_KVM_CLONES", "0")][..]),
+            // Willow (no agent site) with KVM switched off.
+            (false, &[("CARRICK_KVM_CLONES", "0")][..]),
         ] {
             let pairs: &'static [(&'static str, &'static str)] =
                 Box::leak(pairs.to_vec().into_boxed_slice());
             assert!(matches!(
-                Lanes::select(serves_agents, standing, env(pairs)),
+                Lanes::select(serves_agents, env(pairs)),
                 Err(ScalerError::Guard("no clone lane is enabled"))
             ));
         }
