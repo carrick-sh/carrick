@@ -874,6 +874,20 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             NonZeroU64::new(sequence)?,
         ))
     }
+    fn cancel_copyout_fault(&self, address: UserVa, sequence: NonZeroU64) {
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        // SAFETY: boot retains the initialized per-CPU selection portal.
+        let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
+        let Some(slot) = slots.grant(usize::from(self.slot.raw())) else {
+            return;
+        };
+        let mm = self.task.mm.key.load(Ordering::Acquire);
+        if let Some((generation, window)) = slot.pending_fault_selection(mm, address.raw())
+            && generation == sequence.get()
+        {
+            let _ = slot.cancel_fault_selection(window, generation);
+        }
+    }
 
     #[inline(never)]
     fn apply_fault_reply(

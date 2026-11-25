@@ -1053,6 +1053,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
         None
     }
+    /// Withdraw an unpublished CPU fault selection when admission aborts or
+    /// closes before publishing its service request.
+    fn cancel_copyout_fault(&self, _address: UserVa, _sequence: NonZeroU64) {}
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
     /// staging step already made the range writable (fault supply first), so

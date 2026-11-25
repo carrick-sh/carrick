@@ -1389,6 +1389,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    fn cancel_unpublished_fault(&self, operation: ServiceOperation, sequence: Option<NonZeroU64>) {
+        if let (ServiceOperation::Fault(fault), Some(sequence)) = (operation, sequence) {
+            self.service.cancel_copyout_fault(fault.address, sequence);
+        }
+    }
+
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn retain_and_defer_signal_delivery(
@@ -1402,24 +1408,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<(), NativeProcessError> {
         {
             let mut graph = self.runtime.graph.lock();
-            let resources = graph
-                .owner
-                .task_mut(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native_mut()
-                .resources_mut();
-            if !signal_record_exists(self.source.zone, self.record) {
+            let Ok(task) = graph.owner.task_mut(self.key) else {
+                drop(graph);
+                if let SignalCopyDeferral::Supply { fault, sequence } = deferral {
+                    self.service.cancel_copyout_fault(fault.address, sequence);
+                }
                 return Err(NativeProcessError::Stale);
-            }
-            let expected_host = resources
-                .members
-                .iter()
-                .find(|member| {
-                    member.record == self.record
-                        && core::ptr::eq(member.control.control(), self.control)
+            };
+            let resources = task.native_mut().resources_mut();
+            let expected_host = signal_record_exists(self.source.zone, self.record)
+                .then(|| {
+                    resources
+                        .members
+                        .iter()
+                        .find(|member| {
+                            member.record == self.record
+                                && core::ptr::eq(member.control.control(), self.control)
+                        })
+                        .map(|member| member.expected_host)
                 })
-                .map(|member| member.expected_host)
-                .ok_or(NativeProcessError::Stale)?;
+                .flatten();
+            let Some(expected_host) = expected_host else {
+                drop(graph);
+                if let SignalCopyDeferral::Supply { fault, sequence } = deferral {
+                    self.service.cancel_copyout_fault(fault.address, sequence);
+                }
+                return Err(NativeProcessError::Stale);
+            };
             let retained = Box::new(PendingSignalDelivery::new(
                 expected_host,
                 sig,
@@ -1489,7 +1504,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// was SIGSEGV's), with that path's own custody handoff, instead of
     /// rerunning into the same refusal. A delivery teardown already removed
     /// has nothing left to refuse.
-    #[inline(never)]
     fn refuse_signal_frame_supply(&mut self) -> Result<NativeResume, NativeProcessError> {
         let mut graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task_mut(self.key)
@@ -2406,14 +2420,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Publish into the existing boxed pending owner before descending into
         // completion. Admission's payload/manifests and rollback locals must
         // unwind before a ready reply walks four descriptor-table levels.
-        let prepared = self.prepare_service_inner(
+        let adapter = matches!(&payload, ServicePayload::Adapter);
+        let prepared = match self.prepare_service_inner(
             operation,
             fault_sequence,
             owner_wait,
             payload,
             completion.retries_syscall(),
             completion.checkpoints_owner(),
-        )?;
+        ) {
+            Ok(PreparedService::Retired(result)) => {
+                self.cancel_unpublished_fault(operation, fault_sequence);
+                PreparedService::Retired(result)
+            }
+            Ok(other) => other,
+            Err(error) => {
+                if !(adapter
+                    && matches!(
+                        error,
+                        NativeProcessError::Busy | NativeProcessError::Exhausted
+                    ))
+                {
+                    self.cancel_unpublished_fault(operation, fault_sequence);
+                }
+                return Err(error);
+            }
+        };
         let outcome = match prepared {
             PreparedService::WithPortalWait(request, wait) => self
                 .park_owner_wait(&request, wait)
@@ -3297,38 +3329,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             *record.ctx_mut() = *self.words;
             record.publish_owner_continuation(entry);
         }
-        let receipt =
-            if self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free {
-                // The root's first entry has a retained, unqueued host-loaded
-                // record. Materialize it on this slot's queue with its token.
-                let requeue = self
-                    .source
-                    .zone
-                    .requeue_preempted(self.source.slot, self.record.id);
-                if !requeue.is_queued() {
-                    return Err(NativeFailure::ServiceQuarantined(
-                        NativeServiceQuarantine::RequeueRefused,
-                    ));
-                }
-                self.source.zone.clear_current(self.source.slot);
-                self.yield_receipt_race();
-                carrick_core::entry::publish_handoff_yield(start, requeue)
-            } else {
-                let release = self.source.zone.release_current(
-                    self.source.slot,
-                    self.record.id,
-                    &carrick_sched_core::ShortLockSpin,
-                );
-                if release != carrick_sched_core::CurrentRelease::Requeued {
-                    return Err(NativeFailure::ServiceQuarantined(
-                        NativeServiceQuarantine::ReleaseRefused,
-                    ));
-                }
-                // From here the queued record may already be the host's (#1467):
-                // the requeue itself, not a later claim read, is the publication.
-                self.yield_receipt_race();
-                carrick_core::entry::publish_handoff_yield(start, release)
-            };
+        // Requeue at the head with `Handback::Resumed` rather than through
+        // `release_current` (`unswitch`): a thread yielding here has already
+        // published its updated `*record.ctx_mut()` and `OwnerContinuation`, so
+        // a prior wake handback (`Handback::Woken` from an earlier wait) must
+        // not overwrite its saved syscall return on resume, while head
+        // placement ensures an inline-completed continuation runs before peers.
+        let was_free =
+            self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free;
+        let requeue = self
+            .source
+            .zone
+            .requeue_checkpoint_head(self.source.slot, self.record.id);
+        if !requeue.is_queued() {
+            return Err(NativeFailure::ServiceQuarantined(
+                NativeServiceQuarantine::RequeueRefused,
+            ));
+        }
+        if was_free {
+            self.source.zone.clear_current(self.source.slot);
+        }
+        // From here the queued record may already be the host's (#1467):
+        // the requeue itself, not a later claim read, is the publication.
+        self.yield_receipt_race();
+        let receipt = carrick_core::entry::publish_handoff_yield(start, requeue);
         self.handoff = Some(receipt.ok_or(NativeFailure::ServiceQuarantined(
             NativeServiceQuarantine::HandoffReceipt,
         ))?);
@@ -3633,6 +3657,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ))?;
         drop(guard);
         self.release_service_claim(pending.claim)?;
+        self.cancel_unpublished_fault(request.operation, request.fault_sequence);
         Err(error)
     }
 
@@ -4700,6 +4725,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Ok(NativeResume::Left(None));
             }
             return Ok(self.retire_lost_exec_race());
+        }
+        if exiting || result == ServiceResult::Cancelled {
+            self.cancel_unpublished_fault(request.operation, request.fault_sequence);
         }
         if exiting {
             self.discard_rerun_answers();
