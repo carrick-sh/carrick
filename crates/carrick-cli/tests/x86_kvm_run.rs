@@ -1156,6 +1156,46 @@ fn mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings() {
     threads_vfork_exec_matches_native(&[], "threads-vfork-exec-siblings");
 }
 
+/// #3004: Go's preemption shape. Two clone threads each register a mapped,
+/// never-touched alternate signal stack and a `SA_ONSTACK` SIGURG handler,
+/// and the root sends SIGURG at them. Linux makes each stack page resident
+/// as it writes the frame and runs the handler there. On main the ring's
+/// frame write is refused (the copy may not supply a backing page) and each
+/// thread is killed by a forced SIGSEGV: the run exits 139.
+#[test]
+fn mounted_static_x86_thread_handlers_run_on_untouched_alternate_stacks() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("untouched-altstack-threads");
+    compile_assembly_with_flags(
+        "x86_signal_untouched_altstack_threads.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native untouched-altstack oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, "untouched-altstack-threads", false);
+    assert_eq!(
+        guest.status.code(),
+        native.status.code(),
+        "139 is a refused signal frame (a forced SIGSEGV); 95 a handler off its \
+         alternate stack or wrong delivery count; 96 a lost signal; 97 tgkill failed. \
+         Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of
