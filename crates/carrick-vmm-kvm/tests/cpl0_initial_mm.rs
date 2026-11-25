@@ -621,6 +621,24 @@ fn production_temporary_table_shortage_parks_enrols_and_succeeds_after_return() 
 /// completes every touch and exits 0.
 #[test]
 fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() {
+    quarantined_child_vacate_wakes_a_parked_fault(false);
+}
+
+/// #3030, contended (rev3022c P0-1): the host holds the quarantined child's
+/// reservation root, as a cross-MM owed-return settlement does under
+/// physical custody, when the child's last slot vacates. The in-ring
+/// retirement finds the root host-held: "not now", never a strand. The CPU
+/// crosses the space-retired port at once (the crossing waits for custody,
+/// so for the hold's release), reruns its drain, retires the entry and
+/// crosses again; the carrier reclaims the tables and wakes the parked
+/// parent before the child's exit-work crossing. It used to leave the entry
+/// queued with no crossing, and the parent waited for an unrelated drain.
+#[test]
+fn production_fault_parked_on_a_quarantined_child_wakes_when_a_host_held_root_releases() {
+    quarantined_child_vacate_wakes_a_parked_fault(true);
+}
+
+fn quarantined_child_vacate_wakes_a_parked_fault(host_holds_root: bool) {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
@@ -750,6 +768,40 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
     //    own exit work (a `WORK_PORT` crossing, which also drains) and idles.
     //    The vacate itself must return the tables and wake the parent: no
     //    later, unrelated crossing may be what delivers the wake.
+    if host_holds_root {
+        // The host holds the child's root while CPU 1 runs to its first
+        // crossing; that crossing is serviced only after the hold ends, as
+        // the custody it takes would make it wait.
+        let first = factory
+            .fixture_with_quarantined_root_held(|| {
+                (0..64)
+                    .map(|_| child.fixture_run_idle_peer().expect("child vacate"))
+                    .find(|exit| matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }))
+                    .expect("child crossing under the host's hold")
+            })
+            .expect("hold the quarantined child's root");
+        assert!(
+            matches!(
+                first,
+                CarrierRunExit::PhysicalDoorbell { port, .. }
+                    if port == carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT
+            ),
+            "the host-held retirement crossed to wait for the hold, \
+             not on to exit work: {first:?}, {:?}",
+            counters()
+        );
+        assert_eq!(
+            (retired_crossings(), waiters(), counters().returned_children),
+            (Some(0), 1, 0),
+            "nothing retired under the hold"
+        );
+        assert!(
+            child
+                .service_idle_peer_doorbell(&first, |_, _| {})
+                .expect("space-retired crossing after the hold")
+                .is_none()
+        );
+    }
     run_until_idle_within(
         4096,
         &factory,
@@ -782,8 +834,9 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
     let vacated = counters();
     assert_eq!(
         retired_crossings(),
-        Some(1),
-        "exactly the child's last slot vacate retired its space and crossed"
+        Some(1 + u64::from(host_holds_root)),
+        "exactly the child's last slot vacate retired its space and crossed, \
+         after one crossing for the host's hold"
     );
     assert_eq!(
         (waiters(), vacated.returned_children),
@@ -3303,15 +3356,41 @@ fn native_runtime_exit_wake(hold_home: bool) {
         let (misplaced_before, _) = factory
             .fixture_native_wake_debt(peer_cpu)
             .expect("waker debt before the exit wake");
-        let ((exit, owed), released_early) =
+        let ((exit, owed, retired), released_early) =
             with_slot_contended(&factory, carrick_guest_arch::CpuId::new(0), || {
-                let exit = child.fixture_run_idle_peer().expect("finish child exit");
+                // The child's last vacate retires its closed space and
+                // crosses the space-retired port before its exit wake
+                // (#3030); serve that crossing and run on to the boundary.
+                let mut retired = 0;
+                let exit = loop {
+                    let exit = child.fixture_run_idle_peer().expect("finish child exit");
+                    if !matches!(
+                        exit,
+                        CarrierRunExit::PhysicalDoorbell {
+                            port: carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT,
+                            ..
+                        }
+                    ) {
+                        break exit;
+                    }
+                    retired += 1;
+                    assert!(
+                        child
+                            .service_idle_peer_doorbell(&exit, |_, _| {})
+                            .expect("space-retired crossing")
+                            .is_none()
+                    );
+                };
                 let owed = factory
                     .fixture_native_wake_debt(peer_cpu)
                     .expect("waker debt at its boundary")
                     .1;
-                (exit, owed)
+                (exit, owed, retired)
             });
+        assert_eq!(
+            retired, 1,
+            "the child's space retired once, before its exit wake"
+        );
         let (claim, _, wakes) = factory
             .fixture_native_wait_state(root_tid)
             .expect("woken wait");

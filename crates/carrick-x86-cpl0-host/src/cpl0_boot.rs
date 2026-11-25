@@ -4384,6 +4384,22 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock.table_capacity())
     }
 
+    /// Run `body` (a CPU's run, no crossing service) while the host holds
+    /// the one quarantined fork child's reservation root under physical
+    /// custody, as a cross-MM owed-return settlement does. A crossing
+    /// serviced after `body` returns waits for that hold's release.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_with_quarantined_root_held<R>(
+        &self,
+        body: impl FnOnce() -> R,
+    ) -> Result<R, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        custody.fixture_with_quarantined_root_held(body)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture_hold_fork_stock(
         &self,

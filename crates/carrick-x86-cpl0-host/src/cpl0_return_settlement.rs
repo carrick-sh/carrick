@@ -463,6 +463,50 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         })
     }
 
+    /// Run `body` while this host holds the one quarantined child's
+    /// reservation root as the cross-MM owed-return settlement does
+    /// ([`RingRootJournal`]: `lock_returns`, host holder), under the custody
+    /// the caller holds (#3030, rev3022c P0-1 witness).
+    #[cfg(feature = "test-support")]
+    pub(in crate::cpl0_boot) fn fixture_with_quarantined_root_held<R>(
+        &self,
+        body: impl FnOnce() -> R,
+    ) -> Result<R, TrapError> {
+        let [mm] = self.fork_stock.quarantined_mms()[..] else {
+            return Err(fail(
+                "fixture root hold needs exactly one quarantined child",
+            ));
+        };
+        let ram = Arc::clone(&self.ram);
+        let zone = retained_cow_zone(&ram)?;
+        let table = retained_reservations(&ram)?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+        let delivery = |zone: &X86Cpl0Zone,
+                        waker: Waker,
+                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(zone, waker, owned);
+        let release = SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &delivery,
+            ),
+        };
+        let index = zone
+            .spaces
+            .find(mm.raw())
+            .ok_or_else(|| fail("fixture quarantined child unpublished"))?;
+        let held = carrick_el1::memory::reservations::X86Cpl0RootReleaseVenue::new(table, release)
+            .and_then(|venue| venue.lock_returns(index.index(), mm))
+            .map_err(|error| fail(format!("fixture quarantined root hold: {error:?}")))?;
+        let result = body();
+        drop(held);
+        wake.finish()?;
+        Ok(result)
+    }
+
     fn ring_settlement(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
