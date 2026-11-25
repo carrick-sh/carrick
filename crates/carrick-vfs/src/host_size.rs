@@ -33,7 +33,9 @@
 //! registry is bounded by the window slots.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(any(target_os = "linux", test))]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::LazyLock;
 
 use parking_lot::{RwLock, RwLockReadGuard};

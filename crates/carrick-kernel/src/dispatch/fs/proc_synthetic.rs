@@ -490,158 +490,123 @@ impl<'a> FsView<'a> {
             ));
         };
 
-        let action = {
+        let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
+            LINUX_FD_CLOEXEC
+        } else {
+            0
+        };
+        let mut unlinked_fallback = false;
+        let action = loop {
             let Some(mut open) =
                 crate::kernel::FileDescription::write_for_io(&open_file.description)
             else {
+                if unlinked_fallback {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                }
                 *reservation = None;
-                return Ok(self.duplicate_fd(
-                    n,
-                    0,
-                    if flags & LINUX_O_CLOEXEC != 0 {
-                        LINUX_FD_CLOEXEC
-                    } else {
-                        0
-                    },
-                ));
+                return Ok(self.duplicate_fd(n, 0, fd_flags));
             };
             let _ = &mut *open;
-
-            let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
-                LINUX_FD_CLOEXEC
-            } else {
-                0
-            };
-
             let open_ref = &*open;
-            match open_ref {
-                OpenDescription::File { path, .. } if !fd_table::is_anon_overlay_path(path) => {
-                    ReopenAction::ByPath {
+            let action = if unlinked_fallback {
+                self.prepare_reopen_copy(open_ref, open_file.description.common(), flags, fd_flags)
+            } else {
+                match open_ref {
+                    OpenDescription::File { path, .. } if !fd_table::is_anon_overlay_path(path) => {
+                        ReopenAction::ByPath {
+                            target_path: path.clone(),
+                            fallback_unlinked: true,
+                        }
+                    }
+                    OpenDescription::HostFile { metadata, .. }
+                        if !fd_table::is_anon_overlay_path(&metadata.path.to_string_lossy()) =>
+                    {
+                        let target_path = metadata.path.to_string_lossy().into_owned();
+                        ReopenAction::ByPath {
+                            target_path,
+                            fallback_unlinked: true,
+                        }
+                    }
+                    OpenDescription::Directory { path, .. } => ReopenAction::ByPath {
                         target_path: path.clone(),
-                        fallback_unlinked: true,
-                    }
+                        fallback_unlinked: false,
+                    },
+                    OpenDescription::SyntheticFile { path, .. } => ReopenAction::ByPath {
+                        target_path: path.clone(),
+                        fallback_unlinked: false,
+                    },
+                    OpenDescription::ProcExecutable { .. } => self.prepare_reopen_copy(
+                        open_ref,
+                        open_file.description.common(),
+                        flags,
+                        fd_flags,
+                    ),
+                    _ => self.prepare_reopen_copy(
+                        open_ref,
+                        open_file.description.common(),
+                        flags,
+                        fd_flags,
+                    ),
                 }
-                OpenDescription::HostFile { metadata, .. }
-                    if !fd_table::is_anon_overlay_path(&metadata.path.to_string_lossy()) =>
-                {
-                    let target_path = metadata.path.to_string_lossy().into_owned();
-                    ReopenAction::ByPath {
-                        target_path,
-                        fallback_unlinked: true,
+            };
+            drop(open);
+            match action {
+                ReopenAction::ByPath {
+                    target_path,
+                    fallback_unlinked,
+                } => {
+                    *reservation = None;
+                    let outcome = self.open_at_path_string(
+                        context,
+                        registry,
+                        OpenAtArgs {
+                            dirfd: LINUX_AT_FDCWD,
+                            path: &target_path,
+                            flags,
+                            mode: 0,
+                        },
+                        reporter,
+                    );
+                    let failed_enoent = match &outcome {
+                        Ok(DispatchOutcome::Errno { errno }) => *errno == LINUX_ENOENT,
+                        Err(DispatchError::Errno(errno)) => *errno == LINUX_ENOENT,
+                        _ => false,
+                    };
+                    if failed_enoent && fallback_unlinked && !unlinked_fallback {
+                        unlinked_fallback = true;
+                        continue;
                     }
+                    return outcome.map_err(|e| match e {
+                        DispatchError::Errno(errno) => errno,
+                        _ => LINUX_EFAULT,
+                    });
                 }
-                OpenDescription::Directory { path, .. } => ReopenAction::ByPath {
-                    target_path: path.clone(),
-                    fallback_unlinked: false,
-                },
-                OpenDescription::SyntheticFile { path, .. } => ReopenAction::ByPath {
-                    target_path: path.clone(),
-                    fallback_unlinked: false,
-                },
-                OpenDescription::ProcExecutable { .. } => self.prepare_reopen_copy(
-                    open_ref,
-                    open_file.description.common(),
-                    flags,
-                    fd_flags,
-                ),
-                _ => self.prepare_reopen_copy(
-                    open_ref,
-                    open_file.description.common(),
-                    flags,
-                    fd_flags,
-                ),
+                other => break other,
             }
         };
 
         match action {
-            ReopenAction::ByPath {
-                target_path,
-                fallback_unlinked,
-            } => {
-                *reservation = None;
-                let outcome = self.open_at_path_string(
-                    context,
-                    registry,
-                    OpenAtArgs {
-                        dirfd: LINUX_AT_FDCWD,
-                        path: &target_path,
-                        flags,
-                        mode: 0,
-                    },
-                    reporter,
-                );
-                let failed_enoent = match &outcome {
-                    Ok(DispatchOutcome::Errno { errno }) => *errno == LINUX_ENOENT,
-                    Err(DispatchError::Errno(errno)) => *errno == LINUX_ENOENT,
-                    _ => false,
-                };
-                let fallback = if failed_enoent && fallback_unlinked {
-                    let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
-                        LINUX_FD_CLOEXEC
-                    } else {
-                        0
-                    };
-                    crate::kernel::FileDescription::write_for_io(&open_file.description).map(
-                        |open| {
-                            self.prepare_reopen_copy(
-                                &open,
-                                open_file.description.common(),
-                                flags,
-                                fd_flags,
-                            )
-                        },
-                    )
-                } else {
-                    None
-                };
-                if failed_enoent && let Some(fallback) = fallback {
-                    match fallback {
-                        ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
-                            Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
-                        }
-                        ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
-                        ReopenAction::Duplicate => Ok(self.duplicate_fd(
-                            n,
-                            0,
-                            if flags & LINUX_O_CLOEXEC != 0 {
-                                LINUX_FD_CLOEXEC
-                            } else {
-                                0
-                            },
-                        )),
-                        ReopenAction::ByPath { .. } => Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+            ReopenAction::ByPath { .. } => Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+            ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
+                if reservation.is_some() {
+                    let open_file =
+                        crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
+                            Arc::new(RwLock::new(*new_desc)),
+                            new_common,
+                            fd_flags,
+                        );
+                    match self.install_admitted_open_file(reservation, open_file) {
+                        Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
+                        Err(e) => Ok(DispatchOutcome::errno(e)),
                     }
                 } else {
-                    outcome.map_err(|e| match e {
-                        DispatchError::Errno(errno) => errno,
-                        _ => LINUX_EFAULT,
-                    })
-                }
-            }
-            ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
-                let open_file =
-                    crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
-                        Arc::new(RwLock::new(*new_desc)),
-                        new_common,
-                        fd_flags,
-                    );
-                match self.install_admitted_open_file(reservation, open_file) {
-                    Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
-                    Err(e) => Ok(DispatchOutcome::errno(e)),
+                    Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
                 }
             }
             ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
             ReopenAction::Duplicate => {
                 *reservation = None;
-                Ok(self.duplicate_fd(
-                    n,
-                    0,
-                    if flags & LINUX_O_CLOEXEC != 0 {
-                        LINUX_FD_CLOEXEC
-                    } else {
-                        0
-                    },
-                ))
+                Ok(self.duplicate_fd(n, 0, fd_flags))
             }
         }
     }

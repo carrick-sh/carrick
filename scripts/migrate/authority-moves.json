@@ -322,7 +322,7 @@
       "issue": 1338
     },
     {
-      "owner": "carrick_kernel::dispatch::fs::proc_synthetic::FsView<'a>::reopen_proc_self_fd",
+      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized_resize",
       "issue": 1338
     }
   ],

@@ -2001,7 +2001,7 @@ mod tests {
 
     #[test]
     fn in_memory_file_vfs_truncation_and_capacity() {
-        let mut vfs = InMemoryFileVfs::new().max_file_size(20);
+        let vfs = InMemoryFileVfs::new().max_file_size(20);
         vfs.add_file("/test.bin", b"12345").unwrap();
 
         // Truncate expand with zero-fill
