@@ -27,7 +27,7 @@
 //! an inversion fails the first test that reaches it instead of deadlocking
 //! under load.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::{Deref, DerefMut};
 
 use carrick_core_abi::mm::custody::CarrierVmGeneration;
@@ -216,7 +216,7 @@ impl<R> core::fmt::Debug for Stage2Custody<R> {
 /// The custody lock, held without a generation: record bookkeeping and
 /// lifecycle reads, but no backend access.
 pub struct Stage2StateGuard<'a, R> {
-    state: MutexGuard<'a, Stage2CustodyState<R>>,
+    state: HeldState<'a, R>,
 }
 
 impl<R> Deref for Stage2StateGuard<'_, R> {
@@ -236,7 +236,7 @@ impl<R> DerefMut for Stage2StateGuard<'_, R> {
 /// lives: the custody lock is held, so no raw destroy can run. It is the only
 /// way to map or unmap.
 pub struct Stage2Generation<'a, R> {
-    state: MutexGuard<'a, Stage2CustodyState<R>>,
+    state: HeldState<'a, R>,
     backend: &'a (dyn Stage2Backend + Send),
     generation: CarrierVmGeneration,
 }
@@ -372,6 +372,58 @@ impl<R> Stage2Generation<'_, R> {
 thread_local! {
     /// How many [`Stage2Inner`] locks this thread holds.
     static STAGE2_INNER_HELD: Cell<usize> = const { Cell::new(0) };
+    /// The custodies (by address) whose lock this thread holds.
+    static STAGE2_CUSTODY_HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A thread that already holds a custody's lock and asks for it again would
+/// wait on itself forever. That is a broken invariant (a callback run under
+/// the guard re-entered the custody), so it panics at the acquisition.
+fn assert_custody_not_held(custody: usize, operation: &'static str) {
+    let held = STAGE2_CUSTODY_HELD.with(|held| held.borrow().contains(&custody));
+    assert!(
+        !held,
+        "stage-2 custody re-entry: {operation} took the custody lock this thread already \
+         holds (a callback run under the custody's guard re-entered it)"
+    );
+}
+
+/// The custody lock, held: it records itself as held by this thread until
+/// it drops, so a re-entry panics instead of deadlocking.
+struct HeldState<'a, R> {
+    guard: MutexGuard<'a, Stage2CustodyState<R>>,
+    custody: usize,
+}
+
+impl<'a, R> HeldState<'a, R> {
+    fn new(guard: MutexGuard<'a, Stage2CustodyState<R>>, custody: usize) -> Self {
+        STAGE2_CUSTODY_HELD.with(|held| held.borrow_mut().push(custody));
+        Self { guard, custody }
+    }
+}
+
+impl<R> Drop for HeldState<'_, R> {
+    fn drop(&mut self) {
+        STAGE2_CUSTODY_HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|&custody| custody == self.custody) {
+                held.remove(index);
+            }
+        });
+    }
+}
+
+impl<R> Deref for HeldState<'_, R> {
+    type Target = Stage2CustodyState<R>;
+    fn deref(&self) -> &Stage2CustodyState<R> {
+        &self.guard
+    }
+}
+
+impl<R> DerefMut for HeldState<'_, R> {
+    fn deref_mut(&mut self) -> &mut Stage2CustodyState<R> {
+        &mut self.guard
+    }
 }
 
 fn assert_no_inner_lock_held(operation: &'static str) {
@@ -452,16 +504,18 @@ impl<R> Stage2Custody<R> {
         }
     }
 
-    fn lock_state(&self, operation: &'static str) -> MutexGuard<'_, Stage2CustodyState<R>> {
+    fn lock_state(&self, operation: &'static str) -> HeldState<'_, R> {
         assert_no_inner_lock_held(operation);
+        let custody = core::ptr::from_ref(self).addr();
+        assert_custody_not_held(custody, operation);
         #[cfg(any(test, feature = "test-support"))]
         {
-            if let Some(state) = self.state.try_lock() {
-                return state;
+            if let Some(guard) = self.state.try_lock() {
+                return HeldState::new(guard, custody);
             }
             self.at(Stage2HookPoint::LockContended(operation));
         }
-        self.state.lock()
+        HeldState::new(self.state.lock(), custody)
     }
 
     #[cfg(any(test, feature = "test-support"))]

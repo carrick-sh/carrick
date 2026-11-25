@@ -393,3 +393,38 @@ fn taking_the_custody_lock_under_a_stage2_inner_lock_panics() {
     drop(guard);
     let _ = custody.lifecycle();
 }
+
+/// A callback run under a generation guard that takes the same custody's
+/// lock again would wait on its own thread forever (the shape the Mac found
+/// in a record retirement's unmap callback). The custody turns that
+/// re-entry into a panic at the acquisition, so it fails the test that
+/// reaches it instead of hanging it.
+#[test]
+fn reentering_a_custody_from_under_its_own_guard_panics_instead_of_hanging() {
+    let (custody, _) = custody();
+    let generation = live(&custody);
+    let reentry = std::thread::spawn({
+        let custody = custody.clone();
+        move || {
+            let _guard = custody.stage2_in(generation).expect("live stage 2");
+            let _ = custody.lifecycle();
+        }
+    })
+    .join();
+    let message = reentry
+        .expect_err("a re-entry must panic")
+        .downcast::<String>()
+        .map(|message| *message)
+        .unwrap_or_default();
+    assert!(
+        message.contains("stage-2 custody re-entry"),
+        "unexpected panic: {message}"
+    );
+    // The panicking thread's guard dropped while unwinding: another thread,
+    // and a fresh lock on this one, both take the lock normally.
+    assert_eq!(custody.lifecycle(), Stage2Lifecycle::Live(generation));
+    // A second custody's lock is not a re-entry of the first.
+    let (other, _) = self::custody();
+    let _guard = custody.lock();
+    assert_eq!(other.lifecycle(), Stage2Lifecycle::Vacant);
+}
