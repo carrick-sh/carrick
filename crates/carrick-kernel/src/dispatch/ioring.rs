@@ -1050,6 +1050,9 @@ impl SyscallDispatcher {
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
                     return cqe_err(LINUX_EFAULT);
                 };
+                let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
+                    std::os::fd::BorrowedFd::borrow_raw(hfd.get())
+                });
                 let n = unsafe {
                     libc::pwrite(
                         hfd.get(),
@@ -1107,6 +1110,9 @@ impl SyscallDispatcher {
                 let Ok(buf) = gather_iovecs(memory, &iovs) else {
                     return cqe_err(LINUX_EFAULT);
                 };
+                let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
+                    std::os::fd::BorrowedFd::borrow_raw(hfd.get())
+                });
                 let n = unsafe {
                     libc::pwrite(
                         hfd.get(),

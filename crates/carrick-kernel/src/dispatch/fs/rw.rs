@@ -636,6 +636,8 @@ pub(crate) fn commit_bytes_at_offset(
             if !*writable {
                 return Err(LINUX_EBADF);
             }
+            let _write_guard =
+                carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(host_fd));
             let res = unsafe {
                 libc::pwrite(
                     host_fd.raw(),
@@ -1269,6 +1271,9 @@ impl<'a> FsView<'a> {
                 // The writer's own limit is unlimited (`CarrierWrite`).
                 HostFileWriter::Carrier(_) => None,
             };
+            let _write_guard = carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(
+                host_io.host_fd_ref(),
+            ));
             let offset_may_be_nonzero = host_io.offset_may_be_nonzero();
             let pos = if is_append {
                 unsafe { libc::lseek(host_io.raw(), 0, libc::SEEK_END) }
@@ -4317,6 +4322,9 @@ impl<'a> FsView<'a> {
                 if !host_io.is_writable() {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                let _write_guard = carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(
+                    host_io.host_fd_ref(),
+                ));
                 let raw_fd = host_io.raw();
                 let old_len = if !is_append {
                     let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -4647,7 +4655,7 @@ impl<'a> FsView<'a> {
             return Ok(DispatchOutcome::Returned { value: total });
         }
         if matches!(&*open, OpenDescription::HostFile { .. }) {
-            let (hfd, is_append, old_len, at_current) = {
+            let (hfd, host_fd_owner, is_append, at_current) = {
                 let Some(host_io) = HostFileIo::from_read(&open) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
@@ -4655,21 +4663,24 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 let hfd = host_io.raw();
+                let host_fd_owner = host_io.host_fd_ref().clone();
                 let at_current = write_at_current || is_append;
                 if at_current {
                     host_io.record_sequential_io();
                 }
-                let old_len = if !at_current {
-                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                    if unsafe { libc::fstat(hfd, &mut st) } == 0 {
-                        Some(st.st_size as u64)
-                    } else {
-                        None
-                    }
+                (hfd, host_fd_owner, is_append, at_current)
+            };
+            let _write_guard =
+                carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(&host_fd_owner));
+            let old_len = if !at_current {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(hfd, &mut st) } == 0 {
+                    Some(st.st_size as u64)
                 } else {
                     None
-                };
-                (hfd, is_append, old_len, at_current)
+                }
+            } else {
+                None
             };
             let saved_offset = is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
             if is_append {
@@ -5352,6 +5363,11 @@ impl<'a> FsView<'a> {
                 Ok(DispatchOutcome::Returned { value: 0 })
             };
         }
+        let _write_guard = host_target
+            .host_fd_owner
+            .as_ref()
+            .filter(|_| host_target.write_kind == HostWriteKind::RegularFile)
+            .map(|fd| carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(fd)));
         if host_target.append {
             unsafe { libc::lseek(host_target.host_fd, 0, libc::SEEK_END) };
         }
@@ -5702,6 +5718,9 @@ impl<'a> FsView<'a> {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
+                            let _write_guard = carrick_vfs::host_size::admit_write(
+                                std::os::fd::AsFd::as_fd(host_fd),
+                            );
                             // Mirror `write`(64): O_APPEND seeks to EOF, then
                             // libc::write to the real fd advances the shared
                             // kernel offset (visible across fork and to the

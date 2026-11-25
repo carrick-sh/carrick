@@ -1049,7 +1049,9 @@ impl FileContents {
         }
         match self {
             Self::HostBacked { fd } => {
+                use std::os::fd::AsFd as _;
                 use std::os::fd::AsRawFd;
+                let _write_guard = carrick_vfs::host_size::admit_write(fd.as_fd());
                 let raw_fd = fd.as_raw_fd();
                 let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };

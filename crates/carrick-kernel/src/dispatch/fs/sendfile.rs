@@ -658,7 +658,7 @@ impl<'a> FsView<'a> {
                             host_fd,
                             writable: true,
                             ..
-                        }) => host_fd.raw(),
+                        }) => host_fd.clone(),
                         Some(OpenDescription::HostFile { .. }) => {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
@@ -668,9 +668,11 @@ impl<'a> FsView<'a> {
                     },
                     None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 };
+                let _write_guard =
+                    carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(&host_fd));
                 let n = unsafe {
                     libc::pwrite(
-                        host_fd,
+                        host_fd.raw(),
                         bytes.as_ptr() as *const _,
                         bytes.len(),
                         out_off as libc::off_t,

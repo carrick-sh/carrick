@@ -82,6 +82,9 @@ impl InodeWriteback {
                 first_error.get_or_insert(crate::host_to_linux_errno(errno));
             }
         }
+        let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(fd.raw())
+        });
         for page in &self.pages {
             let written = unsafe {
                 libc::pwrite(

@@ -170,6 +170,35 @@ impl X86AnonymousVenue<'_> {
         let table = carrick_el1_linux::ipc::native_table(&venue, self.task)
             .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
         let mut resolve = |fd| carrick_el1_linux::ipc::native_descriptor(&venue, table, fd);
+        // Before popping source releases or calling `forward_to_host` (which
+        // reserves carrier window slots on `MapShared`), preflight reservation
+        // placement and offset alignment so `MAP_FIXED_NOREPLACE` over an
+        // occupied VA answers `-EEXIST` even when the window slot budget is
+        // exhausted (#2975 Codex P0 #3).
+        if let Some(carrick_personality_linux::native_host_file::NativeDescriptor::HostBacked {
+            access,
+        }) = resolve(key.fd)
+        {
+            let shared =
+                key.flags & carrick_personality_linux::native_host_file::LINUX_MAP_SHARED != 0;
+            let eacces = !access.readable()
+                || (shared
+                    && !access.writable()
+                    && key.prot & carrick_personality_linux::native_host_file::LINUX_PROT_WRITE
+                        != 0);
+            if !eacces {
+                let is_window = shared && access.writable();
+                if let Some(errno) = carrick_el1::memory::preflight_file_mmap(
+                    &self.frame,
+                    self.task,
+                    carrick_core::wait::space_access(zone, slot, crate::native_process::release),
+                    shared_x86_cpl0_guest(),
+                    is_window,
+                ) {
+                    return Err(SyscallResult::new(errno));
+                }
+            }
+        }
         let mut releases = |out: &mut [carrick_core_abi::host_file::MapSourceReply]| {
             let mut rows = [(core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN);
                 carrick_core_abi::host_file::MAX_MAP_RELEASES];

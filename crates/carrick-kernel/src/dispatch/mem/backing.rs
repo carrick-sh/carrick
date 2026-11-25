@@ -1686,6 +1686,9 @@ impl<'a> MemView<'a> {
         let Some((host_fd, offset)) = alloc.backing.shared_file_parts() else {
             return;
         };
+        let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(host_fd)
+        });
         let mut written = 0usize;
         while written < bytes.len() {
             let Ok(written_offset) = u64::try_from(written) else {

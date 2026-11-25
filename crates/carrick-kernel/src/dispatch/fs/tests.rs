@@ -16414,4 +16414,89 @@ mod window_size_door {
             });
         }
     }
+
+    #[test]
+    fn interleaved_pwrite_and_growth_ftruncate_never_shrinks_windowed_file() {
+        let mut run = Run::new();
+        let backing = run.rootfs_file("/win", 4096);
+        let _pin = window(&run, &backing);
+        let fd1 = match run.open("/win", LINUX_O_RDWR) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open fd1: {other:?}"),
+        };
+        let fd2 = match run.open("/win", LINUX_O_RDWR) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open fd2: {other:?}"),
+        };
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let ctx = &ctx;
+        let dispatcher = &run.dispatcher;
+        std::thread::scope(|scope| {
+            let ha = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install(entered_tx, proceed_rx);
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            SYS_FTRUNCATE,
+                            SyscallArgs::from([fd1, 8192, 0, 0, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap()
+            });
+            entered_rx.recv().unwrap();
+            let hb = scope.spawn(move || {
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 8192]);
+                let buf_va = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                mem.write_bytes_raw(buf_va, &[0x41u8; 4096]).unwrap();
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                let res = dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            carrick_abi::syscall::nr::PWRITE64.raw(),
+                            SyscallArgs::from([fd2, buf_va, 4096, 8192, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap();
+                let _ = b_done_tx.send(());
+                res
+            });
+            let overtook = b_done_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_ok();
+            let _ = proceed_tx.send(());
+            let ra = ha.join().unwrap();
+            let rb = hb.join().unwrap();
+            assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
+            assert_eq!(rb, DispatchOutcome::Returned { value: 4096 });
+            assert!(
+                !overtook,
+                "pwrite must wait behind windowed resize (#2975 P0 1)"
+            );
+            assert_eq!(
+                size(&backing),
+                12288,
+                "concurrent pwrite must never turn an admitted growth ftruncate into a 12288->8192 shrink"
+            );
+        });
+    }
 }

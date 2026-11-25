@@ -1293,6 +1293,7 @@ fn mounted_static_x86_shared_file_window_slot_budget_is_enforced() {
                 "chunks_gt_zero=0000000000000001",
                 "coarse_err=ffffffffffffffda",
                 "fine_err=ffffffffffffffda",
+                "post_sat_noreplace=ffffffffffffffef",
                 "chunk0_reuse=0000000000000042",
                 "other_mmap=ffffffffffffffda",
                 "other_truncate=0000000000000000",

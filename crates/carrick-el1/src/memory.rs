@@ -167,6 +167,99 @@ pub fn may_complete_advisory_mmap_before_work(flags: u64, protection: u64) -> bo
         )
 }
 
+fn delegated_file_mmap_sharing(
+    window: bool,
+    prot_raw: u64,
+    flags: u64,
+) -> Option<carrick_el1_abi::FileMapSharing> {
+    use carrick_el1_abi::FileMapSharing;
+    let sharing = match (window, flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED)) {
+        (false, MAP_PRIVATE) => FileMapSharing::Private,
+        // The venue copies a source for a shared mapping only
+        // when it asks for no write on a read-only description.
+        (false, MAP_SHARED) if prot_raw & PROT_WRITE == 0 => FileMapSharing::SharedReadOnly,
+        // A window maps the file's own pages, so the mapping may
+        // store now or after an `mprotect` (#1338).
+        (true, MAP_SHARED) => FileMapSharing::Shared,
+        _ => return None,
+    };
+    // MAP_POPULATE only prefaults (mmap(2)): a window page is the
+    // file's page whenever it is touched, so a lazy window is
+    // the same mapping. A copied source keeps the byte snapshot
+    // a prefault would take at map time, so it leaves the ring.
+    let populate = match sharing {
+        FileMapSharing::Shared => MAP_POPULATE,
+        _ => 0,
+    };
+    (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED | populate) == 0).then_some(sharing)
+}
+
+fn mmap_placement(args: [u64; 6]) -> reservations::Placement {
+    let flags = args[3];
+    if flags & MAP_FIXED_NOREPLACE != 0 {
+        reservations::Placement::NoReplace(args[0])
+    } else if flags & MAP_FIXED != 0 {
+        reservations::Placement::Fixed(args[0])
+    } else if args[0] == 0 {
+        reservations::Placement::Anywhere
+    } else {
+        reservations::Placement::Hint(args[0])
+    }
+}
+
+/// Preflight reservation placement and offset invariants for a delegated file
+/// `mmap` before forwarding to the host (which reserves carrier window slots for
+/// `MapShared`), so `MAP_FIXED_NOREPLACE` over an occupied VA answers `-EEXIST`
+/// and invalid lengths/offsets answer `-EINVAL` before window-slot exhaustion
+/// can mask them (#2975 Codex P0 #3). Returns `None` when the call should
+/// proceed normally (including when the root lock is contended or a pending/fork
+/// edit must settle first).
+#[inline(never)]
+pub fn preflight_file_mmap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    frame: &(impl AnonymousCallView + ?Sized),
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    window: bool,
+) -> Option<i64> {
+    let nr = frame.canonical().raw();
+    if nr != SYS_MMAP {
+        return None;
+    }
+    let args = frame.arguments();
+    delegated_file_mmap_sharing(window, args[2], args[3])?;
+    if !matches!(
+        MmapProtectionRoute::decode(args[2]),
+        MmapProtectionRoute::Reservation(_)
+    ) {
+        return None;
+    }
+    if !args[5].is_multiple_of(PAGE_SIZE) || args[5].checked_add(args[1]).is_none() {
+        return Some(-EINVAL);
+    }
+    let (mm, index) = delegated_anonymous_root(nr, current, spaces, table)?;
+    let slot = frame.slot().map_or(u32::MAX, |slot| slot.index() as u32);
+    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, slot) else {
+        return None;
+    };
+    if !model.is_admitted() || model.pending().is_some() || model.fork_pending() {
+        return None;
+    }
+    match model.place(mmap_placement(args), args[1]) {
+        Ok(_) => None,
+        Err(reservations::Refusal::Collision) => Some(-17),
+        Err(reservations::Refusal::Invalid) => Some(-EINVAL),
+        Err(reservations::Refusal::Hole | reservations::Refusal::Limit) => Some(-ENOMEM),
+        Err(
+            reservations::Refusal::ForeignMapping
+            | reservations::Refusal::Busy
+            | reservations::Refusal::PreparedConflict
+            | reservations::Refusal::Stale
+            | reservations::Refusal::MetadataRequired,
+        ) => None,
+    }
+}
+
 const EINVAL: i64 = 22;
 const EACCES: i64 = 13;
 const ENOMEM: i64 = 12;
@@ -363,7 +456,7 @@ pub fn decide_reservation_syscall_for_origin<
     service_origin: ServiceOrigin,
 ) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
-    use reservations::{Decision, Placement, Refusal};
+    use reservations::{Decision, Refusal};
     let Some(origin) = ReservationOrigin::capture(current) else {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     };
@@ -374,56 +467,26 @@ pub fn decide_reservation_syscall_for_origin<
     let result = match nr {
         SYS_BRK => model.brk(frame.arguments()[0]),
         SYS_MMAP => {
-            let flags = frame.arguments()[3];
+            let args = frame.arguments();
+            let flags = args[3];
             let file = file.and_then(|source| {
-                use carrick_el1_abi::FileMapSharing;
-                let sharing = match (source, flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED)) {
-                    (NativeFileSource::Copied(_), MAP_PRIVATE) => FileMapSharing::Private,
-                    // The venue copies a source for a shared mapping only
-                    // when it asks for no write on a read-only description.
-                    (NativeFileSource::Copied(_), MAP_SHARED)
-                        if frame.arguments()[2] & PROT_WRITE == 0 =>
-                    {
-                        FileMapSharing::SharedReadOnly
-                    }
-                    // A window maps the file's own pages, so the mapping may
-                    // store now or after an `mprotect` (#1338).
-                    (NativeFileSource::Window(_), MAP_SHARED) => FileMapSharing::Shared,
-                    _ => return None,
-                };
-                // MAP_POPULATE only prefaults (mmap(2)): a window page is the
-                // file's page whenever it is touched, so a lazy window is
-                // the same mapping. A copied source keeps the byte snapshot
-                // a prefault would take at map time, so it leaves the ring.
-                let populate = match sharing {
-                    FileMapSharing::Shared => MAP_POPULATE,
-                    _ => 0,
-                };
-                let source = source.identity();
-                (flags & !(DELEGATED_MMAP_FLAGS | MAP_SHARED | populate) == 0)
-                    .then_some((source, sharing))
+                let window = matches!(source, NativeFileSource::Window(_));
+                let sharing = delegated_file_mmap_sharing(window, args[2], flags)?;
+                Some((source.identity(), sharing))
             });
             if file.is_none() && !private_anonymous_mmap(flags) {
                 return ReservationDisposition::Forward;
             }
-            let prot = match MmapProtectionRoute::decode(frame.arguments()[2]) {
+            let prot = match MmapProtectionRoute::decode(args[2]) {
                 MmapProtectionRoute::Reservation(protection) => protection,
                 MmapProtectionRoute::HostUnrepresentedBits => {
                     return ReservationDisposition::Forward;
                 }
             };
-            if !frame.arguments()[5].is_multiple_of(PAGE_SIZE) {
+            if !args[5].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
             }
-            let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
-                Placement::NoReplace(frame.arguments()[0])
-            } else if flags & MAP_FIXED != 0 {
-                Placement::Fixed(frame.arguments()[0])
-            } else if frame.arguments()[0] == 0 {
-                Placement::Anywhere
-            } else {
-                Placement::Hint(frame.arguments()[0])
-            };
+            let placement = mmap_placement(args);
             match file {
                 Some((source, sharing)) => match source.advance(frame.arguments()[5]) {
                     Some(source) => model.mmap_private_file(
