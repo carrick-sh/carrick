@@ -29,7 +29,7 @@
 //! runs before the guest has any fds).
 
 use std::ffi::CString;
-use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -38,7 +38,9 @@ use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
 };
 use crate::host_to_linux_errno;
-use carrick_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
+use carrick_abi::{
+    LINUX_EBUSY, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeReexecBindMountV1 {
@@ -95,6 +97,50 @@ impl BindVfs {
     fn is_mount_point(&self, guest_path: &str) -> bool {
         guest_path == self.mount_point
             || guest_path.trim_end_matches('/') == self.mount_point.trim_end_matches('/')
+    }
+
+    fn open_for_truncate(&self, path: &str) -> Result<OwnedFd, VfsError> {
+        let host = self.to_host(path)?;
+        let cpath = CString::new(host.as_os_str().as_bytes()).map_err(|_| LINUX_EINVAL)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // Stat before opening so non-regular files (notably FIFOs) fail with
+        // EINVAL immediately rather than blocking in write-only open (#2975 P0 5).
+        if unsafe { libc::stat(cpath.as_ptr(), &mut st) } != 0 {
+            return Err(host_open_errno());
+        }
+        match st.st_mode & libc::S_IFMT {
+            mode if mode == libc::S_IFDIR => return Err(LINUX_EISDIR),
+            mode if mode != libc::S_IFREG => return Err(LINUX_EINVAL),
+            _ => {}
+        }
+        if is_socket_marker(&host, false) {
+            return Err(LINUX_EINVAL);
+        }
+        if self.readonly {
+            return Err(LINUX_EROFS);
+        }
+        // O_NONBLOCK prevents blocking if replaced by a FIFO between stat and open.
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(host_open_errno());
+        }
+        // SAFETY: `open` returned a fresh descriptor owned by this scope.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut opened_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(owned.as_raw_fd(), &mut opened_stat) } != 0 {
+            return Err(host_open_errno());
+        }
+        match opened_stat.st_mode & libc::S_IFMT {
+            mode if mode == libc::S_IFDIR => return Err(LINUX_EISDIR),
+            mode if mode != libc::S_IFREG => return Err(LINUX_EINVAL),
+            _ => {}
+        }
+        Ok(owned)
     }
 
     fn to_host(&self, guest_path: &str) -> Result<PathBuf, VfsError> {
@@ -900,17 +946,14 @@ impl Vfs for BindVfs {
         Ok(())
     }
 
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        self.open_for_truncate(path).map(|_| ())
+    }
+
     fn truncate(&self, path: &str, len: u64) -> Result<(), VfsError> {
-        if self.readonly {
-            return Err(LINUX_EROFS);
-        }
-        let host = self.to_host(path)?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&host)
-            .map_err(map_io_error)?;
+        let file = self.open_for_truncate(path)?;
         // Through the host size door, on the object opened (#1338 A1).
-        crate::host_size::resize(std::os::fd::AsFd::as_fd(&file), len).map_err(host_to_linux_errno)
+        crate::host_size::resize(file.as_fd(), len).map_err(host_to_linux_errno)
     }
 
     fn name(&self) -> &'static str {
