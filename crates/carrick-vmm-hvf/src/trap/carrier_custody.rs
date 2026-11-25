@@ -2242,6 +2242,7 @@ mod carrier_vm_custody_tests {
         let exact_owner =
             std::sync::Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
 
+        let mut rival_pin = None;
         let outcome = super::retire_global_frame_host_owner_if_generation_in_using(
             &custody,
             key.0,
@@ -2270,13 +2271,27 @@ mod carrier_vm_custody_tests {
                     "the shared live-owner predicate must reject pending"
                 );
                 drop(owners);
-                assert!(
-                    matches!(
-                        exact_owner.pin(),
-                        Err(super::CarrierStage2PinError::RetirementRequested)
-                    ),
-                    "a pre-cloned owner Arc must not admit a pin after pending publication"
-                );
+                // The backend unmap runs under the guard of the record's
+                // generation, so a pin through a pre-cloned owner Arc can't
+                // run beside it (here, on this thread, it would re-enter the
+                // custody). A rival thread's pin must wait for the guard;
+                // the hook reports when it does, with no sleep, and after
+                // the settlement it is refused.
+                let (contended_tx, contended_rx) = std::sync::mpsc::channel::<()>();
+                custody
+                    .stage2
+                    .set_hook(Some(std::sync::Arc::new(move |point| {
+                        if let carrick_aarch64::stage2::custody::Stage2HookPoint::LockContended(_) =
+                            point
+                        {
+                            let _ = contended_tx.send(());
+                        }
+                    })));
+                let owner = std::sync::Arc::clone(&exact_owner);
+                rival_pin = Some(std::thread::spawn(move || owner.pin().map(drop)));
+                contended_rx
+                    .recv()
+                    .expect("a rival pin waits for the retirement's guard");
                 let mut nested_unmap_calls = 0_u32;
                 assert!(matches!(
                     super::retire_global_frame_host_owner_if_generation_in_using(
@@ -2334,10 +2349,24 @@ mod carrier_vm_custody_tests {
                 Ok(())
             },
         );
+        let rival_pin = rival_pin
+            .take()
+            .expect("the backend unmap ran")
+            .join()
+            .expect("rival pin thread");
+        custody.stage2.set_hook(None);
         assert!(matches!(
             outcome,
             super::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
         ));
+        assert!(
+            matches!(
+                rival_pin,
+                Err(super::CarrierStage2PinError::RetirementRequested
+                    | super::CarrierStage2PinError::NotFound)
+            ),
+            "a pre-cloned owner Arc must not admit a pin once its retirement began: {rival_pin:?}"
+        );
         assert!(
             !custody.global_frame_host_owners.lock().contains_key(&key),
             "successful retirement must remove the exact pending slot"
