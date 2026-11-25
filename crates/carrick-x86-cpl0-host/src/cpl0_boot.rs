@@ -4348,6 +4348,43 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock_counters())
     }
 
+    pub fn fork_stock_release_waiters(&self) -> Result<usize, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.fork_stock.release_waiters())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_hold_fork_stock(
+        &self,
+        left: usize,
+    ) -> Result<carrick_hal::fork_stock::SuccessorTables, TrapError> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let count = custody.fork_stock.table_capacity().saturating_sub(left);
+        custody
+            .fork_stock
+            .reserve_successor_tables(count)
+            .map_err(|error| fail(format!("hold fork stock: {error:?}")))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_release_fork_stock(
+        &self,
+        held: carrick_hal::fork_stock::SuccessorTables,
+    ) -> Result<(), TrapError> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        custody.fork_stock.return_successor_tables(held);
+        Ok(())
+    }
+
     /// Retire the exec rows the run left unadopted, once every CPU lane of
     /// this carrier has stopped (#2799). Returns the rows retired.
     pub fn retire_exec_preparations_at_carrier_exit(&self) -> Result<usize, TrapError> {

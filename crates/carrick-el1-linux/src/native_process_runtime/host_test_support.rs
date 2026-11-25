@@ -6610,6 +6610,185 @@ fn a_signal_interrupts_a_native_childs_host_readiness_wait_with_eintr_for<
     );
 }
 
+/// #3017 review P0-1: a native fault answered with a `ReservationPool` owner
+/// wait parks the member on the carrier's reservation-pool queue rather than
+/// looking it up as an MM resource wait (`Stale`), re-publishes its fault
+/// request when the pool notifies, and supports fatal service cancellation
+/// while parked on that queue.
+#[cfg(test)]
+#[test]
+fn a_native_fault_waits_on_the_reservation_pool_and_reruns() {
+    a_native_fault_waits_on_the_reservation_pool_and_reruns_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
+/// [`a_native_fault_waits_on_the_reservation_pool_and_reruns`] on the AArch64 owner's context and MMU.
+#[cfg(test)]
+#[test]
+fn a_native_fault_waits_on_the_reservation_pool_and_reruns_on_arm() {
+    a_native_fault_waits_on_the_reservation_pool_and_reruns_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn a_native_fault_waits_on_the_reservation_pool_and_reruns_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    let wait = HostReadyWaitFixture::<C>::new_for::<B>(make_words);
+    let fixture = &wait.capacity.fixture;
+    let pool_key =
+        carrick_sched_core::object_wait::ObjectWaitKey::reservation_pool(NonZeroU64::MIN);
+    let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    };
+    let _ =
+        fixture
+            .zone
+            .bind_object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion);
+
+    let fault = carrick_guest_arch::FaultInfo {
+        address: UserVa::new(0x10_0000),
+        access: carrick_guest_arch::Access::Write,
+        present: false,
+    };
+    let (record, _) = wait.enter(|child| {
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::NoPending)
+        ));
+        assert!(matches!(
+            child.begin_exec_stage_fault_service(fault, None, None, None),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+    });
+
+    let claim_fault_ticket = || {
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let identity = fixture.zone.record(record.id).identity();
+        // SAFETY: the real native owner retains this exact control allocation.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let svc_key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(svc_key, &carrick_sched_core::ShortLockSpin, &completion)
+            .unwrap();
+        // SAFETY: the service queue authenticates the notice and excludes cancellation.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity)
+        }
+        .unwrap();
+        assert!(matches!(
+            ticket.request().operation,
+            ServiceOperation::Fault(_)
+        ));
+        (queue, ticket)
+    };
+
+    // Round 1: answer a ReservationPool wait; child parks on pool_key, wakes on
+    // pool notification, re-publishes the fault, and completes RetrySyscall.
+    let pool_revision = fixture
+        .zone
+        .object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
+        .unwrap()
+        .snapshot()
+        .revision();
+    {
+        let (queue, ticket) = claim_fault_ticket();
+        // SAFETY: pool_revision was sampled from pool_key before refusing.
+        let owner_wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                ticket.request().identity.birth.mm,
+                carrick_core_abi::PortalWaitCause::ReservationPool,
+                pool_revision,
+            )
+        };
+        assert!(ticket.complete_wait(owner_wait).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+    let (_, parked) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    let parked_err = parked.as_ref().err().cloned();
+    assert!(
+        matches!(parked, Ok(NativeResume::Left(None))),
+        "ReservationPool owner wait parks instead of failing Stale: {parked_err:?}"
+    );
+    fixture
+        .zone
+        .object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
+        .unwrap()
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    let (_, rerun) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert!(
+        matches!(rerun, Ok(NativeResume::RetrySyscall)),
+        "pool notification wakes the fault wait into RetrySyscall so the access re-selects"
+    );
+    wait.enter_loaded(|child| {
+        assert!(matches!(
+            child.begin_exec_stage_fault_service(fault, None, None, None),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+    });
+    {
+        let (queue, ticket) = claim_fault_ticket();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+    let (_, supplied) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert!(matches!(supplied, Ok(NativeResume::RetrySyscall)));
+
+    // Round 2: fatal service cancellation while parked on pool_key wakes cleanly.
+    wait.enter_loaded(|child| {
+        assert!(matches!(
+            child.begin_exec_stage_fault_service(fault, None, None, None),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+    });
+    let pool_revision = fixture
+        .zone
+        .object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
+        .unwrap()
+        .snapshot()
+        .revision();
+    {
+        let (queue, ticket) = claim_fault_ticket();
+        // SAFETY: pool_revision was sampled from pool_key before refusing.
+        let owner_wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                ticket.request().identity.birth.mm,
+                carrick_core_abi::PortalWaitCause::ReservationPool,
+                pool_revision,
+            )
+        };
+        assert!(ticket.complete_wait(owner_wait).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    }
+    let (_, parked) = wait.enter(|child| child.resume_checkpoint(|_| Ok(None)));
+    assert!(matches!(parked, Ok(NativeResume::Left(None))));
+    let mut service = fixture.service();
+    fixture
+        .runtime
+        .cancel_service(record, fixture.slot, &mut service)
+        .expect("cancellation wakes a ReservationPool owner wait");
+}
+
 /// #2414 review P0-1: a native child's blocking stream send keeps its whole
 /// extent across records, in the production ring service shared by both
 /// ISAs. The child's 200000-byte `sendto` crosses its first 65536 bytes;
