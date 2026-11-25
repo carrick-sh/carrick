@@ -97,6 +97,11 @@ pub struct X86TableReserve {
     end: FrameGpa,
 }
 impl X86TableReserve {
+    /// The extent-table license protocol, a boot ABI fact: 2 licenses this
+    /// reserve as page-table storage beside the Prepare working suffix (1
+    /// licensed the suffix alone). An image on 1 refuses a reserve-backed
+    /// table that a host on 2 issues.
+    pub const LICENSE_PROTOCOL: u64 = 2;
     /// `occupied_end` is the page-aligned end of the boot records and grants;
     /// `working` is the suffix [`X86PrepareTableSpan::derive`] placed after
     /// it in the same extent. The reserve may be empty.

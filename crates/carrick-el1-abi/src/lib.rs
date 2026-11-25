@@ -1317,24 +1317,29 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(InotifyNameCacheEntry, seq) as u64,
         core::mem::offset_of!(InotifyNameCacheEntry, path_bytes) as u64,
     ];
-    let boundary_facts = [
-        EL1_APERTURE_CONTROL_OFFSET,
-        core::mem::size_of::<ApertureControl>() as u64,
-        core::mem::align_of::<ApertureControl>() as u64,
-        core::mem::offset_of!(ApertureControl, control) as u64,
-        APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
-        2,                          // control encoding: zero is strict; bit 3 opts out.
-        SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
-        PortalGrantSlot::PREPARED_SELECTION_STATE,
-    ];
     hash_layout_facts(&[
         facts,
         &DESCRIPTOR_TXN_LAYOUT_FACTS,
         &COW_GRANT_LAYOUT_FACTS,
         &THREAD_LIFECYCLE_LAYOUT_FACTS,
-        &boundary_facts,
+        &EL1_ABI_BOUNDARY_FACTS,
     ])
 };
+
+/// Host/image protocol facts no record layout shows: encodings, reply
+/// states and crossing ports whose meaning one side must share with the
+/// other. Hashed into [`EL1_ABI_LAYOUT_HASH`], so a host and an image that
+/// disagree on any of them refuse each other at boot.
+pub const EL1_ABI_BOUNDARY_FACTS: [u64; 8] = [
+    EL1_APERTURE_CONTROL_OFFSET,
+    core::mem::size_of::<ApertureControl>() as u64,
+    core::mem::align_of::<ApertureControl>() as u64,
+    core::mem::offset_of!(ApertureControl, control) as u64,
+    APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
+    2,                          // control encoding: zero is strict; bit 3 opts out.
+    SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
+    PortalGrantSlot::PREPARED_SELECTION_STATE,
+];
 
 /// Fingerprint ordered layout facts with one shared FNV-1a implementation.
 pub const fn hash_layout_facts(groups: &[&[u64]]) -> u64 {
@@ -5362,6 +5367,26 @@ const _: () = {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
+    /// rev3022c P0-4: the table-supply protocol (#3017, #3030) is a boot ABI
+    /// fact. A host and an image that disagree on the grant slot's
+    /// pool-wait and refused reply states, on the space-retired crossing or
+    /// on the table-reserve license refuse each other at boot, instead of a
+    /// reply one side cannot decode, an unexpected port, or a reserve-backed
+    /// table the image refuses mid-run.
+    #[test]
+    fn the_layout_hash_carries_the_table_supply_protocol() {
+        let tail = &super::EL1_ABI_BOUNDARY_FACTS[super::EL1_ABI_BOUNDARY_FACTS.len() - 4..];
+        assert_eq!(
+            tail,
+            [
+                super::PortalGrantSlot::REFUSED_SELECTION_STATE,
+                super::PortalGrantSlot::POOL_WAIT_STATE,
+                u64::from(super::NATIVE_SPACE_RETIRED_PORT),
+                carrick_core_abi::X86TableReserve::LICENSE_PROTOCOL,
+            ]
+        );
+    }
+
     #[test]
     fn layout_hash_changes_when_any_fact_changes() {
         let facts = [0, 1, u64::MAX, EL1_ABI_LAYOUT_HASH];
