@@ -913,6 +913,11 @@ impl DescriptionCommon {
         self.materialized_resize.lock()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_materialized_resize_locked(&self) -> bool {
+        self.materialized_resize.try_lock().is_none()
+    }
+
     pub(crate) fn shared_seals(&self) -> Arc<Mutex<Option<u32>>> {
         Arc::clone(&self.seals)
     }

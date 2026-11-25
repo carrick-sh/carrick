@@ -5294,3 +5294,140 @@ fn two_live_threads_fault_one_window_while_its_busy_loser_settles() {
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
+
+/// Codex r31 P0 #2 (#2975): a shared file `mmap` hitting a `PreparedOverlap`
+/// must park, release its execution slot, and resume after the overlap clears
+/// (both when window slots are free and when the window slot budget is already
+/// exhausted).
+#[test]
+fn production_file_mmap_prepared_conflict_once_parks_and_resumes() {
+    let c_src = r#"
+static long sc(long n, long a, long b, long c, long d, long e, long f) {
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    register long r9 __asm__("r9") = f;
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+#define AT_FDCWD (-100L)
+#define O_RDWR 2L
+#define O_CREAT 0100L
+#define O_TRUNC 01000L
+#define O_CLOEXEC 02000000L
+#define PROT_RW 3L
+#define MAP_SHARED 1L
+#define MAP_PRIVATE 2L
+#define MAP_ANONYMOUS 0x20L
+#define MAP_FIXED_NOREPLACE 0x100000L
+#define ENOSYS (-38L)
+#define EEXIST (-17L)
+#define INJECT_PREPARED_CONFLICT_ONCE (-494LL)
+#define INJECT_WAIT_PARK_CENSUS (-493LL)
+#define CHUNK (2ULL << 20)
+#define BATCH_BYTES (32ULL * CHUNK)
+
+static int is_err(long p) {
+    return p < 0 && p >= -4095L;
+}
+
+void _start(void) {
+    long wfd = sc(257, AT_FDCWD, (long)"/w", O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    if (wfd < 0 || sc(77, wfd, 4096, 0, 0, 0, 0) != 0) sc(231, 90, 0, 0, 0, 0, 0);
+    sc(INJECT_PREPARED_CONFLICT_ONCE, 0, 0, 0, 0, 0, 0);
+    long p = sc(9, 0, 4096, PROT_RW, MAP_SHARED, wfd, 0);
+    if (p == 0 || is_err(p)) sc(231, 91, 0, 0, 0, 0, 0);
+    long parks = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
+    if (parks != 1) sc(231, 92, 0, 0, 0, 0, 0);
+    *(volatile unsigned char *)p = 0x42;
+    unsigned char byte = 0;
+    if (sc(17, wfd, (long)&byte, 1, 0, 0, 0) != 1 || byte != 0x42) sc(231, 93, 0, 0, 0, 0, 0);
+
+    long sat_fd = sc(257, AT_FDCWD, (long)"/sat", O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    if (sat_fd < 0 || sc(77, sat_fd, (long)(72ULL << 30), 0, 0, 0, 0) != 0) sc(231, 94, 0, 0, 0, 0, 0);
+    unsigned long off = 0;
+    for (int i = 0; i < 64; i++) {
+        long m = sc(9, 0, (long)BATCH_BYTES, PROT_RW, MAP_SHARED, sat_fd, (long)off);
+        if (m == ENOSYS) break;
+        if (is_err(m)) sc(231, 95, 0, 0, 0, 0, 0);
+        sc(11, m, (long)BATCH_BYTES, 0, 0, 0, 0);
+        off += BATCH_BYTES;
+    }
+    for (int i = 0; i < 128; i++) {
+        long m = sc(9, 0, (long)CHUNK, PROT_RW, MAP_SHARED, sat_fd, (long)off);
+        if (m == ENOSYS) break;
+        if (is_err(m)) sc(231, 96, 0, 0, 0, 0, 0);
+        sc(11, m, (long)CHUNK, 0, 0, 0, 0);
+        off += CHUNK;
+    }
+
+    sc(INJECT_PREPARED_CONFLICT_ONCE, 0, 0, 0, 0, 0, 0);
+    long sat_p = sc(9, 0, 4096, PROT_RW, MAP_SHARED, sat_fd, (long)off);
+    if (sat_p != ENOSYS) sc(231, 97, 0, 0, 0, 0, 0);
+    long parks2 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
+    if (parks2 != 2) sc(231, 98, 0, 0, 0, 0, 0);
+
+    long occ = sc(9, 0, 4096, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (is_err(occ)) sc(231, 99, 0, 0, 0, 0, 0);
+    sc(INJECT_PREPARED_CONFLICT_ONCE, 0, 0, 0, 0, 0, 0);
+    long col_p = sc(9, occ, 4096, PROT_RW, MAP_SHARED | MAP_FIXED_NOREPLACE, sat_fd, (long)off);
+    if (col_p != EEXIST) sc(231, 100, 0, 0, 0, 0, 0);
+    long parks3 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
+    if (parks3 != 2) sc(231, 101, 0, 0, 0, 0, 0);
+    long sat_p2 = sc(9, 0, 4096, PROT_RW, MAP_SHARED, sat_fd, (long)off);
+    if (sat_p2 != ENOSYS) sc(231, 102, 0, 0, 0, 0, 0);
+    long parks4 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
+    if (parks4 != 3) sc(231, 103, 0, 0, 0, 0, 0);
+
+    sc(231, 7, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+"#;
+    let dir = tempfile::tempdir().expect("tempdir for c witness");
+    let src = dir.path().join("witness.c");
+    let out = dir.path().join("witness");
+    std::fs::write(&src, c_src).expect("write witness.c");
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compile c witness");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let elf = std::fs::read(&out).expect("read compiled witness ELF");
+
+    let shared_dir = tempfile::tempdir().expect("shared host dir");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(shared_dir.path())
+            .expect("host filesystem"),
+    ));
+    let outcome =
+        kvm_pool_fixture::run_instrumented_pool_fixture_with_dispatcher(&elf, 4096, dispatcher);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "{}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}

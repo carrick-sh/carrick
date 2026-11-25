@@ -4536,7 +4536,9 @@ impl<
         }
         let origin = self.service_origin();
         let file = take.matched;
-        match memory::serve_delegated_mapping(
+        let tables = zone.tables;
+        let mm_key = task.mm.key.load(Ordering::Acquire);
+        let outcome = memory::serve_delegated_mapping(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
                 None => {
@@ -4553,19 +4555,14 @@ impl<
                 file: file.map(memory::NativeFileSource::Copied),
                 origin,
             },
-        ) {
-            memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
-            memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+        );
+        let step = match outcome {
+            memory::DelegatedAnonymous::Contended(cause) => {
+                return DelegatedStep::Contended(cause);
+            }
+            memory::DelegatedAnonymous::NotDelegated => return DelegatedStep::NotDelegated,
+            memory::DelegatedAnonymous::Settle(_) => return DelegatedStep::Settle,
             memory::DelegatedAnonymous::Served => {
-                if carrick_core::wait::complete_anonymous_edit_replay(
-                    zone.tables,
-                    slot,
-                    task.mm.key.load(Ordering::Acquire),
-                )
-                .is_err()
-                {
-                    invalid_completion(NativeInvariant::EntryBinding);
-                }
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             // A private file mapping whose retained source the root still
@@ -4580,8 +4577,11 @@ impl<
                 ))
             }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
-            memory::DelegatedAnonymous::Settle(_) => DelegatedStep::Settle,
+        };
+        if carrick_core::wait::complete_anonymous_edit_replay(tables, slot, mm_key).is_err() {
+            invalid_completion(NativeInvariant::EntryBinding);
         }
+        step
     }
     #[cfg(target_arch = "aarch64")]
     fn park_settlement(&mut self) -> Option<FamilyCompletion> {

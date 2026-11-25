@@ -219,11 +219,55 @@ pub enum FileMmapPreflight {
     Proceed,
     Return(i64),
     Park(SpaceWaitCause),
+    Settle,
+}
+
+fn check_file_mmap_root<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    args: [u64; 6],
+    model: &mut ReservationModel<'_, G, C>,
+) -> FileMmapPreflight {
+    if !model.is_admitted() {
+        return FileMmapPreflight::Proceed;
+    }
+    if model.pending().is_some() || model.fork_pending() {
+        return FileMmapPreflight::Park(SpaceWaitCause::PendingEdit);
+    }
+    let range = match model.place(mmap_placement(args), args[1]) {
+        Ok(range) => range,
+        Err(reservations::Refusal::Collision) => return FileMmapPreflight::Return(-17),
+        Err(reservations::Refusal::Invalid) => return FileMmapPreflight::Return(-EINVAL),
+        Err(reservations::Refusal::Hole | reservations::Refusal::Limit) => {
+            return FileMmapPreflight::Return(-ENOMEM);
+        }
+        Err(reservations::Refusal::Busy) => {
+            return FileMmapPreflight::Park(
+                busy_root_cause(model).unwrap_or(SpaceWaitCause::Reservations),
+            );
+        }
+        Err(reservations::Refusal::PreparedConflict) => {
+            return FileMmapPreflight::Park(SpaceWaitCause::PreparedOverlap);
+        }
+        Err(
+            reservations::Refusal::ForeignMapping
+            | reservations::Refusal::Stale
+            | reservations::Refusal::MetadataRequired,
+        ) => return FileMmapPreflight::Proceed,
+    };
+    if model.has_prepared_conflict(range) {
+        return FileMmapPreflight::Park(SpaceWaitCause::PreparedOverlap);
+    }
+    if model.has_owed_return_within(range) {
+        return match busy_root_cause(model) {
+            Some(cause) => FileMmapPreflight::Park(cause),
+            None => FileMmapPreflight::Settle,
+        };
+    }
+    FileMmapPreflight::Proceed
 }
 
 /// Preflight a delegated file `mmap(2)` against reservation placement, pending
-/// edits, and lock contention before staging a host source or claiming carrier
-/// window slots (#2975 P0 #3, r30 P0 #2).
+/// edits, prepared overlaps, owed returns, and lock contention before staging
+/// a host source or claiming carrier window slots (#2975 P0 #3, r30/r31 P0 #2).
 #[inline(never)]
 pub fn preflight_file_mmap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
     frame: &(impl AnonymousCallView + ?Sized),
@@ -260,31 +304,7 @@ pub fn preflight_file_mmap<G: ReservationGeometry, C: Copy + Send + Sync + zeroc
         }
         Err(_) => return FileMmapPreflight::Proceed,
     };
-    if !model.is_admitted() {
-        return FileMmapPreflight::Proceed;
-    }
-    if model.pending().is_some() || model.fork_pending() {
-        return FileMmapPreflight::Park(SpaceWaitCause::PendingEdit);
-    }
-    match model.place(mmap_placement(args), args[1]) {
-        Ok(_) => FileMmapPreflight::Proceed,
-        Err(reservations::Refusal::Collision) => FileMmapPreflight::Return(-17),
-        Err(reservations::Refusal::Invalid) => FileMmapPreflight::Return(-EINVAL),
-        Err(reservations::Refusal::Hole | reservations::Refusal::Limit) => {
-            FileMmapPreflight::Return(-ENOMEM)
-        }
-        Err(reservations::Refusal::Busy) => {
-            FileMmapPreflight::Park(busy_root_cause(&model).unwrap_or(SpaceWaitCause::Reservations))
-        }
-        Err(reservations::Refusal::PreparedConflict) => {
-            FileMmapPreflight::Park(SpaceWaitCause::PreparedOverlap)
-        }
-        Err(
-            reservations::Refusal::ForeignMapping
-            | reservations::Refusal::Stale
-            | reservations::Refusal::MetadataRequired,
-        ) => FileMmapPreflight::Proceed,
-    }
+    check_file_mmap_root(args, &mut model)
 }
 
 const EINVAL: i64 = 22;
@@ -1644,19 +1664,30 @@ pub fn probe_parked_anonymous_edit<
         Err(reservations::Refusal::Busy) => return Some(Some(SpaceWaitCause::Reservations)),
         Err(_) => return None,
     };
-    // Parked file `mmap` probes omit the host source (`file = None`), so keep
-    // them parked until any pending edit, fork, or claimed return settlement
-    // clears rather than letting `decide_reservation_syscall_for_origin` treat
-    // the call as `Forward` (#2975 r30 P0 #2).
-    if frame.canonical().raw() == SYS_MMAP
-        && frame.arguments()[3] & MAP_ANONYMOUS == 0
-        && (root.pending().is_some() || root.fork_pending() || root.return_settlement_claimed())
-    {
-        return Some(Some(if root.pending().is_some() || root.fork_pending() {
-            SpaceWaitCause::PendingEdit
-        } else {
-            SpaceWaitCause::Reservations
-        }));
+    // Parked file `mmap` probes omit the host source (`file = None`), so run the
+    // root preflight checks (`PendingEdit`, `PreparedOverlap`, and active return
+    // settlement) directly rather than letting `decide_reservation_syscall_for_origin`
+    // treat the call as `Forward` (#2975 r30/r31 P0 #2).
+    if frame.canonical().raw() == SYS_MMAP && frame.arguments()[3] & MAP_ANONYMOUS == 0 {
+        let args = frame.arguments();
+        if matches!(
+            MmapProtectionRoute::decode(args[2]),
+            MmapProtectionRoute::Reservation(_)
+        ) {
+            match check_file_mmap_root(args, &mut root) {
+                FileMmapPreflight::Park(cause) => return Some(Some(cause)),
+                FileMmapPreflight::Settle if root.return_settlement_claimed() => {
+                    return Some(Some(SpaceWaitCause::Reservations));
+                }
+                FileMmapPreflight::Proceed
+                | FileMmapPreflight::Return(_)
+                | FileMmapPreflight::Settle => {}
+            }
+        } else if root.pending().is_some() || root.fork_pending() {
+            return Some(Some(SpaceWaitCause::PendingEdit));
+        } else if root.return_settlement_claimed() {
+            return Some(Some(SpaceWaitCause::Reservations));
+        }
     }
     match decide_reservation_syscall_for_origin(frame, current, &mut root, None, origin) {
         ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
@@ -5570,6 +5601,136 @@ mod tests {
             assert_eq!(
                 preflight_file_mmap(&shared_frame, &delegated.task, access, &table, true),
                 FileMmapPreflight::Return(-17)
+            );
+        }
+
+        /// Codex r31 P0 #2 (#2975): an overlapping prepared copy must keep a
+        /// parked file `mmap` (`file = None` in `probe_parked_anonymous_edit`)
+        /// parked on `PreparedOverlap` rather than cycling through `Forward`
+        /// restarts, and preflight must catch it before host `MapShared`.
+        #[test]
+        fn probe_parked_file_mmap_keeps_prepared_overlap_parked() {
+            use carrick_core_abi::mm::transfer::{
+                PortalByteRange, PortalOperation, PortalRetainedData, PortalSelectedData,
+                PortalTransferIntent, PortalTransferRequest,
+            };
+
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 29, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, addr) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!((route, addr), (DelegatedAnonymous::Served, ARENA as i64));
+
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let index = spaces
+                .find(delegated.task.mm.key.load(Ordering::Acquire))
+                .unwrap();
+            let mm_id =
+                carrick_el1_abi::ReservationMm::new(delegated.task.mm.key.load(Ordering::Acquire))
+                    .unwrap();
+
+            let mut guard = root(&spaces, &table, &delegated);
+            let request = PortalTransferRequest::new(
+                PortalOperation {
+                    carrier: NonZeroU64::MIN,
+                    mm: mm_id,
+                    incarnation: NonZeroU64::new(guard.incarnation().raw()).unwrap(),
+                    sequence: NonZeroU64::MIN,
+                },
+                PortalByteRange::new(ARENA, 0x1000).unwrap(),
+                PortalTransferIntent::UserWrite,
+                PortalSelectedData {
+                    ipa: 0x2000,
+                    executable: false,
+                    root_generation: NonZeroU64::MIN,
+                    offset: 0,
+                },
+                PortalRetainedData {
+                    record: NonZeroU64::MIN,
+                    vm_generation: NonZeroU64::MIN,
+                    owner: None,
+                },
+            )
+            .unwrap();
+            let permit = unsafe { guard.prepare_copy_for_fixture(request, None) }.unwrap();
+            drop(guard);
+
+            let overlap_frame = AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED,
+                    3,
+                    0,
+                ],
+                0,
+                carrick_sched_core::SlotId::from_index(0).unwrap(),
+                UserVa::new(0x4000),
+            );
+
+            assert_eq!(
+                preflight_file_mmap(&overlap_frame, &delegated.task, access, &table, true),
+                FileMmapPreflight::Park(SpaceWaitCause::PreparedOverlap)
+            );
+            assert_eq!(
+                probe_parked_anonymous_edit(
+                    &overlap_frame,
+                    &delegated.task,
+                    access,
+                    &table,
+                    index,
+                    mm_id,
+                    0,
+                    ServiceOrigin::Initial,
+                    &crate::alloc::GLOBAL_ALLOCATOR,
+                ),
+                Some(Some(SpaceWaitCause::PreparedOverlap)),
+                "parked file mmap overlapping prepared copy must stay parked (#2975 r31 P0 #2)"
+            );
+
+            assert!(
+                table
+                    .claim_prepared::<carrick_core_abi::mm::residency::NoDynamicResidencyPin>(
+                        None, permit, request
+                    )
+                    .unwrap()
+                    .release()
+            );
+            assert_eq!(
+                probe_parked_anonymous_edit(
+                    &overlap_frame,
+                    &delegated.task,
+                    access,
+                    &table,
+                    index,
+                    mm_id,
+                    0,
+                    ServiceOrigin::Initial,
+                    &crate::alloc::GLOBAL_ALLOCATOR,
+                ),
+                Some(None)
+            );
+            assert_eq!(
+                preflight_file_mmap(&overlap_frame, &delegated.task, access, &table, true),
+                FileMmapPreflight::Proceed
             );
         }
     }

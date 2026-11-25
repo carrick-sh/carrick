@@ -2312,7 +2312,11 @@ impl<'a> FsView<'a> {
         let new_size = (offset as u64).saturating_add(length as u64);
         // Serialize concurrent two-stage materialized resizes across rewrite
         // and apply on the same open file description (#2975 P0 6).
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_before_lock();
         let _materialized_resize = description.common().lock_materialized_resize();
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_after_lock();
         // Snapshot the writeback path/contents in a scope so the borrow
         // drops before we touch this.fs.rootfs_vfs.overlay (mirrors ftruncate).
         let writeback: Option<(String, Vec<u8>)>;
@@ -2555,7 +2559,11 @@ impl<'a> FsView<'a> {
         }
         // Serialize concurrent two-stage materialized resizes across rewrite
         // and apply on the same open file description (#2975 P0 6).
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_before_lock();
         let _materialized_resize = description.common().lock_materialized_resize();
+        #[cfg(test)]
+        test_materialized_resize_hook::signal_after_lock();
         // Snapshot the path + new contents in a scope so the borrow drops
         // before we touch this.fs.rootfs_vfs.overlay.
         let writeback: Option<(String, Vec<u8>)>;
@@ -3521,10 +3529,32 @@ pub(in crate::dispatch) mod test_materialized_resize_hook {
 
     thread_local! {
         static AFTER_REWRITE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_LOCK: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
+        static AFTER_LOCK: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
     }
 
     pub(in crate::dispatch) fn install(entered: mpsc::SyncSender<()>, proceed: mpsc::Receiver<()>) {
         AFTER_REWRITE.with(|slot| *slot.borrow_mut() = Some(Hook { entered, proceed }));
+    }
+
+    pub(in crate::dispatch) fn install_lock_signals(
+        before: mpsc::SyncSender<()>,
+        after: mpsc::SyncSender<()>,
+    ) {
+        BEFORE_LOCK.with(|slot| *slot.borrow_mut() = Some(before));
+        AFTER_LOCK.with(|slot| *slot.borrow_mut() = Some(after));
+    }
+
+    pub(in crate::dispatch) fn signal_before_lock() {
+        if let Some(tx) = BEFORE_LOCK.with(|slot| slot.borrow_mut().take()) {
+            let _ = tx.send(());
+        }
+    }
+
+    pub(in crate::dispatch) fn signal_after_lock() {
+        if let Some(tx) = AFTER_LOCK.with(|slot| slot.borrow_mut().take()) {
+            let _ = tx.send(());
+        }
     }
 
     pub(in crate::dispatch) fn notify_after_rewrite() {
