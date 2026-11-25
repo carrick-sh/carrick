@@ -3079,8 +3079,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
             }?;
             // Any crossing can advance the fork stock's release, which only
-            // flags a parked exec's row: every crossing ends with the probe.
-            custody.probe_parked_execs(lease.cpu)?;
+            // flags a parked exec's row: every crossing the guest continues
+            // from ends with the probe (a root exit or run failure ends it).
+            if served.0.is_none() {
+                custody.probe_parked_execs(lease.cpu)?;
+            }
             if take_work {
                 work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
             }
@@ -3544,8 +3547,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
             }?;
             // Any crossing can advance the fork stock's release, which only
-            // flags a parked exec's row: every crossing ends with the probe.
-            custody.probe_parked_execs(lease.cpu)?;
+            // flags a parked exec's row: every crossing the guest continues
+            // from ends with the probe (a root exit or run failure ends it).
+            if served.0.is_none() {
+                custody.probe_parked_execs(lease.cpu)?;
+            }
             if take_work {
                 work_flags = Some(take_production_work_boundary(custody.task(slot))?);
             }
