@@ -105,6 +105,7 @@ pub struct Stage2Mapping {
     generation: CarrierVmGeneration,
     ipa: u64,
     size: usize,
+    perms: MemPerms,
 }
 
 impl Stage2Mapping {
@@ -121,6 +122,11 @@ impl Stage2Mapping {
     /// The extent's length in bytes.
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// The stage-2 permissions installed for this extent.
+    pub fn perms(&self) -> MemPerms {
+        self.perms
     }
 }
 
@@ -295,6 +301,7 @@ impl<R> Stage2Generation<'_, R> {
             generation: self.generation,
             ipa,
             size,
+            perms,
         })
     }
 

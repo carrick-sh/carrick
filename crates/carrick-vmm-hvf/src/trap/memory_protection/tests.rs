@@ -3187,8 +3187,12 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
             }
             registry.push(target_alias);
             registry.push(cold_alias);
-            // Exhaust cold_alias replay epoch and clear its cache membership so
-            // `contains_replay` returns false (cold lookup) before epoch check.
+        });
+        // Configure exhausted replay epoch & cold cache membership directly on the
+        // registry AFTER `mutate_external_alias_state` finishes so delta-epoch
+        // tracking bumps cleanly first and doesn't overflow `u64::MAX` in setup.
+        {
+            let mut registry = alias_registry().lock();
             registry.remove_replay_in_scope(cold_scope, &replay_mapping_key(cold_alias));
             registry
                 .by_scope
@@ -3198,7 +3202,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
                 .replay_epochs
                 .insert(cold_ipa, u64::MAX);
             assert_eq!(registry.recomputed_replay_counts(), registry.replay_counts);
-        });
+        }
 
         let before_cold_rows = alias_state_rows_scanned();
         let before_cold_scopes = alias_replay_scopes_probed();

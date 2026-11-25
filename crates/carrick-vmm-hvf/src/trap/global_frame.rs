@@ -2090,7 +2090,7 @@ pub(crate) fn register_carrier_stage2_leases(
 ) -> Result<Vec<CarrierStage2RecordIdentity>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
     let mut distinct = std::collections::BTreeSet::new();
-    let registered = custody.carrier_stage2_records.lock();
+    let mut registered = custody.carrier_stage2_records.lock();
     let mut validation_error = None;
     for (&key, lease) in keys.iter().zip(leases.iter()) {
         if !distinct.insert(key) || registered.contains_key(&key) {
@@ -2109,8 +2109,8 @@ pub(crate) fn register_carrier_stage2_leases(
             break;
         }
     }
-    drop(registered);
     if let Some(error) = validation_error {
+        drop(registered);
         let mut rollback_error = None;
         for mut lease in leases.drain(..) {
             if let Err(err) = lease.try_retire(custody) {
@@ -2123,30 +2123,32 @@ pub(crate) fn register_carrier_stage2_leases(
             ))
         }));
     }
-    let mut registered = custody.carrier_stage2_records.lock();
     let mut pending = std::mem::take(leases);
     let mut pending_iter = pending.drain(..);
     let mut identities = Vec::with_capacity(keys.len());
-    let mut transfer_error = None;
+    let mut transfer_error: Option<(TrapError, GlobalFrameStage2Lease)> = None;
     for (key, lease) in keys.iter().copied().zip(&mut pending_iter) {
-        match transfer_global_frame_stage2_lease_to_custody(
+        let installed_perms = lease.mapping.as_ref().map_or(0, |mapping| {
+            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms())
+        });
+        match try_transfer_global_frame_stage2_lease_no_rollback(
             custody,
             lease,
             owner_hosts[&key],
-            0,
+            installed_perms,
             None,
         ) {
             Ok(identity) => {
                 registered.insert(key, identity);
                 identities.push(identity);
             }
-            Err(error) => {
-                transfer_error = Some(error);
+            Err(boxed) => {
+                transfer_error = Some(*boxed);
                 break;
             }
         }
     }
-    if let Some(error) = transfer_error {
+    if let Some((error, mut failed_lease)) = transfer_error {
         drop(registered);
         let mut rollback_error = None;
         for identity in identities {
@@ -2154,6 +2156,9 @@ pub(crate) fn register_carrier_stage2_leases(
                 rollback_error.get_or_insert(retire_err);
                 custody.abandon_carrier_stage2_record(identity);
             }
+        }
+        if let Err(retire_err) = failed_lease.try_retire(custody) {
+            rollback_error.get_or_insert(retire_err);
         }
         for mut remaining in pending_iter {
             if let Err(retire_err) = remaining.try_retire(custody) {
@@ -2275,12 +2280,25 @@ pub(crate) fn cleared_stage2_record_identity() -> CarrierStage2RecordIdentity {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) enum StructuralSafePointRetirement {
+    Retired,
+    DeferredActivePins,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_structural_stage2_record_at_safe_point(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
-) -> Result<(), TrapError> {
+) -> Result<StructuralSafePointRetirement, TrapError> {
     if identity.record_id.0 == 0 {
-        return Ok(());
+        return Ok(StructuralSafePointRetirement::Retired);
     }
     match custody.retire_stage2_record(identity) {
         CarrierStage2RetireOutcome::RetiredUnmapped
@@ -2296,14 +2314,14 @@ pub(crate) fn retire_structural_stage2_record_at_safe_point(
             };
             drop(extracted);
             drop_carrier_lease_keeper(custody, identity.record_id);
-            Ok(())
+            Ok(StructuralSafePointRetirement::Retired)
         }
         CarrierStage2RetireOutcome::NotFound => {
             let retained_by_record = custody.structural_backings.lock();
             if !retained_by_record.contains_key(&identity.record_id)
                 && custody.stage2_record_snapshot(identity.record_id).is_none()
             {
-                Ok(())
+                Ok(StructuralSafePointRetirement::Retired)
             } else {
                 Err(TrapError::Hypervisor(
                     "retire structural stage-2 record at safe point: inconsistent missing record"
@@ -2311,7 +2329,9 @@ pub(crate) fn retire_structural_stage2_record_at_safe_point(
                 ))
             }
         }
-        CarrierStage2RetireOutcome::DeferredActivePins => Ok(()),
+        CarrierStage2RetireOutcome::DeferredActivePins => {
+            Ok(StructuralSafePointRetirement::DeferredActivePins)
+        }
         outcome => Err(TrapError::Hypervisor(format!(
             "retire structural stage-2 record at safe point: {outcome:?}"
         ))),
@@ -2408,20 +2428,66 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
 
 fn transfer_global_frame_stage2_lease_with_backing_to_custody(
     custody: &CarrierVmCustody,
-    mut lease: GlobalFrameStage2Lease,
+    lease: GlobalFrameStage2Lease,
     host_addr: usize,
     perms: u64,
     logical_owner: Option<CarrierLogicalOwner>,
     rollback_backing: &mut Option<crate::host_mapping::OwnedHostMapping>,
 ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+    match try_transfer_global_frame_stage2_lease_no_rollback(
+        custody,
+        lease,
+        host_addr,
+        perms,
+        logical_owner,
+    ) {
+        Ok(identity) => Ok(identity),
+        Err(boxed) => {
+            let (registration_error, mut failed_lease) = *boxed;
+            failed_lease
+                .try_retire_with_backing(custody, rollback_backing.take())
+                .map_err(|rollback_error| {
+                    TrapError::Hypervisor(format!(
+                        "{registration_error}; explicit pre-custody rollback failed: {rollback_error}"
+                    ))
+                })?;
+            Err(registration_error)
+        }
+    }
+}
+
+fn try_transfer_global_frame_stage2_lease_no_rollback(
+    custody: &CarrierVmCustody,
+    mut lease: GlobalFrameStage2Lease,
+    host_addr: usize,
+    perms: u64,
+    logical_owner: Option<CarrierLogicalOwner>,
+) -> Result<CarrierStage2RecordIdentity, Box<(TrapError, GlobalFrameStage2Lease)>> {
     if !lease.active || !lease.mapped || host_addr == 0 {
-        return Err(TrapError::Hypervisor(format!(
+        let error = TrapError::Hypervisor(format!(
             "global frame host owner lease is not active and mapped: key={:?} active={} mapped={} host=0x{host_addr:x}",
             lease.key(),
             lease.active,
             lease.mapped,
+        ));
+        return Err(Box::new((error, lease)));
+    }
+    let installed_perms = lease
+        .mapping
+        .as_ref()
+        .map(|mapping| carrick_aarch64::stage2::stage2_perms_bits(mapping.perms()));
+    if let Some(installed) = installed_perms
+        && perms != 0
+        && installed != perms
+    {
+        return Err(Box::new((
+            TrapError::Hypervisor(format!(
+                "global frame lease permissions mismatch: expected=0x{perms:x} installed=0x{installed:x}"
+            )),
+            lease,
         )));
     }
+    let effective_perms = installed_perms.unwrap_or(perms);
     let mut lease_keeper = lease.backing_keeper.take();
     let registration = (|| {
         let expected_generation = lease
@@ -2474,7 +2540,7 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
                 mapped: lease.mapped,
                 backend_map_installed,
                 release_ipa: lease.release_ipa,
-                perms,
+                perms: effective_perms,
                 logical_owner: Some(logical_owner),
             },
             mapping,
@@ -2486,7 +2552,7 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
             ))
         })?;
         if let Some(keeper) = lease_keeper.take() {
-            let prev = custody.carrier_lease_keepers.lock().insert(
+            let prev = custody.carrier_lease_keepers.lock().entries.insert(
                 identity.record_id,
                 super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper),
             );
@@ -2497,14 +2563,8 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
     let identity = match registration {
         Ok(identity) => identity,
         Err(registration_error) => {
-            lease
-                .try_retire_with_keeper(custody, rollback_backing.take(), lease_keeper)
-                .map_err(|rollback_error| {
-                    TrapError::Hypervisor(format!(
-                        "{registration_error}; explicit pre-custody rollback failed: {rollback_error}"
-                    ))
-                })?;
-            return Err(registration_error);
+            lease.backing_keeper = lease_keeper;
+            return Err(Box::new((registration_error, lease)));
         }
     };
     lease.active = false;
@@ -3429,6 +3489,7 @@ fn drop_carrier_lease_keeper(custody: &CarrierVmCustody, record_id: CarrierStage
     let keeper = custody
         .carrier_lease_keepers
         .lock()
+        .entries
         .remove(&record_id)
         .map(super::carrier_custody::CarrierLeaseKeeperState::into_keeper);
     drop(keeper);
@@ -4084,6 +4145,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             if custody
                 .carrier_lease_keepers
                 .lock()
+                .entries
                 .get(&old_identity.record_id)
                 .is_some_and(super::carrier_custody::CarrierLeaseKeeperState::is_abandoned)
             {
@@ -4104,19 +4166,34 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                 ))
             })?;
             records.insert(key, new_identity);
+            let old_pinned = stage2
+                .stage2_records
+                .get(&old_identity.record_id)
+                .is_some_and(|record| record.snapshot.pin_count != 0);
             {
                 let mut keepers = custody.carrier_lease_keepers.lock();
-                if let Some(super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper)) =
-                    keepers.remove(&old_identity.record_id)
-                {
-                    let prev = keepers.insert(
+                let keeper = if old_pinned {
+                    keepers
+                        .entries
+                        .get(&old_identity.record_id)
+                        .map(super::carrier_custody::CarrierLeaseKeeperState::clone_keeper)
+                } else {
+                    keepers
+                        .entries
+                        .remove(&old_identity.record_id)
+                        .map(super::carrier_custody::CarrierLeaseKeeperState::into_keeper)
+                };
+                if let Some(keeper) = keeper {
+                    let prev = keepers.entries.insert(
                         new_identity.record_id,
                         super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper),
                     );
                     debug_assert!(prev.is_none());
                 }
             }
-            let _ = stage2.remove_record(old_identity.record_id);
+            if !old_pinned {
+                let _ = stage2.remove_record(old_identity.record_id);
+            }
             drop(stage2);
             drop(records);
             report.rebound += 1;

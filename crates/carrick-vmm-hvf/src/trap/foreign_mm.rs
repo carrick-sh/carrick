@@ -465,14 +465,21 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
                 .stage2_record_snapshot(identity.record_id)
                 .is_some()
         {
-            retire_structural_stage2_record_at_safe_point(&self.custody, identity)
-                .map_err(|error| error.to_string())?;
+            match retire_structural_stage2_record_at_safe_point(&self.custody, identity)
+                .map_err(|error| error.to_string())?
+            {
+                crate::trap::StructuralSafePointRetirement::Retired => {}
+                crate::trap::StructuralSafePointRetirement::DeferredActivePins => {
+                    return Err("raw table capacity retirement is still pinned".to_owned());
+                }
+            }
         }
         if identity.record_id.0 != 0
-            && self
-                .custody
-                .stage2_record_snapshot(identity.record_id)
-                .is_some()
+            && (owner.record_identity().record_id.0 != 0
+                || self
+                    .custody
+                    .stage2_record_snapshot(identity.record_id)
+                    .is_some())
         {
             return Err("raw table capacity retirement is still pinned".to_owned());
         }

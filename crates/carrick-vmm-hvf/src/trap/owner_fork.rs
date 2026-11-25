@@ -530,6 +530,7 @@ pub(crate) struct OwnerPhysicalForkBuilder {
     container_root: ContainerRootToken,
     persistent: bool,
     settled: bool,
+    rollback_failed: bool,
 }
 // SAFETY: like ProcessSpec, this owns physical allocations and carrier VM
 // lifetime; its pointers are resolved through retained structural owners.
@@ -666,12 +667,37 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
         for owner in &self.published {
             if !committed {
                 // Physical retirement is exact and precedes logical slot return.
-                let identity = *owner.retained.record_identity.lock();
+                let identity = owner.record_identity();
                 if identity.record_id.0 != 0 {
-                    retire_structural_stage2_record_at_safe_point(
+                    match retire_structural_stage2_record_at_safe_point(
                         &self.physical.custody,
                         identity,
-                    )?;
+                    ) {
+                        Ok(crate::trap::StructuralSafePointRetirement::Retired) => {}
+                        Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
+                            self.rollback_failed = true;
+                            return Err(TrapError::Hypervisor(
+                                "fork rollback structural backing retirement is still pinned"
+                                    .to_owned(),
+                            ));
+                        }
+                        Err(error) => {
+                            self.rollback_failed = true;
+                            return Err(error);
+                        }
+                    }
+                    if owner.record_identity().record_id.0 != 0
+                        || self
+                            .physical
+                            .custody
+                            .stage2_record_snapshot(identity.record_id)
+                            .is_some()
+                    {
+                        self.rollback_failed = true;
+                        return Err(TrapError::Hypervisor(
+                            "fork rollback structural backing remained unretired".to_owned(),
+                        ));
+                    }
                 }
             }
             self.state
@@ -691,15 +717,43 @@ impl Drop for OwnerPhysicalForkBuilder {
         for owner in &self.published {
             let identity = owner.record_identity();
             if identity.record_id.0 == 0 {
+                self.state
+                    .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
                 continue;
             }
-            retire_structural_stage2_record_at_safe_point(&self.physical.custody, identity)
-                .unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!(
-                        "hvpatch::stage2_lifecycle",
-                        "unpublished owner Fork capacity retirement failed: {error}"
-                    );
-                });
+            if self.rollback_failed {
+                continue;
+            }
+            let retired = match retire_structural_stage2_record_at_safe_point(
+                &self.physical.custody,
+                identity,
+            ) {
+                Ok(crate::trap::StructuralSafePointRetirement::Retired) => {
+                    if owner.record_identity().record_id.0 != 0
+                        || self
+                            .physical
+                            .custody
+                            .stage2_record_snapshot(identity.record_id)
+                            .is_some()
+                    {
+                        Err("structural backing left live record".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
+                    // Active pins retain both the physical record and logical
+                    // structural owner slot until pin drain settles them.
+                    continue;
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            retired.unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "hvpatch::stage2_lifecycle",
+                    "unpublished owner Fork capacity retirement failed: {error}"
+                );
+            });
             self.state
                 .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
         }
@@ -799,6 +853,7 @@ impl HvfVmState {
             container_root: self.task.container_root,
             persistent: self.task.persistent_vm_lifecycle,
             settled: false,
+            rollback_failed: false,
         }))
     }
 }
