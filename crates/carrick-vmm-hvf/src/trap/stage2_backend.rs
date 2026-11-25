@@ -528,7 +528,6 @@ pub(crate) unsafe fn stage2_map_replay(
     const MAX_REPLAY_PHASE2_RETRIES: usize = 4;
     let mut slice_buf: Vec<(u64, AliasBacking)> = Vec::with_capacity(super::LAZY_REPLAY_ROW_BUDGET);
     let mut candidates: Vec<(u64, AliasBacking)> = Vec::new();
-    let mut allowed_ipas: Vec<u64> = Vec::new();
     let mut watch_guard = ReplayWatchGuard(None);
     #[cfg(test)]
     let mut fired_phase1_lookup_hook = false;
@@ -552,7 +551,7 @@ pub(crate) unsafe fn stage2_map_replay(
                     if slice_cursor.is_none() {
                         phase1_start_rev = registry.revision();
                     }
-                    match lookup {
+                    let step = match lookup {
                         ReplayAliasLookup::Ipa { gpa } => registry.collect_replay_ipa_slice(
                             gpa,
                             slice_cursor,
@@ -578,7 +577,31 @@ pub(crate) unsafe fn stage2_map_replay(
                                 super::LAZY_REPLAY_ROW_BUDGET,
                                 &mut slice_buf,
                             ),
+                    };
+                    if attempt > 0
+                        && slice_cursor.is_none()
+                        && matches!(step, super::ReplaySliceStep::Complete)
+                    {
+                        let target = match lookup {
+                            ReplayAliasLookup::Ipa { gpa } => super::ReplayWatchTarget::Ipa { gpa },
+                            ReplayAliasLookup::VaAnyScope { va } => {
+                                super::ReplayWatchTarget::VaAnyScope { va }
+                            }
+                            ReplayAliasLookup::VaProcess {
+                                va,
+                                mm_root_slot,
+                                container_root,
+                            } => super::ReplayWatchTarget::VaProcess {
+                                va,
+                                scopes: super::AliasRegistry::process_visible_scopes(
+                                    mm_root_slot,
+                                    container_root,
+                                ),
+                            },
+                        };
+                        watch_guard.set(registry.open_replay_watch_for_single_slice(target));
                     }
+                    step
                 };
                 candidates.append(&mut slice_buf);
                 if let super::ReplaySliceStep::Continue(next) = step {
@@ -655,12 +678,6 @@ pub(crate) unsafe fn stage2_map_replay(
                 return Ok(None);
             };
             let skipped_higher_priority = found_idx > 0;
-            if !allowed_ipas.contains(&backing.physical_ipa) {
-                if !allow_ipa(backing.physical_ipa) {
-                    return Ok(None);
-                }
-                allowed_ipas.push(backing.physical_ipa);
-            }
             #[cfg(test)]
             if !fired_before_guard_hook {
                 fired_before_guard_hook = true;
@@ -698,6 +715,11 @@ pub(crate) unsafe fn stage2_map_replay(
             attempt += 1;
         }
     };
+    // Enforce per-IPA remap rate limit only after Phase 2 confirms freshness and exact
+    // registration so stale candidates neither waste budget nor suppress replacement retries.
+    if !allow_ipa(backing.physical_ipa) {
+        return Ok(None);
+    }
     let key = replay_mapping_key(backing);
     if registry.contains_replay(&key) {
         return Ok(Some((backing, Stage2Status::SUCCESS)));

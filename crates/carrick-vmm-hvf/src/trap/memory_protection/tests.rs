@@ -4595,7 +4595,6 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
             owner_generation: 0,
         };
         let replacement = AliasBacking {
-            ipa: ipa_new_pref,
             host_addr: host_16k,
             size: 0x4000,
             physical_ipa: ipa_new_pref,
@@ -4651,7 +4650,6 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         owner_generation: 0,
     };
     let replacement_va_16k = AliasBacking {
-        ipa: ipa_new_pref,
         host_addr: host_16k,
         size: 0x4000,
         physical_ipa: ipa_new_pref,
@@ -4705,7 +4703,15 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
             &custody,
             g1,
             ReplayAliasLookup::VaAnyScope { va: va_pref },
-            &mut |_| true,
+            &mut |ipa| {
+                // Codex #19 P0-2: stale fallback IPA may already be limiter-exhausted (false);
+                // Phase 2 must detect the dirty watch and retry BEFORE querying allow_ipa.
+                assert_ne!(
+                    ipa, ipa_old_fb,
+                    "allow_ipa must not be called for stale fallback IPA"
+                );
+                ipa == ipa_new_pref
+            },
         )
     };
     custody.stage2.set_hook(None);
@@ -4722,6 +4728,119 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         "must not map older live fallback after preferred row was replaced"
     );
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_new_pref, 0x4000));
+
+    // Subcase 5d (Codex #19 P0-3): Single-slice fallback (`[older_single_fb, dead_preferred]`)
+    // under continuous disjoint sibling writes must arm a live watch on retry and never hit
+    // `MAX_REPLAY_PHASE2_RETRIES` exhaustion.
+    let (disjoint_ready_tx, disjoint_ready_rx) = std::sync::mpsc::channel::<()>();
+    let stop_disjoint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_disjoint_clone = std::sync::Arc::clone(&stop_disjoint);
+    let sibling = std::thread::spawn(move || {
+        let base_row = AliasBacking {
+            start: 0xa100_0000,
+            ipa: 0x8f00_0000,
+            host_addr: 0,
+            size: 0x4000,
+            physical_ipa: 0x8f00_0000,
+            physical_host_addr: 0,
+            physical_size: 0x4000,
+            perms,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(20_000)),
+            inventory_backing: InventoryBackingIdentity::Private(20_000),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        {
+            alias_registry().lock().push(base_row);
+        }
+        let _ = disjoint_ready_tx.send(());
+        let mut iter_count = 0_u64;
+        while !stop_disjoint_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            iter_count += 1;
+            let toggled = AliasBacking {
+                inventory_backing: InventoryBackingIdentity::Private(20_000 + (iter_count & 1)),
+                ..base_row
+            };
+            {
+                let mut registry = alias_registry().lock();
+                let _ = registry.upsert_by_key(toggled);
+            }
+            if iter_count.is_multiple_of(8) {
+                std::thread::yield_now();
+            }
+        }
+    });
+    disjoint_ready_rx.recv().expect("sibling started");
+    for iter in 0..10_u64 {
+        let va_single = 0x5200_0000 + iter * 0x10_0000;
+        let ipa_single_fb = 0x7d40_0000 + iter * 0x10_0000;
+        let single_fb = AliasBacking {
+            start: va_single,
+            ipa: ipa_single_fb,
+            host_addr: host_16k,
+            size: 0x4000,
+            physical_ipa: ipa_single_fb,
+            physical_host_addr: host_16k,
+            physical_size: 0x4000,
+            perms,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
+                18_000 + iter * 2,
+            )),
+            inventory_backing: InventoryBackingIdentity::Private(18_000 + iter * 2),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let single_dead_pref = AliasBacking {
+            start: va_single,
+            ipa: ipa_single_fb + 0x1_0000,
+            host_addr: 0,
+            size: 0x4000,
+            physical_ipa: ipa_single_fb + 0x1_0000,
+            physical_host_addr: 0,
+            physical_size: 0x4000,
+            perms,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
+                18_001 + iter * 2,
+            )),
+            inventory_backing: InventoryBackingIdentity::Private(18_001 + iter * 2),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        {
+            let mut registry = alias_registry().lock();
+            registry.push(single_fb);
+            registry.push(single_dead_pref);
+            registry.clear_replay_mappings_in();
+        }
+        assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
+        let res_single_churn = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::VaAnyScope { va: va_single },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(
+            res_single_churn,
+            Ok(Some((
+                single_fb,
+                carrick_aarch64::stage2::Stage2Status::SUCCESS
+            )))
+        );
+        assert!(ScopedStage2MapTestStub::is_mapped(ipa_single_fb, 0x4000));
+    }
+    stop_disjoint.store(true, std::sync::atomic::Ordering::Release);
+    sibling.join().expect("sibling joined");
 
     mutate_external_alias_state(|registry| {
         assert!(

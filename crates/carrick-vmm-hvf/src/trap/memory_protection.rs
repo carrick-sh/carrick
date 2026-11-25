@@ -1603,6 +1603,18 @@ impl AliasRegistry {
         id
     }
 
+    pub(crate) fn open_replay_watch_for_single_slice(&mut self, target: ReplayWatchTarget) -> u64 {
+        self.open_replay_watch(
+            target,
+            0,
+            ClassSliceCursor {
+                class: 0,
+                start_key: 0,
+                next_pos: 0,
+            },
+        )
+    }
+
     pub(crate) fn update_replay_watch(
         &mut self,
         watch_id: u64,
