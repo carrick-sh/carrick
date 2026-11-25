@@ -16040,4 +16040,78 @@ mod window_size_door {
         }
         assert_eq!(std::fs::read(&windowed).unwrap(), vec![0x42; 8192]);
     }
+
+    /// Review P0 3 on 5a4211a5b (#2975): the object a materialized resize's
+    /// rewrite opens is not the one a check of its path beside it named.
+    /// The rootfs's cached lookup of `/m` still names the plain file it
+    /// created, but the host name now holds a windowed file (replaced on
+    /// the host, behind the cache). The rewrite opens the windowed file, so
+    /// the door must refuse it on that object, and the guest must see the
+    /// refusal with nothing changed. Red before: the path pre-check
+    /// admitted on the cached plain inode, the rewrite was refused, and the
+    /// discarded refusal left `ftruncate` answering 0 with the copy
+    /// shrunk.
+    #[test]
+    fn a_materialized_resize_whose_name_now_holds_a_windowed_file_changes_nothing() {
+        let mut run = Run::new();
+        let plain = run.rootfs_file("/m", 8192);
+        let cached = run.dispatcher.fs.rootfs_vfs.path_inode_identity("/m");
+        assert!(cached.is_some(), "the rootfs caches /m's plain inode");
+        let windowed = run.scratch.path().join("w");
+        std::fs::write(&windowed, vec![0x17; 8192]).unwrap();
+        let _pin = window(&run, &windowed);
+        std::fs::rename(&windowed, &plain).unwrap();
+        // The setup's premise: the rootfs still names the replaced inode.
+        assert_eq!(
+            run.dispatcher.fs.rootfs_vfs.path_inode_identity("/m"),
+            cached,
+            "the cached lookup is stale"
+        );
+        let desc = OpenDescription::File {
+            path: "/m".to_string(),
+            contents: FileContents::dense(vec![0x42; 8192]),
+            offset: 6000,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/m"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 8192,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
+            panic!("install_fd");
+        };
+        for (number, args) in [
+            (SYS_FTRUNCATE, [fd as u64, 4096, 0, 0, 0, 0]),
+            // fallocate(fd, 0, 0, 16384): a grow, rewritten by path.
+            (47, [fd as u64, 0, 0, 16384, 0, 0]),
+        ] {
+            assert_eq!(
+                run.call(number, None, args),
+                DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS),
+                "syscall {number}"
+            );
+            let file = run.dispatcher.open_file(fd as i32).unwrap();
+            let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+            let OpenDescription::File {
+                contents,
+                offset,
+                metadata,
+                ..
+            } = &*open
+            else {
+                panic!("a materialized description");
+            };
+            assert_eq!(contents.len().unwrap(), 8192, "syscall {number}: the copy");
+            assert_eq!(*offset, 6000, "syscall {number}: the offset");
+            assert_eq!(metadata.size, 8192, "syscall {number}: the metadata");
+        }
+        assert_eq!(
+            std::fs::read(&plain).unwrap(),
+            vec![0x17; 8192],
+            "the windowed file now at /m keeps its bytes"
+        );
+    }
 }
