@@ -16,6 +16,7 @@ use super::*;
     ::core::cmp::Ord,
     ::core::cmp::PartialEq,
     ::core::cmp::PartialOrd,
+    ::core::hash::Hash,
 )]
 pub(crate) enum InventoryBackingIdentity {
     Private(u64),

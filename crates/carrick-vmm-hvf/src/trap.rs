@@ -793,6 +793,7 @@ pub fn carrier_vm_live() -> bool {
     ::core::fmt::Debug,
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
+    ::core::hash::Hash,
 )]
 pub(crate) enum GuestMappingSharing {
     Private,

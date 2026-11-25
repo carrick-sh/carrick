@@ -20,6 +20,7 @@ pub(crate) mod tests;
     ::core::cmp::PartialEq,
     ::core::cmp::Ord,
     ::core::cmp::PartialOrd,
+    ::core::hash::Hash,
 )]
 pub(crate) enum AliasOwnershipScope {
     /// Alias belongs to the root address space of a specific container in this carrier.
@@ -67,6 +68,7 @@ pub(crate) fn rebind_inherited_alias_to_process(
     ::core::fmt::Debug,
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
+    ::core::hash::Hash,
 )]
 pub(crate) struct AliasBacking {
     /// Guest VIRTUAL start of the alias (the syscall-path region key).
@@ -620,49 +622,133 @@ impl AliasClassIndex {
         oldest.map(|(_, alias)| alias)
     }
 
-    /// Collect matching rows containing `probe` under an explicit row-inspection
-    /// budget (`row_budget`), returning `(seq, row)` candidates plus the exact
-    /// count of inspected rows. When `newest_first` is true, each bucket is
-    /// sampled from its newest tail (`rows` end); otherwise from its oldest head.
-    pub(crate) fn collect_containing_candidates_bounded(
+    /// Collect the next batch (up to `batch_limit`) of matching rows containing
+    /// `probe` strictly past `cursor` across ALL size classes in `seq` priority
+    /// order (`seq > cursor` ascending when `!newest_first`; `seq < cursor`
+    /// descending when `newest_first`). Returns `(sorted_batch, has_more)` so
+    /// callers can probe liveness in batches without ever discarding deeper live
+    /// rows or letting one class/bucket starve another.
+    pub(crate) fn collect_containing_candidates_from_cursor(
         &self,
         probe: u64,
         newest_first: bool,
-        row_budget: usize,
+        cursor: Option<u64>,
+        batch_limit: usize,
         mut matches: impl FnMut(&AliasBacking) -> bool,
-    ) -> (Vec<(u64, AliasBacking)>, usize) {
-        let mut remaining = row_budget;
-        let mut total_scanned = 0_usize;
-        let mut found = Vec::new();
-        for &class in self.class_counts.keys() {
-            if remaining == 0 {
-                break;
+    ) -> (Vec<(u64, AliasBacking)>, bool) {
+        #[derive(
+            ::core::marker::Copy, ::core::clone::Clone, ::core::cmp::Eq, ::core::cmp::PartialEq,
+        )]
+        struct HeapItem {
+            priority_key: u64,
+            seq: u64,
+            alias: AliasBacking,
+        }
+        impl Ord for HeapItem {
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+                self.priority_key.cmp(&other.priority_key)
             }
+        }
+        impl PartialOrd for HeapItem {
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        if batch_limit == 0 {
+            return (Vec::new(), false);
+        }
+        // Max-heap on `priority_key` keeps the `batch_limit` items with SMALLEST
+        // `priority_key`: `seq` for oldest-first, `u64::MAX - seq` for newest-first.
+        let priority_of = |seq: u64| if newest_first { u64::MAX - seq } else { seq };
+        let mut heap: std::collections::BinaryHeap<HeapItem> =
+            std::collections::BinaryHeap::with_capacity(batch_limit);
+        let mut has_more = false;
+        for &class in self.class_counts.keys() {
             let radius = Self::class_radius(class);
             let lower = probe.saturating_sub(radius.saturating_sub(1));
             for (&(_class, start_key), rows) in
                 self.by_class_start.range((class, lower)..=(class, probe))
             {
-                if remaining == 0 {
-                    break;
-                }
-                let take = rows.len().min(remaining);
-                remaining -= take;
-                total_scanned += take;
-                note_alias_state_rows_scanned(take);
-                let window = if newest_first {
-                    &rows[rows.len() - take..]
+                if newest_first {
+                    let end_idx =
+                        cursor.map_or(rows.len(), |c| rows.partition_point(|&(seq, _)| seq < c));
+                    for &(seq, alias) in rows[..end_idx].iter().rev() {
+                        let key = priority_of(seq);
+                        if heap.len() == batch_limit
+                            && let Some(worst) = heap.peek()
+                            && key >= worst.priority_key
+                        {
+                            has_more = true;
+                            break;
+                        }
+                        note_alias_state_rows_scanned(1);
+                        if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
+                            if heap.len() < batch_limit {
+                                heap.push(HeapItem {
+                                    priority_key: key,
+                                    seq,
+                                    alias,
+                                });
+                            } else if let Some(worst) = heap.peek()
+                                && key < worst.priority_key
+                            {
+                                let _ = heap.pop();
+                                heap.push(HeapItem {
+                                    priority_key: key,
+                                    seq,
+                                    alias,
+                                });
+                                has_more = true;
+                            }
+                        }
+                    }
                 } else {
-                    &rows[..take]
-                };
-                for &(seq, alias) in window {
-                    if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
-                        found.push((seq, alias));
+                    let start_idx =
+                        cursor.map_or(0, |c| rows.partition_point(|&(seq, _)| seq <= c));
+                    for &(seq, alias) in &rows[start_idx..] {
+                        let key = priority_of(seq);
+                        if heap.len() == batch_limit
+                            && let Some(worst) = heap.peek()
+                            && key >= worst.priority_key
+                        {
+                            has_more = true;
+                            break;
+                        }
+                        note_alias_state_rows_scanned(1);
+                        if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
+                            if heap.len() < batch_limit {
+                                heap.push(HeapItem {
+                                    priority_key: key,
+                                    seq,
+                                    alias,
+                                });
+                            } else if let Some(worst) = heap.peek()
+                                && key < worst.priority_key
+                            {
+                                let _ = heap.pop();
+                                heap.push(HeapItem {
+                                    priority_key: key,
+                                    seq,
+                                    alias,
+                                });
+                                has_more = true;
+                            }
+                        }
                     }
                 }
             }
         }
-        (found, total_scanned)
+        let mut ordered: Vec<(u64, AliasBacking)> = heap
+            .into_iter()
+            .map(|item| (item.seq, item.alias))
+            .collect();
+        if newest_first {
+            ordered.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        } else {
+            ordered.sort_by_key(|(seq, _)| *seq);
+        }
+        (ordered, has_more)
     }
 }
 
@@ -1078,6 +1164,16 @@ pub(crate) struct AliasRegistry {
     /// `by_scope` buckets so [`Self::contains_replay`] stays O(log K) without
     /// walking unrelated scopes.
     pub(crate) replay_counts: std::collections::BTreeMap<ReplayMappingKey, usize>,
+    /// Exact `(physical_ipa, physical_size) -> { scope -> count }` index of
+    /// active `bucket.replay` entries so `forget_replay_extent` finds matching
+    /// scopes in O(log K) without ever scanning unrelated `by_scope` entries.
+    pub(crate) replay_scopes_by_extent: std::collections::BTreeMap<
+        (u64, usize),
+        std::collections::BTreeMap<AliasOwnershipScope, usize>,
+    >,
+    /// Exact active row multiplicity for O(1) point revalidation under
+    /// `(stage2, alias_registry)`.
+    pub(crate) exact_row_counts: std::collections::HashMap<AliasBacking, usize>,
     /// First row for each exact semantic key inside a scope: insertion sequence
     /// and value. Receipt publication asks exactly this question for every row;
     /// locating it through the scope `Vec` made a k-row publication O(k * rows-in-mm).
@@ -1356,6 +1452,7 @@ impl AliasRegistry {
             .or_default()
             .entry(alias.physical_size as u64)
             .or_default() += 1;
+        *self.exact_row_counts.entry(alias).or_insert(0) += 1;
     }
 
     pub(crate) fn index_remove(&mut self, seq: u64, alias: AliasBacking) {
@@ -1413,6 +1510,12 @@ impl AliasRegistry {
                 self.by_physical_start.remove(&alias.physical_ipa);
             }
         }
+        if let Some(count) = self.exact_row_counts.get_mut(&alias) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.exact_row_counts.remove(&alias);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1428,9 +1531,16 @@ impl AliasRegistry {
         self.physical_size_counts_by_scope.clear();
         self.exact_first_by_scope.clear();
         self.replay_counts.clear();
-        for bucket in self.by_scope.values() {
+        self.replay_scopes_by_extent.clear();
+        self.exact_row_counts.clear();
+        for (&scope, bucket) in &self.by_scope {
             for &key in &bucket.replay {
-                *self.replay_counts.entry(key).or_insert(0) += 1;
+                Self::track_replay_insert_into(
+                    &mut self.replay_counts,
+                    &mut self.replay_scopes_by_extent,
+                    scope,
+                    key,
+                );
             }
         }
         let rows: Vec<(u64, AliasBacking)> = self
@@ -1525,37 +1635,58 @@ impl AliasRegistry {
         self.ipa_classes.containing_candidates(ipa, matches)
     }
 
-    /// Bounded oldest-first IPA replay candidates; caller verifies host liveness
-    /// outside both `custody.stage2` and `alias_registry`.
-    pub(crate) fn replay_ipa_candidates(&self, gpa: u64, row_budget: usize) -> Vec<AliasBacking> {
-        let (mut found, _) =
-            self.ipa_classes
-                .collect_containing_candidates_bounded(gpa, false, row_budget, |e| {
-                    gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64)
-                });
-        found.sort_by_key(|(seq, _)| *seq);
-        found.into_iter().map(|(_, alias)| alias).collect()
+    /// Cursored oldest-first IPA replay batch (`(seq, alias)` plus `has_more`);
+    /// caller probes host liveness outside `custody.stage2` and `alias_registry`.
+    pub(crate) fn replay_ipa_candidates_after(
+        &self,
+        gpa: u64,
+        after_seq: Option<u64>,
+        batch_limit: usize,
+    ) -> (Vec<(u64, AliasBacking)>, bool) {
+        self.ipa_classes.collect_containing_candidates_from_cursor(
+            gpa,
+            false,
+            after_seq,
+            batch_limit,
+            |e| gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64),
+        )
     }
 
-    /// Bounded newest-first global VA replay candidates; caller verifies host
-    /// liveness outside both `custody.stage2` and `alias_registry`.
-    pub(crate) fn replay_any_va_candidates(&self, va: u64, row_budget: usize) -> Vec<AliasBacking> {
-        let (mut found, _) =
-            self.va_classes
-                .collect_containing_candidates_bounded(va, true, row_budget, |entry| {
-                    va >= entry.start
-                        && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
-                });
-        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        found.into_iter().map(|(_, alias)| alias).collect()
+    /// Cursored newest-first global VA replay batch (`(seq, alias)` plus `has_more`);
+    /// caller probes host liveness outside `custody.stage2` and `alias_registry`.
+    pub(crate) fn replay_any_va_candidates_before(
+        &self,
+        va: u64,
+        before_seq: Option<u64>,
+        batch_limit: usize,
+    ) -> (Vec<(u64, AliasBacking)>, bool) {
+        self.va_classes.collect_containing_candidates_from_cursor(
+            va,
+            true,
+            before_seq,
+            batch_limit,
+            |entry| {
+                va >= entry.start
+                    && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+            },
+        )
     }
 
-    /// Point lookup confirming an exact previously selected `AliasBacking` is
-    /// still registered without scanning unrelated scopes or addresses.
+    /// Exact O(1) membership revalidation under `(stage2, alias_registry)`.
     pub(crate) fn contains_exact_physical_row(&self, backing: &AliasBacking) -> bool {
-        self.by_scope_physical_start
-            .get(&(backing.ownership_scope, backing.physical_ipa))
-            .is_some_and(|rows| rows.iter().any(|(_, row)| row == backing))
+        self.exact_row_counts.contains_key(backing)
+    }
+
+    /// Exact scopes holding active replay entries for `(ipa, size)`.
+    pub(crate) fn replay_scopes_for_extent(
+        &self,
+        ipa: u64,
+        size: usize,
+    ) -> Option<Vec<AliasOwnershipScope>> {
+        self.replay_scopes_by_extent
+            .get(&(ipa, size))
+            .filter(|scopes| !scopes.is_empty())
+            .map(|scopes| scopes.keys().copied().collect())
     }
 
     /// Private rows owned by one process whose exact physical stage-2 extent
@@ -1614,6 +1745,46 @@ impl AliasRegistry {
     /// source indices yield them, and only this placement makes the staged
     /// bucket agree with the live one. Ties keep insertion order, so a split
     /// row's head still precedes its tail.
+    fn track_replay_insert_into(
+        replay_counts: &mut std::collections::BTreeMap<ReplayMappingKey, usize>,
+        replay_scopes_by_extent: &mut std::collections::BTreeMap<
+            (u64, usize),
+            std::collections::BTreeMap<AliasOwnershipScope, usize>,
+        >,
+        scope: AliasOwnershipScope,
+        key: ReplayMappingKey,
+    ) {
+        *replay_counts.entry(key).or_insert(0) += 1;
+        *replay_scopes_by_extent
+            .entry((key.0, key.1))
+            .or_default()
+            .entry(scope)
+            .or_insert(0) += 1;
+    }
+
+    fn track_replay_remove_from(
+        replay_counts: &mut std::collections::BTreeMap<ReplayMappingKey, usize>,
+        replay_scopes_by_extent: &mut std::collections::BTreeMap<
+            (u64, usize),
+            std::collections::BTreeMap<AliasOwnershipScope, usize>,
+        >,
+        scope: AliasOwnershipScope,
+        key: &ReplayMappingKey,
+    ) {
+        Self::decrement_replay_count(replay_counts, key);
+        if let Some(scopes) = replay_scopes_by_extent.get_mut(&(key.0, key.1)) {
+            if let Some(count) = scopes.get_mut(&scope) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    scopes.remove(&scope);
+                }
+            }
+            if scopes.is_empty() {
+                replay_scopes_by_extent.remove(&(key.0, key.1));
+            }
+        }
+    }
+
     pub(crate) fn insert_replay_in_scope(
         &mut self,
         scope: AliasOwnershipScope,
@@ -1622,7 +1793,12 @@ impl AliasRegistry {
         let bucket = self.by_scope.entry(scope).or_default();
         let inserted = bucket.replay.insert(key);
         if inserted {
-            *self.replay_counts.entry(key).or_insert(0) += 1;
+            Self::track_replay_insert_into(
+                &mut self.replay_counts,
+                &mut self.replay_scopes_by_extent,
+                scope,
+                key,
+            );
         }
         inserted
     }
@@ -1637,7 +1813,12 @@ impl AliasRegistry {
         };
         let removed = bucket.replay.remove(key);
         if removed {
-            Self::decrement_replay_count(&mut self.replay_counts, key);
+            Self::track_replay_remove_from(
+                &mut self.replay_counts,
+                &mut self.replay_scopes_by_extent,
+                scope,
+                key,
+            );
         }
         removed
     }
@@ -1654,9 +1835,14 @@ impl AliasRegistry {
         }
     }
 
-    fn retire_bucket_replays(&mut self, bucket: &mut AliasScopeBucket) {
+    fn retire_bucket_replays(&mut self, scope: AliasOwnershipScope, bucket: &mut AliasScopeBucket) {
         for key in bucket.replay.iter() {
-            Self::decrement_replay_count(&mut self.replay_counts, key);
+            Self::track_replay_remove_from(
+                &mut self.replay_counts,
+                &mut self.replay_scopes_by_extent,
+                scope,
+                key,
+            );
         }
         bucket.replay.clear();
     }
@@ -1667,6 +1853,7 @@ impl AliasRegistry {
             bucket.replay.clear();
         }
         self.replay_counts.clear();
+        self.replay_scopes_by_extent.clear();
     }
 
     pub(crate) fn place_in_scope_bucket(&mut self, seq: u64, alias: AliasBacking) {
@@ -1675,7 +1862,12 @@ impl AliasRegistry {
         bucket.rows.insert(at, (seq, alias));
         let key = replay_mapping_key(alias);
         if bucket.replay.insert(key) {
-            *self.replay_counts.entry(key).or_insert(0) += 1;
+            Self::track_replay_insert_into(
+                &mut self.replay_counts,
+                &mut self.replay_scopes_by_extent,
+                alias.ownership_scope,
+                key,
+            );
         }
     }
 
@@ -1719,6 +1911,8 @@ impl AliasRegistry {
         }
         self.by_scope.clear();
         self.replay_counts.clear();
+        self.replay_scopes_by_extent.clear();
+        self.exact_row_counts.clear();
         self.exact_first_by_scope.clear();
         self.va_classes.clear();
         self.ipa_classes.clear();
@@ -1905,14 +2099,21 @@ impl AliasRegistry {
             let changed = updated != previous;
             if changed {
                 if bucket.replay.remove(&replay_mapping_key(previous)) {
-                    Self::decrement_replay_count(
+                    Self::track_replay_remove_from(
                         &mut self.replay_counts,
+                        &mut self.replay_scopes_by_extent,
+                        scope,
                         &replay_mapping_key(previous),
                     );
                 }
                 let updated_key = replay_mapping_key(updated);
                 if bucket.replay.insert(updated_key) {
-                    *self.replay_counts.entry(updated_key).or_insert(0) += 1;
+                    Self::track_replay_insert_into(
+                        &mut self.replay_counts,
+                        &mut self.replay_scopes_by_extent,
+                        scope,
+                        updated_key,
+                    );
                 }
             }
             (seq, previous, updated, changed)
@@ -2093,7 +2294,12 @@ impl AliasRegistry {
             for &(_, alias) in &dropped {
                 let key = replay_mapping_key(alias);
                 if bucket.replay.remove(&key) {
-                    Self::decrement_replay_count(&mut self.replay_counts, &key);
+                    Self::track_replay_remove_from(
+                        &mut self.replay_counts,
+                        &mut self.replay_scopes_by_extent,
+                        scope,
+                        &key,
+                    );
                 }
             }
             self.rebuild_exact_scope(scope);
@@ -2120,7 +2326,7 @@ impl AliasRegistry {
             .collect();
         for scope in empty_scopes {
             if let Some(mut bucket) = self.by_scope.remove(&scope) {
-                self.retire_bucket_replays(&mut bucket);
+                self.retire_bucket_replays(scope, &mut bucket);
             }
         }
     }
@@ -2133,7 +2339,7 @@ impl AliasRegistry {
         let Some(mut bucket) = self.by_scope.remove(&scope) else {
             return RetiredRows::default();
         };
-        self.retire_bucket_replays(&mut bucket);
+        self.retire_bucket_replays(scope, &mut bucket);
         self.exact_first_by_scope.remove(&scope);
         self.physical_size_counts_by_scope.remove(&scope);
         self.bump_revision();
@@ -2183,14 +2389,19 @@ impl AliasRegistry {
             for &(_, alias) in &dropped {
                 let key = replay_mapping_key(alias);
                 if bucket.replay.remove(&key) {
-                    Self::decrement_replay_count(&mut self.replay_counts, &key);
+                    Self::track_replay_remove_from(
+                        &mut self.replay_counts,
+                        &mut self.replay_scopes_by_extent,
+                        scope,
+                        &key,
+                    );
                 }
             }
             self.rows = self.rows.saturating_sub(dropped.len());
             if bucket.rows.is_empty()
                 && let Some(mut empty_bucket) = self.by_scope.remove(&scope)
             {
-                self.retire_bucket_replays(&mut empty_bucket);
+                self.retire_bucket_replays(scope, &mut empty_bucket);
             }
         }
         for &(seq, alias) in &dropped {
@@ -2241,13 +2452,23 @@ impl AliasRegistry {
         for &(_, alias) in &previous {
             let key = replay_mapping_key(alias);
             if bucket.replay.remove(&key) {
-                Self::decrement_replay_count(&mut self.replay_counts, &key);
+                Self::track_replay_remove_from(
+                    &mut self.replay_counts,
+                    &mut self.replay_scopes_by_extent,
+                    scope,
+                    &key,
+                );
             }
         }
         for &(_, alias) in &replacement {
             let key = replay_mapping_key(alias);
             if bucket.replay.insert(key) {
-                *self.replay_counts.entry(key).or_insert(0) += 1;
+                Self::track_replay_insert_into(
+                    &mut self.replay_counts,
+                    &mut self.replay_scopes_by_extent,
+                    scope,
+                    key,
+                );
             }
         }
         for (seq, alias) in previous {
@@ -2264,7 +2485,7 @@ impl AliasRegistry {
         if self.by_scope.get(&scope).is_some_and(|b| b.rows.is_empty())
             && let Some(mut bucket) = self.by_scope.remove(&scope)
         {
-            self.retire_bucket_replays(&mut bucket);
+            self.retire_bucket_replays(scope, &mut bucket);
         }
     }
 
@@ -2339,11 +2560,21 @@ impl AliasRegistry {
                 if changed {
                     let prev_key = replay_mapping_key(previous);
                     if bucket.replay.remove(&prev_key) {
-                        Self::decrement_replay_count(&mut self.replay_counts, &prev_key);
+                        Self::track_replay_remove_from(
+                            &mut self.replay_counts,
+                            &mut self.replay_scopes_by_extent,
+                            scope,
+                            &prev_key,
+                        );
                     }
                     let next_key = replay_mapping_key(alias);
                     if bucket.replay.insert(next_key) {
-                        *self.replay_counts.entry(next_key).or_insert(0) += 1;
+                        Self::track_replay_insert_into(
+                            &mut self.replay_counts,
+                            &mut self.replay_scopes_by_extent,
+                            scope,
+                            next_key,
+                        );
                     }
                 }
                 changed
@@ -2529,7 +2760,12 @@ impl AliasRegistry {
                 for &(_, _, alias) in &removed_in_scope {
                     let key = replay_mapping_key(alias);
                     if bucket.replay.remove(&key) {
-                        Self::decrement_replay_count(&mut self.replay_counts, &key);
+                        Self::track_replay_remove_from(
+                            &mut self.replay_counts,
+                            &mut self.replay_scopes_by_extent,
+                            scope,
+                            &key,
+                        );
                     }
                 }
                 let rows = &mut bucket.rows;
@@ -2711,31 +2947,39 @@ impl AliasRegistry {
         newest.map(|(_, alias)| alias)
     }
 
-    /// Bounded newest-first process VA replay candidates; caller verifies host
-    /// liveness outside both `custody.stage2` and `alias_registry`.
-    pub(crate) fn replay_process_va_candidates(
+    /// Cursored newest-first process VA replay batch (`(seq, alias)` plus
+    /// `has_more`), merged across the process-visible scopes before truncating
+    /// to `batch_limit` so no scope can starve another.
+    pub(crate) fn replay_process_va_candidates_before(
         &self,
         va: u64,
         mm_root_slot: Option<(u64, u64)>,
         container_root: ContainerRootToken,
-        row_budget: usize,
-    ) -> Vec<AliasBacking> {
-        let mut remaining = row_budget;
-        let mut found: Vec<(u64, AliasBacking)> = Vec::new();
+        before_seq: Option<u64>,
+        batch_limit: usize,
+    ) -> (Vec<(u64, AliasBacking)>, bool) {
+        let mut merged: Vec<(u64, AliasBacking)> = Vec::new();
+        let mut any_more = false;
         for index in self.process_va_indexes(mm_root_slot, container_root) {
-            if remaining == 0 {
-                break;
-            }
-            let (hits, scanned) =
-                index.collect_containing_candidates_bounded(va, true, remaining, |alias| {
+            let (hits, more) = index.collect_containing_candidates_from_cursor(
+                va,
+                true,
+                before_seq,
+                batch_limit,
+                |alias| {
                     va >= alias.start
                         && va.saturating_add(1) <= alias.start.saturating_add(alias.size as u64)
-                });
-            remaining = remaining.saturating_sub(scanned);
-            found.extend(hits);
+                },
+            );
+            any_more |= more;
+            merged.extend(hits);
         }
-        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        found.into_iter().map(|(_, alias)| alias).collect()
+        merged.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        if merged.len() > batch_limit {
+            any_more = true;
+            merged.truncate(batch_limit);
+        }
+        (merged, any_more)
     }
 
     /// Candidates for `newest_process_alias_containing_va`, newest first; the
@@ -3887,12 +4131,22 @@ pub(crate) fn unregister_alias_entries(
                 inserted_count = inserted_count.saturating_add(fragments.len());
                 let entry_key = replay_mapping_key(entry);
                 if bucket.replay.remove(&entry_key) {
-                    AliasRegistry::decrement_replay_count(&mut registry.replay_counts, &entry_key);
+                    AliasRegistry::track_replay_remove_from(
+                        &mut registry.replay_counts,
+                        &mut registry.replay_scopes_by_extent,
+                        entry.ownership_scope,
+                        &entry_key,
+                    );
                 }
                 for (_, frag) in &fragments {
                     let frag_key = replay_mapping_key(*frag);
                     if bucket.replay.insert(frag_key) {
-                        *registry.replay_counts.entry(frag_key).or_insert(0) += 1;
+                        AliasRegistry::track_replay_insert_into(
+                            &mut registry.replay_counts,
+                            &mut registry.replay_scopes_by_extent,
+                            frag.ownership_scope,
+                            frag_key,
+                        );
                     }
                 }
                 if pos > last_copied {

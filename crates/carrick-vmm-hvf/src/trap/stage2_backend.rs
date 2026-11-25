@@ -497,44 +497,56 @@ pub(crate) unsafe fn stage2_map_replay(
     lookup: ReplayAliasLookup,
     allow_ipa: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
-    let candidates = {
-        let registry = super::alias_registry().lock();
-        match lookup {
-            ReplayAliasLookup::Ipa { gpa } => {
-                registry.replay_ipa_candidates(gpa, super::LAZY_REPLAY_ROW_BUDGET)
-            }
-            ReplayAliasLookup::VaProcess {
-                va,
-                mm_root_slot,
-                container_root,
-            } => registry.replay_process_va_candidates(
-                va,
-                mm_root_slot,
-                container_root,
-                super::LAZY_REPLAY_ROW_BUDGET,
-            ),
-            ReplayAliasLookup::VaAnyScope { va } => {
-                registry.replay_any_va_candidates(va, super::LAZY_REPLAY_ROW_BUDGET)
-            }
-        }
-    };
-    #[cfg(test)]
-    custody
-        .stage2
-        .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
-    let backing = candidates.into_iter().find(|entry| {
-        let check_addr = match lookup {
-            ReplayAliasLookup::Ipa { .. } => entry.host_addr,
-            ReplayAliasLookup::VaProcess { va, .. } | ReplayAliasLookup::VaAnyScope { va } => {
-                entry.host_addr.saturating_add((va - entry.start) as usize)
+    let mut cursor: Option<u64> = None;
+    let backing = loop {
+        let (batch, has_more) = {
+            let registry = super::alias_registry().lock();
+            match lookup {
+                ReplayAliasLookup::Ipa { gpa } => {
+                    registry.replay_ipa_candidates_after(gpa, cursor, super::LAZY_REPLAY_ROW_BUDGET)
+                }
+                ReplayAliasLookup::VaProcess {
+                    va,
+                    mm_root_slot,
+                    container_root,
+                } => registry.replay_process_va_candidates_before(
+                    va,
+                    mm_root_slot,
+                    container_root,
+                    cursor,
+                    super::LAZY_REPLAY_ROW_BUDGET,
+                ),
+                ReplayAliasLookup::VaAnyScope { va } => registry.replay_any_va_candidates_before(
+                    va,
+                    cursor,
+                    super::LAZY_REPLAY_ROW_BUDGET,
+                ),
             }
         };
-        super::alias_backing_is_live(check_addr)
-            && (entry.physical_host_addr == check_addr
-                || super::alias_backing_is_live(entry.physical_host_addr))
-    });
-    let Some(backing) = backing else {
-        return Ok(None);
+        #[cfg(test)]
+        if cursor.is_none() {
+            custody
+                .stage2
+                .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
+        }
+        if let Some((_, entry)) = batch.iter().find(|&&(_, entry)| {
+            let check_addr = match lookup {
+                ReplayAliasLookup::Ipa { .. } => entry.host_addr,
+                ReplayAliasLookup::VaProcess { va, .. } | ReplayAliasLookup::VaAnyScope { va } => {
+                    entry.host_addr.saturating_add((va - entry.start) as usize)
+                }
+            };
+            super::alias_backing_is_live(check_addr)
+                && (entry.physical_host_addr == check_addr
+                    || super::alias_backing_is_live(entry.physical_host_addr))
+        }) {
+            break *entry;
+        }
+        let next_cursor = batch.last().map(|(seq, _)| *seq);
+        if !has_more || next_cursor.is_none() || next_cursor == cursor {
+            return Ok(None);
+        }
+        cursor = next_cursor;
     };
     if !allow_ipa(backing.physical_ipa) {
         return Ok(None);

@@ -5729,24 +5729,9 @@ pub(crate) fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn forget_replay_extent(ipa: u64, size: usize) {
     let mut registry = alias_registry().lock();
-    let mut candidate_scopes: std::collections::BTreeSet<AliasOwnershipScope> = registry
-        .physical_start_rows(ipa)
-        .iter()
-        .filter(|(_, alias)| alias.physical_size == size)
-        .map(|(_, alias)| alias.ownership_scope)
-        .collect();
-    if candidate_scopes.is_empty() {
-        note_hot_path_rows(HotPathScan::AliasReplayScopes, registry.by_scope.len());
-        for (scope, bucket) in &registry.by_scope {
-            if bucket
-                .replay()
-                .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
-                .any(|(_, mapped_size, _, _, _)| *mapped_size == size)
-            {
-                candidate_scopes.insert(*scope);
-            }
-        }
-    }
+    let Some(candidate_scopes) = registry.replay_scopes_for_extent(ipa, size) else {
+        return;
+    };
     for scope in candidate_scopes {
         let doomed: Vec<ReplayMappingKey> =
             registry

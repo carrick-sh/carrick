@@ -3300,7 +3300,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
 
 #[test]
 #[allow(clippy::expect_used)]
-fn stage2_map_replay_enforces_candidate_row_budget() {
+fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_live_batches() {
     use crate::trap::stage2_backend::{
         ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
     };
@@ -3310,12 +3310,84 @@ fn stage2_map_replay_enforces_candidate_row_budget() {
     let g1 = custody.begin_create().expect("begin G1");
     custody.commit_create(g1).expect("commit G1");
 
-    let overlap_ipa = 0x7c00_0000_u64;
     let len = 0x4000_usize;
+    let live_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        len,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("allocate live backing");
+    let live_host = live_backing.as_ptr() as usize;
     let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+
+    // 1. 70 older dead rows followed by a live row at #71 in the SAME IPA bucket.
+    let overlap_ipa = 0x7c00_0000_u64;
+    let live_ipa_alias = AliasBacking {
+        start: 0x3100_0000,
+        ipa: overlap_ipa,
+        host_addr: live_host,
+        size: len,
+        physical_ipa: overlap_ipa,
+        physical_host_addr: live_host,
+        physical_size: len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(9100),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+
+    // 2. Process VA lookup: 70 newer dead rows in 4 KiB class (ContainerRoot) plus
+    //    one older live row in 16 KiB class (MmRootSlot) must NOT be starved.
+    let va_probe = 0x4400_0000_u64;
+    let proc_slot = (0xa000_0000_u64, 0x20_0000_u64);
+    let proc_container = ContainerRootToken(777);
+    let live_va_alias = AliasBacking {
+        start: va_probe,
+        ipa: 0x7c10_0000,
+        host_addr: live_host,
+        size: len,
+        physical_ipa: 0x7c10_0000,
+        physical_host_addr: live_host,
+        physical_size: len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::ForkSharedAnonymous,
+        ownership_scope: AliasOwnershipScope::MmRootSlot {
+            base: proc_slot.0,
+            size: proc_slot.1,
+        },
+        inventory_backing: InventoryBackingIdentity::Private(9101),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+
+    // 3. Fast head-live IPA with 200 newer dead rows behind it must stop within one batch.
+    let fast_ipa = 0x7c20_0000_u64;
+    let fast_live_alias = AliasBacking {
+        start: 0x3300_0000,
+        ipa: fast_ipa,
+        host_addr: live_host,
+        size: len,
+        physical_ipa: fast_ipa,
+        physical_host_addr: live_host,
+        physical_size: len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(9102),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+
     mutate_external_alias_state(|registry| {
         *registry = AliasRegistry::default();
-        for i in 1..=200_u64 {
+        for i in 1..=70_u64 {
             registry.push(AliasBacking {
                 start: 0x3000_0000 + i * 0x4000,
                 ipa: overlap_ipa,
@@ -3328,16 +3400,60 @@ fn stage2_map_replay_enforces_candidate_row_budget() {
                 guest_writable: true,
                 sharing: GuestMappingSharing::GlobalShared,
                 ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2000 + i)),
-                inventory_backing: InventoryBackingIdentity::Private(9000 + i),
+                inventory_backing: InventoryBackingIdentity::Private(9200 + i),
                 shared_key_base: None,
                 shared_key_offset: 0,
                 owner_generation: 0,
             });
         }
+        registry.push(live_ipa_alias);
+
+        registry.push(live_va_alias);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: va_probe,
+                ipa: 0x7c18_0000 + i * 0x1000,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: 0x7c18_0000 + i * 0x1000,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::ForkSharedAnonymous,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(proc_container),
+                inventory_backing: InventoryBackingIdentity::Private(9400 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+
+        registry.push(fast_live_alias);
+        for i in 1..=200_u64 {
+            registry.push(AliasBacking {
+                start: 0x3400_0000 + i * 0x4000,
+                ipa: fast_ipa,
+                host_addr: 0,
+                size: len,
+                physical_ipa: fast_ipa,
+                physical_host_addr: 0,
+                physical_size: len,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(3000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(9600 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        assert!(registry.contains_exact_physical_row(&live_ipa_alias));
+        assert!(registry.contains_exact_physical_row(&live_va_alias));
     });
 
-    let before = alias_state_rows_scanned();
-    let result = unsafe {
+    let res_past_dead = unsafe {
         stage2_map_replay(
             &custody,
             g1,
@@ -3345,15 +3461,145 @@ fn stage2_map_replay_enforces_candidate_row_budget() {
             &mut |_| true,
         )
     };
-    let scanned = alias_state_rows_scanned() - before;
-    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+    assert_eq!(
+        res_past_dead,
+        Ok(Some((
+            live_ipa_alias,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
 
-    assert_eq!(result, Ok(None));
+    let res_va_cross_class = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaProcess {
+                va: va_probe,
+                mm_root_slot: Some(proc_slot),
+                container_root: proc_container,
+            },
+            &mut |_| true,
+        )
+    };
+    assert_eq!(
+        res_va_cross_class,
+        Ok(Some((
+            live_va_alias,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+
+    let before_fast = alias_state_rows_scanned();
+    let res_fast = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: fast_ipa },
+            &mut |_| true,
+        )
+    };
+    let fast_scanned = alias_state_rows_scanned() - before_fast;
+    assert_eq!(
+        res_fast,
+        Ok(Some((
+            fast_live_alias,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
     assert!(
-        scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
-        "stacked overlapping aliases scanned {scanned} rows beyond budget {}",
+        fast_scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
+        "head-live IPA with 200 newer dead rows scanned {fast_scanned} rows > batch size {}",
         crate::trap::LAZY_REPLAY_ROW_BUDGET
     );
+
+    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+    drop(live_backing);
+}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn forget_replay_extent_skips_unrelated_scopes() {
+    use crate::trap::stage2_backend::{
+        ScopedStage2MapTestStub, stage2_unmap_untracked_in, test_stage2_map_untracked,
+    };
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let custody = std::sync::Arc::new(CarrierVmCustody::new());
+    let g1 = custody.begin_create().expect("begin G1");
+    custody.commit_create(g1).expect("commit G1");
+
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+    let non_alias_ipa = 0xa082_0000_0000_u64;
+    let non_alias_len = 0x4000_usize;
+    let mut non_alias_backing = vec![0_u8; non_alias_len];
+    test_stage2_map_untracked(
+        &custody,
+        non_alias_backing.as_mut_ptr().cast(),
+        non_alias_ipa,
+        non_alias_len,
+        perms,
+    );
+
+    let orphan_ipa = 0x7d10_0000_u64;
+    let orphan_scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(5150));
+    let orphan_key = (orphan_ipa, non_alias_len, 0xdead_beef, perms, 0);
+
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        for i in 1..=200_u64 {
+            let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(5000 + i));
+            let ipa = 0x7e00_0000 + i * 0x4000;
+            registry.push(AliasBacking {
+                start: 0x3500_0000 + i * 0x4000,
+                ipa,
+                host_addr: (0x4500_0000 + i * 0x4000) as usize,
+                size: non_alias_len,
+                physical_ipa: ipa,
+                physical_host_addr: (0x4500_0000 + i * 0x4000) as usize,
+                physical_size: non_alias_len,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: scope,
+                inventory_backing: InventoryBackingIdentity::Private(9800 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.insert_replay_in_scope(orphan_scope, orphan_key);
+        assert_eq!(registry.recomputed_replay_counts(), registry.replay_counts);
+    });
+
+    // 1. Unmapping a non-alias extent must touch 0 alias scopes even with 200 live scopes.
+    let before_non_alias = alias_replay_scopes_probed();
+    stage2_unmap_untracked_in(&custody, g1, None, non_alias_ipa, non_alias_len)
+        .expect("unmap non-alias extent");
+    assert_eq!(
+        alias_replay_scopes_probed() - before_non_alias,
+        0,
+        "unmapping non-alias extent must never scan unrelated alias scopes"
+    );
+
+    // 2. Forgetting an orphan replay extent with no physical-start row must probe ONLY its scope.
+    let before_orphan = alias_replay_scopes_probed();
+    forget_replay_extent(orphan_ipa, non_alias_len);
+    assert!(
+        alias_replay_scopes_probed() - before_orphan <= 1,
+        "forgetting orphan replay extent probed unrelated scopes"
+    );
+    {
+        let registry = alias_registry().lock();
+        assert!(!registry.contains_replay(&orphan_key));
+        assert!(
+            registry
+                .replay_scopes_for_extent(orphan_ipa, non_alias_len)
+                .is_none()
+        );
+        assert_eq!(registry.recomputed_replay_counts(), registry.replay_counts);
+    }
+
+    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
 }
 
 mod maintenance_lookup_budget;
