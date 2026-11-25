@@ -676,6 +676,48 @@ impl Frames {
                     )
                     + write,
             ),
+            // A frame-supply or copy deferral descends from the active
+            // delivery frames into retain_and_defer_signal_delivery and
+            // begin_service_inner (and can continue into begin_return_work).
+            (
+                "signal supply admission",
+                (native + delivery).max(service_signal).max(resumed_signal)
+                    + self.required("::retain_and_defer_signal_delivery::")?
+                    + self.required("::begin_return_work::")?
+                    + self.required("::begin_service_inner::")?
+                    + (self.required("::prepare_service_inner::")?
+                        + self.maximum("::abort_unpublished_service::").max(self.sum(&[
+                            "::retire_closing_entry::",
+                            "::retire_closing_member::",
+                            "::retire_cancelled_pool_member::",
+                            "::retire_thread_verdict::",
+                            "::retire_thread_identity::",
+                            "::lifecycle_admission_settled::",
+                        ])))
+                    .max(
+                        self.required("::park_service::")?
+                            .max(
+                                self.required("::park_owner_wait::")?
+                                    + self.maximum("::finish_owner_wait::"),
+                            )
+                            .max(
+                                self.required("::park_notice_wait::")?
+                                    + self
+                                        .maximum("::cancel_unpublished_service::")
+                                        .max(self.maximum("::abort_unpublished_service::")),
+                            )
+                            + self.sum(&[
+                                "::yield_service_checkpoint::",
+                                "::yield_service_checkpoint_as::",
+                            ]),
+                    )
+                    + self
+                        .maximum("::finish_service::")
+                        .max(self.maximum("::take_preparation_operation::"))
+                        .max(self.maximum("::restore_preparation_operation::"))
+                    + self.maximum("::release_service_claim::")
+                    + allocation,
+            ),
             // Both ordinary returns and host-owned resume checkpoints can
             // select terminal delivery while their respective owners are live.
             (
@@ -876,6 +918,7 @@ mod tests {
             "x::prepare_fault_repark::h0",
             "x::settle_service_exit::h0",
             "x::begin_return_work::h0",
+            "x::retain_and_defer_signal_delivery::h0",
             "x::park_owner_wait::h0",
             "x::park_notice_wait::h0",
             "x::apply_fault_reply::h0",
@@ -999,6 +1042,27 @@ mod tests {
         );
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("resumed signal delivery copy"));
+    }
+
+    #[test]
+    fn signal_supply_admission_charges_resumed_and_service_frames() {
+        for symbol in [
+            "x::arm_signal::checkpoint_saved_user_return::h0",
+            "x::retain_and_defer_signal_delivery::h0",
+            "x::begin_return_work::h0",
+            "x::begin_service_inner::h0",
+            "x::park_owner_wait::h0",
+            "x::finish_owner_wait::h0",
+            "x::finish_service::h0",
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(symbol.to_owned(), 11000);
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(
+                error.contains("signal supply admission"),
+                "{symbol}: {error}"
+            );
+        }
     }
 
     #[test]
