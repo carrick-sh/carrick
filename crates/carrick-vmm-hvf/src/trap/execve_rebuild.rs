@@ -145,6 +145,7 @@ impl PendingExecStage2Cleanup {
                         &mut self.mappings,
                         ipa,
                         size as u64,
+                        (owner_identity.host_addr != 0).then_some(owner_identity.host_addr),
                     )
                 } else {
                     let outcome = retire_global_frame_host_owner_if_generation_in(
@@ -2386,6 +2387,7 @@ impl HvfVmState {
                 replayed_global_frame_owners_for_regions_in(&custody, self.mappings.iter());
             reconcile_global_frame_owners_after_replay_in(&custody, &replayed, false)?;
         }
+        self.vm_generation = custody.setup_generation();
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
             let staged_inventory_mappings = {
                 let mut inventory = self.frame_inventory.lock();

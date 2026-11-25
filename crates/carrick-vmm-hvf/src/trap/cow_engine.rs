@@ -4298,6 +4298,8 @@ impl HvfTaskState {
                     custody,
                     split.old.stage2_base,
                     split.old.stage2_length,
+                    (split.old.stage2_owner.host_addr != 0)
+                        .then_some(split.old.stage2_owner.host_addr),
                 )
             })
             .unwrap_or_else(|error| {
@@ -5374,18 +5376,26 @@ impl HvfVmState {
     /// remap; this is the `handle_memory_exit` hook surface — kept for the trait,
     /// driven on the rare path the in-loop remap doesn't cover.)
     pub(crate) fn try_lazy_alias_remap(&mut self, gpa: u64, va: u64) -> bool {
-        let backing = if gpa != 0 {
-            lookup_shared_alias(gpa)
-        } else {
-            lookup_shared_alias_by_va(va, 1, self.mm_root_slot, self.container_root)
-        };
-        let Some(b) = backing else {
+        let Some(expected_generation) = self.vm_generation else {
             return false;
         };
-        // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
-        // `add_alias`. Replay succeeds only when HVF confirms the installation;
-        // an arbitrary nonzero result is never evidence that a racing mapper won.
-        let rc = unsafe { stage2_map_replay(&self.carrier_vm_custody(), b) };
+        let lookup = if gpa != 0 {
+            ReplayAliasLookup::Ipa { gpa }
+        } else {
+            ReplayAliasLookup::VaProcess {
+                va,
+                mm_root_slot: self.mm_root_slot,
+                container_root: self.container_root,
+            }
+        };
+        // SAFETY: `stage2_map_replay` acquires `expected_generation`'s guard before
+        // reading `alias_registry()`, preventing stale lookups from crossing VM generations.
+        let custody = self.carrier_vm_custody();
+        let Ok(Some((b, rc))) =
+            (unsafe { stage2_map_replay(&custody, expected_generation, lookup, &mut |_| true) })
+        else {
+            return false;
+        };
         crate::probes::hv_vm_map_alias(
             va,
             b.physical_ipa,
@@ -6414,7 +6424,7 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            self.retire_stage2_extent(ipa, length)?;
+            self.retire_stage2_extent(ipa, length, Some(retired.owner.host_addr))?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {
@@ -7244,11 +7254,18 @@ impl HvfTaskState {
         let custody = self.custody_arc();
         let retired_bases = manager.retire_extension_arenas();
         for base in retired_bases {
+            let expected_host = self
+                .mappings
+                .iter()
+                .find(|m| m.physical_ipa == base && m.physical_size == TWO_MIB as usize)
+                .and_then(mapped_region_physical_host_addr)
+                .map(|ptr| ptr as usize);
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &custody,
                 &mut self.mappings,
                 base,
                 TWO_MIB,
+                expected_host,
             )?;
             self.mappings.retain(|m| m.ipa != base);
             self.mm_access
@@ -7518,8 +7535,15 @@ impl HvfTaskState {
         custody: &CarrierVmCustody,
         ipa: u64,
         length: u64,
+        expected_host: Option<usize>,
     ) -> Result<(), TrapError> {
-        HvfVmState::retire_stage2_extent_from_mappings_in(custody, &mut self.mappings, ipa, length)
+        HvfVmState::retire_stage2_extent_from_mappings_in(
+            custody,
+            &mut self.mappings,
+            ipa,
+            length,
+            expected_host,
+        )
     }
 }
 

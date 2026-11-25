@@ -541,6 +541,7 @@ impl HvfVmState {
 
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
+        let vm_generation = carrier_foreign_mm_transport.custody.setup_generation();
         let root_custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
         let root_host_cow_stats = carrier_foreign_mm_transport
             .custody
@@ -548,6 +549,7 @@ impl HvfVmState {
             .admit_mm();
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm.into_inner()),
+            vm_generation,
             carrier_foreign_mm_transport,
             task: HvfTaskState {
                 #[cfg(not(test))]

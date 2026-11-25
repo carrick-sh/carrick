@@ -12,14 +12,21 @@ mod alias_remap_limiter_tests {
     #[test]
     fn exact_replay_marker_turns_a_sibling_race_into_success() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let len = HVF_PAGE_SIZE as usize;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate live replay backing");
+        let host_addr = host_mapping.as_ptr() as usize;
         let backing = AliasBacking {
             start: 0x1000,
             ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
-            host_addr: 0x1234_0000,
-            size: HVF_PAGE_SIZE as usize,
+            host_addr,
+            size: len,
             physical_ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
-            physical_host_addr: 0x1234_0000,
-            physical_size: HVF_PAGE_SIZE as usize,
+            physical_host_addr: host_addr,
+            physical_size: len,
             perms: carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
@@ -30,6 +37,10 @@ mod alias_remap_limiter_tests {
             owner_generation: 0,
         };
         let key = replay_mapping_key(backing);
+        let custody = CarrierVmCustody::new_live_fixture();
+        let g1 = custody.live_generation().expect("live fixture generation");
+
+        // Orphan replay marker without live alias row must be ignored/refused.
         alias_registry()
             .lock()
             .by_scope
@@ -37,15 +48,41 @@ mod alias_remap_limiter_tests {
             .or_default()
             .replay
             .insert(key);
+        let orphan_result = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: backing.ipa },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(orphan_result, Ok(None));
 
-        let custody = CarrierVmCustody::new_live_fixture();
-        // The exact installed marker returns before touching Hypervisor.framework.
-        let result = unsafe { stage2_map_replay(&custody, backing) };
-        assert_eq!(result, 0);
+        // Registered live alias + replay marker hits the cache without mapping backend.
+        register_shared_alias(backing);
+        let result = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: backing.ipa },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(
+            result,
+            Ok(Some((
+                backing,
+                carrick_aarch64::stage2::Stage2Status::SUCCESS
+            )))
+        );
         assert!(alias_registry().lock().contains_replay(&key));
 
+        mutate_external_alias_state(|registry| {
+            registry.retain(|alias| alias.physical_ipa != backing.ipa);
+        });
         forget_replay_extent(backing.ipa, backing.size);
         assert!(!alias_registry().lock().contains_replay(&key));
+        drop(host_mapping);
     }
 
     #[test]

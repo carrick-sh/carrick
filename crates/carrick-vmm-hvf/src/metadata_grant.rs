@@ -2100,19 +2100,21 @@ pub(crate) fn service_native_fork_stock(
                                 })
                             },
                             |pages| ForkStockHostCustody::tables_clean_in(&stage2, pages),
-                            |request, address, count| match pre_retained.take() {
-                                Some((
-                                    expected_request,
-                                    expected_address,
-                                    expected_count,
-                                    retained,
-                                )) if request == expected_request
-                                    && address == expected_address
-                                    && count == expected_count =>
-                                {
-                                    retained
+                            |request, address, count| {
+                                if pre_retained.as_ref().is_some_and(
+                                    |(expected_request, expected_address, expected_count, _)| {
+                                        request == *expected_request
+                                            && address == *expected_address
+                                            && count == *expected_count
+                                    },
+                                ) {
+                                    match pre_retained.take() {
+                                        Some((_, _, _, retained)) => retained,
+                                        None => Err(ForkStockRefusal::Invalid),
+                                    }
+                                } else {
+                                    Err(ForkStockRefusal::Invalid)
                                 }
-                                _ => Err(ForkStockRefusal::Invalid),
                             },
                             |physical| rejected_physical = Some(physical),
                         )

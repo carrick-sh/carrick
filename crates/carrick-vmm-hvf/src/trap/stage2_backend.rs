@@ -471,36 +471,84 @@ pub(crate) fn emit_global_frame_stage2(
     crate::probes::hvpatch_global_frame_stage2(event);
 }
 
-/// Map a registered high-VA alias extent under the live carrier stage-2
-/// generation guard before locking the alias registry (preserving
-/// `stage2 -> alias_registry`), and mark its replay key once mapped.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+pub(crate) enum ReplayAliasLookup {
+    Ipa {
+        gpa: u64,
+    },
+    VaProcess {
+        va: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: super::ContainerRootToken,
+    },
+    VaAnyScope {
+        va: u64,
+    },
+}
+
+/// Look up and replay one lazy high-VA alias backing under the caller's exact
+/// VM generation guard before locking the alias registry (preserving
+/// `stage2 -> alias_registry`), validate live registration even on replay-cache
+/// hits, and record its untracked token and replay key once mapped.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn stage2_map_replay(
     custody: &CarrierVmCustody,
-    backing: AliasBacking,
-) -> Stage2Status {
-    let Ok(mut stage2) = custody.admitting_stage2("lazy alias replay map") else {
-        return Stage2Status::NO_LIVE_VM;
+    expected_generation: carrick_core_abi::mm::custody::CarrierVmGeneration,
+    lookup: ReplayAliasLookup,
+    allow_ipa: &mut dyn FnMut(u64) -> bool,
+) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
+    #[cfg(test)]
+    custody
+        .stage2
+        .at_client_point(super::carrier_custody::REPLAY_REMAP_BEFORE_GUARD);
+    let Ok(mut stage2) = custody.admitting_stage2_in(expected_generation, "lazy alias replay map")
+    else {
+        return Err(Stage2Status::NO_LIVE_VM);
     };
     #[cfg(test)]
     custody
         .stage2
         .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
-    let key = replay_mapping_key(backing);
-    mutate_external_alias_state(|registry| {
+    Ok(mutate_external_alias_state(|registry| {
+        let backing = match lookup {
+            ReplayAliasLookup::Ipa { gpa } => registry.oldest_containing_ipa(gpa, |e| {
+                gpa >= e.ipa
+                    && gpa < e.ipa.saturating_add(e.size as u64)
+                    && super::alias_backing_is_live(e.host_addr)
+            }),
+            ReplayAliasLookup::VaProcess {
+                va,
+                mm_root_slot,
+                container_root,
+            } => {
+                registry.newest_process_alias_containing_va(va, mm_root_slot, container_root, |e| {
+                    va.saturating_add(1) <= e.start.saturating_add(e.size as u64)
+                        && super::alias_backing_is_live(
+                            e.host_addr.saturating_add((va - e.start) as usize),
+                        )
+                })
+            }
+            ReplayAliasLookup::VaAnyScope { va } => registry.newest_containing_va(va, |entry| {
+                va >= entry.start
+                    && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+                    && super::alias_backing_is_live(
+                        entry.host_addr.saturating_add((va - entry.start) as usize),
+                    )
+            }),
+        }?;
+        if !super::alias_backing_is_live(backing.physical_host_addr) {
+            return None;
+        }
+        if !allow_ipa(backing.physical_ipa) {
+            return None;
+        }
+        let key = replay_mapping_key(backing);
         if registry.contains_replay(&key) {
-            return Stage2Status::SUCCESS;
+            return Some((backing, Stage2Status::SUCCESS));
         }
-        let still_registered = registry
-            .oldest_containing_ipa(backing.ipa, |entry| {
-                *entry == backing && super::alias_backing_is_live(entry.host_addr)
-            })
-            .is_some();
-        if !still_registered {
-            return Stage2Status::from_raw(HV_BAD_ARGUMENT);
-        }
-        // SAFETY: forwarded from caller; `stage2` guard proves live VM.
-        match unsafe {
+        // SAFETY: forwarded from caller; `stage2` guard proves `expected_generation` is live.
+        let status = match unsafe {
             stage2_map(
                 &mut stage2,
                 backing.physical_host_addr as *mut std::ffi::c_void,
@@ -526,8 +574,9 @@ pub(crate) unsafe fn stage2_map_replay(
                 Stage2Status::SUCCESS
             }
             Err(status) => status,
-        }
-    })
+        };
+        Some((backing, status))
+    }))
 }
 
 /// Unmap an untracked mapping stored by `map_region_raw_in` / `map_stage2` /
@@ -2252,6 +2301,18 @@ mod ipc_window_tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "commit_destroy(G1) must drop retained IPC backing outside custody locks"
+        );
+
+        let late_dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let late_tracked: std::sync::Arc<dyn IpcWindowBacking> =
+            std::sync::Arc::new(DropTrackedBacking {
+                inner: backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+                dropped: std::sync::Arc::clone(&late_dropped),
+            });
+        custody.retain_unretired_ipc_backing(g1, late_tracked);
+        assert!(
+            late_dropped.load(Ordering::SeqCst),
+            "late retain for already-destroyed G1 must drop backing immediately"
         );
     }
 }

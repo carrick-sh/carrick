@@ -196,7 +196,10 @@ mod user_transfer;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrier_custody::CarrierVmCustody;
 #[cfg(test)]
-pub(crate) use carrier_custody::{COMMIT_DESTROY_HOLDING_STAGE2, FORK_STOCK_INSTALL_BEFORE_ARENAS};
+pub(crate) use carrier_custody::{
+    COMMIT_DESTROY_HOLDING_STAGE2, FORK_CONTROL_CAPACITY_BEFORE_INSTALL,
+    FORK_STOCK_INSTALL_BEFORE_ARENAS,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
 pub use owner_fork::{ForkPhysicalCustody, ForkPhysicalRetention, RetainHostBacking};
@@ -1563,6 +1566,7 @@ pub(crate) struct HvfVmState {
     /// The executor's own live vCPU. `None` for a logical task's backend (a
     /// staged root, or any task between executor loads): load/save swaps it
     /// with the worker, so a task never owns a vCPU.
+    pub(crate) vm_generation: Option<CarrierVmGeneration>,
     pub(crate) executor_vcpu: Option<ExecutorVcpuIdentity>,
     pub(crate) cached_fork_alias_snapshot: parking_lot::Mutex<Option<ForkAliasSnapshot>>,
     /// Fresh host anonymous mappings the most recent `build_process_spec`
@@ -7844,6 +7848,7 @@ impl HvfVmState {
             carrier_mappings: None,
             mailbox_slots: plan.mailbox_slots,
             syscall_transport: plan.syscall_transport,
+            vm_generation: plan.carrier_foreign_mm_transport.custody.setup_generation(),
             executor_vcpu: Some(ExecutorVcpuIdentity::of(&vcpu)),
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
@@ -8414,42 +8419,54 @@ impl HvfInner {
             if exit.reason == ExitReason::EXCEPTION
                 && is_aarch64_abort_exception(exit.exception.syndrome)
                 && crate::memory::is_high_va(exit.exception.virtual_address)
+                && let Some(expected_generation) = vm_generation
             {
-                let backing = if exit.exception.physical_address != 0 {
-                    lookup_shared_alias(exit.exception.physical_address)
+                let gpa = exit.exception.physical_address;
+                let va = exit.exception.virtual_address;
+                let lookup = if gpa != 0 {
+                    ReplayAliasLookup::Ipa { gpa }
                 } else {
-                    lookup_live_alias_by_va_any_scope(exit.exception.virtual_address, 1)
+                    ReplayAliasLookup::VaAnyScope { va }
                 };
-                if let Some(b) = backing
-                    && alias_remap_limiter.allow(b.physical_ipa)
-                {
-                    // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
-                    // by add_alias. Only rc=0 proves replay installation.
-                    let rc = unsafe { stage2_map_replay(custody, b) };
-                    crate::probes::hv_vm_map_alias(
-                        exit.exception.virtual_address,
-                        b.physical_ipa,
-                        b.physical_size as u64,
-                        rc.raw() as i32,
-                        0,
-                    );
-                    if rc != 0 {
+                // SAFETY: `stage2_map_replay` acquires `expected_generation`'s guard
+                // before looking up any registered alias backing.
+                match unsafe {
+                    stage2_map_replay(custody, expected_generation, lookup, &mut |ipa| {
+                        alias_remap_limiter.allow(ipa)
+                    })
+                } {
+                    Ok(Some((b, rc))) => {
+                        crate::probes::hv_vm_map_alias(
+                            va,
+                            b.physical_ipa,
+                            b.physical_size as u64,
+                            rc.raw() as i32,
+                            0,
+                        );
+                        if rc != 0 {
+                            return Err(TrapError::Hypervisor(format!(
+                                "lazy alias replay hv_vm_map(ipa=0x{:x}, size={}) failed: 0x{rc:x}",
+                                b.physical_ipa, b.physical_size
+                            )));
+                        }
+                        // Diagnostic-only alias-remap counter+dump, gated behind
+                        // `debug-stats` (no other consumer reads the counter).
+                        #[cfg(feature = "debug-stats")]
+                        {
+                            let n = ALIAS_REMAP_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n.is_multiple_of(256) {
+                                eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.physical_ipa);
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(rc) => {
                         return Err(TrapError::Hypervisor(format!(
-                            "lazy alias replay hv_vm_map(ipa=0x{:x}, size={}) failed: 0x{rc:x}",
-                            b.physical_ipa, b.physical_size
+                            "lazy alias replay refused stale/non-admitting carrier VM for va=0x{va:x} (expected={expected_generation:?}): 0x{rc:x}"
                         )));
                     }
-                    // Diagnostic-only alias-remap counter+dump, gated behind
-                    // `debug-stats` (no other consumer reads the counter).
-                    #[cfg(feature = "debug-stats")]
-                    {
-                        let n =
-                            ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n.is_multiple_of(256) {
-                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.physical_ipa);
-                        }
-                    }
-                    continue;
                 }
             }
             if exit.reason != ExitReason::EXCEPTION {

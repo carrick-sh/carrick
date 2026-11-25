@@ -50,10 +50,13 @@ impl Drop for MmapBuffer {
 }
 
 pub(super) fn test_vm_state(task: HvfTaskState) -> HvfVmState {
+    let transport = std::sync::Arc::new(CarrierForeignMmTransport::new());
+    let vm_generation = transport.custody.setup_generation();
     HvfVmState {
         _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
+        vm_generation,
         task,
-        carrier_foreign_mm_transport: std::sync::Arc::new(CarrierForeignMmTransport::new()),
+        carrier_foreign_mm_transport: transport,
         carrier_mappings: None,
         mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,

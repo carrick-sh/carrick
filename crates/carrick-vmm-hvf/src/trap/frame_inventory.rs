@@ -1396,11 +1396,22 @@ pub(crate) fn final_exec_physical_extents(
 pub(crate) mod tests;
 
 impl HvfVmState {
-    pub(crate) fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
+    pub(crate) fn retire_stage2_extent(
+        &mut self,
+        ipa: u64,
+        length: u64,
+        expected_host: Option<usize>,
+    ) -> Result<(), TrapError> {
         #[cfg(not(test))]
         {
             let custody = std::sync::Arc::clone(&self.custody);
-            Self::retire_stage2_extent_from_mappings_in(&custody, &mut self.mappings, ipa, length)
+            Self::retire_stage2_extent_from_mappings_in(
+                &custody,
+                &mut self.mappings,
+                ipa,
+                length,
+                expected_host,
+            )
         }
         #[cfg(test)]
         {
@@ -1409,6 +1420,7 @@ impl HvfVmState {
                 &mut self.mappings,
                 ipa,
                 length,
+                expected_host,
             )
         }
     }
@@ -1418,6 +1430,7 @@ impl HvfVmState {
         mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
+        expected_host: Option<usize>,
     ) -> Result<(), TrapError> {
         let outcome = retire_global_frame_host_owner_in(custody, ipa, length);
         if outcome.is_retired()
@@ -1486,7 +1499,11 @@ impl HvfVmState {
         // not on a mapping row. Without this the fallback below released an IPA
         // whose lease was still live, and the lease's `Drop` then released it
         // again.
-        if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
+        let carrier_record = match expected_host {
+            Some(host_addr) => take_carrier_stage2_record_if_owner(custody, ipa, length, host_addr),
+            None => take_carrier_stage2_record(custody, ipa, length),
+        };
+        if let Some(identity) = carrier_record {
             retire_carrier_stage2_record_at_safe_point(custody, identity)?;
             return Ok(());
         }
@@ -1499,22 +1516,24 @@ impl HvfVmState {
             return Ok(());
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let Some(expected_generation) = mappings.iter().find_map(|mapping| {
-            (mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
-                .then_some(mapping.stage2_generation)
-                .flatten()
+        let Some((expected_generation, resolved_host)) = mappings.iter().find_map(|mapping| {
+            let generation = mapping.stage2_generation?;
+            let host = mapped_region_physical_host_addr(mapping)? as usize;
+            (mapping.physical_ipa == ipa
+                && mapping.physical_size as u64 == length
+                && expected_host.is_none_or(|expected| expected == host))
+            .then_some((generation, host))
         }) else {
             return Err(TrapError::Hypervisor(format!(
-                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} lacks owning VM generation"
+                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} lacks matching VM generation and host backing"
             )));
         };
-        stage2_unmap_untracked_in(custody, expected_generation, None, ipa, size).map_err(
-            |error| {
+        stage2_unmap_untracked_in(custody, expected_generation, Some(resolved_host), ipa, size)
+            .map_err(|error| {
                 TrapError::Hypervisor(format!(
                     "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
                 ))
-            },
-        )?;
+            })?;
         release_retired_stage2_ipa(ipa, length)?;
         Ok(())
     }
@@ -1547,9 +1566,11 @@ impl HvfVmState {
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
         let Some(expected_generation) = mappings.iter().find_map(|mapping| {
-            (mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
-                .then_some(mapping.stage2_generation)
-                .flatten()
+            (mapping.physical_ipa == ipa
+                && mapping.physical_size as u64 == length
+                && mapped_region_physical_host_addr(mapping) == Some(host_addr as *mut u8))
+            .then_some(mapping.stage2_generation)
+            .flatten()
         }) else {
             return Err(TrapError::Hypervisor(format!(
                 "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} lacks owning VM generation"
@@ -1575,6 +1596,7 @@ impl HvfVmState {
             mappings,
             ipa,
             length,
+            None,
         )
     }
 
@@ -3486,6 +3508,7 @@ impl HvfVmState {
                         &mut task.mappings,
                         ipa,
                         length,
+                        Some(owner.host_addr),
                     )
                 })? {
                     extents.insert((ipa, size));

@@ -1042,6 +1042,7 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         let state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
+            vm_generation: spec.carrier_foreign_mm_transport.custody.setup_generation(),
             carrier_foreign_mm_transport: std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
             task: HvfTaskState::neutral(),
             carrier_mappings: Some(std::sync::Arc::clone(&spec.carrier_mappings)),
@@ -1206,8 +1207,10 @@ impl HvfVmState {
 
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
+        let vm_generation = carrier_foreign_mm_transport.custody.setup_generation();
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
+            vm_generation,
             carrier_foreign_mm_transport,
             task: HvfTaskState {
                 #[cfg(not(test))]

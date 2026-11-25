@@ -622,6 +622,7 @@ pub(crate) fn settle_one(
                 &mut TaskMappingIndex::new(),
                 split.old.stage2_base,
                 split.old.stage2_length,
+                (split.old.stage2_owner.host_addr != 0).then_some(split.old.stage2_owner.host_addr),
             )
         },
     )?;

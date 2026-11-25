@@ -185,12 +185,12 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         backend_calls, 3,
         "only the three inventory wrappers may call the HVF backend"
     );
-    // Both lazy replay paths keep the exact serialized replay under Stage2Custody.
+    // Both lazy replay paths resolve and map under Stage2Custody's generation guard.
     assert_eq!(
-        count(&sources, "stage2_map_replay(custody, b)")
-            + count(&sources, "stage2_map_replay(&self.carrier_vm_custody(), b)"),
+        count(&sources, "stage2_map_replay(custody, expected_generation")
+            + count(&sources, "stage2_map_replay(&custody, expected_generation"),
         2,
-        "both lazy replay paths must use exact guarded serialized replay"
+        "both lazy replay paths must use exact generation-guarded serialized replay"
     );
     assert_eq!(
         count(&sources, "pub(crate) unsafe fn inventory_stage2_")

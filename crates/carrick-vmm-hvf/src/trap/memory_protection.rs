@@ -3230,7 +3230,7 @@ pub(crate) fn alias_backing_is_live(host_addr: usize) -> bool {
 }
 
 /// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
 pub(crate) fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
     alias_registry().lock().oldest_containing_ipa(ipa, |e| {
         ipa >= e.ipa
@@ -3453,39 +3453,6 @@ pub(crate) fn current_process_alias_keys<'a>(
         .filter(|mapping| mapping_is_current_for_process_fork_indexed(mapping, &index))
         .map(mapped_region_process_alias_key)
         .collect()
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn lookup_shared_alias_by_va(
-    va: u64,
-    len: usize,
-    mm_root_slot: Option<(u64, u64)>,
-    container_root: ContainerRootToken,
-) -> Option<AliasBacking> {
-    let end = va.saturating_add(len as u64);
-    alias_registry().lock().newest_process_alias_containing_va(
-        va,
-        mm_root_slot,
-        container_root,
-        |e| {
-            end <= e.start.saturating_add(e.size as u64)
-                // Reject an entry whose backing is not mapped in THIS process
-                // (a parent's host_addr COW-inherited into a forked child) —
-                // dereferencing it would HOST-SIGSEGV the child. See
-                // `alias_backing_is_live`.
-                && alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
-        },
-    )
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn lookup_live_alias_by_va_any_scope(va: u64, len: usize) -> Option<AliasBacking> {
-    let end = va.saturating_add(len as u64);
-    alias_registry().lock().newest_containing_va(va, |entry| {
-        va >= entry.start
-            && end <= entry.start.saturating_add(entry.size as u64)
-            && alias_backing_is_live(entry.host_addr.saturating_add((va - entry.start) as usize))
-    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

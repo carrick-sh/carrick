@@ -379,6 +379,7 @@ impl ForkStockHostCustody {
         let perms =
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
         let mut stage2 = custody.admitting_stage2("native fork control stage-2 map")?;
+        let generation = stage2.generation();
         // SAFETY: the fresh IPA lease and mapping are retained by the owner.
         let stage2_mapping = unsafe {
             crate::trap::stage2_map(&mut stage2, mapping.as_ptr().cast(), base, len, perms)
@@ -391,8 +392,13 @@ impl ForkStockHostCustody {
             custody, mapping, lease, perms, epoch, base, len,
         )?;
         let mut unused_owner = Some(owner);
+        #[cfg(test)]
+        custody
+            .stage2
+            .at_client_point(crate::trap::FORK_CONTROL_CAPACITY_BEFORE_INSTALL);
         let result = {
-            let _stage2 = custody.admitting_stage2("native fork control capacity install")?;
+            let _stage2 =
+                custody.admitting_stage2_in(generation, "native fork control capacity install")?;
             let mut stock = custody.fork_stock.lock();
             if !stock.owner.needs_control_capacity() {
                 Ok(())
@@ -1457,5 +1463,103 @@ mod tests {
         destroy_thread.join().expect("destroy thread panicked");
         custody.stage2.set_hook(None);
         assert_eq!(custody.stage2.lifecycle(), Stage2Lifecycle::Vacant);
+    }
+
+    #[test]
+    fn ensure_control_capacity_refuses_stale_g1_arena_against_g2() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::{Arc, mpsc};
+
+        #[derive(Debug)]
+        struct TestTables(Vec<RootGpa>);
+        impl carrick_hal::fork_stock::NativeForkTableReservation for TestTables {
+            fn arenas(&self) -> &[RootGpa] {
+                &self.0
+            }
+        }
+        #[derive(Debug)]
+        struct DummyInventory;
+        impl carrick_hal::PhysicalFrameInventory for DummyInventory {
+            fn bind(
+                &self,
+                _: carrick_hal::GuestFrameOwner,
+            ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
+                panic!("unused in control capacity witness")
+            }
+            fn allocate_backing_ids(
+                &self,
+            ) -> Result<
+                (carrick_hal::FrameId, carrick_hal::MappingId),
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err("unused in control capacity witness".into())
+            }
+            fn retire_mm(
+                &self,
+                _: carrick_guest_arch::MmGeneration,
+            ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(0)
+            }
+        }
+
+        let _global_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = crate::trap::ScopedStage2MapTestStub::enable();
+        let custody = Arc::new(CarrierVmCustody::new());
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
+        *custody.root_slot_pool.lock() = crate::trap::CarrierRootSlotPoolState::Failed;
+
+        let g1_resources = carrick_hal::fork_stock::NativeForkStockResources {
+            tables: Arc::new(TestTables(vec![page(0xa081_f000_0000)])),
+            inventory: Arc::new(DummyInventory),
+        };
+        ForkStockHostCustody::install(&custody, g1_resources).expect("install G1 fork stock");
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        custody.stage2.set_hook(Some(Arc::new(move |point| {
+            if matches!(
+                point,
+                Stage2HookPoint::Client(name) if name == crate::trap::FORK_CONTROL_CAPACITY_BEFORE_INSTALL
+            ) {
+                let _ = entered_tx.send(());
+                let _ = go_rx.lock().unwrap().recv();
+            }
+        })));
+
+        let cap_custody = Arc::clone(&custody);
+        let worker = std::thread::spawn(move || {
+            let _stub = crate::trap::ScopedStage2MapTestStub::enable();
+            ForkStockHostCustody::ensure_control_capacity(&cap_custody)
+        });
+
+        entered_rx
+            .recv()
+            .expect("ensure_control_capacity paused before install");
+        custody.begin_destroy(g1).expect("begin destroy G1");
+        custody.destroy_stage2_for_test(g1);
+        custody.commit_destroy(g1).expect("commit destroy G1");
+
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        let g2_resources = carrick_hal::fork_stock::NativeForkStockResources {
+            tables: Arc::new(TestTables(vec![page(0xa081_f200_0000)])),
+            inventory: Arc::new(DummyInventory),
+        };
+        ForkStockHostCustody::install(&custody, g2_resources).expect("install G2 fork stock");
+        assert!(custody.fork_stock.lock().owner.needs_control_capacity());
+        go_tx.send(()).expect("resume G1 control capacity");
+
+        let err = worker
+            .join()
+            .expect("worker join")
+            .expect_err("stale G1 control arena must not install into G2");
+        let _ = err;
+        custody.stage2.set_hook(None);
+        assert!(
+            custody.fork_stock.lock().owner.needs_control_capacity(),
+            "G1 arena must never publish into G2 fork stock"
+        );
     }
 }
