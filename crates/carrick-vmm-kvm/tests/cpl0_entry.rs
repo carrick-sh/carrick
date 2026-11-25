@@ -5294,3 +5294,828 @@ fn two_live_threads_fault_one_window_while_its_busy_loser_settles() {
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
+
+/// #3003 (x86 KVM witness 1, zero test hooks): `rt_sigreturn` whose signal
+/// frame read encounters an unbacked-yet-readable anonymous page (here, an
+/// `fpstate` image straddling resident page 0 into never-touched lazy anonymous
+/// page 1) must supply the page via the shared owner and retry `rt_sigreturn`,
+/// restoring caller registers and `uc_sigmask` without forcing `SIGSEGV`.
+#[test]
+fn production_sigreturn_unbacked_lazy_fpstate_crossing_page_supplies_and_restores() {
+    let asm = r#"
+.global _start
+.data
+.balign 8
+handler_runs:   .quad 0
+fp_target:      .quad 0
+blocked_mask:   .quad 0x800     /* SIGUSR2 initially blocked */
+observed_mask:  .quad 0
+
+.balign 8
+sigact_usr1:
+    .quad sigusr1_handler
+    .quad 0x04000004            /* SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+
+.text
+_start:
+    /* 64 KiB RW stack -> switch %rsp onto pre-faulted anonymous pages. */
+    xor %edi, %edi
+    mov $0x10000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %rcx
+    xor %edx, %edx
+fault_stack:
+    cmp $0x10000, %rdx
+    jae stack_ready
+    movb $0, (%rcx,%rdx,1)
+    add $0x1000, %rdx
+    jmp fault_stack
+stack_ready:
+    lea 0xf000(%rcx), %rsp
+
+    /* 2-page RW anonymous fpstate arena: fault ONLY page 0, leave page 1 unbacked! */
+    xor %edi, %edi
+    mov $0x2000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    movb $0, (%rax)
+    lea 0xf00(%rax), %rax       /* Spans resident page 0 [0xf00..0x1000) into lazy page 1 [0x0..0x100) */
+    movw $0x037f, (%rax)        /* FCW */
+    movl $0x1f80, 24(%rax)      /* MXCSR */
+    movabs $0x1122334455667788, %rcx
+    mov %rcx, 160(%rax)         /* xmm0 low qword on page 0 */
+    movabs $0x99aabbccddeeff00, %rcx
+    mov %rcx, 168(%rax)         /* xmm0 high qword on page 0; xmm8..xmm15 stay unbacked 0 on page 1 */
+    mov %rax, fp_target(%rip)
+
+    /* Block SIGUSR2 initially so we can verify rt_sigreturn overwrites mask from uc_sigmask. */
+    mov $2, %edi                /* SIG_SETMASK */
+    lea blocked_mask(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $14, %eax               /* rt_sigprocmask */
+    syscall
+    test %rax, %rax
+    jnz fail_procmask
+
+    /* Install SIGUSR1 handler. */
+    mov $10, %edi
+    lea sigact_usr1(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax               /* rt_sigaction */
+    syscall
+    test %rax, %rax
+    jnz fail_sigaction
+
+    /* Sentinel callee-saved regs that handler clobbers and rt_sigreturn must restore. */
+    movabs $0x1122334455667788, %rbx
+    movabs $0x2233445566778899, %r14
+    movabs $0x33445566778899aa, %r15
+
+    mov $39, %eax               /* getpid */
+    syscall
+    mov %rax, %rdi
+    mov $10, %esi               /* SIGUSR1 */
+    mov $62, %eax               /* kill */
+    syscall
+    test %rax, %rax
+    jnz fail_kill
+
+    cmpq $1, handler_runs(%rip)
+    jne fail_handler_count
+
+    movabs $0x1122334455667788, %rax
+    cmp %rax, %rbx
+    jne fail_rbx
+    movabs $0x2233445566778899, %rax
+    cmp %rax, %r14
+    jne fail_r14
+    movabs $0x33445566778899aa, %rax
+    cmp %rax, %r15
+    jne fail_r15
+
+    mov $2, %edi
+    xor %esi, %esi
+    lea observed_mask(%rip), %rdx
+    mov $8, %r10d
+    mov $14, %eax               /* rt_sigprocmask */
+    syscall
+    test %rax, %rax
+    jnz fail_procmask
+    cmpq $0x2000, observed_mask(%rip)
+    jne fail_mask
+
+    sub $32, %rsp
+    movdqu %xmm0, (%rsp)
+    movdqu %xmm8, 16(%rsp)
+    movabs $0x1122334455667788, %rax
+    cmp (%rsp), %rax
+    jne fail_fp
+    movabs $0x99aabbccddeeff00, %rax
+    cmp 8(%rsp), %rax
+    jne fail_fp
+    mov 16(%rsp), %rax
+    test %rax, %rax
+    jnz fail_fp
+    mov 24(%rsp), %rax
+    test %rax, %rax
+    jnz fail_fp
+    add $32, %rsp
+
+    mov $7, %edi
+    jmp die
+
+sigusr1_handler:
+    /* rdi = sig, rsi = siginfo*, rdx = ucontext* */
+    lock incq handler_runs(%rip)
+    mov fp_target(%rip), %rax
+    mov %rax, 0xe0(%rdx)        /* uc->uc_mcontext.fpstate */
+    movq $0x2000, 0x128(%rdx)   /* uc->uc_sigmask = SIGALRM */
+    pcmpeqd %xmm0, %xmm0        /* clobber XMM registers before rt_sigreturn */
+    pcmpeqd %xmm8, %xmm8
+    movabs $0xdeadbeef00000001, %rbx
+    movabs $0xdeadbeef00000002, %r14
+    movabs $0xdeadbeef00000003, %r15
+    ret
+
+restorer:
+    mov $15, %eax               /* rt_sigreturn */
+    syscall
+    mov $91, %edi               /* rt_sigreturn must never return to user code */
+    jmp die
+
+fail_mmap:          mov $90, %edi; jmp die
+fail_procmask:      mov $92, %edi; jmp die
+fail_sigaction:     mov $93, %edi; jmp die
+fail_kill:          mov $94, %edi; jmp die
+fail_handler_count: mov $95, %edi; jmp die
+fail_rbx:           mov $96, %edi; jmp die
+fail_r14:           mov $97, %edi; jmp die
+fail_r15:           mov $98, %edi; jmp die
+fail_mask:          mov $99, %edi; jmp die
+fail_fp:            mov $100, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "unbacked lazy fpstate across page boundary during rt_sigreturn must supply & restore (terminating_signal={:?}, stderr={})",
+        outcome.run.terminating_signal,
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #3003 (x86 KVM witness 2, contended MM editor): `rt_sigreturn` hitting an
+/// MM-editor contention (`INJECT_EDITOR_BUSY_ONCE`) while resolving a lazy
+/// signal-frame page must park once on the owner wait (`INJECT_WAIT_PARK_CENSUS`),
+/// retry `rt_sigreturn` cleanly, and preserve caller registers without forcing SIGSEGV.
+#[test]
+fn production_sigreturn_editor_busy_parks_and_restores() {
+    let asm = r#"
+.global _start
+.data
+.balign 8
+handler_runs:   .quad 0
+fp_target:      .quad 0
+
+.balign 8
+sigact_usr1:
+    .quad sigusr1_handler
+    .quad 0x04000004            /* SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+
+.text
+_start:
+    xor %edi, %edi
+    mov $0x10000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %rcx
+    xor %edx, %edx
+fault_stack:
+    cmp $0x10000, %rdx
+    jae stack_ready
+    movb $0, (%rcx,%rdx,1)
+    add $0x1000, %rdx
+    jmp fault_stack
+stack_ready:
+    lea 0xf000(%rcx), %rsp
+
+    /* Untouched lazy RW page for fpstate so prepare_owned_read enters MM editor. */
+    xor %edi, %edi
+    mov $0x1000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, fp_target(%rip)
+
+    mov $10, %edi
+    lea sigact_usr1(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax               /* rt_sigaction */
+    syscall
+    test %rax, %rax
+    jnz fail_sigaction
+
+    /* Baseline wait-park census -> %r13. */
+    mov $-493, %rax             /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    mov %rax, %r13
+
+    movabs $0xcafebabe12345678, %rbx
+    mov $39, %eax               /* getpid */
+    syscall
+    mov %rax, %rdi
+    mov $10, %esi
+    mov $62, %eax               /* kill */
+    syscall
+    test %rax, %rax
+    jnz fail_kill
+
+    cmpq $1, handler_runs(%rip)
+    jne fail_handler_count
+    movabs $0xcafebabe12345678, %rax
+    cmp %rax, %rbx
+    jne fail_rbx
+
+    mov $-493, %rax             /* INJECT_WAIT_PARK_CENSUS */
+    syscall
+    lea 1(%r13), %rdx
+    cmp %rdx, %rax
+    jne fail_census
+
+    mov $7, %edi
+    jmp die
+
+sigusr1_handler:
+    lock incq handler_runs(%rip)
+    mov fp_target(%rip), %rax
+    mov %rax, 0xe0(%rdx)        /* uc->uc_mcontext.fpstate */
+    mov $-495, %rax             /* INJECT_EDITOR_BUSY_ONCE */
+    syscall
+    test %rax, %rax
+    jnz fail_inject
+    movabs $0xbadc0ffe00000001, %rbx
+    ret
+
+restorer:
+    mov $15, %eax               /* rt_sigreturn */
+    syscall
+    mov $91, %edi
+    jmp die
+
+fail_mmap:          mov $90, %edi; jmp die
+fail_sigaction:     mov $92, %edi; jmp die
+fail_kill:          mov $93, %edi; jmp die
+fail_handler_count: mov $94, %edi; jmp die
+fail_rbx:           mov $95, %edi; jmp die
+fail_census:        mov $96, %edi; jmp die
+fail_inject:        mov $97, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "contended MM editor on rt_sigreturn copy-in must park and restore (terminating_signal={:?}, stderr={})",
+        outcome.run.terminating_signal,
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// #3003 (x86 KVM witness 3, two-thread real MM contention):
+/// Worker thread hammers `mmap` + `munmap` on the shared root MM while leader
+/// executes `tgkill` -> handler -> `rt_sigreturn` cycles each reading a fresh
+/// unbacked lazy `fpstate` page until `INJECT_SIGRETURN_CONTENTION_CENSUS`
+/// observes at least one real `rt_sigreturn` copy-in editor contention hit
+/// (bounded at 4096 cycles; at least 64 cycles). Zero `INJECT_*_BUSY` fake
+/// injections are armed. Contention between sibling MM editor and `rt_sigreturn`
+/// frame copy-in must settle cleanly without ever forcing SIGSEGV.
+#[test]
+fn production_two_threads_concurrent_mmap_and_sigreturn_never_sigsegvs() {
+    let asm = r#"
+.global _start
+.data
+.balign 8
+handler_runs:       .quad 0
+current_fp:         .quad 0
+contention_base:    .quad 0
+
+.balign 8
+sigact_usr1:
+    .quad sigusr1_handler
+    .quad 0x04000004            /* SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+
+.text
+_start:
+    /* Control + worker stack region: 0x4000 bytes RW anonymous. */
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_ctrl
+    mov %rax, %r12
+    movq $0, 0x0000(%r12)       /* CLONE_CHILD_CLEARTID futex word */
+    movq $0, 0x1000(%r12)
+    movq $0, 0x2000(%r12)
+    movq $0, 0x3000(%r12)
+    movq $0, 0x10(%r12)         /* worker_iters */
+    movq $0, 0x18(%r12)         /* worker_status (77 ok, 88 fail) */
+    movq $10, 0x20(%r12)        /* join timeout 10s */
+    movq $0, 0x28(%r12)
+    movq $0, 0x30(%r12)         /* stop_worker flag */
+
+    /* 1 MiB lazy RW arena (256 untouched pages) for per-iteration fpstate. */
+    xor %edi, %edi
+    mov $0x100000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_arena
+    mov %rax, %r13
+
+    mov $10, %edi
+    lea sigact_usr1(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax               /* rt_sigaction */
+    syscall
+    test %rax, %rax
+    jnz fail_sigaction
+
+    /* Clone sibling thread sharing the root MM. */
+    mov $0x013d0f00, %edi
+    lea 0x3ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js fail_clone
+    jz worker_entry
+
+    /* Wait barrier baseline. */
+
+    /* Barrier with sibling so both threads enter the race together. */
+    lock incl 0x08(%r12)
+1:
+    cmpl $2, 0x08(%r12)
+    je 2f
+    pause
+    jmp 1b
+2:
+    mov $39, %eax               /* getpid */
+    syscall
+    mov %rax, %r14
+    xor %ebx, %ebx
+leader_loop:
+    cmp $64, %rbx
+    jae leader_stop
+    mov %rbx, %rax
+    and $255, %eax
+    jnz 6f
+    test %rbx, %rbx
+    jz 6f
+    /* Replenish a fresh untouched 1 MiB lazy arena every 256 iterations. */
+    mov %r13, %rdi
+    mov $0x100000, %esi
+    mov $11, %eax               /* munmap */
+    syscall
+    test %rax, %rax
+    jnz fail_arena
+    xor %edi, %edi
+    mov $0x100000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax               /* mmap */
+    syscall
+    test %rax, %rax
+    js fail_arena
+    mov %rax, %r13
+6:
+    mov %rbx, %rax
+    and $255, %eax
+    shl $12, %rax
+    add %r13, %rax
+    mov %rax, current_fp(%rip)
+
+    /* Thread-directed signal to leader so worker never receives SIGUSR1. */
+    mov %r14, %rdi
+    mov %r14, %rsi
+    mov $10, %edx
+    mov $234, %eax              /* tgkill */
+    syscall
+    test %rax, %rax
+    jnz fail_tgkill
+
+    inc %rbx
+    jmp leader_loop
+
+leader_stop:
+    movq $1, 0x30(%r12)         /* ask worker to stop */
+leader_join:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz verify_counts
+    mov %r12, %rdi
+    xor %esi, %esi
+    lea 0x20(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_timeout
+    jmp leader_join
+
+verify_counts:
+    cmpq $77, 0x18(%r12)
+    jne fail_worker
+    cmpq $0, 0x10(%r12)
+    je fail_worker
+    cmpq $64, handler_runs(%rip)
+    jb fail_handler_count
+    mov $7, %edi
+    jmp die
+
+worker_entry:
+    lock incl 0x08(%r12)
+3:
+    cmpl $2, 0x08(%r12)
+    je 4f
+    pause
+    jmp 3b
+4:
+worker_loop:
+    cmpq $0, 0x30(%r12)
+    jne worker_done
+    xor %edi, %edi
+    mov $0x40000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js worker_fail
+    mov %rax, %rdi
+    movb $1, (%rdi)
+    mov $0x40000, %esi
+    mov $11, %eax               /* munmap */
+    syscall
+    test %rax, %rax
+    jnz worker_fail
+    lock incq 0x10(%r12)
+    jmp worker_loop
+worker_done:
+    movq $77, 0x18(%r12)
+    xor %edi, %edi
+    mov $60, %eax               /* exit thread */
+    syscall
+worker_fail:
+    movq $88, 0x18(%r12)
+    xor %edi, %edi
+    mov $60, %eax
+    syscall
+
+sigusr1_handler:
+    lock incq handler_runs(%rip)
+    mov current_fp(%rip), %rax
+    mov %rax, 0xe0(%rdx)
+    ret
+
+restorer:
+    mov $15, %eax               /* rt_sigreturn */
+    syscall
+    mov $91, %edi
+    jmp die
+
+fail_ctrl:          mov $90, %edi; jmp die
+fail_arena:         mov $92, %edi; jmp die
+fail_sigaction:     mov $93, %edi; jmp die
+fail_clone:         mov $94, %edi; jmp die
+fail_tgkill:        mov $95, %edi; jmp die
+fail_timeout:       mov $96, %edi; jmp die
+fail_worker:        mov $97, %edi; jmp die
+fail_handler_count: mov $98, %edi; jmp die
+fail_no_contention: mov $99, %edi; jmp die
+
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let elf = compile_static_gas_witness(asm);
+    let outcome = run_instrumented_pool_fixture(&elf, 256);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "concurrent mmap/munmap + rt_sigreturn must hit live contention and settle cleanly without SIGSEGV (terminating_signal={:?}, stderr={})",
+        outcome.run.terminating_signal,
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// #3003 (x86 KVM negative control, zero test hooks): a genuinely unreadable
+/// frame on `rt_sigreturn` (either unmapped `%rsp`, or multi-page `fpstate`
+/// straddling lazy page 0 into `PROT_NONE` page 1) must still force `SIGSEGV`
+/// with Linux `SI_KERNEL` (`si_code == 128`, `si_addr == 0`), never return
+/// `-EFAULT` to userspace.
+#[test]
+fn production_sigreturn_real_fault_delivers_sigsegv_si_kernel() {
+    for prot_none_fpstate in [false, true] {
+        let asm = if !prot_none_fpstate {
+            r#"
+.global _start
+.data
+.balign 8
+altstack_rec:
+    .quad 0
+    .quad 0
+    .quad 0x4000
+sigact_segv:
+    .quad segv_handler
+    .quad 0x0c000004            /* SA_ONSTACK | SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+
+.text
+_start:
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_setup
+    mov %rax, %rcx
+    xor %edx, %edx
+1:
+    cmp $0x4000, %rdx
+    jae 2f
+    movb $0, (%rcx,%rdx,1)
+    add $0x1000, %rdx
+    jmp 1b
+2:
+    mov %rcx, altstack_rec(%rip)
+    lea altstack_rec(%rip), %rdi
+    xor %esi, %esi
+    mov $131, %eax              /* sigaltstack */
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+    mov $11, %edi               /* SIGSEGV */
+    lea sigact_segv(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+    mov $0x70000000, %rsp       /* unmapped rsp */
+    mov $15, %eax               /* rt_sigreturn */
+    syscall
+after_sigreturn_syscall:
+    mov $91, %edi               /* negative control: must NEVER return -EFAULT */
+    jmp die
+
+segv_handler:
+    cmp $11, %rdi
+    jne fail_segv
+    cmpl $128, 8(%rsi)          /* SI_KERNEL */
+    jne fail_segv
+    cmpq $0, 16(%rsi)           /* si_addr == 0 */
+    jne fail_segv
+    cmpq $15, 0x90(%rdx)        /* uc_mcontext.rax must stay __NR_rt_sigreturn, never -EFAULT */
+    jne fail_segv
+    lea after_sigreturn_syscall(%rip), %rcx
+    cmpq %rcx, 0xa8(%rdx)       /* uc_mcontext.rip must not rewind to syscall */
+    jne fail_segv
+    mov $7, %edi
+    jmp die
+
+restorer:
+    mov $15, %eax
+    syscall
+    mov $92, %edi
+    jmp die
+
+fail_setup: mov $90, %edi; jmp die
+fail_segv:  mov $93, %edi; jmp die
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#
+        } else {
+            r#"
+.global _start
+.data
+.balign 8
+fp_target:      .quad 0
+supply_base:    .quad 0
+altstack_rec:
+    .quad 0
+    .quad 0
+    .quad 0x4000
+sigact_segv:
+    .quad segv_handler
+    .quad 0x0c000004            /* SA_ONSTACK | SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+sigact_usr1:
+    .quad sigusr1_handler
+    .quad 0x04000004            /* SA_RESTORER | SA_SIGINFO */
+    .quad restorer
+    .quad 0
+
+.text
+_start:
+    xor %edi, %edi
+    mov $0x4000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_setup
+    mov %rax, %rcx
+    xor %edx, %edx
+1:
+    cmp $0x4000, %rdx
+    jae 2f
+    movb $0, (%rcx,%rdx,1)
+    add $0x1000, %rdx
+    jmp 1b
+2:
+    mov %rcx, altstack_rec(%rip)
+    lea altstack_rec(%rip), %rdi
+    xor %esi, %esi
+    mov $131, %eax              /* sigaltstack */
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+    /* Two pages: p0 stays untouched lazy RW, p1 is PROT_NONE. */
+    xor %edi, %edi
+    mov $0x2000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_setup
+    lea 0xf00(%rax), %rcx
+    mov %rcx, fp_target(%rip)
+    lea 0x1000(%rax), %rdi
+    mov $0x1000, %esi
+    xor %edx, %edx              /* PROT_NONE */
+    mov $10, %eax               /* mprotect */
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+
+
+    mov $11, %edi               /* SIGSEGV */
+    lea sigact_segv(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+    mov $10, %edi               /* SIGUSR1 */
+    lea sigact_usr1(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_setup
+
+    mov $39, %eax
+    syscall
+    mov %rax, %rdi
+    mov $10, %esi
+    mov $62, %eax               /* kill */
+    syscall
+    mov $94, %edi
+    jmp die
+
+sigusr1_handler:
+    mov fp_target(%rip), %rax
+    mov %rax, 0xe0(%rdx)        /* fpstate crosses lazy p0 into PROT_NONE p1 */
+    ret
+
+segv_handler:
+    cmp $11, %rdi
+    jne fail_segv
+    cmpl $128, 8(%rsi)          /* SI_KERNEL */
+    jne fail_segv
+    cmpq $0, 16(%rsi)           /* si_addr == 0 */
+    jne fail_segv
+    cmpq $15, 0x90(%rdx)        /* uc_mcontext.rax must stay __NR_rt_sigreturn, never -EFAULT */
+    jne fail_segv
+    lea after_sigreturn_syscall(%rip), %rcx
+    cmpq %rcx, 0xa8(%rdx)       /* uc_mcontext.rip must not rewind to syscall */
+    jne fail_segv
+    mov $7, %edi
+    jmp die
+
+restorer:
+    mov $15, %eax               /* rt_sigreturn */
+    syscall
+after_sigreturn_syscall:
+    mov $91, %edi               /* negative control: must NEVER return -EFAULT */
+    jmp die
+
+fail_setup: mov $90, %edi; jmp die
+fail_segv:  mov $93, %edi; jmp die
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#
+        };
+
+        let elf = compile_static_gas_witness(asm);
+        let outcome = run_pool_fixture(&elf, 64);
+        assert_eq!(
+            outcome.run.exit_code, 7,
+            "prot_none_fpstate={prot_none_fpstate} real fault on rt_sigreturn must force SIGSEGV with SI_KERNEL (exit={}, terminating_signal={:?})",
+            outcome.run.exit_code, outcome.run.terminating_signal
+        );
+        assert_eq!(outcome.run.terminating_signal, None);
+    }
+}

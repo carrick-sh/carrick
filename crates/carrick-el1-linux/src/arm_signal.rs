@@ -390,6 +390,60 @@ pub(crate) fn restore_live_arm_signal_frame(
     Ok(mask)
 }
 
+#[cfg(all(test, not(all(target_os = "none", target_arch = "aarch64"))))]
+std::thread_local! {
+    static HOST_ARM_SIGNAL_CONTEXT: core::cell::RefCell<Option<carrick_sched_core::ThreadCtx>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(all(target_os = "none", target_arch = "aarch64"))))]
+pub(crate) fn set_host_arm_signal_context_for_test(ctx: Option<carrick_sched_core::ThreadCtx>) {
+    HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow_mut() = ctx);
+}
+
+#[cfg(all(test, not(all(target_os = "none", target_arch = "aarch64"))))]
+pub(crate) fn host_arm_signal_context_for_test() -> Option<carrick_sched_core::ThreadCtx> {
+    HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow())
+}
+
+#[cfg(all(test, not(all(target_os = "none", target_arch = "aarch64"))))]
+pub(crate) fn restore_host_arm_signal_frame(
+    frame: &mut TrapFrame,
+    copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
+{
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
+
+    let mut saved = match HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow()) {
+        Some(ctx) => ctx,
+        None => return Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS),
+    };
+    let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    fp.vregs = saved.v;
+    fp.fpsr = saved.fpsr as u32;
+    fp.fpcr = saved.fpcr as u32;
+    let sp = UserVa::new(saved.sp_el0);
+    let mut bytes =
+        frame_copy_buffer(arm::PUBLIC_FRAME_LEN).map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    if !copy_in.copy_in(&mut bytes, sp).is_done() {
+        return Err(carrick_syscall_abi::LINUX_EFAULT);
+    }
+    let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
+        return Err(carrick_syscall_abi::LINUX_EFAULT);
+    };
+    let (mask, saved_sp, stack) = restore(frame, sigframe, fp.as_mut_bytes(), sp)
+        .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    apply_restored_context(&mut saved, frame, &fp, saved_sp);
+    HOST_ARM_SIGNAL_CONTEXT.with(|cell| *cell.borrow_mut() = Some(saved));
+    Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+        mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(mask),
+        ),
+        stack,
+    })
+}
+
 #[cfg(any(
     test,
     feature = "host-test",
@@ -436,7 +490,7 @@ pub(crate) fn build(
     all(target_os = "none", target_arch = "aarch64")
 ))]
 use carrick_guest_arch::UserVa;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use zerocopy::FromBytes;
 
 /// The Linux signal-frame codec over the neutral ARM backend's types.

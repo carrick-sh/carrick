@@ -995,6 +995,7 @@ type TestOwnerAccess = Box<
 #[cfg(test)]
 std::thread_local! {
     pub(super) static TEST_OWNER_ACCESS: std::cell::RefCell<Option<TestOwnerAccess>> = const { std::cell::RefCell::new(None) };
+    pub(super) static TEST_COPYOUT_FAULT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 pub trait ForkStockCrossing {
@@ -2851,6 +2852,17 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
+            #[cfg(test)]
+            if TEST_COPYOUT_FAULT.with(|enabled| enabled.get()) {
+                return Some((
+                    carrick_guest_arch::FaultInfo {
+                        address,
+                        access: carrick_guest_arch::Access::Write,
+                        present: false,
+                    },
+                    NonZeroU64::MIN,
+                ));
+            }
             let _ = address;
             None
         }

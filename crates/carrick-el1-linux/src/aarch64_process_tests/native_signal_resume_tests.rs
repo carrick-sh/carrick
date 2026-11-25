@@ -2098,3 +2098,572 @@ fn arm_sa_restart_reruns_interrupted_svc_once(position: carrick_sched_core::Save
         "a restarted context is at its SVC: nothing may rewind it again"
     );
 }
+
+#[test]
+fn arm_rt_sigreturn_contention_parks_retries_and_restores_without_sigsegv() {
+    run_arm_rt_sigreturn_production_witness(false);
+    run_arm_rt_sigreturn_production_witness(true);
+}
+
+#[test]
+fn arm_rt_sigreturn_fault_forces_sigsegv_without_efault() {
+    run_arm_rt_sigreturn_inline_fault_witness(false, false);
+    run_arm_rt_sigreturn_inline_fault_witness(true, false);
+    run_arm_rt_sigreturn_inline_fault_witness(false, true);
+}
+
+struct ArmSigreturnFixture {
+    fixture: &'static Fixture,
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    runtime: std::sync::Arc<
+        NativeProcessRuntime<'static, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    >,
+    member: carrick_el1_abi::RecordRef,
+    service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame_buf: carrick_test_support::GuestUserBuffer,
+    initial_altstack: carrick_personality_linux::abi::thread::AltStack,
+    restored_altstack: carrick_personality_linux::abi::thread::AltStack,
+}
+
+fn setup_arm_sigreturn_fixture() -> ArmSigreturnFixture {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    registry()
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let owner_record = runtime
+        .task_binding(TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        })
+        .unwrap()
+        .record
+        .id;
+    let member = fixture.zone.record_ref(owner_record);
+    fixture.control.bind_zone_record(member);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, owner_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        owner_record
+    );
+    run_as_leader(fixture);
+
+    let frame_buf = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let restored_altstack = carrick_personality_linux::abi::thread::AltStack {
+        sp: 0x30_0000,
+        size: 0x4000,
+        flags: 0,
+    };
+    let initial_altstack = carrick_personality_linux::abi::thread::AltStack {
+        sp: frame_buf.arg() + 0x2000,
+        size: 0x2000,
+        flags: 0,
+    };
+    fixture.control.write_altstack(initial_altstack);
+
+    let mut frame_img = carrick_personality_linux::signal::arm::SignalFrame {
+        rt: carrick_personality_linux::signal::arm::RtSigframe {
+            siginfo: carrick_syscall_abi::LinuxSiginfo::empty(),
+            ucontext: carrick_syscall_abi::LinuxUcontext {
+                uc_stack: carrick_syscall_abi::LinuxSignalStack {
+                    ss_sp: restored_altstack.sp,
+                    ss_flags: 0,
+                    _pad0: 0,
+                    ss_size: restored_altstack.size,
+                },
+                uc_sigmask: 1 << 9,
+                ..carrick_syscall_abi::LinuxUcontext::empty()
+            },
+        },
+        frame_record: [0; 2],
+    };
+    frame_img.rt.ucontext.uc_mcontext.pc = 0x55_0000;
+    frame_img.rt.ucontext.uc_mcontext.sp = 0x66_0000;
+    frame_img.rt.ucontext.uc_mcontext.pstate = 0x6000_0000;
+    frame_img.rt.ucontext.uc_mcontext.regs[0] = 0x1111_2222_3333_4444;
+    frame_img.rt.ucontext.uc_mcontext.regs[19] = 0x5555_6666_7777_8888;
+    let mut restored_fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    restored_fp.vregs[0] = 0x9999_aaaa_bbbb_cccc;
+    carrick_personality_linux::signal::arm::encode(&mut frame_img, Some(&restored_fp), None)
+        .unwrap();
+    let raw = frame_img.rt.as_bytes();
+    unsafe {
+        core::ptr::copy_nonoverlapping(raw.as_ptr(), frame_buf.va().raw() as *mut u8, raw.len());
+    }
+
+    let mut service = fixture.process_service();
+    {
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        with_process_entry(
+            source,
+            &fixture.task,
+            &words.native,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |entry| {
+                entry
+                    .rt_sigaction(
+                        Signal::SEGV,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x72_0000)),
+                            flags: carrick_signal_core::policy::ActionFlags {
+                                siginfo: true,
+                                on_stack: true,
+                                ..Default::default()
+                            },
+                            restorer: Some(carrick_signal_core::policy::RestorerAddress(0x73_0000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
+
+    ArmSigreturnFixture {
+        fixture,
+        source,
+        runtime,
+        member,
+        service,
+        frame_buf,
+        initial_altstack,
+        restored_altstack,
+    }
+}
+
+fn run_arm_rt_sigreturn_production_witness(busy_once: bool) {
+    let ArmSigreturnFixture {
+        fixture,
+        source,
+        runtime,
+        member,
+        mut service,
+        frame_buf,
+        initial_altstack,
+        restored_altstack,
+    } = setup_arm_sigreturn_fixture();
+    let ttbr0 = fixture_ttbr0(fixture);
+    let task: &'static CurrentTask = &fixture.task;
+    let frame_sp = frame_buf.va();
+    let initial_blocked = carrick_el1_abi::BlockedMask(1 << 11);
+    fixture.control.init_blocked(initial_blocked);
+
+    let mut host_ctx = ThreadCtx::ZERO;
+    host_ctx.pc = 0x40_0004;
+    host_ctx.sp_el0 = frame_sp.raw();
+    host_ctx.x[0] = 0xaaaa_bbbb;
+    host_ctx.x[8] = 139;
+    host_ctx.v[0] = 0x1234;
+    crate::arm_signal::set_host_arm_signal_context_for_test(Some(host_ctx));
+
+    let mut held_editor = None;
+    let owner_wait = if !busy_once {
+        let handle = crate::cow_resolver::admitted_fault_mm_handle(
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            fixture.slot,
+            task,
+        )
+        .unwrap();
+        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+        let index = access.find(handle.mm().raw()).unwrap();
+        let notifications = fixture
+            .zone
+            .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+            .unwrap()
+            .notifications(handle.incarnation())
+            .unwrap();
+        let observed =
+            notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+        held_editor = Some(
+            access
+                .try_begin_edit_bounded(index, handle.mm().raw(), NonZeroU64::new(91).unwrap(), 0)
+                .unwrap(),
+        );
+        Some(unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_core_abi::PortalWaitCause::Editor,
+                observed.revision(),
+            )
+        })
+    } else {
+        None
+    };
+
+    let refuse_once = std::rc::Rc::new(core::cell::Cell::new(true));
+    {
+        let refuse_once = refuse_once.clone();
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |va, _, access| {
+                !(va == frame_sp && access == carrick_guest_arch::Access::Read && refuse_once.get())
+            }));
+        });
+    }
+    let owner_refuse_once = std::rc::Rc::new(core::cell::Cell::new(true));
+    {
+        let owner_refuse_once = owner_refuse_once.clone();
+        crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+                if bytes.is_none() && owner_refuse_once.replace(false) {
+                    return Some(Err(match owner_wait {
+                        Some(wait) => NativeProcessError::OwnerWait(wait),
+                        None => NativeProcessError::Busy,
+                    }));
+                }
+                None
+            }));
+        });
+    }
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            crate::arm_signal::set_host_arm_signal_context_for_test(None);
+        }
+    }
+    let _clear = ClearHooks;
+
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x40_0004,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[0] = 0xaaaa_bbbb;
+    frame.x[8] = 139; // SYS_rt_sigreturn
+
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (ttbr0, ttbr0),
+        ..Default::default()
+    };
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        fixture.control,
+        &host_ctx,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+        "NotYet rt_sigreturn copy-in must suspend without forcing SIGSEGV"
+    );
+    assert_eq!(frame.x[0], 0xaaaa_bbbb);
+    assert_eq!(frame.elr, 0x40_0004);
+    assert_eq!(fixture.control.blocked().0, initial_blocked.0);
+    assert_eq!(fixture.control.read_altstack(), initial_altstack);
+
+    refuse_once.set(false);
+    if busy_once {
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(member).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap();
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &fixture.control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(member.id).identity(),
+            )
+        }
+        .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    } else {
+        drop(held_editor.take());
+    }
+
+    let mut resume_cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu {
+            ttbr: (ttbr0, ttbr0),
+            ..Default::default()
+        },
+        runtime: &runtime,
+        registry: registry(),
+        source,
+        task,
+        service: &mut service,
+    };
+    let mut resumed_frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task,
+            cpu: &mut resume_cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut resumed_frame, 0),
+        Served::Returned { switched: true }
+    );
+    assert_eq!(
+        resumed_frame.elr, 0x40_0000,
+        "resumed rt_sigreturn must rewind PC to SVC"
+    );
+    assert_eq!(resumed_frame.x[8], 139);
+
+    // Guest re-executes SVC 139 at 0x40_0000 (ELR becomes 0x40_0004).
+    resumed_frame.elr = 0x40_0004;
+    let route2 = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut resumed_frame,
+        &counters,
+        core::slice::from_ref(task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        fixture.control,
+        &host_ctx,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(
+        route2,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(resumed_frame.elr, 0x55_0000);
+    assert_eq!(resumed_frame.x[0], 0x1111_2222_3333_4444);
+    assert_eq!(resumed_frame.x[19], 0x5555_6666_7777_8888);
+    assert_eq!(
+        crate::arm_signal::host_arm_signal_context_for_test().map(|c| (c.sp_el0, c.v[0])),
+        Some((0x66_0000, 0x9999_aaaa_bbbb_cccc))
+    );
+    assert_eq!(fixture.control.read_altstack(), restored_altstack);
+    assert_eq!(fixture.control.blocked().0, 1 << 9);
+    let _ = (&runtime,);
+}
+
+fn run_arm_rt_sigreturn_inline_fault_witness(masked_segv: bool, sync_service_refusal: bool) {
+    let ArmSigreturnFixture {
+        fixture,
+        source,
+        runtime,
+        member,
+        mut service,
+        frame_buf,
+        initial_altstack,
+        ..
+    } = setup_arm_sigreturn_fixture();
+    let ttbr0 = fixture_ttbr0(fixture);
+    let task: &'static CurrentTask = &fixture.task;
+    let frame_sp = frame_buf.va();
+    if masked_segv {
+        fixture
+            .control
+            .init_blocked(carrick_el1_abi::BlockedMask(Signal::SEGV.bit()));
+    } else {
+        fixture
+            .control
+            .init_blocked(carrick_el1_abi::BlockedMask(0));
+    }
+
+    let mut host_ctx = ThreadCtx::ZERO;
+    host_ctx.pc = 0x40_0004;
+    host_ctx.sp_el0 = frame_sp.raw();
+    host_ctx.x[0] = 0x1234_5678;
+    crate::arm_signal::set_host_arm_signal_context_for_test(Some(host_ctx));
+
+    carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |va, _, _| va != frame_sp));
+    });
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
+            bytes.is_none().then_some(Err(if sync_service_refusal {
+                NativeProcessError::Unsupported
+            } else {
+                NativeProcessError::Fault
+            }))
+        }));
+    });
+    if sync_service_refusal {
+        crate::aarch64_process::TEST_COPYOUT_FAULT.with(|enabled| enabled.set(true));
+        let runtime_addr = std::sync::Arc::as_ptr(&runtime) as usize;
+        crate::native_process_runtime::host_test_support::set_service_published_hook(
+            runtime_addr,
+            Box::new(move || {
+                let notice = fixture.task.service_notice.take().unwrap().unwrap();
+                let ticket = unsafe {
+                    carrick_core_abi::service::ServiceCell::claim_notice(
+                        &fixture.control.service,
+                        notice,
+                        core::num::NonZeroU64::MIN,
+                        fixture.zone.record(member.id).identity(),
+                    )
+                }
+                .unwrap();
+                assert!(ticket.complete(false).is_ok());
+            }),
+        );
+    }
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+            crate::aarch64_process::TEST_COPYOUT_FAULT.with(|enabled| enabled.set(false));
+            crate::arm_signal::set_host_arm_signal_context_for_test(None);
+        }
+    }
+    let _clear = ClearHooks;
+
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x40_0004,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[0] = 0x1234_5678;
+    frame.x[8] = 139;
+
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (ttbr0, ttbr0),
+        ..Default::default()
+    };
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        fixture.control,
+        &host_ctx,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(
+        frame.elr, 0x40_0004,
+        "faulted/settled rt_sigreturn must not rewind PC for syscall retry"
+    );
+    assert_eq!(
+        frame.x[0], 0x1234_5678,
+        "faulted rt_sigreturn must never write -EFAULT into x0"
+    );
+    assert_eq!(fixture.control.read_altstack(), initial_altstack);
+    assert_eq!(fixture.control.blocked().0 & Signal::SEGV.bit(), 0);
+    let segv_stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut delivery_frame = frame;
+    let action = crate::dispatch::arm_signal_user_return_entry(
+        source,
+        task,
+        &host_ctx,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        (delivery_frame.esr, delivery_frame.x[0]),
+        true,
+        &mut service,
+        |process| {
+            crate::arm_signal::deliver_on_user_return_at(
+                task,
+                fixture.control,
+                process,
+                &mut delivery_frame,
+                |_, _| segv_stack.va_at(segv_stack.len()),
+            )
+        },
+    )
+    .unwrap();
+    if masked_segv {
+        // Blocking a forced SIGSEGV resets it to SIG_DFL and terminates the thread.
+        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        assert!(
+            fixture.zone.slot(fixture.slot).current().is_none(),
+            "fatal masked SIGSEGV must retire thread from CPU slot"
+        );
+    } else {
+        assert_eq!(action, carrick_el1_abi::Action::Served);
+        assert_eq!(
+            delivery_frame.elr, 0x72_0000,
+            "faulted rt_sigreturn must deliver SIGSEGV handler"
+        );
+        assert_eq!(delivery_frame.x[0], 11);
+    }
+}
