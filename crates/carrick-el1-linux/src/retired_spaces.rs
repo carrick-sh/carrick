@@ -18,6 +18,7 @@ use carrick_mmu_core::owner_mmu::OwnerMmu;
 use carrick_sched_core::{SlotId, ZoneTables};
 use core::num::NonZeroU64;
 
+use super::native_process_runtime::NativeProcessError;
 use carrick_core::mm::reservation::{RootHolder, RootWait};
 use carrick_el1::lock::SpinLock;
 
@@ -31,19 +32,36 @@ pub struct RetiredSpace {
     pub mm: ReservationMm,
 }
 
-/// Why one queued space did not retire.
+/// Why one queued space did not retire: the owner's refusal, and who held
+/// the space's reservation root when that refusal was a held root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpaceRetireRefusal {
-    /// A host thread held the space's reservation root: "not now". The
-    /// carrier's own release ends it; a drain with a
-    /// [`SpaceRetiredCrossing`] enrols on that release by crossing, then
-    /// reruns ([`RetiredSpaces::drain_portal_crossing`]).
-    HostHeld,
-    /// Otherwise not now (a guest holder of the root, a pending edit): the
-    /// entry stays queued for the next drain (#3031).
-    Busy,
-    /// The entry is gone or cannot retire: it is dropped.
-    Stale,
+pub struct SpaceRetireRefusal {
+    pub error: NativeProcessError,
+    pub holder: Option<RootHolder>,
+}
+
+impl SpaceRetireRefusal {
+    /// A refusal with no root holder observed.
+    pub const fn of(error: NativeProcessError) -> Self {
+        Self {
+            error,
+            holder: None,
+        }
+    }
+
+    /// "Not now": the entry stays queued for the next drain.
+    pub fn not_now(self) -> bool {
+        self.error == NativeProcessError::Busy
+    }
+
+    /// A host thread held the root. The carrier's own release ends it; a
+    /// drain with a [`SpaceRetiredCrossing`] enrols on that release by
+    /// crossing, then reruns ([`RetiredSpaces::drain_portal_crossing`]).
+    /// Any other "not now" (a guest holder, a pending edit) waits for the
+    /// next drain (#3031).
+    pub fn host_held(self) -> bool {
+        self.not_now() && self.holder == Some(RootHolder::Host)
+    }
 }
 
 /// What one [`RetiredSpaces::drain`] did: how many queued spaces it
@@ -102,8 +120,8 @@ impl RetiredSpaces {
     /// Lock order: the queue lock is taken before owner and root locks, and
     /// nothing calls `push` or `drain` while holding those.
     ///
-    /// When `retire` answers "not now" ([`SpaceRetireRefusal::HostHeld`] or
-    /// [`SpaceRetireRefusal::Busy`]), that space and every later entry stay
+    /// When `retire` answers "not now" ([`SpaceRetireRefusal::not_now`]),
+    /// that space and every later entry stay
     /// queued to retry at the next drain. Stale or unretireable entries are
     /// dropped so they do not block the queue head forever, allowing
     /// subsequent entries to drain.
@@ -133,7 +151,7 @@ impl RetiredSpaces {
             }
             match retire(&space) {
                 Ok(()) => retired += 1,
-                Err(refusal @ (SpaceRetireRefusal::HostHeld | SpaceRetireRefusal::Busy)) => {
+                Err(refusal) if refusal.not_now() => {
                     if write != read
                         && let Some(slot) = pending.get_mut(write)
                     {
@@ -216,7 +234,7 @@ impl RetiredSpaces {
     ) -> Result<(), SpaceRetireRefusal> {
         loop {
             let drained = drain();
-            let host_held = drained.result == Err(SpaceRetireRefusal::HostHeld);
+            let host_held = drained.result.is_err_and(SpaceRetireRefusal::host_held);
             if drained.retired != 0 || host_held {
                 crossing.cross();
             }
@@ -283,26 +301,26 @@ pub fn retire_closed_space<
     mm: ReservationMm,
     worker: u32,
 ) -> Result<(), SpaceRetireRefusal> {
-    let index = owner
-        .spaces
-        .find(mm.raw())
-        .ok_or(SpaceRetireRefusal::Stale)?;
+    let stale = SpaceRetireRefusal::of(NativeProcessError::Stale);
+    let index = owner.spaces.find(mm.raw()).ok_or(stale)?;
     owner.spaces.close(index);
     let holder = HolderProbe::default();
     owner
         .root_any_observing(mm, worker, &holder)
-        .map_err(|error| match (error, holder.0.get()) {
-            (MmError::Busy, Some(RootHolder::Host)) => SpaceRetireRefusal::HostHeld,
-            (MmError::Busy, _) => SpaceRetireRefusal::Busy,
-            _ => SpaceRetireRefusal::Stale,
+        .map_err(|error| match error {
+            MmError::Busy => SpaceRetireRefusal {
+                error: NativeProcessError::Busy,
+                holder: holder.0.get(),
+            },
+            _ => stale,
         })?
         .retire_final()
-        .map_err(|_| SpaceRetireRefusal::Busy)?;
+        .map_err(|_| SpaceRetireRefusal::of(NativeProcessError::Busy))?;
     owner
         .space_access(worker)
-        .map_err(|_| SpaceRetireRefusal::Stale)?
+        .map_err(|_| stale)?
         .retire_entry(index)
-        .map_err(|_| SpaceRetireRefusal::Stale)?;
+        .map_err(|_| stale)?;
     Ok(())
 }
 
@@ -342,7 +360,7 @@ mod tests {
             |space| space.mm.raw() != 11,
             |space| {
                 if space.mm.raw() == 12 {
-                    Err(SpaceRetireRefusal::Busy)
+                    Err(SpaceRetireRefusal::of(NativeProcessError::Busy))
                 } else {
                     retired.borrow_mut().push(space.mm.raw());
                     Ok(())
@@ -353,7 +371,7 @@ mod tests {
             result,
             RetiredDrain {
                 retired: 1,
-                result: Err(SpaceRetireRefusal::Busy)
+                result: Err(SpaceRetireRefusal::of(NativeProcessError::Busy))
             }
         );
         assert_eq!(*retired.borrow(), vec![10]);
@@ -390,7 +408,7 @@ mod tests {
             |_| true,
             |space| {
                 if space.mm.raw() == 10 {
-                    Err(SpaceRetireRefusal::Stale)
+                    Err(SpaceRetireRefusal::of(NativeProcessError::Stale))
                 } else {
                     retired.borrow_mut().push(space.mm.raw());
                     Ok(())
@@ -401,7 +419,7 @@ mod tests {
             result,
             RetiredDrain {
                 retired: 1,
-                result: Err(SpaceRetireRefusal::Stale)
+                result: Err(SpaceRetireRefusal::of(NativeProcessError::Stale))
             }
         );
         assert_eq!(*retired.borrow(), vec![11]);
@@ -433,7 +451,10 @@ mod tests {
                     |_| {
                         attempts.set(attempts.get() + 1);
                         if attempts.get() == 1 {
-                            Err(SpaceRetireRefusal::HostHeld)
+                            Err(SpaceRetireRefusal {
+                                error: NativeProcessError::Busy,
+                                holder: Some(RootHolder::Host),
+                            })
                         } else {
                             Ok(())
                         }
@@ -459,10 +480,18 @@ mod tests {
         queue.push(space(10));
         let mut crossing = CountingCrossing(0);
         let result = queue.drain_crossing(
-            || queue.drain(|_| true, |_| Err(SpaceRetireRefusal::Busy)),
+            || {
+                queue.drain(
+                    |_| true,
+                    |_| Err(SpaceRetireRefusal::of(NativeProcessError::Busy)),
+                )
+            },
             &mut crossing,
         );
-        assert_eq!(result, Err(SpaceRetireRefusal::Busy));
+        assert_eq!(
+            result,
+            Err(SpaceRetireRefusal::of(NativeProcessError::Busy))
+        );
         assert_eq!(crossing.0, 0);
         assert_eq!(queue.len(), 1);
     }

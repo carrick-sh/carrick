@@ -25,9 +25,7 @@ use carrick_el1_linux::native_process_runtime::{
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
     NativeProcessService,
 };
-use carrick_el1_linux::retired_spaces::{
-    RetiredSpace, RetiredSpaces, SpaceRetireRefusal, SpaceRetiredCrossing,
-};
+use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces, SpaceRetiredCrossing};
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
@@ -83,10 +81,7 @@ fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcess
             worker,
             &mut SpaceRetiredPort,
         )
-        .map_err(|refusal| match refusal {
-            SpaceRetireRefusal::HostHeld | SpaceRetireRefusal::Busy => NativeProcessError::Busy,
-            SpaceRetireRefusal::Stale => NativeProcessError::Stale,
-        })
+        .map_err(|refusal| refusal.error)
 }
 
 /// Leave this CPU's installed space for the maintenance root and publish the

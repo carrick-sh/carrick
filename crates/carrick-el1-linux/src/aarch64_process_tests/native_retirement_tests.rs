@@ -929,8 +929,8 @@ fn test_reservation_layout() -> carrick_el1_abi::Layout {
 
 /// A held root keeps a closed space queued until the next drain, and the
 /// refusal names who held it: a host thread's hold is
-/// [`SpaceRetireRefusal::HostHeld`] (an x86 drain crosses and reruns on
-/// it, #3030), a guest slot's is [`SpaceRetireRefusal::Busy`].
+/// [`SpaceRetireRefusal::host_held`] (an x86 drain crosses and reruns on
+/// it, #3030), a guest slot's is only "not now".
 #[test]
 fn contended_root_keeps_closed_space_queued_until_next_drain() {
     contended_root_keeps_closed_space_queued(true);
@@ -991,10 +991,13 @@ fn contended_root_keeps_closed_space_queued(host_holds: bool) {
         (first.retired, first.result, queue.len()),
         (
             0,
-            Err(if host_holds {
-                SpaceRetireRefusal::HostHeld
-            } else {
-                SpaceRetireRefusal::Busy
+            Err(SpaceRetireRefusal {
+                error: NativeProcessError::Busy,
+                holder: Some(if host_holds {
+                    carrick_el1::memory::reservations::RootHolder::Host
+                } else {
+                    carrick_el1::memory::reservations::RootHolder::El1Slot(5)
+                }),
             }),
             2
         )
@@ -1046,7 +1049,7 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
     let owner: crate::aarch64_process::Portal<'_> = MmPortal::for_zone(carrier, roots, zone);
     assert_eq!(
         retire_closed_space(&owner, unrooted_mm, 0),
-        Err(SpaceRetireRefusal::Stale)
+        Err(SpaceRetireRefusal::of(NativeProcessError::Stale))
     );
 
     let queue = RetiredSpaces::new();
@@ -1060,7 +1063,10 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
     }
 
     let result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-    assert_eq!(result.result, Err(SpaceRetireRefusal::Stale));
+    assert_eq!(
+        result.result,
+        Err(SpaceRetireRefusal::of(NativeProcessError::Stale))
+    );
     assert!(queue.is_empty());
     assert!(zone.spaces.find(valid_mm.raw()).is_none());
 }
