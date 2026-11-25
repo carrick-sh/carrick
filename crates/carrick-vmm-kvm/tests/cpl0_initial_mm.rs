@@ -621,7 +621,7 @@ fn production_temporary_table_shortage_parks_enrols_and_succeeds_after_return() 
 /// completes every touch and exits 0.
 #[test]
 fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() {
-    quarantined_child_vacate_wakes_a_parked_fault(false);
+    quarantined_child_vacate_wakes_a_parked_fault(VacateContention::None);
 }
 
 /// #3030, contended (rev3022c P0-1): the host holds the quarantined child's
@@ -635,7 +635,31 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
 /// queued with no crossing, and the parent waited for an unrelated drain.
 #[test]
 fn production_fault_parked_on_a_quarantined_child_wakes_when_a_host_held_root_releases() {
-    quarantined_child_vacate_wakes_a_parked_fault(true);
+    quarantined_child_vacate_wakes_a_parked_fault(VacateContention::HostRoot);
+}
+
+/// rev3022d P0: a notification borrower outlives the retirement. A
+/// foreign-holder wait borrows the quarantined child's live notification
+/// lease without its reservation root, and holds it while the child's last
+/// slot vacates, retires the space in ring and crosses the space-retired
+/// port, and while the carrier serves that crossing. The retirement must
+/// unpublish the entry itself, so that crossing reclaims the tables and
+/// wakes the parked parent. It used to leave the entry published until the
+/// borrower's release, which crosses nothing: the crossing deferred the
+/// reclaim, and the parent waited for the child's unrelated exit-work drain.
+#[test]
+fn production_fault_parked_on_a_quarantined_child_wakes_past_a_notification_borrower() {
+    quarantined_child_vacate_wakes_a_parked_fault(VacateContention::NotificationBorrower);
+}
+
+/// What contends with the quarantined child's last slot vacate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VacateContention {
+    None,
+    /// The host holds the child's reservation root.
+    HostRoot,
+    /// A borrower holds the child's live notification lease.
+    NotificationBorrower,
 }
 
 /// rev3022c P0-2: a stock release can fire a parked exec's wake inside a
@@ -831,7 +855,7 @@ fn production_owner_grant_crossing_reruns_a_parked_exec_its_release_woke() {
     );
 }
 
-fn quarantined_child_vacate_wakes_a_parked_fault(host_holds_root: bool) {
+fn quarantined_child_vacate_wakes_a_parked_fault(contention: VacateContention) {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
@@ -962,7 +986,42 @@ fn quarantined_child_vacate_wakes_a_parked_fault(host_holds_root: bool) {
     //    own exit work (a `WORK_PORT` crossing, which also drains) and idles.
     //    The vacate itself must return the tables and wake the parent: no
     //    later, unrelated crossing may be what delivers the wake.
-    if host_holds_root {
+    if contention == VacateContention::NotificationBorrower {
+        // The borrower holds the child's notification lease across the
+        // vacate's in-ring retirement, its space-retired crossing and the
+        // carrier's service of that crossing, and releases it only after.
+        factory
+            .fixture_with_quarantined_notifications_borrowed(|| {
+                let first = (0..64)
+                    .map(|_| child.fixture_run_idle_peer().expect("child vacate"))
+                    .find(|exit| matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }))
+                    .expect("child crossing under the borrow");
+                assert!(
+                    matches!(
+                        first,
+                        CarrierRunExit::PhysicalDoorbell { port, .. }
+                            if port == carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT
+                    ),
+                    "the vacate retired the space and crossed: {first:?}, {:?}",
+                    counters()
+                );
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&first, |_, _| {})
+                        .expect("space-retired crossing under the borrow")
+                        .is_none()
+                );
+                assert_eq!(
+                    (retired_crossings(), waiters(), counters().returned_children),
+                    (Some(1), 0, 1),
+                    "the space-retired crossing reclaimed the tables and woke the \
+                     parent while the borrower still held the lease: {:?}",
+                    counters()
+                );
+            })
+            .expect("borrow the quarantined child's notifications");
+    }
+    if contention == VacateContention::HostRoot {
         // The host holds the child's root while CPU 1 runs to its first
         // crossing; that crossing is serviced only after the hold ends, as
         // the custody it takes would make it wait.
@@ -1028,7 +1087,7 @@ fn quarantined_child_vacate_wakes_a_parked_fault(host_holds_root: bool) {
     let vacated = counters();
     assert_eq!(
         retired_crossings(),
-        Some(1 + u64::from(host_holds_root)),
+        Some(1 + u64::from(contention == VacateContention::HostRoot)),
         "exactly the child's last slot vacate retired its space and crossed, \
          after one crossing for the host's hold"
     );

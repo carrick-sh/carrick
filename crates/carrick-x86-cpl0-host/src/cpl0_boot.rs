@@ -4422,6 +4422,39 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         custody.fixture_with_quarantined_root_held(body)
     }
 
+    /// Run `body` (CPU runs and crossing services) while one borrower holds
+    /// the one quarantined fork child's live notification lease, as a
+    /// foreign-holder wait that enrols on that MM's release does without
+    /// its reservation root (`carrick_core::wait::coordinate_holder_release_wait`).
+    /// The lease is released only after `body` returns.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_with_quarantined_notifications_borrowed<R>(
+        &self,
+        body: impl FnOnce() -> R,
+    ) -> Result<R, TrapError> {
+        let (ram, mm) = {
+            let custody = self
+                .custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            let [mm] = custody.fork_stock.quarantined_mms()[..] else {
+                return Err(fail(
+                    "fixture notification borrow needs exactly one quarantined child",
+                ));
+            };
+            (Arc::clone(&custody.ram), mm)
+        };
+        let zone = anonymous_owner::retained_cow_zone(&ram)?;
+        let lease = NonZeroU64::new(mm.raw())
+            .and_then(|mm| zone.space_entry(mm))
+            .ok_or_else(|| fail("fixture quarantined child unpublished"))?
+            .live_notifications()
+            .map_err(|error| fail(format!("fixture quarantined notifications: {error:?}")))?;
+        let result = body();
+        drop(lease);
+        Ok(result)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture_hold_fork_stock(
         &self,
