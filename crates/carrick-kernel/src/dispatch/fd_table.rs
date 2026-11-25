@@ -247,19 +247,18 @@ impl EventFdState {
             },
         }
     }
-    /// The counter's object lock: a refusal is the carrier gone, and a
-    /// retired counter is EBADF.
+    /// The counter's object lock: a refusal after the stop is the carrier
+    /// gone; any other failure (a retired counter) is EBADF, as before.
     fn lock(
         &self,
     ) -> Result<carrick_el1_abi::ipc::IpcObjectGuard<'_>, crate::el1_ipc::LiveStepError> {
-        match self.owner.region().lock(self.object, &self.owner.wait()) {
-            Ok(guard) => Ok(guard),
-            Err(carrick_el1_abi::ipc::IpcError::Stale) => Err(carrick_abi::LINUX_EBADF.into()),
-            Err(error) => match self.owner.cut_off(error) {
-                Ok(gone) => Err(gone.into()),
-                Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter lock"),
-            },
-        }
+        self.owner
+            .region()
+            .lock(self.object, &self.owner.wait())
+            .map_err(|error| match self.owner.cut_off(error) {
+                Ok(gone) => gone.into(),
+                Err(_) => carrick_abi::LINUX_EBADF.into(),
+            })
     }
     fn finish<T>(
         &self,
