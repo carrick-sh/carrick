@@ -2884,7 +2884,7 @@ fn child_futex<'a>(
             // The rem page is not yet backed: the first copy needs the owner
             // to prepare it, then the retained output is written.
             SleepCase::PendingSignalLazyRemainder => {
-                fail_signal_copies(&[NativeProcessError::Unsupported]);
+                fail_signal_copies(&[NativeProcessError::NeedsSupply]);
             }
             SleepCase::PendingSignalBusyRemainder => {
                 fail_signal_copies(&[NativeProcessError::Busy]);

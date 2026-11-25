@@ -2212,6 +2212,8 @@ pub(crate) fn declined_fault_admission_result(
             | NativeProcessError::Fault
             | NativeProcessError::ForkRefused(_)
             | NativeProcessError::Unsupported
+            | NativeProcessError::NeedsSupply
+            | NativeProcessError::SupplySelected
             | NativeProcessError::GroupExitCustody
             | NativeProcessError::NoChild,
         ) => Ok(Action::Forward),
@@ -3108,7 +3110,10 @@ fn native_service_fatal_reason(
         Error::Stale => Fatal::NativeServiceStale,
         Error::Exhausted => Fatal::NativeServiceExhausted,
         Error::Fault => Fatal::NativeServiceFault,
-        Error::Unsupported => Fatal::NativeServiceUnsupported,
+        // A supply request no owner took is an unsupported operation there.
+        Error::Unsupported | Error::NeedsSupply | Error::SupplySelected => {
+            Fatal::NativeServiceUnsupported
+        }
         Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
         Error::Busy => Fatal::NativeServiceBusy,
         Error::Quarantined => Fatal::NativeServiceQuarantined,

@@ -1520,7 +1520,7 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
             if slot.publish_fault_selection(window.operation.sequence.get(), window) {
                 // The existing native fault service owns physical supply. The
                 // caller retains its operation while that service releases CPU.
-                Err(NativeProcessError::Unsupported)
+                Err(NativeProcessError::SupplySelected)
             } else {
                 Err(NativeProcessError::Busy)
             },
