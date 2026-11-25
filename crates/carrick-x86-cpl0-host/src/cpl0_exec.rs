@@ -2047,32 +2047,37 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 self.exec_predecessors.release_permitted.push(receipt);
                 continue;
             };
-            let memory = std::cell::RefCell::new(&mut self._vm);
-            let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
-            let settled = self.fork_stock.settle_exec_predecessor(
-                &mut carrick_hal::fork_stock::NoTableLedger,
-                receipt,
-                absence,
-                |tables| {
-                    let mut memory = memory.borrow_mut();
-                    tables
-                        .iter()
-                        .all(|page| memory.write(page.address(), &zero).is_ok())
-                },
-                |_, absence| {
-                    anonymous_owner::release_retired_child(
-                        &mut memory.borrow_mut(),
-                        &*inventory,
-                        absence,
-                        anonymous_owner::ChildRelease::Retired {
-                            returns,
-                            zone,
-                            supplied: &mut supplied.borrow_mut(),
-                        },
-                    )
-                    .is_ok()
-                },
-            );
+            let mut retired = Vec::new();
+            let settled = {
+                let memory = std::cell::RefCell::new(&mut self._vm);
+                let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
+                self.fork_stock.settle_exec_predecessor(
+                    &mut carrick_hal::fork_stock::NoTableLedger,
+                    receipt,
+                    absence,
+                    |tables| {
+                        let mut memory = memory.borrow_mut();
+                        tables
+                            .iter()
+                            .all(|page| memory.write(page.address(), &zero).is_ok())
+                    },
+                    |_, absence| {
+                        anonymous_owner::release_retired_child(
+                            &mut memory.borrow_mut(),
+                            &*inventory,
+                            absence,
+                            anonymous_owner::ChildRelease::Retired {
+                                returns,
+                                zone,
+                                supplied: &mut supplied.borrow_mut(),
+                            },
+                        )
+                        .is_ok()
+                    },
+                    &mut retired,
+                )
+            };
+            drop(retired);
             if settled.is_err() {
                 self.exec_predecessors.release_permitted.push(receipt);
             }

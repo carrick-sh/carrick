@@ -182,6 +182,7 @@ fn native_exclusion_reclaims_a_full_table_of_exited_fork_holders() {
                 |_| true,
                 |_| true,
                 |_, _, _| Ok(NativeChildPhysical::default()),
+                |_| {},
             )
             .unwrap();
         let mut commit = carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, done).unwrap();
@@ -194,6 +195,7 @@ fn native_exclusion_reclaims_a_full_table_of_exited_fork_holders() {
                 |_| true,
                 |_| true,
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap();
         let mut child = test_execution(42 + index, 1, child_mm);

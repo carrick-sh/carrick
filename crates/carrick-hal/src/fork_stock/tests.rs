@@ -70,6 +70,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             |_| true,
             |_| true,
             |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped), sources.clone())),
+            |_| {},
         )
         .unwrap();
     let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
@@ -81,6 +82,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -110,6 +112,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -175,6 +178,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
                     drops: Arc::clone(&drops),
                 })
             },
+            |_| {},
         )
         .unwrap();
     let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
@@ -186,6 +190,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -221,6 +226,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             wrong,
             |_| true,
             |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            &mut Vec::new(),
         ),
         Err(ForkStockServiceError::StaleExecution)
     );
@@ -232,6 +238,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             predecessor_absent,
             |_| true,
             |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -242,6 +249,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             absent(loan.request.child_mm).unwrap(),
             |_| true,
             |_, _| true,
+            &mut Vec::new(),
         ),
         Err(ForkStockServiceError::StaleExecution),
         "the consuming predecessor receipt must reject duplicates"
@@ -281,6 +289,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
                 child_releases += 1;
                 false
             },
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(child_releases, 0, "root frames are not fork-stock custody");
@@ -294,6 +303,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
                 |_| true,
                 |_| false,
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap(),
         1
@@ -354,6 +364,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
                 releases += 1;
                 true
             },
+            &mut Vec::new(),
         ),
         Err(ForkStockServiceError::ExposedDirtyTable)
     );
@@ -370,6 +381,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
                 releases += 1;
                 true
             },
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(
@@ -602,7 +614,14 @@ fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_
             .stock
             .lock()
             .unwrap()
-            .reserve_custody(parent, &mut reserve, |_| true, |_| true, |_, _, _| Ok(pin))
+            .reserve_custody(
+                parent,
+                &mut reserve,
+                |_| true,
+                |_| true,
+                |_, _, _| Ok(pin),
+                |_| {},
+            )
             .unwrap();
         let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
         carrier
@@ -616,6 +635,7 @@ fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_
                 |_| true,
                 |_| true,
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(carrier.stock.lock().unwrap().live_children(), 1);
@@ -763,7 +783,14 @@ fn commit<T: ChildAddressTags>(
         ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
     stock
-        .reserve_custody(exec, &mut reserve, |_| true, |_| true, |_, _, _| Ok(()))
+        .reserve_custody(
+            exec,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(()),
+            |_| {},
+        )
         .map_err(|_| ForkStockServiceError::InvalidRecord)?;
     let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
     stock.settle(
@@ -773,6 +800,7 @@ fn commit<T: ChildAddressTags>(
         |_| true,
         |_| true,
         |_| true,
+        &mut Vec::new(),
     )
 }
 
@@ -828,6 +856,7 @@ fn reclaim<T: ChildAddressTags, C>(
             },
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap()
 }
@@ -940,7 +969,8 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| true,
+                &mut Vec::new()
             )
             .unwrap(),
         0
@@ -1029,7 +1059,8 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
             &mut abort,
             |_| true,
             |_| true,
-            |_| false
+            |_| false,
+            &mut Vec::new()
         ),
         Err(ForkStockServiceError::MemoryAccessFailed)
     );
@@ -1046,6 +1077,7 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
                 *cleared.borrow_mut() = Some(life);
                 true
             },
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(*cleared.borrow(), Some(granted.lifecycle));
@@ -1089,6 +1121,7 @@ fn abort_settle_is_atomic_on_tag_release_failure() {
         |_| true,
         |_| true,
         |_| true,
+        &mut Vec::new(),
     );
     assert_eq!(result, Err(ForkStockServiceError::InvalidRecord));
     assert_eq!(stock.table_stock().len(), 1);
@@ -1111,6 +1144,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
         |_| true,
         |_| is_clean.get(),
         |_| true,
+        &mut Vec::new(),
     );
     assert_eq!(result, Err(ForkStockServiceError::ExposedDirtyTable));
     assert!(stock.pending(CpuId::new(0)).is_some());
@@ -1129,6 +1163,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
         |_| true,
         |_| is_clean.get(),
         |_| true,
+        &mut Vec::new(),
     );
     assert_eq!(result, Ok(()));
     assert!(stock.pending(CpuId::new(0)).is_none());
@@ -1165,7 +1200,8 @@ fn commit_refuses_dirty_unused_tables() {
                 &mut reserve,
                 |_| true,
                 |_| false,
-                |_, _, _| Ok(())
+                |_, _, _| Ok(()),
+                |_| {}
             )
             .unwrap_err(),
         ForkStockRefusal::Invalid
@@ -1178,7 +1214,8 @@ fn commit_refuses_dirty_unused_tables() {
             &mut settlement,
             |_| true,
             |_| true,
-            |_| true
+            |_| true,
+            &mut Vec::new()
         ),
         Err(ForkStockServiceError::InvalidRecord)
     );
@@ -1304,6 +1341,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
                 },
                 |life| window.clear(life),
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(returned, 1);
@@ -1352,6 +1390,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             |_| true,
             |life| window.clear(life),
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(deferred, 0);
@@ -1371,6 +1410,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             |_| true,
             |life| window.clear(life),
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1407,6 +1447,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(
@@ -1462,6 +1503,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
             |_| true,
             |life| window.clear(life),
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1552,6 +1594,7 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
                 released.borrow_mut().push(absence.mm());
                 false
             },
+            &mut Vec::new(),
         ),
         Ok(0)
     );
@@ -1590,6 +1633,7 @@ fn deferred_candidate_does_not_block_later_candidates() {
         |_| true,
         |_| true,
         |absence| absence.mm() != mm(302),
+        &mut Vec::new(),
     );
     assert_eq!(result, Ok(1));
     assert!(stock.is_quarantined(mm(302)));
@@ -1619,6 +1663,7 @@ fn failed_clear_after_release_is_retried_without_a_second_release() {
                 releases.set(releases.get() + 1);
                 true
             },
+            &mut Vec::new(),
         )
     };
     assert_eq!(attempt(&mut stock), Ok(0));
@@ -1645,6 +1690,7 @@ fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
         |_| true,
         |_| true,
         |_| true,
+        &mut Vec::new(),
     );
     assert_eq!(foreign, Ok(0));
     assert!(stock.is_quarantined(mm(302)));
@@ -1722,6 +1768,7 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
                 releases.set(releases.get() + 1);
                 true
             },
+            &mut Vec::new(),
         )
     };
     assert_eq!(attempt(&mut stock), Ok(0));
@@ -1759,6 +1806,7 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
             });
             absence.mm() == mm(302)
         },
+        &mut Vec::new(),
     );
     assert_eq!(result, Ok(1));
     // 302 was released before its tables were cleared and returned.
@@ -1790,6 +1838,7 @@ fn unreserved_commit_cannot_bypass_physical_custody_admission() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         ),
         Err(ForkStockServiceError::InvalidRecord),
         "every Commit must consume pre-publication physical custody admission"
@@ -1824,7 +1873,8 @@ fn reserve_custody_refuses_invalid_completion_before_retaining_physical_custody(
                 &mut reserve_dirty,
                 |_| true,
                 |_| false,
-                |_, _, _| panic!("retain_physical must not run when unused tables are dirty")
+                |_, _, _| panic!("retain_physical must not run when unused tables are dirty"),
+                |_| {}
             )
             .unwrap_err(),
         ForkStockRefusal::Invalid
@@ -1839,7 +1889,8 @@ fn reserve_custody_refuses_invalid_completion_before_retaining_physical_custody(
                 &mut reserve_unresolvable,
                 |_| false,
                 |_| true,
-                |_, _, _| panic!("retain_physical must not run when tables are unresolvable")
+                |_, _, _| panic!("retain_physical must not run when tables are unresolvable"),
+                |_| {}
             )
             .unwrap_err(),
         ForkStockRefusal::Inventory
@@ -1860,7 +1911,8 @@ fn reserve_custody_refuses_invalid_completion_before_retaining_physical_custody(
                 &mut reserve_ok,
                 |_| true,
                 |_| true,
-                |_, _, _| Ok(())
+                |_, _, _| Ok(()),
+                |_| {}
             )
             .is_ok()
     );
@@ -1993,6 +2045,7 @@ fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() 
             // Second mapping's stage-2 record entered RetirementRequested from concurrent munmap.
             Err(ForkStockRefusal::Inventory)
         },
+        |_| {},
     );
     assert_eq!(result.unwrap_err(), ForkStockRefusal::Inventory);
     assert_eq!(
@@ -2024,6 +2077,7 @@ fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() 
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(stock.pending(CpuId::new(0)).is_none());
@@ -2084,6 +2138,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             |_| true,
             |_| true,
             |_, _, _| Ok(vec![PhysicalPin(Arc::clone(&dropped))]),
+            |_| {},
         )
         .unwrap();
     assert_eq!(reserve.take(granted), Some(Ok(())));
@@ -2097,6 +2152,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(
@@ -2130,6 +2186,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             |_| true,
             |_| true,
             |_, _, _| Ok(vec![PhysicalPin(Arc::clone(&dropped))]),
+            |_| {},
         )
         .unwrap();
     let mut commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
@@ -2150,6 +2207,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
@@ -2333,7 +2391,8 @@ fn registered_root_draws_shared_tables_and_retires_once() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| true,
+                &mut Vec::new()
             )
             .unwrap(),
         1
@@ -2347,7 +2406,8 @@ fn registered_root_draws_shared_tables_and_retires_once() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| true,
+                &mut Vec::new()
             )
             .unwrap(),
         0
@@ -2732,7 +2792,14 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
     )
     .unwrap();
     stock
-        .reserve_custody(root1, &mut reserve1, |_| true, |_| true, |_, _, _| Ok(()))
+        .reserve_custody(
+            root1,
+            &mut reserve1,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(()),
+            |_| {},
+        )
         .unwrap();
     let mut settlement1 = ForkStockSettlement::commit_reserved(granted1, completion1).unwrap();
     stock
@@ -2743,6 +2810,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(stock.table_stock().is_empty());
@@ -2766,6 +2834,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
                 released.borrow_mut().push(absence.mm());
                 true
             },
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(reclaimed, 2);
@@ -2846,6 +2915,7 @@ fn accepted_cold_lifecycle_publishes_all_affinity_aliases_and_abort_scrubs_them(
             |_| true,
             |_| true,
             |life| window.clear(life),
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(window.is_zero(granted.lifecycle));
@@ -3102,6 +3172,7 @@ fn a_pending_fork_holds_the_stock_until_its_abort_releases_the_successor() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(
@@ -3166,6 +3237,7 @@ fn an_enrolled_waiter_is_woken_once_by_the_holder_return() {
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(wakes.load(Ordering::Acquire), 1, "the abort woke it");
@@ -3235,6 +3307,7 @@ fn settlement_exclusion_reclaims_all_64_slots_held_by_exited_fork_children() {
                                 )
                             })
                     },
+                    &mut Vec::new(),
                 )
                 .map(|_| ())
         }
@@ -3326,6 +3399,7 @@ fn a_root_exec_with_built_tables_moves_into_the_stock_and_execs_again_as_a_child
                 true
             },
             |_, _| false,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(
@@ -3368,6 +3442,7 @@ fn a_root_exec_with_built_tables_moves_into_the_stock_and_execs_again_as_a_child
                 true
             },
             |_, _| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(
@@ -3430,6 +3505,7 @@ fn a_built_exec_successor_commits_its_linked_tables_and_returns_the_rest() {
                 true
             },
             |_, _| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(cleared.borrow().len(), 1, "the predecessor's one table");
@@ -3933,7 +4009,7 @@ fn reserve_custody_collecting_returns_rejected_loan_via_collector() {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut rejected = None;
     let err = stock
-        .reserve_custody_collecting(
+        .reserve_custody(
             root,
             &mut reserve,
             |_| true,

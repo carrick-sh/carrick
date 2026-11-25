@@ -2149,6 +2149,7 @@ pub(crate) fn register_carrier_stage2_leases(
         }
     }
     if let Some((error, mut failed_lease)) = transfer_error {
+        custody.detach_and_abandon_carrier_batch_prefix_locked(&mut registered, &identities);
         drop(registered);
         #[cfg(test)]
         custody
@@ -2156,6 +2157,9 @@ pub(crate) fn register_carrier_stage2_leases(
             .at_client_point(CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE);
         let mut rollback_error = None;
         for identity in identities {
+            if custody.is_abandoned_record_settled_by_destroy(identity) {
+                continue;
+            }
             match retire_carrier_stage2_record_at_safe_point_outcome(custody, identity) {
                 Ok(CarrierSafePointRetirement::Retired) => {}
                 Ok(CarrierSafePointRetirement::DeferredActivePins) => {
@@ -2344,6 +2348,13 @@ pub(crate) fn retire_structural_stage2_record_at_safe_point(
     match custody.retire_stage2_record(identity) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            if custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|snapshot| snapshot.pin_count != 0)
+                || custody.has_pinned_structural_predecessor(identity.record_id)
+            {
+                return Ok(StructuralSafePointRetirement::DeferredActivePins);
+            }
             let extracted = {
                 let mut retained_by_record = custody.structural_backings.lock();
                 finalize_structural_backing_terminal_locked(
@@ -2405,6 +2416,12 @@ fn retire_carrier_stage2_record_at_safe_point_with(
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
             if custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|record| record.pin_count != 0)
+            {
+                return Ok(CarrierSafePointRetirement::DeferredActivePins);
+            }
+            if custody
                 .structural_backings
                 .lock()
                 .contains_key(&identity.record_id)
@@ -2455,6 +2472,11 @@ fn retire_carrier_stage2_record_at_safe_point_with(
             if records.get(&key) == Some(&identity) {
                 records.remove(&key);
             }
+            Ok(CarrierSafePointRetirement::Retired)
+        }
+        CarrierStage2RetireOutcome::NotFound
+            if custody.is_abandoned_record_settled_by_destroy(identity) =>
+        {
             Ok(CarrierSafePointRetirement::Retired)
         }
         CarrierStage2RetireOutcome::DeferredActivePins => {
@@ -4294,6 +4316,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let mut structural_pending_retire = Vec::new();
     for retained in structural {
         #[cfg(test)]
         if custody.structural_backings.is_locked() {
@@ -4313,16 +4336,147 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             })?;
         let key = (snapshot.ipa, snapshot.len as u64);
         let replay = replayed_by_key.get(&key).copied();
-
-        if retained
+        let is_retired_or_deferred = retained
             .owner_retired
             .load(std::sync::atomic::Ordering::Acquire)
-        {
+            || custody.has_deferred_structural_logical_release(identity.record_id);
+
+        if let Some(replay) = replay {
+            if (replay.host_addr, replay.perms) != (snapshot.host_addr, snapshot.perms) {
+                return Err(TrapError::Hypervisor(format!(
+                    "structural backing replay identity drift at IPA 0x{:x} size {}",
+                    key.0, key.1
+                )));
+            }
+            let mut stage2 = acquire_replay_rebind_stage2(
+                custody,
+                replay.vm_generation,
+                &mut rebind_generation,
+                "structural backing replay",
+            )?;
+            let current_snapshot =
+                CarrierVmCustody::stage2_record_snapshot_in(&stage2, identity.record_id);
+            if current_snapshot.is_some_and(|s| s.vm_generation == stage2.generation() && s.mapped)
+            {
+                if is_retired_or_deferred {
+                    let old_pinned = current_snapshot.is_some_and(|s| s.pin_count != 0)
+                        || stage2
+                            .pinned_structural_predecessors
+                            .contains_key(&identity.record_id);
+                    if let Some(record) = stage2.stage2_records.get_mut(&identity.record_id) {
+                        let _ = carrick_core::mm::retirement::request_record_retirement(
+                            record, identity,
+                        );
+                    }
+                    if old_pinned {
+                        report.deferred += 1;
+                    } else {
+                        structural_pending_retire.push(identity);
+                    }
+                }
+                continue;
+            }
+            let old_identity = identity;
+            let mut inherited_preds = stage2
+                .pinned_structural_predecessors
+                .remove(&old_identity.record_id)
+                .unwrap_or_default();
+            let direct_pinned = stage2
+                .stage2_records
+                .get(&old_identity.record_id)
+                .is_some_and(|record| record.snapshot.pin_count != 0);
+            let old_pinned = direct_pinned || !inherited_preds.is_empty();
+            let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
+                &mut stage2,
+                old_identity,
+                replay.host_addr,
+                replay.perms,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "rebind structural backing after VM replay: {error:?}"
+                ))
+            })?;
+            if is_retired_or_deferred
+                && let Some(record) = stage2.stage2_records.get_mut(&new_identity.record_id)
+            {
+                record.snapshot.retirement_requested = true;
+            }
+            if old_pinned {
+                for &pred in &inherited_preds {
+                    stage2
+                        .pinned_structural_successor
+                        .insert(pred, new_identity);
+                }
+                if direct_pinned {
+                    inherited_preds.insert(old_identity.record_id);
+                    stage2
+                        .pinned_structural_successor
+                        .insert(old_identity.record_id, new_identity);
+                } else {
+                    let _ = stage2.remove_record(old_identity.record_id);
+                }
+                stage2
+                    .pinned_structural_predecessors
+                    .insert(new_identity.record_id, inherited_preds);
+            } else {
+                let _ = stage2.remove_record(old_identity.record_id);
+            }
+            {
+                let mut keepers = custody.carrier_lease_keepers.lock();
+                let keeper = if direct_pinned {
+                    keepers
+                        .entries
+                        .get(&old_identity.record_id)
+                        .map(super::carrier_custody::CarrierLeaseKeeperState::clone_keeper)
+                } else {
+                    keepers
+                        .entries
+                        .remove(&old_identity.record_id)
+                        .map(super::carrier_custody::CarrierLeaseKeeperState::into_keeper)
+                };
+                if let Some(keeper) = keeper {
+                    let prev = keepers.entries.insert(
+                        new_identity.record_id,
+                        super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper),
+                    );
+                    debug_assert!(prev.is_none());
+                }
+            }
+            *retained.record_identity.lock() = new_identity;
+            retained_by_record.remove(&old_identity.record_id);
+            retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
+            custody.rebind_deferred_structural_logical_release(
+                old_identity.record_id,
+                new_identity.record_id,
+            );
+            drop(stage2);
+            drop(retained_by_record);
+            if is_retired_or_deferred {
+                if old_pinned {
+                    report.deferred += 1;
+                } else {
+                    structural_pending_retire.push(new_identity);
+                }
+            } else {
+                report.rebound += 1;
+            }
+            continue;
+        }
+
+        if is_retired_or_deferred {
             if !snapshot.terminalized_by_vm_destroy {
                 return Err(TrapError::Hypervisor(format!(
                     "retired structural backing IPA 0x{:x} size {} survived VM destroy",
                     key.0, key.1
                 )));
+            }
+            if snapshot.pin_count != 0
+                || custody.has_pinned_structural_predecessor(identity.record_id)
+            {
+                let _ = custody.request_stage2_record_retirement(identity);
+                report.deferred += 1;
+                continue;
             }
             let extracted = finalize_structural_backing_terminal_locked(
                 custody,
@@ -4333,6 +4487,11 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             drop(retained_by_record);
             drop(extracted);
             drop_carrier_lease_keeper(custody, identity.record_id);
+            if let Some(deferred) =
+                custody.take_deferred_structural_logical_release(identity.record_id)
+            {
+                deferred.drain();
+            }
             report.retired += 1;
             continue;
         }
@@ -4349,48 +4508,6 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             // authenticate through an explicit replay extent below.
             continue;
         }
-        if let Some(replay) = replay {
-            if (replay.host_addr, replay.perms) != (snapshot.host_addr, snapshot.perms) {
-                return Err(TrapError::Hypervisor(format!(
-                    "structural backing replay identity drift at IPA 0x{:x} size {}",
-                    key.0, key.1
-                )));
-            }
-            let mut stage2 = acquire_replay_rebind_stage2(
-                custody,
-                replay.vm_generation,
-                &mut rebind_generation,
-                "structural backing replay",
-            )?;
-            let current_generation = stage2.generation();
-            if snapshot.vm_generation == current_generation && snapshot.mapped {
-                continue;
-            }
-            let old_identity = identity;
-            let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
-                &mut stage2,
-                old_identity,
-                replay.host_addr,
-                replay.perms,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "rebind structural backing after VM replay: {error:?}"
-                ))
-            })?;
-            *retained.record_identity.lock() = new_identity;
-            retained_by_record.remove(&old_identity.record_id);
-            retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
-            custody.rebind_deferred_structural_logical_release(
-                old_identity.record_id,
-                new_identity.record_id,
-            );
-            drop(stage2);
-            drop(retained_by_record);
-            let _ = custody.remove_terminal_stage2_record(old_identity);
-            report.rebound += 1;
-            continue;
-        }
         if !retire_unreplayed {
             return Err(TrapError::Hypervisor(format!(
                 "live structural backing IPA 0x{:x} size {} was not replayed into the current VM",
@@ -4401,6 +4518,11 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             return Err(TrapError::Hypervisor(
                 "unreplayed structural backing is not terminalized by VM destroy".to_owned(),
             ));
+        }
+        if snapshot.pin_count != 0 || custody.has_pinned_structural_predecessor(identity.record_id)
+        {
+            report.deferred += 1;
+            continue;
         }
         let extracted = finalize_structural_backing_terminal_locked(
             custody,
@@ -4416,6 +4538,20 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             deferred.drain();
         }
         report.retired += 1;
+    }
+    for identity in structural_pending_retire {
+        match retire_structural_stage2_record_at_safe_point(custody, identity) {
+            Ok(StructuralSafePointRetirement::Retired) => {
+                report.retired += 1;
+            }
+            Ok(StructuralSafePointRetirement::DeferredActivePins) => {
+                report.deferred += 1;
+            }
+            Err(error) => {
+                custody.request_global_frame_retirement_retry();
+                return Err(error);
+            }
+        }
     }
     Ok(report)
 }
@@ -5175,8 +5311,26 @@ fn retry_pending_global_frame_retirements_at_idle_with(
         }
     }
 
+    let _ =
+        retry_structural_backing_retirements_with(custody, retire, &mut release_retired_stage2_ipa);
+    let retired_structural_ids = custody
+        .structural_backings
+        .lock()
+        .iter()
+        .filter_map(|(&id, retained)| {
+            retained
+                .owner_retired
+                .load(std::sync::atomic::Ordering::Acquire)
+                .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    let structural_remaining = retired_structural_ids
+        .into_iter()
+        .filter(|&id| custody.stage2_record_snapshot(id).is_some())
+        .count();
     report.remaining = custody.pending_global_frame_directory_retries.lock().len()
-        + custody.pending_global_frame_detached_retries.lock().len();
+        + custody.pending_global_frame_detached_retries.lock().len()
+        + structural_remaining;
     if report.remaining != 0 {
         custody.request_global_frame_retirement_retry();
     }

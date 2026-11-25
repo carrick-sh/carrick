@@ -2469,28 +2469,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     /// Consume an exact exec predecessor receipt after translation switch.
     /// Carrier release runs once; table clearing and tag retirement must both
-    /// succeed before stock is reusable. A stale or duplicate receipt cannot
-    /// act on a later MM that recycled either numeric identity.
+    /// succeed before stock is reusable, and any retired child physical custody
+    /// is appended to `retired` so the caller drops it outside stock locks.
+    /// A stale or duplicate receipt cannot act on a later MM that recycled
+    /// either numeric identity.
     pub fn settle_exec_predecessor(
-        &mut self,
-        ledger: &mut impl ForkTableLedger,
-        receipt: ExecPredecessorReceipt<T::Tag>,
-        absence: SlotAbsence,
-        clear_tables: impl FnMut(&[RootGpa]) -> bool,
-        release: impl FnMut(&C, &SlotAbsence) -> bool,
-    ) -> Result<(), ForkStockServiceError> {
-        let mut retired = Vec::new();
-        self.settle_exec_predecessor_collecting(
-            ledger,
-            receipt,
-            absence,
-            clear_tables,
-            release,
-            &mut retired,
-        )
-    }
-
-    pub fn settle_exec_predecessor_collecting(
         &mut self,
         ledger: &mut impl ForkTableLedger,
         receipt: ExecPredecessorReceipt<T::Tag>,
@@ -3064,32 +3047,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     /// Validate a prepared child's table completion and retain its inherited
     /// physical custody into an [`AdmittedForkCustody`] token on the pending
-    /// loan before child publication. Any refusal leaves the loan pending so
-    /// the guest can scrub and abort it into a counted fork failure.
-    pub fn reserve_custody(
-        &mut self,
-        execution: GrantExecution,
-        settlement: &mut ForkStockSettlement,
-        is_resolvable: impl Fn(&[RootGpa]) -> bool,
-        is_clean: impl Fn(&[RootGpa]) -> bool,
-        retain_physical: impl FnOnce(
-            carrick_el1_abi::PortalForkRequest,
-            carrick_guest_arch::KernelVa,
-            u64,
-        ) -> Result<C, ForkStockRefusal>,
-    ) -> Result<&AdmittedForkCustody<C>, ForkStockRefusal> {
-        self.reserve_custody_collecting(
-            execution,
-            settlement,
-            is_resolvable,
-            is_clean,
-            retain_physical,
-            |_| {},
-        )
-    }
-
+    /// loan before child publication, routing any already-retained physical
+    /// custody rejected at settlement acceptance to `collect_unused`. Any refusal
+    /// leaves the loan pending so the guest can scrub and abort it into a
+    /// counted fork failure.
     #[allow(clippy::too_many_arguments)]
-    pub fn reserve_custody_collecting(
+    pub fn reserve_custody(
         &mut self,
         execution: GrantExecution,
         settlement: &mut ForkStockSettlement,
@@ -3252,29 +3215,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// `is_clean` that pages returning to stock are zero, and
     /// `clear_lifecycle` clears an aborted lifecycle record the guest may
     /// already have initialized.
-    pub fn settle(
-        &mut self,
-        ledger: &mut impl ForkTableLedger,
-        execution: GrantExecution,
-        settlement: &mut ForkStockSettlement,
-        is_resolvable: impl Fn(&[RootGpa]) -> bool,
-        is_clean: impl Fn(&[RootGpa]) -> bool,
-        clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
-    ) -> Result<(), ForkStockServiceError> {
-        let mut retired = Vec::new();
-        self.settle_collecting(
-            ledger,
-            execution,
-            settlement,
-            is_resolvable,
-            is_clean,
-            clear_lifecycle,
-            &mut retired,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn settle_collecting(
+    pub fn settle(
         &mut self,
         ledger: &mut impl ForkTableLedger,
         execution: GrantExecution,
@@ -3375,29 +3317,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// quarantined, retried at the next drain); only a broken custody
     /// invariant (a quarantined MM with neither a committed child nor
     /// borrowed parent tables) is an error.
-    pub fn reclaim(
-        &mut self,
-        ledger: &mut impl ForkTableLedger,
-        execution: impl Into<ReclaimExecution>,
-        occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
-        clear_tables: impl FnMut(&[RootGpa]) -> bool,
-        clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
-        release: impl FnMut(&SlotAbsence) -> bool,
-    ) -> Result<usize, ForkStockServiceError> {
-        let mut retired = Vec::new();
-        self.reclaim_collecting(
-            ledger,
-            execution,
-            occupancy,
-            clear_tables,
-            clear_lifecycle,
-            release,
-            &mut retired,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn reclaim_collecting(
+    pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
         execution: impl Into<ReclaimExecution>,

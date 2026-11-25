@@ -726,6 +726,7 @@ mod tests {
                         finalized: Arc::clone(&finalized),
                     })
                 },
+                |_| {},
             )
             .unwrap();
         let mut commit =
@@ -738,6 +739,7 @@ mod tests {
                 |_| true,
                 |_| true,
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap();
         let mut child = test_execution(42, 1, 302);
@@ -766,6 +768,7 @@ mod tests {
                 |_| true,
                 |_| true,
                 |_| true,
+                &mut Vec::new(),
             )
             .unwrap();
         terminal.join().unwrap();

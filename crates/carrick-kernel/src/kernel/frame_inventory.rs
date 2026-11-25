@@ -3112,6 +3112,7 @@ mod tests {
                     |_| true,
                     |_| true,
                     |_, _, _| Ok(()),
+                    |_| {},
                 )
                 .expect("reserve custody");
             let mut settlement =
@@ -3125,6 +3126,7 @@ mod tests {
                     |_| true,
                     |_| true,
                     |_| true,
+                    &mut Vec::new(),
                 )
                 .expect("commit");
 
@@ -3189,6 +3191,7 @@ mod tests {
                                 release_child_mm(&*inventory, &residency, &*returns, &absent)
                             })
                     },
+                    &mut Vec::new(),
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
             assert_eq!(returned, 1, "cycle {cycle}");

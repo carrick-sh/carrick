@@ -710,6 +710,9 @@ pub(crate) enum ForkOwnerRollbackOutcome {
     DeferredActivePins,
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const FORK_PREPARE_BEFORE_ROLLBACK: &str = "fork prepare before rollback";
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_or_defer_published_fork_owners(
     custody: &CarrierVmCustody,
@@ -719,72 +722,58 @@ pub(crate) fn retire_or_defer_published_fork_owners(
     let mut deferred = false;
     let mut first_error: Option<TrapError> = None;
     for owner in owners {
-        let identity = owner.record_identity();
-        if identity.record_id.0 == 0 {
+        let identity = {
+            let retained_by_record = custody.structural_backings.lock();
+            let identity = *owner.retained.record_identity.lock();
+            owner
+                .retained
+                .owner_retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            if identity.record_id.0 == 0 || !retained_by_record.contains_key(&identity.record_id) {
+                None
+            } else {
+                custody.deferred_structural_owner_releases.lock().insert(
+                    identity.record_id,
+                    crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
+                        state: Arc::downgrade(state),
+                        owner: Arc::clone(owner),
+                    },
+                );
+                let _ = custody.request_stage2_record_retirement(identity);
+                Some(identity)
+            }
+        };
+        let Some(identity) = identity else {
             state.release_exact_structural_owner(owner);
             continue;
-        }
-        match retire_structural_stage2_record_at_safe_point(custody, identity) {
+        };
+        let current = owner.record_identity();
+        let target = if current.record_id.0 != 0 {
+            current
+        } else {
+            identity
+        };
+        match retire_structural_stage2_record_at_safe_point(custody, target) {
             Ok(crate::trap::StructuralSafePointRetirement::Retired) => {
                 if owner.record_identity().record_id.0 == 0
-                    && custody.stage2_record_snapshot(identity.record_id).is_none()
+                    && custody.stage2_record_snapshot(target.record_id).is_none()
                 {
-                    state.release_exact_structural_owner(owner);
+                    if let Some(entry) =
+                        custody.take_deferred_structural_logical_release(target.record_id)
+                    {
+                        entry.drain();
+                    } else {
+                        state.release_exact_structural_owner(owner);
+                    }
                 } else {
-                    custody.deferred_structural_owner_releases.lock().insert(
-                        identity.record_id,
-                        crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
-                            state: Arc::downgrade(state),
-                            owner: Arc::clone(owner),
-                        },
-                    );
-                    first_error.get_or_insert_with(|| {
-                        TrapError::Hypervisor(
-                            "fork rollback structural backing remained unretired".to_owned(),
-                        )
-                    });
+                    deferred = true;
                 }
             }
             Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
-                custody.deferred_structural_owner_releases.lock().insert(
-                    identity.record_id,
-                    crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
-                        state: Arc::downgrade(state),
-                        owner: Arc::clone(owner),
-                    },
-                );
-                // Re-probe after registration so a concurrent last unpin between
-                // the initial probe and registration still settles logically.
-                match retire_structural_stage2_record_at_safe_point(custody, identity) {
-                    Ok(crate::trap::StructuralSafePointRetirement::Retired)
-                        if owner.record_identity().record_id.0 == 0
-                            && custody.stage2_record_snapshot(identity.record_id).is_none() =>
-                    {
-                        if let Some(entry) =
-                            custody.take_deferred_structural_logical_release(identity.record_id)
-                        {
-                            entry.drain();
-                        } else {
-                            state.release_exact_structural_owner(owner);
-                        }
-                    }
-                    Ok(crate::trap::StructuralSafePointRetirement::Retired)
-                    | Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
-                        deferred = true;
-                    }
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
+                deferred = true;
             }
             Err(error) => {
-                custody.deferred_structural_owner_releases.lock().insert(
-                    identity.record_id,
-                    crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
-                        state: Arc::downgrade(state),
-                        owner: Arc::clone(owner),
-                    },
-                );
+                custody.request_global_frame_retirement_retry();
                 first_error.get_or_insert(error);
             }
         }
@@ -848,9 +837,12 @@ impl HvfVmState {
             })?
             .0;
         let state = self.task.mm_access_authority();
-        let runtime = state.cow_runtime.read().clone().ok_or_else(|| {
-            TrapError::Hypervisor("owner parent source custody is unbound".into())
-        })?;
+        let Some(runtime) = state.cow_runtime.read().clone() else {
+            source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
+            return Err(TrapError::Hypervisor(
+                "owner parent source custody is unbound".into(),
+            ));
+        };
         let custody = self.carrier_vm_custody();
         let mut raw = Vec::new();
         if let Err(error) = state.publish_raw_stage1_arenas_into(
@@ -859,6 +851,8 @@ impl HvfVmState {
             carrick_hal::MemPerms::ReadWriteExec,
             &mut raw,
         ) {
+            #[cfg(test)]
+            custody.stage2.at_client_point(FORK_PREPARE_BEFORE_ROLLBACK);
             let owners = raw
                 .iter()
                 .filter_map(|region| region.structural_owner.clone())
@@ -879,6 +873,8 @@ impl HvfVmState {
             .filter_map(|region| region.structural_owner.clone())
             .collect::<Vec<_>>();
         if published.len() != 2 {
+            #[cfg(test)]
+            custody.stage2.at_client_point(FORK_PREPARE_BEFORE_ROLLBACK);
             let rollback = retire_or_defer_published_fork_owners(&custody, &state, &published);
             if !state
                 .structural_owners

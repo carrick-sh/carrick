@@ -377,7 +377,7 @@ fn settle_native_exec_predecessor(
         let stage2 = custody.stage2.lock();
         let mut stock = custody.fork_stock.lock();
         let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-        stock.owner.settle_exec_predecessor_collecting(
+        stock.owner.settle_exec_predecessor(
             &mut ledger,
             receipt,
             absence,
@@ -1825,7 +1825,7 @@ fn reclaim_fork_stock_in(
         .view()
         .ok_or(ForkStockServiceError::InvalidRecord)?;
     let returns = retained_reservations(region).ok_or(ForkStockServiceError::InvalidRecord)?;
-    stock.owner.reclaim_collecting(
+    stock.owner.reclaim(
         ledger,
         execution,
         |mm| {
@@ -2087,7 +2087,7 @@ pub(crate) fn service_native_fork_stock(
                     let mut stock = custody.fork_stock.lock();
                     let result = stock
                         .owner
-                        .reserve_custody_collecting(
+                        .reserve_custody(
                             execution,
                             settlement,
                             |pages| {
@@ -2137,7 +2137,7 @@ pub(crate) fn service_native_fork_stock(
                     let stage2 = custody.stage2.lock();
                     let mut stock = custody.fork_stock.lock();
                     let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-                    match stock.owner.settle_collecting(
+                    match stock.owner.settle(
                         &mut ledger,
                         execution,
                         settlement,

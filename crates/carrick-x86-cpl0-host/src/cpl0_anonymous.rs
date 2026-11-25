@@ -1122,36 +1122,42 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let returns = retained_reservations(&self.ram)?;
         let window = self.lifecycle_window();
         let inventory = Arc::clone(&self.frame_inventory);
-        let memory = std::cell::RefCell::new(&mut self._vm);
-        let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
-        let zero = [0u8; 4096];
-        self.fork_stock
-            .reclaim(
-                &mut NoTableLedger,
-                venue,
-                |mm| SlotAbsence::scan(mm, installed.iter().copied()),
-                |tables| {
-                    let mut memory = memory.borrow_mut();
-                    tables
-                        .iter()
-                        .all(|page| memory.write(page.address(), &zero).is_ok())
-                },
-                |lifecycle| window.clear(lifecycle),
-                |absence| {
-                    release_retired_child(
-                        &mut memory.borrow_mut(),
-                        &*inventory,
-                        absence,
-                        ChildRelease::Retired {
-                            returns,
-                            zone,
-                            supplied: &mut supplied.borrow_mut(),
-                        },
-                    )
-                    .is_ok()
-                },
-            )
-            .map(|_| ())
+        let mut retired = Vec::new();
+        let reclaimed = {
+            let memory = std::cell::RefCell::new(&mut self._vm);
+            let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
+            let zero = [0u8; 4096];
+            self.fork_stock
+                .reclaim(
+                    &mut NoTableLedger,
+                    venue,
+                    |mm| SlotAbsence::scan(mm, installed.iter().copied()),
+                    |tables| {
+                        let mut memory = memory.borrow_mut();
+                        tables
+                            .iter()
+                            .all(|page| memory.write(page.address(), &zero).is_ok())
+                    },
+                    |lifecycle| window.clear(lifecycle),
+                    |absence| {
+                        release_retired_child(
+                            &mut memory.borrow_mut(),
+                            &*inventory,
+                            absence,
+                            ChildRelease::Retired {
+                                returns,
+                                zone,
+                                supplied: &mut supplied.borrow_mut(),
+                            },
+                        )
+                        .is_ok()
+                    },
+                    &mut retired,
+                )
+                .map(|_| ())
+        };
+        drop(retired);
+        reclaimed
             // A refused release, clear or tag retirement defers only that
             // child (counted as `reclaim_deferral`, retried next drain).
             // What remains is a broken custody invariant, never guest input.
@@ -1474,6 +1480,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .transpose()?;
         let executable = sources.as_deref().and_then(|sources| sources.executable());
         let parent_sources = sources.as_deref().filter(|_| has_host_backing).cloned();
+        let mut unused_custody = None;
         let refused = {
             let vm = std::cell::RefCell::new(&mut self._vm);
             self.fork_stock
@@ -1761,9 +1768,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         }
                         Ok(inherited_sources)
                     },
+                    |custody| unused_custody = Some(custody),
                 )
                 .is_err()
         };
+        drop(unused_custody);
         if refused && !parent_residency.is_empty() {
             let residency = self.cow_residency()?;
             let view = residency
@@ -1849,16 +1858,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             None
         };
         let window = self.lifecycle_window();
-        let memory = &self._vm;
-        self.fork_stock
-            .settle(
+        let mut retired = Vec::new();
+        let settled = {
+            let memory = &self._vm;
+            self.fork_stock.settle(
                 &mut NoTableLedger,
                 execution,
                 &mut record,
                 |pages| tables_resolve(memory, pages),
                 |pages| tables_are_zero(memory, pages),
                 |lifecycle| window.clear(lifecycle),
+                &mut retired,
             )
+        };
+        drop(retired);
+        settled
             .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
         if is_abort && had_admitted {
             let absence = SlotAbsence::scan(loan.request.child_mm, [])

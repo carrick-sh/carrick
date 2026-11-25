@@ -327,6 +327,7 @@ impl PhysicalStock {
                         supplied: None,
                     })
                 },
+                |_| {},
             )
             .map(|_| ())
     }
@@ -352,6 +353,7 @@ impl PhysicalStock {
                 |_| true,
                 |_| true,
                 |life| window.clear(life),
+                &mut Vec::new(),
             )
             .inspect_err(|error| {
                 settlement.refuse(
@@ -430,6 +432,7 @@ impl PhysicalStock {
                             )
                         })
                 },
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(

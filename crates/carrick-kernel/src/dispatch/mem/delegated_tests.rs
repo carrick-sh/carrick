@@ -995,6 +995,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
                 }
                 Ok(retained)
             },
+            |_| {},
         )
         .map(|_| ());
     assert!(
@@ -1121,6 +1122,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
                         .ok_or(ForkStockRefusal::Inventory)?,
                 ])
             },
+            |_| {},
         )
         .unwrap();
     let mut descendant_commit =
@@ -1160,6 +1162,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
             clean,
             |_| bytes.iter().all(|byte| *byte == 0),
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(stock.child_root(request.child_mm).is_none());
