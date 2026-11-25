@@ -38,8 +38,9 @@ mod alias_remap_limiter_tests {
             .replay
             .insert(key);
 
+        let custody = CarrierVmCustody::new_live_fixture();
         // The exact installed marker returns before touching Hypervisor.framework.
-        let result = unsafe { inventory_stage2_map_replay(backing) };
+        let result = unsafe { stage2_map_replay(&custody, backing) };
         assert_eq!(result, 0);
         assert!(alias_registry().lock().contains_replay(&key));
 

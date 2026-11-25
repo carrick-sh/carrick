@@ -291,6 +291,8 @@ pub(crate) struct CarrierStage2Records {
         CarrierStage2RecordId,
         carrick_aarch64::stage2::custody::Stage2Mapping,
     >,
+    pub(crate) untracked_mappings:
+        std::collections::BTreeMap<(u64, usize), carrick_aarch64::stage2::custody::Stage2Mapping>,
     /// One physical index over every record, independent of the authority
     /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
     stage2_extent_index:
@@ -323,6 +325,32 @@ impl CarrierStage2Records {
         }
         removed
     }
+
+    pub(crate) fn record_covering(
+        &self,
+        ipa: u64,
+        len: usize,
+    ) -> Option<CarrierStage2RecordIdentity> {
+        let (&(base, length), ids) = self
+            .stage2_extent_index
+            .range(..=(ipa, u64::MAX))
+            .next_back()?;
+        let end = ipa.checked_add(len as u64)?;
+        if end > base.checked_add(length)? {
+            return None;
+        }
+        ids.iter().rev().find_map(|id| {
+            let record = self.stage2_records.get(id)?;
+            let snapshot = record.snapshot;
+            (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
+                CarrierStage2RecordIdentity {
+                    record_id: *id,
+                    vm_generation: snapshot.vm_generation,
+                    logical_owner: snapshot.logical_owner,
+                },
+            )
+        })
+    }
 }
 
 /// The carrier's exec owner (#2305): the neutral owner the x86 carrier
@@ -351,7 +379,8 @@ pub struct CarrierVmCustody {
         Option<std::sync::Arc<dyn crate::metadata_grant::NativeWaitChannelWake>>,
     >,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
-    pub fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    pub fork_stock:
+        carrick_aarch64::stage2::custody::Stage2Inner<crate::fork_stock::ForkStockHostCustody>,
     /// Serializes every settlement of a native child's owed returns
     /// (#1369 slice 3).
     pub(crate) return_settlement: carrick_hal::return_settlement::SettlementLock,
@@ -757,7 +786,7 @@ impl CarrierVmCustody {
             ),
             native_frame_backings: Default::default(),
             return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
-            fork_stock: parking_lot::Mutex::new(
+            fork_stock: carrick_aarch64::stage2::custody::Stage2Inner::new(
                 crate::fork_stock::ForkStockHostCustody::with_asids(
                     transfer_carrier,
                     asids.clone(),
@@ -772,6 +801,7 @@ impl CarrierVmCustody {
                     next_logical_owner_generation: 1,
                     stage2_records: std::collections::BTreeMap::new(),
                     installed: std::collections::BTreeMap::new(),
+                    untracked_mappings: std::collections::BTreeMap::new(),
                     stage2_extent_index: std::collections::BTreeMap::new(),
                 },
             ),
@@ -900,6 +930,9 @@ impl CarrierVmCustody {
     ) {
         records
             .installed
+            .retain(|_, mapping| mapping.generation() != generation);
+        records
+            .untracked_mappings
             .retain(|_, mapping| mapping.generation() != generation);
         for record in records
             .stage2_records
@@ -1376,19 +1409,49 @@ impl CarrierVmCustody {
         map: impl FnOnce(
             &mut super::stage2_backend::CarrierStage2<'_>,
             CarrierStage2RecordIdentity,
-        ) -> carrick_aarch64::stage2::Stage2Status,
+        ) -> Result<
+            Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+            carrick_aarch64::stage2::Stage2Status,
+        >,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
         let identity = Self::register_stage2_record_locked(stage2, spec).map_err(|error| {
             TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
         })?;
-        let rc = map(stage2, identity);
-        if rc != 0 {
-            let _ = stage2.remove_record(identity.record_id);
-            return Err(TrapError::Hypervisor(format!(
-                "stage-2 map failed: {rc:#x}"
-            )));
+        match map(stage2, identity) {
+            Ok(maybe_mapping) => {
+                if spec.backend_map_installed != maybe_mapping.is_some() {
+                    let _ = stage2.remove_record(identity.record_id);
+                    if let Some(mapping) = maybe_mapping {
+                        let _ = unsafe { stage2.unmap(mapping) };
+                    }
+                    return Err(TrapError::Hypervisor(format!(
+                        "stage-2 record backend mapping mismatch at IPA {:#x}/{}",
+                        spec.ipa, spec.len
+                    )));
+                }
+                if let Some(mapping) = maybe_mapping {
+                    if mapping.generation() != spec.vm_generation
+                        || mapping.ipa() != spec.ipa
+                        || mapping.size() != spec.len
+                    {
+                        let _ = stage2.remove_record(identity.record_id);
+                        let _ = unsafe { stage2.unmap(mapping) };
+                        return Err(TrapError::Hypervisor(format!(
+                            "stage-2 record mapping extent mismatch at IPA {:#x}/{}",
+                            spec.ipa, spec.len
+                        )));
+                    }
+                    stage2.installed.insert(identity.record_id, mapping);
+                }
+                Ok(identity)
+            }
+            Err(rc) => {
+                let _ = stage2.remove_record(identity.record_id);
+                Err(TrapError::Hypervisor(format!(
+                    "stage-2 map failed: {rc:#x}"
+                )))
+            }
         }
-        Ok(identity)
     }
 
     /// Commit backend mapping and its exact record under one generation guard.
@@ -1401,12 +1464,40 @@ impl CarrierVmCustody {
         map: impl FnOnce(
             &mut super::stage2_backend::CarrierStage2<'_>,
             CarrierStage2RecordIdentity,
-        ) -> carrick_aarch64::stage2::Stage2Status,
+        ) -> Result<
+            Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+            carrick_aarch64::stage2::Stage2Status,
+        >,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
         let mut stage2 = self
             .admitting_stage2_in(spec.vm_generation, "stage-2 record admission")
             .map_err(|_| TrapError::Hypervisor("stage-2 record admission: NoLiveVm".to_owned()))?;
         Self::publish_stage2_record_in(&mut stage2, spec, map)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_stage2_record_using(
+        &self,
+        spec: CarrierStage2RecordSpec,
+        map: impl FnOnce(
+            &mut super::stage2_backend::CarrierStage2<'_>,
+            CarrierStage2RecordIdentity,
+        ) -> carrick_aarch64::stage2::Stage2Status,
+    ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+        let mut stage2 = self
+            .admitting_stage2_in(spec.vm_generation, "stage-2 record admission")
+            .map_err(|_| TrapError::Hypervisor("stage-2 record admission: NoLiveVm".to_owned()))?;
+        let identity = Self::register_stage2_record_locked(&mut stage2, spec).map_err(|error| {
+            TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
+        })?;
+        let rc = map(&mut stage2, identity);
+        if rc != 0 {
+            let _ = stage2.remove_record(identity.record_id);
+            return Err(TrapError::Hypervisor(format!(
+                "stage-2 map failed: {rc:#x}"
+            )));
+        }
+        Ok(identity)
     }
 
     fn register_stage2_record_locked(
@@ -1511,6 +1602,11 @@ impl CarrierVmCustody {
             vm_generation: live_generation,
             logical_owner: old_identity.logical_owner,
         };
+        let stage2_mapping = state
+            .untracked_mappings
+            .remove(&(old.snapshot.ipa, old.snapshot.len))
+            .filter(|mapping| mapping.generation() == live_generation);
+        let backend_map_installed = stage2_mapping.is_some();
         state.stage2_records.insert(
             record_id,
             CarrierStage2Record {
@@ -1521,7 +1617,7 @@ impl CarrierVmCustody {
                     len: old.snapshot.len,
                     host_addr,
                     mapped: true,
-                    backend_map_installed: true,
+                    backend_map_installed,
                     release_ipa: old.snapshot.release_ipa,
                     perms,
                     logical_owner: old.snapshot.logical_owner,
@@ -1537,6 +1633,9 @@ impl CarrierVmCustody {
                 unmap_in_flight: false,
             },
         );
+        if let Some(mapping) = stage2_mapping {
+            state.installed.insert(record_id, mapping);
+        }
         state.index_record(record_id, old.snapshot.ipa, old.snapshot.len);
         let old = state
             .stage2_records
@@ -1576,26 +1675,15 @@ impl CarrierVmCustody {
         ipa: u64,
         len: usize,
     ) -> Option<CarrierStage2RecordIdentity> {
-        let state = self.stage2.lock();
-        let (&(base, length), ids) = state
-            .stage2_extent_index
-            .range(..=(ipa, u64::MAX))
-            .next_back()?;
-        let end = ipa.checked_add(len as u64)?;
-        if end > base.checked_add(length)? {
-            return None;
-        }
-        ids.iter().rev().find_map(|id| {
-            let record = state.stage2_records.get(id)?;
-            let snapshot = record.snapshot;
-            (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
-                CarrierStage2RecordIdentity {
-                    record_id: *id,
-                    vm_generation: snapshot.vm_generation,
-                    logical_owner: snapshot.logical_owner,
-                },
-            )
-        })
+        self.stage2.lock().record_covering(ipa, len)
+    }
+
+    pub(crate) fn stage2_record_covering_in(
+        state: &Stage2CustodyState<CarrierStage2Records>,
+        ipa: u64,
+        len: usize,
+    ) -> Option<CarrierStage2RecordIdentity> {
+        state.record_covering(ipa, len)
     }
 
     pub(crate) fn stage2_identity_mismatch(
@@ -1644,18 +1732,39 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::request_record_retirement(record, identity)
     }
 
+    pub(crate) fn retire_stage2_record(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome {
+        self.retire_stage2_record_with(identity, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> CarrierStage2RetireOutcome {
+        let mut unmap = Some(unmap);
+        let mut unmap_fn = |ipa, len| {
+            unmap
+                .take()
+                .expect("test retire unmap callback called at most once")(ipa, len)
+        };
+        self.retire_stage2_record_with(identity, Some(&mut unmap_fn))
+    }
+
+    fn retire_stage2_record_with(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
     ) -> CarrierStage2RetireOutcome {
         use carrick_core::mm::retirement::{
             RecordRetirement, prepare_record_retirement, settle_record_retirement,
         };
         // The decision to unmap, the backend unmap and its settlement run
         // under one guard of the record's own generation: no raw destroy, and
-        // so no successor VM, can run between them. `unmap` must not re-enter
-        // the custody.
+        // so no successor VM, can run between them.
         let mut stage2 = match self.stage2.stage2_in(identity.vm_generation) {
             Ok(stage2) => stage2,
             Err(Stage2Gone) => {
@@ -1683,8 +1792,29 @@ impl CarrierVmCustody {
             RecordRetirement::Complete(outcome) => return outcome,
             RecordRetirement::Unmap { ipa, len } => (ipa, len),
         };
+        let mapping = stage2.installed.remove(&identity.record_id);
         self.stage2.at_client_point(RECORD_UNMAP_PREPARED);
-        let backend_result = unmap(ipa, len);
+        let backend_result = if let Some(unmap) = test_unmap {
+            let result = unmap(ipa, len);
+            if result.is_err()
+                && let Some(mapping) = mapping
+            {
+                stage2.installed.insert(identity.record_id, mapping);
+            }
+            result
+        } else if let Some(mapping) = mapping {
+            // SAFETY: the record retirement is prepared under its generation
+            // guard and has zero active pins.
+            match unsafe { stage2.unmap(mapping) } {
+                Ok(()) => Ok(()),
+                Err((mapping, status)) => {
+                    stage2.installed.insert(identity.record_id, mapping);
+                    Err(CarrierStage2BackendError::HvReturn(status.raw()))
+                }
+            }
+        } else {
+            Err(CarrierStage2BackendError::HvReturn(0xfae9_4001))
+        };
         let Some(record) = stage2.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -4890,22 +5020,16 @@ mod carrier_vm_custody_tests {
             crate::host_mapping::HostMappingKind::PrivateAnon,
         )
         .expect("allocate replacement root-slot backing");
-        assert_eq!(
-            unsafe {
-                super::inventory_stage2_map(
-                    replacement.as_ptr().cast(),
-                    ipa,
-                    len as usize,
-                    carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
-                )
-            },
-            0,
-            "a second child must map the returned root slot while stale MM-access metadata still exists",
+        let replacement_mapping = super::test_stage2_map(
+            &custody,
+            replacement.as_ptr().cast(),
+            ipa,
+            len as usize,
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         );
-        assert_eq!(
-            unsafe { super::inventory_stage2_unmap(ipa, len as usize) },
-            0
-        );
+        let mut stage2 = custody.stage2.stage2().expect("live custody");
+        assert!(unsafe { stage2.unmap(replacement_mapping) }.is_ok());
+        drop(stage2);
         drop(replacement);
         drop(mm_access);
     }
@@ -4983,27 +5107,31 @@ mod carrier_vm_custody_tests {
             crate::host_mapping::HostMappingKind::PrivateAnon,
         )
         .expect("allocate refused replacement root-slot backing");
-        assert_ne!(
+        let mut stage2 = custody
+            .admitting_stage2("refused reuse check")
+            .expect("admitting");
+        assert!(
             unsafe {
-                super::inventory_stage2_map(
+                super::stage2_map(
+                    &mut stage2,
                     replacement.as_ptr().cast(),
                     ipa,
                     len as usize,
                     carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
                 )
-            },
-            0,
+            }
+            .is_err(),
             "same-IPA reuse must remain refused until structural retirement is terminal",
         );
+        drop(stage2);
         drop(replacement);
 
         drop(pin);
         drop(mappings);
         drop(mm_access);
-        super::retry_structural_backing_identities_in_using(
+        super::retry_structural_backing_identities_in(
             &custody,
             &[identity],
-            &mut super::unmap_global_frame_stage2_record,
             &mut super::release_retired_stage2_ipa,
         )
         .expect("clean up deferred pinned structural fixture");

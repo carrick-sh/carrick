@@ -2476,8 +2476,28 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         ledger: &mut impl ForkTableLedger,
         receipt: ExecPredecessorReceipt<T::Tag>,
         absence: SlotAbsence,
+        clear_tables: impl FnMut(&[RootGpa]) -> bool,
+        release: impl FnMut(&C, &SlotAbsence) -> bool,
+    ) -> Result<(), ForkStockServiceError> {
+        let mut retired = Vec::new();
+        self.settle_exec_predecessor_collecting(
+            ledger,
+            receipt,
+            absence,
+            clear_tables,
+            release,
+            &mut retired,
+        )
+    }
+
+    pub fn settle_exec_predecessor_collecting(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        receipt: ExecPredecessorReceipt<T::Tag>,
+        absence: SlotAbsence,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut release: impl FnMut(&C, &SlotAbsence) -> bool,
+        retired: &mut Vec<C>,
     ) -> Result<(), ForkStockServiceError> {
         let Some(mut pending) = self.exec_predecessors.remove(&receipt.sequence) else {
             return Err(ForkStockServiceError::StaleExecution);
@@ -2520,7 +2540,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if !returned {
             self.wake_if_exhausted();
         }
-        drop(pending.physical);
+        if let ExecPredecessorPhysical::Child(physical) = pending.physical {
+            retired.push(physical);
+        }
         Ok(())
     }
 
@@ -3216,6 +3238,29 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         is_clean: impl Fn(&[RootGpa]) -> bool,
         clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
     ) -> Result<(), ForkStockServiceError> {
+        let mut retired = Vec::new();
+        self.settle_collecting(
+            ledger,
+            execution,
+            settlement,
+            is_resolvable,
+            is_clean,
+            clear_lifecycle,
+            &mut retired,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_collecting(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+        is_resolvable: impl Fn(&[RootGpa]) -> bool,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+        clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
+        retired: &mut Vec<C>,
+    ) -> Result<(), ForkStockServiceError> {
         let loan = self.settlement_loan(execution)?;
         let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
         let pending = self.pending[index]
@@ -3235,7 +3280,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             let pending = self.pending[index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
-            drop(pending.admitted);
+            if let Some(admitted) = pending.admitted {
+                retired.push(admitted.physical);
+            }
             for page in &pending.child_tables {
                 ledger.give_back(*page, loan.request.child_mm);
             }
@@ -3310,9 +3357,32 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         ledger: &mut impl ForkTableLedger,
         execution: impl Into<ReclaimExecution>,
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
+        clear_tables: impl FnMut(&[RootGpa]) -> bool,
+        clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
+        release: impl FnMut(&SlotAbsence) -> bool,
+    ) -> Result<usize, ForkStockServiceError> {
+        let mut retired = Vec::new();
+        self.reclaim_collecting(
+            ledger,
+            execution,
+            occupancy,
+            clear_tables,
+            clear_lifecycle,
+            release,
+            &mut retired,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaim_collecting(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        execution: impl Into<ReclaimExecution>,
+        occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
         mut release: impl FnMut(&SlotAbsence) -> bool,
+        retired: &mut Vec<C>,
     ) -> Result<usize, ForkStockServiceError> {
         let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
@@ -3400,6 +3470,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 {
                     self.controls.push(control);
                 }
+                retired.push(child.physical);
                 self.counters.returned_children = self.counters.returned_children.saturating_add(1);
             }
             self.quarantine.remove(&key);

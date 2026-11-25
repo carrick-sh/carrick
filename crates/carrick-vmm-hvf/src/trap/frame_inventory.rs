@@ -1460,10 +1460,9 @@ impl HvfVmState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
-            let retirement = retry_structural_backing_identities_in_using(
+            let retirement = retry_structural_backing_identities_in(
                 custody,
                 &[identity],
-                &mut unmap_global_frame_stage2_record,
                 &mut release_retired_stage2_ipa,
             );
             if let Err(error) = retirement {
@@ -1500,12 +1499,11 @@ impl HvfVmState {
             return Ok(());
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
-            )));
-        }
+        stage2_unmap_untracked(custody, ipa, size).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
+            ))
+        })?;
         release_retired_stage2_ipa(ipa, length)?;
         Ok(())
     }
@@ -1537,12 +1535,11 @@ impl HvfVmState {
             )));
         }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-        let rc = unsafe { inventory_stage2_unmap(ipa, size) };
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
-            )));
-        }
+        stage2_unmap_untracked(custody, ipa, size).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: {error}"
+            ))
+        })?;
         Ok(())
     }
 

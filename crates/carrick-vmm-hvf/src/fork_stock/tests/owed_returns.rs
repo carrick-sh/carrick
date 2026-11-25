@@ -98,7 +98,7 @@ fn native_exclusion_reclaims_a_full_table_of_exited_fork_holders() {
         // SAFETY: each complete mapped span is within the retained fixture storage.
         let host_addr = unsafe { physical.as_mut_ptr().add(offset) } as usize;
         custody
-            .publish_stage2_record_using(
+            .publish_test_stage2_record_using(
                 crate::trap::CarrierStage2RecordSpec {
                     vm_generation: generation,
                     ipa,

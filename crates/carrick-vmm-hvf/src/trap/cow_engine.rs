@@ -5342,15 +5342,19 @@ impl HvfVmState {
         len: u64,
         perms: carrick_hal::MemPerms,
     ) -> Result<(), TrapError> {
+        let custody = self.carrier_vm_custody();
+        let mut stage2 = custody.admitting_stage2("guest stage-2 map")?;
         let perms_raw: u64 = carrick_aarch64::stage2::stage2_perms_bits(perms);
-        let r = unsafe {
-            inventory_stage2_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
-        };
-        if r != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "hv_vm_map(ipa=0x{ipa:x}, size={len}) failed: 0x{r:x}"
-            )));
-        }
+        // SAFETY: host backing remains live until unmapped or VM destroy.
+        let mapping = unsafe { stage2_map(&mut stage2, host.cast(), ipa, len as usize, perms_raw) }
+            .map_err(|r| {
+                TrapError::Hypervisor(format!(
+                    "hv_vm_map(ipa=0x{ipa:x}, size={len}) failed: 0x{r:x}"
+                ))
+            })?;
+        stage2
+            .untracked_mappings
+            .insert((mapping.ipa(), mapping.size()), mapping);
         Ok(())
     }
 
@@ -5370,14 +5374,10 @@ impl HvfVmState {
         let Some(b) = backing else {
             return false;
         };
-        #[cfg(test)]
-        self.carrier_vm_custody()
-            .stage2
-            .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
         // `add_alias`. Replay succeeds only when HVF confirms the installation;
         // an arbitrary nonzero result is never evidence that a racing mapper won.
-        let rc = unsafe { inventory_stage2_map_replay(b) };
+        let rc = unsafe { stage2_map_replay(&self.carrier_vm_custody(), b) };
         crate::probes::hv_vm_map_alias(
             va,
             b.physical_ipa,

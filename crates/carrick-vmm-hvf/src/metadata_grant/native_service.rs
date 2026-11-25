@@ -645,29 +645,36 @@ impl NativeService {
         // settlement leaves them owed.
         super::settle_native_exclusion(&custody, exclusion.proof())?;
         let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(|| stale())?;
-        let mut stock = custody.fork_stock.lock();
-        if stock.owner.child_owner(handle.mm()) != Some(handle)
-            || stock.owner.is_quarantined(handle.mm())
-        {
-            return self.refuse();
-        }
-        let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
-        let inventory = stock.inventory().ok_or_else(|| stale())?;
-        settle_native_cow_grants(&custody, &mut stock, handle, root, pool, exclusion.proof())?;
-        // A first write into an armed block needs one grant carrying its split
-        // tables (#2276); a page write refills table-less grants.
-        let split_tables = native_cow_fault_split(&custody, root, window.fault_page).unwrap_or(0);
-        let refill = if pool
-            .ready(handle.mm().raw())
-            .any(|grant| grant.serves(split_tables))
-        {
-            0
-        } else if split_tables == 0 {
-            carrick_hal::physical_grants::NativePhysicalGrants::<
-                crate::fork_stock::NativeFrameBacking,
-            >::REFILL_GRANTS
-        } else {
-            1
+        let (root, inventory, split_tables, refill) = {
+            let stage2 = custody.stage2.lock();
+            let mut stock = custody.fork_stock.lock();
+            if stock.owner.child_owner(handle.mm()) != Some(handle)
+                || stock.owner.is_quarantined(handle.mm())
+            {
+                drop(stock);
+                drop(stage2);
+                return self.refuse();
+            }
+            let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
+            let inventory = stock.inventory().ok_or_else(|| stale())?;
+            settle_native_cow_grants(&custody, &mut stock, handle, root, pool, exclusion.proof())?;
+            // A first write into an armed block needs one grant carrying its split
+            // tables (#2276); a page write refills table-less grants.
+            let split_tables =
+                native_cow_fault_split_in(&stage2, root, window.fault_page).unwrap_or(0);
+            let refill = if pool
+                .ready(handle.mm().raw())
+                .any(|grant| grant.serves(split_tables))
+            {
+                0
+            } else if split_tables == 0 {
+                carrick_hal::physical_grants::NativePhysicalGrants::<
+                    crate::fork_stock::NativeFrameBacking,
+                >::REFILL_GRANTS
+            } else {
+                1
+            };
+            (root, inventory, split_tables, refill)
         };
         let owner = carrick_hal::GuestFrameOwner {
             native_mm: carrick_guest_arch::MmGeneration::new(
@@ -675,7 +682,8 @@ impl NativeService {
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
         };
-        {
+        if refill > 0 {
+            let mut allocated = Vec::with_capacity(refill);
             for _ in 0..refill {
                 let (_, ipa, generation) = crate::trap::allocate_grant_compound(
                     &custody,
@@ -692,58 +700,92 @@ impl NativeService {
                     .native_frame_backings
                     .lock()
                     .insert((ipa, generation), Arc::downgrade(&retained));
-                let tables = if split_tables == 0 {
-                    carrick_el1_abi::CowSplitTables::NONE
-                } else {
-                    stock
-                        .owner
-                        .reserve_native_cow_split_tables(
-                            &mut crate::fork_stock::fork_table_accounting(&custody),
-                            handle,
-                            root,
-                            ipa,
-                            split_tables,
-                        )
-                        .map_err(|_| stale())?
-                };
-                let physical = stock
-                    .owner
-                    .child_physical_mut(handle.mm(), root)
-                    .ok_or_else(|| stale())?;
-                let grants = physical.supplied.get_or_insert_with(|| {
-                    carrick_hal::physical_grants::NativePhysicalGrants::new(owner)
-                });
-                if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
-                    return Err(stale());
+                allocated.push((ipa, retained));
+            }
+            let mut keep_alive: Vec<Arc<crate::fork_stock::NativeFrameBacking>> = allocated
+                .iter()
+                .map(|(_, backing)| Arc::clone(backing))
+                .collect();
+            let publish_result = (|| -> Result<Option<()>, TrapError> {
+                let mut stock = custody.fork_stock.lock();
+                if stock.owner.child_owner(handle.mm()) != Some(handle)
+                    || stock.owner.child_root(handle.mm()) != Some(root)
+                    || stock.owner.is_quarantined(handle.mm())
+                {
+                    return Ok(None);
                 }
-                let published =
-                    carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
-                        Arc::clone(&physical.rollback),
-                        Arc::clone(&inventory),
-                        [carrick_guest_arch::FrameGpa::new(ipa)],
-                        0,
-                        carrick_el1_abi::COW_GRANT_SIZE,
-                        owner,
-                        carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
-                    )
-                    .and_then(|staged| {
-                        grants.publish_cow(
-                            staged.with_backing(retained),
-                            pool,
-                            exclusion.proof(),
-                            tables,
-                        )
-                    });
-                if let Err(error) = published {
-                    if !tables.is_empty() {
+                for (ipa, retained) in allocated {
+                    let tables = if split_tables == 0 {
+                        carrick_el1_abi::CowSplitTables::NONE
+                    } else {
                         stock
                             .owner
-                            .cancel_native_cow_split_tables(
+                            .reserve_native_cow_split_tables(
                                 &mut crate::fork_stock::fork_table_accounting(&custody),
                                 handle,
+                                root,
                                 ipa,
+                                split_tables,
                             )
-                            .map_err(|_| stale())?;
+                            .map_err(|_| stale())?
+                    };
+                    let physical = stock
+                        .owner
+                        .child_physical_mut(handle.mm(), root)
+                        .ok_or_else(|| stale())?;
+                    let grants = physical.supplied.get_or_insert_with(|| {
+                        carrick_hal::physical_grants::NativePhysicalGrants::new(owner)
+                    });
+                    if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
+                        return Err(stale());
+                    }
+                    let published =
+                        carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
+                            Arc::clone(&physical.rollback),
+                            Arc::clone(&inventory),
+                            [carrick_guest_arch::FrameGpa::new(ipa)],
+                            0,
+                            carrick_el1_abi::COW_GRANT_SIZE,
+                            owner,
+                            carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
+                        )
+                        .and_then(|staged| {
+                            grants.publish_cow(
+                                staged.with_backing(retained),
+                                pool,
+                                exclusion.proof(),
+                                tables,
+                            )
+                        });
+                    if let Err(error) = published {
+                        if !tables.is_empty() {
+                            stock
+                                .owner
+                                .cancel_native_cow_split_tables(
+                                    &mut crate::fork_stock::fork_table_accounting(&custody),
+                                    handle,
+                                    ipa,
+                                )
+                                .map_err(|_| stale())?;
+                        }
+                        return Err(error);
+                    }
+                }
+                Ok(Some(()))
+            })();
+            match publish_result {
+                Ok(Some(())) => drop(keep_alive),
+                Ok(None) => {
+                    for backing in keep_alive.drain(..) {
+                        let _ = backing.release_unused();
+                    }
+                    drop(exclusion);
+                    drop(source);
+                    return self.refuse();
+                }
+                Err(error) => {
+                    for backing in keep_alive.drain(..) {
+                        let _ = backing.release_unused();
                     }
                     return Err(error);
                 }
@@ -752,7 +794,6 @@ impl NativeService {
         let supplied = pool
             .ready(window.operation.mm.raw())
             .any(|grant| grant.serves(split_tables));
-        drop(stock);
         drop(exclusion);
         drop(source);
         self.complete(supplied)
@@ -777,6 +818,7 @@ impl NativeService {
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
         {
+            drop(stock);
             return self.refuse();
         }
         let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
@@ -982,6 +1024,7 @@ impl NativeService {
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
         {
+            drop(stock);
             return self.refuse();
         }
         let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
@@ -1022,41 +1065,46 @@ impl NativeService {
         } else {
             None
         };
-        let mut stock = custody.fork_stock.lock();
-        if stock.owner.child_owner(handle.mm()) != Some(handle)
-            || stock.owner.child_root(handle.mm()) != Some(root)
-            || stock.owner.is_quarantined(handle.mm())
-        {
-            return self.refuse();
-        }
-        let physical = stock
-            .owner
-            .child_physical_mut(handle.mm(), root)
-            .ok_or_else(|| stale())?;
-        let publication_len = bytes
-            .as_ref()
-            .map_or(window.range.len(), |bytes| bytes.len() as u64);
-        if window.fault_page >= window.range.start() + publication_len {
-            return self.finish(None, false, true);
-        }
         let owner = carrick_hal::GuestFrameOwner {
             native_mm: carrick_guest_arch::MmGeneration::new(
                 core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
         };
-        let grants = physical
-            .supplied
-            .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
-        if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
-            return Err(stale());
-        }
         // SAFETY: intake retains this authenticated request-owned reply.
         let reply_slot = unsafe { reply.as_ref() };
-        if !grants.backing_reply_available(reply_slot, window) {
-            drop(stock);
-            return self.refuse();
-        }
+        let publication_len = bytes
+            .as_ref()
+            .map_or(window.range.len(), |bytes| bytes.len() as u64);
+        let rollback = {
+            let mut stock = custody.fork_stock.lock();
+            if stock.owner.child_owner(handle.mm()) != Some(handle)
+                || stock.owner.child_root(handle.mm()) != Some(root)
+                || stock.owner.is_quarantined(handle.mm())
+            {
+                drop(stock);
+                return self.refuse();
+            }
+            let physical = stock
+                .owner
+                .child_physical_mut(handle.mm(), root)
+                .ok_or_else(|| stale())?;
+            if window.fault_page >= window.range.start() + publication_len {
+                drop(stock);
+                return self.finish(None, false, true);
+            }
+            let grants = physical.supplied.get_or_insert_with(|| {
+                carrick_hal::physical_grants::NativePhysicalGrants::new(owner)
+            });
+            if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
+                return Err(stale());
+            }
+            if !grants.backing_reply_available(reply_slot, window) {
+                drop(stock);
+                return self.refuse();
+            }
+            Arc::clone(&physical.rollback)
+        };
         let data_len = publication_len.next_multiple_of(carrick_el1_abi::COW_GRANT_SIZE);
         let executable = window
             .protection
@@ -1089,7 +1137,7 @@ impl NativeService {
         }
         let staged_result =
             carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
-                Arc::clone(&physical.rollback),
+                Arc::clone(&rollback),
                 inventory,
                 [carrick_guest_arch::FrameGpa::new(ipa)],
                 0,
@@ -1110,8 +1158,9 @@ impl NativeService {
                 // attempts undo; an unknown undo already retained the receipt.
                 // Couple this allocation to that failure custody before any
                 // backend release can discard its bytes.
-                if physical.rollback.failed() {
-                    physical.rollback.retain_allocation(retained);
+                if rollback.failed() {
+                    rollback.retain_allocation(retained);
+                    let mut stock = custody.fork_stock.lock();
                     stock
                         .owner
                         .quarantine_native_supply(handle, root)
@@ -1123,10 +1172,11 @@ impl NativeService {
                     Ok(
                         carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement,
                     ) => {
-                        physical.rollback.retain_until_mm_retirement(retained);
+                        rollback.retain_until_mm_retirement(retained);
                     }
                     Err(release_error) => {
-                        physical.rollback.retain_allocation(retained);
+                        rollback.retain_allocation(retained);
+                        let mut stock = custody.fork_stock.lock();
                         stock
                             .owner
                             .quarantine_native_supply(handle, root)
@@ -1137,87 +1187,121 @@ impl NativeService {
                 return Err(error);
             }
         };
+        let keep_alive = Arc::clone(&retained);
         let unpublished = staged.with_backing(retained);
-        let data = *unpublished.grants().first().ok_or_else(|| stale())?;
-        let table_reservation = match stock.owner.reserve_native_descriptor_tables(
-            &mut crate::fork_stock::fork_table_accounting(&custody),
-            handle,
-            root,
-            MAX_TABLE_GRANTS,
-        ) {
-            Ok(reservation) => reservation,
-            Err(_) => {
+        let Some(&data) = unpublished.grants().first() else {
+            let _ = unpublished.abort_with_release(|backing| backing.release_unused());
+            drop(keep_alive);
+            return Err(stale());
+        };
+        enum StageOutcome {
+            Committed(DescriptorTxn),
+            Refuse(
+                carrick_hal::physical_grants::UnpublishedPhysicalGrant<
+                    Arc<crate::fork_stock::NativeFrameBacking>,
+                >,
+            ),
+        }
+        let mut deferred_releases: Vec<(
+            Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+            Arc<crate::fork_stock::NativeFrameBacking>,
+        )> = Vec::new();
+        let mm_key = core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?;
+        let writable = window
+            .protection
+            .permits(carrick_el1_abi::ReservationProtection::WRITE);
+        let staged_res = {
+            let mut stock = custody.fork_stock.lock();
+            if stock.owner.child_owner(handle.mm()) != Some(handle)
+                || stock.owner.child_root(handle.mm()) != Some(root)
+                || stock.owner.is_quarantined(handle.mm())
+                || rollback.failed()
+            {
+                Ok(StageOutcome::Refuse(unpublished))
+            } else {
+                match stock.owner.reserve_native_descriptor_tables(
+                    &mut crate::fork_stock::fork_table_accounting(&custody),
+                    handle,
+                    root,
+                    MAX_TABLE_GRANTS,
+                ) {
+                    Err(_) => Ok(StageOutcome::Refuse(unpublished)),
+                    Ok(table_reservation) => {
+                        let txn = DescriptorTxn {
+                            id: DescriptorTxnId {
+                                mm_key,
+                                generation: window.operation.sequence,
+                            },
+                            root: SubstrateGpa(root.address().raw()),
+                            op: DescriptorOp::Prepare {
+                                publication: GuestLeafPublication {
+                                    va: window.range.start(),
+                                    ipa: data.gpa.raw(),
+                                    len: publication_len,
+                                    writable,
+                                    executable,
+                                },
+                                resident: PageSpan::new(window.fault_page, 4096),
+                                backing: data.identity,
+                            },
+                            tables: table_reservation.descriptor_tables(),
+                        };
+                        if stock
+                            .owner
+                            .track_native_descriptor_tables(
+                                &mut crate::fork_stock::fork_table_accounting(&custody),
+                                table_reservation,
+                                txn,
+                            )
+                            .is_err()
+                        {
+                            Ok(StageOutcome::Refuse(unpublished))
+                        } else {
+                            let staged = stock
+                                .owner
+                                .child_physical_mut(handle.mm(), root)
+                                .ok_or_else(|| stale())?
+                                .supplied
+                                .as_mut()
+                                .ok_or_else(|| stale())?
+                                .stage_backing_reply(reply_slot, window, txn, unpublished, |backing| {
+                                    deferred_releases
+                                        .push((Arc::clone(&rollback), Arc::clone(backing)));
+                                    Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
+                                });
+                            if let Err(error) = staged {
+                                stock
+                                    .owner
+                                    .quarantine_native_supply(handle, root)
+                                    .map_err(|_| stale())?;
+                                Err(error)
+                            } else {
+                                Ok(StageOutcome::Committed(txn))
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let release_err = release_deferred_backings(&custody, handle, root, deferred_releases);
+        drop(keep_alive);
+        release_err?;
+        let txn = match staged_res? {
+            StageOutcome::Committed(txn) => txn,
+            StageOutcome::Refuse(unpublished) => {
                 if let Err(error) =
                     unpublished.abort_with_release(|backing| backing.release_unused())
                 {
+                    let mut stock = custody.fork_stock.lock();
                     stock
                         .owner
                         .quarantine_native_supply(handle, root)
                         .map_err(|_| stale())?;
                     return Err(error);
                 }
-                drop(stock);
                 return self.refuse();
             }
         };
-        let txn = DescriptorTxn {
-            id: DescriptorTxnId {
-                mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
-                generation: window.operation.sequence,
-            },
-            root: SubstrateGpa(root.address().raw()),
-            op: DescriptorOp::Prepare {
-                publication: GuestLeafPublication {
-                    va: window.range.start(),
-                    ipa: data.gpa.raw(),
-                    len: publication_len,
-                    writable: window
-                        .protection
-                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
-                    executable,
-                },
-                resident: PageSpan::new(window.fault_page, 4096),
-                backing: data.identity,
-            },
-            tables: table_reservation.descriptor_tables(),
-        };
-        if stock
-            .owner
-            .track_native_descriptor_tables(
-                &mut crate::fork_stock::fork_table_accounting(&custody),
-                table_reservation,
-                txn,
-            )
-            .is_err()
-        {
-            if let Err(error) = unpublished.abort_with_release(|backing| backing.release_unused()) {
-                stock
-                    .owner
-                    .quarantine_native_supply(handle, root)
-                    .map_err(|_| stale())?;
-                return Err(error);
-            }
-            drop(stock);
-            return self.refuse();
-        }
-        let staged = stock
-            .owner
-            .child_physical_mut(handle.mm(), root)
-            .ok_or_else(|| stale())?
-            .supplied
-            .as_mut()
-            .ok_or_else(|| stale())?
-            .stage_backing_reply(reply_slot, window, txn, unpublished, |backing| {
-                backing.release_unused()
-            });
-        if let Err(error) = staged {
-            stock
-                .owner
-                .quarantine_native_supply(handle, root)
-                .map_err(|_| stale())?;
-            return Err(error);
-        }
-        drop(stock);
         self.finish_backing_supply(handle, root, reply_slot, &txn)
     }
     /// Reserve delivery against cancellation before making the physical reply
@@ -1239,45 +1323,61 @@ impl NativeService {
         )
         .ok_or_else(stale)?;
         let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
-        let mut stock = custody.fork_stock.lock();
-        if stock.owner.child_owner(handle.mm()) != Some(handle)
-            || stock.owner.child_root(handle.mm()) != Some(root)
-            || stock.owner.is_quarantined(handle.mm())
-        {
-            return Err(stale());
-        }
-        let grants = stock
-            .owner
-            .child_physical_mut(handle.mm(), root)
-            .and_then(|physical| physical.supplied.as_mut())
-            .ok_or_else(stale)?;
-        // Acquire the host mutex before the guest queue, never beneath it.
-        // No native-service queue holder acquires ForkStock. This queue spans
-        // only the bounded ServiceCell/descriptor publication and notification;
-        // cancellation releases it before physical/table undo or backing drop.
-        let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
-                    owned.zone(),
-                    owned,
-                )
-            })
-            .map_err(|_| stale())?;
-        let mut offered = false;
-        let delivery = self.ticket.publish_prepared((), |()| {
-            offered = grants.offer_backing_reply(reply, txn);
-            if offered { Ok(()) } else { Err(()) }
-        });
-        let queue = match delivery {
-            Ok(()) => {
-                drop(stock);
-                queue
+        let mut deferred_releases = Vec::new();
+        let (delivery_result, offered) = {
+            let mut stock = custody.fork_stock.lock();
+            if stock.owner.child_owner(handle.mm()) != Some(handle)
+                || stock.owner.child_root(handle.mm()) != Some(root)
+                || stock.owner.is_quarantined(handle.mm())
+            {
+                return Err(stale());
             }
-            Err((reason, ticket, ())) => {
-                drop(queue);
-                // The returned ticket keeps the service BUSY and reply pinned
-                // until rollback settles. No queue guard spans this release.
-                if !settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)? {
+            let grants = stock
+                .owner
+                .child_physical_mut(handle.mm(), root)
+                .and_then(|physical| physical.supplied.as_mut())
+                .ok_or_else(stale)?;
+            // Acquire the host mutex before the guest queue, never beneath it.
+            // No native-service queue holder acquires ForkStock. This queue spans
+            // only the bounded ServiceCell/descriptor publication and notification;
+            // cancellation releases it before physical/table undo or backing drop.
+            let queue = zone
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    carrick_el1::substrate::sched::object_wait::deliver_host_completion(
+                        owned.zone(),
+                        owned,
+                    )
+                })
+                .map_err(|_| stale())?;
+            let mut offered = false;
+            let delivery = self.ticket.publish_prepared((), |()| {
+                offered = grants.offer_backing_reply(reply, txn);
+                if offered { Ok(()) } else { Err(()) }
+            });
+            match delivery {
+                Ok(()) => (Ok(queue), offered),
+                Err((reason, ticket, ())) => {
+                    drop(queue);
+                    // The returned ticket keeps the service BUSY and reply pinned
+                    // until rollback settles. No queue guard spans this release.
+                    let settled = settle_backing_and_tables(
+                        &custody,
+                        &mut stock,
+                        handle,
+                        root,
+                        reply,
+                        txn,
+                        &mut deferred_releases,
+                    )?;
+                    (Err((reason, ticket, settled)), offered)
+                }
+            }
+        };
+        release_deferred_backings(&custody, handle, root, deferred_releases)?;
+        let queue = match delivery_result {
+            Ok(queue) => queue,
+            Err((reason, ticket, settled)) => {
+                if !settled {
                     return Err(stale());
                 }
                 if !matches!(
@@ -1287,7 +1387,6 @@ impl NativeService {
                 ) {
                     return Err(stale());
                 }
-                drop(stock);
                 let queue = zone
                     .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
                         carrick_el1::substrate::sched::object_wait::deliver_host_completion(
@@ -1604,6 +1703,7 @@ fn retain_exec_payload(
     // Authentication is against the request's retained MM incarnation, not
     // whichever task a host process lookup happens to find.
     {
+        let stage2 = custody.stage2.lock();
         let stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle) {
             return Err(stale());
@@ -1611,7 +1711,7 @@ fn retain_exec_payload(
         let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
         let mut cursor = address;
         while cursor < end {
-            if native_output(custody, root, cursor) != Some(cursor & !4095) {
+            if native_output_in(&stage2, root, cursor) != Some(cursor & !4095) {
                 return Err(stale());
             }
             cursor = end.min((cursor | 4095).checked_add(1).ok_or_else(|| stale())?);
@@ -1668,14 +1768,16 @@ fn retain_exec_payload(
 }
 
 // The stock lock retains the table arenas; exclusion prevents descriptor edits.
-fn native_output(
-    custody: &crate::trap::CarrierVmCustody,
+fn native_output_in(
+    stage2: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+        crate::trap::CarrierStage2Records,
+    >,
     root: carrick_guest_arch::RootGpa,
     va: u64,
 ) -> Option<u64> {
     native_output_from(root, va, |address| {
-        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
-            custody,
+        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr_in::<AtomicU64>(
+            stage2,
             carrick_guest_arch::FrameGpa::new(address),
         )
         .ok()?;
@@ -1754,8 +1856,10 @@ fn settle_native_cow_grants(
 
 /// Tables the first EL1 COW write at `va` in a live child must link: the
 /// live terminal is an EL1-private, COW-armed, Linux-writable page or block.
-fn native_cow_fault_split(
-    custody: &crate::trap::CarrierVmCustody,
+fn native_cow_fault_split_in(
+    stage2: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+        crate::trap::CarrierStage2Records,
+    >,
     root: carrick_guest_arch::RootGpa,
     va: u64,
 ) -> Option<usize> {
@@ -1764,8 +1868,8 @@ fn native_cow_fault_split(
     };
     let mut table = root.address().raw();
     for (level, shift) in [39u64, 30, 21, 12].into_iter().enumerate() {
-        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
-            custody,
+        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr_in::<AtomicU64>(
+            stage2,
             carrick_guest_arch::FrameGpa::new(table + ((va >> shift) & 511) * 8),
         )
         .ok()?;
@@ -1851,26 +1955,32 @@ pub(super) fn settle_native_descriptor_reply(
             return Ok(true);
         }
         drop(ledger);
-        let mut stock = custody.fork_stock.lock();
-        if !stock.owner.child_execution_matches(execution, owner) {
-            return Ok(false);
-        }
-        let Some(txn) = stock
-            .owner
-            .child_physical_mut(owner.mm(), execution.context.root)
-            .and_then(|physical| physical.supplied.as_ref())
-            .and_then(|grants| grants.pending_backing_reply(reply, generation))
-        else {
-            return Ok(false);
+        let mut deferred_releases = Vec::new();
+        let outcome = {
+            let mut stock = custody.fork_stock.lock();
+            if !stock.owner.child_execution_matches(execution, owner) {
+                return Ok(false);
+            }
+            let Some(txn) = stock
+                .owner
+                .child_physical_mut(owner.mm(), execution.context.root)
+                .and_then(|physical| physical.supplied.as_ref())
+                .and_then(|grants| grants.pending_backing_reply(reply, generation))
+            else {
+                return Ok(false);
+            };
+            settle_backing_and_tables(
+                custody,
+                &mut stock,
+                owner,
+                execution.context.root,
+                reply,
+                &txn,
+                &mut deferred_releases,
+            )
         };
-        settle_backing_and_tables(
-            custody,
-            &mut stock,
-            owner,
-            execution.context.root,
-            reply,
-            &txn,
-        )
+        release_deferred_backings(custody, owner, execution.context.root, deferred_releases)?;
+        outcome
     })();
     match accepted {
         Ok(true) => Ok(settlement.accept()),
@@ -1885,6 +1995,32 @@ pub(super) fn settle_native_descriptor_reply(
     }
 }
 
+fn release_deferred_backings(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    owner: carrick_el1_abi::El1MmHandle,
+    root: carrick_guest_arch::RootGpa,
+    deferred_releases: Vec<(
+        Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+        Arc<crate::fork_stock::NativeFrameBacking>,
+    )>,
+) -> Result<(), TrapError> {
+    for (rollback, backing) in deferred_releases {
+        match backing.release_unused() {
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released) => {}
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement) => {
+                rollback.retain_until_mm_retirement(backing);
+            }
+            Err(error) => {
+                rollback.retain_allocation(backing);
+                let mut stock = custody.fork_stock.lock();
+                let _ = stock.owner.quarantine_native_supply(owner, root);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The shared physical owner authenticates the outcome and owns rollback.
 /// Tables settle from that SAME outcome before the reply is acknowledged.
 fn settle_backing_and_tables(
@@ -1894,14 +2030,26 @@ fn settle_backing_and_tables(
     root: carrick_guest_arch::RootGpa,
     reply: &carrick_el1_abi::PortalGrantSlot,
     txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    deferred_releases: &mut Vec<(
+        Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+        Arc<crate::fork_stock::NativeFrameBacking>,
+    )>,
 ) -> Result<bool, TrapError> {
+    let rollback = stock
+        .owner
+        .child_physical_mut(owner.mm(), root)
+        .map(|physical| Arc::clone(&physical.rollback))
+        .ok_or_else(stale)?;
     stock.owner.settle_native_backing_reply(
         &mut crate::fork_stock::fork_table_accounting(custody),
         owner,
         root,
         reply,
         txn,
-        |backing| backing.release_unused(),
+        |backing| {
+            deferred_releases.push((Arc::clone(&rollback), Arc::clone(backing)));
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
+        },
     )
 }
 

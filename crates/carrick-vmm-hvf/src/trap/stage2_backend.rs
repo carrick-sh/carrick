@@ -353,7 +353,7 @@ impl carrick_aarch64::stage2::Stage2Backend for HvfStage2 {
 /// is the recorded stage-2 permission word
 /// ([`carrick_aarch64::stage2::STAGE2_PERM_READ`] and its siblings).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_map(
+unsafe fn inventory_stage2_map(
     host: *mut std::ffi::c_void,
     ipa: u64,
     size: usize,
@@ -433,38 +433,81 @@ pub(crate) fn emit_global_frame_stage2(
     crate::probes::hvpatch_global_frame_stage2(event);
 }
 
-/// Serialize lazy replay and make a sibling that lost the race observe the
-/// exact already-installed extent as success without accepting arbitrary HVF
-/// errors. The marker is cleared on unmap and every VM destruction.
+/// Map a registered high-VA alias extent under the live carrier stage-2
+/// generation guard before locking the alias registry (preserving
+/// `stage2 -> alias_registry`), and mark its replay key once mapped.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_map_replay(backing: AliasBacking) -> Stage2Status {
+pub(crate) unsafe fn stage2_map_replay(
+    custody: &CarrierVmCustody,
+    backing: AliasBacking,
+) -> Stage2Status {
+    let Ok(mut stage2) = custody.admitting_stage2("lazy alias replay map") else {
+        return Stage2Status::NO_LIVE_VM;
+    };
+    #[cfg(test)]
+    custody
+        .stage2
+        .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
     let key = replay_mapping_key(backing);
     mutate_external_alias_state(|registry| {
         if registry.contains_replay(&key) {
             return Stage2Status::SUCCESS;
         }
-        let result = unsafe {
-            inventory_stage2_map(
+        // SAFETY: forwarded from caller; `stage2` guard proves live VM.
+        match unsafe {
+            stage2_map(
+                &mut stage2,
                 backing.physical_host_addr as *mut std::ffi::c_void,
                 backing.physical_ipa,
                 backing.physical_size,
                 backing.perms,
             )
-        };
-        if result.is_success() {
-            let bucket = registry
-                .by_scope
-                .entry(backing.ownership_scope)
-                .or_default();
-            bucket.replay.insert(key);
+        } {
+            Ok(mapping) => {
+                stage2
+                    .untracked_mappings
+                    .insert((mapping.ipa(), mapping.size()), mapping);
+                let bucket = registry
+                    .by_scope
+                    .entry(backing.ownership_scope)
+                    .or_default();
+                bucket.replay.insert(key);
+                Stage2Status::SUCCESS
+            }
+            Err(status) => status,
         }
-        result
     })
 }
 
-/// Sole stage-2 unmap boundary.
+/// Unmap an untracked mapping stored by `map_region_raw_in` / `map_stage2` /
+/// `stage2_map_replay` through the owning custody's generation guard.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Status {
+pub(crate) fn stage2_unmap_untracked(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    size: usize,
+) -> Result<(), TrapError> {
+    let Some(mut stage2) = custody.stage2.stage2() else {
+        return Ok(());
+    };
+    let Some(mapping) = stage2.untracked_mappings.remove(&(ipa, size)) else {
+        return Err(TrapError::Hypervisor(format!(
+            "untracked stage-2 mapping IPA {ipa:#x} size {size} not owned by live custody"
+        )));
+    };
+    // SAFETY: caller retires an untracked extent no longer used by guest CPUs.
+    if let Err((mapping, status)) = unsafe { stage2.unmap(mapping) } {
+        stage2.untracked_mappings.insert((ipa, size), mapping);
+        return Err(TrapError::Hypervisor(format!(
+            "hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: {status:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Sole stage-2 unmap boundary (private to `HvfCarrierStage2`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn inventory_stage2_unmap(ipa: u64, size: usize) -> Stage2Status {
     #[cfg(test)]
     if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
         let should_fail = STAGE2_AUDIT_STATE.with(|s| {
@@ -923,29 +966,47 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             perms_raw,
         )
     };
-    drop(stage2);
-    let r = match &map_result {
-        Ok(_) => Stage2Status::SUCCESS,
-        Err(status) => *status,
-    };
-    if emit_exec_backing_census {
-        crate::probes::hvpatch_exec_stage2(carrick_observability::probes::HvpatchExecStage2::new(
-            carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
-            mapping.ipa_start,
-            size as u64,
-            mapping.guest_start,
-            r.raw() as i32,
-        ));
-    }
-    let stage2_mapping = match map_result {
-        Ok(stage2_mapping) => stage2_mapping,
+    let mut retained_stage2_mapping = match map_result {
+        Ok(stage2_mapping) => {
+            if !retain_structural_owner {
+                stage2.untracked_mappings.insert(
+                    (stage2_mapping.ipa(), stage2_mapping.size()),
+                    stage2_mapping,
+                );
+                None
+            } else {
+                Some(stage2_mapping)
+            }
+        }
         Err(r) => {
+            drop(stage2);
+            if emit_exec_backing_census {
+                crate::probes::hvpatch_exec_stage2(
+                    carrick_observability::probes::HvpatchExecStage2::new(
+                        carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
+                        mapping.ipa_start,
+                        size as u64,
+                        mapping.guest_start,
+                        r.raw() as i32,
+                    ),
+                );
+            }
             return Err(TrapError::Hypervisor(format!(
                 "hv_vm_map(ipa=0x{:x}, va=0x{:x}, size={size}) failed: 0x{r:x}",
                 mapping.ipa_start, mapping.guest_start
             )));
         }
     };
+    drop(stage2);
+    if emit_exec_backing_census {
+        crate::probes::hvpatch_exec_stage2(carrick_observability::probes::HvpatchExecStage2::new(
+            carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
+            mapping.ipa_start,
+            size as u64,
+            mapping.guest_start,
+            Stage2Status::SUCCESS.raw() as i32,
+        ));
+    }
     let sharing = if mapping.shared {
         GuestMappingSharing::GlobalShared
     } else {
@@ -980,19 +1041,46 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         ),
     };
     if retain_structural_owner {
-        let host_mapping = region.host_mapping.take().ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "initial fixed mapping at IPA 0x{:x} has no host owner",
+        let cleanup_stage2_mapping =
+            |mapping: &mut Option<carrick_aarch64::stage2::custody::Stage2Mapping>| {
+                if let Some(m) = mapping.take()
+                    && let Some(mut s2) = custody.stage2.stage2()
+                {
+                    let _ = unsafe { s2.unmap(m) };
+                }
+            };
+        let host_mapping = match region.host_mapping.take() {
+            Some(mapping) => match mapping.into_exclusive() {
+                Ok(exclusive) => exclusive,
+                Err(error) => {
+                    cleanup_stage2_mapping(&mut retained_stage2_mapping);
+                    return Err(error);
+                }
+            },
+            None => {
+                cleanup_stage2_mapping(&mut retained_stage2_mapping);
+                return Err(TrapError::Hypervisor(format!(
+                    "initial fixed mapping at IPA 0x{:x} has no host owner",
+                    region.physical_ipa
+                )));
+            }
+        };
+        let epoch = match structural_epoch {
+            Some(epoch) => epoch,
+            None => {
+                cleanup_stage2_mapping(&mut retained_stage2_mapping);
+                return Err(TrapError::Hypervisor(format!(
+                    "initial fixed mapping at IPA 0x{:x} has no structural epoch",
+                    region.physical_ipa
+                )));
+            }
+        };
+        let Some(stage2_mapping) = retained_stage2_mapping.take() else {
+            return Err(TrapError::Hypervisor(format!(
+                "initial fixed mapping at IPA 0x{:x} missing retained stage-2 mapping",
                 region.physical_ipa
-            ))
-        })?;
-        let host_mapping = host_mapping.into_exclusive()?;
-        let epoch = structural_epoch.ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "initial fixed mapping at IPA 0x{:x} has no structural epoch",
-                region.physical_ipa
-            ))
-        })?;
+            )));
+        };
         let mut lease =
             GlobalFrameStage2Lease::fixed(region.physical_ipa, region.physical_size as u64);
         lease.mark_mapped(stage2_mapping);
@@ -1512,6 +1600,10 @@ fn stage2_map_refuses_the_gic_window() {
         LINUX_GIC_WINDOW_SIZE,
     };
     let _stub = ScopedStage2MapTestStub::enable();
+    let custody = CarrierVmCustody::new_live_fixture();
+    let mut stage2 = custody
+        .admitting_stage2("GIC refusal test")
+        .expect("live fixture admits mappings");
     let mut page = vec![0u8; 0x4000];
     for ipa in [
         LINUX_GIC_DISTRIBUTOR_BASE,
@@ -1520,23 +1612,25 @@ fn stage2_map_refuses_the_gic_window() {
         LINUX_GIC_WINDOW_BASE - 0x2000,
     ] {
         // SAFETY: the test stub records the call; nothing reaches HVF.
-        let rc = unsafe { inventory_stage2_map(page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
+        let rc = unsafe { stage2_map(&mut stage2, page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
         assert_eq!(
             rc,
-            Stage2Status::from_raw(HV_BAD_ARGUMENT),
+            Err(Stage2Status::from_raw(HV_BAD_ARGUMENT)),
             "stage-2 map at {ipa:#x} must be refused"
         );
     }
     // SAFETY: as above.
-    let rc = unsafe {
-        inventory_stage2_map(
+    let mapping = unsafe {
+        stage2_map(
+            &mut stage2,
             page.as_mut_ptr().cast(),
             LINUX_GIC_WINDOW_BASE - 0x4000,
             0x4000,
             0b111,
         )
-    };
-    assert_eq!(rc, 0, "the page below the window is ordinary");
+    }
+    .expect("the page below the window is ordinary");
+    assert!(unsafe { stage2.unmap(mapping) }.is_ok());
 }
 
 pub use carrick_el1_abi::IpcWindowBacking;
@@ -1621,8 +1715,10 @@ pub(crate) fn install_ipc_window_using(
         u64,
         usize,
         u64,
-    ) -> carrick_aarch64::stage2::Stage2Status,
-    mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<
+        Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+        carrick_aarch64::stage2::Stage2Status,
+    >,
 ) -> Result<IpcWindowInstallation, TrapError> {
     let (directory_len, pool_len) = ipc_window_geometry(backing.as_ref())?;
     let mut stage2 = custody
@@ -1661,7 +1757,7 @@ pub(crate) fn install_ipc_window_using(
             Err(error) => {
                 drop(stage2);
                 for identity in records {
-                    let _ = custody.retire_stage2_record_using(identity, &mut unmap);
+                    let _ = custody.retire_stage2_record(identity);
                     let _ = custody.remove_terminal_stage2_record(identity);
                 }
                 return Err(TrapError::Hypervisor(format!(
@@ -1687,7 +1783,7 @@ pub(crate) fn install_ipc_window_using(
             Err(error) => {
                 drop(stage2);
                 for identity in records {
-                    let _ = custody.retire_stage2_record_using(identity, &mut unmap);
+                    let _ = custody.retire_stage2_record(identity);
                     let _ = custody.remove_terminal_stage2_record(identity);
                 }
                 return Err(error);
@@ -1752,20 +1848,8 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         backing,
         // SAFETY: the backing is validated host memory retained by the
         // installation for as long as the VM maps it.
-        |stage2, host, ipa, len, perms| match unsafe {
-            stage2_map(stage2, host.cast(), ipa, len, perms)
-        } {
-            Ok(_mapping) => Stage2Status::SUCCESS,
-            Err(status) => status,
-        },
-        |ipa, len| {
-            // SAFETY: unmapping exactly the extent this installation mapped.
-            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(CarrierStage2BackendError::HvReturn(rc.raw()))
-            }
+        |stage2, host, ipa, len, perms| {
+            unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
         },
     )?;
     *INSTALLED_IPC_WINDOW.lock() = Some(installed);
@@ -1841,16 +1925,16 @@ mod ipc_window_tests {
     #[test]
     fn el1_ipc_window_maps_directory_and_pool_as_custody_records() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
         let custody = CarrierVmCustody::new_live_fixture();
         let mut calls = Vec::new();
         let installed = install_ipc_window_using(
             &custody,
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-            |_stage2, host, ipa, len, perms| {
+            |stage2, host, ipa, len, perms| {
                 calls.push((host as usize, ipa, len, perms));
-                carrick_aarch64::stage2::Stage2Status::SUCCESS
+                unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
             },
-            |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(calls.len(), 2);
@@ -1866,33 +1950,37 @@ mod ipc_window_tests {
     #[test]
     fn el1_ipc_window_refuses_bad_geometry_and_rolls_back_a_failed_map() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
         let custody = CarrierVmCustody::new_live_fixture();
         let wrong_pool = install_ipc_window_using(
             &custody,
             backing(0x10_0000),
-            |_, _, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
-            |_, _| Ok(()),
+            |stage2, host, ipa, len, perms| {
+                unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
+            },
         );
         assert!(wrong_pool.is_err(), "a pool of another length fails closed");
-        let mut unmapped = Vec::new();
         let mut maps = 0;
         let failed = install_ipc_window_using(
             &custody,
             backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-            |_, _, _, _, _| {
+            |stage2, host, ipa, len, perms| {
                 maps += 1;
                 if maps == 2 {
-                    carrick_aarch64::stage2::Stage2Status::from_raw(1)
+                    Err(carrick_aarch64::stage2::Stage2Status::from_raw(1))
                 } else {
-                    carrick_aarch64::stage2::Stage2Status::SUCCESS
+                    unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
                 }
-            },
-            |ipa, len| {
-                unmapped.push((ipa, len));
-                Ok(())
             },
         );
         assert!(failed.is_err());
+        let unmapped: Vec<_> = ScopedStage2MapTestStub::events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Stage2BackendEvent::Unmap { ipa, size } => Some((ipa, size)),
+                _ => None,
+            })
+            .collect();
         assert_eq!(unmapped.len(), 1, "the mapped directory is retired");
         assert_eq!(unmapped[0].0, carrick_el1_abi::EL1_IPC_BASE);
         assert!(
@@ -1904,8 +1992,9 @@ mod ipc_window_tests {
             install_ipc_window_using(
                 &no_vm,
                 backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
-                |_, _, _, _, _| carrick_aarch64::stage2::Stage2Status::SUCCESS,
-                |_, _| Ok(())
+                |stage2, host, ipa, len, perms| {
+                    unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
+                },
             )
             .is_err()
         );
@@ -1967,12 +2056,8 @@ mod ipc_window_tests {
                 if rival_done.load(Ordering::SeqCst) {
                     mapped_after_rival.store(true, Ordering::SeqCst);
                 }
-                match unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) } {
-                    Ok(_mapping) => Stage2Status::SUCCESS,
-                    Err(status) => status,
-                }
+                unsafe { stage2_map(stage2, host.cast(), ipa, len, perms) }.map(Some)
             },
-            |_, _| Ok(()),
         );
         rival.join().expect("rival");
         custody.stage2.set_hook(None);

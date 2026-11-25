@@ -84,7 +84,7 @@ fn native_fork_reserve_retains_a_source_the_parent_acquired_after_birth() {
         ),
     ] {
         custody
-            .publish_stage2_record_using(
+            .publish_test_stage2_record_using(
                 crate::trap::CarrierStage2RecordSpec {
                     vm_generation: generation,
                     ipa,

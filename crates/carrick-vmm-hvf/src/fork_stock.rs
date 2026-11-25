@@ -241,21 +241,26 @@ impl ForkStockHostCustody {
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_hal::TrapError;
         let fail = |message: &str| TrapError::Hypervisor(message.into());
-        let pool = custody.root_slot_pool();
-        let mut stock = custody.fork_stock.lock();
-        if let Some(existing) = stock.backing.as_ref() {
-            if existing.resources.matches(&resources) {
-                return Ok(());
+        {
+            let stock = custody.fork_stock.lock();
+            if let Some(existing) = stock.backing.as_ref() {
+                if existing.resources.matches(&resources) {
+                    return Ok(());
+                }
+                return Err(fail("native fork stock already installed"));
             }
-            return Err(fail("native fork stock already installed"));
         }
-        let mut arenas = Vec::new();
-        let mut tables = Vec::new();
-        let roots = resources.tables.arenas();
+        let generation = custody
+            .live_generation()
+            .ok_or_else(|| fail("native fork stock has no live carrier"))?;
         #[cfg(test)]
         custody
             .stage2
             .at_client_point(crate::trap::FORK_STOCK_INSTALL_BEFORE_ARENAS);
+        let pool = custody.root_slot_pool();
+        let mut arenas = Vec::new();
+        let mut tables = Vec::new();
+        let roots = resources.tables.arenas();
         for root in roots {
             let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
@@ -303,9 +308,6 @@ impl ForkStockHostCustody {
             }
             arenas.push(owner);
         }
-        let generation = custody
-            .live_generation()
-            .ok_or_else(|| fail("native fork stock has no live carrier"))?;
         let extent = crate::metadata_grant::install_fork_lifecycle(custody, generation)
             .map_err(|error| fail(&format!("native fork lifecycle extent: {error:?}")))?;
         let lifecycles = carrick_hal::fork_stock::lifecycle_slots(
@@ -314,32 +316,53 @@ impl ForkStockHostCustody {
             extent.len() / carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE,
         )
         .ok_or_else(|| fail("native fork lifecycle extent layout"))?;
-        stock
-            .owner
-            .install(
+        let mut unused_arenas = None;
+        let outcome = {
+            let Ok(_stage2) = custody.stage2.stage2_in(generation) else {
+                drop(arenas);
+                return Err(fail("native fork stock has no live carrier"));
+            };
+            let mut stock = custody.fork_stock.lock();
+            if let Some(existing) = stock.backing.as_ref() {
+                let matches = existing.resources.matches(&resources);
+                unused_arenas = Some(arenas);
+                if matches {
+                    Ok(())
+                } else {
+                    Err(fail("native fork stock already installed"))
+                }
+            } else if let Err(error) = stock.owner.install(
                 tables,
                 carrick_hal::fork_stock::TableReserve::EMPTY,
                 lifecycles,
-            )
-            .map_err(|error| fail(&format!("native fork stock install: {error:?}")))?;
-        stock.backing = Some(NativeForkBacking {
-            resources,
-            _arenas: arenas,
-        });
-        Ok(())
+            ) {
+                unused_arenas = Some(arenas);
+                Err(fail(&format!("native fork stock install: {error:?}")))
+            } else {
+                stock.backing = Some(NativeForkBacking {
+                    resources,
+                    _arenas: arenas,
+                });
+                Ok(())
+            }
+        };
+        drop(unused_arenas);
+        outcome
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn ensure_control_capacity(
-        &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_hal::TrapError;
-        if !self.owner.needs_control_capacity() {
-            return Ok(());
-        }
-        if self.backing.is_none() {
-            return Err(TrapError::Hypervisor("native fork backing absent".into()));
+        {
+            let stock = custody.fork_stock.lock();
+            if !stock.owner.needs_control_capacity() {
+                return Ok(());
+            }
+            if stock.backing.is_none() {
+                return Err(TrapError::Hypervisor("native fork backing absent".into()));
+            }
         }
         let len = usize::try_from(carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE)
             .map_err(|_| TrapError::Hypervisor("native fork control size overflow".into()))?;
@@ -364,15 +387,30 @@ impl ForkStockHostCustody {
         let owner = crate::trap::StructuralBackingOwner::new_in(
             custody, mapping, lease, perms, epoch, base, len,
         )?;
-        self.owner
-            .provide_arm_control_capacity(base)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("native fork control install: {error:?}"))
-            })?;
-        if let Some(backing) = self.backing.as_mut() {
-            backing._arenas.push(owner);
-        }
-        Ok(())
+        let mut unused_owner = Some(owner);
+        let result = {
+            let _stage2 = custody.admitting_stage2("native fork control capacity install")?;
+            let mut stock = custody.fork_stock.lock();
+            if !stock.owner.needs_control_capacity() {
+                Ok(())
+            } else if stock.backing.is_none() {
+                Err(TrapError::Hypervisor("native fork backing absent".into()))
+            } else {
+                stock
+                    .owner
+                    .provide_arm_control_capacity(base)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("native fork control install: {error:?}"))
+                    })?;
+                if let (Some(backing), Some(arena)) = (stock.backing.as_mut(), unused_owner.take())
+                {
+                    backing._arenas.push(arena);
+                }
+                Ok(())
+            }
+        };
+        drop(unused_owner);
+        result
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -460,11 +498,21 @@ impl ForkStockHostCustody {
         custody: &CarrierVmCustody,
         frame: FrameGpa,
     ) -> Result<*mut T, ForkStockServiceError> {
-        let address = frame.raw();
-        let identity = custody
-            .stage2_record_covering(address, core::mem::size_of::<T>())
-            .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
         let state = custody.stage2.lock();
+        Self::physical_ptr_in(&state, frame)
+    }
+
+    /// Resolve a complete physical object under a caller-held stage-2 guard.
+    pub(crate) fn physical_ptr_in<T>(
+        state: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+            crate::trap::CarrierStage2Records,
+        >,
+        frame: FrameGpa,
+    ) -> Result<*mut T, ForkStockServiceError> {
+        let address = frame.raw();
+        let identity =
+            CarrierVmCustody::stage2_record_covering_in(state, address, core::mem::size_of::<T>())
+                .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
         let record = state
             .stage2_records
             .get(&identity.record_id)
@@ -483,11 +531,17 @@ impl ForkStockHostCustody {
             .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
         Ok(host as *mut T)
     }
-    pub(crate) fn clear_tables(custody: &CarrierVmCustody, pages: &[RootGpa]) -> bool {
+
+    pub(crate) fn clear_tables_in(
+        state: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+            crate::trap::CarrierStage2Records,
+        >,
+        pages: &[RootGpa],
+    ) -> bool {
         // Resolve every complete frame before clearing any of them.
         let Some(pointers) = pages
             .iter()
-            .map(|page| Self::physical_ptr::<[u8; 4096]>(custody, page.address()).ok())
+            .map(|page| Self::physical_ptr_in::<[u8; 4096]>(state, page.address()).ok())
             .collect::<Option<Vec<_>>>()
         else {
             return false;
@@ -502,9 +556,14 @@ impl ForkStockHostCustody {
         true
     }
 
-    pub(crate) fn tables_clean(custody: &CarrierVmCustody, pages: &[RootGpa]) -> bool {
+    pub(crate) fn tables_clean_in(
+        state: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+            crate::trap::CarrierStage2Records,
+        >,
+        pages: &[RootGpa],
+    ) -> bool {
         pages.iter().all(|page| {
-            Self::physical_ptr::<[u8; 4096]>(custody, page.address())
+            Self::physical_ptr_in::<[u8; 4096]>(state, page.address())
                 .is_ok_and(|ptr| unsafe { &*ptr }.iter().all(|byte| *byte == 0))
         })
     }
@@ -801,7 +860,7 @@ mod tests {
             ),
         ] {
             custody
-                .publish_stage2_record_using(
+                .publish_test_stage2_record_using(
                     crate::trap::CarrierStage2RecordSpec {
                         vm_generation: generation,
                         ipa,
@@ -997,7 +1056,7 @@ mod tests {
             ),
         ] {
             custody
-                .publish_stage2_record_using(
+                .publish_test_stage2_record_using(
                     crate::trap::CarrierStage2RecordSpec {
                         vm_generation: generation,
                         ipa,

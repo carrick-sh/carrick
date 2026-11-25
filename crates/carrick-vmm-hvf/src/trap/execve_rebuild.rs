@@ -282,10 +282,9 @@ impl PendingExecStage2Cleanup {
             }
         }
         std::mem::forget(retained_backings);
-        retry_structural_backing_identities_in_using(
+        retry_structural_backing_identities_in(
             custody,
             &structural_retirements,
-            &mut unmap_global_frame_stage2_record,
             &mut release_retired_stage2_ipa,
         )?;
         self.armed = false;
@@ -685,14 +684,33 @@ impl PreparedExecBacking {
     /// partial failure retires every earlier record in reverse order. If an
     /// unmap refuses, the returned error retains the complete unresolved
     /// backing/root/record owner for transfer to carrier cleanup.
+    #[cfg(test)]
     fn install_using(
+        self,
+        map: impl FnMut(
+            &mut super::stage2_backend::CarrierStage2<'_>,
+            ExecStage2Install,
+            CarrierStage2RecordIdentity,
+        ) -> Result<
+            Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+            carrick_aarch64::stage2::Stage2Status,
+        >,
+        mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<InstalledExecBacking, ExecBackingInstallError> {
+        self.install_with(map, Some(&mut unmap))
+    }
+
+    fn install_with(
         self,
         mut map: impl FnMut(
             &mut super::stage2_backend::CarrierStage2<'_>,
             ExecStage2Install,
             CarrierStage2RecordIdentity,
-        ) -> carrick_aarch64::stage2::Stage2Status,
-        mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+        ) -> Result<
+            Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+            carrick_aarch64::stage2::Stage2Status,
+        >,
+        test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
     ) -> Result<InstalledExecBacking, ExecBackingInstallError> {
         let Self {
             plan,
@@ -710,7 +728,7 @@ impl PreparedExecBacking {
                     installed_regions,
                     std::sync::Arc::clone(&custody),
                     error,
-                    &mut unmap,
+                    test_unmap,
                 ));
             }
         };
@@ -747,7 +765,7 @@ impl PreparedExecBacking {
                                 installed_regions,
                                 custody,
                                 error,
-                                &mut unmap,
+                                test_unmap,
                             ));
                         }
                     }
@@ -770,7 +788,7 @@ impl PreparedExecBacking {
                             installed_regions,
                             custody,
                             error,
-                            &mut unmap,
+                            test_unmap,
                         ));
                     }
                 },
@@ -802,7 +820,7 @@ impl PreparedExecBacking {
                         installed_regions,
                         custody,
                         error,
-                        &mut unmap,
+                        test_unmap,
                     ));
                 }
             };
@@ -824,7 +842,7 @@ impl PreparedExecBacking {
                     installed_regions,
                     custody,
                     error,
-                    &mut unmap,
+                    test_unmap,
                 ));
             };
             if let Err(error) = lease.transfer_to_record(snapshot, pre_mapped) {
@@ -840,7 +858,7 @@ impl PreparedExecBacking {
                     installed_regions,
                     custody,
                     error,
-                    &mut unmap,
+                    test_unmap,
                 ));
             }
             installed_regions.push(InstalledExecRegion {
@@ -865,7 +883,7 @@ fn fail_exec_install(
     regions: Vec<InstalledExecRegion>,
     custody: std::sync::Arc<CarrierVmCustody>,
     error: TrapError,
-    unmap: &mut impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
 ) -> ExecBackingInstallError {
     let installed = InstalledExecBacking {
         plan,
@@ -875,7 +893,7 @@ fn fail_exec_install(
     ExecBackingInstallError {
         error,
         retained: installed
-            .rollback_using(unmap)
+            .rollback_with(test_unmap)
             .err()
             .map(|failure| failure.installed),
     }
@@ -893,13 +911,13 @@ fn install_prepared_exec_backing(
 ) -> Result<PublishedExecBacking, ExecBackingTransactionError> {
     let fail_after = exec_stage2_fail_after_maps();
     let mut maps_completed = 0usize;
-    let installed = prepared.install_using(
+    let installed = prepared.install_with(
         |stage2, extent, _record| {
             if extent.pre_mapped {
-                return carrick_aarch64::stage2::Stage2Status::SUCCESS;
+                return Ok(None);
             }
             if fail_after.is_some_and(|limit| maps_completed >= limit) {
-                return carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX);
+                return Err(carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX));
             }
             crate::probes::hvpatch_exec_stage2(
                 carrick_observability::probes::HvpatchExecStage2::new(
@@ -910,7 +928,7 @@ fn install_prepared_exec_backing(
                     0,
                 ),
             );
-            let rc = match unsafe {
+            let mapped = unsafe {
                 stage2_map(
                     stage2,
                     extent.host.cast(),
@@ -918,9 +936,10 @@ fn install_prepared_exec_backing(
                     extent.size,
                     extent.perms,
                 )
-            } {
-                Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
-                Err(status) => status,
+            };
+            let rc = match &mapped {
+                Ok(_) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                Err(status) => *status,
             };
             if rc == 0
                 && let Some(replay_key) = extent.replay_key()
@@ -945,16 +964,9 @@ fn install_prepared_exec_backing(
             if rc == 0 {
                 maps_completed += 1;
             }
-            rc
+            mapped.map(Some)
         },
-        |ipa, len| {
-            let rc = unsafe { inventory_stage2_unmap(ipa, len) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(CarrierStage2BackendError::HvReturn(rc.raw()))
-            }
-        },
+        None,
     );
     let published = match installed {
         Ok(installed) => installed.publish(successor_root_slot).map_err(|failure| {
@@ -1058,17 +1070,33 @@ impl InstalledExecBacking {
         })
     }
 
+    #[cfg(test)]
     fn rollback_using(
-        mut self,
+        self,
         mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<(), ExecBackingRollbackError> {
+        self.rollback_with(Some(&mut unmap))
+    }
+
+    fn rollback_with(
+        mut self,
+        mut test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
     ) -> Result<(), ExecBackingRollbackError> {
         for index in (0..self.regions.len()).rev() {
             let Some(identity) = self.regions[index].record else {
                 continue;
             };
-            let outcome = self
-                .custody
-                .retire_stage2_record_using(identity, &mut unmap);
+            #[cfg(test)]
+            let outcome = if let Some(unmap) = test_unmap.as_deref_mut() {
+                self.custody.retire_stage2_record_using(identity, unmap)
+            } else {
+                self.custody.retire_stage2_record(identity)
+            };
+            #[cfg(not(test))]
+            let outcome = {
+                let _ = &mut test_unmap;
+                self.custody.retire_stage2_record(identity)
+            };
             match outcome {
                 CarrierStage2RetireOutcome::RetiredUnmapped
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -2697,6 +2725,7 @@ mod backing_preparation_tests {
     #[test]
     fn exec_backing_install_registers_before_map_and_rolls_back_as_one_owner() {
         let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
         let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
         let prepared =
             PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(1, false).unwrap())
@@ -2704,9 +2733,18 @@ mod backing_preparation_tests {
         let mut map_saw_record = false;
         let installed = prepared
             .install_using(
-                |_stage2, _install, identity| {
+                |stage2, install, identity| {
                     map_saw_record = identity.record_id.0 != 0;
-                    carrick_aarch64::stage2::Stage2Status::SUCCESS
+                    unsafe {
+                        stage2_map(
+                            stage2,
+                            install.host.cast(),
+                            install.ipa,
+                            install.size,
+                            install.perms,
+                        )
+                    }
+                    .map(Some)
                 },
                 |_ipa, _len| Ok(()),
             )
@@ -2721,6 +2759,7 @@ mod backing_preparation_tests {
     #[test]
     fn exec_backing_partial_install_restores_allocator_and_preserves_peer() {
         let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
         let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
         let baseline = global_frame_ipa_allocator().lock().live.clone();
         let peer =
@@ -2733,12 +2772,21 @@ mod backing_preparation_tests {
         let mut maps = 0;
         let mut unmaps = Vec::new();
         let failure = match transaction.install_using(
-            |_stage2, _install, _identity| {
+            |stage2, install, _identity| {
                 maps += 1;
                 if maps == 2 {
-                    carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX)
+                    Err(carrick_aarch64::stage2::Stage2Status::from_raw(u32::MAX))
                 } else {
-                    carrick_aarch64::stage2::Stage2Status::SUCCESS
+                    unsafe {
+                        stage2_map(
+                            stage2,
+                            install.host.cast(),
+                            install.ipa,
+                            install.size,
+                            install.perms,
+                        )
+                    }
+                    .map(Some)
                 }
             },
             |ipa, len| {

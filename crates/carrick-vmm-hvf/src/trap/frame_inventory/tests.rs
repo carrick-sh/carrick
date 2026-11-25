@@ -3008,34 +3008,42 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
         crate::host_mapping::HostMappingKind::PerMmKernelState,
     )
     .expect("allocate successor root backing");
+    let mut stage2 = custody
+        .admitting_stage2("successor root replacement map")
+        .expect("admitting live custody");
     let replacement_map = unsafe {
-        inventory_stage2_map(
+        stage2_map(
+            &mut stage2,
             replacement.as_ptr().cast(),
             root_slot.0,
             root_len as usize,
             carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
         )
     };
+    drop(stage2);
+    let replacement_mapped = replacement_map.is_ok();
 
     // Keep a RED run from contaminating later host tests with the leaked
     // pre-fix custody row. Production must make both observations false/0.
     if root_remained_live {
+        if let Ok(mapping) = replacement_map
+            && let Some(mut stage2) = custody.stage2.stage2()
+        {
+            let _ = unsafe { stage2.unmap(mapping) };
+        }
         root_owner
             .retained
             .owner_retired
             .store(true, std::sync::atomic::Ordering::Release);
-        retry_structural_backing_identities_in_using(
+        retry_structural_backing_identities_in(
             custody,
             &[root_identity],
-            &mut unmap_global_frame_stage2_record,
             &mut release_retired_stage2_ipa,
         )
         .expect("clean leaked RED root fixture");
-    } else if replacement_map == 0 {
-        assert_eq!(
-            unsafe { inventory_stage2_unmap(root_slot.0, root_len as usize) },
-            0,
-        );
+    } else if let Ok(mapping) = replacement_map {
+        let mut stage2 = custody.stage2.stage2().expect("live custody");
+        assert!(unsafe { stage2.unmap(mapping) }.is_ok());
     }
     drop(replacement);
     drop(root_owner);
@@ -3044,8 +3052,8 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
         !root_remained_live,
         "MM retirement returned while its exact structural root remained mapped/current",
     );
-    assert_eq!(
-        replacement_map, 0,
+    assert!(
+        replacement_mapped,
         "the next MM must be able to map the returned numeric root slot",
     );
 }

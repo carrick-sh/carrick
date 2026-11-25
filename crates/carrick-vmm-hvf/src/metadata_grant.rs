@@ -147,16 +147,24 @@ fn service_terminal_operation(
             let Some(region) = retained_abi_region(custody) else {
                 return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
             };
-            let mut stock = custody.fork_stock.lock();
-            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-            return match reclaim_fork_stock(
-                custody,
-                &mut stock,
-                &mut ledger,
-                region,
-                zone,
-                execution,
-            ) {
+            let mut retired = Vec::new();
+            let reclaimed = {
+                let stage2 = custody.stage2.lock();
+                let mut stock = custody.fork_stock.lock();
+                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+                reclaim_fork_stock_in(
+                    &stage2,
+                    custody,
+                    &mut stock,
+                    &mut ledger,
+                    region,
+                    zone,
+                    execution,
+                    &mut retired,
+                )
+            };
+            drop(retired);
+            return match reclaimed {
                 Ok(count) => [METADATA_GRANT_SUCCESS, count as u64, 0, 0],
                 Err(_) => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
             };
@@ -364,14 +372,16 @@ fn settle_native_exec_predecessor(
     let Some(returns) = retained_reservations(region) else {
         return false;
     };
+    let mut retired = Vec::new();
     let settled = {
+        let stage2 = custody.stage2.lock();
         let mut stock = custody.fork_stock.lock();
         let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-        stock.owner.settle_exec_predecessor(
+        stock.owner.settle_exec_predecessor_collecting(
             &mut ledger,
             receipt,
             absence,
-            |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
+            |pages| crate::fork_stock::ForkStockHostCustody::clear_tables_in(&stage2, pages),
             |_, absence| {
                 zone.spaces
                     .unpublished(absence.mm().raw())
@@ -384,8 +394,10 @@ fn settle_native_exec_predecessor(
                         )
                     })
             },
+            &mut retired,
         )
     };
+    drop(retired);
     if settled.is_err() {
         return false;
     }
@@ -565,12 +577,7 @@ impl CarrierMetadataAccess {
     ) -> Result<RetainedMetadataMapping, MetadataResolutionError> {
         let extent = metadata_aperture(&self.carrier.custody)
             .lock()
-            .install_retained_using(
-                &self.carrier.custody,
-                self.generation,
-                backing,
-                map_metadata_backing,
-            )?;
+            .install_retained(&self.carrier.custody, self.generation, backing)?;
         Ok(RetainedMetadataMapping {
             access: self.clone(),
             extent,
@@ -632,18 +639,7 @@ impl RetainedMetadataMapping {
                 metadata_aperture(&self.access.carrier.custody)
                     .lock()
                     .retire_retained_using(self.extent, self.access.generation.0, |record| {
-                        retire_metadata_record_using(
-                            &self.access.carrier.custody,
-                            record.identity,
-                            |ipa, len| {
-                                let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, len) };
-                                if rc == 0 {
-                                    Ok(())
-                                } else {
-                                    Err(crate::trap::CarrierStage2BackendError::HvReturn(rc.raw()))
-                                }
-                            },
-                        )
+                        retire_metadata_record(&self.access.carrier.custody, record.identity)
                     })
             } else {
                 METADATA_GRANT_ERR_DENIED
@@ -705,6 +701,33 @@ impl HostApertureState {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn install_retained(
+        &mut self,
+        custody: &crate::trap::CarrierVmCustody,
+        generation: crate::trap::CarrierVmGeneration,
+        backing: Arc<dyn RetainedMetadataBacking>,
+    ) -> Result<MetadataExtent, MetadataResolutionError> {
+        if !request_has_live_vm(custody, Some(generation)) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        self.install_backing_using(
+            MetadataBacking::Retained(backing),
+            generation.0,
+            |host, ipa, len, token| {
+                publish_backing(
+                    custody,
+                    generation,
+                    host,
+                    ipa,
+                    len,
+                    token,
+                    map_metadata_backing,
+                )
+            },
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     fn install_retained_using(
         &mut self,
         custody: &crate::trap::CarrierVmCustody,
@@ -1028,6 +1051,21 @@ fn allocate_metadata_backing(size: usize) -> Result<OwnedHostMapping, std::io::E
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_metadata_mapping(
+    custody: &crate::trap::CarrierVmCustody,
+    spec: crate::trap::CarrierStage2RecordSpec,
+    map: impl FnOnce(
+        &mut crate::trap::CarrierStage2<'_>,
+        crate::trap::CarrierStage2RecordIdentity,
+    ) -> Result<
+        Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+        carrick_aarch64::stage2::Stage2Status,
+    >,
+) -> Result<crate::trap::CarrierStage2RecordIdentity, TrapError> {
+    custody.publish_stage2_record_using(spec, map)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn publish_metadata_mapping_using(
     custody: &crate::trap::CarrierVmCustody,
     spec: crate::trap::CarrierStage2RecordSpec,
@@ -1036,10 +1074,25 @@ fn publish_metadata_mapping_using(
         crate::trap::CarrierStage2RecordIdentity,
     ) -> carrick_aarch64::stage2::Stage2Status,
 ) -> Result<crate::trap::CarrierStage2RecordIdentity, TrapError> {
-    custody.publish_stage2_record_using(spec, map)
+    custody.publish_test_stage2_record_using(spec, map)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_metadata_record(
+    custody: &crate::trap::CarrierVmCustody,
+    identity: crate::trap::CarrierStage2RecordIdentity,
+) -> bool {
+    use crate::trap::CarrierStage2RetireOutcome;
+    match custody.retire_stage2_record(identity) {
+        CarrierStage2RetireOutcome::RetiredUnmapped
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            custody.remove_terminal_stage2_record(identity).is_some()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn retire_metadata_record_using(
     custody: &crate::trap::CarrierVmCustody,
     identity: crate::trap::CarrierStage2RecordIdentity,
@@ -1067,7 +1120,7 @@ pub(crate) fn install_fork_lifecycle(
     metadata_aperture(custody)
         .lock()
         .install_fork_lifecycle_using(generation.0, |host, ipa, len, token| {
-            publish_backing_using(
+            publish_backing(
                 custody,
                 generation,
                 host,
@@ -1083,10 +1136,13 @@ pub(crate) fn install_fork_lifecycle(
 fn map_metadata_backing(
     stage2: &mut crate::trap::CarrierStage2<'_>,
     spec: crate::trap::CarrierStage2RecordSpec,
-) -> carrick_aarch64::stage2::Stage2Status {
+) -> Result<
+    Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+    carrick_aarch64::stage2::Stage2Status,
+> {
     // SAFETY: the aperture owner retains the validated backing and reservation
     // through the inventory's rollback-capable stage-2 publication.
-    match unsafe {
+    unsafe {
         crate::trap::stage2_map(
             stage2,
             spec.host_addr as *mut std::ffi::c_void,
@@ -1094,13 +1150,46 @@ fn map_metadata_backing(
             spec.len,
             spec.perms,
         )
-    } {
-        Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
-        Err(status) => status,
     }
+    .map(Some)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_backing(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: crate::trap::CarrierVmGeneration,
+    host: usize,
+    ipa: u64,
+    len: usize,
+    token: u64,
+    map: impl FnOnce(
+        &mut crate::trap::CarrierStage2<'_>,
+        crate::trap::CarrierStage2RecordSpec,
+    ) -> Result<
+        Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
+        carrick_aarch64::stage2::Stage2Status,
+    >,
+) -> Result<MetadataPublication, MetadataResolutionError> {
+    let spec = crate::trap::CarrierStage2RecordSpec {
+        vm_generation: generation,
+        ipa,
+        len,
+        host_addr: host,
+        mapped: true,
+        backend_map_installed: true,
+        release_ipa: false,
+        perms: 3,
+        logical_owner: Some(crate::trap::CarrierLogicalOwner {
+            id: token,
+            generation: token,
+        }),
+    };
+    publish_metadata_mapping(custody, spec, |stage2, _| map(stage2, spec))
+        .map(|identity| MetadataPublication { identity })
+        .map_err(|_| MetadataResolutionError::Busy)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn publish_backing_using(
     custody: &crate::trap::CarrierVmCustody,
     generation: crate::trap::CarrierVmGeneration,
@@ -1284,8 +1373,8 @@ pub(crate) fn service_metadata_operation(
             }),
         };
         let mut state = aperture.lock();
-        let publication = publish_metadata_mapping_using(custody, spec, |stage2, _| {
-            match unsafe {
+        let publication = publish_metadata_mapping(custody, spec, |stage2, _| {
+            unsafe {
                 crate::trap::stage2_map(
                     stage2,
                     backing.as_ptr().cast(),
@@ -1293,10 +1382,8 @@ pub(crate) fn service_metadata_operation(
                     extent_size,
                     permissions,
                 )
-            } {
-                Ok(_mapping) => carrick_aarch64::stage2::Stage2Status::SUCCESS,
-                Err(status) => status,
             }
+            .map(Some)
         });
         let identity = match publication {
             Ok(identity) => identity,
@@ -1345,14 +1432,7 @@ pub(crate) fn service_metadata_operation(
             aperture
                 .lock()
                 .return_extent_using(slot_idx, size, token, generation, |record| {
-                    retire_metadata_record_using(custody, record.identity, |ipa, size| {
-                        let rc = unsafe { crate::trap::inventory_stage2_unmap(ipa, size) };
-                        if rc == 0 {
-                            Ok(())
-                        } else {
-                            Err(crate::trap::CarrierStage2BackendError::HvReturn(rc.raw()))
-                        }
-                    })
+                    retire_metadata_record(custody, record.identity)
                 });
         Ok([status, 0, 0, 0])
     } else if op == GRANT_OP_ROOT_EXIT {
@@ -1719,13 +1799,18 @@ fn retain_fork_custody_rows(
 /// terminal maintenance-root, or a settlement-exclusion venue. This supplies mechanics;
 /// release-once, hygiene, tag retirement and pin disposal stay with ForkStock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn reclaim_fork_stock(
+#[allow(clippy::too_many_arguments)]
+fn reclaim_fork_stock_in(
+    stage2: &carrick_aarch64::stage2::custody::Stage2CustodyState<
+        crate::trap::CarrierStage2Records,
+    >,
     custody: &crate::trap::CarrierVmCustody,
     stock: &mut crate::fork_stock::ForkStockHostCustody,
     ledger: &mut impl carrick_hal::fork_stock::ForkTableLedger,
     region: RetainedAbiRegion<'_>,
     zone: &carrick_el1_abi::ZoneTables,
     execution: carrick_hal::fork_stock::ReclaimExecution,
+    retired: &mut Vec<crate::fork_stock::NativeChildPhysical>,
 ) -> Result<usize, carrick_hal::fork_stock::ForkStockServiceError> {
     use carrick_hal::fork_stock::{ForkStockServiceError, SlotAbsence};
     if !stock.owner.has_quarantine() {
@@ -1740,7 +1825,7 @@ fn reclaim_fork_stock(
         .view()
         .ok_or(ForkStockServiceError::InvalidRecord)?;
     let returns = retained_reservations(region).ok_or(ForkStockServiceError::InvalidRecord)?;
-    stock.owner.reclaim(
+    stock.owner.reclaim_collecting(
         ledger,
         execution,
         |mm| {
@@ -1755,8 +1840,8 @@ fn reclaim_fork_stock(
                     .map(|slot| zone.installed_space(slot)),
             )
         },
-        |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
-        |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+        |pages| crate::fork_stock::ForkStockHostCustody::clear_tables_in(stage2, pages),
+        |life| lifecycle_window_in(stage2, life).is_some_and(|window| window.clear(life)),
         |absence| {
             zone.spaces
                 .unpublished(absence.mm().raw())
@@ -1769,6 +1854,7 @@ fn reclaim_fork_stock(
                     )
                 })
         },
+        retired,
     )
 }
 
@@ -1828,8 +1914,6 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            let mut stock = custody.fork_stock.lock();
-            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
             let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
             else {
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
@@ -1837,26 +1921,60 @@ pub(crate) fn service_native_fork_stock(
             let Some((_, zone)) = stopped_records(region, cpu) else {
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            if reclaim_fork_stock(
-                custody,
-                &mut stock,
-                &mut ledger,
-                region,
-                zone,
-                active.into(),
-            )
-            .is_err()
-            {
+            let mut retired = Vec::new();
+            let pre_reclaim = {
+                let stage2 = custody.stage2.lock();
+                let mut stock = custody.fork_stock.lock();
+                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+                reclaim_fork_stock_in(
+                    &stage2,
+                    custody,
+                    &mut stock,
+                    &mut ledger,
+                    region,
+                    zone,
+                    active.into(),
+                    &mut retired,
+                )
+            };
+            drop(retired);
+            if pre_reclaim.is_err() {
                 exchange.refuse(ForkStockRefusal::Inventory);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            if stock.ensure_control_capacity(custody).is_err() {
+            if ForkStockHostCustody::ensure_control_capacity(custody).is_err() {
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            let result = stock.loan(&mut ledger, execution, exchange, |life| {
-                lifecycle_window(custody, life)
-            });
+            let mut retired = Vec::new();
+            let outcome = {
+                let stage2 = custody.stage2.lock();
+                let mut stock = custody.fork_stock.lock();
+                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+                reclaim_fork_stock_in(
+                    &stage2,
+                    custody,
+                    &mut stock,
+                    &mut ledger,
+                    region,
+                    zone,
+                    active.into(),
+                    &mut retired,
+                )
+                .map(|_| {
+                    stock.loan(&mut ledger, execution, exchange, |life| {
+                        lifecycle_window_in(&stage2, life)
+                    })
+                })
+            };
+            drop(retired);
+            let result = match outcome {
+                Ok(result) => result,
+                Err(_) => {
+                    exchange.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                }
+            };
             if let Err(refusal) = result {
                 report_stock_refusal(
                     exchange.request().map(|r| (r.binding, r.context)),
@@ -1894,51 +2012,63 @@ pub(crate) fn service_native_fork_stock(
                 settlement.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            let mut stock = custody.fork_stock.lock();
             if kind == Some(ForkStockKind::Reserve) {
-                // Capture the parent's source receipts before reserve mutably
-                // borrows stock: everything its custody holds, including the
-                // sources it acquired after birth (an exec image, a native
-                // private file mapping), not only the rows its own fork
-                // inherited.
-                let mut inherited = stock
-                    .owner
-                    .pending(execution.cpu)
-                    .and_then(|pending| {
-                        stock
-                            .owner
-                            .child_custody(pending.loan.request.operation, execution.context.root)
-                    })
-                    .map(crate::fork_stock::NativeChildPhysical::fork_sources)
-                    .unwrap_or_default();
-                if let Some((seed, executable)) = stock.root_executables.get(&execution.cpu)
-                    && *seed == execution
-                    && inherited.executable().is_none()
-                {
-                    inherited.bind_executable(Arc::clone(executable));
-                }
-                let executable = inherited.executable();
-                let result = stock.owner.reserve_custody(
-                    execution,
-                    settlement,
-                    |pages| {
-                        pages.iter().all(|page| {
-                            ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
-                                custody,
-                                page.address(),
-                            )
-                            .is_ok()
+                let preflight = {
+                    let stock = custody.fork_stock.lock();
+                    stock
+                        .owner
+                        .pending(execution.cpu)
+                        .filter(|pending| pending.execution == execution)
+                        .and_then(|pending| {
+                            settlement
+                                .reservation(pending.loan)
+                                .map(|(_, custody_va, count)| {
+                                    (pending.loan.request, custody_va, count)
+                                })
                         })
-                    },
-                    |pages| ForkStockHostCustody::tables_clean(custody, pages),
-                    |request, address, count| {
-                        retain_fork_custody_rows(
+                        .map(|(expected_request, expected_address, expected_count)| {
+                            // Capture the parent's source receipts before reserve mutably
+                            // borrows stock: everything its custody holds, including the
+                            // sources it acquired after birth (an exec image, a native
+                            // private file mapping), not only the rows its own fork
+                            // inherited.
+                            let mut inherited = stock
+                                .owner
+                                .child_custody(expected_request.operation, execution.context.root)
+                                .map(crate::fork_stock::NativeChildPhysical::fork_sources)
+                                .unwrap_or_default();
+                            if let Some((seed, executable)) =
+                                stock.root_executables.get(&execution.cpu)
+                                && *seed == execution
+                                && inherited.executable().is_none()
+                            {
+                                inherited.bind_executable(Arc::clone(executable));
+                            }
+                            let executable = inherited.executable();
+                            (
+                                expected_request,
+                                expected_address,
+                                expected_count,
+                                inherited,
+                                executable,
+                            )
+                        })
+                };
+                let mut pre_retained = preflight.map(
+                    |(
+                        expected_request,
+                        expected_address,
+                        expected_count,
+                        inherited,
+                        executable,
+                    )| {
+                        let retained = retain_fork_custody_rows(
                             custody,
                             region,
                             execution.context,
-                            request,
-                            address,
-                            count,
+                            expected_request,
+                            expected_address,
+                            expected_count,
                             inherited,
                         )
                         .map(|rows| {
@@ -1947,39 +2077,91 @@ pub(crate) fn service_native_fork_stock(
                                 physical.sources.bind_executable(executable);
                             }
                             physical
-                        })
+                        });
+                        (expected_request, expected_address, expected_count, retained)
                     },
                 );
+                let result = {
+                    let stage2 = custody.stage2.lock();
+                    let mut stock = custody.fork_stock.lock();
+                    let result = stock
+                        .owner
+                        .reserve_custody(
+                            execution,
+                            settlement,
+                            |pages| {
+                                pages.iter().all(|page| {
+                                    ForkStockHostCustody::physical_ptr_in::<[u8; 4096]>(
+                                        &stage2,
+                                        page.address(),
+                                    )
+                                    .is_ok()
+                                })
+                            },
+                            |pages| ForkStockHostCustody::tables_clean_in(&stage2, pages),
+                            |request, address, count| match pre_retained.take() {
+                                Some((
+                                    expected_request,
+                                    expected_address,
+                                    expected_count,
+                                    retained,
+                                )) if request == expected_request
+                                    && address == expected_address
+                                    && count == expected_count =>
+                                {
+                                    retained
+                                }
+                                _ => Err(ForkStockRefusal::Invalid),
+                            },
+                        )
+                        .map(|_| ());
+                    let accepted = result.is_ok();
+                    if accepted {
+                        stock.root_executables.remove(&execution.cpu);
+                    }
+                    result
+                };
+                drop(pre_retained);
                 if let Err(refusal) = &result {
                     report_stock_refusal(None, Some(execution), &format!("Reserve: {refusal:?}"));
                 }
-                let accepted = result.is_ok();
-                if accepted {
-                    stock.root_executables.remove(&execution.cpu);
-                }
-                accepted
+                result.is_ok()
             } else {
-                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-                match stock.owner.settle(
-                    &mut ledger,
-                    execution,
-                    settlement,
-                    |pages| {
-                        pages.iter().all(|page| {
-                            ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
-                                custody,
-                                page.address(),
-                            )
-                            .is_ok()
-                        })
-                    },
-                    |pages| ForkStockHostCustody::tables_clean(custody, pages),
-                    |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-                ) {
-                    Ok(()) => {
-                        stock.root_executables.remove(&execution.cpu);
-                        true
+                let mut retired = Vec::new();
+                let outcome = {
+                    let stage2 = custody.stage2.lock();
+                    let mut stock = custody.fork_stock.lock();
+                    let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+                    match stock.owner.settle_collecting(
+                        &mut ledger,
+                        execution,
+                        settlement,
+                        |pages| {
+                            pages.iter().all(|page| {
+                                ForkStockHostCustody::physical_ptr_in::<[u8; 4096]>(
+                                    &stage2,
+                                    page.address(),
+                                )
+                                .is_ok()
+                            })
+                        },
+                        |pages| ForkStockHostCustody::tables_clean_in(&stage2, pages),
+                        |life| {
+                            lifecycle_window_in(&stage2, life)
+                                .is_some_and(|window| window.clear(life))
+                        },
+                        &mut retired,
+                    ) {
+                        Ok(()) => {
+                            stock.root_executables.remove(&execution.cpu);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
                     }
+                };
+                drop(retired);
+                match outcome {
+                    Ok(()) => true,
                     Err(error) => {
                         settlement.refuse(
                             if error
@@ -2027,15 +2209,15 @@ pub(crate) fn service_native_fork_stock(
 /// Dynamic metadata is explicitly identity-mapped by this module's extent
 /// owner. Validate that venue before projecting its KernelVa into that mapping.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn lifecycle_window(
-    custody: &crate::trap::CarrierVmCustody,
+fn lifecycle_window_in(
+    state: &carrick_aarch64::stage2::custody::Stage2CustodyState<crate::trap::CarrierStage2Records>,
     life: carrick_el1_abi::ForkLifecycleLoan,
 ) -> Option<carrick_hal::fork_stock::LifecycleWindow> {
     if carrick_el1_abi::ForkLifecycleLoan::new(life.page, life.controls)? != life {
         return None;
     }
-    let (host, base, len) = retained_dynamic_metadata(
-        custody,
+    let (host, base, len) = retained_dynamic_metadata_in(
+        state,
         life.page,
         core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
     )?;
@@ -2049,8 +2231,18 @@ fn retained_dynamic_metadata(
     address: carrick_guest_arch::KernelVa,
     len: usize,
 ) -> Option<(core::ptr::NonNull<u8>, u64, usize)> {
-    let identity = custody.stage2_record_covering(address.raw(), len)?;
     let state = custody.stage2.lock();
+    retained_dynamic_metadata_in(&state, address, len)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retained_dynamic_metadata_in(
+    state: &carrick_aarch64::stage2::custody::Stage2CustodyState<crate::trap::CarrierStage2Records>,
+    address: carrick_guest_arch::KernelVa,
+    len: usize,
+) -> Option<(core::ptr::NonNull<u8>, u64, usize)> {
+    let identity =
+        crate::trap::CarrierVmCustody::stage2_record_covering_in(state, address.raw(), len)?;
     let record = state.stage2_records.get(&identity.record_id)?;
     if record.snapshot.ipa < EL1_DYNAMIC_METADATA_BASE
         || record
@@ -2279,6 +2471,7 @@ fn service_native_exec_adopt(
             successor.root_generation,
         )
     };
+    let mut rejected_physical = None;
     let predecessor = {
         let mut stock = custody.fork_stock.lock();
         let predecessor_mm = carrick_core_abi::ReservationMm::new(execution.binding.mm.raw());
@@ -2303,12 +2496,17 @@ fn service_native_exec_adopt(
             )
         };
         match replaced {
-            Ok(receipt) => receipt,
-            Err((_error, _physical)) => {
-                request.refuse();
-                return Ok(refused);
+            Ok(receipt) => Some(receipt),
+            Err((_error, physical)) => {
+                rejected_physical = Some(physical);
+                None
             }
         }
+    };
+    drop(rejected_physical);
+    let Some(predecessor) = predecessor else {
+        request.refuse();
+        return Ok(refused);
     };
     custody.native_exec_predecessors.lock().push(predecessor);
     request.accept();

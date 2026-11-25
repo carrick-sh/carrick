@@ -1694,9 +1694,7 @@ impl GlobalFrameHostOwner {
         let custody = self.custody.upgrade().ok_or_else(|| {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
-        match custody
-            .retire_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
-        {
+        match custody.retire_stage2_record(self.record_identity) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 finalize_global_frame_owner_record(&custody, self)
@@ -2085,29 +2083,44 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
 ) -> Result<(), TrapError> {
-    retire_carrier_stage2_record_at_safe_point_using(
+    retire_carrier_stage2_record_at_safe_point_with(
         custody,
         identity,
-        unmap_global_frame_stage2_record,
-        release_retired_stage2_ipa,
+        |custody, identity| custody.retire_stage2_record(identity),
+        &mut release_retired_stage2_ipa,
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
     unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     mut release: impl FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
+    retire_carrier_stage2_record_at_safe_point_with(
+        custody,
+        identity,
+        move |custody, identity| custody.retire_stage2_record_using(identity, unmap),
+        &mut release,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_carrier_stage2_record_at_safe_point_with(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    retire: impl FnOnce(&CarrierVmCustody, CarrierStage2RecordIdentity) -> CarrierStage2RetireOutcome,
+    release: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
     let snapshot = custody
         .stage2_record_snapshot(identity.record_id)
         .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
     let key = (snapshot.ipa, snapshot.len as u64);
-    match custody.retire_stage2_record_using(identity, unmap) {
+    match retire(custody, identity) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
-            finalize_terminal_stage2_record_using(custody, identity, &mut release)?;
+            finalize_terminal_stage2_record_using(custody, identity, release)?;
             let mut records = custody.carrier_stage2_records.lock();
             if records.get(&key) == Some(&identity) {
                 records.remove(&key);
@@ -2207,41 +2220,50 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn unmap_global_frame_stage2_record(
-    ipa: u64,
-    len: usize,
-) -> Result<(), CarrierStage2BackendError> {
-    let rc = unsafe { inventory_stage2_unmap(ipa, len) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(CarrierStage2BackendError::HvReturn(rc.raw()))
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn register_global_frame_host_owner_in(
     custody: &std::sync::Arc<CarrierVmCustody>,
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
 ) -> Result<u64, TrapError> {
-    register_global_frame_host_owner_in_using(
+    register_global_frame_host_owner_in_with(
         custody,
         lease,
         mapping,
         perms,
-        &mut unmap_global_frame_stage2_record,
+        &mut |custody, record_identity| custody.retire_stage2_record(record_identity),
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn register_global_frame_host_owner_in_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
     rollback_unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Result<u64, TrapError> {
+    register_global_frame_host_owner_in_with(
+        custody,
+        lease,
+        mapping,
+        perms,
+        &mut |custody, record_identity| {
+            custody.retire_stage2_record_using(record_identity, &mut *rollback_unmap)
+        },
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_global_frame_host_owner_in_with(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    lease: GlobalFrameStage2Lease,
+    mapping: crate::host_mapping::OwnedHostMapping,
+    perms: u64,
+    rollback_retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
 ) -> Result<u64, TrapError> {
     let key = lease.key();
     if key.1 != mapping.len() as u64 || !lease.mapped {
@@ -2281,7 +2303,7 @@ pub(crate) fn register_global_frame_host_owner_in_using(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let outcome = custody.retire_stage2_record_using(record_identity, rollback_unmap);
+        let outcome = rollback_retire(custody, record_identity);
         match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -2355,8 +2377,7 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let outcome =
-            custody.retire_stage2_record_using(record_identity, unmap_global_frame_stage2_record);
+        let outcome = custody.retire_stage2_record(record_identity);
         match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -3065,9 +3086,36 @@ pub(crate) fn finalize_terminal_stage2_record_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retry_structural_backing_retirements_in(
+    custody: &CarrierVmCustody,
+) -> Result<(), TrapError> {
+    retry_structural_backing_retirements_with(
+        custody,
+        &mut |custody, identity| custody.retire_stage2_record(identity),
+        &mut release_retired_stage2_ipa,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retry_structural_backing_retirements_in_using(
     custody: &CarrierVmCustody,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    retry_structural_backing_retirements_with(
+        custody,
+        &mut |custody, identity| custody.retire_stage2_record_using(identity, &mut *unmap),
+        release_ipa,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_structural_backing_retirements_with(
+    custody: &CarrierVmCustody,
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     let retained = custody
@@ -3080,7 +3128,7 @@ pub(crate) fn retry_structural_backing_retirements_in_using(
         .iter()
         .map(|retained| *retained.record_identity.lock())
         .collect::<Vec<_>>();
-    retry_structural_backing_identities_in_using(custody, &identities, unmap, release_ipa)
+    retry_structural_backing_identities_with(custody, &identities, retire, release_ipa)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3117,10 +3165,9 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
     // PreparedStage1Mm can return its numeric root slot to the pool.
     drop(structural_owners);
     for &identity in structural_identities {
-        if let Err(error) = retry_structural_backing_identities_in_using(
+        if let Err(error) = retry_structural_backing_identities_in(
             custody,
             &[identity],
-            &mut unmap_global_frame_stage2_record,
             &mut release_retired_stage2_ipa,
         ) {
             rollback_error.get_or_insert(error);
@@ -3153,10 +3200,42 @@ pub(crate) fn fail_stop_partial_process_stage2_rollback(context: &str, error: &T
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retry_structural_backing_identities_in(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    retry_structural_backing_identities_with(
+        custody,
+        identities,
+        &mut |custody, identity| custody.retire_stage2_record(identity),
+        release_ipa,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retry_structural_backing_identities_in_using(
     custody: &CarrierVmCustody,
     identities: &[CarrierStage2RecordIdentity],
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    retry_structural_backing_identities_with(
+        custody,
+        identities,
+        &mut |custody, identity| custody.retire_stage2_record_using(identity, &mut *unmap),
+        release_ipa,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_structural_backing_identities_with(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     for &identity in identities {
@@ -3177,7 +3256,7 @@ pub(crate) fn retry_structural_backing_identities_in_using(
         {
             continue;
         }
-        match custody.retire_stage2_record_using(identity, &mut *unmap) {
+        match retire(custody, identity) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
@@ -3712,12 +3791,12 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in(
     length: u64,
     expected_generation: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_if_generation_in_using(
+    retire_global_frame_host_owner_inner_in_with(
         custody,
         ipa,
         length,
-        expected_generation,
-        &mut unmap_global_frame_stage2_record,
+        Some(expected_generation),
+        &mut |custody, identity| custody.retire_stage2_record(identity),
     )
 }
 
@@ -3728,16 +3807,16 @@ pub(crate) fn retire_global_frame_host_owner_inner_in(
     length: u64,
     expected_generation: Option<u64>,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_inner_in_using(
+    retire_global_frame_host_owner_inner_in_with(
         custody,
         ipa,
         length,
         expected_generation,
-        &mut unmap_global_frame_stage2_record,
+        &mut |custody, identity| custody.retire_stage2_record(identity),
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_if_generation_in_using(
     custody: &CarrierVmCustody,
     ipa: u64,
@@ -3754,13 +3833,33 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in_using(
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_inner_in_using(
     custody: &CarrierVmCustody,
     ipa: u64,
     length: u64,
     expected_generation: Option<u64>,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> GlobalFrameRetirementOutcome {
+    retire_global_frame_host_owner_inner_in_with(
+        custody,
+        ipa,
+        length,
+        expected_generation,
+        &mut |custody, identity| custody.retire_stage2_record_using(identity, &mut *unmap),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner_inner_in_with(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    expected_generation: Option<u64>,
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
 ) -> GlobalFrameRetirementOutcome {
     let outcome = (|| {
         // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
@@ -3853,7 +3952,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
         );
         drop(owners);
 
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
+        let outcome = retire(custody, owner.record_identity);
         let mut owners = custody.global_frame_host_owners.lock();
         if !matches!(
             owners.get(&key),
@@ -4001,7 +4100,10 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
 pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
     custody: &CarrierVmCustody,
 ) -> Result<(), TrapError> {
-    drain_all_global_frame_retirements_in_using(custody, &mut unmap_global_frame_stage2_record)
+    drain_all_global_frame_retirements_in_using(custody, &mut |ipa, len| {
+        let _ = (ipa, len);
+        Ok(())
+    })
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -4253,9 +4355,31 @@ impl Drop for PendingGlobalFrameRetirementTurn<'_> {
 /// been released. Failed or excess work remains explicitly requested for the
 /// next idle turn.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retry_pending_global_frame_retirements_at_idle_in(
+    custody: &CarrierVmCustody,
+) -> PendingGlobalFrameRetirementTurnReport {
+    retry_pending_global_frame_retirements_at_idle_with(custody, &mut |custody, identity| {
+        custody.retire_stage2_record(identity)
+    })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     custody: &CarrierVmCustody,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> PendingGlobalFrameRetirementTurnReport {
+    retry_pending_global_frame_retirements_at_idle_with(custody, &mut |custody, identity| {
+        custody.retire_stage2_record_using(identity, &mut *unmap)
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_pending_global_frame_retirements_at_idle_with(
+    custody: &CarrierVmCustody,
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
 ) -> PendingGlobalFrameRetirementTurnReport {
     if !custody.take_global_frame_retirement_retry_request() {
         return PendingGlobalFrameRetirementTurnReport::default();
@@ -4309,12 +4433,12 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
                 .complete((key, generation));
             continue;
         }
-        let outcome = retire_global_frame_host_owner_inner_in_using(
+        let outcome = retire_global_frame_host_owner_inner_in_with(
             custody,
             ipa,
             length,
             Some(generation),
-            unmap,
+            retire,
         );
         let mut retries = custody.pending_global_frame_directory_retries.lock();
         if matches!(
@@ -4363,7 +4487,7 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
             finish_pending_global_frame_owner(custody, &owner);
             continue;
         }
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        let outcome = retire(custody, owner.record_identity);
         let completed = matches!(
             outcome,
             CarrierStage2RetireOutcome::RetiredUnmapped

@@ -922,10 +922,13 @@ impl ContainerRootToken {
 pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
-    static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasRegistry>> =
+pub(crate) fn alias_registry()
+-> &'static carrick_aarch64::stage2::custody::Stage2Inner<AliasRegistry> {
+    static CELL: std::sync::OnceLock<carrick_aarch64::stage2::custody::Stage2Inner<AliasRegistry>> =
         std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(AliasRegistry::default()))
+    CELL.get_or_init(
+        || carrick_aarch64::stage2::custody::Stage2Inner::new(AliasRegistry::default()),
+    )
 }
 
 /// The registry write lock, attributed to its writer. Every row-changing
@@ -933,7 +936,7 @@ pub(crate) fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
 /// caller's source site.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct AliasRegistryWriteGuard<'a> {
-    guard: parking_lot::MutexGuard<'a, AliasRegistry>,
+    guard: carrick_aarch64::stage2::custody::Stage2InnerGuard<'a, AliasRegistry>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2186,12 +2189,10 @@ impl HvfTaskState {
                 "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
             ));
         }
-        let rc = unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
-            )));
-        }
+        stage2_unmap_untracked(self.custody(), mapping.physical_ipa, mapping.physical_size)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("unmap HVPatch initial sparse mmap arena: {error}"))
+            })?;
         self.mappings.remove_range(
             GuestVa::new(crate::memory::LINUX_MMAP_BASE),
             crate::memory::mmap_arena_size() as usize,
@@ -4646,11 +4647,7 @@ fn abort_prepared_task_and_carrier(
     drop(task);
     state_result?;
     if let Some(custody) = custody.as_ref()
-        && let Err(error) = retry_structural_backing_retirements_in_using(
-            custody,
-            &mut unmap_global_frame_stage2_record,
-            &mut release_retired_stage2_ipa,
-        )
+        && let Err(error) = retry_structural_backing_retirements_in(custody)
     {
         owner_rollback_error = Some(error);
     }
@@ -8413,7 +8410,7 @@ impl HvfInner {
                 {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
                     // by add_alias. Only rc=0 proves replay installation.
-                    let rc = unsafe { inventory_stage2_map_replay(b) };
+                    let rc = unsafe { stage2_map_replay(custody, b) };
                     crate::probes::hv_vm_map_alias(
                         exit.exception.virtual_address,
                         b.physical_ipa,

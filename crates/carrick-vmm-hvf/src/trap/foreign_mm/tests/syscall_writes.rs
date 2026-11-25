@@ -378,13 +378,8 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     );
     drop(task);
     drop(owner);
-    retry_structural_backing_identities_in_using(
-        custody,
-        &[identity],
-        &mut unmap_global_frame_stage2_record,
-        &mut release_retired_stage2_ipa,
-    )
-    .unwrap();
+    retry_structural_backing_identities_in(custody, &[identity], &mut release_retired_stage2_ipa)
+        .unwrap();
 }
 
 mod allocations {

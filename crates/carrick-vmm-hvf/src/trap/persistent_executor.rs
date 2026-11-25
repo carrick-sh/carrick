@@ -595,12 +595,14 @@ impl Drop for PersistentCarrierMappings {
                     });
                 }
             } else if !vm_destroyed {
-                let rc =
-                    unsafe { inventory_stage2_unmap(mapping.physical_ipa, mapping.physical_size) };
-                if rc != 0 {
+                if let Err(error) = stage2_unmap_untracked(
+                    &self.custody,
+                    mapping.physical_ipa,
+                    mapping.physical_size,
+                ) {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
-                        "retire persistent carrier stage-2 IPA 0x{:x} size {} failed: 0x{rc:x}",
+                        "retire persistent carrier stage-2 IPA 0x{:x} size {} failed: {error}",
                         mapping.physical_ipa,
                         mapping.physical_size
                     );
@@ -1062,9 +1064,8 @@ impl HvfVmState {
         // Maintenance failures remain recorded on the exact Pending owner and
         // re-arm the custody-local request bit. They must not kill an otherwise
         // clean persistent worker; the next executor-idle boundary retries.
-        let _remaining = retry_pending_global_frame_retirements_at_idle_in_using(
+        let _remaining = retry_pending_global_frame_retirements_at_idle_in(
             &self.carrier_foreign_mm_transport.custody,
-            &mut unmap_global_frame_stage2_record,
         );
         Ok(())
     }

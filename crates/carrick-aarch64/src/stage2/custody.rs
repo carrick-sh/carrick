@@ -459,6 +459,12 @@ impl<T> Stage2Inner<T> {
         STAGE2_INNER_HELD.with(|held| held.set(held.get() + 1));
         Stage2InnerGuard { guard }
     }
+
+    pub fn try_lock(&self) -> Option<Stage2InnerGuard<'_, T>> {
+        let guard = self.inner.try_lock()?;
+        STAGE2_INNER_HELD.with(|held| held.set(held.get() + 1));
+        Some(Stage2InnerGuard { guard })
+    }
 }
 
 impl<T> Drop for Stage2InnerGuard<'_, T> {

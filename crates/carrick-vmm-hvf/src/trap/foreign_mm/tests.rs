@@ -3895,10 +3895,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
             .is_some_and(|entry| entry.is_pending())),
         "foreign lease drop must release pins and enqueue retirement without backend unmap",
     );
-    let turn = retry_pending_global_frame_retirements_at_idle_in_using(
-        &transport.custody,
-        &mut unmap_global_frame_stage2_record,
-    );
+    let turn = retry_pending_global_frame_retirements_at_idle_in(&transport.custody);
     assert!(turn.inspected_directory <= 16);
     for _ in 0..2 {
         if owners
@@ -3908,10 +3905,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         {
             break;
         }
-        let _ = retry_pending_global_frame_retirements_at_idle_in_using(
-            &transport.custody,
-            &mut unmap_global_frame_stage2_record,
-        );
+        let _ = retry_pending_global_frame_retirements_at_idle_in(&transport.custody);
     }
     assert!(
         owners
@@ -4185,10 +4179,9 @@ fn structural_backing_owner_lifecycle_and_retained_backing() {
     assert!(missing.is_err());
     drop(backing);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("explicitly retire structural lifecycle fixture");
@@ -4243,10 +4236,9 @@ fn serial_host_structural_backing_owner_invalid_arguments_and_exact_drop_order()
         alias_backing_is_live(host_addr),
         "custody must retain backing until the explicit safe point"
     );
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("explicitly retire structural drop-order fixture");
@@ -5266,10 +5258,9 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
     );
 
     drop(region);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire initial fixed mapping fixture");
@@ -5527,10 +5518,9 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
     drop(desc);
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire structural vvar fork fixture");
@@ -6489,10 +6479,9 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     drop(parent);
     drop(vvar_owner);
     drop(overlay_owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[vvar_identity, overlay_identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire production vvar fixture");
@@ -6553,10 +6542,9 @@ fn current_generation_structural_owner_needs_no_replay_rebind() {
     );
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire current-generation reconciliation fixture");
@@ -6654,10 +6642,9 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
         .expect("publish G2 fixture");
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[g2_identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire G2 structural replay fixture");
@@ -6767,10 +6754,9 @@ fn structural_alias_rejects_forged_semantic_host_projection() {
     drop(projected);
     drop(source);
     drop(region);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire forged semantic projection fixture");
@@ -6920,10 +6906,9 @@ fn initial_fixed_mapping_composes_through_first_fork_preparation() {
     drop(projected);
     drop(region);
     drop(root_owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire first-fork composition fixture");
@@ -7125,10 +7110,9 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
     drop(projected);
     drop(region);
     drop(parent_owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire private overlay structural fixture");
@@ -7503,10 +7487,9 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     drop(child_source);
     drop(prepared);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire copied-child structural fixture");
@@ -10618,19 +10601,16 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
         crate::host_mapping::HostMappingKind::PrivateAnon,
     )
     .expect("allocate replacement root backing");
-    assert_eq!(
-        unsafe {
-            inventory_stage2_map(
-                replacement.as_ptr().cast(),
-                root_ipa,
-                0x20_0000,
-                carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
-            )
-        },
-        0,
-        "the same numeric root slot must be reusable after exact rollback",
+    let replacement_mapping = test_stage2_map(
+        &custody,
+        replacement.as_ptr().cast(),
+        root_ipa,
+        0x20_0000,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
-    assert_eq!(unsafe { inventory_stage2_unmap(root_ipa, 0x20_0000) }, 0);
+    let mut stage2 = custody.stage2.stage2().expect("live custody");
+    assert!(unsafe { stage2.unmap(replacement_mapping) }.is_ok());
+    drop(stage2);
 }
 
 #[test]
@@ -10674,26 +10654,26 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
         crate::host_mapping::HostMappingKind::PrivateAnon,
     )
     .expect("allocate prohibited replacement backing");
-    assert_ne!(
+    let mut stage2 = custody
+        .admitting_stage2("prohibited replacement check")
+        .expect("admitting");
+    assert!(
         unsafe {
-            inventory_stage2_map(
+            stage2_map(
+                &mut stage2,
                 replacement.as_ptr().cast(),
                 root_ipa,
                 0x20_0000,
                 carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
             )
-        },
-        0,
+        }
+        .is_err(),
         "the occupied slot cannot be reissued after the carrier fail-stop boundary",
     );
+    drop(stage2);
 
-    retry_structural_backing_identities_in_using(
-        &custody,
-        &new_records,
-        &mut unmap_global_frame_stage2_record,
-        &mut release_retired_stage2_ipa,
-    )
-    .expect("test cleanup exact failed rollback record");
+    retry_structural_backing_identities_in(&custody, &new_records, &mut release_retired_stage2_ipa)
+        .expect("test cleanup exact failed rollback record");
     assert!(!ScopedStage2MapTestStub::is_mapped(root_ipa, 0x20_0000));
 }
 
@@ -10734,11 +10714,10 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
     drop(sentinel_owner);
     stage2_stub.set_fail_next_unmap(true);
     assert!(
-        retry_structural_backing_identities_in_using(
+        retry_structural_backing_identities_in(
             &custody,
             &[sentinel_identity],
-            &mut unmap_global_frame_stage2_record,
-            &mut release_retired_stage2_ipa,
+            &mut release_retired_stage2_ipa
         )
         .is_err(),
         "fixture must leave the unrelated sentinel retry-pending",
@@ -10761,10 +10740,9 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
             .is_some_and(|snapshot| snapshot.retry_pending.is_some()),
     );
 
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &custody,
         &[sentinel_identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("cleanup unrelated retry-pending sentinel");
@@ -10872,17 +10850,13 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
         crate::host_mapping::HostMappingKind::PrivateAnon,
     )
     .expect("allocate authoritative rollback sentinel backing");
-    assert_eq!(
-        unsafe {
-            inventory_stage2_map(
-                sentinel_host.as_ptr().cast(),
-                sentinel_ipa,
-                sentinel_len as usize,
-                3,
-            )
-        },
-        0,
-        "install authoritative rollback sentinel stage-2 mapping"
+    let sentinel_custody = Arc::new(CarrierVmCustody::new_live_fixture());
+    let sentinel_stage2_mapping = test_stage2_map(
+        &sentinel_custody,
+        sentinel_host.as_ptr().cast(),
+        sentinel_ipa,
+        sentinel_len as usize,
+        3,
     );
     let sentinel_frame =
         carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(91).unwrap());
@@ -11075,11 +11049,15 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
         alias_registry().lock().is_empty(),
         "alias registry must be empty"
     );
-    assert_eq!(
-        unsafe { inventory_stage2_unmap(sentinel_ipa, sentinel_len as usize) },
-        0,
+    let mut sentinel_stage2 = sentinel_custody
+        .stage2
+        .stage2()
+        .expect("live sentinel custody");
+    assert!(
+        unsafe { sentinel_stage2.unmap(sentinel_stage2_mapping) }.is_ok(),
         "remove authoritative rollback sentinel mapping"
     );
+    drop(sentinel_stage2);
     drop(sentinel_host);
 
     // 3. Real directory publication failure rollback with concrete Process state and dynamic alias
@@ -12136,10 +12114,9 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         .retained
         .owner_retired
         .store(true, std::sync::atomic::Ordering::Release);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         &transport.custody,
         &[owner.record_identity()],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire extension backing");

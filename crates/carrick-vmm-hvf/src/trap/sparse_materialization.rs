@@ -1612,7 +1612,6 @@ pub(super) fn publish_replacing(
                                     &context.custody,
                                     popped,
                                     &journal,
-                                    &mut unmap_global_frame_stage2_record,
                                     &mut release_retired_stage2_ipa,
                                 )?;
                                 Ok::<(), TrapError>(())
@@ -1899,7 +1898,29 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         popped: &[u64],
         journal: &std::collections::BTreeMap<u64, std::sync::Arc<StructuralBackingOwner>>,
+        release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        self.retire_rolled_back_arenas_with(custody, popped, journal, None, release_ipa)
+    }
+
+    #[cfg(test)]
+    fn retire_rolled_back_arenas_using(
+        &self,
+        custody: &CarrierVmCustody,
+        popped: &[u64],
+        journal: &std::collections::BTreeMap<u64, std::sync::Arc<StructuralBackingOwner>>,
         unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+        release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        self.retire_rolled_back_arenas_with(custody, popped, journal, Some(unmap), release_ipa)
+    }
+
+    fn retire_rolled_back_arenas_with(
+        &self,
+        custody: &CarrierVmCustody,
+        popped: &[u64],
+        journal: &std::collections::BTreeMap<u64, std::sync::Arc<StructuralBackingOwner>>,
+        mut test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
         release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
     ) -> Result<(), TrapError> {
         for &base in popped {
@@ -1920,7 +1941,22 @@ impl MmAccessState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
-            retry_structural_backing_identities_in_using(custody, &[identity], unmap, release_ipa)?;
+            #[cfg(test)]
+            if let Some(unmap) = test_unmap.as_deref_mut() {
+                retry_structural_backing_identities_in_using(
+                    custody,
+                    &[identity],
+                    unmap,
+                    release_ipa,
+                )?;
+            } else {
+                retry_structural_backing_identities_in(custody, &[identity], release_ipa)?;
+            }
+            #[cfg(not(test))]
+            {
+                let _ = &mut test_unmap;
+                retry_structural_backing_identities_in(custody, &[identity], release_ipa)?;
+            }
             if custody.stage2_record_snapshot(identity.record_id).is_some() {
                 return Err(TrapError::Hypervisor(
                     "rollback arena backing remained nonterminal".to_owned(),
@@ -2061,7 +2097,7 @@ mod arena_pin_tests {
             let journal = std::collections::BTreeMap::from([(base, owner.clone())]);
             let pin = (!fail_backend).then(|| custody.pin_stage2_record(identity).unwrap());
             let calls = std::cell::Cell::new(0);
-            let result = state.retire_rolled_back_arenas(
+            let result = state.retire_rolled_back_arenas_using(
                 &custody,
                 &[base],
                 &journal,
@@ -2082,7 +2118,7 @@ mod arena_pin_tests {
             );
             drop(pin);
             state
-                .retire_rolled_back_arenas(
+                .retire_rolled_back_arenas_using(
                     &custody,
                     &[base],
                     &journal,
@@ -2111,7 +2147,7 @@ mod arena_pin_tests {
             let empty = std::collections::BTreeMap::new();
             assert!(
                 state
-                    .retire_rolled_back_arenas(
+                    .retire_rolled_back_arenas_using(
                         &custody,
                         &[base],
                         if missing_mm { &journal } else { &empty },
@@ -2129,7 +2165,7 @@ mod arena_pin_tests {
         }
         state.install_structural_owner(owner.clone());
         state
-            .retire_rolled_back_arenas(
+            .retire_rolled_back_arenas_using(
                 &custody,
                 &[base],
                 &journal,
@@ -2186,7 +2222,7 @@ mod arena_pin_tests {
         drop(permit);
         let journal = std::collections::BTreeMap::from([(owner.physical_ipa, owner.clone())]);
         state
-            .retire_rolled_back_arenas(
+            .retire_rolled_back_arenas_using(
                 &custody,
                 &[owner.physical_ipa],
                 &journal,
@@ -2319,7 +2355,7 @@ mod arena_pin_tests {
         drop(state.cow_runtime.write().take());
         let journal = std::collections::BTreeMap::from([(owner.physical_ipa, owner.clone())]);
         state
-            .retire_rolled_back_arenas(
+            .retire_rolled_back_arenas_using(
                 &custody,
                 &[owner.physical_ipa],
                 &journal,

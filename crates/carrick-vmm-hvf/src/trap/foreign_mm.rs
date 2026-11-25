@@ -1299,12 +1299,7 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        self.retire_mm_root_stage2_in_using(
-            custody,
-            expected_root_slot,
-            true,
-            &mut unmap_global_frame_stage2_record,
-        )
+        self.retire_mm_root_stage2_in_with(custody, expected_root_slot, true, None)
     }
 
     /// Retire an exec predecessor's physical root while preserving its
@@ -1314,20 +1309,26 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        self.retire_mm_root_stage2_in_using(
-            custody,
-            expected_root_slot,
-            false,
-            &mut unmap_global_frame_stage2_record,
-        )
+        self.retire_mm_root_stage2_in_with(custody, expected_root_slot, false, None)
     }
 
-    fn retire_mm_root_stage2_in_using(
+    #[cfg(test)]
+    pub(crate) fn retire_mm_root_stage2_in_using(
         &self,
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
         terminal: bool,
         unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<RetiredMmRootStage2, TrapError> {
+        self.retire_mm_root_stage2_in_with(custody, expected_root_slot, terminal, Some(unmap))
+    }
+
+    fn retire_mm_root_stage2_in_with(
+        &self,
+        custody: &CarrierVmCustody,
+        expected_root_slot: (u64, u64),
+        terminal: bool,
+        mut test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
     ) -> Result<RetiredMmRootStage2, TrapError> {
         // Keep the authority identity and its descriptor-access guard alive
         // through backend retirement and pool release. A cached owner Arc keeps
@@ -1373,12 +1374,30 @@ impl MmAccessState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
-            retry_structural_backing_identities_in_using(
-                custody,
-                &[authority.record_identity],
-                unmap,
-                &mut release_retired_stage2_ipa,
-            )?;
+            #[cfg(test)]
+            if let Some(unmap) = test_unmap.as_deref_mut() {
+                retry_structural_backing_identities_in_using(
+                    custody,
+                    &[authority.record_identity],
+                    unmap,
+                    &mut release_retired_stage2_ipa,
+                )?;
+            } else {
+                retry_structural_backing_identities_in(
+                    custody,
+                    &[authority.record_identity],
+                    &mut release_retired_stage2_ipa,
+                )?;
+            }
+            #[cfg(not(test))]
+            {
+                let _ = &mut test_unmap;
+                retry_structural_backing_identities_in(
+                    custody,
+                    &[authority.record_identity],
+                    &mut release_retired_stage2_ipa,
+                )?;
+            }
             if let Some(snapshot) =
                 custody.stage2_record_snapshot(authority.record_identity.record_id)
             {

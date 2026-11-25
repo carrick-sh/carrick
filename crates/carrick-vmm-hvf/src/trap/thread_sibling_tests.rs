@@ -61,10 +61,9 @@ fn shared_mm_task_projection_preserves_structural_owner() {
 
     drop(projected);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retry_structural_backing_identities_in(
         legacy_test_carrier_vm_custody(),
         &[identity],
-        &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire shared-MM projection fixture");
