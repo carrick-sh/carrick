@@ -272,3 +272,127 @@ fn forked_shared_file_window_leaf_is_never_an_inventoried_frame() {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
     });
 }
+
+#[test]
+fn window_slot_budget_bounds_windows_preserves_headroom_and_rolls_back() {
+    use carrick_core::mm::window::WINDOW_CHUNK_BYTES;
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let path = std::env::temp_dir().join(format!(
+        "carrick-window-budget-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file.set_len(PAGE).unwrap();
+    file.write_all(b"budget").unwrap();
+
+    let mut memory =
+        CarrierMemory::new(test_support::MemoryTestIo::new(TestMemoryIo::default())).unwrap();
+    let mut ram = GuestRam::new();
+    ram.add_window(0x1000, PAGE as usize, crate::guest_ram::WindowKind::Private)
+        .unwrap();
+    memory.install_bootstrap(Arc::new(ram)).unwrap();
+
+    // TestMemoryIo has limit 512 -> headroom 128 -> 383 available after 1 bootstrap slot.
+    assert_eq!(memory.available_window_slots(), 383);
+    assert!(memory.admit_window_slots(384).is_none());
+
+    let serial = NonZeroU64::new(9).unwrap();
+    let id = BackingIdentity {
+        frame_id: serial,
+        mapping_id: serial,
+        owner_generation: serial,
+        inventory_revision: serial,
+    };
+    let window_backing = |gpa| PreparedBacking {
+        extent: Arc::new(
+            BackingExtent::host_file_window(
+                FrameGpa::new(gpa),
+                file.as_fd(),
+                0,
+                WINDOW_CHUNK_BYTES as usize,
+            )
+            .unwrap(),
+        ),
+        identity: id,
+    };
+    let private_backing = |gpa| PreparedBacking {
+        extent: Arc::new(BackingExtent::private(FrameGpa::new(gpa), PAGE as usize).unwrap()),
+        identity: id,
+    };
+
+    // Stale budget across a private install is refused.
+    let stale_budget = memory.admit_window_slots(1).unwrap();
+    memory.install(&[private_backing(0x2000)]).unwrap();
+    assert_eq!(memory.available_window_slots(), 382);
+    assert!(
+        memory
+            .install_window_slots(stale_budget, &[window_backing(0x1000_0000)])
+            .is_err()
+    );
+
+    // Mismatched count and non-window extent are refused without consuming slots.
+    let bad_len = memory.admit_window_slots(1).unwrap();
+    assert!(memory.install_window_slots(bad_len, &[]).is_err());
+    let non_window = memory.admit_window_slots(1).unwrap();
+    assert!(
+        memory
+            .install_window_slots(non_window, &[private_backing(0x3000)])
+            .is_err()
+    );
+    assert_eq!(memory.window_slots(), 0);
+
+    // Mid-batch set_region failure rolls back window_slots cleanly.
+    let fail_budget = memory.admit_window_slots(2).unwrap();
+    memory.vm().fail_region_call(1);
+    assert!(
+        memory
+            .install_window_slots(
+                fail_budget,
+                &[window_backing(0x1000_0000), window_backing(0x1020_0000)],
+            )
+            .is_err()
+    );
+    memory.vm().clear_region_failure();
+    assert_eq!(memory.window_slots(), 0);
+    assert_eq!(memory.available_window_slots(), 382);
+
+    // Filling the remaining window budget leaves the 128-slot non-window headroom intact.
+    let mut backings = Vec::with_capacity(382);
+    for idx in 0..382u64 {
+        backings.push(window_backing(0x2000_0000 + idx * WINDOW_CHUNK_BYTES));
+    }
+    let full_budget = memory.admit_window_slots(382).unwrap();
+    memory.install_window_slots(full_budget, &backings).unwrap();
+    assert_eq!(memory.window_slots(), 382);
+    assert_eq!(memory.available_window_slots(), 0);
+    assert!(memory.admit_window_slots(1).is_none());
+    memory.install(&[private_backing(0x4000)]).unwrap();
+
+    // Large KVM-like slot limits stay bounded by MAX_WINDOW_SLOTS.
+    struct LargeSlotIo;
+    impl CarrierMemoryIo for LargeSlotIo {
+        fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError> {
+            Ok(32764)
+        }
+        unsafe fn set_user_memory_region(
+            &self,
+            _: CarrierMemoryRegion,
+        ) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+        fn signal_msi(&self, _: u32, _: u32) -> Result<(), carrick_hal::OsError> {
+            Ok(())
+        }
+    }
+    let large = CarrierMemory::new(LargeSlotIo).unwrap();
+    assert_eq!(large.available_window_slots(), MAX_WINDOW_SLOTS);
+}

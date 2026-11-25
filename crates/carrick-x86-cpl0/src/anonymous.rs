@@ -24,6 +24,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
 pub(super) struct X86AnonymousVenue<'a> {
+    native: carrick_guest_arch::NativeOrdinal,
     frame: AnonymousCall,
     task: &'a CurrentTask,
     source: BornInZoneSource<'static, ParkedContextWords>,
@@ -44,6 +45,7 @@ impl<'a> X86AnonymousVenue<'a> {
     ) -> Option<Self> {
         let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
         Some(Self {
+            native: call.native,
             frame,
             task,
             source,
@@ -262,7 +264,16 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
         let file = match self.source(zone) {
             Ok(file) => file,
-            Err(result) => return DelegatedStep::Served(result),
+            Err(result) => {
+                if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval() {
+                    counters.record_refusal(
+                        self.native,
+                        self.origin,
+                        carrick_el1_abi::RefusalVenue::Ring,
+                    );
+                }
+                return DelegatedStep::Served(result);
+            }
         };
         match carrick_el1::memory::serve_delegated_mapping(
             &mut self.frame,
@@ -303,6 +314,11 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 DelegatedStep::Contended(cause)
             }
             carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
+                counters.record_refusal(
+                    self.native,
+                    self.origin,
+                    carrick_el1_abi::RefusalVenue::Ring,
+                );
                 DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
             }
             carrick_el1::memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,

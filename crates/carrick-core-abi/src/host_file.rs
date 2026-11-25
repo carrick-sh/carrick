@@ -1084,6 +1084,17 @@ pub fn waits_timed(bytes: &[u8]) -> bool {
     record_parts(bytes, REPLY_PENDING).is_some() && read_u64(bytes, RESULT) == Some(WAIT_TIMED)
 }
 
+/// Overwrite an already-written host-file reply with an errno refusal and zero
+/// output length before exposing the record back to the guest.
+pub fn refuse_written_reply(bytes: &mut [u8], result: i64) -> Result<(), HostFileRecordError> {
+    if result >= 0 || record_parts(bytes, REPLY_WRITTEN).is_none() {
+        return Err(HostFileRecordError::Invalid);
+    }
+    bytes[RESULT..RESULT + 8].copy_from_slice(&result.to_le_bytes());
+    bytes[OUTPUT_LEN..OUTPUT_LEN + 4].copy_from_slice(&0u32.to_le_bytes());
+    Ok(())
+}
+
 /// The reply the ring reads back after acknowledgment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostFileReply<'a> {
@@ -1576,5 +1587,40 @@ mod tests {
         let view = HostFileRequestView::parse(&mut bytes).unwrap();
         assert_eq!(view.reply(-9, b"1"), Err(HostFileRecordError::Invalid));
         assert!(record_len(HOST_FILE_AREA_BYTES + 1, 0).is_none());
+    }
+
+    #[test]
+    fn refuse_written_reply_rewrites_reply_to_errno_and_rejects_pending_or_non_negative() {
+        let mut bytes = vec![0u8; record_len(0, MapSourceReply::BYTES).unwrap()];
+        encode(
+            &mut bytes,
+            header(HostFileOp::MapShared),
+            &[],
+            MapSourceReply::BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            refuse_written_reply(&mut bytes, -38),
+            Err(HostFileRecordError::Invalid),
+            "pending record must be rejected"
+        );
+        let output = MapSourceReply {
+            handle: core::num::NonZeroU64::new(3).unwrap(),
+            generation: core::num::NonZeroU64::MIN,
+        }
+        .encode();
+        HostFileRequestView::parse(&mut bytes)
+            .unwrap()
+            .reply(0, &output)
+            .unwrap();
+        assert_eq!(
+            refuse_written_reply(&mut bytes, 0),
+            Err(HostFileRecordError::Invalid),
+            "non-negative result is not a refusal"
+        );
+        refuse_written_reply(&mut bytes, -38).unwrap();
+        let written = reply(&bytes).unwrap();
+        assert_eq!(written.result, -38);
+        assert!(written.output.is_empty());
     }
 }

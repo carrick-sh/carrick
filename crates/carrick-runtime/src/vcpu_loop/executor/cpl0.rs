@@ -1146,7 +1146,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     }
                 };
                 self.physical.with_retained_forward(task, &token, |venue| {
-                    venue.complete_host_file(address, &record, source)
+                    venue.complete_host_file(address, &mut record, source, |fd| {
+                        dispatcher.admit_window_inode(fd)
+                    })
                 })?;
                 ForwardDecision::Immediate(InitialSyscallDisposition::Return(0))
             }

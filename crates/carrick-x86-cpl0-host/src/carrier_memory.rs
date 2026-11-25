@@ -589,6 +589,27 @@ impl InventoryRetirement for AlreadyRetiredInventory {
     }
 }
 
+/// Maximum shared host-file window slots per carrier run (`2048 * 2 MiB = 4 GiB`),
+/// bounding both KVM memslots and host `mmap` VMA count well below OS limits.
+pub const MAX_WINDOW_SLOTS: usize = 2048;
+const WINDOW_SLOT_NON_WINDOW_HEADROOM: usize = 512;
+
+/// Typed admission token reserving carrier window slots at `mmap(MAP_SHARED)` time
+/// so first touch never discovers memslot exhaustion (#1338, #2975).
+#[derive(Debug)]
+#[must_use = "WindowSlotBudget must be consumed by CarrierMemory::install_window_slots"]
+pub struct WindowSlotBudget {
+    identity: CarrierVmId,
+    generation: u64,
+    slots: usize,
+}
+
+impl WindowSlotBudget {
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+}
+
 /// Drops VM before all registered backing. It exclusively owns its slot
 /// namespace; legacy HvVm::map_memory is never called on this VM.
 pub struct CarrierMemory<M: CarrierMemoryIo> {
@@ -597,6 +618,7 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
     slots: BTreeMap<u32, Slot>,
     by_gpa: BTreeMap<u64, u32>,
     free: BTreeSet<u32>,
+    window_slots: usize,
     aliases: BTreeMap<NonZeroU64, BTreeMap<u64, Alias>>,
     alias_visits: usize,
     roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
@@ -660,6 +682,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             slots: BTreeMap::new(),
             by_gpa: BTreeMap::new(),
             free: (0..limit).collect(),
+            window_slots: 0,
             aliases: BTreeMap::new(),
             alias_visits: 0,
             roots: BTreeMap::new(),
@@ -676,6 +699,59 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
 
     pub fn quarantine(&mut self) {
         self.quarantined = true;
+    }
+
+    fn window_headroom(limit: u32) -> usize {
+        (limit as usize / 4).clamp(1, WINDOW_SLOT_NON_WINDOW_HEADROOM)
+    }
+
+    pub fn window_slots(&self) -> usize {
+        self.window_slots
+    }
+
+    pub fn available_window_slots(&self) -> usize {
+        if self.quarantined {
+            return 0;
+        }
+        let free_cap = self
+            .free
+            .len()
+            .saturating_sub(Self::window_headroom(self.limit));
+        let window_cap = MAX_WINDOW_SLOTS.saturating_sub(self.window_slots);
+        free_cap.min(window_cap)
+    }
+
+    pub fn admit_window_slots(&self, count: usize) -> Option<WindowSlotBudget> {
+        if count > self.available_window_slots()
+            || self.generation.checked_add(count as u64).is_none()
+        {
+            return None;
+        }
+        Some(WindowSlotBudget {
+            identity: self.identity,
+            generation: self.generation,
+            slots: count,
+        })
+    }
+
+    pub fn install_window_slots(
+        &mut self,
+        budget: WindowSlotBudget,
+        backings: &[PreparedBacking],
+    ) -> Result<Vec<BackingHandle>, MemoryError> {
+        if budget.identity != self.identity || budget.generation != self.generation {
+            return Err(error("stale window slot budget"));
+        }
+        if backings.len() != budget.slots {
+            return Err(error("window slot budget length mismatch"));
+        }
+        if !backings.iter().all(|b| b.extent.is_host_file_window()) {
+            return Err(error("non-window backing in window slot budget"));
+        }
+        if backings.len() > self.available_window_slots() {
+            return Err(error("window slot budget exceeded"));
+        }
+        self.install_inner(backings)
     }
 
     pub fn is_quarantined(&self) -> bool {
@@ -747,22 +823,43 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         &mut self,
         backings: &[PreparedBacking],
     ) -> Result<Vec<BackingHandle>, MemoryError> {
+        self.install_inner(backings)
+    }
+
+    fn check_no_overlap(&self, backings: &[PreparedBacking]) -> Result<(), MemoryError> {
+        let mut batch = Vec::with_capacity(backings.len());
+        for b in backings {
+            let start = b.extent.base.raw();
+            let end = start
+                .checked_add(b.extent.len as u64)
+                .ok_or_else(|| error("carrier GPA extent overflow"))?;
+            if let Some((_, &slot_id)) = self.by_gpa.range(..=start).next_back()
+                && let Some(existing) = self.slots.get(&slot_id)
+                && existing.backing.extent.base.raw() + existing.backing.extent.len as u64 > start
+            {
+                return Err(error("overlapping carrier GPA extent"));
+            }
+            if self.by_gpa.range(start..end).next().is_some() {
+                return Err(error("overlapping carrier GPA extent"));
+            }
+            batch.push((start, end));
+        }
+        batch.sort_unstable();
+        if batch.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(error("overlapping carrier GPA extent"));
+        }
+        Ok(())
+    }
+
+    fn install_inner(
+        &mut self,
+        backings: &[PreparedBacking],
+    ) -> Result<Vec<BackingHandle>, MemoryError> {
         self.admit()?;
         if self.slots.len() + backings.len() > self.limit as usize {
             return Err(error("carrier memslot capacity"));
         }
-        for (i, b) in backings.iter().enumerate() {
-            let start = b.extent.base.raw();
-            let end = start + b.extent.len as u64;
-            if self.slots.values().any(|s| {
-                start < s.backing.extent.base.raw() + s.backing.extent.len as u64
-                    && s.backing.extent.base.raw() < end
-            }) || backings[..i].iter().any(|s| {
-                start < s.extent.base.raw() + s.extent.len as u64 && s.extent.base.raw() < end
-            }) {
-                return Err(error("overlapping carrier GPA extent"));
-            }
-        }
+        self.check_no_overlap(backings)?;
         self.generation
             .checked_add(backings.len() as u64)
             .ok_or_else(|| error("carrier slot generation exhausted"))?;
@@ -787,6 +884,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 slot,
                 generation: CarrierSlotGeneration(generation),
             };
+            if b.extent.is_host_file_window() {
+                self.window_slots += 1;
+            }
             self.slots.insert(
                 slot,
                 Slot {
@@ -806,6 +906,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }
         Ok(installed)
     }
+
     fn rollback_slots(&mut self, handles: &[BackingHandle]) -> Result<(), MemoryError> {
         for handle in handles.iter().rev() {
             if let Err(reason) = self.set_region(handle.slot, None) {
@@ -814,6 +915,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             }
             if let Some(slot) = self.slots.remove(&handle.slot) {
                 self.by_gpa.remove(&slot.backing.extent.base.raw());
+                if slot.backing.extent.is_host_file_window() {
+                    self.window_slots -= 1;
+                }
             }
             self.free.insert(handle.slot);
         }
@@ -1884,6 +1988,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }
         if let Some(slot) = self.slots.remove(&handle.slot) {
             self.by_gpa.remove(&slot.backing.extent.base.raw());
+            if slot.backing.extent.is_host_file_window() {
+                self.window_slots -= 1;
+            }
             for mm in &slot.allowed {
                 if let Some(slots) = self.admitted.get_mut(mm) {
                     slots.remove(&handle.slot);
