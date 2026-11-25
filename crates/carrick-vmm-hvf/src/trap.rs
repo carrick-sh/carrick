@@ -4770,6 +4770,9 @@ pub(crate) enum HotPathScan {
     /// Linear passes over the carrier-global alias registry, replay set and
     /// alias version chains.
     AliasState,
+    /// Scope-bucket probes performed while checking replay membership or
+    /// diffing replay buckets across scopes.
+    AliasReplayScopes,
     /// Passes over one forking process's source mappings.
     ForkMappings,
     /// Rows one task's [`TaskMappingIndex`] offered to a lookup. The ordered
@@ -4791,7 +4794,9 @@ pub(crate) enum HotPathScan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
-    static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Tuple stores `(alias_state_rows_scanned, alias_replay_scopes_probed)` so
+    // scope-probe accounting shares the existing thread-local slot.
+    static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     static FORK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TASK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FRAME_EXTENTS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4829,13 +4834,26 @@ fn note_alias_state_rows_scanned(rows: usize) {
 /// Account one pass over a hot-path container. See [`HotPathScan`].
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn note_hot_path_rows(scan: HotPathScan, rows: usize) {
-    let counter = match scan {
-        HotPathScan::AliasState => &ALIAS_STATE_ROWS_SCANNED,
-        HotPathScan::ForkMappings => &FORK_MAPPING_ROWS_SCANNED,
-        HotPathScan::TaskMappings => &TASK_MAPPING_ROWS_SCANNED,
-        HotPathScan::FrameExtents => &FRAME_EXTENTS_SCANNED,
-    };
-    counter.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
+    let add = rows as u64;
+    match scan {
+        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(|cell| {
+            let (scanned, scopes) = cell.get();
+            cell.set((scanned.saturating_add(add), scopes));
+        }),
+        HotPathScan::AliasReplayScopes => ALIAS_STATE_ROWS_SCANNED.with(|cell| {
+            let (scanned, scopes) = cell.get();
+            cell.set((scanned, scopes.saturating_add(add)));
+        }),
+        HotPathScan::ForkMappings => {
+            FORK_MAPPING_ROWS_SCANNED.with(|cell| cell.set(cell.get().saturating_add(add)));
+        }
+        HotPathScan::TaskMappings => {
+            TASK_MAPPING_ROWS_SCANNED.with(|cell| cell.set(cell.get().saturating_add(add)));
+        }
+        HotPathScan::FrameExtents => {
+            FRAME_EXTENTS_SCANNED.with(|cell| cell.set(cell.get().saturating_add(add)));
+        }
+    }
 }
 
 /// Account one row a [`TaskMappingIndex`] ordered query offered its consumer.
@@ -4850,7 +4868,8 @@ pub(crate) fn note_task_mapping_row_visited() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn hot_path_rows_scanned_live(scan: HotPathScan) -> u64 {
     match scan {
-        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(|cell| cell.get().0),
+        HotPathScan::AliasReplayScopes => ALIAS_STATE_ROWS_SCANNED.with(|cell| cell.get().1),
         HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
         HotPathScan::TaskMappings => TASK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
         HotPathScan::FrameExtents => FRAME_EXTENTS_SCANNED.with(std::cell::Cell::get),
@@ -4873,6 +4892,11 @@ pub(crate) fn hot_path_rows_scanned(scan: HotPathScan) -> u64 {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn alias_state_rows_scanned() -> u64 {
     hot_path_rows_scanned(HotPathScan::AliasState)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_replay_scopes_probed() -> u64 {
+    hot_path_rows_scanned(HotPathScan::AliasReplayScopes)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5116,7 +5140,7 @@ pub(crate) fn retire_process_aliases_in(
                             "external replay mutation epoch exhausted"
                         );
                     });
-                let base = replay_rows_for_ipa(&global_bucket.replay, physical_ipa);
+                let base = replay_rows_for_ipa(global_bucket.replay(), physical_ipa);
                 for id in
                     reset_replay_chain(&mut global_bucket.versions.replays, physical_ipa, base)
                 {
@@ -5203,8 +5227,9 @@ fn mutate_external_alias_state_in<R>(
         .copied()
         .collect();
     for scope in all_scopes {
-        let before_replay = registry_before.by_scope.get(&scope).map(|b| &b.replay);
-        let after_replay = registry.by_scope.get(&scope).map(|b| &b.replay);
+        note_hot_path_rows(HotPathScan::AliasReplayScopes, 1);
+        let before_replay = registry_before.by_scope.get(&scope).map(|b| b.replay());
+        let after_replay = registry.by_scope.get(&scope).map(|b| b.replay());
         let empty_set = std::collections::BTreeSet::new();
         let before_set = before_replay.unwrap_or(&empty_set);
         let after_set = after_replay.unwrap_or(&empty_set);
@@ -5222,9 +5247,14 @@ fn mutate_external_alias_state_in<R>(
         }
     }
     for (scope, physical_ipas) in affected_physical_ipas_by_scope {
-        let bucket = registry.by_scope.entry(scope).or_default();
         for physical_ipa in physical_ipas {
-            let after_rows = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            let after_rows = registry
+                .by_scope
+                .get(&scope)
+                .map_or_else(Vec::new, |bucket| {
+                    replay_rows_for_ipa(bucket.replay(), physical_ipa)
+                });
+            let bucket = registry.by_scope.entry(scope).or_default();
             bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
                 || {
                     carrick_fatal!(
@@ -5277,7 +5307,8 @@ fn mutate_known_external_alias_state_in<R>(
         std::collections::BTreeMap::<(AliasOwnershipScope, u64), Vec<ReplayMappingKey>>::new();
     for &ipa in &replay_ipas {
         for (&scope, bucket) in &registry.by_scope {
-            let rows = replay_rows_for_ipa(&bucket.replay, ipa);
+            note_hot_path_rows(HotPathScan::AliasReplayScopes, 1);
+            let rows = replay_rows_for_ipa(bucket.replay(), ipa);
             if !rows.is_empty() {
                 replay_before.insert((scope, ipa), rows);
             }
@@ -5303,7 +5334,7 @@ fn mutate_known_external_alias_state_in<R>(
     }
     for &physical_ipa in &replay_ipas {
         for (&scope, bucket) in registry.by_scope.iter_mut() {
-            let after = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            let after = replay_rows_for_ipa(bucket.replay(), physical_ipa);
             let before = replay_before.get(&(scope, physical_ipa));
             if before.is_none() && after.is_empty() {
                 continue;
@@ -5344,7 +5375,7 @@ pub(crate) fn record_external_replay_insertion_in_bucket(
     bucket: &mut AliasScopeBucket,
     physical_ipa: u64,
 ) -> bool {
-    let after = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+    let after = replay_rows_for_ipa(bucket.replay(), physical_ipa);
     record_external_replay_insertion_in_bucket_with_rows(bucket, physical_ipa, after)
 }
 
@@ -5439,7 +5470,7 @@ impl AliasPublicationReceipt {
             let replay_base = registry
                 .by_scope
                 .get(&scope)
-                .map(|b| replay_rows_for_ipa(&b.replay, alias.physical_ipa))
+                .map(|b| replay_rows_for_ipa(b.replay(), alias.physical_ipa))
                 .unwrap_or_default();
             let _ = registry.upsert_by_key(*alias);
             let bucket = registry.by_scope.entry(scope).or_default();
@@ -5483,12 +5514,14 @@ impl AliasPublicationReceipt {
                 .versions
                 .replay_version_owner
                 .insert(id, alias.physical_ipa);
-            for row in replay_rows_for_ipa(&bucket.replay, alias.physical_ipa) {
-                if row != replay_key {
-                    bucket.replay.remove(&row);
-                }
+            let stale: Vec<_> = replay_rows_for_ipa(bucket.replay(), alias.physical_ipa)
+                .into_iter()
+                .filter(|row| *row != replay_key)
+                .collect();
+            for row in stale {
+                registry.remove_replay_in_scope(scope, &row);
             }
-            bucket.replay.insert(replay_key);
+            registry.insert_replay_in_scope(scope, replay_key);
             receipt.versions.push((scope, id));
         }
         Ok(receipt)
@@ -5613,17 +5646,11 @@ impl AliasPublicationReceipt {
                 let previous = chain.versions.last().map(|version| version.value);
                 let empty = chain.versions.is_empty();
                 let current_epoch = bucket.versions.replay_epochs.get(&physical_ipa).copied();
-                let current = replay_rows_for_ipa(&bucket.replay, physical_ipa);
-                if was_top && current_epoch == Some(removed.epoch) && current == vec![removed.value]
-                {
-                    for row in current {
-                        bucket.replay.remove(&row);
-                    }
-                    if let Some(previous) = previous {
-                        bucket.replay.insert(previous);
-                    } else {
-                        bucket.replay.extend(base);
-                    }
+                let current = replay_rows_for_ipa(bucket.replay(), physical_ipa);
+                let updated_replay = was_top
+                    && current_epoch == Some(removed.epoch)
+                    && current == vec![removed.value];
+                if updated_replay {
                     bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa)
                         .unwrap_or_else(|| {
                             carrick_fatal!(
@@ -5634,6 +5661,18 @@ impl AliasPublicationReceipt {
                 }
                 if empty {
                     bucket.versions.replays.remove(&physical_ipa);
+                }
+                if updated_replay {
+                    for row in current {
+                        registry.remove_replay_in_scope(scope, &row);
+                    }
+                    if let Some(previous) = previous {
+                        registry.insert_replay_in_scope(scope, previous);
+                    } else {
+                        for row in base {
+                            registry.insert_replay_in_scope(scope, row);
+                        }
+                    }
                 }
             }
         }

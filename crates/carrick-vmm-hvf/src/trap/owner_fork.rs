@@ -667,7 +667,12 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
             if !committed {
                 // Physical retirement is exact and precedes logical slot return.
                 let identity = *owner.retained.record_identity.lock();
-                retire_carrier_stage2_record_at_safe_point(&self.physical.custody, identity)?;
+                if identity.record_id.0 != 0 {
+                    retire_structural_stage2_record_at_safe_point(
+                        &self.physical.custody,
+                        identity,
+                    )?;
+                }
             }
             self.state
                 .structural_owners
@@ -684,16 +689,17 @@ impl Drop for OwnerPhysicalForkBuilder {
             return;
         }
         for owner in &self.published {
-            retire_carrier_stage2_record_at_safe_point(
-                &self.physical.custody,
-                owner.record_identity(),
-            )
-            .unwrap_or_else(|error| {
-                carrick_fatal::carrick_fatal!(
-                    "hvpatch::stage2_lifecycle",
-                    "unpublished owner Fork capacity retirement failed: {error}"
-                );
-            });
+            let identity = owner.record_identity();
+            if identity.record_id.0 == 0 {
+                continue;
+            }
+            retire_structural_stage2_record_at_safe_point(&self.physical.custody, identity)
+                .unwrap_or_else(|error| {
+                    carrick_fatal::carrick_fatal!(
+                        "hvpatch::stage2_lifecycle",
+                        "unpublished owner Fork capacity retirement failed: {error}"
+                    );
+                });
             self.state
                 .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
         }

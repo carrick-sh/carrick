@@ -43,11 +43,7 @@ mod alias_remap_limiter_tests {
         // Orphan replay marker without live alias row must be ignored/refused.
         alias_registry()
             .lock()
-            .by_scope
-            .entry(backing.ownership_scope)
-            .or_default()
-            .replay
-            .insert(key);
+            .insert_replay_in_scope(backing.ownership_scope, key);
         let orphan_result = unsafe {
             stage2_map_replay(
                 &custody,
@@ -3112,7 +3108,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
     .expect("target alias backing");
     let target_ipa = 0x7e00_1000_u64;
     let target_va = 0x6000_1000_u64;
-    let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+    let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(10_000_000));
     let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
     let target_alias = AliasBacking {
         start: target_va,
@@ -3132,6 +3128,31 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
         owner_generation: 0,
     };
 
+    let cold_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        target_len,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .expect("allocate cold alias backing");
+    let cold_ipa = 0x7100_0000_u64;
+    let cold_scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(10_000_001));
+    let cold_alias = AliasBacking {
+        start: 0x5100_0000,
+        ipa: cold_ipa,
+        host_addr: cold_backing.as_ptr() as usize,
+        size: target_len,
+        physical_ipa: cold_ipa,
+        physical_host_addr: cold_backing.as_ptr() as usize,
+        physical_size: target_len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: cold_scope,
+        inventory_backing: InventoryBackingIdentity::Private(7002),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+
     for population in [16_u64, 256, 2000] {
         let _stub = ScopedStage2MapTestStub::enable();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
@@ -3140,10 +3161,10 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
 
         mutate_external_alias_state(|registry| {
             *registry = AliasRegistry::default();
-            registry.push(target_alias);
             for i in 1..=population {
                 let va = 0x1000_0000 + i * 0x8000;
                 let ipa = 0x8000_0000 + i * 0x8000;
+                // Distinct scope per unrelated alias so any by_scope walk scales linearly.
                 registry.push(AliasBacking {
                     start: va,
                     ipa,
@@ -3155,16 +3176,52 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
                     perms,
                     guest_writable: true,
                     sharing: GuestMappingSharing::GlobalShared,
-                    ownership_scope: scope,
+                    ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
+                        1000 + i,
+                    )),
                     inventory_backing: InventoryBackingIdentity::Private(8000 + i),
                     shared_key_base: None,
                     shared_key_offset: 0,
                     owner_generation: 0,
                 });
             }
+            registry.push(target_alias);
+            registry.push(cold_alias);
+            // Exhaust cold_alias replay epoch and clear its cache membership so
+            // `contains_replay` returns false (cold lookup) before epoch check.
+            registry.remove_replay_in_scope(cold_scope, &replay_mapping_key(cold_alias));
+            registry
+                .by_scope
+                .entry(cold_scope)
+                .or_default()
+                .versions
+                .replay_epochs
+                .insert(cold_ipa, u64::MAX);
+            assert_eq!(registry.recomputed_replay_counts(), registry.replay_counts);
         });
 
-        // Warm initial target replay entry into replay cache (exactly one map).
+        let before_cold_rows = alias_state_rows_scanned();
+        let before_cold_scopes = alias_replay_scopes_probed();
+        // 1. Cold registered lookup with empty replay cache (contains_replay == false).
+        let cold_exhausted = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: cold_ipa },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(
+            cold_exhausted,
+            Ok(Some((
+                cold_alias,
+                carrick_aarch64::stage2::Stage2Status::from_raw(0xfae9_4003)
+            )))
+        );
+        assert_eq!(alias_state_rows_scanned() - before_cold_rows, 0);
+        assert_eq!(alias_replay_scopes_probed() - before_cold_scopes, 0);
+
+        // 2. Warm target replay entry into replay cache (placed in LAST scope).
         let mapped = unsafe {
             stage2_map_replay(
                 &custody,
@@ -3181,8 +3238,9 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
             )))
         );
 
-        // Miss, limiter refusal, and cache hit must NOT clone or scan the registry.
-        let before = alias_state_rows_scanned();
+        // 3. Miss, limiter refusal, and warm cache hit in last scope must NOT clone rows OR probe scopes.
+        let before_rows = alias_state_rows_scanned();
+        let before_scopes = alias_replay_scopes_probed();
         let miss = unsafe {
             stage2_map_replay(
                 &custody,
@@ -3218,12 +3276,18 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
                 carrick_aarch64::stage2::Stage2Status::SUCCESS
             )))
         );
-        let scanned = alias_state_rows_scanned() - before;
+        let scanned = alias_state_rows_scanned() - before_rows;
+        let scopes_probed = alias_replay_scopes_probed() - before_scopes;
         assert_eq!(
             scanned, 0,
             "stage2_map_replay miss/limit/hit scanned {scanned} rows at population {population}"
         );
+        assert_eq!(
+            scopes_probed, 0,
+            "stage2_map_replay probed {scopes_probed} unrelated scopes at population {population}"
+        );
     }
+    drop(cold_backing);
     mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
     drop(target_backing);
 }

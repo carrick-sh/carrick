@@ -986,11 +986,7 @@ fn install_prepared_exec_backing(
                 && let Some(replay_key) = extent.replay_key()
             {
                 mutate_external_alias_state(|registry| {
-                    let bucket = registry
-                        .by_scope
-                        .entry(AliasOwnershipScope::Global)
-                        .or_default();
-                    bucket.replay.insert(replay_key);
+                    registry.insert_replay_in_scope(AliasOwnershipScope::Global, replay_key);
                 });
             }
             crate::probes::hvpatch_exec_stage2(

@@ -1821,7 +1821,7 @@ fn exit_cost_is_bounded_by_own_rows() {
     };
     let other_bucket = registry.by_scope.get(&other_scope).unwrap();
     assert_eq!(other_bucket.rows.len(), 64);
-    assert_eq!(other_bucket.replay.len(), 64);
+    assert_eq!(other_bucket.replay().len(), 64);
     assert_eq!(other_bucket.versions.aliases.len(), 64);
 }
 

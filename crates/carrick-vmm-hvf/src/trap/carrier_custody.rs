@@ -373,6 +373,35 @@ pub(crate) type NativeExecOwner =
 /// the exact generation; a successful destroy must be committed before a later
 /// generation can begin creation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
+pub(crate) enum CarrierLeaseKeeperState {
+    Replayable(super::global_frame::LeaseBackingKeeper),
+    Abandoned {
+        vm_generation: CarrierVmGeneration,
+        release_ipa: Option<(u64, u64)>,
+        keeper: super::global_frame::LeaseBackingKeeper,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierLeaseKeeperState {
+    pub(crate) fn into_keeper(self) -> super::global_frame::LeaseBackingKeeper {
+        match self {
+            Self::Replayable(keeper) | Self::Abandoned { keeper, .. } => keeper,
+        }
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        matches!(self, Self::Abandoned { .. })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) enum TerminalReleaseClaim {
+    AlreadyTerminal(Option<super::global_frame::LeaseBackingKeeper>),
+    NeedsRelease { ipa: u64, length: u64 },
+}
+
 pub(crate) struct RetainedIpcWindowBacking(
     #[allow(dead_code)] std::sync::Arc<dyn super::stage2_backend::IpcWindowBacking>,
 );
@@ -435,7 +464,7 @@ pub struct CarrierVmCustody {
     pub(crate) carrier_stage2_records:
         parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
     pub(crate) carrier_lease_keepers: parking_lot::Mutex<
-        std::collections::BTreeMap<CarrierStage2RecordId, super::global_frame::LeaseBackingKeeper>,
+        std::collections::BTreeMap<CarrierStage2RecordId, CarrierLeaseKeeperState>,
     >,
     pub(crate) global_frame_host_owners: GlobalFrameHostOwnerDirectory,
     pub(crate) pending_global_frame_owners: parking_lot::Mutex<
@@ -953,12 +982,103 @@ impl CarrierVmCustody {
 
     /// A failed setup's raw destroy left the generation `Gone`, its records
     /// already terminal; a successor may now be created.
+    fn drain_abandoned_carrier_lease_keepers_locked(
+        &self,
+        state: &mut Stage2CustodyState<CarrierStage2Records>,
+        generation: CarrierVmGeneration,
+    ) -> (
+        Vec<super::global_frame::LeaseBackingKeeper>,
+        Vec<(u64, u64)>,
+    ) {
+        let mut keepers = self.carrier_lease_keepers.lock();
+        let doomed: Vec<_> = keepers
+            .iter()
+            .filter_map(|(&record_id, entry)| match entry {
+                CarrierLeaseKeeperState::Abandoned {
+                    vm_generation,
+                    release_ipa,
+                    ..
+                } if vm_generation.0 <= generation.0 => {
+                    let record = state.stage2_records.get(&record_id);
+                    let pinned = record.is_some_and(|r| r.snapshot.pin_count != 0);
+                    if pinned {
+                        None
+                    } else {
+                        let extent = record
+                            .and_then(|r| {
+                                r.snapshot
+                                    .release_ipa
+                                    .then_some((r.snapshot.ipa, r.snapshot.len as u64))
+                            })
+                            .or(*release_ipa);
+                        Some((record_id, extent))
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        let mut drained_keepers = Vec::with_capacity(doomed.len());
+        let mut drained_ipas = Vec::new();
+        for (record_id, extent) in doomed {
+            let _ = state.remove_record(record_id);
+            if let Some(entry) = keepers.remove(&record_id) {
+                drained_keepers.push(entry.into_keeper());
+            }
+            if let Some(extent) = extent {
+                drained_ipas.push(extent);
+            }
+        }
+        (drained_keepers, drained_ipas)
+    }
+
+    pub(crate) fn abandon_carrier_stage2_record(&self, identity: CarrierStage2RecordIdentity) {
+        let mut records = self.carrier_stage2_records.lock();
+        let mut state = self.stage2.lock();
+        let release_ipa = if let Some(record) = state.stage2_records.get_mut(&identity.record_id) {
+            if Self::stage2_identity_mismatch(record, identity).is_none() {
+                let key = (record.snapshot.ipa, record.snapshot.len as u64);
+                if records.get(&key) == Some(&identity) {
+                    records.remove(&key);
+                }
+                let _ = carrick_core::mm::retirement::request_record_retirement(record, identity);
+                record
+                    .snapshot
+                    .release_ipa
+                    .then_some((record.snapshot.ipa, record.snapshot.len as u64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut keepers = self.carrier_lease_keepers.lock();
+        if let Some(existing) = keepers.remove(&identity.record_id) {
+            let keeper = existing.into_keeper();
+            keepers.insert(
+                identity.record_id,
+                CarrierLeaseKeeperState::Abandoned {
+                    vm_generation: identity.vm_generation,
+                    release_ipa,
+                    keeper,
+                },
+            );
+        }
+    }
+
     pub(crate) fn abort_created_vm_after_raw_destroy(
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), Stage2CustodyError> {
+        let (drained_keepers, drained_ipas) = {
+            let mut state = self.stage2.lock();
+            self.drain_abandoned_carrier_lease_keepers_locked(&mut state, generation)
+        };
         let retired_ipc_backings = self.drain_ipc_backings_through(generation);
         drop(retired_ipc_backings);
+        drop(drained_keepers);
+        for (ipa, len) in drained_ipas {
+            let _ = super::global_frame::release_retired_stage2_ipa(ipa, len);
+        }
         self.stage2.finish_destroy(generation)
     }
 
@@ -1049,7 +1169,7 @@ impl CarrierVmCustody {
         // Join physical callbacks before publishing Vacant: a successor VM
         // must never race an old callback through the process-global ABI view.
         self.native_root_waits.clear_all_before_mapping_release();
-        let destroyed_stock = {
+        let (destroyed_stock, drained_keepers, drained_ipas) = {
             // Match grant publication/return: aperture precedes lifecycle state.
             let mut metadata = self.metadata_aperture.lock();
             let mut state = self.stage2.lock();
@@ -1073,13 +1193,16 @@ impl CarrierVmCustody {
             metadata.release_destroyed_vm(generation.0, |identity| {
                 let _ = state.remove_record(identity.record_id);
             });
-            std::mem::replace(
+            let (drained_keepers, drained_ipas) =
+                self.drain_abandoned_carrier_lease_keepers_locked(&mut state, generation);
+            let stock = std::mem::replace(
                 &mut *self.fork_stock.lock(),
                 crate::fork_stock::ForkStockHostCustody::with_asids(
                     self.transfer_carrier,
                     self.asids.clone(),
                 ),
-            )
+            );
+            (stock, drained_keepers, drained_ipas)
         };
         self.native_root_replies
             .lock()
@@ -1088,6 +1211,10 @@ impl CarrierVmCustody {
         let retired_ipc_backings = self.drain_ipc_backings_through(generation);
         drop(retired_ipc_backings);
         drop(destroyed_stock);
+        drop(drained_keepers);
+        for (ipa, len) in drained_ipas {
+            let _ = super::global_frame::release_retired_stage2_ipa(ipa, len);
+        }
         self.stage2.finish_destroy(generation)
     }
 
@@ -1354,16 +1481,18 @@ impl CarrierVmCustody {
             .map(|record| record.snapshot)
     }
 
-    pub(crate) fn claim_terminal_stage2_release(
+    pub(crate) fn claim_terminal_stage2_release_with_keeper(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
+    ) -> Result<TerminalReleaseClaim, CarrierStage2RecordError> {
         let mut state = self.stage2.lock();
         let record = state
             .stage2_records
             .get_mut(&identity.record_id)
             .ok_or(CarrierStage2RecordError::RecordNotFound)?;
-        if Self::stage2_identity_mismatch(record, identity).is_some() {
+        if Self::stage2_identity_mismatch(record, identity).is_some()
+            || record.snapshot.superseded_by_rebind
+        {
             return Err(CarrierStage2RecordError::RecordIdentityMismatch);
         }
         if record.snapshot.pin_count != 0
@@ -1376,14 +1505,39 @@ impl CarrierVmCustody {
         }
         if !record.snapshot.release_ipa {
             let _ = state.remove_record(identity.record_id);
-            return Ok(None);
+            let keeper = self
+                .carrier_lease_keepers
+                .lock()
+                .remove(&identity.record_id)
+                .map(CarrierLeaseKeeperState::into_keeper);
+            return Ok(TerminalReleaseClaim::AlreadyTerminal(keeper));
         }
         record.snapshot.release_in_flight = true;
         record.snapshot.release_retry_pending = false;
-        Ok(Some((record.snapshot.ipa, record.snapshot.len as u64)))
+        Ok(TerminalReleaseClaim::NeedsRelease {
+            ipa: record.snapshot.ipa,
+            length: record.snapshot.len as u64,
+        })
     }
 
-    pub(crate) fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn claim_terminal_stage2_release(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
+        match self.claim_terminal_stage2_release_with_keeper(identity)? {
+            TerminalReleaseClaim::AlreadyTerminal(keeper) => {
+                drop(keeper);
+                Ok(None)
+            }
+            TerminalReleaseClaim::NeedsRelease { ipa, length } => Ok(Some((ipa, length))),
+        }
+    }
+
+    pub(crate) fn commit_terminal_stage2_release_with_keeper(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Option<super::global_frame::LeaseBackingKeeper> {
         let mut state = self.stage2.lock();
         let removable = state
             .stage2_records
@@ -1399,7 +1553,19 @@ impl CarrierVmCustody {
         );
         if removable {
             let _ = state.remove_record(identity.record_id);
+            self.carrier_lease_keepers
+                .lock()
+                .remove(&identity.record_id)
+                .map(CarrierLeaseKeeperState::into_keeper)
+        } else {
+            None
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
+        let keeper = self.commit_terminal_stage2_release_with_keeper(identity);
+        drop(keeper);
     }
 
     pub(crate) fn abort_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
@@ -1924,6 +2090,8 @@ pub(crate) const IPC_WINDOW_ADMITTED: &str = "ipc window admitted";
 #[cfg(test)]
 pub(crate) const FORK_STOCK_INSTALL_BEFORE_ARENAS: &str = "fork stock install before arenas";
 #[cfg(test)]
+pub(crate) const STRUCTURAL_DIRECTORY_CONTENDED: &str = "structural directory contended";
+#[cfg(test)]
 pub(crate) const FORK_CONTROL_CAPACITY_BEFORE_INSTALL: &str =
     "fork control capacity before install";
 #[cfg(test)]
@@ -1968,7 +2136,7 @@ impl CarrierVmCustody {
             self.request_global_frame_retirement_retry();
         } else if let RecordPinRelease::ReadyToRetire { ipa } = outcome {
             if self.is_active_root_slot_pool_ipa(ipa) {
-                let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
+                let _ = super::retire_structural_stage2_record_at_safe_point(self, identity);
             } else {
                 // A global owner already retained its exact pending retirement.
                 // Last-unpin requests that existing idle turn; it neither unmaps
@@ -2227,7 +2395,9 @@ mod carrier_vm_custody_tests {
         custody
             .stage2
             .set_hook(Some(std::sync::Arc::new(move |point| match point {
-                Stage2HookPoint::Client(super::RECORD_UNMAP_PREPARED) => {
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::RECORD_UNMAP_PREPARED,
+                ) => {
                     start_tx.send(()).expect("rival alive");
                     let event = event_rx
                         .lock()
@@ -2306,7 +2476,9 @@ mod carrier_vm_custody_tests {
             let mapped_after_rival = std::sync::Arc::clone(&mapped_after_rival);
             custody.stage2.set_hook(Some(std::sync::Arc::new(
                 move |hook_point| match hook_point {
-                    Stage2HookPoint::Client(name) if name == point => {
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name)
+                        if name == point =>
+                    {
                         start_tx.send(()).expect("rival alive");
                         let event = event_rx
                             .lock()
@@ -2441,7 +2613,9 @@ mod carrier_vm_custody_tests {
         custody
             .stage2
             .set_hook(Some(std::sync::Arc::new(move |point| match point {
-                Stage2HookPoint::Client(super::REPLAY_REBIND_ADMITTED) => {
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::REPLAY_REBIND_ADMITTED,
+                ) => {
                     start_tx.send(()).expect("rival alive");
                     let event = event_rx
                         .lock()
@@ -6111,7 +6285,9 @@ mod carrier_vm_custody_tests {
             let mapped_after_rival = std::sync::Arc::clone(&mapped_after_rival);
             custody.stage2.set_hook(Some(std::sync::Arc::new(
                 move |hook_point| match hook_point {
-                    Stage2HookPoint::Client(name) if name == super::REPLAY_REMAP_LOOKED_UP => {
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name)
+                        if name == super::REPLAY_REMAP_LOOKED_UP =>
+                    {
                         start_tx.send(()).expect("rival alive");
                         let event = event_rx
                             .lock()
@@ -6287,7 +6463,6 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn try_lazy_alias_remap_refuses_g1_after_pre_guard_destroy_and_g2_create() {
-        use carrick_aarch64::stage2::custody::Stage2HookPoint;
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stage2_stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
@@ -6342,7 +6517,9 @@ mod carrier_vm_custody_tests {
         let go_rx = std::sync::Mutex::new(go_rx);
         custody.stage2.set_hook(Some(std::sync::Arc::new(
             move |hook_point| match hook_point {
-                Stage2HookPoint::Client(name) if name == super::REPLAY_REMAP_BEFORE_GUARD => {
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name)
+                    if name == super::REPLAY_REMAP_BEFORE_GUARD =>
+                {
                     entered_tx.send(()).expect("rival alive");
                     let _ = go_rx.lock().expect("go receiver").recv();
                 }
@@ -6639,6 +6816,89 @@ mod carrier_vm_custody_tests {
             Some(local_ptr_b as usize),
         )
         .expect("exact host B retires local lease B");
+        assert!(
+            !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(local_ipa, local_len),
+            "exact local retirement must unmap stage-2 mapping"
+        );
+        assert!(
+            !super::alias_backing_is_live(local_ptr_b as usize),
+            "exact local retirement must release row host backing once unmapped"
+        );
+
+        // 4. Unowned row-local stage2_lease C: stale host A preserves lease and
+        // stage-2 mapping; exact host C unmaps stage-2 mapping and drops backing.
+        let unowned_ipa = 0x2200_0000_u64;
+        let unowned_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            local_len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("map unowned backing C");
+        let unowned_ptr = unowned_backing.as_ptr();
+        let unowned_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            unowned_ptr.cast(),
+            unowned_ipa,
+            local_len,
+            perms,
+        );
+        let mut unowned_lease = super::GlobalFrameStage2Lease::fixed(unowned_ipa, local_len as u64);
+        unowned_lease.mark_mapped(unowned_stage2);
+        let mut unowned_mappings = super::TaskMappingIndex::from_region(super::HvfMappedRegion {
+            start: 0x3200_0000,
+            end: 0x3200_0000 + local_len as u64,
+            ipa: unowned_ipa,
+            physical_ipa: unowned_ipa,
+            physical_size: local_len,
+            owner_generation: 0,
+            host_addr: unowned_ptr,
+            size: local_len,
+            perms: carrick_hal::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: Some(unowned_backing.into()),
+            structural_owner: None,
+            stage2_lease: Some(unowned_lease),
+            stage2_generation: Some(g1),
+            is_dynamic_alias: false,
+            sharing: super::GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: None,
+            shared_key_offset: 0,
+        });
+        let unowned_err = super::HvfVmState::retire_unowned_stage2_extent_from_mappings_in(
+            &custody,
+            &mut unowned_mappings,
+            unowned_ipa,
+            local_len as u64,
+            stale_host_a,
+        )
+        .expect_err("stale host A must not retire unowned lease C");
+        let _ = unowned_err;
+        assert!(unowned_mappings.first().unwrap().stage2_lease.is_some());
+        assert!(
+            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(
+                unowned_ipa,
+                local_len
+            )
+        );
+        super::HvfVmState::retire_unowned_stage2_extent_from_mappings_in(
+            &custody,
+            &mut unowned_mappings,
+            unowned_ipa,
+            local_len as u64,
+            unowned_ptr as usize,
+        )
+        .expect("exact host C retires unowned lease C");
+        assert!(
+            !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(
+                unowned_ipa,
+                local_len
+            ),
+            "exact unowned local retirement must unmap stage-2 mapping"
+        );
+        assert!(
+            !super::alias_backing_is_live(unowned_ptr as usize),
+            "exact unowned local retirement must release host backing after unmap"
+        );
         let _ = (global_host_b, stale_host_a);
     }
 
@@ -6647,11 +6907,22 @@ mod carrier_vm_custody_tests {
     fn failed_carrier_batch_rollback_retains_all_host_backings_until_vm_destroy() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
-        let (custody, g1) = live_custody();
+        let (custody, g0) = live_custody();
+        // Destroy g0 and start g1 on the SAME custody so g0 is a genuine destroyed
+        // predecessor generation when testing mid-batch stale-generation failure below.
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G0 for predecessor generation",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G0");
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
         let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
         let len = 0x4000_usize;
 
-        let make_mapped_lease = || {
+        let make_mapped_lease_in = |target_custody: &std::sync::Arc<CarrierVmCustody>| {
             let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 len,
                 crate::host_mapping::HostMappingKind::FrameCow,
@@ -6662,7 +6933,7 @@ mod carrier_vm_custody_tests {
                 .expect("reserve IPA");
             let ipa = lease.base();
             let stage2_mapping = super::super::stage2_backend::test_stage2_map(
-                &custody,
+                target_custody,
                 backing.as_ptr().cast(),
                 ipa,
                 len,
@@ -6675,23 +6946,12 @@ mod carrier_vm_custody_tests {
             (lease, ipa, host_addr)
         };
 
-        // 1. Mid-batch register_carrier_stage2_leases failure on Destroying VM:
-        // lease 0 registers first; then VM enters Destroying & unmap fails ->
-        // lease 1 fails registration and keeps backing; lease 2 also settles!
-        let (lease0, ipa0, host0) = make_mapped_lease();
-        let (lease1, ipa1, host1) = make_mapped_lease();
-        let (lease2, ipa2, host2) = make_mapped_lease();
-        let owners = std::collections::BTreeMap::from([
-            ((ipa0, len as u64), host0),
-            ((ipa1, len as u64), host1),
-            ((ipa2, len as u64), host2),
-        ]);
-        // Force collision on lease1 with duplicate key? Even stronger: fail lease0 unmap
-        // via Destroying/fail_next_unmap on LeaseTest::abort with 3 leases!
+        // 1. Multi-lease Process/LeaseTest::abort where lease 0 fails unmap:
+        // leases 1 & 2 still settle immediately, while lease 0 retains host0 + ipa0 until VM destroy.
+        let (lease0, ipa0, host0) = make_mapped_lease_in(&custody);
+        let (lease1, ipa1, host1) = make_mapped_lease_in(&custody);
+        let (lease2, ipa2, host2) = make_mapped_lease_in(&custody);
         let mut leases = vec![lease0, lease1, lease2];
-        // Test multi-lease LeaseTest::abort where lease 0 fails unmap: leases 1 & 2 MUST
-        // still unmap and release their IPAs immediately, while lease 0 retains host0 + ipa0
-        // until VM destroy.
         stub.set_fail_next_unmap(true);
         let abort_err = super::HvpatchCarrierTaskState::LeaseTest {
             stage2_leases: std::mem::take(&mut leases),
@@ -6701,18 +6961,9 @@ mod carrier_vm_custody_tests {
         let _ = abort_err;
         stub.set_fail_next_unmap(false);
 
-        assert!(
-            super::alias_backing_is_live(host0),
-            "refused lease 0 backing must stay live until VM destroy"
-        );
-        assert!(
-            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa0, len),
-            "refused lease 0 mapping must remain tracked until destroy"
-        );
-        assert!(
-            !super::alias_backing_is_live(host1) && !super::alias_backing_is_live(host2),
-            "abort loop must continue settling leases 1 and 2 after lease 0 failure"
-        );
+        assert!(super::alias_backing_is_live(host0));
+        assert!(super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa0, len));
+        assert!(!super::alias_backing_is_live(host1) && !super::alias_backing_is_live(host2));
         assert!(
             !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa1, len)
                 && !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa2, len)
@@ -6731,50 +6982,191 @@ mod carrier_vm_custody_tests {
                 .is_live(ipa0, len as u64)
         );
 
-        // 2. Also exercise register_carrier_stage2_leases validation-error rollback
-        // where bad1 hits unmap refusal while bad0 unmaps cleanly.
-        let (bad0, bad_ipa0, bad_host0) = make_mapped_lease();
-        let (bad1, bad_ipa1, bad_host1) = make_mapped_lease();
-        // Omit bad_ipa0 from owner_hosts so validation fails while both leases stay active.
-        let bad_owners = std::collections::BTreeMap::from([((bad_ipa1, len as u64), bad_host1)]);
-        let mut bad_batch = vec![bad1, bad0];
+        // 2. Production mid-batch `register_carrier_stage2_leases` transfer failure:
+        // `mid0` succeeds custody transfer in G1 first, then `mid_stale` (mapped on destroyed G0)
+        // passes batch validation and fails transfer -> rollback must unmap/retire BOTH `mid0`
+        // (with unmap refusal retaining keeper as Abandoned!) AND remaining `mid2` in pending_iter,
+        // preserve the rollback error, and `commit_destroy(g1)` MUST drain the Abandoned keeper!
+        let (mid_stale, mid_stale_ipa, mid_stale_host) = {
+            let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                len,
+                crate::host_mapping::HostMappingKind::FrameCow,
+            )
+            .expect("allocate stale lease backing");
+            let host_addr = backing.as_ptr() as usize;
+            let mut lease = super::GlobalFrameStage2Lease::reserve(len as u64, len as u64)
+                .expect("reserve stale IPA");
+            lease.mark_pre_mapped_in(Some(g0));
+            lease.set_backing_keeper(super::LeaseBackingKeeper::Host(std::sync::Arc::new(
+                super::GlobalFrameSharedMapping::new(backing),
+            )));
+            let ipa = lease.base();
+            (lease, ipa, host_addr)
+        };
+        let (mid0, mid_ipa0, mid_host0) = make_mapped_lease_in(&custody);
+        let (mid2, mid_ipa2, mid_host2) = make_mapped_lease_in(&custody);
+        let mid_owners = std::collections::BTreeMap::from([
+            ((mid_ipa0, len as u64), mid_host0),
+            ((mid_stale_ipa, len as u64), mid_stale_host),
+            ((mid_ipa2, len as u64), mid_host2),
+        ]);
+        let mut mid_batch = vec![mid0, mid_stale, mid2];
         stub.set_fail_next_unmap(true);
-        let batch_err =
-            super::register_carrier_stage2_leases(&custody, &mut bad_batch, &bad_owners)
-                .expect_err("invalid batch must fail validation and settle all leases");
-        let _ = batch_err;
+        let mid_err = super::register_carrier_stage2_leases(&custody, &mut mid_batch, &mid_owners)
+            .expect_err("mid-batch transfer failure must fail and roll back batch");
         stub.set_fail_next_unmap(false);
         assert!(
-            super::alias_backing_is_live(bad_host1),
-            "failed unmap in register_carrier_stage2_leases validation must retain host backing"
+            mid_err
+                .to_string()
+                .contains("carrier stage-2 batch rollback failed"),
+            "mid-batch rollback error must be preserved: {mid_err}"
         );
         assert!(
-            !super::alias_backing_is_live(bad_host0),
-            "remaining batch lease bad0 must settle cleanly after bad1 unmap failure"
+            super::alias_backing_is_live(mid_host0),
+            "unmap-refused transferred mid0 backing must stay live as Abandoned until VM destroy"
+        );
+        assert!(
+            custody.carrier_stage2_records.lock().is_empty(),
+            "abandoned mid0 record must not linger in replayable carrier_stage2_records"
+        );
+        assert!(
+            !super::alias_backing_is_live(mid_stale_host)
+                && !super::alias_backing_is_live(mid_host2),
+            "failing and remaining leases in pending_iter must settle cleanly"
         );
         assert!(
             !super::global_frame_ipa_allocator()
                 .lock()
-                .is_live(bad_ipa0, len as u64)
+                .is_live(mid_ipa2, len as u64)
+                && !super::global_frame_ipa_allocator()
+                    .lock()
+                    .is_live(mid_stale_ipa, len as u64)
         );
-        let _ = owners;
+
+        // 3. Also keep a live Replayable carrier record in the same VM G1 so we prove
+        // `commit_destroy(g1)` drains Abandoned mid0 + lease0 WITHOUT dropping Replayable
+        // `keep_host`, and Loop 3 rebind atomically moves `keep_host` to G2 without letting
+        // concurrent cleanup of old_identity drop the rebound keeper!
+        let (keep_lease, keep_ipa, keep_host) = make_mapped_lease_in(&custody);
+        let keep_owners = std::collections::BTreeMap::from([((keep_ipa, len as u64), keep_host)]);
+        let mut keep_batch = vec![keep_lease];
+        let keep_ids =
+            super::register_carrier_stage2_leases(&custody, &mut keep_batch, &keep_owners)
+                .expect("register replayable carrier lease");
+        let old_id = keep_ids[0];
 
         custody.begin_destroy(g1).expect("begin destroy");
         custody.destroy_stage2_for_test(g1);
         custody.commit_destroy(g1).expect("commit destroy");
         assert!(
-            !super::alias_backing_is_live(host0) && !super::alias_backing_is_live(bad_host1),
-            "VM destroy must release all retained backings and IPAs"
+            !super::alias_backing_is_live(host0) && !super::alias_backing_is_live(mid_host0),
+            "VM destroy must drain all retained/abandoned backings"
         );
         assert!(
             !super::global_frame_ipa_allocator()
                 .lock()
                 .is_live(ipa0, len as u64)
+                && !super::global_frame_ipa_allocator()
+                    .lock()
+                    .is_live(mid_ipa0, len as u64)
         );
+        assert!(
+            super::alias_backing_is_live(keep_host),
+            "Replayable carrier lease keeper must survive G1 destroy for Loop 3 replay"
+        );
+
+        // Begin/commit G2, stage untracked G2 mapping, and race Loop 3 rebind against
+        // stale terminal finalization of `old_id`.
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            keep_host as *mut std::ffi::c_void,
+            keep_ipa,
+            len,
+            perms,
+        );
+        let (rebind_tx, rebind_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| {
+                if matches!(
+                    point,
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                        super::REPLAY_REBIND_ADMITTED
+                    )
+                ) {
+                    rebind_tx.send(()).expect("notify Loop 3 rebind point");
+                    go_rx
+                        .lock()
+                        .expect("go lock")
+                        .recv()
+                        .expect("resume Loop 3");
+                }
+            })));
+        let reconcile_custody = std::sync::Arc::clone(&custody);
+        let reconcile_thread = std::thread::spawn(move || {
+            super::reconcile_global_frame_owners_after_replay_in_using(
+                &reconcile_custody,
+                &[super::GlobalFrameReplayExtent {
+                    ipa: keep_ipa,
+                    length: len as u64,
+                    host_addr: keep_host,
+                    perms,
+                    vm_generation: g2,
+                }],
+                false,
+                &mut super::release_retired_stage2_ipa,
+            )
+        });
+        rebind_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Loop 3 reached REPLAY_REBIND_ADMITTED");
+        let stale_finalize_custody = std::sync::Arc::clone(&custody);
+        let stale_finalize_thread = std::thread::spawn(move || {
+            super::finalize_terminal_stage2_record_using(
+                &stale_finalize_custody,
+                old_id,
+                &mut super::release_retired_stage2_ipa,
+            )
+        });
+        go_tx.send(()).expect("resume Loop 3");
+        reconcile_thread
+            .join()
+            .expect("reconcile thread")
+            .expect("Loop 3 rebind must succeed");
+        let _ = stale_finalize_thread.join().expect("stale finalize thread");
+        custody.stage2.set_hook(None);
+
+        assert!(
+            super::alias_backing_is_live(keep_host),
+            "rebound G2 record must still own live host backing after concurrent old_id cleanup"
+        );
+        let new_id = custody.carrier_stage2_records.lock()[&(keep_ipa, len as u64)];
+        assert_ne!(new_id, old_id);
+        assert!(
+            custody
+                .carrier_lease_keepers
+                .lock()
+                .contains_key(&new_id.record_id)
+        );
+        assert!(
+            !custody
+                .carrier_lease_keepers
+                .lock()
+                .contains_key(&old_id.record_id)
+        );
+
+        super::retire_carrier_stage2_record_at_safe_point(&custody, new_id)
+            .expect("retire rebound G2 carrier record");
+        assert!(!super::alias_backing_is_live(keep_host));
+        assert!(custody.carrier_lease_keepers.lock().is_empty());
         assert!(
             !super::global_frame_ipa_allocator()
                 .lock()
-                .is_live(bad_ipa1, len as u64)
+                .is_live(keep_ipa, len as u64)
         );
     }
 
@@ -6784,7 +7176,6 @@ mod carrier_vm_custody_tests {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
-        let ipa = 0xa081_f900_0000_u64;
         let len = 0x4000_usize;
         let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
         let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -6793,6 +7184,9 @@ mod carrier_vm_custody_tests {
         )
         .expect("structural backing");
         let host_addr = backing.as_ptr() as usize;
+        let mut lease =
+            super::GlobalFrameStage2Lease::reserve(len as u64, len as u64).expect("reserve IPA");
+        let ipa = lease.base();
         let stage2_mapping = super::super::stage2_backend::test_stage2_map(
             &custody,
             backing.as_ptr().cast(),
@@ -6800,13 +7194,13 @@ mod carrier_vm_custody_tests {
             len,
             perms,
         );
-        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
         lease.mark_mapped(stage2_mapping);
         let epoch = super::next_structural_epoch().expect("epoch");
         let owner =
             super::StructuralBackingOwner::new_in(&custody, backing, lease, perms, epoch, ipa, len)
                 .expect("structural owner");
         let identity = owner.record_identity();
+        let owner_entry = std::sync::Arc::clone(&owner.retained);
 
         // Owner retires before G1 destroys; record remains terminal until finalization.
         drop(owner);
@@ -6820,10 +7214,10 @@ mod carrier_vm_custody_tests {
 
         // Park retry inside `release_ipa` (which holds `structural_backings` and has claimed
         // terminal release) while concurrent `reconcile_global_frame_owners_after_replay_in_using`
-        // enters Loop 4. Loop 4 must serialize behind `structural_backings` instead of failing
-        // with RecordNotFound / ReleaseInFlight / missing record.
+        // enters Loop 4 and signals `STRUCTURAL_DIRECTORY_CONTENDED`.
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel::<()>();
         let retry_custody = std::sync::Arc::clone(&custody);
         let retry_releases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let retry_releases_worker = std::sync::Arc::clone(&retry_releases);
@@ -6832,16 +7226,30 @@ mod carrier_vm_custody_tests {
                 &retry_custody,
                 &[identity],
                 &mut |_, _| Ok(()),
-                &mut |_, _| {
+                &mut |released_ipa, released_len| {
                     retry_releases_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     entered_tx.send(()).expect("notify main");
                     go_rx.recv().expect("resume retry");
-                    Ok(())
+                    super::release_retired_stage2_ipa(released_ipa, released_len)
                 },
             )
         });
 
-        entered_rx.recv().expect("retry inside release_ipa");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("retry inside release_ipa");
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| {
+                if matches!(
+                    point,
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                        super::STRUCTURAL_DIRECTORY_CONTENDED
+                    )
+                ) {
+                    let _ = contended_tx.send(());
+                }
+            })));
         let reconcile_custody = std::sync::Arc::clone(&custody);
         let reconcile_releases = std::sync::Arc::clone(&retry_releases);
         let reconcile_thread = std::thread::spawn(move || {
@@ -6856,7 +7264,9 @@ mod carrier_vm_custody_tests {
             )
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        contended_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Loop 4 reached contended structural_backings lock");
         go_tx.send(()).expect("unblock retry");
 
         retry_thread
@@ -6867,6 +7277,7 @@ mod carrier_vm_custody_tests {
             .join()
             .expect("reconcile thread panicked")
             .expect("reconcile must not race retry terminal finalization");
+        custody.stage2.set_hook(None);
         let _ = (g1, report);
         assert_eq!(
             retry_releases.load(std::sync::atomic::Ordering::SeqCst),
@@ -6875,6 +7286,75 @@ mod carrier_vm_custody_tests {
         );
         assert!(custody.structural_backings.lock().is_empty());
         assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        assert_eq!(
+            *owner_entry.record_identity.lock(),
+            super::cleared_stage2_record_identity()
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(ipa, len as u64)
+        );
         assert!(!super::alias_backing_is_live(host_addr));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn pooled_root_last_unpin_removes_structural_directory_entry_for_replay() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
+
+        let pool = custody
+            .root_slot_pool()
+            .expect("create root slot pool in G1");
+        let handle = pool.allocate_slot().expect("checkout pooled root slot");
+        let ipa = handle.ipa();
+        let len = handle.len();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_pre_mapped_in(Some(g1));
+        let epoch = super::next_structural_epoch().expect("epoch");
+        let owner = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody, handle, lease, perms, epoch, ipa, len,
+        )
+        .expect("pooled root structural owner");
+        let identity = owner.record_identity();
+        let owner_entry = std::sync::Arc::clone(&owner.retained);
+
+        let pin = custody
+            .pin_stage2_record(identity)
+            .expect("pin pooled root");
+        drop(owner);
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id),
+            "pinned pooled root remains in structural_backings until last unpin"
+        );
+        drop(pin);
+
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_none(),
+            "last unpin must terminalize pooled root stage-2 record"
+        );
+        assert!(
+            custody.structural_backings.lock().is_empty(),
+            "last unpin must remove pooled root from structural_backings too"
+        );
+        assert_eq!(
+            *owner_entry.record_identity.lock(),
+            super::cleared_stage2_record_identity()
+        );
+        super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[],
+            false,
+            &mut super::release_retired_stage2_ipa,
+        )
+        .expect("Loop 4 must succeed after pooled-root last unpin");
     }
 }

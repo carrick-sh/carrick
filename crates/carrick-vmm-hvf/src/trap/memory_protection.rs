@@ -682,8 +682,23 @@ impl IntoIterator for RetiredRows {
 )]
 pub(crate) struct AliasScopeBucket {
     pub(crate) rows: Vec<(u64, AliasBacking)>,
-    pub(crate) replay: std::collections::BTreeSet<ReplayMappingKey>,
+    replay: std::collections::BTreeSet<ReplayMappingKey>,
     pub(crate) versions: AliasVersionRegistry,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasScopeBucket {
+    pub(crate) fn replay(&self) -> &std::collections::BTreeSet<ReplayMappingKey> {
+        super::note_hot_path_rows(super::HotPathScan::AliasReplayScopes, 1);
+        &self.replay
+    }
+
+    pub(crate) fn with_versions_and_replay<R>(
+        &mut self,
+        op: impl FnOnce(&mut AliasVersionRegistry, &std::collections::BTreeSet<ReplayMappingKey>) -> R,
+    ) -> R {
+        op(&mut self.versions, &self.replay)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1008,6 +1023,10 @@ impl AliasVisibleRevisions {
 #[derive(::core::fmt::Debug, ::core::default::Default, ::core::clone::Clone)]
 pub(crate) struct AliasRegistry {
     pub(crate) by_scope: std::collections::BTreeMap<AliasOwnershipScope, AliasScopeBucket>,
+    /// Cross-scope count of active `ReplayMappingKey` memberships across all
+    /// `by_scope` buckets so [`Self::contains_replay`] stays O(log K) without
+    /// walking unrelated scopes.
+    pub(crate) replay_counts: std::collections::BTreeMap<ReplayMappingKey, usize>,
     /// First row for each exact semantic key inside a scope: insertion sequence
     /// and value. Receipt publication asks exactly this question for every row;
     /// locating it through the scope `Vec` made a k-row publication O(k * rows-in-mm).
@@ -1357,6 +1376,12 @@ impl AliasRegistry {
         self.by_scope_physical_start.clear();
         self.physical_size_counts_by_scope.clear();
         self.exact_first_by_scope.clear();
+        self.replay_counts.clear();
+        for bucket in self.by_scope.values() {
+            for &key in &bucket.replay {
+                *self.replay_counts.entry(key).or_insert(0) += 1;
+            }
+        }
         let rows: Vec<(u64, AliasBacking)> = self
             .by_scope
             .values()
@@ -1503,11 +1528,69 @@ impl AliasRegistry {
     /// source indices yield them, and only this placement makes the staged
     /// bucket agree with the live one. Ties keep insertion order, so a split
     /// row's head still precedes its tail.
+    pub(crate) fn insert_replay_in_scope(
+        &mut self,
+        scope: AliasOwnershipScope,
+        key: ReplayMappingKey,
+    ) -> bool {
+        let bucket = self.by_scope.entry(scope).or_default();
+        let inserted = bucket.replay.insert(key);
+        if inserted {
+            *self.replay_counts.entry(key).or_insert(0) += 1;
+        }
+        inserted
+    }
+
+    pub(crate) fn remove_replay_in_scope(
+        &mut self,
+        scope: AliasOwnershipScope,
+        key: &ReplayMappingKey,
+    ) -> bool {
+        let Some(bucket) = self.by_scope.get_mut(&scope) else {
+            return false;
+        };
+        let removed = bucket.replay.remove(key);
+        if removed {
+            Self::decrement_replay_count(&mut self.replay_counts, key);
+        }
+        removed
+    }
+
+    fn decrement_replay_count(
+        replay_counts: &mut std::collections::BTreeMap<ReplayMappingKey, usize>,
+        key: &ReplayMappingKey,
+    ) {
+        if let Some(count) = replay_counts.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                replay_counts.remove(key);
+            }
+        }
+    }
+
+    fn retire_bucket_replays(&mut self, bucket: &mut AliasScopeBucket) {
+        for key in bucket.replay.iter() {
+            Self::decrement_replay_count(&mut self.replay_counts, key);
+        }
+        bucket.replay.clear();
+    }
+
+    pub(crate) fn clear_replay_mappings_in(&mut self) {
+        note_hot_path_rows(HotPathScan::AliasReplayScopes, self.by_scope.len());
+        for bucket in self.by_scope.values_mut() {
+            bucket.replay.clear();
+        }
+        self.replay_counts.clear();
+    }
+
     pub(crate) fn place_in_scope_bucket(&mut self, seq: u64, alias: AliasBacking) {
         let bucket = self.by_scope.entry(alias.ownership_scope).or_default();
         let at = bucket.rows.partition_point(|&(row_seq, _)| row_seq <= seq);
         bucket.rows.insert(at, (seq, alias));
-        bucket.replay.insert(replay_mapping_key(alias));
+        let key = replay_mapping_key(alias);
+        if bucket.replay.insert(key) {
+            *self.replay_counts.entry(key).or_insert(0) += 1;
+        }
     }
 
     pub(crate) fn push(&mut self, alias: AliasBacking) {
@@ -1549,6 +1632,7 @@ impl AliasRegistry {
             }
         }
         self.by_scope.clear();
+        self.replay_counts.clear();
         self.exact_first_by_scope.clear();
         self.va_classes.clear();
         self.ipa_classes.clear();
@@ -1602,11 +1686,25 @@ impl AliasRegistry {
         rows
     }
 
+    #[cfg(test)]
+    pub(crate) fn recomputed_replay_counts(
+        &self,
+    ) -> std::collections::BTreeMap<ReplayMappingKey, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for bucket in self.by_scope.values() {
+            for &key in &bucket.replay {
+                *counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     pub(crate) fn contains_replay(&self, key: &ReplayMappingKey) -> bool {
-        self.by_scope.values().any(|b| b.replay.contains(key))
+        self.replay_counts.contains_key(key)
     }
 
     pub(crate) fn all_replay_mappings(&self) -> std::collections::BTreeSet<ReplayMappingKey> {
+        note_hot_path_rows(HotPathScan::AliasReplayScopes, self.by_scope.len());
         self.by_scope
             .values()
             .flat_map(|b| b.replay.iter().copied())
@@ -1720,8 +1818,16 @@ impl AliasRegistry {
             let updated = slot.1;
             let changed = updated != previous;
             if changed {
-                bucket.replay.remove(&replay_mapping_key(previous));
-                bucket.replay.insert(replay_mapping_key(updated));
+                if bucket.replay.remove(&replay_mapping_key(previous)) {
+                    Self::decrement_replay_count(
+                        &mut self.replay_counts,
+                        &replay_mapping_key(previous),
+                    );
+                }
+                let updated_key = replay_mapping_key(updated);
+                if bucket.replay.insert(updated_key) {
+                    *self.replay_counts.entry(updated_key).or_insert(0) += 1;
+                }
             }
             (seq, previous, updated, changed)
         };
@@ -1899,7 +2005,10 @@ impl AliasRegistry {
                 survives
             });
             for &(_, alias) in &dropped {
-                bucket.replay.remove(&replay_mapping_key(alias));
+                let key = replay_mapping_key(alias);
+                if bucket.replay.remove(&key) {
+                    Self::decrement_replay_count(&mut self.replay_counts, &key);
+                }
             }
             self.rebuild_exact_scope(scope);
         }
@@ -1917,7 +2026,17 @@ impl AliasRegistry {
         for (seq, alias) in dropped {
             self.index_remove(seq, alias);
         }
-        self.by_scope.retain(|_, bucket| !bucket.rows.is_empty());
+        let empty_scopes: Vec<_> = self
+            .by_scope
+            .iter()
+            .filter(|(_, bucket)| bucket.rows.is_empty())
+            .map(|(&scope, _)| scope)
+            .collect();
+        for scope in empty_scopes {
+            if let Some(mut bucket) = self.by_scope.remove(&scope) {
+                self.retire_bucket_replays(&mut bucket);
+            }
+        }
     }
 
     /// Retire all rows belonging to `scope`.
@@ -1925,9 +2044,10 @@ impl AliasRegistry {
     /// Retiring a scope drops its bucket (rows, replay set, and version chains)
     /// in O(rows in scope) time, without visiting any foreign scopes.
     pub(crate) fn retire_scope(&mut self, scope: AliasOwnershipScope) -> RetiredRows {
-        let Some(bucket) = self.by_scope.remove(&scope) else {
+        let Some(mut bucket) = self.by_scope.remove(&scope) else {
             return RetiredRows::default();
         };
+        self.retire_bucket_replays(&mut bucket);
         self.exact_first_by_scope.remove(&scope);
         self.physical_size_counts_by_scope.remove(&scope);
         self.bump_revision();
@@ -1975,11 +2095,16 @@ impl AliasRegistry {
                 survives
             });
             for &(_, alias) in &dropped {
-                bucket.replay.remove(&replay_mapping_key(alias));
+                let key = replay_mapping_key(alias);
+                if bucket.replay.remove(&key) {
+                    Self::decrement_replay_count(&mut self.replay_counts, &key);
+                }
             }
             self.rows = self.rows.saturating_sub(dropped.len());
-            if bucket.rows.is_empty() {
-                self.by_scope.remove(&scope);
+            if bucket.rows.is_empty()
+                && let Some(mut empty_bucket) = self.by_scope.remove(&scope)
+            {
+                self.retire_bucket_replays(&mut empty_bucket);
             }
         }
         for &(seq, alias) in &dropped {
@@ -2028,10 +2153,16 @@ impl AliasRegistry {
         });
         bucket.rows = replacement.clone();
         for &(_, alias) in &previous {
-            bucket.replay.remove(&replay_mapping_key(alias));
+            let key = replay_mapping_key(alias);
+            if bucket.replay.remove(&key) {
+                Self::decrement_replay_count(&mut self.replay_counts, &key);
+            }
         }
         for &(_, alias) in &replacement {
-            bucket.replay.insert(replay_mapping_key(alias));
+            let key = replay_mapping_key(alias);
+            if bucket.replay.insert(key) {
+                *self.replay_counts.entry(key).or_insert(0) += 1;
+            }
         }
         for (seq, alias) in previous {
             self.index_remove(seq, alias);
@@ -2044,8 +2175,10 @@ impl AliasRegistry {
     }
 
     pub(crate) fn drop_empty_scope(&mut self, scope: AliasOwnershipScope) {
-        if self.by_scope.get(&scope).is_some_and(|b| b.rows.is_empty()) {
-            self.by_scope.remove(&scope);
+        if self.by_scope.get(&scope).is_some_and(|b| b.rows.is_empty())
+            && let Some(mut bucket) = self.by_scope.remove(&scope)
+        {
+            self.retire_bucket_replays(&mut bucket);
         }
     }
 
@@ -2118,8 +2251,14 @@ impl AliasRegistry {
                 slot.1 = alias;
                 let changed = previous != alias;
                 if changed {
-                    bucket.replay.remove(&replay_mapping_key(previous));
-                    bucket.replay.insert(replay_mapping_key(alias));
+                    let prev_key = replay_mapping_key(previous);
+                    if bucket.replay.remove(&prev_key) {
+                        Self::decrement_replay_count(&mut self.replay_counts, &prev_key);
+                    }
+                    let next_key = replay_mapping_key(alias);
+                    if bucket.replay.insert(next_key) {
+                        *self.replay_counts.entry(next_key).or_insert(0) += 1;
+                    }
                 }
                 changed
             };
@@ -2302,7 +2441,10 @@ impl AliasRegistry {
             let first_removed = removed_in_scope[0].0;
             if let Some(bucket) = self.by_scope.get_mut(&scope) {
                 for &(_, _, alias) in &removed_in_scope {
-                    bucket.replay.remove(&replay_mapping_key(alias));
+                    let key = replay_mapping_key(alias);
+                    if bucket.replay.remove(&key) {
+                        Self::decrement_replay_count(&mut self.replay_counts, &key);
+                    }
                 }
                 let rows = &mut bucket.rows;
                 let mut remove_idx = 0;
@@ -3630,9 +3772,15 @@ pub(crate) fn unregister_alias_entries(
                 }
                 removed_count = removed_count.saturating_add(1);
                 inserted_count = inserted_count.saturating_add(fragments.len());
-                bucket.replay.remove(&replay_mapping_key(entry));
+                let entry_key = replay_mapping_key(entry);
+                if bucket.replay.remove(&entry_key) {
+                    AliasRegistry::decrement_replay_count(&mut registry.replay_counts, &entry_key);
+                }
                 for (_, frag) in &fragments {
-                    bucket.replay.insert(replay_mapping_key(*frag));
+                    let frag_key = replay_mapping_key(*frag);
+                    if bucket.replay.insert(frag_key) {
+                        *registry.replay_counts.entry(frag_key).or_insert(0) += 1;
+                    }
                 }
                 if pos > last_copied {
                     new_rows.extend_from_slice(&rows[last_copied..pos]);

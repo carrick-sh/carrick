@@ -573,11 +573,11 @@ pub(crate) unsafe fn stage2_map_replay(
                     perms: backing.perms,
                 },
             );
-            let bucket = registry
-                .by_scope
-                .entry(backing.ownership_scope)
-                .or_default();
-            if bucket.replay.insert(key) {
+            if registry.insert_replay_in_scope(backing.ownership_scope, key) {
+                let bucket = registry
+                    .by_scope
+                    .entry(backing.ownership_scope)
+                    .or_default();
                 let _ =
                     super::record_external_replay_insertion_in_bucket(bucket, backing.physical_ipa);
             }

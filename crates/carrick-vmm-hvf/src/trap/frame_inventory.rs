@@ -1494,8 +1494,10 @@ impl HvfVmState {
             drop(owner);
             return Ok(());
         }
-        if let Some(lease) = mappings.take_stage2_lease_matching(ipa, length, expected_host) {
-            drop(lease);
+        if let Some((mut lease, region_owner)) =
+            mappings.take_stage2_lease_with_backing_matching(ipa, length, expected_host)
+        {
+            lease.try_retire_with_region_owner(custody, region_owner)?;
             return Ok(());
         }
         // A forked process parks its fresh kernel-state leases on the carrier,
@@ -1553,8 +1555,10 @@ impl HvfVmState {
                 "unowned stage-2 retirement {ipa:#x}/{length:#x} found live global owner {live:?}"
             )));
         }
-        if let Some(lease) = mappings.take_exact_unowned_stage2_lease(ipa, length, host_addr) {
-            drop(lease);
+        if let Some((mut lease, region_owner)) =
+            mappings.take_exact_unowned_stage2_lease_with_backing(ipa, length, host_addr)
+        {
+            lease.try_retire_with_region_owner(custody, region_owner)?;
             return Ok(());
         }
         if let Some(identity) = take_carrier_stage2_record_if_owner(custody, ipa, length, host_addr)

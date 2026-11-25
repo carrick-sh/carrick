@@ -997,12 +997,26 @@ impl TaskMappingIndex {
         self.take_stage2_lease_matching(ipa, length, None)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_stage2_lease_matching(
         &mut self,
         ipa: u64,
         length: u64,
         expected_host: Option<usize>,
     ) -> Option<GlobalFrameStage2Lease> {
+        self.take_stage2_lease_with_backing_matching(ipa, length, expected_host)
+            .map(|(lease, host_mapping)| {
+                drop(host_mapping);
+                lease
+            })
+    }
+
+    pub(crate) fn take_stage2_lease_with_backing_matching(
+        &mut self,
+        ipa: u64,
+        length: u64,
+        expected_host: Option<usize>,
+    ) -> Option<(GlobalFrameStage2Lease, Option<RegionHostOwner>)> {
         self.iter_mut().find_map(|mapping| {
             let host_matches = expected_host.is_none_or(|expected| {
                 mapped_region_physical_host_addr(mapping) == Some(expected as *mut u8)
@@ -1015,18 +1029,27 @@ impl TaskMappingIndex {
                     base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
                 }
             });
-            (host_matches && lease_matches)
-                .then(|| mapping.stage2_lease.take())
-                .flatten()
+            if host_matches && lease_matches {
+                let lease = mapping.stage2_lease.take()?;
+                let host_mapping = mapping.host_mapping.take();
+                if mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                    && host_mapping.is_some()
+                {
+                    super::stage2_backend::clear_el1_region_host_ptr_if(mapping.host_addr as usize);
+                }
+                Some((lease, host_mapping))
+            } else {
+                None
+            }
         })
     }
 
-    pub(crate) fn take_exact_unowned_stage2_lease(
+    pub(crate) fn take_exact_unowned_stage2_lease_with_backing(
         &mut self,
         ipa: u64,
         length: u64,
         host_addr: usize,
-    ) -> Option<GlobalFrameStage2Lease> {
+    ) -> Option<(GlobalFrameStage2Lease, Option<RegionHostOwner>)> {
         let expected = InventoryStage2OwnerIdentity {
             host_addr,
             generation: 0,
@@ -1037,9 +1060,18 @@ impl TaskMappingIndex {
                 .stage2_lease
                 .as_ref()
                 .is_some_and(|lease| lease.key() == (ipa, length) && lease.active && lease.mapped);
-            (exact_owner && exact_lease)
-                .then(|| mapping.stage2_lease.take())
-                .flatten()
+            if exact_owner && exact_lease {
+                let lease = mapping.stage2_lease.take()?;
+                let host_mapping = mapping.host_mapping.take();
+                if mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                    && host_mapping.is_some()
+                {
+                    super::stage2_backend::clear_el1_region_host_ptr_if(mapping.host_addr as usize);
+                }
+                Some((lease, host_mapping))
+            } else {
+                None
+            }
         })
     }
 }

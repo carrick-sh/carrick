@@ -459,18 +459,20 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
         let identity = owner.record_identity();
         // Exact records are removed only after terminal retirement. A prior
         // mapping-row retirement can finish before this MM drops its capacity.
-        if self
-            .custody
-            .stage2_record_snapshot(identity.record_id)
-            .is_some()
+        if identity.record_id.0 != 0
+            && self
+                .custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some()
         {
-            retire_carrier_stage2_record_at_safe_point(&self.custody, identity)
+            retire_structural_stage2_record_at_safe_point(&self.custody, identity)
                 .map_err(|error| error.to_string())?;
         }
-        if self
-            .custody
-            .stage2_record_snapshot(identity.record_id)
-            .is_some()
+        if identity.record_id.0 != 0
+            && self
+                .custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some()
         {
             return Err("raw table capacity retirement is still pinned".to_owned());
         }

@@ -1321,6 +1321,29 @@ impl GlobalFrameStage2Lease {
         self.try_retire_with_backing(custody, None)
     }
 
+    pub(crate) fn try_retire_with_region_owner(
+        &mut self,
+        custody: &CarrierVmCustody,
+        region_owner: Option<super::RegionHostOwner>,
+    ) -> Result<(), TrapError> {
+        match region_owner {
+            Some(super::RegionHostOwner::Exclusive(owned)) => {
+                self.try_retire_with_backing(custody, Some(owned))
+            }
+            Some(super::RegionHostOwner::BirthZone(backing)) => {
+                backing
+                    .live
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.try_retire_with_keeper(
+                    custody,
+                    None,
+                    Some(LeaseBackingKeeper::BirthZone(backing)),
+                )
+            }
+            None => self.try_retire(custody),
+        }
+    }
+
     pub(crate) fn try_retire_with_backing(
         &mut self,
         custody: &CarrierVmCustody,
@@ -2125,13 +2148,22 @@ pub(crate) fn register_carrier_stage2_leases(
     }
     if let Some(error) = transfer_error {
         drop(registered);
+        let mut rollback_error = None;
         for identity in identities {
-            if retire_carrier_stage2_record_at_safe_point(custody, identity).is_err() {
-                let _ = custody.request_stage2_record_retirement(identity);
+            if let Err(retire_err) = retire_carrier_stage2_record_at_safe_point(custody, identity) {
+                rollback_error.get_or_insert(retire_err);
+                custody.abandon_carrier_stage2_record(identity);
             }
         }
         for mut remaining in pending_iter {
-            let _ = remaining.try_retire(custody);
+            if let Err(retire_err) = remaining.try_retire(custody) {
+                rollback_error.get_or_insert(retire_err);
+            }
+        }
+        if let Some(rb) = rollback_error {
+            return Err(TrapError::Hypervisor(format!(
+                "{error}; carrier stage-2 batch rollback failed: {rb}"
+            )));
         }
         return Err(error);
     }
@@ -2234,6 +2266,59 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn cleared_stage2_record_identity() -> CarrierStage2RecordIdentity {
+    CarrierStage2RecordIdentity {
+        record_id: CarrierStage2RecordId(0),
+        vm_generation: CarrierVmGeneration(0),
+        logical_owner: None,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_structural_stage2_record_at_safe_point(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+) -> Result<(), TrapError> {
+    if identity.record_id.0 == 0 {
+        return Ok(());
+    }
+    match custody.retire_stage2_record(identity) {
+        CarrierStage2RetireOutcome::RetiredUnmapped
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            let extracted = {
+                let mut retained_by_record = custody.structural_backings.lock();
+                finalize_structural_backing_terminal_locked(
+                    custody,
+                    &mut retained_by_record,
+                    identity,
+                    &mut release_retired_stage2_ipa,
+                )?
+            };
+            drop(extracted);
+            drop_carrier_lease_keeper(custody, identity.record_id);
+            Ok(())
+        }
+        CarrierStage2RetireOutcome::NotFound => {
+            let retained_by_record = custody.structural_backings.lock();
+            if !retained_by_record.contains_key(&identity.record_id)
+                && custody.stage2_record_snapshot(identity.record_id).is_none()
+            {
+                Ok(())
+            } else {
+                Err(TrapError::Hypervisor(
+                    "retire structural stage-2 record at safe point: inconsistent missing record"
+                        .to_owned(),
+                ))
+            }
+        }
+        CarrierStage2RetireOutcome::DeferredActivePins => Ok(()),
+        outcome => Err(TrapError::Hypervisor(format!(
+            "retire structural stage-2 record at safe point: {outcome:?}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retire_carrier_stage2_record_at_safe_point_with(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
@@ -2247,7 +2332,48 @@ fn retire_carrier_stage2_record_at_safe_point_with(
     match retire(custody, identity) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
-            finalize_terminal_stage2_record_using(custody, identity, release)?;
+            if custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id)
+            {
+                let extracted = {
+                    let mut retained_by_record = custody.structural_backings.lock();
+                    finalize_structural_backing_terminal_locked(
+                        custody,
+                        &mut retained_by_record,
+                        identity,
+                        release,
+                    )?
+                };
+                drop(extracted);
+                drop_carrier_lease_keeper(custody, identity.record_id);
+                return Ok(());
+            }
+            match custody.claim_terminal_stage2_release_with_keeper(identity) {
+                Ok(super::carrier_custody::TerminalReleaseClaim::AlreadyTerminal(keeper)) => {
+                    drop(keeper);
+                }
+                Ok(super::carrier_custody::TerminalReleaseClaim::NeedsRelease { ipa, length }) => {
+                    if let Err(error) = release(ipa, length) {
+                        custody.abort_terminal_stage2_release(identity);
+                        return Err(error);
+                    }
+                    let keeper = custody.commit_terminal_stage2_release_with_keeper(identity);
+                    drop(keeper);
+                }
+                Err(CarrierStage2RecordError::RecordNotFound)
+                | Err(CarrierStage2RecordError::RecordIdentityMismatch)
+                    if custody.carrier_stage2_records.lock().get(&key) != Some(&identity) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "claim global owner terminal release: {error:?}"
+                    )));
+                }
+            }
             let mut records = custody.carrier_stage2_records.lock();
             if records.get(&key) == Some(&identity) {
                 records.remove(&key);
@@ -2296,7 +2422,7 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
             lease.mapped,
         )));
     }
-    let lease_keeper = lease.backing_keeper.take();
+    let mut lease_keeper = lease.backing_keeper.take();
     let registration = (|| {
         let expected_generation = lease
             .mapping
@@ -2338,7 +2464,7 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
         };
         let mapping = lease.mapping.take();
         let backend_map_installed = mapping.is_some();
-        CarrierVmCustody::register_stage2_record_with_mapping(
+        let identity = CarrierVmCustody::register_stage2_record_with_mapping(
             &mut stage2,
             CarrierStage2RecordSpec {
                 vm_generation,
@@ -2358,7 +2484,15 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
             TrapError::Hypervisor(format!(
                 "transfer global frame lease into carrier custody: {error:?}"
             ))
-        })
+        })?;
+        if let Some(keeper) = lease_keeper.take() {
+            let prev = custody.carrier_lease_keepers.lock().insert(
+                identity.record_id,
+                super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper),
+            );
+            debug_assert!(prev.is_none());
+        }
+        Ok(identity)
     })();
     let identity = match registration {
         Ok(identity) => identity,
@@ -2373,12 +2507,6 @@ fn transfer_global_frame_stage2_lease_with_backing_to_custody(
             return Err(registration_error);
         }
     };
-    if let Some(keeper) = lease_keeper {
-        custody
-            .carrier_lease_keepers
-            .lock()
-            .insert(identity.record_id, keeper);
-    }
     lease.active = false;
     lease.mapped = false;
     lease.mapping = None;
@@ -3177,6 +3305,9 @@ impl Drop for StructuralBackingOwner {
                 .store(true, std::sync::atomic::Ordering::Release);
             *self.retained.record_identity.lock()
         };
+        if identity.record_id.0 == 0 {
+            return;
+        }
         let _ = custody.request_stage2_record_retirement(identity);
         // The carrier pre-maps pooled table slots. Their stage-2 record has no
         // backend mapping to unmap, so the final owner can complete retirement
@@ -3295,7 +3426,11 @@ pub(crate) fn finalize_global_frame_owner_record_using(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn drop_carrier_lease_keeper(custody: &CarrierVmCustody, record_id: CarrierStage2RecordId) {
-    let keeper = custody.carrier_lease_keepers.lock().remove(&record_id);
+    let keeper = custody
+        .carrier_lease_keepers
+        .lock()
+        .remove(&record_id)
+        .map(super::carrier_custody::CarrierLeaseKeeperState::into_keeper);
     drop(keeper);
 }
 
@@ -3305,19 +3440,21 @@ pub(crate) fn finalize_terminal_stage2_record_using(
     identity: CarrierStage2RecordIdentity,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
-    let claim = custody
-        .claim_terminal_stage2_release(identity)
+    let keeper = match custody
+        .claim_terminal_stage2_release_with_keeper(identity)
         .map_err(|error| {
             TrapError::Hypervisor(format!("claim global owner terminal release: {error:?}"))
-        })?;
-    if let Some((ipa, length)) = claim {
-        if let Err(error) = release_ipa(ipa, length) {
-            custody.abort_terminal_stage2_release(identity);
-            return Err(error);
+        })? {
+        super::carrier_custody::TerminalReleaseClaim::AlreadyTerminal(keeper) => keeper,
+        super::carrier_custody::TerminalReleaseClaim::NeedsRelease { ipa, length } => {
+            if let Err(error) = release_ipa(ipa, length) {
+                custody.abort_terminal_stage2_release(identity);
+                return Err(error);
+            }
+            custody.commit_terminal_stage2_release_with_keeper(identity)
         }
-        custody.commit_terminal_stage2_release(identity);
-    }
-    drop_carrier_lease_keeper(custody, identity.record_id);
+    };
+    drop(keeper);
     Ok(())
 }
 
@@ -3351,6 +3488,7 @@ fn finalize_structural_backing_terminal_locked(
         }
         custody.commit_terminal_stage2_release(identity);
     }
+    *retained.record_identity.lock() = cleared_stage2_record_identity();
     Ok(retained_by_record.remove(&identity.record_id))
 }
 
@@ -3943,6 +4081,17 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             custody
                 .stage2
                 .at_client_point(super::carrier_custody::REPLAY_REBIND_ADMITTED);
+            if custody
+                .carrier_lease_keepers
+                .lock()
+                .get(&old_identity.record_id)
+                .is_some_and(super::carrier_custody::CarrierLeaseKeeperState::is_abandoned)
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "abandoned carrier-MM stage-2 record IPA 0x{:x} size {} cannot rebind",
+                    key.0, key.1
+                )));
+            }
             let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
                 &mut stage2,
                 old_identity,
@@ -3955,15 +4104,21 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                 ))
             })?;
             records.insert(key, new_identity);
-            drop(stage2);
-            drop(records);
             {
                 let mut keepers = custody.carrier_lease_keepers.lock();
-                if let Some(keeper) = keepers.remove(&old_identity.record_id) {
-                    keepers.insert(new_identity.record_id, keeper);
+                if let Some(super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper)) =
+                    keepers.remove(&old_identity.record_id)
+                {
+                    let prev = keepers.insert(
+                        new_identity.record_id,
+                        super::carrier_custody::CarrierLeaseKeeperState::Replayable(keeper),
+                    );
+                    debug_assert!(prev.is_none());
                 }
             }
-            let _ = custody.remove_terminal_stage2_record(old_identity);
+            let _ = stage2.remove_record(old_identity.record_id);
+            drop(stage2);
+            drop(records);
             report.rebound += 1;
             continue;
         }
@@ -3986,6 +4141,12 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         report.retired += 1;
     }
 
+    #[cfg(test)]
+    if custody.structural_backings.is_locked() {
+        custody
+            .stage2
+            .at_client_point(super::carrier_custody::STRUCTURAL_DIRECTORY_CONTENDED);
+    }
     let structural = custody
         .structural_backings
         .lock()
@@ -3993,9 +4154,15 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         .cloned()
         .collect::<Vec<_>>();
     for retained in structural {
+        #[cfg(test)]
+        if custody.structural_backings.is_locked() {
+            custody
+                .stage2
+                .at_client_point(super::carrier_custody::STRUCTURAL_DIRECTORY_CONTENDED);
+        }
         let mut retained_by_record = custody.structural_backings.lock();
         let identity = *retained.record_identity.lock();
-        if !retained_by_record.contains_key(&identity.record_id) {
+        if identity.record_id.0 == 0 || !retained_by_record.contains_key(&identity.record_id) {
             continue;
         }
         let snapshot = custody
@@ -5157,9 +5324,10 @@ pub(crate) fn forget_replay_extent(ipa: u64, size: usize) {
         .map(|(_, alias)| alias.ownership_scope)
         .collect();
     if candidate_scopes.is_empty() {
+        note_hot_path_rows(HotPathScan::AliasReplayScopes, registry.by_scope.len());
         for (scope, bucket) in &registry.by_scope {
             if bucket
-                .replay
+                .replay()
                 .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
                 .any(|(_, mapped_size, _, _, _)| *mapped_size == size)
             {
@@ -5168,30 +5336,37 @@ pub(crate) fn forget_replay_extent(ipa: u64, size: usize) {
         }
     }
     for scope in candidate_scopes {
+        let doomed: Vec<ReplayMappingKey> =
+            registry
+                .by_scope
+                .get(&scope)
+                .map_or_else(Vec::new, |bucket| {
+                    bucket
+                        .replay()
+                        .range(
+                            (ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX),
+                        )
+                        .filter(|(_, mapped_size, _, _, _)| *mapped_size == size)
+                        .copied()
+                        .collect()
+                });
+        if doomed.is_empty() {
+            continue;
+        }
+        for row in &doomed {
+            registry.remove_replay_in_scope(scope, row);
+        }
         if let Some(bucket) = registry.by_scope.get_mut(&scope) {
-            let doomed: Vec<ReplayMappingKey> = bucket
-                .replay
-                .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
-                .filter(|(_, mapped_size, _, _, _)| *mapped_size == size)
-                .copied()
-                .collect();
-            if doomed.is_empty() {
-                continue;
-            }
-            for row in &doomed {
-                bucket.replay.remove(row);
-            }
-            scoped_alias_epoch_update(&mut bucket.versions, None, &[ipa], &bucket.replay);
+            bucket.with_versions_and_replay(|versions, replay| {
+                scoped_alias_epoch_update(versions, None, &[ipa], replay);
+            });
         }
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn clear_replay_mappings() {
-    let mut registry = alias_registry().lock();
-    for bucket in registry.by_scope.values_mut() {
-        bucket.replay.clear();
-    }
+    alias_registry().lock().clear_replay_mappings_in();
 }
 
 /// Diagnostic: lazy-alias re-map count (the `debug-stats` feature logs every 256th).
@@ -5232,11 +5407,11 @@ pub(crate) fn register_shared_alias_if_vacant(
 fn register_shared_alias_locked(registry: &mut AliasRegistry, b: AliasBacking) {
     let scope = b.ownership_scope;
     let key = replay_mapping_key(b);
-    let bucket = registry.by_scope.entry(scope).or_default();
-    let replay_rows_changed = {
+    let (replay_rows_changed, stale_rows) = {
+        let bucket = registry.by_scope.entry(scope).or_default();
         let mut had_other = false;
         let mut had_exact = false;
-        for row in bucket.replay.range(
+        for row in bucket.replay().range(
             (b.physical_ipa, 0, 0, 0, 0)
                 ..=(b.physical_ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX),
         ) {
@@ -5246,13 +5421,19 @@ fn register_shared_alias_locked(registry: &mut AliasRegistry, b: AliasBacking) {
                 had_other = true;
             }
         }
-        had_other || !had_exact
+        let changed = had_other || !had_exact;
+        let stale = if changed {
+            replay_rows_for_ipa(bucket.replay(), b.physical_ipa)
+        } else {
+            Vec::new()
+        };
+        (changed, stale)
     };
     if replay_rows_changed {
-        for row in replay_rows_for_ipa(&bucket.replay, b.physical_ipa) {
-            bucket.replay.remove(&row);
+        for row in stale_rows {
+            registry.remove_replay_in_scope(scope, &row);
         }
-        bucket.replay.insert(key);
+        registry.insert_replay_in_scope(scope, key);
     }
     let old_entry = registry.upsert_by_key(b);
     let entry_changed = old_entry != Some(b);
@@ -5267,12 +5448,14 @@ fn register_shared_alias_locked(registry: &mut AliasRegistry, b: AliasBacking) {
         replay_ipas.push(old.physical_ipa);
     }
     let bucket = registry.by_scope.entry(scope).or_default();
-    scoped_alias_epoch_update(
-        &mut bucket.versions,
-        entry_changed.then_some((alias_version_key(&b), Some(b))),
-        &replay_ipas,
-        &bucket.replay,
-    );
+    bucket.with_versions_and_replay(|versions, replay| {
+        scoped_alias_epoch_update(
+            versions,
+            entry_changed.then_some((alias_version_key(&b), Some(b))),
+            &replay_ipas,
+            replay,
+        );
+    });
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5350,20 +5533,23 @@ pub(crate) fn remove_rows_for_retired_stage2_projections(
                 cleanup.preserved_reused_aliases.push(alias);
             }
         }
-        for bucket in registry.by_scope.values_mut() {
+        let scopes: Vec<_> = registry.by_scope.keys().copied().collect();
+        for scope in scopes {
             let mut removed_from_scope = Vec::new();
-            for row in replay_rows_for_ipa(&bucket.replay, physical_ipa) {
-                if row.1 as u64 != physical_length {
-                    continue;
-                }
-                if owners.contains(&(row.2, row.4)) {
-                    removed_from_scope.push(row);
-                } else {
-                    cleanup.preserved_reused_replay.push(row);
+            if let Some(bucket) = registry.by_scope.get(&scope) {
+                for row in replay_rows_for_ipa(bucket.replay(), physical_ipa) {
+                    if row.1 as u64 != physical_length {
+                        continue;
+                    }
+                    if owners.contains(&(row.2, row.4)) {
+                        removed_from_scope.push(row);
+                    } else {
+                        cleanup.preserved_reused_replay.push(row);
+                    }
                 }
             }
             for row in removed_from_scope {
-                bucket.replay.remove(&row);
+                registry.remove_replay_in_scope(scope, &row);
                 cleanup.removed_replay.push(row);
             }
         }
