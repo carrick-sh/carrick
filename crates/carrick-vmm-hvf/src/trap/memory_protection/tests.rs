@@ -3438,7 +3438,7 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
         registry.push(upsert_initial);
         for i in 1..=70_u64 {
             registry.push(AliasBacking {
-                start: 0x3000_0000 + i * 0x4000,
+                start: upsert_initial.start,
                 ipa: upsert_ipa,
                 host_addr: 0,
                 size: len,
@@ -3458,6 +3458,22 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
         assert_eq!(registry.upsert_by_key(upsert_live), Some(upsert_initial));
         assert!(!registry.contains_exact_physical_row(&upsert_initial));
         assert!(registry.contains_exact_physical_row(&upsert_live));
+        let ipa_bucket = registry.ipa_classes.rows_at(upsert_ipa, len as u64);
+        assert_eq!(ipa_bucket.len(), 71);
+        assert!(
+            ipa_bucket.windows(2).all(|w| w[0].0 < w[1].0),
+            "AliasClassIndex IPA bucket must stay strictly seq-sorted after upsert_by_key"
+        );
+        assert_eq!(ipa_bucket[0].1, upsert_live);
+        let va_bucket = registry
+            .va_classes
+            .rows_at(upsert_initial.start, len as u64);
+        assert_eq!(va_bucket.len(), 71);
+        assert!(
+            va_bucket.windows(2).all(|w| w[0].0 < w[1].0),
+            "AliasClassIndex VA bucket must stay strictly seq-sorted after upsert_by_key"
+        );
+        assert_eq!(va_bucket[0].1, upsert_live);
 
         // 200 distinct overlapping starts (`ipa = distinct_ipa - k * 0x1000`, wide enough
         // to cover `distinct_ipa`) plus live row `distinct_live`.
@@ -3531,9 +3547,13 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
                 owner_generation: 0,
             });
         }
+        // Clear pre-populated replay cache so every `stage2_map_replay` below
+        // exercises Phase 2 exact-row checks and real `stage2_map` installation.
+        registry.clear_replay_mappings_in();
     });
 
-    // Verify P0: `upsert_by_key` older-seq live row is still resolved cleanly.
+    // Verify P0 + full map path: `upsert_by_key` older-seq live row maps cleanly.
+    assert!(!ScopedStage2MapTestStub::is_mapped(upsert_ipa, len));
     let res_upserted = unsafe {
         stage2_map_replay(
             &custody,
@@ -3549,36 +3569,37 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(upsert_ipa, len));
 
-    // Verify P1-1: 200 distinct overlapping starts are sliced at `<= LAZY_REPLAY_ROW_BUDGET`
-    // rows per lock hold with ZERO revisited starts across slices.
-    {
-        let registry = alias_registry().lock();
-        let mut cursor = None;
-        let mut collected = Vec::new();
-        let mut slice_count = 0_usize;
-        loop {
-            let before_slice = alias_state_rows_scanned();
-            let next = registry.collect_replay_ipa_slice(
-                distinct_ipa,
-                cursor,
-                crate::trap::LAZY_REPLAY_ROW_BUDGET,
-                &mut collected,
-            );
-            let slice_scanned = alias_state_rows_scanned() - before_slice;
-            slice_count += 1;
-            assert!(
-                slice_scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
-                "slice {slice_count} exceeded lock budget: {slice_scanned}"
-            );
-            let Some(c) = next else {
-                break;
-            };
-            cursor = Some(c);
-        }
-        assert!(slice_count >= 4);
-        assert_eq!(collected.len(), 201);
-    }
+    // Verify production lock release and per-slice row budget between slices inside
+    // `stage2_map_replay` itself across 200 distinct overlapping starts + 1 live row.
+    let slice_fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let last_scanned =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(alias_state_rows_scanned()));
+    let slice_fires_hook = std::sync::Arc::clone(&slice_fires);
+    let last_scanned_hook = std::sync::Arc::clone(&last_scanned);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS
+            {
+                assert!(
+                    alias_registry().try_lock().is_some(),
+                    "production stage2_map_replay must release alias_registry lock between slices"
+                );
+                let now = alias_state_rows_scanned();
+                let prev = last_scanned_hook.swap(now, std::sync::atomic::Ordering::SeqCst);
+                let delta = now.saturating_sub(prev);
+                assert!(
+                    delta > 0 && delta <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
+                    "production slice inspected {delta} rows (budget {})",
+                    crate::trap::LAZY_REPLAY_ROW_BUDGET
+                );
+                slice_fires_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(distinct_ipa, len));
     let before_distinct = alias_state_rows_scanned();
     let res_distinct = unsafe {
         stage2_map_replay(
@@ -3588,6 +3609,14 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
             &mut |_| true,
         )
     };
+    custody.stage2.set_hook(None);
+    let tail_scanned =
+        alias_state_rows_scanned() - last_scanned.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(slice_fires.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(
+        tail_scanned > 0 && tail_scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
+        "final production slice tail inspected {tail_scanned} rows"
+    );
     assert_eq!(
         alias_state_rows_scanned() - before_distinct,
         201,
@@ -3600,8 +3629,10 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(distinct_ipa, len));
 
-    // Verify P1-2: both `MmRootSlot` and `Global` visible scopes resolve across classes.
+    // Verify cross-scope + cross-class newest-first merging on real backend map.
+    assert!(!ScopedStage2MapTestStub::is_mapped(0x7c10_0000, len));
     assert_eq!(
         unsafe {
             stage2_map_replay(
@@ -3620,6 +3651,9 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(0x7c10_0000, len));
+
+    assert!(!ScopedStage2MapTestStub::is_mapped(0x7c14_0000, len));
     assert_eq!(
         unsafe {
             stage2_map_replay(
@@ -3638,6 +3672,7 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(0x7c14_0000, len));
 
     // Verify duplicate insertion/removal and `retire_scope` keep `exact_row_counts` exact.
     mutate_external_alias_state(|registry| {
@@ -3669,6 +3704,215 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slic
         *registry = AliasRegistry::default();
     });
     drop(live_backing);
+}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
+    use crate::trap::stage2_backend::{
+        ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
+    };
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let custody = std::sync::Arc::new(CarrierVmCustody::new());
+    let g1 = custody.begin_create().expect("begin G1");
+    custody.commit_create(g1).expect("commit G1");
+
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+    let live_4k = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        0x1000,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("allocate 4 KiB backing");
+    let live_16k = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        0x4000,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("allocate 16 KiB backing");
+    let host_4k = live_4k.as_ptr() as usize;
+    let host_16k = live_16k.as_ptr() as usize;
+    let upsert_scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(4100));
+
+    // Subcase 1 (Codex #14 P0): Slice 1 collects `old_4k`; before Slice 2, an in-place
+    // `upsert_by_key` grows the same semantic row into `new_16k` (preserving `seq`) while
+    // `live_4k` remains live. Replay must restart coherently and resolve `new_16k`.
+    let ipa_grow = 0x7c40_0000_u64;
+    let old_4k = AliasBacking {
+        start: 0x3500_0000,
+        ipa: ipa_grow,
+        host_addr: host_4k,
+        size: 0x1000,
+        physical_ipa: ipa_grow,
+        physical_host_addr: host_4k,
+        physical_size: 0x1000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: upsert_scope,
+        inventory_backing: InventoryBackingIdentity::Private(9700),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let new_16k = AliasBacking {
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        inventory_backing: InventoryBackingIdentity::Private(9701),
+        ..old_4k
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(old_4k);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: 0x3501_0000 + i * 0x1000,
+                ipa: ipa_grow,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: ipa_grow,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(4200 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(9710 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.clear_replay_mappings_in();
+    });
+    let did_grow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let did_grow_hook = std::sync::Arc::clone(&did_grow);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS
+                && !did_grow_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                mutate_external_alias_state(|registry| {
+                    assert_eq!(registry.upsert_by_key(new_16k), Some(old_4k));
+                    registry.clear_replay_mappings_in();
+                });
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_grow, 0x4000));
+    let res_grow = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: ipa_grow },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    assert!(did_grow.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        res_grow,
+        Ok(Some((
+            new_16k,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_grow, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_grow, 0x1000));
+
+    // Subcase 2: `old_16k` (earliest seq) starts in the 16 KiB class behind 70 dead 4 KiB
+    // rows; between Slice 1 (past row 64 of the 4 KiB bucket) and Slice 2, `upsert_by_key`
+    // shrinks it into `new_4k` at index 0 of the already-traversed 4 KiB bucket.
+    let ipa_shrink = 0x7c50_0000_u64;
+    let old_16k = AliasBacking {
+        start: 0x3600_0000,
+        ipa: ipa_shrink,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_shrink,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: upsert_scope,
+        inventory_backing: InventoryBackingIdentity::Private(9800),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let new_4k = AliasBacking {
+        host_addr: host_4k,
+        size: 0x1000,
+        physical_host_addr: host_4k,
+        physical_size: 0x1000,
+        inventory_backing: InventoryBackingIdentity::Private(9801),
+        ..old_16k
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(old_16k);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: 0x3601_0000 + i * 0x1000,
+                ipa: ipa_shrink,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: ipa_shrink,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(4300 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(9810 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.clear_replay_mappings_in();
+    });
+    let did_shrink = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let did_shrink_hook = std::sync::Arc::clone(&did_shrink);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS
+                && !did_shrink_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                mutate_external_alias_state(|registry| {
+                    assert_eq!(registry.upsert_by_key(new_4k), Some(old_16k));
+                    registry.clear_replay_mappings_in();
+                });
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_shrink, 0x1000));
+    let res_shrink = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: ipa_shrink },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    assert!(did_shrink.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        res_shrink,
+        Ok(Some((
+            new_4k,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_shrink, 0x1000));
+
+    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+    drop(live_4k);
+    drop(live_16k);
 }
 
 #[test]

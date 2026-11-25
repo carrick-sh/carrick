@@ -621,16 +621,15 @@ impl AliasClassIndex {
         oldest.map(|(_, alias)| alias)
     }
 
-    /// Collect at most `budget` candidate rows containing `probe`, resuming from
-    /// `cursor` without ever revisiting prior `(class, start_key)` buckets.
-    /// Returns `(next_cursor, scanned_rows)`.
+    /// Collect at most `budget` candidate rows containing `probe` from an
+    /// unchanged registry revision, resuming at `cursor` in O(1) without ever
+    /// revisiting prior `(class, start_key)` buckets.
     pub(crate) fn collect_containing_slice(
         &self,
         probe: u64,
         cursor: Option<ClassSliceCursor>,
-        revision_matched: bool,
         budget: usize,
-        found: &mut Vec<(u64, AliasBacking)>,
+        slice_buf: &mut Vec<(u64, AliasBacking)>,
         mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> (Option<ClassSliceCursor>, usize) {
         if budget == 0 {
@@ -654,15 +653,7 @@ impl AliasClassIndex {
                 .range((class, range_start)..=(class, probe))
             {
                 let start_idx = match cursor {
-                    Some(c) if c.class == class && c.start_key == start_key => {
-                        if revision_matched {
-                            c.next_pos.min(rows.len())
-                        } else if let Some(prev_seq) = c.last_seq {
-                            rows.partition_point(|&(seq, _)| seq <= prev_seq)
-                        } else {
-                            0
-                        }
-                    }
+                    Some(c) if c.class == class && c.start_key == start_key => c.next_pos,
                     _ => 0,
                 };
                 if start_idx >= rows.len() {
@@ -675,7 +666,7 @@ impl AliasClassIndex {
                 let end_idx = start_idx + take;
                 for &(seq, alias) in &rows[start_idx..end_idx] {
                     if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
-                        found.push((seq, alias));
+                        slice_buf.push((seq, alias));
                     }
                 }
                 if remaining == 0 {
@@ -684,7 +675,6 @@ impl AliasClassIndex {
                             class,
                             start_key,
                             next_pos: end_idx,
-                            last_seq: Some(rows[end_idx - 1].0),
                         })
                     } else if let Some(next_start) = start_key.checked_add(1)
                         && next_start <= probe
@@ -693,14 +683,12 @@ impl AliasClassIndex {
                             class,
                             start_key: next_start,
                             next_pos: 0,
-                            last_seq: None,
                         })
                     } else {
                         class.checked_add(1).map(|next_class| ClassSliceCursor {
                             class: next_class,
                             start_key: 0,
                             next_pos: 0,
-                            last_seq: None,
                         })
                     };
                     return (next_cursor, scanned);
@@ -723,7 +711,6 @@ pub(crate) struct ClassSliceCursor {
     pub(crate) class: u32,
     pub(crate) start_key: u64,
     pub(crate) next_pos: usize,
-    pub(crate) last_seq: Option<u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -738,6 +725,20 @@ pub(crate) struct ReplaySliceCursor {
     pub(crate) scope_index: usize,
     pub(crate) revision: u64,
     pub(crate) class_cursor: ClassSliceCursor,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) enum ReplaySliceStep {
+    Complete,
+    Continue(ReplaySliceCursor),
+    RestartFromRevision,
 }
 
 /// Maximum candidate rows inspected per lazy stage-2 replay lookup so stacked
@@ -1629,52 +1630,70 @@ impl AliasRegistry {
         probe: u64,
         cursor: Option<ReplaySliceCursor>,
         budget: usize,
-        out: &mut Vec<(u64, AliasBacking)>,
+        slice_buf: &mut Vec<(u64, AliasBacking)>,
         matches: impl FnMut(&AliasBacking) -> bool,
-    ) -> Option<ReplaySliceCursor> {
-        let rev_matched = cursor.is_some_and(|c| c.revision == self.revision);
+    ) -> ReplaySliceStep {
+        if let Some(c) = cursor
+            && c.revision != self.revision
+        {
+            return ReplaySliceStep::RestartFromRevision;
+        }
         let (next, _) = index.collect_containing_slice(
             probe,
             cursor.map(|c| c.class_cursor),
-            rev_matched,
             budget,
-            out,
+            slice_buf,
             matches,
         );
-        next.map(|class_cursor| ReplaySliceCursor {
-            scope_index: 0,
-            revision: self.revision,
-            class_cursor,
-        })
+        match next {
+            Some(class_cursor) => ReplaySliceStep::Continue(ReplaySliceCursor {
+                scope_index: 0,
+                revision: self.revision,
+                class_cursor,
+            }),
+            None => ReplaySliceStep::Complete,
+        }
     }
 
-    /// Bounded lock-slice collector for IPA replay candidates; never revisits
-    /// prior `(class, start_key)` buckets across lock yields.
+    /// Bounded lock-slice collector for IPA replay candidates; aborts cleanly on
+    /// cross-slice mutation so the caller never mixes stale and updated rows.
     pub(crate) fn collect_replay_ipa_slice(
         &self,
         gpa: u64,
         cursor: Option<ReplaySliceCursor>,
         budget: usize,
-        out: &mut Vec<(u64, AliasBacking)>,
-    ) -> Option<ReplaySliceCursor> {
-        self.collect_single_index_replay_slice(&self.ipa_classes, gpa, cursor, budget, out, |e| {
-            gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64)
-        })
+        slice_buf: &mut Vec<(u64, AliasBacking)>,
+    ) -> ReplaySliceStep {
+        self.collect_single_index_replay_slice(
+            &self.ipa_classes,
+            gpa,
+            cursor,
+            budget,
+            slice_buf,
+            |e| gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64),
+        )
     }
 
-    /// Bounded lock-slice collector for global VA replay candidates; never
-    /// revisits prior `(class, start_key)` buckets across lock yields.
+    /// Bounded lock-slice collector for global VA replay candidates; aborts cleanly
+    /// on cross-slice mutation so the caller never mixes stale and updated rows.
     pub(crate) fn collect_replay_any_va_slice(
         &self,
         va: u64,
         cursor: Option<ReplaySliceCursor>,
         budget: usize,
-        out: &mut Vec<(u64, AliasBacking)>,
-    ) -> Option<ReplaySliceCursor> {
-        self.collect_single_index_replay_slice(&self.va_classes, va, cursor, budget, out, |entry| {
-            va >= entry.start
-                && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
-        })
+        slice_buf: &mut Vec<(u64, AliasBacking)>,
+    ) -> ReplaySliceStep {
+        self.collect_single_index_replay_slice(
+            &self.va_classes,
+            va,
+            cursor,
+            budget,
+            slice_buf,
+            |entry| {
+                va >= entry.start
+                    && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+            },
+        )
     }
 
     /// Exact O(1) membership revalidation under `(stage2, alias_registry)`.
@@ -2953,8 +2972,8 @@ impl AliasRegistry {
     }
 
     /// Bounded lock-slice collector across a process's two visible scopes
-    /// (`MmRootSlot`/`ContainerRoot` and `Global`), resuming across scopes
-    /// without revisiting prior buckets or dropping deeper candidates.
+    /// (`MmRootSlot`/`ContainerRoot` and `Global`), aborts cleanly on cross-slice
+    /// mutation so the caller never mixes stale and updated rows.
     pub(crate) fn collect_replay_process_va_slice(
         &self,
         va: u64,
@@ -2962,55 +2981,57 @@ impl AliasRegistry {
         container_root: ContainerRootToken,
         cursor: Option<ReplaySliceCursor>,
         budget: usize,
-        out: &mut Vec<(u64, AliasBacking)>,
-    ) -> Option<ReplaySliceCursor> {
+        slice_buf: &mut Vec<(u64, AliasBacking)>,
+    ) -> ReplaySliceStep {
+        if let Some(c) = cursor
+            && c.revision != self.revision
+        {
+            return ReplaySliceStep::RestartFromRevision;
+        }
         if budget == 0 {
-            return cursor;
+            return cursor.map_or(ReplaySliceStep::Complete, ReplaySliceStep::Continue);
         }
         let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
         let mut remaining = budget;
         let start_scope = cursor.map_or(0, |c| c.scope_index);
-        let rev_matched = cursor.is_some_and(|c| c.revision == self.revision);
         for (scope_index, scope) in scopes.iter().enumerate().skip(start_scope) {
-            if remaining == 0 {
-                return Some(ReplaySliceCursor {
-                    scope_index,
-                    revision: self.revision,
-                    class_cursor: ClassSliceCursor {
-                        class: 0,
-                        start_key: 0,
-                        next_pos: 0,
-                        last_seq: None,
-                    },
-                });
-            }
             let Some(index) = self.va_classes_by_scope.get(scope) else {
                 continue;
             };
             let class_cursor = cursor
                 .filter(|c| c.scope_index == scope_index)
                 .map(|c| c.class_cursor);
-            let (next, scanned) = index.collect_containing_slice(
-                va,
-                class_cursor,
-                rev_matched,
-                remaining,
-                out,
-                |alias| {
+            let (next, scanned) =
+                index.collect_containing_slice(va, class_cursor, remaining, slice_buf, |alias| {
                     va >= alias.start
                         && va.saturating_add(1) <= alias.start.saturating_add(alias.size as u64)
-                },
-            );
+                });
             remaining = remaining.saturating_sub(scanned);
             if let Some(next_class_cursor) = next {
-                return Some(ReplaySliceCursor {
+                return ReplaySliceStep::Continue(ReplaySliceCursor {
                     scope_index,
                     revision: self.revision,
                     class_cursor: next_class_cursor,
                 });
             }
+            if remaining == 0 {
+                let next_scope = scope_index + 1;
+                return if next_scope < scopes.len() {
+                    ReplaySliceStep::Continue(ReplaySliceCursor {
+                        scope_index: next_scope,
+                        revision: self.revision,
+                        class_cursor: ClassSliceCursor {
+                            class: 0,
+                            start_key: 0,
+                            next_pos: 0,
+                        },
+                    })
+                } else {
+                    ReplaySliceStep::Complete
+                };
+            }
         }
-        None
+        ReplaySliceStep::Complete
     }
 
     /// Candidates for `newest_process_alias_containing_va`, newest first; the

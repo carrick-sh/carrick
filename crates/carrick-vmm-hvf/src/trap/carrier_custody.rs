@@ -2256,6 +2256,8 @@ pub(crate) const COMMIT_DESTROY_HOLDING_STAGE2: &str = "commit destroy holding s
 #[cfg(test)]
 pub(crate) const REPLAY_REMAP_DURING_PHASE1_LOOKUP: &str = "replay remap during phase1 lookup";
 #[cfg(test)]
+pub(crate) const REPLAY_SLICE_BETWEEN_LOCKS: &str = "replay slice between locks";
+#[cfg(test)]
 pub(crate) const REPLAY_REMAP_BEFORE_GUARD: &str = "replay remap before guard";
 #[cfg(test)]
 pub(crate) const REPLAY_REMAP_LOOKED_UP: &str = "replay remap looked up";

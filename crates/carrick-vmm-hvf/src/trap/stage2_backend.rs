@@ -497,17 +497,20 @@ pub(crate) unsafe fn stage2_map_replay(
     lookup: ReplayAliasLookup,
     allow_ipa: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
+    const MAX_REPLAY_REVISION_RESTARTS: usize = 8;
     let mut candidates: Vec<(u64, AliasBacking)> = Vec::new();
+    let mut slice_buf: Vec<(u64, AliasBacking)> = Vec::with_capacity(super::LAZY_REPLAY_ROW_BUDGET);
     let mut slice_cursor: Option<super::ReplaySliceCursor> = None;
+    let mut restarts = 0_usize;
     loop {
-        let next_cursor = {
+        let step = {
             let registry = super::alias_registry().lock();
             match lookup {
                 ReplayAliasLookup::Ipa { gpa } => registry.collect_replay_ipa_slice(
                     gpa,
                     slice_cursor,
                     super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut candidates,
+                    &mut slice_buf,
                 ),
                 ReplayAliasLookup::VaProcess {
                     va,
@@ -519,26 +522,41 @@ pub(crate) unsafe fn stage2_map_replay(
                     container_root,
                     slice_cursor,
                     super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut candidates,
+                    &mut slice_buf,
                 ),
                 ReplayAliasLookup::VaAnyScope { va } => registry.collect_replay_any_va_slice(
                     va,
                     slice_cursor,
                     super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut candidates,
+                    &mut slice_buf,
                 ),
             }
         };
+        candidates.append(&mut slice_buf);
         #[cfg(test)]
         if slice_cursor.is_none() {
             custody
                 .stage2
                 .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
         }
-        let Some(next) = next_cursor else {
-            break;
-        };
-        slice_cursor = Some(next);
+        match step {
+            super::ReplaySliceStep::Complete => break,
+            super::ReplaySliceStep::Continue(next) => {
+                #[cfg(test)]
+                custody
+                    .stage2
+                    .at_client_point(super::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS);
+                slice_cursor = Some(next);
+            }
+            super::ReplaySliceStep::RestartFromRevision => {
+                candidates.clear();
+                slice_cursor = None;
+                restarts += 1;
+                if restarts > MAX_REPLAY_REVISION_RESTARTS {
+                    return Ok(None);
+                }
+            }
+        }
     }
     if matches!(lookup, ReplayAliasLookup::Ipa { .. }) {
         candidates.sort_by_key(|(seq, _)| *seq);
