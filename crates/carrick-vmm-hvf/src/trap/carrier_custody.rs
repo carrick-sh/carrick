@@ -2224,6 +2224,113 @@ mod carrier_vm_custody_tests {
         assert!(snapshot.terminalized_by_vm_destroy && !snapshot.mapped);
     }
 
+    /// A `GlobalFrameStage2Lease` mapped in `G1` carries no generation on the
+    /// lease before `Stage2Mapping` replaces its `backend_map_installed` bool.
+    /// If `G1` destroys and `G2` starts before custody transfer runs, transfer
+    /// must refuse `G1`'s stale mapping instead of fabricating a live `G2`
+    /// record, and rollback must never unmap `G2`'s stage 2.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn g1_mapped_lease_never_transfers_into_g2_and_never_unmaps_g2() {
+        use super::super::stage2_backend::ScopedStage2MapTestStub;
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (custody, _g1) = live_custody();
+        let ipa = 0xa081_c000_0000_u64;
+        let len = 0x4000_usize;
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        let mut backing = vec![0_u8; len];
+        assert_eq!(
+            unsafe { super::inventory_stage2_map(backing.as_mut_ptr().cast(), ipa, len, perms) },
+            0
+        );
+        lease.mark_mapped();
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        ScopedStage2MapTestStub::clear_events();
+
+        let transferred = super::transfer_global_frame_stage2_lease_to_custody(
+            &custody,
+            lease,
+            backing.as_ptr() as usize,
+            perms,
+            None,
+        );
+        assert!(
+            transferred.is_err(),
+            "a lease mapped in destroyed G1 transferred into live G2: {transferred:?}"
+        );
+        assert!(custody.stage2_record_identities().is_empty());
+        assert!(
+            ScopedStage2MapTestStub::events().is_empty(),
+            "retiring destroyed G1 lease emitted backend unmap on G2: {:?}",
+            ScopedStage2MapTestStub::events()
+        );
+    }
+
+    /// Rolling back an un-transferred `G1` mapped lease after `G1` destroyed
+    /// and `G2` mapped the same IPA must drop the gone `G1` mapping without
+    /// unmapping `G2`'s backend extent.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn g1_mapped_lease_rollback_after_vm_destroy_never_unmaps_g2() {
+        use super::super::stage2_backend::ScopedStage2MapTestStub;
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (custody, _g1) = live_custody();
+        let ipa = 0xa081_d000_0000_u64;
+        let len = 0x4000_usize;
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut g1_lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        let mut g1_backing = vec![0_u8; len];
+        assert_eq!(
+            unsafe { super::inventory_stage2_map(g1_backing.as_mut_ptr().cast(), ipa, len, perms) },
+            0
+        );
+        g1_lease.mark_mapped();
+
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        let mut g2_backing = vec![0_u8; len];
+        assert_eq!(
+            unsafe { super::inventory_stage2_map(g2_backing.as_mut_ptr().cast(), ipa, len, perms) },
+            0
+        );
+        assert!(ScopedStage2MapTestStub::is_mapped(ipa, len));
+        ScopedStage2MapTestStub::clear_events();
+
+        super::rollback_partial_process_stage2_authorities(
+            &custody,
+            &mut [g1_lease],
+            &[],
+            &[],
+            std::collections::BTreeMap::new(),
+        )
+        .expect("rollback of gone G1 lease settles cleanly");
+        assert!(
+            ScopedStage2MapTestStub::events().is_empty()
+                && ScopedStage2MapTestStub::is_mapped(ipa, len),
+            "rolling back a destroyed G1 lease unmapped live G2: events={:?}",
+            ScopedStage2MapTestStub::events()
+        );
+    }
+
     fn register_test_stage2_record(
         custody: &CarrierVmCustody,
         spec: CarrierStage2RecordSpec,
