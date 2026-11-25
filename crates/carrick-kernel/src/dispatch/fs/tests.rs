@@ -15876,11 +15876,14 @@ mod window_size_door {
         }
     }
 
-    /// Record `host` as windowed; the returned file pins it.
-    fn window(_run: &Run, host: &std::path::Path) -> std::fs::File {
+    /// Record `host` as windowed; the returned pair keeps both the inode and fence pin live.
+    fn window(
+        _run: &Run,
+        host: &std::path::Path,
+    ) -> (std::fs::File, carrick_vfs::host_size::WindowRegistration) {
         let pin = std::fs::File::open(host).unwrap();
-        carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)).unwrap();
-        pin
+        let reg = carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)).unwrap();
+        (pin, reg)
     }
 
     fn size(host: &std::path::Path) -> u64 {

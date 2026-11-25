@@ -35,19 +35,54 @@
 use std::collections::HashMap;
 #[cfg(any(target_os = "linux", test))]
 use std::os::fd::FromRawFd;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::LazyLock;
 
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::vfs::InodeIdentity;
 
-/// Each windowed inode, with its birth time when the host reports one. No
-/// descriptor is kept: the window's own host mapping keeps the inode alive
-/// while it is recorded, and the birth time tells a reused `(st_dev, st_ino)`
-/// from the recorded inode, so the registry costs no host descriptor and is
-/// bounded by the window slots that exist.
-type Registry = HashMap<InodeIdentity, Birth>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowEntry {
+    birth: Birth,
+    refs: usize,
+}
+
+/// Process-wide live pin keeping an inode registered in the shrink fence
+/// while at least one carrier retains a shared window slot for it (#1338 A1,
+/// #2975 P0 2). Holds no host descriptor; drops the entry when the last
+/// carrier reference drops.
+#[derive(Debug)]
+pub struct WindowRegistration {
+    identity: InodeIdentity,
+}
+
+impl WindowRegistration {
+    pub fn identity(&self) -> InodeIdentity {
+        self.identity
+    }
+}
+
+impl Drop for WindowRegistration {
+    fn drop(&mut self) {
+        let mut registry = WINDOWED.write();
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            registry.entry(self.identity)
+        {
+            if entry.get().refs <= 1 {
+                entry.remove();
+            } else {
+                entry.get_mut().refs -= 1;
+            }
+        }
+    }
+}
+
+/// Each windowed inode, with its birth time when the host reports one and
+/// active reference count. No descriptor is kept: the window's own host
+/// mapping keeps the inode alive while it is recorded, and the birth time
+/// tells a reused `(st_dev, st_ino)` from the recorded inode.
+type Registry = HashMap<InodeIdentity, WindowEntry>;
 
 static WINDOWED: LazyLock<RwLock<Registry>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -99,9 +134,15 @@ impl Fenced {
 /// window can be recorded for the file until the resize has been applied.
 /// The door applies it itself ([`Resize::apply`]): the admitted length on
 /// the admitted descriptor, nothing else.
+#[allow(dead_code)]
+enum RegistryGuard<'a> {
+    Read(RwLockReadGuard<'a, Registry>),
+    Write(RwLockWriteGuard<'a, Registry>),
+}
+
 #[must_use = "an admitted resize does nothing until it is applied"]
 pub struct Resize<'a> {
-    _registry: RwLockReadGuard<'a, Registry>,
+    _registry: RegistryGuard<'a>,
     fd: BorrowedFd<'a>,
     len: libc::off_t,
 }
@@ -137,13 +178,23 @@ impl Discard<'_> {
 
 /// Admit a resize of the file `fd` names to `len` bytes: `Err(EFBIG)` for a
 /// length the host cannot represent, `Err(`[`Fenced::ERRNO`]`)` when
-/// fenced.
+/// fenced. Serializes concurrent resizes on any windowed inode under
+/// `WINDOWED.write()` across the EOF check and `ftruncate` (#2975 P0 1).
 pub fn admit_resize(fd: BorrowedFd<'_>, len: u64) -> Result<Resize<'_>, libc::c_int> {
     let off = libc::off_t::try_from(len).map_err(|_| libc::EFBIG)?;
     let registry = WINDOWED.read();
-    check(&registry, fd.as_raw_fd(), Change::Resize(len)).map_err(|Fenced| Fenced::ERRNO)?;
+    if !registry.is_empty() && is_windowed_or_unstatable(&registry, fd.as_raw_fd()) {
+        drop(registry);
+        let registry = WINDOWED.write();
+        check(&registry, fd.as_raw_fd(), Change::Resize(len)).map_err(|Fenced| Fenced::ERRNO)?;
+        return Ok(Resize {
+            _registry: RegistryGuard::Write(registry),
+            fd,
+            len: off,
+        });
+    }
     Ok(Resize {
-        _registry: registry,
+        _registry: RegistryGuard::Read(registry),
         fd,
         len: off,
     })
@@ -167,23 +218,34 @@ pub fn resize(fd: BorrowedFd<'_>, len: u64) -> Result<(), libc::c_int> {
 }
 
 /// An `open(2)` of a guest file through the door. `open` is the host open
-/// with the flags to use. Without `O_TRUNC`, or with no window anywhere, it
-/// runs once with `flags` as given. Otherwise it runs without `O_TRUNC`,
-/// and the truncation is admitted against the descriptor it returned, the
-/// exact object, then applied to it: `Err(`[`Fenced::ERRNO`]`)` (and the
-/// descriptor closed) when fenced. As `O_TRUNC` does, only a regular file
-/// is truncated.
+/// with the flags to use. Without `O_TRUNC`, or on `O_CREAT | O_EXCL` (which
+/// atomically creates a fresh unmapped inode), it runs once with `flags` as
+/// given. Otherwise it runs without `O_TRUNC`, and the truncation is admitted
+/// against the descriptor it returned, the exact object, then applied to it:
+/// `Err(`[`Fenced::ERRNO`]`)` (and the descriptor closed) when fenced.
 pub fn open_truncating(
     flags: libc::c_int,
     open: impl FnOnce(libc::c_int) -> Result<OwnedFd, libc::c_int>,
+) -> Result<OwnedFd, libc::c_int> {
+    open_truncating_with(flags, open, reopen_writable_self_fd)
+}
+
+fn open_truncating_with(
+    flags: libc::c_int,
+    open: impl FnOnce(libc::c_int) -> Result<OwnedFd, libc::c_int>,
+    reopen_writable: impl FnOnce(BorrowedFd<'_>, libc::c_int) -> Result<OwnedFd, libc::c_int>,
 ) -> Result<OwnedFd, libc::c_int> {
     if flags & libc::O_TRUNC == 0 {
         // An ordinary open changes no size: the door is not involved.
         return open(flags);
     }
-    // The host open runs with no lock held (it may block, a FIFO or a slow
-    // mount): only the truncation, admitted against the object it returned,
-    // runs under the registry's read lock.
+    // `O_CREAT | O_EXCL` atomically creates a brand-new inode (or fails EEXIST),
+    // which no existing carrier window can map; passing `O_TRUNC` straight to
+    // the host preserves `O_CREAT | O_EXCL | O_RDONLY | O_TRUNC` on mode `0444`.
+    if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
+        return open(flags);
+    }
+    // Host opens run with no lock held (they may block on a FIFO or slow FS).
     let owned = open(flags & !libc::O_TRUNC)?;
     let Some(stat) = fstat(owned.as_raw_fd()) else {
         return Err(last_errno());
@@ -191,33 +253,29 @@ pub fn open_truncating(
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Ok(owned);
     }
-    let registry = WINDOWED.read();
-    check(&registry, owned.as_raw_fd(), Change::Resize(0)).map_err(|Fenced| Fenced::ERRNO)?;
     if flags & libc::O_ACCMODE != libc::O_RDONLY {
-        // SAFETY: a plain host call on the descriptor this function owns.
-        if unsafe { libc::ftruncate(owned.as_raw_fd(), 0) } != 0 {
-            return Err(last_errno());
-        }
+        admit_resize(owned.as_fd(), 0)?.apply()?;
         return Ok(owned);
     }
-    reopen_truncating(owned, flags)
+    // `O_RDONLY | O_TRUNC` (Linux truncates when the caller may write, open(2)):
+    // open a writable handle via `/proc/self/fd` BEFORE acquiring `WINDOWED`,
+    // then admit and truncate under the door while returning the caller's
+    // `O_RDONLY` descriptor intact (#2975 P0 4).
+    let writable = reopen_writable(owned.as_fd(), flags)?;
+    admit_resize(writable.as_fd(), 0)?.apply()?;
+    Ok(owned)
 }
 
-/// `O_RDONLY | O_TRUNC` (Linux truncates when the caller may write, open(2)):
-/// reopen the exact object through its descriptor with the caller's flags.
 #[cfg(target_os = "linux")]
-fn reopen_truncating(owned: OwnedFd, flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
+fn reopen_writable_self_fd(owned: BorrowedFd<'_>, flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
     let path = std::ffi::CString::new(format!("/proc/self/fd/{}", owned.as_raw_fd()))
         .map_err(|_| libc::EINVAL)?;
-    // The object exists now: creation flags no longer apply, and the
-    // descriptor link is followed by design.
-    let flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW);
-    // SAFETY: a NUL-terminated path naming a descriptor this function owns.
-    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    let wr_flags = libc::O_WRONLY | libc::O_CLOEXEC | (flags & libc::O_NONBLOCK);
+    // SAFETY: a NUL-terminated `/proc/self/fd` path naming a descriptor this function borrows.
+    let fd = unsafe { libc::open(path.as_ptr(), wr_flags) };
     if fd < 0 {
         return Err(last_errno());
     }
-    drop(owned);
     // SAFETY: `open` returned a fresh descriptor this function now owns.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -225,25 +283,34 @@ fn reopen_truncating(owned: OwnedFd, flags: libc::c_int) -> Result<OwnedFd, libc
 /// No window exists on a host without one (#2972): refuse rather than open
 /// untruncated.
 #[cfg(not(target_os = "linux"))]
-fn reopen_truncating(owned: OwnedFd, _flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
-    drop(owned);
+fn reopen_writable_self_fd(_owned: BorrowedFd<'_>, _flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
     Err(Fenced::ERRNO)
 }
 
-/// Record the host file `fd` names as mapped by a shared file window,
-/// before the window's source is retained. `None` (nothing recorded) when
-/// its identity cannot be read: the caller must not window it.
 /// Return the `(device, inode)` identity of `fd` without pinning it.
 pub fn identity(fd: BorrowedFd<'_>) -> Option<InodeIdentity> {
     fstat(fd.as_raw_fd()).map(|stat| identity_of(&stat))
 }
 
-pub fn record(fd: BorrowedFd<'_>) -> Option<InodeIdentity> {
+/// Record the host file `fd` names as mapped by a shared file window,
+/// returning a reference-counted registration that clears the fence when the
+/// final carrier drops it (#1338 A1, #2975 P0 2). `None` when its identity
+/// cannot be read: the caller must not window it.
+pub fn record(fd: BorrowedFd<'_>) -> Option<WindowRegistration> {
     let stat = fstat(fd.as_raw_fd())?;
     let identity = identity_of(&stat);
     let birth = birth(fd.as_raw_fd(), &stat);
-    WINDOWED.write().insert(identity, birth);
-    Some(identity)
+    let mut registry = WINDOWED.write();
+    match registry.entry(identity) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().birth = birth;
+            entry.get_mut().refs += 1;
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(WindowEntry { birth, refs: 1 });
+        }
+    }
+    Some(WindowRegistration { identity })
 }
 
 /// Whether a window of this process maps `identity`.
@@ -256,6 +323,16 @@ pub fn any_window() -> bool {
     !WINDOWED.read().is_empty()
 }
 
+fn is_windowed_or_unstatable(registry: &Registry, fd: RawFd) -> bool {
+    let Some(stat) = fstat(fd) else {
+        return true;
+    };
+    matches!(
+        registry.get(&identity_of(&stat)),
+        Some(recorded) if recorded.birth == birth(fd, &stat)
+    )
+}
+
 fn check(registry: &Registry, fd: RawFd, change: Change) -> Result<(), Fenced> {
     if registry.is_empty() {
         return Ok(());
@@ -265,7 +342,7 @@ fn check(registry: &Registry, fd: RawFd, change: Change) -> Result<(), Fenced> {
     };
     match registry.get(&identity_of(&stat)) {
         // A reused `(st_dev, st_ino)` is another inode: not windowed.
-        Some(&recorded) if recorded == birth(fd, &stat) => {}
+        Some(recorded) if recorded.birth == birth(fd, &stat) => {}
         _ => return Ok(()),
     }
     match change {
@@ -346,6 +423,9 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
+    static TEST_REGISTRY_MUTEX: LazyLock<parking_lot::Mutex<()>> =
+        LazyLock::new(|| parking_lot::Mutex::new(()));
+
     fn file(len: u64) -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
@@ -382,9 +462,11 @@ mod tests {
 
     #[test]
     fn a_window_fences_every_shrink_of_its_inode_by_the_object_mutated() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
         let (_dir, path, windowed) = file(8192);
         let (_other_dir, other_path, other) = file(8192);
-        let identity = record(windowed.as_fd()).unwrap();
+        let _reg = record(windowed.as_fd()).unwrap();
+        let identity = _reg.identity();
         assert!(maps(identity));
         assert!(any_window());
 
@@ -446,19 +528,128 @@ mod tests {
     /// a window being recorded, and so never wedges every other change.
     #[test]
     fn no_host_open_runs_under_the_registry_lock() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
         let (_dir, path, _file) = file(4096);
         for flags in [libc::O_RDWR, libc::O_RDWR | libc::O_TRUNC] {
             let opened = open_truncating(flags, |flags| {
-                // A writer can take the lock while the open runs (bounded:
-                // another test's read lock is held only for a check).
-                let taken = WINDOWED
-                    .try_write_for(std::time::Duration::from_secs(10))
-                    .is_some();
-                assert!(taken, "the registry is locked across the open ({flags:#x})");
+                assert!(
+                    WINDOWED.try_write().is_some(),
+                    "the registry is locked across the open ({flags:#x})"
+                );
                 host_open(&path, flags)
             });
             assert!(opened.is_ok());
         }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&path, b"abcdef").unwrap();
+            let opened = open_truncating_with(
+                libc::O_RDONLY | libc::O_TRUNC,
+                |flags| {
+                    assert!(
+                        WINDOWED.try_write().is_some(),
+                        "the registry is locked across initial O_RDONLY|O_TRUNC open"
+                    );
+                    host_open(&path, flags)
+                },
+                |fd, flags| {
+                    assert!(
+                        WINDOWED.try_write().is_some(),
+                        "the registry is locked across /proc/self/fd reopen (#2975 P0 4)"
+                    );
+                    reopen_writable_self_fd(fd, flags)
+                },
+            )
+            .unwrap();
+            assert_eq!(size(&path), 0);
+            // Returned fd remains read-only (O_RDONLY): write must fail EBADF.
+            let rc = unsafe { libc::write(opened.as_raw_fd(), c"x".as_ptr().cast(), 1) };
+            assert_eq!(rc, -1);
+            assert_eq!(last_errno(), libc::EBADF);
+        }
+    }
+
+    #[test]
+    fn excl_rdonly_trunc_creates_mode_0444_atomically() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly_excl");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let flags = libc::O_CREAT | libc::O_EXCL | libc::O_RDONLY | libc::O_TRUNC;
+        let mut calls = 0usize;
+        let opened = open_truncating(flags, |open_flags| {
+            calls += 1;
+            let fd = unsafe { libc::open(cpath.as_ptr(), open_flags | libc::O_CLOEXEC, 0o444) };
+            if fd < 0 {
+                Err(last_errno())
+            } else {
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+        });
+        assert!(opened.is_ok(), "O_CREAT|O_EXCL|O_RDONLY|O_TRUNC 0444 failed: {opened:?}");
+        assert_eq!(calls, 1);
+        assert_eq!(size(&path), 0);
+    }
+
+    #[test]
+    fn concurrent_windowed_resizes_are_serialized() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
+        let (_dir, path, windowed) = file(4096);
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let _reg = record(windowed.as_fd()).unwrap();
+        let tok = admit_resize(windowed.as_fd(), 8192).unwrap();
+        assert!(
+            WINDOWED.try_read().is_none(),
+            "admitted resize of a windowed inode must exclude competing resizes until applied"
+        );
+        tok.apply().unwrap();
+        assert_eq!(size(&path), 8192);
+        drop(_reg);
+
+        // Concurrent 8 KiB vs 12 KiB growths across independent fds never shrink 12 KiB -> 8 KiB.
+        for _ in 0..64 {
+            second.set_len(4096).unwrap();
+            let pin = record(windowed.as_fd()).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            let (r8, r12) = std::thread::scope(|s| {
+                let b1 = &barrier;
+                let h1 = s.spawn(|| {
+                    b1.wait();
+                    resize(windowed.as_fd(), 8192)
+                });
+                barrier.wait();
+                let r12 = resize(second.as_fd(), 12288);
+                (h1.join().unwrap(), r12)
+            });
+            assert_eq!(r12, Ok(()));
+            assert_eq!(size(&path), 12288);
+            assert!(matches!(r8, Ok(()) | Err(Fenced::ERRNO)));
+            drop(pin);
+        }
+    }
+
+    #[test]
+    fn window_registration_refcounts_and_unregisters_on_final_drop() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
+        let (_dir, path, windowed) = file(8192);
+        let reg1 = record(windowed.as_fd()).unwrap();
+        let id = reg1.identity();
+        let reg2 = record(windowed.as_fd()).unwrap();
+        assert_eq!(reg2.identity(), id);
+        assert!(maps(id));
+        assert_eq!(resize(windowed.as_fd(), 0), Err(Fenced::ERRNO));
+        drop(reg1);
+        assert!(maps(id), "second reference must keep shrink fence active");
+        assert_eq!(resize(windowed.as_fd(), 0), Err(Fenced::ERRNO));
+        drop(reg2);
+        assert!(!maps(id), "final drop must remove inode from registry");
+        assert!(!any_window());
+        assert_eq!(resize(windowed.as_fd(), 0), Ok(()));
+        assert_eq!(size(&path), 0);
     }
 
     /// Early review P0 2 (#2975): the registry holds no host descriptor
@@ -466,18 +657,19 @@ mod tests {
     /// be taken for the windowed inode.
     #[test]
     fn a_recorded_window_holds_no_descriptor_and_names_only_its_inode() {
+        let _guard = TEST_REGISTRY_MUTEX.lock();
         let (_dir, path, windowed) = file(8192);
-        let identity = record(windowed.as_fd()).unwrap();
+        let _reg = record(windowed.as_fd()).unwrap();
+        let identity = _reg.identity();
         assert!(maps(identity));
         // Same (st_dev, st_ino), another birth: the inode was reused.
         WINDOWED
             .write()
-            .insert(identity, Birth(Some((0, 0))))
+            .insert(identity, WindowEntry { birth: Birth(Some((0, 0))), refs: 1 })
             .unwrap();
         if birth(windowed.as_raw_fd(), &fstat(windowed.as_raw_fd()).unwrap()) != Birth(None) {
             assert_eq!(resize(windowed.as_fd(), 0), Ok(()));
             assert_eq!(size(&path), 0);
         }
-        WINDOWED.write().remove(&identity);
     }
 }
