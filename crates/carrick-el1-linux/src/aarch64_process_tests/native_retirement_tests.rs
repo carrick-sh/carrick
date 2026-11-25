@@ -927,9 +927,18 @@ fn test_reservation_layout() -> carrick_el1_abi::Layout {
     }
 }
 
+/// A held root keeps a closed space queued until the next drain, and the
+/// refusal names who held it: a host thread's hold is
+/// [`SpaceRetireRefusal::HostHeld`] (an x86 drain crosses and reruns on
+/// it, #3030), a guest slot's is [`SpaceRetireRefusal::Busy`].
 #[test]
 fn contended_root_keeps_closed_space_queued_until_next_drain() {
-    use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
+    contended_root_keeps_closed_space_queued(true);
+    contended_root_keeps_closed_space_queued(false);
+}
+
+fn contended_root_keeps_closed_space_queued(host_holds: bool) {
+    use crate::retired_spaces::{RetiredSpace, RetiredSpaces, SpaceRetireRefusal};
     use carrick_core::mm::transaction::{MmError, MmPortal};
     use carrick_el1::memory::reservations::{NoRootWait, RootReleaseVenue};
 
@@ -958,10 +967,13 @@ fn contended_root_keeps_closed_space_queued_until_next_drain() {
         .unwrap();
 
     let access = crate::sched::object_wait::space_access(zone, SlotId::new(0));
-    let held_root = RootReleaseVenue::new(roots, access.venue().unwrap())
-        .unwrap()
-        .lock(child_space.index(), child_mm, &NoRootWait)
-        .unwrap();
+    let venue = RootReleaseVenue::new(roots, access.venue().unwrap()).unwrap();
+    let held_root = if host_holds {
+        venue.lock(child_space.index(), child_mm, &NoRootWait)
+    } else {
+        venue.lock_el1(child_space.index(), child_mm, 5)
+    }
+    .unwrap();
 
     let queue = RetiredSpaces::new();
     for mm in [child_mm, later_mm] {
@@ -977,7 +989,15 @@ fn contended_root_keeps_closed_space_queued_until_next_drain() {
     let first = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
     assert_eq!(
         (first.retired, first.result, queue.len()),
-        (0, Err(NativeProcessError::Busy), 2)
+        (
+            0,
+            Err(if host_holds {
+                SpaceRetireRefusal::HostHeld
+            } else {
+                SpaceRetireRefusal::Busy
+            }),
+            2
+        )
     );
     assert!(!zone.spaces.is_open(child_mm.raw()));
     assert!(zone.spaces.find(child_mm.raw()).is_some());
@@ -996,7 +1016,9 @@ fn contended_root_keeps_closed_space_queued_until_next_drain() {
 
 #[test]
 fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
-    use crate::retired_spaces::{RetiredSpace, RetiredSpaces, retire_closed_space};
+    use crate::retired_spaces::{
+        RetiredSpace, RetiredSpaces, SpaceRetireRefusal, retire_closed_space,
+    };
     use carrick_core::mm::transaction::MmPortal;
 
     let region = crate::mm_portal::test_support::Region::new();
@@ -1006,7 +1028,7 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
 
     // Space exists in `zone.spaces`, so `spaces.find` and `spaces.close` pass,
     // but no reservation root was published in `roots`: `root_any` returns
-    // `MmError::Stale`, which must keep mapping to `NativeProcessError::Stale`.
+    // `MmError::Stale`, which must keep mapping to `SpaceRetireRefusal::Stale`.
     let unrooted_mm = ReservationMm::new(9).unwrap();
     zone.spaces
         .publish_closed(unrooted_mm.raw(), 0x9000, 0x9000)
@@ -1024,7 +1046,7 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
     let owner: crate::aarch64_process::Portal<'_> = MmPortal::for_zone(carrier, roots, zone);
     assert_eq!(
         retire_closed_space(&owner, unrooted_mm, 0),
-        Err(NativeProcessError::Stale)
+        Err(SpaceRetireRefusal::Stale)
     );
 
     let queue = RetiredSpaces::new();
@@ -1038,7 +1060,7 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
     }
 
     let result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-    assert_eq!(result.result, Err(NativeProcessError::Stale));
+    assert_eq!(result.result, Err(SpaceRetireRefusal::Stale));
     assert!(queue.is_empty());
     assert!(zone.spaces.find(valid_mm.raw()).is_none());
 }

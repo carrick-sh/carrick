@@ -25,7 +25,7 @@ use carrick_el1_linux::exec_successor::{
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeProcessError,
 };
-use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
+use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces, SpaceRetiredCrossing};
 use carrick_guest_arch::{AddressContext, RootGpa, SlotId};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
@@ -51,6 +51,17 @@ pub(crate) trait X86ExecMachine {
     /// The live-context census a first syscall capture authenticates against.
     fn admit_context(&self, address: Mm) -> bool;
     fn retire_context(&self, address: Mm) -> bool;
+    /// The space-retired crossing a retired-space drain owes
+    /// ([`carrick_el1_linux::retired_spaces::SpaceRetiredCrossing`]).
+    fn cross_space_retired(&self);
+}
+
+/// A machine's space-retired crossing, for the shared drain.
+struct MachineSpaceRetired<'m, M>(&'m M);
+impl<M: X86ExecMachine> SpaceRetiredCrossing for MachineSpaceRetired<'_, M> {
+    fn cross(&mut self) {
+        self.0.cross_space_retired();
+    }
 }
 
 /// The successor build x86 runs inside `prepare_cross`, after the arm and
@@ -242,10 +253,16 @@ where
             mm: predecessor_mm,
         });
         // A refused drain keeps the entry queued for the next drain; the
-        // switch itself is complete.
-        let _ = self
-            .retired
-            .drain_portal(&self.portal(), self.zone, self.cpus, self.worker());
+        // switch itself is complete. Whatever it retired (a fork child's
+        // closed space, not only the predecessor) crosses, so the carrier
+        // reclaims it now.
+        let _ = self.retired.drain_portal_crossing(
+            &self.portal(),
+            self.zone,
+            self.cpus,
+            self.worker(),
+            &mut MachineSpaceRetired(&self.machine),
+        );
         self.machine
             .cross_settle(predecessor_mm, successor_mm, effects)
     }
@@ -313,6 +330,7 @@ mod tests {
         admitted: Cell<Option<Mm>>,
         retired_context: Cell<Option<Mm>>,
         bind: Cell<Option<(u64, u64)>>,
+        space_retired: Cell<u32>,
     }
     impl X86ExecMachine for Machine<'_> {
         fn cross_adopt(&self, record: u64) -> Result<(), NativeProcessError> {
@@ -361,6 +379,9 @@ mod tests {
         fn retire_context(&self, address: Mm) -> bool {
             self.retired_context.set(Some(address));
             true
+        }
+        fn cross_space_retired(&self) {
+            self.space_retired.set(self.space_retired.get() + 1);
         }
     }
 
@@ -438,6 +459,7 @@ mod tests {
                 parked: Cell::new(0),
                 admitted: Cell::new(None),
                 retired_context: Cell::new(None),
+                space_retired: Cell::new(0),
                 bind: Cell::new(Some((SUCCESSOR, ROOT))),
             }
         }
@@ -577,6 +599,9 @@ mod tests {
         assert_eq!(exec.machine.parked.get(), 1);
         assert_eq!(exec.machine.admitted.get(), Some(adopted.address));
         assert_eq!(exec.machine.retired_context.get(), Some(predecessor));
+        // The predecessor's entry retired in ring: the drain crossed once,
+        // so the carrier reclaims what waited on it (#3030).
+        assert_eq!(exec.machine.space_retired.get(), 1);
     }
 
     /// #2235: pre-admission exec import and post-admission boot insertion

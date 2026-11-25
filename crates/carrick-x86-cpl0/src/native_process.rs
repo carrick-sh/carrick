@@ -25,7 +25,9 @@ use carrick_el1_linux::native_process_runtime::{
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
     NativeProcessService,
 };
-use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
+use carrick_el1_linux::retired_spaces::{
+    RetiredSpace, RetiredSpaces, SpaceRetireRefusal, SpaceRetiredCrossing,
+};
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
@@ -45,21 +47,15 @@ static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
 /// AArch64 owner).
 static RETIRED_SPACES: RetiredSpaces = RetiredSpaces::new();
 
-/// Retire every queued closed space no slot runs any more. When this
-/// unpublished at least one entry, a retired fork child's quarantined tables
-/// became reclaimable: cross [`carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT`]
-/// so the carrier reclaims them now and wakes whatever waits on the stock's
-/// release, instead of at some later, unrelated drain (#3030). A refused
-/// entry stays queued (`RetiredSpaces::drain`) for the next drain.
-fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
-    let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
-    let drained = RETIRED_SPACES.drain_portal(
-        owner,
-        zone,
-        carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
-        worker,
-    );
-    if drained.retired != 0 {
+/// The recordless [`carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT`] crossing.
+/// The carrier reclaims what waited for an unpublished entry (a retired
+/// fork child's quarantined tables) and wakes whatever waits on the stock's
+/// release (#3030). The host serves it under the physical custody it holds
+/// across every hold of a guest MM's reservation root, so it returns only
+/// after any such hold has ended ([`SpaceRetiredCrossing`]'s contract).
+pub(super) struct SpaceRetiredPort;
+impl SpaceRetiredCrossing for SpaceRetiredPort {
+    fn cross(&mut self) {
         // SAFETY: a synchronous, recordless doorbell; the carrier
         // authenticates the stopped CPU's root (a registered process root or
         // the maintenance root) and reads no guest memory for it.
@@ -72,7 +68,25 @@ fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcess
             );
         }
     }
-    drained.result
+}
+
+/// Retire every queued closed space no slot runs any more, crossing for
+/// what it retired and for a root the host held (then rerunning). A guest
+/// holder's refusal stays queued for the next drain.
+fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
+    let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
+    RETIRED_SPACES
+        .drain_portal_crossing(
+            owner,
+            zone,
+            carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
+            worker,
+            &mut SpaceRetiredPort,
+        )
+        .map_err(|refusal| match refusal {
+            SpaceRetireRefusal::HostHeld | SpaceRetireRefusal::Busy => NativeProcessError::Busy,
+            SpaceRetireRefusal::Stale => NativeProcessError::Stale,
+        })
 }
 
 /// Leave this CPU's installed space for the maintenance root and publish the
@@ -303,6 +317,9 @@ impl X86ExecMachine for ServiceExecMachine {
     }
     fn retire_context(&self, address: Mm) -> bool {
         anonymous::retire_context(address)
+    }
+    fn cross_space_retired(&self) {
+        SpaceRetiredPort.cross();
     }
 }
 

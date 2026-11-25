@@ -184,6 +184,17 @@ impl<
         mm: ReservationMm,
         slot: u32,
     ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
+        self.lock_el1_observing(index, mm, slot, &NoRootWait)
+    }
+    /// [`Self::lock_el1`], shown the holder of a held root through `wait`
+    /// (EL1 never waits: `wait` only observes and answers `false`).
+    pub fn lock_el1_observing(
+        self,
+        index: usize,
+        mm: ReservationMm,
+        slot: u32,
+        wait: &dyn RootWait,
+    ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
         self.table.lock_using(
             index,
             mm,
@@ -191,7 +202,7 @@ impl<
                 banks: None,
                 identity: cfg!(target_os = "none"),
             },
-            &NoRootWait,
+            wait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::Bound(self),
         )
@@ -225,6 +236,18 @@ impl<
         nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         slot: u32,
     ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
+        self.lock_el1_resolved_observing(index, mm, nodes, slot, &NoRootWait)
+    }
+    /// [`Self::lock_el1_resolved`], shown the holder of a held root through
+    /// `wait`, as [`Self::lock_el1_observing`].
+    pub fn lock_el1_resolved_observing<P: PinnedMetadataExtent>(
+        self,
+        index: usize,
+        mm: ReservationMm,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
+        slot: u32,
+        wait: &dyn RootWait,
+    ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
         if !core::ptr::eq(nodes.table, self.table) {
             return Err(Refusal::Stale);
         }
@@ -235,7 +258,7 @@ impl<
                 banks: Some(nodes),
                 identity: false,
             },
-            &NoRootWait,
+            wait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::Bound(self),
         )
