@@ -115,7 +115,7 @@ historical one-job pilot was retired in #3016.)
 | Concurrency | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
 
 Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including one
-claiming `refs/heads/main`), `pull_request_target`, `schedule`, other branches
+claiming `refs/heads/main`), `pull_request_target`, other branches
 and tags, every merge group, a foreign workflow file, a workflow file read
 at another ref, a fork repository, a short SHA, and, for a bound
 runner, any other run id, attempt or SHA. `kernel-runtime.yml` has no
