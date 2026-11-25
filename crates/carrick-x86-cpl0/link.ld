@@ -7,7 +7,9 @@ SECTIONS {
     .initial_boot_header 0xffffffff80001000 : { KEEP(*(.initial_boot_header)) }
     .progress_header 0xffffffff80002000 : { KEEP(*(.progress_header)) }
     . = 0xffffffff80003000;
-    .text : ALIGN(4096) { *(.text .text.*) }
+    /* The fixture's reserved high-PC trampoline slot follows all other code;
+       the production image has no such input, so nothing is added there. */
+    .text : ALIGN(4096) { *(.text .text.*) KEEP(*(.progress_trampoline)) }
     .rodata : ALIGN(4096) { *(.rodata .rodata.*) }
     .data : ALIGN(4096) { *(.data .data.*) *(.got .got.*) }
     .bss : ALIGN(4096) { *(.bss .bss.*) *(COMMON) }
