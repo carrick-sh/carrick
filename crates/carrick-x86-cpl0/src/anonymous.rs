@@ -148,17 +148,13 @@ fn publish_injected_release(
     true
 }
 
+type StagedFileSource = (
+    carrick_el1::memory::NativeFileSource,
+    crate::rust_alloc::boxed::Box<[u8]>,
+);
+
 impl X86AnonymousVenue<'_> {
-    fn source(
-        &self,
-        zone: &X86Cpl0Zone,
-    ) -> Result<
-        Option<(
-            carrick_el1::memory::NativeFileSource,
-            crate::rust_alloc::boxed::Box<[u8]>,
-        )>,
-        SyscallResult,
-    > {
+    fn source(&self, zone: &X86Cpl0Zone) -> Result<Option<StagedFileSource>, SyscallResult> {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
         };
@@ -258,12 +254,7 @@ impl X86AnonymousVenue<'_> {
     /// not commit the mapping into a reservation (#2975 P0 3). Reuses the
     /// already-allocated POD record.
     #[inline(never)]
-    fn release_unplaced_file(
-        staged: Option<(
-            carrick_el1::memory::NativeFileSource,
-            crate::rust_alloc::boxed::Box<[u8]>,
-        )>,
-    ) {
+    fn release_unplaced_file(staged: Option<StagedFileSource>) {
         let Some((source, mut record)) = staged else {
             return;
         };
