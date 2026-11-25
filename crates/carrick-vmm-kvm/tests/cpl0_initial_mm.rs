@@ -638,13 +638,207 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_a_host_held_root_re
     quarantined_child_vacate_wakes_a_parked_fault(true);
 }
 
+/// rev3022c P0-2: a stock release can fire a parked exec's wake inside a
+/// crossing that used not to probe parked execs (an owner-grant descriptor
+/// settlement that returned nothing still advances the release, and the
+/// exec's wake only sets its row's flag). The exec then stayed parked until
+/// some unrelated probing crossing. The fork child's exec parks with the
+/// whole stock held; the stock returns outside any crossing, so its row is
+/// flagged and unprobed; the parent's next crossing is an owner-grant table
+/// supply. That crossing must probe the row, which reruns and seals, and
+/// the successor runs. Every crossing ends with that probe.
+#[test]
+fn production_owner_grant_crossing_reruns_a_parked_exec_its_release_woke() {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    use carrick_x86_cpl0_host::cpl0_boot::exec_service::{NativeExecLoad, X86ExecImage};
+
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_exec_parked_owner_grant.S", &[&define]);
+    let program =
+        carrick_mem::elf::ElfProgram::load(&marker, 62, &|_| None).expect("successor ELF");
+    let mut load = |_, _: &[u8]| {
+        Ok(NativeExecLoad {
+            image: X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
+                .expect("successor image"),
+            root: None,
+        })
+    };
+    let (parts, root_tid, dispatcher) = native_exit_workers_in(&elf, None, None, true);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let cpu1 = carrick_guest_arch::CpuId::new(1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut child = factory.claim(1).expect("peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    let census = || factory.exec_owner_census().expect("exec owner census");
+    let mut host_file = |caller: carrick_vmm_kvm::cpl0_boot::NativeHostFileCaller,
+                         record: &mut [u8]| {
+        dispatcher
+            .serve_native_host_file(record, caller.executable)
+            .map(|served| served.into_reply())
+            .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
+    };
+
+    // 1. Fork, seeded with the root's filesystem as the runtime seeds it;
+    //    the child runs on CPU 1 only.
+    for _ in 0..128 {
+        let exit = parent.fixture_run_loaded(task).expect("parent forks").exit;
+        match exit {
+            CarrierRunExit::PhysicalDoorbell { port, .. }
+                if port == carrick_core_abi::service::ROOT_FORK_SEED_PORT =>
+            {
+                parent
+                    .service_root_fork_seed(Some(task), |record| {
+                        let root = dispatcher.capture_one_task_context().expect("root context");
+                        (
+                            carrick_kernel::dispatch::resources::HostRootResources::capture(&root)
+                                .seed_fork(record),
+                            dispatcher.root_executable_seed(),
+                        )
+                    })
+                    .expect("root fork seed");
+                break;
+            }
+            CarrierRunExit::PhysicalDoorbell { .. } => {
+                assert!(
+                    parent
+                        .service_physical_doorbell(task, &exit, |_, _| {})
+                        .expect("parent doorbell")
+                        .is_none()
+                );
+            }
+            CarrierRunExit::Kick => {}
+            other => panic!("unexpected parent exit before its fork seed: {other:?}"),
+        }
+    }
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(child_tid, cpu1)
+        .expect("pin child to CPU 1");
+
+    // 2. The child runs to its exec's service crossing. With every table
+    //    held from there (returnable custody, never spent), the exec parks
+    //    on the stock's release.
+    let mut held = None;
+    let mut exits = Vec::new();
+    for _ in 0..4096 {
+        let exit = child.fixture_run_idle_peer().expect("child exec");
+        exits.push(format!("{exit:?}"));
+        match exit {
+            CarrierRunExit::PhysicalDoorbell { port, .. } => {
+                if port == carrick_x86::cpl0_entry::NATIVE_SERVICE_PORT && held.is_none() {
+                    held = Some(factory.fixture_hold_fork_stock(0).expect("hold the stock"));
+                }
+                assert!(
+                    child
+                        .service_idle_peer_doorbell_with_host_file(
+                            &exit,
+                            |_, _| {},
+                            &mut host_file,
+                            &mut load,
+                        )
+                        .expect("child exec service")
+                        .is_none()
+                );
+                if census().parked == 1 {
+                    break;
+                }
+            }
+            CarrierRunExit::Kick => {}
+            other => panic!("unexpected child exit before its exec parked: {other:?}; {exits:?}"),
+        }
+    }
+    let parked = census();
+    assert_eq!(
+        (parked.parked, parked.reruns, parked.sealed),
+        (1, 0, 0),
+        "the exec parked on the held stock: {parked:?}; {exits:?}"
+    );
+
+    // 3. The stock returns outside any crossing: the row's wake fires and
+    //    nothing probes it yet.
+    factory
+        .fixture_release_fork_stock(held.expect("the exec's service crossed"))
+        .expect("return the stock");
+    assert_eq!(census().reruns, 0, "a release alone reruns nothing");
+
+    // 4. The parent's first crossing is an owner-grant table supply; it
+    //    must rerun the parked exec.
+    let exit = (0..64)
+        .map(|_| {
+            parent
+                .fixture_run_loaded(task)
+                .expect("parent touches")
+                .exit
+        })
+        .find(|exit| matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }))
+        .expect("parent crossing");
+    assert!(
+        matches!(
+            exit,
+            CarrierRunExit::PhysicalDoorbell { port, .. }
+                if port == carrick_x86::cpl0_entry::OWNER_GRANT_PORT
+        ),
+        "the parent's first crossing supplies tables: {exit:?}"
+    );
+    assert!(
+        parent
+            .service_physical_doorbell(task, &exit, |_, _| {})
+            .expect("owner-grant crossing")
+            .is_none()
+    );
+    let rerun = census();
+    assert_eq!(
+        (rerun.reruns, rerun.sealed, rerun.refused),
+        (1, 1, 0),
+        "the owner-grant crossing probed the flagged exec, which reran and sealed: {rerun:?}"
+    );
+
+    // 5. The successor runs to its exit; the parent reaps it and exits 0.
+    run_until_idle_within(
+        4096,
+        &factory,
+        cpu1,
+        || {
+            let exit = child.fixture_run_idle_peer().expect("successor");
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell_with_host_file(
+                            &exit,
+                            |_, _| {},
+                            &mut host_file,
+                            &mut load,
+                        )
+                        .expect("successor service")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+    assert_eq!(
+        census().adopted,
+        1,
+        "the successor was adopted: {:?}",
+        census()
+    );
+}
+
 fn quarantined_child_vacate_wakes_a_parked_fault(host_holds_root: bool) {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
 
     let elf = native_exit_fixture("native_quarantined_child_table_shortage.S");
-    let (parts, root_tid, _dispatcher) = native_exit_workers_in(&elf, None, Some(2 * 1024 * 1024));
+    let (parts, root_tid, _dispatcher) =
+        native_exit_workers_in(&elf, None, Some(2 * 1024 * 1024), false);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let cpu0 = carrick_guest_arch::CpuId::new(0);
@@ -2463,15 +2657,18 @@ fn native_exit_workers_on(
     carrick_el1_abi::El1TaskId,
     carrick_kernel::dispatch::SyscallDispatcher,
 ) {
-    native_exit_workers_in(elf, entry, None)
+    native_exit_workers_in(elf, entry, None, false)
 }
 
 /// As [`native_exit_workers_on`], in a carrier of `extent` bytes instead of
-/// the image's production extent (a tight page-table window).
+/// the image's production extent (a tight page-table window), and with the
+/// host filesystem as the issuing owner's backend when `host_fs` (a fork
+/// child that execs resolves its path there).
 fn native_exit_workers_in(
     elf: &[u8],
     entry: Option<&[u8]>,
     extent: Option<usize>,
+    host_fs: bool,
 ) -> (
     carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
     carrick_el1_abi::El1TaskId,
@@ -2485,7 +2682,13 @@ fn native_exit_workers_in(
     });
     // Match production preparation: native descriptor owners require the
     // shared IPC window and this exact root table's publication.
-    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    if host_fs {
+        dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+                .expect("host filesystem"),
+        ));
+    }
     let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
     let mut carrier = match entry {
         None => Cpl0Carrier::boot_production(physical_inventory(), extent, ipc),
