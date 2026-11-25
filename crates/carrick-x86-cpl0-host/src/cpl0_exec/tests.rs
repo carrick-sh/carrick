@@ -968,7 +968,14 @@ fn terminal_table_exhaustion_refuses_exec_with_enomem_and_committed_fork_wakes_p
             .unwrap();
     fixture
         .stock
-        .reserve_custody(parent, &mut reserve, |_| true, |_| true, |_, _, _| Ok(()))
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(()),
+            |_| {},
+        )
         .unwrap();
     let mut commit_settlement = ForkStockSettlement::commit_reserved(fork, completion).unwrap();
     fixture
@@ -980,6 +987,7 @@ fn terminal_table_exhaustion_refuses_exec_with_enomem_and_committed_fork_wakes_p
             |_| true,
             |_| true,
             |_| true,
+            &mut Vec::new(),
         )
         .unwrap();
     assert_eq!(fixture.stock.returnable_tables(), 0);
