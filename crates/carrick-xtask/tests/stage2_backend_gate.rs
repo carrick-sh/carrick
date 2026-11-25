@@ -185,11 +185,19 @@ fn custody_reaches_stage2_only_through_the_inventory_wrappers() {
         backend_calls, 3,
         "only the three inventory wrappers may call the HVF backend"
     );
-    // Both lazy replay paths keep the exact serialized replay.
+    // Both lazy replay paths keep the exact serialized replay under Stage2Custody.
     assert_eq!(
-        count(&sources, concat!("inventory_stage2_map_replay", "(b)")),
+        count(&sources, "stage2_map_replay(custody, b)")
+            + count(&sources, "stage2_map_replay(&self.carrier_vm_custody(), b)"),
         2,
-        "both lazy replay paths must use exact serialized replay"
+        "both lazy replay paths must use exact guarded serialized replay"
+    );
+    assert_eq!(
+        count(&sources, "pub(crate) unsafe fn inventory_stage2_")
+            + count(&sources, "pub(crate) fn inventory_stage2_")
+            + count(&sources, "unmap_global_frame_stage2_record"),
+        0,
+        "raw stage-2 wrappers and unguarded global-frame unmap must not escape stage2_backend.rs"
     );
     // VM destruction stays a custody transaction: the carrier backend is
     // built once, inside the custody that owns it, so its raw destroy is
