@@ -2553,6 +2553,20 @@ impl<
     pub fn place(&mut self, placement: Placement, len: u64) -> Result<ReservationRange, Refusal> {
         Policy::place(self, placement, GuestLen::new(len))
     }
+    /// True when any unsettled prepared copy (or injected conflict) overlaps
+    /// `range` (#2975 r31 P0 #2).
+    pub fn has_prepared_conflict(&mut self, range: ReservationRange) -> bool {
+        #[cfg(feature = "test-support")]
+        if injected_prepared_conflict() {
+            return true;
+        }
+        self.prepared_overlaps(range)
+    }
+    /// True when any unacknowledged host-owned return falls within `range`
+    /// (#2975 r31 P0 #2).
+    pub fn has_owed_return_within(&self, range: ReservationRange) -> bool {
+        self.return_owed_within(range)
+    }
     /// Visit the committed mappings overlapping `range` in address order:
     /// one bounded descent per mapping, independent of the population
     /// outside `range`.

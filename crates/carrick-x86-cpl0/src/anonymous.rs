@@ -156,9 +156,35 @@ type StagedFileSource = (
 enum FileSourceAbort {
     Returned(SyscallResult),
     Park(SpaceWaitCause),
+    Settle,
 }
 
 impl X86AnonymousVenue<'_> {
+    fn complete_replay(&self, check_injected_refusal: bool) {
+        // A parked edit's token outlives its wake; any terminal or forwarded
+        // completion of the replay owns and consumes it (#2975 r31 KVM).
+        #[cfg(feature = "test-support")]
+        let refused =
+            check_injected_refusal && crate::test_support::take_replay_settlement_refusal();
+        #[cfg(not(feature = "test-support"))]
+        let refused = {
+            let _ = check_injected_refusal;
+            false
+        };
+        if refused
+            || carrick_core::wait::complete_anonymous_edit_replay(
+                self.source.zone,
+                self.frame.slot(),
+                self.task.mm.key.load(Ordering::Acquire),
+            )
+            .is_err()
+        {
+            // The edit is already settled/finished and the refusal is an
+            // ownership failure no errno repairs: fatal, as on ARM.
+            fatal_reservation();
+        }
+    }
+
     fn source(&self, zone: &X86Cpl0Zone) -> Result<Option<StagedFileSource>, FileSourceAbort> {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
@@ -208,6 +234,9 @@ impl X86AnonymousVenue<'_> {
                     }
                     carrick_el1::memory::FileMmapPreflight::Park(cause) => {
                         return Err(FileSourceAbort::Park(cause));
+                    }
+                    carrick_el1::memory::FileMmapPreflight::Settle => {
+                        return Err(FileSourceAbort::Settle);
                     }
                 }
             }
@@ -368,10 +397,14 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                         carrick_el1_abi::RefusalVenue::Ring,
                     );
                 }
+                self.complete_replay(false);
                 return DelegatedStep::Served(result);
             }
             Err(FileSourceAbort::Park(cause)) => {
                 return DelegatedStep::Contended(cause);
+            }
+            Err(FileSourceAbort::Settle) => {
+                return DelegatedStep::Settle;
             }
         };
         let file = staged.as_ref().map(|(source, _)| *source);
@@ -392,25 +425,10 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 let result = self.frame.result().0 as i64;
                 if result < 0 {
                     Self::release_unplaced_file(staged);
+                    self.complete_replay(false);
                     return DelegatedStep::Served(SyscallResult::new(result));
                 }
-                // A parked edit's token outlives its wake; the replay owns it.
-                #[cfg(feature = "test-support")]
-                let refused = crate::test_support::take_replay_settlement_refusal();
-                #[cfg(not(feature = "test-support"))]
-                let refused = false;
-                if refused
-                    || carrick_core::wait::complete_anonymous_edit_replay(
-                        self.source.zone,
-                        slot,
-                        self.task.mm.key.load(Ordering::Acquire),
-                    )
-                    .is_err()
-                {
-                    // The edit is already committed and the refusal is an
-                    // ownership failure no errno repairs: fatal, as on ARM.
-                    fatal_reservation();
-                }
+                self.complete_replay(true);
                 DelegatedStep::Served(SyscallResult::new(result))
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => {
@@ -430,10 +448,12 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     self.origin,
                     carrick_el1_abi::RefusalVenue::Ring,
                 );
+                self.complete_replay(false);
                 DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
             }
             carrick_el1::memory::DelegatedAnonymous::Forward => {
                 Self::release_unplaced_file(staged);
+                self.complete_replay(false);
                 DelegatedStep::Forward
             }
             carrick_el1::memory::DelegatedAnonymous::Settle(_) => {

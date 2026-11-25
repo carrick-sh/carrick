@@ -16349,7 +16349,8 @@ mod window_size_door {
         ] {
             let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
             let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
-            let (b_done_tx, b_done_rx) = std::sync::mpsc::sync_channel(1);
+            let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
+            let (b_after_tx, b_after_rx) = std::sync::mpsc::sync_channel(1);
             std::thread::scope(|scope| {
                 let ha = scope.spawn(move || {
                     super::test_materialized_resize_hook::install(entered_tx, proceed_rx);
@@ -16369,13 +16370,25 @@ mod window_size_door {
                         .unwrap()
                 });
                 entered_rx.recv().unwrap();
+                let locked_desc = dispatcher.open_file(fd as i32).unwrap();
+                assert!(
+                    locked_desc
+                        .description
+                        .common()
+                        .is_materialized_resize_locked(),
+                    "thread A must hold materialized_resize across rewrite and apply"
+                );
                 let hb = scope.spawn(move || {
+                    super::test_materialized_resize_hook::install_lock_signals(
+                        b_before_tx,
+                        b_after_tx,
+                    );
                     let mut mem =
                         LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                     let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
                     let reg = crate::thread::ThreadRegistry::new(tid);
                     let futex = crate::thread::FutexTable::new();
-                    let res = dispatcher
+                    dispatcher
                         .dispatch_threaded(
                             ctx,
                             b_req,
@@ -16383,14 +16396,22 @@ mod window_size_door {
                             &CompatReporter::default(),
                             crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
                         )
-                        .unwrap();
-                    let _ = b_done_tx.send(());
-                    res
+                        .unwrap()
                 });
-                let overtook = b_done_rx
-                    .recv_timeout(std::time::Duration::from_millis(25))
-                    .is_ok();
+                b_before_rx.recv().unwrap();
+                assert!(
+                    locked_desc
+                        .description
+                        .common()
+                        .is_materialized_resize_locked(),
+                    "materialized_resize lock must remain held while thread A is paused"
+                );
+                assert!(
+                    b_after_rx.try_recv().is_err(),
+                    "thread B must not acquire materialized_resize before thread A releases it"
+                );
                 let _ = proceed_tx.send(());
+                b_after_rx.recv().unwrap();
                 let ra = ha.join().unwrap();
                 let rb = hb.join().unwrap();
                 assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
@@ -16405,10 +16426,6 @@ mod window_size_door {
                     panic!("materialized");
                 };
                 let copy_len = contents.len().unwrap();
-                assert!(
-                    !overtook,
-                    "thread B must wait behind thread A's materialized resize"
-                );
                 assert_eq!(host_len, copy_len, "host path len != copy len");
                 assert_eq!(metadata.size as u64, copy_len);
             });
@@ -16431,7 +16448,8 @@ mod window_size_door {
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
-        let (b_done_tx, b_done_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_after_tx, b_after_rx) = std::sync::mpsc::sync_channel(1);
         let ctx = run.dispatcher.capture_one_task_context().unwrap();
         let ctx = &ctx;
         let dispatcher = &run.dispatcher;
@@ -16457,8 +16475,11 @@ mod window_size_door {
                     .unwrap()
             });
             entered_rx.recv().unwrap();
-            let before_writes = carrick_vfs::host_size::test_resize_hook::write_attempts();
             let hb = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install_write_lock_signals(
+                    b_before_tx,
+                    b_after_tx,
+                );
                 let mut mem =
                     LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 8192]);
                 let buf_va = crate::memory::LINUX_IDENTITY_PAGE_BASE;
@@ -16466,7 +16487,7 @@ mod window_size_door {
                 let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
                 let reg = crate::thread::ThreadRegistry::new(tid);
                 let futex = crate::thread::FutexTable::new();
-                let res = dispatcher
+                dispatcher
                     .dispatch_threaded(
                         ctx,
                         SyscallRequest::new(
@@ -16477,25 +16498,23 @@ mod window_size_door {
                         &CompatReporter::default(),
                         crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
                     )
-                    .unwrap();
-                let _ = b_done_tx.send(());
-                res
+                    .unwrap()
             });
-            while carrick_vfs::host_size::test_resize_hook::write_attempts() == before_writes {
-                std::thread::yield_now();
-            }
-            let overtook = b_done_rx
-                .recv_timeout(std::time::Duration::from_millis(25))
-                .is_ok();
+            b_before_rx.recv().unwrap();
+            assert!(
+                carrick_vfs::host_size::test_resize_hook::window_write_lock_held(),
+                "windowed admit_resize must hold WINDOWED write lock across ftruncate"
+            );
+            assert!(
+                b_after_rx.try_recv().is_err(),
+                "pwrite admit_write must not acquire WINDOWED read lock behind windowed resize (#2975 P0 1)"
+            );
             let _ = proceed_tx.send(());
+            b_after_rx.recv().unwrap();
             let ra = ha.join().unwrap();
             let rb = hb.join().unwrap();
             assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
             assert_eq!(rb, DispatchOutcome::Returned { value: 4096 });
-            assert!(
-                !overtook,
-                "pwrite must wait behind windowed resize (#2975 P0 1)"
-            );
             assert_eq!(
                 size(&backing),
                 12288,
@@ -16523,6 +16542,8 @@ mod window_size_door {
         let (b_proceed_tx, b_proceed_rx) = std::sync::mpsc::sync_channel(1);
         let (a_entered_tx, a_entered_rx) = std::sync::mpsc::sync_channel(1);
         let (a_proceed_tx, a_proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let (a_before_tx, a_before_rx) = std::sync::mpsc::sync_channel(1);
+        let (a_after_tx, a_after_rx) = std::sync::mpsc::sync_channel(1);
         let ctx = run.dispatcher.capture_one_task_context().unwrap();
         let ctx = &ctx;
         let dispatcher = &run.dispatcher;
@@ -16536,8 +16557,11 @@ mod window_size_door {
                     .unwrap();
             });
             b_entered_rx.recv().unwrap();
-            let before_resizes = carrick_vfs::host_size::test_resize_hook::resize_attempts();
             let ha = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install_resize_lock_signals(
+                    a_before_tx,
+                    a_after_tx,
+                );
                 carrick_vfs::host_size::test_resize_hook::install(a_entered_tx, a_proceed_rx);
                 let mut mem =
                     LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
@@ -16557,20 +16581,24 @@ mod window_size_door {
                     )
                     .unwrap()
             });
-            while carrick_vfs::host_size::test_resize_hook::resize_attempts() == before_resizes {
-                std::thread::yield_now();
-            }
-            let a_entered = a_entered_rx
-                .recv_timeout(std::time::Duration::from_millis(25))
-                .is_ok();
+            a_before_rx.recv().unwrap();
+            assert!(
+                carrick_vfs::host_size::test_resize_hook::window_read_lock_held(),
+                "set_file_contents must hold WINDOWED read lock across write_all"
+            );
+            assert!(
+                a_after_rx.try_recv().is_err(),
+                "admitted ftruncate must not acquire WINDOWED write lock while set_file_contents writes"
+            );
+            assert!(
+                a_entered_rx.try_recv().is_err(),
+                "admitted ftruncate must not reach apply while set_file_contents holds admit_write"
+            );
             let _ = b_proceed_tx.send(());
             hb.join().unwrap();
+            a_after_rx.recv().unwrap();
             let _ = a_proceed_tx.send(());
             let ra = ha.join().unwrap();
-            assert!(
-                !a_entered,
-                "admitted ftruncate must wait behind whole-file set_file_contents write"
-            );
             assert_eq!(ra, DispatchOutcome::errno(LINUX_ENOSYS));
             assert_eq!(
                 size(&backing),
@@ -16646,5 +16674,59 @@ mod window_size_door {
             run.call(SYS_TRUNCATE, Some("/wrap/missing"), [PATH, 0, 0, 0, 0, 0]),
             DispatchOutcome::errno(LINUX_ENOENT)
         );
+    }
+
+    /// Codex r31 P0 3 (#2975): guest `openat(O_CREAT | O_RDONLY | O_TRUNC)`
+    /// through a bind-mounted dangling symlink (and direct `BindVfs::open`)
+    /// creates the target cleanly.
+    #[test]
+    fn bind_creat_rdonly_trunc_through_dangling_symlink_creates_target() {
+        let mut run = Run::new();
+        let rw = tempfile::tempdir().unwrap();
+        let missing = rw.path().join("created_via_link");
+        let link = rw.path().join("dangling");
+        std::os::unix::fs::symlink("created_via_link", &link).unwrap();
+        let direct_missing = rw.path().join("created_direct");
+        let direct_link = rw.path().join("dangling_direct");
+        std::os::unix::fs::symlink(&direct_missing, &direct_link).unwrap();
+        let bind = carrick_vfs::BindVfs::new("/rw", rw.path(), false);
+        let direct = carrick_vfs::Vfs::open(
+            &bind,
+            "/rw/dangling_direct",
+            carrick_vfs::OpenFlags {
+                read: true,
+                write: false,
+                create: true,
+                excl: false,
+                trunc: true,
+                append: false,
+                directory: false,
+                nofollow: false,
+                nonblock: false,
+                cloexec: true,
+                mode: 0o444,
+            },
+            &carrick_vfs::OpenContext::default(),
+        );
+        assert!(
+            direct.is_ok(),
+            "BindVfs::open(O_CREAT|O_RDONLY|O_TRUNC) through dangling symlink failed: {direct:?}"
+        );
+        assert_eq!(std::fs::metadata(&direct_missing).unwrap().len(), 0);
+
+        run.dispatcher.register_mount("/rw", Box::new(bind));
+        let flags = (carrick_abi::LINUX_O_CREAT
+            | carrick_abi::LINUX_O_RDONLY
+            | carrick_abi::LINUX_O_TRUNC) as u64;
+        let out = run.call(
+            SYS_OPENAT,
+            Some("/rw/dangling"),
+            [AT_FDCWD, PATH, flags, 0o444, 0, 0],
+        );
+        assert!(
+            matches!(out, DispatchOutcome::Returned { value } if value >= 0),
+            "openat(O_CREAT|O_RDONLY|O_TRUNC) through dangling symlink failed: {out:?}"
+        );
+        assert_eq!(std::fs::metadata(&missing).unwrap().len(), 0);
     }
 }

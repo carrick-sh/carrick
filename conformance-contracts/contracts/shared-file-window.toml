@@ -32,18 +32,21 @@ structural_budgets = []
 rationale = """
 Linux: every MAP_SHARED mapping of a file, in any process, reaches the same
 page-cache pages, so a write through one is at once in the file and in every
-other mapping, with or without msync. Carrick serves these mappings as
-windows: a carrier's view of the host file's page cache in fixed 2 MiB
-chunks, with no copy and no write-back state. One neutral model
+other mapping, with or without msync. In A1 scope, Carrick serves writable
+host-backed MAP_SHARED file mappings on x86 as windows: a carrier's view of
+the host file's page cache in fixed 2 MiB chunks, with no copy and no
+write-back state (O_RDONLY host MAP_SHARED coherence is tracked separately
+in #2838; ARM and unrouted variants stay fenced ENOSYS). One neutral model
 (carrick_core::mm::window) specifies chunk geometry, per-mapping edges,
 SIGBUS past EOF, and shrink/park/epoch state transitions; A1 production
 enforces shrink safety through the host-inode size fence (carrick_vfs::host_size)
-and carrier window-slot custody (A3 will wire live shrink revocation). The
-active KVM fixture runs the Go linker's sequence, two live processes sharing
-one writable file mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED with a read by
-path, a chunk mapped twice, mprotect read-only and back over faulted window
-pages, and SIGBUS past EOF (root and forked child), comparing every active
-row with native Linux; the three separate KVM cases for /dev/zero, msync,
+and carrier window-slot custody (WindowSlotBudget; A3 will wire live shrink
+revocation). The active KVM fixtures run the Go linker's sequence, two live
+processes sharing one writable file mapping, MAP_SHARED|MAP_POPULATE|MAP_FIXED
+with a read by path, a chunk mapped twice, mprotect read-only and back over
+faulted window pages, SIGBUS past EOF (root and forked child), and
+WindowSlotBudget exhaustion without trap errors, comparing active functional
+rows with native Linux; the three separate KVM cases for /dev/zero, msync,
 and /proc/self/maps rw-s remain ignored pending #2958, A3, and #2808.
 """
 
@@ -57,6 +60,7 @@ embed = [
   "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_shrink_is_fenced_before_the_host (A1 interim fence until A3 revokes: ftruncate, fallocate punch and collapse by a forked child, truncate and O_TRUNC by the root, of a window-mapped file are a counted ENOSYS before the host shrinks; growth and an unmapped shrink are served)",
   "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_shrink_through_a_bind_mount_is_fenced (A1 fence keyed on the host inode a path routes to: truncate and O_TRUNC by name through a bind mount are a counted ENOSYS before the mount's host call; red before #2977's fix)",
   "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_mixed_range_edits_are_served_or_counted (the served range-edit surface: a munmap of a private and a window page is served unless both are faulted, a counted ENOSYS then; PROT_NONE over a faulted window page is a counted ENOSYS, over an unfaulted one served)",
+  "carrick-cli::x86_kvm_run::mounted_static_x86_shared_file_window_slot_budget_is_enforced (A1 carrier custody, #2975 P0 3: WindowSlotBudget admits and installs 2 MiB window slots at mmap time so exhaustion returns counted ENOSYS before touching memory, MAP_FIXED_NOREPLACE over an occupied VA answers EEXIST without leaking slots or pinning the shrink fence, installed chunks keep data across saturation, unmapped files stay shrinkable, and non-window headroom still serves anonymous faults and fork)",
 ]
 
 [bindings.unresolved]
