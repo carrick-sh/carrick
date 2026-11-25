@@ -49,23 +49,6 @@ pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
     })
 }
 
-/// One stdio admission policy for production and the hardware fixture lane.
-pub fn admit_stdio_cached(binding: &CpuBinding, task: &CurrentTask, files: &FileTables<'_>) {
-    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
-    if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
-        carrick_el1_linux::file_table::admit_stdio(
-            files.fd_map(),
-            files.opens(),
-            files.objects(),
-            file_table,
-            [true; 3],
-        );
-        binding
-            .stdio_table_admitted
-            .store(file_table, Ordering::Release);
-    }
-}
-
 // SAFETY: live diagnostic counter exported for test/telemetry inspection.
 #[unsafe(no_mangle)]
 pub static CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS: core::sync::atomic::AtomicU64 =
@@ -1694,7 +1677,6 @@ impl Personality for LinuxPersonality {
         let source = carrick_x86_carrier::native_execution::source(slot);
         let words = capture(frame, early_xstate);
         native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot!());
-        admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let mut service = native_process::Service::new(task, slot);
         native_process::drain_external_ingress(source, &mut service)
