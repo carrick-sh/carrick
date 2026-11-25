@@ -16355,11 +16355,20 @@ mod window_size_door {
                 ),
             ),
         ] {
+            struct SendOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+            impl Drop for SendOnDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+            }
             let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
             let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
             let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
             let (b_after_tx, b_after_rx) = std::sync::mpsc::sync_channel(1);
             std::thread::scope(|scope| {
+                let mut proceed_guard = SendOnDrop(Some(proceed_tx));
                 let ha = scope.spawn(move || {
                     super::test_materialized_resize_hook::install(entered_tx, proceed_rx);
                     let mut mem =
@@ -16418,7 +16427,7 @@ mod window_size_door {
                     b_after_rx.try_recv().is_err(),
                     "thread B must not acquire materialized_resize before thread A releases it"
                 );
-                let _ = proceed_tx.send(());
+                let _ = proceed_guard.0.take().unwrap().send(());
                 b_after_rx.recv().unwrap();
                 let ra = ha.join().unwrap();
                 let rb = hb.join().unwrap();
@@ -16455,6 +16464,14 @@ mod window_size_door {
             other => panic!("open fd2: {other:?}"),
         };
 
+        struct SendOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for SendOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
         let (b_before_tx, b_before_rx) = std::sync::mpsc::sync_channel(1);
@@ -16463,6 +16480,7 @@ mod window_size_door {
         let ctx = &ctx;
         let dispatcher = &run.dispatcher;
         std::thread::scope(|scope| {
+            let mut proceed_guard = SendOnDrop(Some(proceed_tx));
             let ha = scope.spawn(move || {
                 carrick_vfs::host_size::test_resize_hook::install(entered_tx, proceed_rx);
                 let mut mem =
@@ -16518,7 +16536,7 @@ mod window_size_door {
                 b_after_rx.try_recv().is_err(),
                 "pwrite admit_write must not acquire WINDOWED read lock behind windowed resize (#2975 P0 1)"
             );
-            let _ = proceed_tx.send(());
+            let _ = proceed_guard.0.take().unwrap().send(());
             b_after_rx.recv().unwrap();
             let ra = ha.join().unwrap();
             let rb = hb.join().unwrap();
@@ -16548,6 +16566,14 @@ mod window_size_door {
             other => panic!("open fd1: {other:?}"),
         };
 
+        struct SendOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for SendOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
         let (b_entered_tx, b_entered_rx) = std::sync::mpsc::sync_channel(1);
         let (b_proceed_tx, b_proceed_rx) = std::sync::mpsc::sync_channel(1);
         let (a_entered_tx, a_entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -16558,6 +16584,8 @@ mod window_size_door {
         let ctx = &ctx;
         let dispatcher = &run.dispatcher;
         std::thread::scope(|scope| {
+            let mut b_proceed_guard = SendOnDrop(Some(b_proceed_tx));
+            let mut a_proceed_guard = SendOnDrop(Some(a_proceed_tx));
             let hb = scope.spawn(move || {
                 carrick_vfs::host_size::test_resize_hook::install_write(b_entered_tx, b_proceed_rx);
                 dispatcher
@@ -16604,10 +16632,10 @@ mod window_size_door {
                 a_entered_rx.try_recv().is_err(),
                 "admitted ftruncate must not reach apply while set_file_contents holds admit_write"
             );
-            let _ = b_proceed_tx.send(());
+            let _ = b_proceed_guard.0.take().unwrap().send(());
             hb.join().unwrap();
             a_after_rx.recv().unwrap();
-            let _ = a_proceed_tx.send(());
+            let _ = a_proceed_guard.0.take().unwrap().send(());
             let ra = ha.join().unwrap();
             assert_eq!(ra, DispatchOutcome::errno(LINUX_ENOSYS));
             assert_eq!(
@@ -16740,5 +16768,92 @@ mod window_size_door {
             "openat(O_CREAT|O_RDONLY|O_TRUNC) through dangling symlink failed: {out:?}"
         );
         assert_eq!(std::fs::metadata(&missing).unwrap().len(), 0);
+    }
+
+    /// Codex r33 P0 4 (#2975): if a peer extends a windowed file beyond a
+    /// growing `fallocate`'s target while `fallocate` waits for `WINDOWED`
+    /// custody, `fallocate` must return `0` and preserve the longer EOF rather
+    /// than failing `ENOSYS` as a shrink.
+    #[test]
+    fn fallocate_growth_returns_zero_when_peer_extends_beyond_target() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        const SYS_FALLOCATE: u64 = 47;
+        let mut run = Run::new();
+        let backing = run.rootfs_file("/win", 4096);
+        let DispatchOutcome::Returned { value: fd1 } =
+            run.open("/win", carrick_abi::LINUX_O_RDWR as u64)
+        else {
+            panic!("open fd1");
+        };
+        let DispatchOutcome::Returned { value: fd2 } =
+            run.open("/win", carrick_abi::LINUX_O_RDWR as u64)
+        else {
+            panic!("open fd2");
+        };
+        let fd1 = fd1 as u64;
+        let fd2 = fd2 as u64;
+        let _reg = window(&run, &backing);
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let ctx = &ctx;
+        let dispatcher = &run.dispatcher;
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+            struct ReleaseOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+            }
+            let ha = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install_before_resize_lock(
+                    entered_tx, proceed_rx,
+                );
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            SYS_FALLOCATE,
+                            SyscallArgs::from([fd1, 0, 0, 8192, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap()
+            });
+            let _release = ReleaseOnDrop(Some(proceed_tx));
+            entered_rx.recv().unwrap();
+            let mut mem_b =
+                LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
+            let tid_b = crate::thread::ThreadId::from_guest_supplied_tid(2);
+            let reg_b = crate::thread::ThreadRegistry::new(tid_b);
+            let futex_b = crate::thread::FutexTable::new();
+            let rb = dispatcher
+                .dispatch_threaded(
+                    ctx,
+                    SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd2, 16384, 0, 0, 0, 0])),
+                    &mut mem_b,
+                    &CompatReporter::default(),
+                    crate::dispatch::ThreadCtx::new(tid_b, &reg_b, &futex_b),
+                )
+                .unwrap();
+            assert_eq!(rb, DispatchOutcome::Returned { value: 0 });
+            drop(_release);
+            let ra = ha.join().unwrap();
+            assert_eq!(
+                ra,
+                DispatchOutcome::Returned { value: 0 },
+                "growing fallocate behind peer extension must return 0 rather than ENOSYS"
+            );
+            assert_eq!(size(&backing), 16384);
+        });
     }
 }

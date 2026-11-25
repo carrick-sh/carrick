@@ -34,6 +34,9 @@ mod test_support {
     /// Injected grant refusals answered in the high 32 bits; the pages of
     /// the first grant applied after one in the low 32 bits.
     pub const INJECT_GRANT_REFUSAL_CENSUS: u64 = 0xffff_ffff_ffff_fe53;
+    /// 1 if the calling member's kernel wait record currently holds an active
+    /// `OperationToken`, else 0 (`#2975` r33 P1 #2).
+    pub const INJECT_OPERATION_TOKEN_ACTIVE: u64 = 0xffff_ffff_ffff_fe54;
     pub const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
     pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
@@ -971,6 +974,14 @@ mod test_support {
                         .el1_parks
                         .load(Ordering::Acquire),
                 )
+            }
+            INJECT_OPERATION_TOKEN_ACTIVE => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                let record = zone.record(zone.slot(slot).current()?);
+                Some(u64::from(record.has_object_operation()))
             }
             INJECT_WAIT_HANDBACK_CENSUS => Some(ANONYMOUS_WAIT_HANDBACKS.load(Ordering::Acquire)),
             INJECT_METADATA_ON_REPROBE_ONCE => METADATA_ON_REPROBE
