@@ -364,6 +364,12 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
             let _ = source;
             Ok(())
         }
+        fn release_terminal_space(
+            &mut self,
+            source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
+        ) {
+            let _ = source.zone.release_space(source.slot);
+        }
 
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
@@ -1356,6 +1362,12 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         ) -> Result<(), NativeFailure> {
             let _ = source;
             Ok(())
+        }
+        fn release_terminal_space(
+            &mut self,
+            source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
+        ) {
+            let _ = source.zone.release_space(source.slot);
         }
 
         type Mm = AddressContext<RootGpa>;

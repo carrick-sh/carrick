@@ -832,14 +832,17 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             && matches!(
                 &exit,
                 CarrierRunExit::PhysicalDoorbell {
-                    port: carrick_x86::cpl0_entry::WORK_PORT | carrick_el1_abi::NATIVE_EXEC_PORT,
+                    port: carrick_x86::cpl0_entry::WORK_PORT
+                        | carrick_el1_abi::NATIVE_EXEC_PORT
+                        | carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT,
                     ..
                 }
             )
         {
             // Exit work can be published after the last child has left its
-            // process root, and an exec settlement crosses after leaving the
-            // predecessor root. Only the boot-published maintenance root may
+            // process root, an exec settlement crosses after leaving the
+            // predecessor root, and a retired space's entry retirement can
+            // cross after its last slot left it (#3030). Only the boot-published maintenance root may
             // stand here; it has no user task snapshot to save.
             self.custody = Custody::Loaded {
                 binding,

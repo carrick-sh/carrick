@@ -708,6 +708,9 @@ pub enum PhysicalCrossingFamily {
     /// Owed-return settlement doorbells (#1369 slice 3). They ride the
     /// owner-grant port, so each is also one `OwnerGrant` crossing.
     ReturnSettlement,
+    /// The guest retired a closed space's entry and crossed so the carrier
+    /// drains the fork quarantine waiting for it (#3030).
+    SpaceRetired,
 }
 impl PhysicalCrossingFamily {
     pub const fn as_str(self) -> &'static str {
@@ -717,6 +720,7 @@ impl PhysicalCrossingFamily {
             Self::ChildRetire => "child_retire",
             Self::RunFailure => "run_failure",
             Self::ReturnSettlement => "return_settlement",
+            Self::SpaceRetired => "space_retired",
         }
     }
 }
@@ -3014,6 +3018,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     let retire_result = custody.service_child_retire(&lease);
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
+                carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT => {
+                    custody.service_space_retired(&lease)?;
+                    Ok((None, None, None))
+                }
                 carrick_core_abi::NATIVE_RUN_FAILURE_PORT => {
                     let cause = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody
@@ -3467,6 +3475,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     let retire_result = custody.service_child_retire(&lease);
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
+                Some(ProductionPort::SpaceRetired) => {
+                    custody.service_space_retired(&lease)?;
+                    Ok((None, None, None))
+                }
                 Some(ProductionPort::RunFailure) => {
                     let cause = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
@@ -3663,6 +3675,7 @@ enum ProductionPort {
     ForkStock,
     NativeExec,
     ChildRetire,
+    SpaceRetired,
     RunFailure,
     RootExit,
     NativeService,
@@ -3675,6 +3688,7 @@ fn production_port(port: u16) -> Option<ProductionPort> {
         carrick_el1_abi::FORK_STOCK_PORT => Some(ProductionPort::ForkStock),
         carrick_el1_abi::NATIVE_EXEC_PORT => Some(ProductionPort::NativeExec),
         carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => Some(ProductionPort::ChildRetire),
+        carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT => Some(ProductionPort::SpaceRetired),
         carrick_core_abi::NATIVE_RUN_FAILURE_PORT => Some(ProductionPort::RunFailure),
         carrick_core_abi::NATIVE_ROOT_EXIT_PORT => Some(ProductionPort::RootExit),
         WORK_PORT => Some(ProductionPort::Work),
@@ -4299,7 +4313,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 
     pub fn physical_crossing_counts(
         &self,
-    ) -> Result<[(PhysicalCrossingFamily, u64); 5], TrapError> {
+    ) -> Result<[(PhysicalCrossingFamily, u64); 6], TrapError> {
         let custody = self
             .custody
             .lock()
@@ -4324,6 +4338,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             (
                 PhysicalCrossingFamily::ReturnSettlement,
                 custody.return_settlement_counters.doorbells,
+            ),
+            (
+                PhysicalCrossingFamily::SpaceRetired,
+                custody.space_retired_crossings,
             ),
         ])
     }
@@ -4663,6 +4681,8 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     fixture_holder_hold: Option<Arc<anonymous_owner::OwedReturnHolderHold>>,
     root_exit_crossings: u64,
     child_retire_crossings: u64,
+    /// [`carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT`] crossings (#3030).
+    space_retired_crossings: u64,
     run_failure_crossings: u64,
     metadata_base: RetainedMetadataPtr,
     host_forwards: u64,
@@ -6124,6 +6144,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             fixture_holder_hold: None,
             root_exit_crossings: 0,
             child_retire_crossings: 0,
+            space_retired_crossings: 0,
             run_failure_crossings: 0,
             metadata_base,
             initial_sources: None,
@@ -6311,7 +6332,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn return_settlement_counters(&self) -> anonymous_owner::ReturnSettlementCounters {
         self.0.return_settlement_counters
     }
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 5] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 6] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -6329,6 +6350,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             (
                 PhysicalCrossingFamily::ReturnSettlement,
                 self.0.return_settlement_counters.doorbells,
+            ),
+            (
+                PhysicalCrossingFamily::SpaceRetired,
+                self.0.space_retired_crossings,
             ),
         ]
     }

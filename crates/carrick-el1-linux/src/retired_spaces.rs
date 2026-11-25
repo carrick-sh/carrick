@@ -31,6 +31,17 @@ pub struct RetiredSpace {
     pub mm: ReservationMm,
 }
 
+/// What one [`RetiredSpaces::drain`] did: how many queued spaces it
+/// retired (their entries are unpublished, so carrier custody waiting for
+/// that, a retired fork child's quarantined tables, is now reclaimable),
+/// and the first refusal, if any (the refused entries stay queued).
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetiredDrain {
+    pub retired: usize,
+    pub result: Result<(), NativeProcessError>,
+}
+
 /// The pending queue. Each ISA owns one static instance.
 pub struct RetiredSpaces {
     pending: SpinLock<Vec<RetiredSpace>>,
@@ -71,11 +82,12 @@ impl RetiredSpaces {
         &self,
         mut ready: impl FnMut(&RetiredSpace) -> bool,
         mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> RetiredDrain {
         let mut pending = self.pending.lock();
         let len = pending.len();
         let mut write = 0;
         let mut busy = false;
+        let mut retired = 0;
         let mut result = Ok(());
         for read in 0..len {
             let Some(space) = pending.get(read).copied() else {
@@ -91,7 +103,7 @@ impl RetiredSpaces {
                 continue;
             }
             match retire(&space) {
-                Ok(()) => {}
+                Ok(()) => retired += 1,
                 Err(NativeProcessError::Busy) => {
                     if write != read
                         && let Some(slot) = pending.get_mut(write)
@@ -110,7 +122,7 @@ impl RetiredSpaces {
             }
         }
         pending.truncate(write);
-        result
+        RetiredDrain { retired, result }
     }
 
     /// The production drain for one ISA's portal and zone: entries from
@@ -129,7 +141,7 @@ impl RetiredSpaces {
         zone: &ZoneTables<Context>,
         slots: usize,
         worker: u32,
-    ) -> Result<(), NativeProcessError> {
+    ) -> RetiredDrain {
         let zone_address = core::ptr::from_ref(zone).addr();
         let roots_address = core::ptr::from_ref(owner.roots).addr();
         self.drain(
@@ -253,7 +265,13 @@ mod tests {
                 }
             },
         );
-        assert_eq!(result, Err(NativeProcessError::Busy));
+        assert_eq!(
+            result,
+            RetiredDrain {
+                retired: 1,
+                result: Err(NativeProcessError::Busy)
+            }
+        );
         assert_eq!(*retired.borrow(), vec![10]);
         // 11 (deferred), 12 (failed) and 13 (never reached) are all kept.
         assert_eq!(queue.len(), 3);
@@ -264,7 +282,13 @@ mod tests {
                 Ok::<(), NativeProcessError>(())
             },
         );
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            RetiredDrain {
+                retired: 3,
+                result: Ok(())
+            }
+        );
         let mut done = retired.borrow().clone();
         done.sort_unstable();
         assert_eq!(done, vec![10, 11, 12, 13]);
@@ -289,7 +313,13 @@ mod tests {
                 }
             },
         );
-        assert_eq!(result, Err(NativeProcessError::Stale));
+        assert_eq!(
+            result,
+            RetiredDrain {
+                retired: 1,
+                result: Err(NativeProcessError::Stale)
+            }
+        );
         assert_eq!(*retired.borrow(), vec![11]);
         // 10 is dropped (does not sit at head forever); 11 was retired.
         assert!(queue.is_empty());

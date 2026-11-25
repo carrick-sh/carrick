@@ -896,7 +896,9 @@ fn concurrent_drain_portal_does_not_hide_retiring_child_space() {
 
             let owner: crate::aarch64_process::Portal<'_> =
                 carrick_core::mm::transaction::MmPortal::for_zone(carrier_b, roots, zone);
-            let result = queue_ref.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+            let result = queue_ref
+                .drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0)
+                .result;
             let retired =
                 zone.spaces.find(child_mm.raw()).is_none() && owner.root_any(child_mm, 0).is_err();
             let _ = b_done_tx.send(());
@@ -908,7 +910,7 @@ fn concurrent_drain_portal_does_not_hide_retiring_child_space() {
         (a_result, b_result, b_retired_on_return)
     });
 
-    assert_eq!(a_result, Ok(()));
+    assert_eq!(a_result.result, Ok(()));
     assert_eq!(b_result, Ok(()));
     assert!(
         b_retired_on_return,
@@ -973,7 +975,10 @@ fn contended_root_keeps_closed_space_queued_until_next_drain() {
 
     let owner: crate::aarch64_process::Portal<'_> = MmPortal::for_zone(carrier, roots, zone);
     let first = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-    assert_eq!((first, queue.len()), (Err(NativeProcessError::Busy), 2));
+    assert_eq!(
+        (first.retired, first.result, queue.len()),
+        (0, Err(NativeProcessError::Busy), 2)
+    );
     assert!(!zone.spaces.is_open(child_mm.raw()));
     assert!(zone.spaces.find(child_mm.raw()).is_some());
     assert!(zone.spaces.find(later_mm.raw()).is_some());
@@ -981,7 +986,7 @@ fn contended_root_keeps_closed_space_queued_until_next_drain() {
     drop(held_root);
 
     let second = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-    assert_eq!(second, Ok(()));
+    assert_eq!((second.retired, second.result), (2, Ok(())));
     assert!(queue.is_empty());
     assert!(zone.spaces.find(child_mm.raw()).is_none());
     assert!(zone.spaces.find(later_mm.raw()).is_none());
@@ -1033,7 +1038,7 @@ fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
     }
 
     let result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-    assert_eq!(result, Err(NativeProcessError::Stale));
+    assert_eq!(result.result, Err(NativeProcessError::Stale));
     assert!(queue.is_empty());
     assert!(zone.spaces.find(valid_mm.raw()).is_none());
 }

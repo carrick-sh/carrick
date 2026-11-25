@@ -45,14 +45,53 @@ static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
 /// AArch64 owner).
 static RETIRED_SPACES: RetiredSpaces = RetiredSpaces::new();
 
+/// Retire every queued closed space no slot runs any more. When this
+/// unpublished at least one entry, a retired fork child's quarantined tables
+/// became reclaimable: cross [`carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT`]
+/// so the carrier reclaims them now and wakes whatever waits on the stock's
+/// release, instead of at some later, unrelated drain (#3030). A refused
+/// entry stays queued (`RetiredSpaces::drain`) for the next drain.
 fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
     let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
-    RETIRED_SPACES.drain_portal(
+    let drained = RETIRED_SPACES.drain_portal(
         owner,
         zone,
         carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
         worker,
-    )
+    );
+    if drained.retired != 0 {
+        // SAFETY: a synchronous, recordless doorbell; the carrier
+        // authenticates the stopped CPU's root (a registered process root or
+        // the maintenance root) and reads no guest memory for it.
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT,
+                in("al") 0u8,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    drained.result
+}
+
+/// Leave this CPU's installed space for the maintenance root and publish the
+/// slot's absence. A retiring space that left is retired here once no slot
+/// runs it ([`drain_retired_spaces`]): its last slot vacate is the event the
+/// queued retirement, and the carrier custody behind it, wait for. False
+/// when the carrier published no maintenance root.
+pub(super) fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+    match carrick_x86_carrier::native_execution::leave_space(source) {
+        None => false,
+        Some(carrick_sched_core::VacatedSpace::Retiring) => {
+            if let Ok(owner) = portal() {
+                // A refusal stays queued for the next drain.
+                let _ = drain_retired_spaces(&owner, u32::from(source.slot.raw()));
+            }
+            true
+        }
+        Some(_) => true,
+    }
 }
 
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
@@ -1296,6 +1335,11 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
         Ok(())
     }
+    fn release_terminal_space(&mut self, source: BornInZoneSource<'static, ParkedContextWords>) {
+        // `vacate_terminal_space` already left this CPU on the maintenance
+        // root; this publishes the absence and retires a retiring space.
+        let _ = leave_space(source);
+    }
 
     fn retire_mm(&mut self, mm: Mm) {
         // The runtime calls this only for a fork-born process's final exit.
@@ -1349,9 +1393,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if !anonymous::retire_context(mm) {
             fatal();
         }
-        if !carrick_x86_carrier::native_execution::leave_space(source) {
-            fatal();
-        }
+        // Queue the closed space before leaving it: whichever slot leaves it
+        // last (this one, or another still running it) then retires it in
+        // `leave_space`, and the carrier reclaims the quarantine at once.
         let roots = core::ptr::from_ref(owner.roots).addr();
         RETIRED_SPACES.push(RetiredSpace {
             carrier: owner.carrier,
@@ -1359,11 +1403,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             roots,
             mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
         });
-        // A refused drain is not fatal: the failed entry and every entry
-        // after it stay queued (`RetiredSpaces::drain`), and the next drain
-        // (the next fork's `prepare_mm_start`, or the next child exit)
-        // retries them, as on the AArch64 owner.
-        let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
+        if !leave_space(source) {
+            fatal();
+        }
     }
     /// A completed service's output (a read's bytes, a stat record) into
     /// the caller's own MM. Staging already proved the whole range

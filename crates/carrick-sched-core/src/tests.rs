@@ -2772,6 +2772,41 @@ fn a_closed_space_is_never_installed_again() {
     assert_eq!(zone.installed_space(SLOT), 0);
 }
 
+/// #3030: the slot vacate a retiring space's custody waits for reports
+/// itself. An open space leaving a slot is `Open`; a closed one, or one
+/// whose entry was retired while it stayed installed, is `Retiring`, so its
+/// owner hears the absence that makes the custody reclaimable; an empty
+/// slot reports `Nothing`.
+#[test]
+fn release_space_reports_whether_the_space_that_left_is_retiring() {
+    let zone = zone();
+    zone.spaces.set_idle_ttbr(0x4000_0000);
+    let other = SlotId::new(1);
+    assert_eq!(zone.release_space(SLOT), VacatedSpace::Nothing);
+    let index = zone.spaces.publish_closed(MM, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(index);
+    assert!(zone.install_space(SLOT, MM).is_some());
+    assert_eq!(zone.release_space(SLOT), VacatedSpace::Open);
+    assert_eq!(zone.release_space(SLOT), VacatedSpace::Nothing);
+
+    // Both slots run the space; it closes while both are installed: the
+    // first to leave and the last both read it retiring.
+    assert!(zone.install_space(SLOT, MM).is_some());
+    assert!(zone.install_space(other, MM).is_some());
+    zone.spaces.close(index);
+    assert_eq!(zone.release_space(other), VacatedSpace::Retiring);
+    assert_eq!(zone.release_space(SLOT), VacatedSpace::Retiring);
+
+    // An entry retired while a slot still names it is retiring too.
+    let index = zone.spaces.publish_closed(MM + 1, 0x8000, 0x8000).unwrap();
+    zone.spaces.open(index);
+    assert!(zone.install_space(SLOT, MM + 1).is_some());
+    zone.spaces.close(index);
+    zone.spaces.free(index);
+    assert_eq!(zone.spaces.find(MM + 1), None);
+    assert_eq!(zone.release_space(SLOT), VacatedSpace::Retiring);
+}
+
 /// A synthetic EL1 save area for a thread EL1 parked (a private futex wait,
 /// exactly as `park` above does it), with a distinctive, fully populated
 /// [`ThreadCtx`] so a reader must round-trip every field, not just prove

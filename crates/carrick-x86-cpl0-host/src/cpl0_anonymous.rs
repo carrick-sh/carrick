@@ -32,7 +32,7 @@ fn decode_fork_custody(bytes: &[u8]) -> Option<carrick_el1_abi::PortalForkCustod
 /// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
 /// it (`run_fp_stub`), never a hardware CPL0 VM, so its number is shared with
 /// [`carrick_core_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
-pub const CPL0_CARRIER_PORTS: [u16; 21] = [
+pub const CPL0_CARRIER_PORTS: [u16; 22] = [
     FAULT_DOORBELL_PORT,
     FORWARD_PORT,
     CONTROL_PORT,
@@ -52,6 +52,7 @@ pub const CPL0_CARRIER_PORTS: [u16; 21] = [
     carrick_el1_abi::NATIVE_PEER_READY_PORT,
     carrick_core_abi::NATIVE_RUN_FAILURE_PORT,
     carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+    carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT,
     carrick_core_abi::X86_INITIAL_RUNNER_READY_PORT,
     carrick_el1_abi::NATIVE_EXEC_PORT,
 ];
@@ -1214,6 +1215,37 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .write(physical, bytes)
             .map_err(|e| fail(e.to_string()))?;
         self.drain_fork_quarantine(execution)?;
+        self.probe_parked_execs(lease.cpu)
+    }
+
+    /// The guest's retired-space drain unpublished at least one closed
+    /// space's entry and crossed (#3030). A retired fork child's quarantine
+    /// was waiting for exactly that: drain it, which returns its tables to
+    /// the stock and wakes every waiter enrolled on the stock's release (a
+    /// parked fault or exec), then probe the parked execs. From a process
+    /// root the stopped execution's MM is excluded, as on every crossing;
+    /// from the maintenance root, none is.
+    pub fn service_space_retired<I: CarrierCpuIo>(
+        &mut self,
+        lease: &StoppedCpuLease<'_, I>,
+    ) -> Result<(), TrapError> {
+        self.space_retired_crossings = self
+            .space_retired_crossings
+            .checked_add(1)
+            .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+        if let Ok(execution) = self.physical_execution(lease) {
+            self.drain_fork_quarantine(execution)?;
+        } else {
+            let maintenance = self
+                .maintenance_root
+                .ok_or_else(|| fail("space retired without a maintenance root"))?;
+            let live = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)?))
+                .ok_or_else(|| fail("space retired root alignment"))?;
+            let venue =
+                carrick_hal::fork_stock::ReclaimExecution::maintenance_root(live, maintenance)
+                    .ok_or_else(|| fail("space retired off any authenticated root"))?;
+            self.drain_fork_quarantine_in(venue)?;
+        }
         self.probe_parked_execs(lease.cpu)
     }
 

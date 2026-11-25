@@ -245,6 +245,19 @@ pub use spaces::{
     SpaceGrant, SpaceIndex, VMA_JOURNAL_ENTRIES, VmaEdit,
 };
 
+/// What [`ZoneTables::release_space`] took off a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VacatedSpace {
+    /// No address space was installed there.
+    Nothing,
+    /// An open space: it may be installed again.
+    Open,
+    /// A space that is never installed again: its gate is closed, or its
+    /// entry is already retired. Custody retained until its last slot left
+    /// (a retired fork child's quarantined tables) may now be reclaimed.
+    Retiring,
+}
+
 use core::cell::UnsafeCell;
 #[cfg(not(all(test, feature = "loom")))]
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
@@ -4480,12 +4493,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// EL1 on `slot`, after switching the vCPU to the maintenance root:
-    /// no address space is installed on it any more.
-    pub fn release_space(&self, slot: SlotId) {
+    /// no address space is installed on it any more. The answer says
+    /// whether the space that left can ever be installed again: a
+    /// [`VacatedSpace::Retiring`] space's retained custody (a retired fork
+    /// child's quarantined tables) waits for exactly this absence, so the
+    /// caller tells that custody's owner (#3030).
+    pub fn release_space(&self, slot: SlotId) -> VacatedSpace {
         let here = ExecutionSlot::zone(slot);
         let from = self.occupancy.running_raw(here);
-        if from != 0 {
-            self.occupancy.replace(here, from, 0);
+        if from == 0 || !self.occupancy.replace(here, from, 0) {
+            return VacatedSpace::Nothing;
+        }
+        // Read the gate after the vacate (both SeqCst). Whoever closes a
+        // space does so while installed on a slot and vacates after: the
+        // last slot to leave a closed space therefore always reads it
+        // closed (or its entry already retired), and its owner's absence
+        // scan after this answer sees every slot empty.
+        match self.spaces.find(from) {
+            Some(index) if self.spaces.gate(index) & spaces::GATE_CLOSED == 0 => VacatedSpace::Open,
+            _ => VacatedSpace::Retiring,
         }
     }
 
