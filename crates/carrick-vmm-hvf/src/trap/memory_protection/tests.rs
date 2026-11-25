@@ -3300,7 +3300,7 @@ fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
 
 #[test]
 #[allow(clippy::expect_used)]
-fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_live_batches() {
+fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_per_lock_slices() {
     use crate::trap::stage2_backend::{
         ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
     };
@@ -3319,60 +3319,42 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_live_batches(
     let live_host = live_backing.as_ptr() as usize;
     let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
 
-    // 1. 70 older dead rows followed by a live row at #71 in the SAME IPA bucket.
-    let overlap_ipa = 0x7c00_0000_u64;
-    let live_ipa_alias = AliasBacking {
+    // 1. Codex #13 P0: insert an early row, add 70 dead rows at the SAME IPA,
+    //    then `upsert_by_key` the early row (keeping its low sequence number).
+    let upsert_ipa = 0x7c00_0000_u64;
+    let upsert_scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(2100));
+    let upsert_initial = AliasBacking {
         start: 0x3100_0000,
-        ipa: overlap_ipa,
-        host_addr: live_host,
+        ipa: upsert_ipa,
+        host_addr: 0,
         size: len,
-        physical_ipa: overlap_ipa,
-        physical_host_addr: live_host,
+        physical_ipa: upsert_ipa,
+        physical_host_addr: 0,
         physical_size: len,
         perms,
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
-        ownership_scope: AliasOwnershipScope::Global,
+        ownership_scope: upsert_scope,
         inventory_backing: InventoryBackingIdentity::Private(9100),
         shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     };
-
-    // 2. Process VA lookup: 70 newer dead rows in 4 KiB class (ContainerRoot) plus
-    //    one older live row in 16 KiB class (MmRootSlot) must NOT be starved.
-    let va_probe = 0x4400_0000_u64;
-    let proc_slot = (0xa000_0000_u64, 0x20_0000_u64);
-    let proc_container = ContainerRootToken(777);
-    let live_va_alias = AliasBacking {
-        start: va_probe,
-        ipa: 0x7c10_0000,
+    let upsert_live = AliasBacking {
         host_addr: live_host,
-        size: len,
-        physical_ipa: 0x7c10_0000,
         physical_host_addr: live_host,
-        physical_size: len,
-        perms,
-        guest_writable: true,
-        sharing: GuestMappingSharing::ForkSharedAnonymous,
-        ownership_scope: AliasOwnershipScope::MmRootSlot {
-            base: proc_slot.0,
-            size: proc_slot.1,
-        },
-        inventory_backing: InventoryBackingIdentity::Private(9101),
-        shared_key_base: None,
-        shared_key_offset: 0,
-        owner_generation: 0,
+        ..upsert_initial
     };
 
-    // 3. Fast head-live IPA with 200 newer dead rows behind it must stop within one batch.
-    let fast_ipa = 0x7c20_0000_u64;
-    let fast_live_alias = AliasBacking {
+    // 2. Codex #13 P1-1: 200 dead overlapping rows across 200 DISTINCT start keys
+    //    (worst-to-best sequence order) plus one live row at the end.
+    let distinct_ipa = 0x7c20_0000_u64;
+    let distinct_live = AliasBacking {
         start: 0x3300_0000,
-        ipa: fast_ipa,
+        ipa: distinct_ipa,
         host_addr: live_host,
         size: len,
-        physical_ipa: fast_ipa,
+        physical_ipa: distinct_ipa,
         physical_host_addr: live_host,
         physical_size: len,
         perms,
@@ -3385,60 +3367,112 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_live_batches(
         owner_generation: 0,
     };
 
+    // 3. Codex #13 P1-2: `VaProcess` with `mm_root_slot: Some(...)` sees BOTH
+    //    `MmRootSlot` and `Global`. Populate BOTH visible scopes across 4 KiB
+    //    and 16 KiB size classes with competing rows.
+    let va_probe_a = 0x4400_0000_u64;
+    let va_probe_b = 0x4600_0000_u64;
+    let proc_slot = (0xa000_0000_u64, 0x20_0000_u64);
+    let proc_container = ContainerRootToken(777);
+    let mm_scope = AliasOwnershipScope::MmRootSlot {
+        base: proc_slot.0,
+        size: proc_slot.1,
+    };
+    let live_mm_alias = AliasBacking {
+        start: va_probe_a,
+        ipa: 0x7c10_0000,
+        host_addr: live_host,
+        size: len,
+        physical_ipa: 0x7c10_0000,
+        physical_host_addr: live_host,
+        physical_size: len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::ForkSharedAnonymous,
+        ownership_scope: mm_scope,
+        inventory_backing: InventoryBackingIdentity::Private(9101),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let older_global_fallback = AliasBacking {
+        ipa: 0x7c11_0000,
+        physical_ipa: 0x7c11_0000,
+        size: 0x1000,
+        physical_size: 0x1000,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(9104),
+        ..live_mm_alias
+    };
+    let live_global_alias = AliasBacking {
+        start: va_probe_b,
+        ipa: 0x7c14_0000,
+        host_addr: live_host,
+        size: len,
+        physical_ipa: 0x7c14_0000,
+        physical_host_addr: live_host,
+        physical_size: len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(9103),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let older_mm_fallback = AliasBacking {
+        ipa: 0x7c15_0000,
+        physical_ipa: 0x7c15_0000,
+        size: 0x1000,
+        physical_size: 0x1000,
+        sharing: GuestMappingSharing::ForkSharedAnonymous,
+        ownership_scope: mm_scope,
+        inventory_backing: InventoryBackingIdentity::Private(9105),
+        ..live_global_alias
+    };
+
     mutate_external_alias_state(|registry| {
         *registry = AliasRegistry::default();
+        registry.push(upsert_initial);
         for i in 1..=70_u64 {
             registry.push(AliasBacking {
                 start: 0x3000_0000 + i * 0x4000,
-                ipa: overlap_ipa,
+                ipa: upsert_ipa,
                 host_addr: 0,
                 size: len,
-                physical_ipa: overlap_ipa,
+                physical_ipa: upsert_ipa,
                 physical_host_addr: 0,
                 physical_size: len,
                 perms,
                 guest_writable: true,
                 sharing: GuestMappingSharing::GlobalShared,
-                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2000 + i)),
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2200 + i)),
                 inventory_backing: InventoryBackingIdentity::Private(9200 + i),
                 shared_key_base: None,
                 shared_key_offset: 0,
                 owner_generation: 0,
             });
         }
-        registry.push(live_ipa_alias);
+        assert_eq!(registry.upsert_by_key(upsert_live), Some(upsert_initial));
+        assert!(!registry.contains_exact_physical_row(&upsert_initial));
+        assert!(registry.contains_exact_physical_row(&upsert_live));
 
-        registry.push(live_va_alias);
-        for i in 1..=70_u64 {
-            registry.push(AliasBacking {
-                start: va_probe,
-                ipa: 0x7c18_0000 + i * 0x1000,
-                host_addr: 0,
-                size: 0x1000,
-                physical_ipa: 0x7c18_0000 + i * 0x1000,
-                physical_host_addr: 0,
-                physical_size: 0x1000,
-                perms,
-                guest_writable: true,
-                sharing: GuestMappingSharing::ForkSharedAnonymous,
-                ownership_scope: AliasOwnershipScope::ContainerRoot(proc_container),
-                inventory_backing: InventoryBackingIdentity::Private(9400 + i),
-                shared_key_base: None,
-                shared_key_offset: 0,
-                owner_generation: 0,
-            });
-        }
-
-        registry.push(fast_live_alias);
+        // 200 distinct overlapping starts (`ipa = distinct_ipa - k * 0x1000`, wide enough
+        // to cover `distinct_ipa`) plus live row `distinct_live`.
+        registry.push(distinct_live);
         for i in 1..=200_u64 {
+            let start_ipa = distinct_ipa - i * 0x1000;
+            let row_len = ((i as usize) + 1) * 0x1000;
             registry.push(AliasBacking {
                 start: 0x3400_0000 + i * 0x4000,
-                ipa: fast_ipa,
+                ipa: start_ipa,
                 host_addr: 0,
-                size: len,
-                physical_ipa: fast_ipa,
+                size: row_len,
+                physical_ipa: start_ipa,
                 physical_host_addr: 0,
-                physical_size: len,
+                physical_size: row_len,
                 perms,
                 guest_writable: true,
                 sharing: GuestMappingSharing::GlobalShared,
@@ -3449,70 +3483,191 @@ fn stage2_map_replay_resolves_live_row_past_dead_prefix_and_bounds_live_batches(
                 owner_generation: 0,
             });
         }
-        assert!(registry.contains_exact_physical_row(&live_ipa_alias));
-        assert!(registry.contains_exact_physical_row(&live_va_alias));
+
+        // VaProcess Subcase A: oldest live 4 KiB in Global, newer live 16 KiB in MmRootSlot,
+        // plus 70 newest dead 4 KiB rows in Global.
+        registry.push(older_global_fallback);
+        registry.push(live_mm_alias);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: va_probe_a,
+                ipa: 0x7c18_0000 + i * 0x1000,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: 0x7c18_0000 + i * 0x1000,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::Global,
+                inventory_backing: InventoryBackingIdentity::Private(9400 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+
+        // VaProcess Subcase B: oldest live 4 KiB in MmRootSlot, newer live 16 KiB in Global,
+        // plus 70 newest dead 4 KiB rows in MmRootSlot.
+        registry.push(older_mm_fallback);
+        registry.push(live_global_alias);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: va_probe_b,
+                ipa: 0x7c38_0000 + i * 0x1000,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: 0x7c38_0000 + i * 0x1000,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::ForkSharedAnonymous,
+                ownership_scope: mm_scope,
+                inventory_backing: InventoryBackingIdentity::Private(9500 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
     });
 
-    let res_past_dead = unsafe {
+    // Verify P0: `upsert_by_key` older-seq live row is still resolved cleanly.
+    let res_upserted = unsafe {
         stage2_map_replay(
             &custody,
             g1,
-            ReplayAliasLookup::Ipa { gpa: overlap_ipa },
+            ReplayAliasLookup::Ipa { gpa: upsert_ipa },
             &mut |_| true,
         )
     };
     assert_eq!(
-        res_past_dead,
+        res_upserted,
         Ok(Some((
-            live_ipa_alias,
+            upsert_live,
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
 
-    let res_va_cross_class = unsafe {
+    // Verify P1-1: 200 distinct overlapping starts are sliced at `<= LAZY_REPLAY_ROW_BUDGET`
+    // rows per lock hold with ZERO revisited starts across slices.
+    {
+        let registry = alias_registry().lock();
+        let mut cursor = None;
+        let mut collected = Vec::new();
+        let mut slice_count = 0_usize;
+        loop {
+            let before_slice = alias_state_rows_scanned();
+            let next = registry.collect_replay_ipa_slice(
+                distinct_ipa,
+                cursor,
+                crate::trap::LAZY_REPLAY_ROW_BUDGET,
+                &mut collected,
+            );
+            let slice_scanned = alias_state_rows_scanned() - before_slice;
+            slice_count += 1;
+            assert!(
+                slice_scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
+                "slice {slice_count} exceeded lock budget: {slice_scanned}"
+            );
+            let Some(c) = next else {
+                break;
+            };
+            cursor = Some(c);
+        }
+        assert!(slice_count >= 4);
+        assert_eq!(collected.len(), 201);
+    }
+    let before_distinct = alias_state_rows_scanned();
+    let res_distinct = unsafe {
         stage2_map_replay(
             &custody,
             g1,
-            ReplayAliasLookup::VaProcess {
-                va: va_probe,
-                mm_root_slot: Some(proc_slot),
-                container_root: proc_container,
-            },
+            ReplayAliasLookup::Ipa { gpa: distinct_ipa },
             &mut |_| true,
         )
     };
     assert_eq!(
-        res_va_cross_class,
-        Ok(Some((
-            live_va_alias,
-            carrick_aarch64::stage2::Stage2Status::SUCCESS
-        )))
+        alias_state_rows_scanned() - before_distinct,
+        201,
+        "200 distinct overlapping starts + 1 live row must be visited once without revisiting"
     );
-
-    let before_fast = alias_state_rows_scanned();
-    let res_fast = unsafe {
-        stage2_map_replay(
-            &custody,
-            g1,
-            ReplayAliasLookup::Ipa { gpa: fast_ipa },
-            &mut |_| true,
-        )
-    };
-    let fast_scanned = alias_state_rows_scanned() - before_fast;
     assert_eq!(
-        res_fast,
+        res_distinct,
         Ok(Some((
-            fast_live_alias,
+            distinct_live,
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
-    assert!(
-        fast_scanned <= crate::trap::LAZY_REPLAY_ROW_BUDGET as u64,
-        "head-live IPA with 200 newer dead rows scanned {fast_scanned} rows > batch size {}",
-        crate::trap::LAZY_REPLAY_ROW_BUDGET
+
+    // Verify P1-2: both `MmRootSlot` and `Global` visible scopes resolve across classes.
+    assert_eq!(
+        unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::VaProcess {
+                    va: va_probe_a,
+                    mm_root_slot: Some(proc_slot),
+                    container_root: proc_container,
+                },
+                &mut |_| true,
+            )
+        },
+        Ok(Some((
+            live_mm_alias,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert_eq!(
+        unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::VaProcess {
+                    va: va_probe_b,
+                    mm_root_slot: Some(proc_slot),
+                    container_root: proc_container,
+                },
+                &mut |_| true,
+            )
+        },
+        Ok(Some((
+            live_global_alias,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
     );
 
-    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+    // Verify duplicate insertion/removal and `retire_scope` keep `exact_row_counts` exact.
+    mutate_external_alias_state(|registry| {
+        let dup_scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken(8888));
+        let dup_row = AliasBacking {
+            ownership_scope: dup_scope,
+            inventory_backing: InventoryBackingIdentity::Private(9988),
+            ..upsert_live
+        };
+        registry.push(dup_row);
+        registry.push(dup_row);
+        assert!(registry.contains_exact_physical_row(&dup_row));
+        let mut drop_once = false;
+        let removed = registry.retain_in_scope(dup_scope, |_| {
+            if !drop_once {
+                drop_once = true;
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(removed.len(), 1);
+        assert!(
+            registry.contains_exact_physical_row(&dup_row),
+            "second duplicate row must preserve membership after removing first"
+        );
+        let _ = registry.retire_scope(dup_scope);
+        assert!(!registry.contains_exact_physical_row(&dup_row));
+        *registry = AliasRegistry::default();
+    });
     drop(live_backing);
 }
 

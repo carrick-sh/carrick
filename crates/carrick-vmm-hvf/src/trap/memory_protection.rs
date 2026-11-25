@@ -317,10 +317,9 @@ impl AliasClassIndex {
 
     pub(crate) fn insert(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
         let class = Self::class(self.width(&alias));
-        self.by_class_start
-            .entry((class, start_key))
-            .or_default()
-            .push((seq, alias));
+        let rows = self.by_class_start.entry((class, start_key)).or_default();
+        let at = rows.partition_point(|&(row_seq, _)| row_seq <= seq);
+        rows.insert(at, (seq, alias));
         *self.class_counts.entry(class).or_default() += 1;
     }
 
@@ -622,134 +621,123 @@ impl AliasClassIndex {
         oldest.map(|(_, alias)| alias)
     }
 
-    /// Collect the next batch (up to `batch_limit`) of matching rows containing
-    /// `probe` strictly past `cursor` across ALL size classes in `seq` priority
-    /// order (`seq > cursor` ascending when `!newest_first`; `seq < cursor`
-    /// descending when `newest_first`). Returns `(sorted_batch, has_more)` so
-    /// callers can probe liveness in batches without ever discarding deeper live
-    /// rows or letting one class/bucket starve another.
-    pub(crate) fn collect_containing_candidates_from_cursor(
+    /// Collect at most `budget` candidate rows containing `probe`, resuming from
+    /// `cursor` without ever revisiting prior `(class, start_key)` buckets.
+    /// Returns `(next_cursor, scanned_rows)`.
+    pub(crate) fn collect_containing_slice(
         &self,
         probe: u64,
-        newest_first: bool,
-        cursor: Option<u64>,
-        batch_limit: usize,
+        cursor: Option<ClassSliceCursor>,
+        revision_matched: bool,
+        budget: usize,
+        found: &mut Vec<(u64, AliasBacking)>,
         mut matches: impl FnMut(&AliasBacking) -> bool,
-    ) -> (Vec<(u64, AliasBacking)>, bool) {
-        #[derive(
-            ::core::marker::Copy, ::core::clone::Clone, ::core::cmp::Eq, ::core::cmp::PartialEq,
-        )]
-        struct HeapItem {
-            priority_key: u64,
-            seq: u64,
-            alias: AliasBacking,
+    ) -> (Option<ClassSliceCursor>, usize) {
+        if budget == 0 {
+            return (cursor, 0);
         }
-        impl Ord for HeapItem {
-            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-                self.priority_key.cmp(&other.priority_key)
-            }
-        }
-        impl PartialOrd for HeapItem {
-            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        if batch_limit == 0 {
-            return (Vec::new(), false);
-        }
-        // Max-heap on `priority_key` keeps the `batch_limit` items with SMALLEST
-        // `priority_key`: `seq` for oldest-first, `u64::MAX - seq` for newest-first.
-        let priority_of = |seq: u64| if newest_first { u64::MAX - seq } else { seq };
-        let mut heap: std::collections::BinaryHeap<HeapItem> =
-            std::collections::BinaryHeap::with_capacity(batch_limit);
-        let mut has_more = false;
-        for &class in self.class_counts.keys() {
+        let mut remaining = budget;
+        let mut scanned = 0_usize;
+        let min_class = cursor.map_or(0, |c| c.class);
+        for (&class, _) in self.class_counts.range(min_class..) {
             let radius = Self::class_radius(class);
             let lower = probe.saturating_sub(radius.saturating_sub(1));
-            for (&(_class, start_key), rows) in
-                self.by_class_start.range((class, lower)..=(class, probe))
+            let range_start = match cursor {
+                Some(c) if c.class == class => c.start_key.max(lower),
+                _ => lower,
+            };
+            if range_start > probe {
+                continue;
+            }
+            for (&(_class, start_key), rows) in self
+                .by_class_start
+                .range((class, range_start)..=(class, probe))
             {
-                if newest_first {
-                    let end_idx =
-                        cursor.map_or(rows.len(), |c| rows.partition_point(|&(seq, _)| seq < c));
-                    for &(seq, alias) in rows[..end_idx].iter().rev() {
-                        let key = priority_of(seq);
-                        if heap.len() == batch_limit
-                            && let Some(worst) = heap.peek()
-                            && key >= worst.priority_key
-                        {
-                            has_more = true;
-                            break;
-                        }
-                        note_alias_state_rows_scanned(1);
-                        if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
-                            if heap.len() < batch_limit {
-                                heap.push(HeapItem {
-                                    priority_key: key,
-                                    seq,
-                                    alias,
-                                });
-                            } else if let Some(worst) = heap.peek()
-                                && key < worst.priority_key
-                            {
-                                let _ = heap.pop();
-                                heap.push(HeapItem {
-                                    priority_key: key,
-                                    seq,
-                                    alias,
-                                });
-                                has_more = true;
-                            }
+                let start_idx = match cursor {
+                    Some(c) if c.class == class && c.start_key == start_key => {
+                        if revision_matched {
+                            c.next_pos.min(rows.len())
+                        } else if let Some(prev_seq) = c.last_seq {
+                            rows.partition_point(|&(seq, _)| seq <= prev_seq)
+                        } else {
+                            0
                         }
                     }
-                } else {
-                    let start_idx =
-                        cursor.map_or(0, |c| rows.partition_point(|&(seq, _)| seq <= c));
-                    for &(seq, alias) in &rows[start_idx..] {
-                        let key = priority_of(seq);
-                        if heap.len() == batch_limit
-                            && let Some(worst) = heap.peek()
-                            && key >= worst.priority_key
-                        {
-                            has_more = true;
-                            break;
-                        }
-                        note_alias_state_rows_scanned(1);
-                        if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
-                            if heap.len() < batch_limit {
-                                heap.push(HeapItem {
-                                    priority_key: key,
-                                    seq,
-                                    alias,
-                                });
-                            } else if let Some(worst) = heap.peek()
-                                && key < worst.priority_key
-                            {
-                                let _ = heap.pop();
-                                heap.push(HeapItem {
-                                    priority_key: key,
-                                    seq,
-                                    alias,
-                                });
-                                has_more = true;
-                            }
-                        }
+                    _ => 0,
+                };
+                if start_idx >= rows.len() {
+                    continue;
+                }
+                let take = (rows.len() - start_idx).min(remaining);
+                remaining -= take;
+                scanned += take;
+                note_alias_state_rows_scanned(take);
+                let end_idx = start_idx + take;
+                for &(seq, alias) in &rows[start_idx..end_idx] {
+                    if probe < start_key.saturating_add(self.width(&alias)) && matches(&alias) {
+                        found.push((seq, alias));
                     }
+                }
+                if remaining == 0 {
+                    let next_cursor = if end_idx < rows.len() {
+                        Some(ClassSliceCursor {
+                            class,
+                            start_key,
+                            next_pos: end_idx,
+                            last_seq: Some(rows[end_idx - 1].0),
+                        })
+                    } else if let Some(next_start) = start_key.checked_add(1)
+                        && next_start <= probe
+                    {
+                        Some(ClassSliceCursor {
+                            class,
+                            start_key: next_start,
+                            next_pos: 0,
+                            last_seq: None,
+                        })
+                    } else {
+                        class.checked_add(1).map(|next_class| ClassSliceCursor {
+                            class: next_class,
+                            start_key: 0,
+                            next_pos: 0,
+                            last_seq: None,
+                        })
+                    };
+                    return (next_cursor, scanned);
                 }
             }
         }
-        let mut ordered: Vec<(u64, AliasBacking)> = heap
-            .into_iter()
-            .map(|item| (item.seq, item.alias))
-            .collect();
-        if newest_first {
-            ordered.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        } else {
-            ordered.sort_by_key(|(seq, _)| *seq);
-        }
-        (ordered, has_more)
+        (None, scanned)
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) struct ClassSliceCursor {
+    pub(crate) class: u32,
+    pub(crate) start_key: u64,
+    pub(crate) next_pos: usize,
+    pub(crate) last_seq: Option<u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) struct ReplaySliceCursor {
+    pub(crate) scope_index: usize,
+    pub(crate) revision: u64,
+    pub(crate) class_cursor: ClassSliceCursor,
 }
 
 /// Maximum candidate rows inspected per lazy stage-2 replay lookup so stacked
@@ -1635,41 +1623,58 @@ impl AliasRegistry {
         self.ipa_classes.containing_candidates(ipa, matches)
     }
 
-    /// Cursored oldest-first IPA replay batch (`(seq, alias)` plus `has_more`);
-    /// caller probes host liveness outside `custody.stage2` and `alias_registry`.
-    pub(crate) fn replay_ipa_candidates_after(
+    fn collect_single_index_replay_slice(
         &self,
-        gpa: u64,
-        after_seq: Option<u64>,
-        batch_limit: usize,
-    ) -> (Vec<(u64, AliasBacking)>, bool) {
-        self.ipa_classes.collect_containing_candidates_from_cursor(
-            gpa,
-            false,
-            after_seq,
-            batch_limit,
-            |e| gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64),
-        )
+        index: &AliasClassIndex,
+        probe: u64,
+        cursor: Option<ReplaySliceCursor>,
+        budget: usize,
+        out: &mut Vec<(u64, AliasBacking)>,
+        matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<ReplaySliceCursor> {
+        let rev_matched = cursor.is_some_and(|c| c.revision == self.revision);
+        let (next, _) = index.collect_containing_slice(
+            probe,
+            cursor.map(|c| c.class_cursor),
+            rev_matched,
+            budget,
+            out,
+            matches,
+        );
+        next.map(|class_cursor| ReplaySliceCursor {
+            scope_index: 0,
+            revision: self.revision,
+            class_cursor,
+        })
     }
 
-    /// Cursored newest-first global VA replay batch (`(seq, alias)` plus `has_more`);
-    /// caller probes host liveness outside `custody.stage2` and `alias_registry`.
-    pub(crate) fn replay_any_va_candidates_before(
+    /// Bounded lock-slice collector for IPA replay candidates; never revisits
+    /// prior `(class, start_key)` buckets across lock yields.
+    pub(crate) fn collect_replay_ipa_slice(
+        &self,
+        gpa: u64,
+        cursor: Option<ReplaySliceCursor>,
+        budget: usize,
+        out: &mut Vec<(u64, AliasBacking)>,
+    ) -> Option<ReplaySliceCursor> {
+        self.collect_single_index_replay_slice(&self.ipa_classes, gpa, cursor, budget, out, |e| {
+            gpa >= e.ipa && gpa < e.ipa.saturating_add(e.size as u64)
+        })
+    }
+
+    /// Bounded lock-slice collector for global VA replay candidates; never
+    /// revisits prior `(class, start_key)` buckets across lock yields.
+    pub(crate) fn collect_replay_any_va_slice(
         &self,
         va: u64,
-        before_seq: Option<u64>,
-        batch_limit: usize,
-    ) -> (Vec<(u64, AliasBacking)>, bool) {
-        self.va_classes.collect_containing_candidates_from_cursor(
-            va,
-            true,
-            before_seq,
-            batch_limit,
-            |entry| {
-                va >= entry.start
-                    && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
-            },
-        )
+        cursor: Option<ReplaySliceCursor>,
+        budget: usize,
+        out: &mut Vec<(u64, AliasBacking)>,
+    ) -> Option<ReplaySliceCursor> {
+        self.collect_single_index_replay_slice(&self.va_classes, va, cursor, budget, out, |entry| {
+            va >= entry.start
+                && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+        })
     }
 
     /// Exact O(1) membership revalidation under `(stage2, alias_registry)`.
@@ -2947,39 +2952,65 @@ impl AliasRegistry {
         newest.map(|(_, alias)| alias)
     }
 
-    /// Cursored newest-first process VA replay batch (`(seq, alias)` plus
-    /// `has_more`), merged across the process-visible scopes before truncating
-    /// to `batch_limit` so no scope can starve another.
-    pub(crate) fn replay_process_va_candidates_before(
+    /// Bounded lock-slice collector across a process's two visible scopes
+    /// (`MmRootSlot`/`ContainerRoot` and `Global`), resuming across scopes
+    /// without revisiting prior buckets or dropping deeper candidates.
+    pub(crate) fn collect_replay_process_va_slice(
         &self,
         va: u64,
         mm_root_slot: Option<(u64, u64)>,
         container_root: ContainerRootToken,
-        before_seq: Option<u64>,
-        batch_limit: usize,
-    ) -> (Vec<(u64, AliasBacking)>, bool) {
-        let mut merged: Vec<(u64, AliasBacking)> = Vec::new();
-        let mut any_more = false;
-        for index in self.process_va_indexes(mm_root_slot, container_root) {
-            let (hits, more) = index.collect_containing_candidates_from_cursor(
+        cursor: Option<ReplaySliceCursor>,
+        budget: usize,
+        out: &mut Vec<(u64, AliasBacking)>,
+    ) -> Option<ReplaySliceCursor> {
+        if budget == 0 {
+            return cursor;
+        }
+        let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
+        let mut remaining = budget;
+        let start_scope = cursor.map_or(0, |c| c.scope_index);
+        let rev_matched = cursor.is_some_and(|c| c.revision == self.revision);
+        for (scope_index, scope) in scopes.iter().enumerate().skip(start_scope) {
+            if remaining == 0 {
+                return Some(ReplaySliceCursor {
+                    scope_index,
+                    revision: self.revision,
+                    class_cursor: ClassSliceCursor {
+                        class: 0,
+                        start_key: 0,
+                        next_pos: 0,
+                        last_seq: None,
+                    },
+                });
+            }
+            let Some(index) = self.va_classes_by_scope.get(scope) else {
+                continue;
+            };
+            let class_cursor = cursor
+                .filter(|c| c.scope_index == scope_index)
+                .map(|c| c.class_cursor);
+            let (next, scanned) = index.collect_containing_slice(
                 va,
-                true,
-                before_seq,
-                batch_limit,
+                class_cursor,
+                rev_matched,
+                remaining,
+                out,
                 |alias| {
                     va >= alias.start
                         && va.saturating_add(1) <= alias.start.saturating_add(alias.size as u64)
                 },
             );
-            any_more |= more;
-            merged.extend(hits);
+            remaining = remaining.saturating_sub(scanned);
+            if let Some(next_class_cursor) = next {
+                return Some(ReplaySliceCursor {
+                    scope_index,
+                    revision: self.revision,
+                    class_cursor: next_class_cursor,
+                });
+            }
         }
-        merged.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-        if merged.len() > batch_limit {
-            any_more = true;
-            merged.truncate(batch_limit);
-        }
-        (merged, any_more)
+        None
     }
 
     /// Candidates for `newest_process_alias_containing_va`, newest first; the
