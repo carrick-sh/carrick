@@ -4743,10 +4743,8 @@ mod tests {
             dispatcher.fs.rootfs_vfs.path_inode_identity("/plain")
         );
         let pin = std::fs::File::open(scratch.path().join("windowed")).unwrap();
-        assert_eq!(
-            carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)),
-            Some(identity)
-        );
+        let _window_pin = carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&pin)).unwrap();
+        assert_eq!(_window_pin.identity(), identity);
         let kernel = dispatcher.capture_one_task_context().unwrap();
         let mut call = |nr: u64, args: [u64; 6]| {
             dispatcher

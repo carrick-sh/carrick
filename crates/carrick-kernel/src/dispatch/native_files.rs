@@ -393,12 +393,15 @@ impl SyscallDispatcher {
     /// Descriptor allocation still belongs exclusively to the ring namespace.
     /// Record `fd` in the host size door and recall any in-zone delegation once
     /// the carrier's `WindowSlotBudget` admits a shared file window (#1338 A1).
-    pub fn admit_window_inode(&self, fd: std::os::fd::BorrowedFd<'_>) -> bool {
-        let Some(identity) = carrick_vfs::host_size::record(fd) else {
-            return false;
-        };
-        crate::el1_delegation::recall_inode(identity);
-        true
+    /// Returns a reference-counted pin that removes the fence entry when the
+    /// last carrier holding a slot drops it (#2975 P0 2).
+    pub fn admit_window_inode(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        let registration = carrick_vfs::host_size::record(fd)?;
+        crate::el1_delegation::recall_inode(registration.identity());
+        Some(std::sync::Arc::new(registration))
     }
 
     pub fn serve_host_root_file(

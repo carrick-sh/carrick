@@ -2152,6 +2152,26 @@ mod forward_execution_tests {
         std::fs::remove_file(&path).unwrap();
         file.set_len(WINDOW_CHUNK_BYTES * 8).unwrap();
 
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+        let live_pins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct TrackedPin {
+            _pin: Arc<dyn std::any::Any + Send + Sync>,
+            live: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for TrackedPin {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let admit = |fd: std::os::fd::BorrowedFd<'_>| {
+            let pin = dispatcher.admit_window_inode(fd)?;
+            live_pins.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Some(Arc::new(TrackedPin {
+                _pin: pin,
+                live: Arc::clone(&live_pins),
+            }) as Arc<dyn std::any::Any + Send + Sync>)
+        };
+
         let mut fx = ForwardVenueFixture::with_pod();
         let context = fx.root_binding.context();
         let root = context.root;
@@ -2232,9 +2252,9 @@ mod forward_execution_tests {
             let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
             let mut admitted_called = false;
             venue
-                .complete_host_file(pod_va, &mut bytes, Some(refused_source), |_| {
+                .complete_host_file(pod_va, &mut bytes, Some(refused_source), |fd| {
                     admitted_called = true;
-                    true
+                    admit(fd)
                 })
                 .unwrap();
             assert!(!admitted_called, "refused mapping must not pin inode");
@@ -2274,12 +2294,13 @@ mod forward_execution_tests {
             let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
             let mut admitted_called = false;
             venue
-                .complete_host_file(pod_va, &mut bytes, Some(ok_source), |_| {
+                .complete_host_file(pod_va, &mut bytes, Some(ok_source), |fd| {
                     admitted_called = true;
-                    true
+                    admit(fd)
                 })
                 .unwrap();
             assert!(admitted_called);
+            assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 1);
         }
         let guest_bytes = fx.custody.0._vm.read(pod_gpa, bytes.len()).unwrap();
         assert_eq!(reply(&guest_bytes).unwrap().result, 0);
@@ -2304,15 +2325,16 @@ mod forward_execution_tests {
             let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
             let mut admitted_called = false;
             venue
-                .complete_host_file(pod_va, &mut bytes, Some(reuse_source), |_| {
+                .complete_host_file(pod_va, &mut bytes, Some(reuse_source), |fd| {
                     admitted_called = true;
-                    true
+                    admit(fd)
                 })
                 .unwrap();
             assert!(
                 !admitted_called,
                 "cached chunk reuse needs no new inode pin"
             );
+            assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 1);
         }
         let guest_bytes = fx.custody.0._vm.read(pod_gpa, bytes.len()).unwrap();
         assert_eq!(reply(&guest_bytes).unwrap().result, 0);
@@ -2345,7 +2367,7 @@ mod forward_execution_tests {
             };
             let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
             venue
-                .complete_host_file(pod_va, &mut bytes, Some(err_source), |_| true)
+                .complete_host_file(pod_va, &mut bytes, Some(err_source), admit)
                 .unwrap();
         }
         fx.custody.0._vm.vm().clear_region_failure();
@@ -2359,6 +2381,19 @@ mod forward_execution_tests {
             FrameGpa::new(DYNAMIC_GRANT_GPA + 2 * WINDOW_CHUNK_BYTES)
         );
         assert!(!fx.custody.0.sources_mut(context).unwrap().is_window(err_id));
+        assert_eq!(
+            live_pins.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "failed slot installation must release its shrink-fence pin immediately (#2975 P0 2)"
+        );
+
+        // 5. Carrier teardown unmaps extents and drops all remaining shrink-fence pins.
+        drop(fx);
+        assert_eq!(
+            live_pins.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "carrier teardown must release all shrink-fence pins (#2975 P0 2)"
+        );
     }
 
     fn execution() -> (carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>) {
@@ -4957,6 +4992,16 @@ impl<'a> core::ops::Deref for StoppedFileTables<'a> {
 // and their existing inode/descriptor owners for concurrent guest access.
 unsafe impl Send for RetainedFileRegion {}
 
+#[allow(dead_code)]
+pub(crate) struct WindowSlotEntry {
+    pub(crate) handle: BackingHandle,
+    pub(crate) gpa: FrameGpa,
+    pub(crate) identity: BackingIdentity,
+    pub(crate) inode_lease: Arc<dyn std::any::Any + Send + Sync>,
+    pub(crate) committed: bool,
+    pub(crate) pending_holders: std::collections::BTreeSet<(NonZeroU64, NonZeroU64)>,
+}
+
 /// One coordinator owns physical backing, grants and retained metadata.
 /// CPU execution leases are disjoint from this custody, so stopped host service
 /// never borrows the carrier or a simultaneously running peer CPU.
@@ -5017,9 +5062,10 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     cancelled_backing_pending: Vec<anonymous_owner::PendingPrepare>,
     /// Shared file window slots (#1338), by host device, inode and 2 MiB
     /// chunk: a host `mmap(MAP_SHARED)` of the chunk installed once and kept
-    /// for the run, with its GPA and backing identity.
-    window_slots:
-        std::collections::BTreeMap<(u64, u64, u64), (BackingHandle, FrameGpa, BackingIdentity)>,
+    /// for the run, with its GPA, backing identity, and shrink-fence lease.
+    /// Declared after `_vm` so carrier teardown unmaps host extents before
+    /// unregistering inodes (#2975 P0 2).
+    window_slots: std::collections::BTreeMap<(u64, u64, u64), WindowSlotEntry>,
     owner_grant_crossings: u64,
     /// Serializes every settlement of an MM's owed returns (#1369 slice 3).
     return_settlement: carrick_hal::return_settlement::SettlementLock,

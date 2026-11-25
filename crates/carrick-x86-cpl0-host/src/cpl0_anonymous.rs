@@ -3099,7 +3099,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let (handle, base, identity) = self
             .window_slots
             .get(&key)
-            .copied()
+            .map(|entry| (entry.handle, entry.gpa, entry.identity))
             .ok_or_else(|| fail("missing admitted window slot"))?;
         let edge = self
             ._vm
@@ -3472,7 +3472,9 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         &mut self,
         bytes: &mut [u8],
         source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
-        admit_window_inode: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> bool,
+        admit_window_inode: impl FnOnce(
+            std::os::fd::BorrowedFd<'_>,
+        ) -> Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, TrapError> {
         use carrick_core::mm::window::{WINDOW_CHUNK_BYTES, WindowChunk};
         use carrick_core_abi::host_file::{refuse_written_reply, replied_parts};
@@ -3533,6 +3535,8 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             }
         }
 
+        let source_identity = source.identity();
+        let source_id = (source_identity.handle(), source_identity.generation());
         let Some(budget) = self.custody._vm.admit_window_slots(missing.len()) else {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
         };
@@ -3541,6 +3545,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
                 ._vm
                 .install_window_slots(budget, &[])
                 .map_err(|error| fail(error.to_string()))?;
+            for chunk_index in first_chunk..=last_chunk {
+                if let Some(entry) = self.custody.window_slots.get_mut(&(device, inode, chunk_index)) {
+                    entry.pending_holders.insert(source_id);
+                }
+            }
             return Ok(Some(source));
         }
 
@@ -3559,9 +3568,9 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
         }
 
-        if !admit_window_inode(file.as_fd()) {
+        let Some(inode_lease) = admit_window_inode(file.as_fd()) else {
             return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
-        }
+        };
 
         let start_gpa = self.custody.anonymous_next_gpa.raw();
         let mut prepared = Vec::with_capacity(missing.len());
@@ -3595,10 +3604,25 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
             }
         };
         self.custody.anonymous_next_gpa = FrameGpa::new(next_gpa);
+        for chunk_index in first_chunk..=last_chunk {
+            if let Some(entry) = self.custody.window_slots.get_mut(&(device, inode, chunk_index)) {
+                entry.pending_holders.insert(source_id);
+            }
+        }
         for ((key, base, identity), handle) in staged.into_iter().zip(handles) {
-            self.custody
-                .window_slots
-                .insert(key, (handle, base, identity));
+            let mut pending_holders = std::collections::BTreeSet::new();
+            pending_holders.insert(source_id);
+            self.custody.window_slots.insert(
+                key,
+                crate::cpl0_boot::WindowSlotEntry {
+                    handle,
+                    gpa: base,
+                    identity,
+                    inode_lease: Arc::clone(&inode_lease),
+                    committed: false,
+                    pending_holders,
+                },
+            );
         }
         Ok(Some(source))
     }
@@ -3609,7 +3633,9 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         address: carrick_guest_arch::KernelVa,
         bytes: &mut [u8],
         source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
-        admit_window_inode: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> bool,
+        admit_window_inode: impl FnOnce(
+            std::os::fd::BorrowedFd<'_>,
+        ) -> Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<(), TrapError> {
         // Reauthenticate the entire retained output after the host service ran.
         self.custody
