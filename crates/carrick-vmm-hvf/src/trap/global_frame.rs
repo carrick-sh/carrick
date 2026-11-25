@@ -3642,6 +3642,10 @@ fn finalize_structural_backing_terminal_locked(
         }
         custody.commit_terminal_stage2_release(identity);
     }
+    custody
+        .pending_structural_retries
+        .lock()
+        .complete(identity.record_id);
     *retained.record_identity.lock() = cleared_stage2_record_identity();
     Ok(retained_by_record.remove(&identity.record_id))
 }
@@ -4577,7 +4581,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                 report.deferred += 1;
             }
             Err(error) => {
-                custody.request_global_frame_retirement_retry();
+                custody.enqueue_structural_retirement_retry(identity.record_id);
                 return Err(error);
             }
         }
@@ -5097,7 +5101,7 @@ impl<K: Copy + Ord> PendingGlobalFrameRetirementQueue<K> {
         }
     }
 
-    fn complete(&mut self, item: K) {
+    pub(crate) fn complete(&mut self, item: K) {
         if let Some(Some(sequence)) = self.by_item.remove(&item) {
             self.by_sequence.remove(&sequence);
         }
@@ -5126,6 +5130,7 @@ pub(crate) struct PendingGlobalFrameRetirementTurnReport {
     pub(crate) remaining: usize,
     pub(crate) inspected_directory: usize,
     pub(crate) inspected_detached: usize,
+    pub(crate) inspected_structural: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5229,7 +5234,8 @@ fn retry_pending_global_frame_retirements_at_idle_with(
         custody.request_global_frame_retirement_retry();
         return PendingGlobalFrameRetirementTurnReport {
             remaining: custody.pending_global_frame_directory_retries.lock().len()
-                + custody.pending_global_frame_detached_retries.lock().len(),
+                + custody.pending_global_frame_detached_retries.lock().len()
+                + custody.pending_structural_retries.lock().len(),
             ..PendingGlobalFrameRetirementTurnReport::default()
         };
     }
@@ -5340,31 +5346,70 @@ fn retry_pending_global_frame_retirements_at_idle_with(
         }
     }
 
-    let _ =
-        retry_structural_backing_retirements_with(custody, retire, &mut release_retired_stage2_ipa);
-    let retired_structural_ids = custody
-        .structural_backings
+    let structural_attempts = custody
+        .pending_structural_retries
         .lock()
-        .iter()
-        .filter_map(|(&id, retained)| {
-            retained
-                .owner_retired
-                .load(std::sync::atomic::Ordering::Acquire)
-                .then_some(id)
-        })
-        .collect::<Vec<_>>();
-    let structural_remaining = retired_structural_ids
-        .into_iter()
-        .filter(|&id| {
+        .len()
+        .min(PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN);
+    for _ in 0..structural_attempts {
+        let Some(record_id) = custody.pending_structural_retries.lock().pop_front() else {
+            break;
+        };
+        report.inspected_structural += 1;
+        let identity = {
+            let retained_by_record = custody.structural_backings.lock();
+            retained_by_record
+                .get(&record_id)
+                .filter(|retained| {
+                    retained
+                        .owner_retired
+                        .load(std::sync::atomic::Ordering::Acquire)
+                })
+                .map(|retained| *retained.record_identity.lock())
+                .filter(|id| id.record_id == record_id)
+        };
+        let Some(identity) = identity else {
             custody
-                .stage2_record_snapshot(id)
-                .is_some_and(|snapshot| snapshot.pin_count == 0)
-                && !custody.has_pinned_structural_predecessor(id)
-        })
-        .count();
+                .pending_structural_retries
+                .lock()
+                .complete(record_id);
+            continue;
+        };
+        let Some(snapshot) = custody.stage2_record_snapshot(record_id) else {
+            custody
+                .pending_structural_retries
+                .lock()
+                .complete(record_id);
+            continue;
+        };
+        if snapshot.pin_count != 0 || custody.has_pinned_structural_predecessor(record_id) {
+            custody
+                .pending_structural_retries
+                .lock()
+                .complete(record_id);
+            continue;
+        }
+        if retry_structural_backing_identities_with(
+            custody,
+            &[identity],
+            retire,
+            &mut release_retired_stage2_ipa,
+        )
+        .is_ok()
+            && custody.stage2_record_snapshot(record_id).is_none()
+        {
+            custody
+                .pending_structural_retries
+                .lock()
+                .complete(record_id);
+        } else {
+            custody.pending_structural_retries.lock().requeue(record_id);
+        }
+    }
+
     report.remaining = custody.pending_global_frame_directory_retries.lock().len()
         + custody.pending_global_frame_detached_retries.lock().len()
-        + structural_remaining;
+        + custody.pending_structural_retries.lock().len();
     if report.remaining != 0 {
         custody.request_global_frame_retirement_retry();
     }

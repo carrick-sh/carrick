@@ -147,6 +147,7 @@ fn service_terminal_operation(
             let Some(region) = retained_abi_region(custody) else {
                 return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
             };
+            let resolved_residency = resolve_custody_residency_with_generation(custody, region);
             let mut retired = Vec::new();
             let reclaimed = {
                 let stage2 = custody.stage2.lock();
@@ -154,7 +155,7 @@ fn service_terminal_operation(
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 reclaim_fork_stock_in(
                     &stage2,
-                    custody,
+                    resolved_residency.as_ref(),
                     &mut stock,
                     &mut ledger,
                     region,
@@ -164,6 +165,7 @@ fn service_terminal_operation(
                 )
             };
             drop(retired);
+            drop(resolved_residency);
             return match reclaimed {
                 Ok(count) => [METADATA_GRANT_SUCCESS, count as u64, 0, 0],
                 Err(_) => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
@@ -306,10 +308,13 @@ fn service_terminal_operation(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn resolve_custody_residency(
+pub(in crate::metadata_grant) fn resolve_custody_residency_with_generation(
     custody: &crate::trap::CarrierVmCustody,
     region: RetainedAbiRegion<'_>,
-) -> Option<Box<carrick_el1_abi::ResolvedResidencyTable<HostMetadataExtentPin>>> {
+) -> Option<(
+    crate::trap::CarrierVmGeneration,
+    Box<carrick_el1_abi::ResolvedResidencyTable<HostMetadataExtentPin>>,
+)> {
     let pointer = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
         carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
     )?;
@@ -337,7 +342,15 @@ fn resolve_custody_residency(
             )
             .ok()?;
     }
-    Some(resolved)
+    Some((generation, resolved))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn resolve_custody_residency(
+    custody: &crate::trap::CarrierVmCustody,
+    region: RetainedAbiRegion<'_>,
+) -> Option<Box<carrick_el1_abi::ResolvedResidencyTable<HostMetadataExtentPin>>> {
+    resolve_custody_residency_with_generation(custody, region).map(|(_, resolved)| resolved)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1804,7 +1817,10 @@ fn reclaim_fork_stock_in(
     stage2: &carrick_aarch64::stage2::custody::Stage2CustodyState<
         crate::trap::CarrierStage2Records,
     >,
-    custody: &crate::trap::CarrierVmCustody,
+    resolved_residency: Option<&(
+        crate::trap::CarrierVmGeneration,
+        Box<carrick_el1_abi::ResolvedResidencyTable<HostMetadataExtentPin>>,
+    )>,
     stock: &mut crate::fork_stock::ForkStockHostCustody,
     ledger: &mut impl carrick_hal::fork_stock::ForkTableLedger,
     region: RetainedAbiRegion<'_>,
@@ -1816,11 +1832,17 @@ fn reclaim_fork_stock_in(
     if !stock.owner.has_quarantine() {
         return Ok(0);
     }
+    let (residency_generation, resolved_residency) = resolved_residency
+        .as_ref()
+        .ok_or(ForkStockServiceError::InvalidRecord)?;
+    if stage2.lifecycle()
+        != carrick_aarch64::stage2::custody::Stage2Lifecycle::Live(*residency_generation)
+    {
+        return Err(ForkStockServiceError::InvalidRecord);
+    }
     let inventory = stock
         .inventory()
         .ok_or(ForkStockServiceError::OccupancyUnavailable)?;
-    let resolved_residency =
-        resolve_custody_residency(custody, region).ok_or(ForkStockServiceError::InvalidRecord)?;
     let residency = resolved_residency
         .view()
         .ok_or(ForkStockServiceError::InvalidRecord)?;
@@ -1921,6 +1943,7 @@ pub(crate) fn service_native_fork_stock(
             let Some((_, zone)) = stopped_records(region, cpu) else {
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
+            let pre_residency = resolve_custody_residency_with_generation(custody, region);
             let mut retired = Vec::new();
             let pre_reclaim = {
                 let stage2 = custody.stage2.lock();
@@ -1928,7 +1951,7 @@ pub(crate) fn service_native_fork_stock(
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 reclaim_fork_stock_in(
                     &stage2,
-                    custody,
+                    pre_residency.as_ref(),
                     &mut stock,
                     &mut ledger,
                     region,
@@ -1938,6 +1961,7 @@ pub(crate) fn service_native_fork_stock(
                 )
             };
             drop(retired);
+            drop(pre_residency);
             if pre_reclaim.is_err() {
                 exchange.refuse(ForkStockRefusal::Inventory);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
@@ -1946,6 +1970,7 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
+            let loan_residency = resolve_custody_residency_with_generation(custody, region);
             let mut retired = Vec::new();
             let outcome = {
                 let stage2 = custody.stage2.lock();
@@ -1953,7 +1978,7 @@ pub(crate) fn service_native_fork_stock(
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 reclaim_fork_stock_in(
                     &stage2,
-                    custody,
+                    loan_residency.as_ref(),
                     &mut stock,
                     &mut ledger,
                     region,
@@ -1968,6 +1993,7 @@ pub(crate) fn service_native_fork_stock(
                 })
             };
             drop(retired);
+            drop(loan_residency);
             let result = match outcome {
                 Ok(result) => result,
                 Err(_) => {

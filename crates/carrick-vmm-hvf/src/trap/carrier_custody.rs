@@ -514,6 +514,8 @@ pub struct CarrierVmCustody {
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<((u64, u64), u64)>>,
     pub(crate) pending_global_frame_detached_retries:
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
+    pub(crate) pending_structural_retries:
+        parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
     pub(crate) frame_pool: Stage2Inner<CarrierFramePoolState>,
     pub(crate) root_slot_pool: Stage2Inner<CarrierRootSlotPoolState>,
     /// The exact backend state of every MM whose COW runtime this carrier
@@ -925,6 +927,9 @@ impl CarrierVmCustody {
             pending_global_frame_detached_retries: parking_lot::Mutex::new(
                 PendingGlobalFrameRetirementQueue::default(),
             ),
+            pending_structural_retries: parking_lot::Mutex::new(
+                PendingGlobalFrameRetirementQueue::default(),
+            ),
             frame_pool: Stage2Inner::new(CarrierFramePoolState::Uninitialized),
             root_slot_pool: Stage2Inner::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -966,6 +971,11 @@ impl CarrierVmCustody {
         self.pending_global_frame_detached_retries
             .lock()
             .enqueue(record_id);
+        self.request_global_frame_retirement_retry();
+    }
+
+    pub(crate) fn enqueue_structural_retirement_retry(&self, record_id: CarrierStage2RecordId) {
+        self.pending_structural_retries.lock().enqueue(record_id);
         self.request_global_frame_retirement_retry();
     }
 
@@ -2310,6 +2320,7 @@ impl CarrierVmCustody {
         if let Some(entry) = deferred.remove(&old_id) {
             deferred.insert(new_id, entry);
         }
+        self.pending_structural_retries.lock().complete(old_id);
     }
 
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
@@ -2403,7 +2414,7 @@ impl CarrierVmCustody {
                 || self.is_structural_owner_retired(successor.record_id))
                 && super::retire_structural_stage2_record_at_safe_point(self, successor).is_err()
             {
-                self.request_global_frame_retirement_retry();
+                self.enqueue_structural_retirement_retry(successor.record_id);
             }
             return;
         }
@@ -2421,14 +2432,18 @@ impl CarrierVmCustody {
         }
         if settles_last_pin && self.has_deferred_structural_logical_release(identity.record_id) {
             if super::retire_structural_stage2_record_at_safe_point(self, identity).is_err() {
-                self.request_global_frame_retirement_retry();
+                self.enqueue_structural_retirement_retry(identity.record_id);
             }
         } else if outcome == RecordPinRelease::ReadyToRetry {
-            self.request_global_frame_retirement_retry();
+            if self.is_structural_owner_retired(identity.record_id) {
+                self.enqueue_structural_retirement_retry(identity.record_id);
+            } else {
+                self.request_global_frame_retirement_retry();
+            }
         } else if let RecordPinRelease::ReadyToRetire { ipa } = outcome {
             if self.is_active_root_slot_pool_ipa(ipa) {
                 if super::retire_structural_stage2_record_at_safe_point(self, identity).is_err() {
-                    self.request_global_frame_retirement_retry();
+                    self.enqueue_structural_retirement_retry(identity.record_id);
                 }
             } else {
                 // A global owner already retained its exact pending retirement.
@@ -8963,7 +8978,24 @@ mod carrier_vm_custody_tests {
                 .load(std::sync::atomic::Ordering::Acquire)
         );
 
-        // Idle retry where lower-ID owner keeps refusing unmap MUST NOT starve later owner!
+        // Also retain 20 unrelated live structural owners so idle turn proves O(queued) work.
+        let mut unrelated_owners = Vec::new();
+        for idx in 0..20_usize {
+            let extra_ipa = 0x3000_0000_u64 + (idx as u64) * 0x40_0000;
+            let mut extra_raw = Vec::new();
+            state
+                .publish_raw_stage1_arenas_into(
+                    &custody,
+                    &[extra_ipa],
+                    carrick_hal::MemPerms::ReadWriteExec,
+                    &mut extra_raw,
+                )
+                .expect("publish unrelated live owner");
+            unrelated_owners.extend(extra_raw.iter().filter_map(|r| r.structural_owner.clone()));
+        }
+
+        // Idle retry where lower-ID owner keeps refusing unmap MUST NOT starve later owner
+        // and MUST NOT scan unrelated live structural owners!
         let turn1 = super::retry_pending_global_frame_retirements_at_idle_in_using(
             &custody,
             &mut |ipa, _| {
@@ -8974,6 +9006,7 @@ mod carrier_vm_custody_tests {
                 }
             },
         );
+        assert_eq!(turn1.inspected_structural, 2);
         assert_eq!(turn1.remaining, 1);
         assert!(
             custody
@@ -8990,12 +9023,20 @@ mod carrier_vm_custody_tests {
         assert!(state.structural_owner_host_ptr(ipa_low, ARENA).is_some());
 
         let turn2 = super::retry_pending_global_frame_retirements_at_idle_in(&custody);
+        assert_eq!(turn2.inspected_structural, 1);
         assert_eq!(turn2.remaining, 0);
         assert!(custody.stage2_record_snapshot(id_low.record_id).is_none());
-        assert!(custody.structural_backings.lock().is_empty());
+        assert_eq!(custody.structural_backings.lock().len(), 20);
         assert!(!custody.has_deferred_structural_logical_release(id_low.record_id));
         assert!(state.structural_owner_host_ptr(ipa_low, ARENA).is_none());
         assert!(!super::alias_backing_is_live(ptr_low));
+        for owner in unrelated_owners {
+            state.release_exact_structural_owner(&owner);
+            drop(owner);
+        }
+        super::retry_structural_backing_retirements_in(&custody)
+            .expect("retire unrelated structural test owners");
+        assert!(custody.structural_backings.lock().is_empty());
         std::mem::forget(vm);
     }
 

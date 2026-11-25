@@ -773,7 +773,7 @@ pub(crate) fn retire_or_defer_published_fork_owners(
                 deferred = true;
             }
             Err(error) => {
-                custody.request_global_frame_retirement_retry();
+                custody.enqueue_structural_retirement_retry(target.record_id);
                 first_error.get_or_insert(error);
             }
         }
