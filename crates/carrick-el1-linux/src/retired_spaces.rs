@@ -18,7 +18,7 @@ use carrick_mmu_core::owner_mmu::OwnerMmu;
 use carrick_sched_core::{SlotId, ZoneTables};
 use core::num::NonZeroU64;
 
-use super::native_process_runtime::NativeProcessError;
+use carrick_core::mm::reservation::{RootHolder, RootWait};
 use carrick_el1::lock::SpinLock;
 
 /// A closed child space awaiting retirement, keyed by the exact carrier,
@@ -31,6 +31,21 @@ pub struct RetiredSpace {
     pub mm: ReservationMm,
 }
 
+/// Why one queued space did not retire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpaceRetireRefusal {
+    /// A host thread held the space's reservation root: "not now". The
+    /// carrier's own release ends it; a drain with a
+    /// [`SpaceRetiredCrossing`] enrols on that release by crossing, then
+    /// reruns ([`RetiredSpaces::drain_portal_crossing`]).
+    HostHeld,
+    /// Otherwise not now (a guest holder of the root, a pending edit): the
+    /// entry stays queued for the next drain (#3031).
+    Busy,
+    /// The entry is gone or cannot retire: it is dropped.
+    Stale,
+}
+
 /// What one [`RetiredSpaces::drain`] did: how many queued spaces it
 /// retired (their entries are unpublished, so carrier custody waiting for
 /// that, a retired fork child's quarantined tables, is now reclaimable),
@@ -39,7 +54,20 @@ pub struct RetiredSpace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetiredDrain {
     pub retired: usize,
-    pub result: Result<(), NativeProcessError>,
+    pub result: Result<(), SpaceRetireRefusal>,
+}
+
+/// The carrier crossing a retired-space drain owes (x86: the recordless
+/// [`carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT`]).
+///
+/// The contract a crossing must keep: it returns only after every host
+/// thread's hold of a reservation root that was live when it began has
+/// ended. The carrier holds a guest MM's root only inside the custody a
+/// crossing must take, so the crossing is the enrolment on that holder's
+/// release. It also tells the carrier that entries were unpublished, so it
+/// reclaims what waited for that (a retired fork child's quarantine).
+pub trait SpaceRetiredCrossing {
+    fn cross(&mut self);
 }
 
 /// The pending queue. Each ISA owns one static instance.
@@ -74,14 +102,15 @@ impl RetiredSpaces {
     /// Lock order: the queue lock is taken before owner and root locks, and
     /// nothing calls `push` or `drain` while holding those.
     ///
-    /// When `retire` returns `NativeProcessError::Busy`, that space and every
-    /// later entry stay queued to retry at the next drain. Stale or
-    /// unretireable entries are dropped so they do not block the queue head
-    /// forever, allowing subsequent entries to drain.
+    /// When `retire` answers "not now" ([`SpaceRetireRefusal::HostHeld`] or
+    /// [`SpaceRetireRefusal::Busy`]), that space and every later entry stay
+    /// queued to retry at the next drain. Stale or unretireable entries are
+    /// dropped so they do not block the queue head forever, allowing
+    /// subsequent entries to drain.
     pub fn drain(
         &self,
         mut ready: impl FnMut(&RetiredSpace) -> bool,
-        mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
+        mut retire: impl FnMut(&RetiredSpace) -> Result<(), SpaceRetireRefusal>,
     ) -> RetiredDrain {
         let mut pending = self.pending.lock();
         let len = pending.len();
@@ -104,7 +133,7 @@ impl RetiredSpaces {
             }
             match retire(&space) {
                 Ok(()) => retired += 1,
-                Err(NativeProcessError::Busy) => {
+                Err(refusal @ (SpaceRetireRefusal::HostHeld | SpaceRetireRefusal::Busy)) => {
                     if write != read
                         && let Some(slot) = pending.get_mut(write)
                     {
@@ -112,7 +141,7 @@ impl RetiredSpaces {
                     }
                     write += 1;
                     busy = true;
-                    result = Err(NativeProcessError::Busy);
+                    result = Err(refusal);
                 }
                 Err(error) => {
                     // Stale or unretireable entries are dropped from the queue
@@ -153,6 +182,48 @@ impl RetiredSpaces {
             },
             |space| retire_closed_space(owner, space.mm, worker),
         )
+    }
+
+    /// [`Self::drain_portal`] for a carrier that parks waiters on what a
+    /// retirement returns: cross whenever the drain retired an entry, so
+    /// the carrier reclaims it now, or found a root the host held. A host
+    /// hold is "not now": the crossing waits for its release
+    /// ([`SpaceRetiredCrossing`]'s contract), and the drain reruns. Every
+    /// rerun follows a host hold that began after the previous crossing, so
+    /// none spins. Any other refusal stays queued and is returned.
+    pub fn drain_portal_crossing<
+        P: PinnedMetadataExtent,
+        Policy: ReservationPolicy,
+        Geometry: ReservationGeometry,
+        Venue: OwnerVenue<Context>,
+        B: OwnerMmu,
+        Context: Copy + Send + Sync + zerocopy::FromZeros,
+    >(
+        &self,
+        owner: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
+        zone: &ZoneTables<Context>,
+        slots: usize,
+        worker: u32,
+        crossing: &mut dyn SpaceRetiredCrossing,
+    ) -> Result<(), SpaceRetireRefusal> {
+        self.drain_crossing(|| self.drain_portal(owner, zone, slots, worker), crossing)
+    }
+
+    fn drain_crossing(
+        &self,
+        mut drain: impl FnMut() -> RetiredDrain,
+        crossing: &mut dyn SpaceRetiredCrossing,
+    ) -> Result<(), SpaceRetireRefusal> {
+        loop {
+            let drained = drain();
+            let host_held = drained.result == Err(SpaceRetireRefusal::HostHeld);
+            if drained.retired != 0 || host_held {
+                crossing.cross();
+            }
+            if !host_held {
+                return drained.result;
+            }
+        }
     }
 
     /// Carriers with at least one queued entry for `(zone, roots)`.
@@ -211,26 +282,39 @@ pub fn retire_closed_space<
     owner: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     mm: ReservationMm,
     worker: u32,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), SpaceRetireRefusal> {
     let index = owner
         .spaces
         .find(mm.raw())
-        .ok_or(NativeProcessError::Stale)?;
+        .ok_or(SpaceRetireRefusal::Stale)?;
     owner.spaces.close(index);
+    let holder = HolderProbe::default();
     owner
-        .root_any(mm, worker)
-        .map_err(|error| match error {
-            MmError::Busy => NativeProcessError::Busy,
-            _ => NativeProcessError::Stale,
+        .root_any_observing(mm, worker, &holder)
+        .map_err(|error| match (error, holder.0.get()) {
+            (MmError::Busy, Some(RootHolder::Host)) => SpaceRetireRefusal::HostHeld,
+            (MmError::Busy, _) => SpaceRetireRefusal::Busy,
+            _ => SpaceRetireRefusal::Stale,
         })?
         .retire_final()
-        .map_err(|_| NativeProcessError::Busy)?;
+        .map_err(|_| SpaceRetireRefusal::Busy)?;
     owner
         .space_access(worker)
-        .map_err(|_| NativeProcessError::Stale)?
+        .map_err(|_| SpaceRetireRefusal::Stale)?
         .retire_entry(index)
-        .map_err(|_| NativeProcessError::Stale)?;
+        .map_err(|_| SpaceRetireRefusal::Stale)?;
     Ok(())
+}
+
+/// Observes the holder of a held root for [`retire_closed_space`]; never
+/// waits (EL1 gives up at once).
+#[derive(Default)]
+struct HolderProbe(core::cell::Cell<Option<RootHolder>>);
+impl RootWait for HolderProbe {
+    fn wait(&self, _attempt: u32, holder: RootHolder) -> bool {
+        self.0.set(Some(holder));
+        false
+    }
 }
 
 #[cfg(test)]
@@ -258,7 +342,7 @@ mod tests {
             |space| space.mm.raw() != 11,
             |space| {
                 if space.mm.raw() == 12 {
-                    Err(NativeProcessError::Busy)
+                    Err(SpaceRetireRefusal::Busy)
                 } else {
                     retired.borrow_mut().push(space.mm.raw());
                     Ok(())
@@ -269,7 +353,7 @@ mod tests {
             result,
             RetiredDrain {
                 retired: 1,
-                result: Err(NativeProcessError::Busy)
+                result: Err(SpaceRetireRefusal::Busy)
             }
         );
         assert_eq!(*retired.borrow(), vec![10]);
@@ -279,7 +363,7 @@ mod tests {
             |_| true,
             |space| {
                 retired.borrow_mut().push(space.mm.raw());
-                Ok::<(), NativeProcessError>(())
+                Ok::<(), SpaceRetireRefusal>(())
             },
         );
         assert_eq!(
@@ -306,7 +390,7 @@ mod tests {
             |_| true,
             |space| {
                 if space.mm.raw() == 10 {
-                    Err(NativeProcessError::Stale)
+                    Err(SpaceRetireRefusal::Stale)
                 } else {
                     retired.borrow_mut().push(space.mm.raw());
                     Ok(())
@@ -317,11 +401,69 @@ mod tests {
             result,
             RetiredDrain {
                 retired: 1,
-                result: Err(NativeProcessError::Stale)
+                result: Err(SpaceRetireRefusal::Stale)
             }
         );
         assert_eq!(*retired.borrow(), vec![11]);
         // 10 is dropped (does not sit at head forever); 11 was retired.
         assert!(queue.is_empty());
+    }
+
+    struct CountingCrossing(usize);
+    impl SpaceRetiredCrossing for CountingCrossing {
+        fn cross(&mut self) {
+            self.0 += 1;
+        }
+    }
+
+    /// #3030 (rev3022c P0-1): a host thread holding a retiring space's root
+    /// is "not now", never a strand. The drain crosses (the crossing waits
+    /// out the carrier's hold), reruns, retires the entry and crosses again
+    /// for it. "Host-held once, then success."
+    #[test]
+    fn a_host_held_root_crosses_and_reruns_until_the_space_retires() {
+        let queue = RetiredSpaces::new();
+        queue.push(space(10));
+        let attempts = core::cell::Cell::new(0);
+        let mut crossing = CountingCrossing(0);
+        let result = queue.drain_crossing(
+            || {
+                queue.drain(
+                    |_| true,
+                    |_| {
+                        attempts.set(attempts.get() + 1);
+                        if attempts.get() == 1 {
+                            Err(SpaceRetireRefusal::HostHeld)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            },
+            &mut crossing,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.get(), 2, "held once, then retired");
+        assert_eq!(
+            crossing.0, 2,
+            "one crossing for the hold, one for the retirement"
+        );
+        assert!(queue.is_empty());
+    }
+
+    /// A guest holder is not the carrier's to release: the entry stays
+    /// queued, nothing crosses, and the drain does not spin (#3031).
+    #[test]
+    fn a_guest_held_root_stays_queued_without_crossing() {
+        let queue = RetiredSpaces::new();
+        queue.push(space(10));
+        let mut crossing = CountingCrossing(0);
+        let result = queue.drain_crossing(
+            || queue.drain(|_| true, |_| Err(SpaceRetireRefusal::Busy)),
+            &mut crossing,
+        );
+        assert_eq!(result, Err(SpaceRetireRefusal::Busy));
+        assert_eq!(crossing.0, 0);
+        assert_eq!(queue.len(), 1);
     }
 }

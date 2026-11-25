@@ -302,12 +302,23 @@ impl<
         mm: ReservationMm,
         slot: u32,
     ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
+        self.root_any_observing(mm, slot, &crate::mm::reservation::NoRootWait)
+    }
+    /// [`Self::root_any`], shown the holder of a held root through `wait`
+    /// (which only observes: EL1 never waits for a holder). A fixture
+    /// portal without a release venue shows no holder.
+    pub fn root_any_observing(
+        &self,
+        mm: ReservationMm,
+        slot: u32,
+        wait: &dyn crate::mm::reservation::RootWait,
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
         if let Some(venue) = self.space_access(slot)?.venue() {
             let roots = RootReleaseVenue::new(self.roots, venue)?;
             return match self.nodes {
-                Some(nodes) => Ok(roots.lock_el1_resolved(index, mm, nodes, slot)?),
-                None => Ok(roots.lock_el1(index, mm, slot)?),
+                Some(nodes) => Ok(roots.lock_el1_resolved_observing(index, mm, nodes, slot, wait)?),
+                None => Ok(roots.lock_el1_observing(index, mm, slot, wait)?),
             };
         }
         #[cfg(any(test, feature = "host-test"))]
