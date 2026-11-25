@@ -3477,6 +3477,9 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             if snapshot.vm_generation == current_generation && snapshot.mapped {
                 continue;
             }
+            custody
+                .stage2
+                .at_client_point(super::carrier_custody::REPLAY_REBIND_ADMITTED);
             let new_identity = custody
                 .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
                 .map_err(|error| {

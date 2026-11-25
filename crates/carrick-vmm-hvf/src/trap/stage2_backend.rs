@@ -1568,6 +1568,9 @@ pub(crate) fn install_ipc_window_using(
     let generation = custody.live_generation().ok_or_else(|| {
         TrapError::Hypervisor("IPC window installation without a live carrier VM".to_owned())
     })?;
+    custody
+        .stage2
+        .at_client_point(super::carrier_custody::IPC_WINDOW_ADMITTED);
     const READ_WRITE: u64 = 0b011;
     let mut records = Vec::with_capacity(2);
     for (host, ipa, len) in [
@@ -1817,5 +1820,81 @@ mod ipc_window_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn el1_ipc_window_install_holds_its_generation_guard_across_extents() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let g1 = custody.live_generation().expect("live G1");
+        let rival_done = std::sync::Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let event_rx = std::sync::Mutex::new(event_rx);
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| match point {
+                Stage2HookPoint::Client(super::super::carrier_custody::IPC_WINDOW_ADMITTED) => {
+                    start_tx.send(()).expect("rival alive");
+                    let event = event_rx
+                        .lock()
+                        .expect("event receiver")
+                        .recv()
+                        .expect("rival reports");
+                    assert!(matches!(event, "contended" | "done"));
+                }
+                Stage2HookPoint::LockContended(_) => {
+                    let _ = hook_event_tx.send("contended");
+                }
+                _ => {}
+            })));
+
+        let rival = {
+            let custody = std::sync::Arc::clone(&custody);
+            let rival_done = std::sync::Arc::clone(&rival_done);
+            std::thread::spawn(move || {
+                start_rx.recv().expect("IPC install parked");
+                super::super::carrier_custody::destroy_vm_with_custody_using(
+                    &custody,
+                    "rival G1 destroy",
+                    Stage2Status::SUCCESS,
+                    || {},
+                )
+                .expect("rival destroys G1");
+                rival_done.store(true, Ordering::SeqCst);
+                let _ = event_tx.send("done");
+            })
+        };
+
+        let mapped_after_rival = AtomicBool::new(false);
+        let installed = install_ipc_window_using(
+            &custody,
+            backing(carrick_el1_abi::EL1_IPC_POOL_SPAN as usize),
+            |_, _, _, _| {
+                if rival_done.load(Ordering::SeqCst) {
+                    mapped_after_rival.store(true, Ordering::SeqCst);
+                }
+                Stage2Status::SUCCESS
+            },
+            |_, _| Ok(()),
+        );
+        rival.join().expect("rival");
+        custody.stage2.set_hook(None);
+
+        let installed = installed.expect("G1 admitted IPC window install before destroy");
+        assert!(
+            !mapped_after_rival.load(Ordering::SeqCst),
+            "IPC window mapping ran after rival destroyed G1"
+        );
+        for identity in installed.records {
+            let snap = custody
+                .stage2_record_snapshot(identity.record_id)
+                .expect("installed IPC window record");
+            assert_eq!(snap.vm_generation, g1);
+            assert!(snap.terminalized_by_vm_destroy && !snap.mapped);
+        }
     }
 }

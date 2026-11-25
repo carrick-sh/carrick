@@ -1571,6 +1571,10 @@ pub(crate) const RECORD_UNMAP_PREPARED: &str = "record unmap prepared";
 pub(crate) const FRAME_POOL_ADMITTED: &str = "frame pool admitted";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const ROOT_SLOT_POOL_ADMITTED: &str = "root slot pool admitted";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const REPLAY_REBIND_ADMITTED: &str = "replay rebind admitted";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const IPC_WINDOW_ADMITTED: &str = "ipc window admitted";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
@@ -2028,6 +2032,109 @@ mod carrier_vm_custody_tests {
                 CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => None,
             },
         );
+    }
+
+    /// Replay reconciliation checked the live generation (`G2`), then rebound
+    /// a terminal `G1` carrier-MM record without holding `G2`'s guard while a
+    /// rival destroyed `G2` and began `G3` (with no replay into `G3`). Holding
+    /// the generation guard from the check through the rebind ensures `G2` is
+    /// either rebound and terminalized before `G3` begins, or refused; a live
+    /// mapped record can never appear in `G3` without an actual replay in `G3`.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_replay_rebind_never_binds_to_a_generation_created_after_it_checked() {
+        use carrick_aarch64::stage2::custody::Stage2HookPoint;
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (custody, g1) = live_custody();
+        let key = (0xa081_b000_0000_u64, 0x4000_u64);
+        let spec = CarrierStage2RecordSpec {
+            ipa: key.0,
+            len: key.1 as usize,
+            release_ipa: false,
+            ..stage2_spec(g1, 101)
+        };
+        let old_identity = custody
+            .register_stage2_record(spec)
+            .expect("register G1 carrier-MM record");
+        custody
+            .carrier_stage2_records
+            .lock()
+            .insert(key, old_identity);
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let event_rx = std::sync::Mutex::new(event_rx);
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| match point {
+                Stage2HookPoint::Client(super::REPLAY_REBIND_ADMITTED) => {
+                    start_tx.send(()).expect("rival alive");
+                    let event = event_rx
+                        .lock()
+                        .expect("event receiver")
+                        .recv()
+                        .expect("rival reports");
+                    assert!(matches!(event, "contended" | "done"));
+                }
+                Stage2HookPoint::LockContended(_) => {
+                    let _ = hook_event_tx.send("contended");
+                }
+                _ => {}
+            })));
+
+        let rival = {
+            let custody = std::sync::Arc::clone(&custody);
+            std::thread::spawn(move || {
+                start_rx.recv().expect("reconcile parked");
+                destroy_vm_with_custody_using(
+                    &custody,
+                    "rival G2 destroy",
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                    || {},
+                )
+                .expect("rival destroys G2");
+                let g3 = custody.begin_create().expect("begin G3");
+                let _ = event_tx.send("done");
+                g3
+            })
+        };
+
+        let result = super::reconcile_global_frame_owners_after_replay_in(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa: key.0,
+                length: key.1,
+                host_addr: spec.host_addr,
+                perms: spec.perms,
+            }],
+            false,
+        );
+        let g3 = rival.join().expect("rival");
+        custody.stage2.set_hook(None);
+
+        assert_ne!(g3, g2);
+        result.expect("G2 admitted replay rebind before G2 was destroyed");
+        let current = custody.carrier_stage2_records.lock()[&key];
+        let snapshot = custody
+            .stage2_record_snapshot(current.record_id)
+            .expect("rebound record snapshot");
+        assert_ne!(
+            snapshot.vm_generation, g3,
+            "a replay checked in G2 fabricated a live mapped record in G3 after G2 destroyed"
+        );
+        assert_eq!(snapshot.vm_generation, g2);
+        assert!(snapshot.terminalized_by_vm_destroy && !snapshot.mapped);
     }
 
     fn stage2_spec(
