@@ -36,7 +36,8 @@ other mapping, with or without msync. In A1 scope, Carrick serves writable
 host-backed MAP_SHARED file mappings on x86 as windows: a carrier's view of
 the host file's page cache in fixed 2 MiB chunks, with no copy and no
 write-back state (O_RDONLY host MAP_SHARED coherence is tracked separately
-in #2838; ARM and unrouted variants stay fenced ENOSYS). One neutral model
+in #2838; ARM retains its aligned non-MAP_FIXED host-alias route while
+unrouted and snapshot variants stay fenced ENOSYS). One neutral model
 (carrick_core::mm::window) specifies chunk geometry, per-mapping edges,
 SIGBUS past EOF, and shrink/park/epoch state transitions; A1 production
 enforces shrink safety through the host-inode size fence (carrick_vfs::host_size)

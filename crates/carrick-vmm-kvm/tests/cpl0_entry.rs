@@ -5323,10 +5323,12 @@ static long sc(long n, long a, long b, long c, long d, long e, long f) {
 #define MAP_PRIVATE 2L
 #define MAP_ANONYMOUS 0x20L
 #define MAP_FIXED_NOREPLACE 0x100000L
+#define EINVAL (-22L)
 #define ENOSYS (-38L)
 #define EEXIST (-17L)
 #define INJECT_PREPARED_CONFLICT_ONCE (-494LL)
 #define INJECT_WAIT_PARK_CENSUS (-493LL)
+#define INJECT_OPERATION_TOKEN_ACTIVE (-428LL)
 #define CHUNK (2ULL << 20)
 #define BATCH_BYTES (32ULL * CHUNK)
 
@@ -5369,6 +5371,7 @@ void _start(void) {
     if (sat_p != ENOSYS) sc(231, 97, 0, 0, 0, 0, 0);
     long parks2 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
     if (parks2 != 2) sc(231, 98, 0, 0, 0, 0, 0);
+    if (sc(INJECT_OPERATION_TOKEN_ACTIVE, 0, 0, 0, 0, 0, 0) != 0) sc(231, 104, 0, 0, 0, 0, 0);
 
     long occ = sc(9, 0, 4096, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (is_err(occ)) sc(231, 99, 0, 0, 0, 0, 0);
@@ -5377,10 +5380,19 @@ void _start(void) {
     if (col_p != EEXIST) sc(231, 100, 0, 0, 0, 0, 0);
     long parks3 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
     if (parks3 != 2) sc(231, 101, 0, 0, 0, 0, 0);
+    if (sc(INJECT_OPERATION_TOKEN_ACTIVE, 0, 0, 0, 0, 0, 0) != 0) sc(231, 105, 0, 0, 0, 0, 0);
     long sat_p2 = sc(9, 0, 4096, PROT_RW, MAP_SHARED, sat_fd, (long)off);
     if (sat_p2 != ENOSYS) sc(231, 102, 0, 0, 0, 0, 0);
     long parks4 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
     if (parks4 != 3) sc(231, 103, 0, 0, 0, 0, 0);
+    if (sc(INJECT_OPERATION_TOKEN_ACTIVE, 0, 0, 0, 0, 0, 0) != 0) sc(231, 106, 0, 0, 0, 0, 0);
+
+    sc(INJECT_PREPARED_CONFLICT_ONCE, 0, 0, 0, 0, 0, 0);
+    long bad_p = sc(9, 0, 4096, PROT_RW, MAP_SHARED, wfd, (long)(1ULL << 63));
+    if (bad_p != EINVAL) sc(231, 107, 0, 0, 0, 0, 0);
+    long parks5 = sc(INJECT_WAIT_PARK_CENSUS, 0, 0, 0, 0, 0, 0);
+    if (parks5 != 4) sc(231, 108, 0, 0, 0, 0, 0);
+    if (sc(INJECT_OPERATION_TOKEN_ACTIVE, 0, 0, 0, 0, 0, 0) != 0) sc(231, 109, 0, 0, 0, 0, 0);
 
     sc(231, 7, 0, 0, 0, 0, 0);
     __builtin_unreachable();

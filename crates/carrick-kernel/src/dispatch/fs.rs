@@ -2479,22 +2479,18 @@ impl<'a> FsView<'a> {
                             return Ok(DispatchOutcome::errno(errno));
                         }
                     } else if grow {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if let Err(errno) =
-                            (unsafe { libc::fstat(host_fd.raw(), &mut st) }).host_syscall_errno()
-                        {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        if new_size > st.st_size as u64 {
-                            use std::os::fd::AsFd as _;
-                            if let Err(errno) =
-                                carrick_vfs::host_size::resize(host_fd.as_fd(), new_size)
-                            {
+                        use std::os::fd::AsFd as _;
+                        match carrick_vfs::host_size::extend_to(host_fd.as_fd(), new_size) {
+                            Ok(grew) => {
+                                if grew {
+                                    this.invalidate_dentry_host_fd(host_fd.raw());
+                                }
+                            }
+                            Err(errno) => {
                                 return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
                                     errno,
                                 )));
                             }
-                            this.invalidate_dentry_host_fd(host_fd.raw());
                         }
                     }
                     writeback = None;

@@ -3069,8 +3069,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// Serve one page of a shared file window (#1338): map the carrier's
     /// slot for the file's chunk, never a private copy, so the guest's
     /// stores are the file's bytes. The slot is a host `mmap(MAP_SHARED)` of
-    /// the chunk, made at the chunk's first fault in this carrier and kept
-    /// for the run; each MM that faults it is admitted to it.
+    /// the chunk installed when `HostFileOp::MapShared` replies (subject to
+    /// `WindowSlotBudget`, rolled back by `ReleaseWindow` if placement fails
+    /// before committing); each MM that faults it is admitted to it.
     fn prepare_window_grant(
         &mut self,
         execution: GrantExecution,

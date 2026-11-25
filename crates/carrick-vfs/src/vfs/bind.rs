@@ -630,20 +630,12 @@ impl Vfs for BindVfs {
         }
 
         let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
-        let cpath = CString::new(host.to_string_lossy().as_ref()).map_err(|_| LINUX_EINVAL)?;
-        // An O_TRUNC open goes through the host size door (#1338 A1).
-        let host_fd = crate::host_size::open_truncating(host_flags, |host_flags| {
-            // SAFETY: host path as NUL-terminated string.
-            let fd = unsafe { libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int) };
-            if fd < 0 {
-                Err(carrick_portable::errno())
-            } else {
-                // SAFETY: `open` returned a fresh descriptor.
-                Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-            }
-        })
-        .map_err(host_to_linux_errno)?
-        .into_raw_fd();
+        // An O_TRUNC open goes through the host size door (#1338 A1), resolving
+        // dangling symlinks to atomic `O_EXCL` leaf creation (`#2975` r33 P0 #1).
+        let host_fd =
+            crate::host_size::open_truncating_path(&host, host_flags, flags.mode as libc::c_uint)
+                .map_err(host_to_linux_errno)?
+                .into_raw_fd();
         if flags.create && !existed_before_create {
             self.publish_namespace();
         }

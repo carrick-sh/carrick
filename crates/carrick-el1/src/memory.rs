@@ -1890,10 +1890,14 @@ pub fn serve_delegated_mapping<
     let served = serve_delegated_anonymous_for_origin(
         frame, counters, current, spaces, table, editor, mapping,
     );
-    // A retained source this call did not consume (an errno, a refusal or a
-    // forward) is retired now; one a committed node holds is unchanged.
-    if let Some(file) = mapping.file {
-        retire_native_sources(current, spaces, table, slot, &[file.identity()]);
+    // A retained private-copy source this call did not consume (an errno, a
+    // refusal or a forward) is retired now; one a committed node holds is
+    // unchanged. Shared file windows (`Window`) never queue onto the MM
+    // batch retirement stream here: unplaced calls roll back synchronously via
+    // `HostFileOp::ReleaseWindow`, preventing a peer `decode_releases` from
+    // falsely marking unplaced carrier window slots committed (#2975 r33 P0 #2).
+    if let Some(NativeFileSource::Copied(identity)) = mapping.file {
+        retire_native_sources(current, spaces, table, slot, &[identity]);
     }
     served
 }
@@ -5731,6 +5735,77 @@ mod tests {
             assert_eq!(
                 preflight_file_mmap(&overlap_frame, &delegated.task, access, &table, true),
                 FileMmapPreflight::Proceed
+            );
+        }
+
+        /// Codex r33 P0 2 (#2975): when `serve_delegated_mapping` rejects a
+        /// `NativeFileSource::Window` `mmap` (for instance `MAP_FIXED_NOREPLACE`
+        /// `EEXIST`), it must not queue that source onto the MM's batch
+        /// retirement stream (where a peer `decode_releases` would mark the
+        /// carrier window slot committed before `ReleaseWindow` runs).
+        #[test]
+        fn serve_delegated_mapping_rejected_window_does_not_queue_retirement() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 30, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, addr) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!((route, addr), (DelegatedAnonymous::Served, ARENA as i64));
+
+            let mut frame = TrapFrame {
+                elr: 0x40004,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = SYS_MMAP;
+            frame.x[..6].copy_from_slice(&[
+                ARENA,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_FIXED_NOREPLACE,
+                3,
+                0,
+            ]);
+            let window_id = carrick_el1_abi::HostBackingIdentity::new(
+                NonZeroU64::new(99).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+                0,
+            );
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let route = serve_delegated_mapping(
+                &mut frame,
+                &counters,
+                &delegated.task,
+                access,
+                &table,
+                &mut editor,
+                NativeMapping {
+                    file: Some(NativeFileSource::Window(window_id)),
+                    origin: ServiceOrigin::Initial,
+                },
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert_eq!(frame.x[0] as i64, -17);
+
+            let mut guard = root(&spaces, &table, &delegated);
+            assert_eq!(
+                guard.take_retired_host_backing(),
+                Ok(None),
+                "rejected Window mmap must rely on synchronous ReleaseWindow rather than batch retirement (#2975 r33 P0 #2)"
             );
         }
     }
