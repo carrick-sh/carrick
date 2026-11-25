@@ -86,7 +86,9 @@ fn stock(tables: u64) -> ForkStock<UntaggedRoots> {
         )
         .unwrap(),
     ];
-    stock.install(pages, lifecycles).unwrap();
+    stock
+        .install(pages, crate::fork_stock::TableReserve::EMPTY, lifecycles)
+        .unwrap();
     stock
 }
 

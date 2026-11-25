@@ -114,6 +114,7 @@ fn native_fork_reserve_retains_a_source_the_parent_acquired_after_birth() {
                 (0..8)
                     .map(|index| page(stock_base + index * 4096))
                     .collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 vec![second_lifecycle, ForkLifecycleLoan::ARM_DEFAULT],
             )
             .unwrap();

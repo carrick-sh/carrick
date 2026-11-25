@@ -161,12 +161,17 @@ pub fn prepare_table_suffix(extent_bytes: usize, occupied_end: usize) -> Option<
     )
 }
 
-fn prepare_table_candidates(stock: &[RootGpa]) -> Vec<SubstrateGpa> {
-    stock
-        .iter()
-        .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
-        .map(|table| SubstrateGpa(table.address().raw()))
-        .collect()
+/// The never-issued page-table reserve between the occupied boot records
+/// and grants (`occupied_end`, an extent offset) and the Prepare working
+/// suffix: the span the CPL0 editor licenses as tables at boot
+/// ([`carrick_core_abi::X86TableReserve`]), as the fork stock draws it.
+pub fn initial_table_reserve(
+    occupied_end: usize,
+    working: PrepareTableSpan,
+) -> Option<carrick_hal::fork_stock::TableReserve> {
+    let occupied_end = INITIAL_EXTENT_GPA.checked_add(u64::try_from(occupied_end).ok()?)?;
+    let span = carrick_core_abi::X86TableReserve::derive(FrameGpa::new(occupied_end), working)?;
+    carrick_hal::fork_stock::TableReserve::new(span.start(), span.end())
 }
 
 /// What preparing an owner-selected window produced.
@@ -990,11 +995,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// unused initial table grant becomes the carrier's maintenance root:
     /// only the initial root's shared supervisor branches, published as the
     /// zone's idle root so a CPU can leave every process root before its
-    /// slot reports no installed MM. The rest become fork table stock.
+    /// slot reports no installed MM. The rest become fork table stock, with
+    /// the extent's never-issued table `reserve` behind it.
     pub fn install_fork_stock(
         &mut self,
         context: AddressContext<RootGpa>,
         unused: Vec<RootGpa>,
+        reserve: carrick_hal::fork_stock::TableReserve,
     ) -> Result<(), TrapError> {
         let initial_root = context.root;
         let BootForkStock {
@@ -1051,7 +1058,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .set_idle_ttbr(maintenance.address().raw());
         self.maintenance_root = Some(maintenance);
         self.fork_stock
-            .install(tables, lifecycles)
+            .install(tables, reserve, lifecycles)
             .map_err(|e| fail(format!("fork stock install: {e:?}")))?;
         let mm = carrick_el1_abi::ReservationMm::new(context.mm.raw().get())
             .ok_or_else(|| fail("initial root MM"))?;
@@ -2823,7 +2830,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
-        let tables = prepare_table_candidates(self.fork_stock.table_stock());
+        let tables: Vec<SubstrateGpa> = self
+            .fork_stock
+            .descriptor_table_candidates()
+            .iter()
+            .map(|table| SubstrateGpa(table.address().raw()))
+            .collect();
         let mut txn = WireTxn {
             id: DescriptorTxnId {
                 mm_key: mm,
@@ -2929,6 +2941,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     PublicationDecline::InheritedPrepared
                     | PublicationDecline::NotNow(PublicationNotNow::MmRelease) => {
                         Ok(Ok(BackingPreparation::Raced(refusal)))
+                    }
+                    // The candidates were the whole stock and its reserve:
+                    // the carrier's page-table window is spent. That is the
+                    // guest running out of memory, never a carrier fault.
+                    // Leave the selection unserved, counted: the guest
+                    // cancels it and its fault owner answers as for any
+                    // unbackable access (#3017).
+                    PublicationDecline::NotNow(PublicationNotNow::Capacity(
+                        carrick_mmu_core::descriptor_refusal::DescriptorRefusal::TablesExhausted,
+                    )) => {
+                        self.fork_stock.refuse_descriptor_capacity();
+                        Ok(Ok(BackingPreparation::Prepared(None)))
                     }
                     _ => Err(fail(format!(
                         "owner grant physical table plan refused: {refusal:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}",
@@ -3181,6 +3205,7 @@ mod custody_tests {
                 (1..=24)
                     .map(|page| RootGpa::page_aligned(FrameGpa::new(page * 4096)).unwrap())
                     .collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 Vec::new(),
             )
             .unwrap();
@@ -3585,7 +3610,13 @@ mod custody_tests {
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             UntaggedRoots,
         );
-        stock.install(boot.tables, boot.lifecycles).unwrap();
+        stock
+            .install(
+                boot.tables,
+                carrick_hal::fork_stock::TableReserve::EMPTY,
+                boot.lifecycles,
+            )
+            .unwrap();
         let exec = execution();
         let request = ForkStockRequest {
             binding: exec.binding,

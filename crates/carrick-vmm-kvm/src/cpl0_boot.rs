@@ -356,8 +356,9 @@ impl Cpl0Carrier {
         context.run(&mut self.cpus[index])
     }
     /// Size one private retained aperture for the host-staged PT_LOAD bytes,
-    /// the boot record, and guest-owned table/data grants. Capacity follows
-    /// the submitted image rather than reserving a carrier-wide RAM pool.
+    /// the boot record, guest-owned table/data grants and the page-table
+    /// reserve every MM's tables grow into (the whole supervisor-aliased
+    /// window, reserved rather than committed).
     pub fn initial_extent_bytes_for(
         image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
         argv: &[String],
@@ -2753,9 +2754,10 @@ impl Cpl0Carrier {
         self.custody.native_exec_reservation(successor)
     }
 
-    /// Reusable fork-stock table pages.
-    pub fn fork_table_stock(&self) -> usize {
-        self.custody.fork_table_stock()
+    /// Fork-stock table pages the carrier can issue: the reusable stock
+    /// and the never-issued reserve it draws from.
+    pub fn fork_table_capacity(&self) -> usize {
+        self.custody.fork_table_capacity()
     }
 
     /// Waiters enrolled on the fork stock's release and not yet woken.

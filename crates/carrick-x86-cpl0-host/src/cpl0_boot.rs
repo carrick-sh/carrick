@@ -6223,8 +6223,9 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         &mut self,
         context: AddressContext<RootGpa>,
         unused: Vec<RootGpa>,
+        reserve: carrick_hal::fork_stock::TableReserve,
     ) -> Result<(), TrapError> {
-        self.0.install_fork_stock(context, unused)
+        self.0.install_fork_stock(context, unused, reserve)
     }
     pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
         self.0.fork_stock_counters()
@@ -7312,8 +7313,10 @@ pub fn install_boot_memory<M: CarrierMemoryIo>(
 }
 
 /// Size one private retained aperture for the host-staged PT_LOAD bytes,
-/// the boot record, and guest-owned table/data grants. Capacity follows
-/// the submitted image rather than reserving a carrier-wide RAM pool.
+/// the boot record, guest-owned table/data grants and the page-table
+/// reserve: the image must fit the supervisor-aliased window, and the
+/// aperture is the whole window, so every MM's page tables can grow into
+/// it on demand. The mapping is reserved, never committed up front.
 pub fn initial_extent_bytes_for(
     image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
     argv: &[String],
@@ -7387,7 +7390,12 @@ pub fn initial_extent_bytes_for(
     if bytes > MAX_BYTES {
         return Err(fail("initial image exceeds carrier memory budget"));
     }
-    Ok(bytes)
+    // The rest of the window is the page-table reserve (#3017): every MM's
+    // tables come from this one retained, supervisor-aliased extent, and
+    // their number follows the guest's address spaces, not this image. The
+    // private mapping is reserved, not committed: a reserve page costs host
+    // memory only once a table is drawn from it and written.
+    Ok(MAX_BYTES)
 }
 
 /// One stopped kernel entry on a carrier CPU: kernel CS/SS, the given GS
@@ -7507,8 +7515,10 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
     let occupied_end = frame_offset
         .checked_add(grant_count * 4096)
         .ok_or_else(|| fail("initial occupied physical extent"))?;
-    anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
+    let working = anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
         .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
+    let reserve = anonymous_owner::initial_table_reserve(occupied_end, working)
+        .ok_or_else(|| fail("initial table reserve"))?;
     let (mut inventory, grants) = InitialInventory::stage(
         carrier.custody().rollback_fault(),
         Arc::clone(carrier.custody().frame_inventory()),
@@ -7883,7 +7893,9 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
                     .ok_or_else(|| fail("initial unused table alignment"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        carrier.custody_mut().install_fork_stock(context, unused)?;
+        carrier
+            .custody_mut()
+            .install_fork_stock(context, unused, reserve)?;
         match carrier.run_cpu(0)? {
             VcpuExit::IoOut {
                 port: X86_INITIAL_RUNNER_READY_PORT,
