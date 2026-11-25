@@ -309,7 +309,11 @@ impl ForkStockHostCustody {
         .ok_or_else(|| fail("native fork lifecycle extent layout"))?;
         stock
             .owner
-            .install(tables, lifecycles)
+            .install(
+                tables,
+                carrick_hal::fork_stock::TableReserve::EMPTY,
+                lifecycles,
+            )
             .map_err(|error| fail(&format!("native fork stock install: {error:?}")))?;
         stock.backing = Some(NativeForkBacking {
             resources,
