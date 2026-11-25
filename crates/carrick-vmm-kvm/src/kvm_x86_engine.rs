@@ -938,7 +938,7 @@ impl X86Vcpu for KvmVcpu {
         // the doorbell exit; kvm_valid_regs requests SREGS too) instead of a
         // KVM_GET_SREGS ioctl. Read-only mirror — kernel sregs stay authoritative.
         let mut sregs = if self.sync_regs_usable() {
-            self.fd().sync_regs().sregs
+            self.run_map().synced_regs().sregs
         } else {
             crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
             self.fd()
@@ -1031,7 +1031,7 @@ impl X86Vcpu for KvmVcpu {
         // other accessor (get_gpr/set_gpr) is unaffected. RAX/RIP are independent
         // of RCX/R11, so reading first preserves their values.
         let mut regs = if self.sync_regs_usable() {
-            self.fd().sync_regs().regs
+            self.run_map().synced_regs().regs
         } else {
             crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
             self.fd()
@@ -1276,7 +1276,7 @@ impl X86Vcpu for KvmVcpu {
                 // kvm_run.s.regs on this exit (kvm_valid_regs was set before the
                 // run), so read the frame from the mmap page — no KVM_GET_REGS.
                 let regs = if self.sync_regs_usable() {
-                    self.fd().sync_regs().regs
+                    self.run_map().synced_regs().regs
                 } else {
                     crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
                     self.fd().get_regs().map_err(|e| {

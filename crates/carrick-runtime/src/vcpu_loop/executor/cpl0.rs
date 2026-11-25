@@ -102,6 +102,8 @@ pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMem
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    off_root_kick_probe: Option<crate::prepare::KvmOffRootKickProbe>,
 }
 
 /// The run root's current task binding, shared by every executor of one
@@ -298,6 +300,8 @@ pub(crate) struct Cpl0PersistentExecutorConfig<M: CarrierCpuIo, Mem: CarrierMemo
     pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     pub(crate) injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    pub(crate) off_root_kick_probe: Option<crate::prepare::KvmOffRootKickProbe>,
 }
 
 /// The CPL0 run's completion, applying the scheduler's executor-death
@@ -320,8 +324,8 @@ impl carrick_kernel::kernel::ExecutorDeathObserver for Cpl0ExecutorDeathCompleti
     }
 }
 
-/// Loaded-lane pre-entry hook for test control; it receives the backend kick
-/// handle armed for the loaded task's next guest entry.
+/// Loaded-lane pre-entry hook for test control; it runs before every loaded
+/// entry and receives the backend kick handle armed for that entry.
 #[cfg(feature = "kvm-pool-test-control")]
 pub(crate) type LoadedPreEntryHook<K> =
     Arc<dyn Fn(&std::sync::atomic::AtomicBool, &K) + Send + Sync + 'static>;
@@ -358,6 +362,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
             loaded_pre_entry_hook: config.loaded_pre_entry_hook,
             #[cfg(feature = "kvm-pool-test-control")]
             injected_death: config.injected_death,
+            #[cfg(feature = "kvm-pool-test-control")]
+            off_root_kick_probe: config.off_root_kick_probe,
         })
     }
 }
@@ -409,6 +415,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutorFactory
             loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
             #[cfg(feature = "kvm-pool-test-control")]
             injected_death: self.injected_death,
+            #[cfg(feature = "kvm-pool-test-control")]
+            off_root_kick: self
+                .off_root_kick_probe
+                .clone()
+                .map(OffRootKickTracker::new),
         })
     }
 }
@@ -437,7 +448,48 @@ pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo =
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    off_root_kick: Option<OffRootKickTracker>,
     external_signals: HostSignalIngressProducer,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+struct ArmedOffRootKick {
+    target: crate::prepare::KvmOffRootKickTarget,
+    expected_root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
+    expected_binding: GuestArchBinding,
+    expected_generation: ExecutionGeneration,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+struct OffRootKickTracker {
+    probe: crate::prepare::KvmOffRootKickProbe,
+    maintenance_armed: bool,
+    retired_child_armed: bool,
+    pending: Option<ArmedOffRootKick>,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+impl OffRootKickTracker {
+    fn new(probe: crate::prepare::KvmOffRootKickProbe) -> Self {
+        Self {
+            probe,
+            maintenance_armed: false,
+            retired_child_armed: false,
+            pending: None,
+        }
+    }
+}
+
+/// A reschedule check's verdict at one loaded boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reschedule {
+    /// Save the lease and give the executor back.
+    Preempt,
+    /// Keep running the guest: nothing is asked of this boundary, or the
+    /// reschedule stays owed (`need_resched` set) to the next boundary where
+    /// the lease is the leader's to save.
+    Continue,
 }
 
 struct RetainedForward {
@@ -712,6 +764,105 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             return Err(TrapError::Hypervisor(
                 "injected executor death after exec seal".into(),
             ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn arm_pending_off_root_kick_on_entry(
+        &mut self,
+    ) -> Result<Option<ArmedOffRootKick>, TrapError> {
+        let Some(tracker) = &mut self.off_root_kick else {
+            return Ok(None);
+        };
+        let Some(armed) = tracker.pending.take() else {
+            return Ok(None);
+        };
+        if self.physical.cpu().live_root()? != armed.expected_root {
+            return Err(TrapError::Hypervisor(
+                "off-root kick test control lost its target root before entry".into(),
+            ));
+        }
+        carrick_hal::VcpuKickDyn::kick(&self.idle_kick);
+        Ok(Some(armed))
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn observe_off_root_kick(
+        &self,
+        task: TaskIdentity,
+        armed: ArmedOffRootKick,
+        stopped: &carrick_x86_cpl0_host::carrier_cpu::StoppedTaskExit,
+    ) -> Result<(), TrapError> {
+        let Some(tracker) = &self.off_root_kick else {
+            return Ok(());
+        };
+        let cpu = self.physical.cpu();
+        let stopped_root = cpu.live_root()?;
+        let retained_loaded_custody = cpu.loaded_binding() == Some(armed.expected_binding)
+            && self.task == Some(armed.expected_binding.task())
+            && self.loaded_generation == Some(armed.expected_generation)
+            && self.binding.as_ref().is_some_and(|loaded| {
+                loaded.arch() == armed.expected_binding
+                    && loaded.generation() == armed.expected_generation
+            });
+        tracker
+            .probe
+            .record(crate::prepare::KvmOffRootKickObservation {
+                target: armed.target,
+                expected_root: armed.expected_root,
+                stopped_root,
+                exit_is_kick: stopped.exit == CarrierRunExit::Kick,
+                state_is_none: stopped.state.is_none(),
+                child_binding_present: cpu.has_child_binding(stopped_root)?,
+                can_save_loaded: cpu.can_save_loaded(task)?,
+                retained_loaded_custody,
+            })
+            .map_err(TrapError::Hypervisor)
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn maybe_arm_off_root_kick_after_doorbell(
+        &mut self,
+        port: u16,
+        expected_binding: GuestArchBinding,
+    ) -> Result<(), TrapError> {
+        let Some(tracker) = &mut self.off_root_kick else {
+            return Ok(());
+        };
+        let cpu = self.physical.cpu();
+        let live_root = cpu.live_root()?;
+        let target = if port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT
+            && tracker.probe.arm_retired_child_root
+            && !tracker.retired_child_armed
+        {
+            if cpu.has_child_binding(live_root)? {
+                return Err(TrapError::Hypervisor(
+                    "ChildRetire left the retired child's binding registered".into(),
+                ));
+            }
+            tracker.retired_child_armed = true;
+            Some(crate::prepare::KvmOffRootKickTarget::RetiredChildRoot)
+        } else if port == carrick_x86::cpl0_entry::WORK_PORT
+            && tracker.probe.arm_maintenance_root
+            && !tracker.maintenance_armed
+            && cpu.maintenance_root() == Some(live_root)
+        {
+            tracker.maintenance_armed = true;
+            Some(crate::prepare::KvmOffRootKickTarget::MaintenanceRoot)
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            let expected_generation = self.loaded_generation.ok_or_else(|| {
+                TrapError::Hypervisor("off-root kick has no loaded generation".into())
+            })?;
+            tracker.pending = Some(ArmedOffRootKick {
+                target,
+                expected_root: live_root,
+                expected_binding,
+                expected_generation,
+            });
         }
         Ok(())
     }
@@ -1050,7 +1201,26 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         // forward is the same bounded inspection point used by the
         // carrier's physical coordinator.
         self.scheduler.poke_executor_control();
-        Ok(ExecutorExit::Syscall)
+        if has_submission {
+            self.loaded_syscall_boundary()
+        } else {
+            Ok(ExecutorExit::Syscall)
+        }
+    }
+
+    /// The exit for a completed loaded-lane crossing. The generic quantum
+    /// loop may turn a syscall boundary into a preemption and save the lease
+    /// there, so this is a syscall boundary only where the reschedule rule
+    /// lets the lease be saved: the leader's own crossing on its root. A
+    /// member's or a forked child's crossing resumes the guest instead, and
+    /// a reschedule stays owed to the next boundary (#2962).
+    fn loaded_syscall_boundary(&self) -> Result<ExecutorExit, TrapError> {
+        let task = self.task()?;
+        if self.physical.can_save_loaded_leader(task)? {
+            Ok(ExecutorExit::Syscall)
+        } else {
+            Ok(ExecutorExit::ResumeEl1)
+        }
     }
 
     /// The single terminal path for every executor lane: a lane error that
@@ -1066,17 +1236,37 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         result
     }
 
+    /// The one reschedule rule for the loaded lane (#2962). Shutdown always
+    /// preempts. A reschedule preempts wherever the save is the lease
+    /// leader's own reloadable image
+    /// ([`ProductionCpuLease::can_save_loaded_leader`]): the leader on its
+    /// root, in user space or inside CPL0. On the maintenance root, a forked
+    /// child or a thread-group member it stays owed: `need_resched` stays set
+    /// and every later boundary (kick, crossing, entry) runs this rule again.
+    fn reschedule(
+        &self,
+        task: TaskIdentity,
+        need_resched: &AtomicBool,
+    ) -> Result<Reschedule, TrapError> {
+        if carrick_hal::vcpu_run::current_shutdown_requested()
+            || (need_resched.load(Ordering::Acquire)
+                && self.physical.can_save_loaded_leader(task)?)
+        {
+            Ok(Reschedule::Preempt)
+        } else {
+            Ok(Reschedule::Continue)
+        }
+    }
+
     fn run_loaded_lane(
         &mut self,
         need_resched: &AtomicBool,
         submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
-        if need_resched.load(Ordering::Acquire)
-            || carrick_hal::vcpu_run::current_shutdown_requested()
-        {
+        let task = self.task()?;
+        if self.reschedule(task, need_resched)? == Reschedule::Preempt {
             return Ok(ExecutorExit::Preempted);
         }
-        let task = self.task()?;
         let binding = self
             .binding
             .as_ref()
@@ -1133,7 +1323,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 Cpl0ResumeEffect::Refuse(errno) => {
                     self.physical
                         .complete_forward(task, retained.frame, errno.guest_retval())?;
-                    return Ok(ExecutorExit::Syscall);
+                    return self.loaded_syscall_boundary();
                 }
             };
             if restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
@@ -1198,12 +1388,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 DispatchOutcome::Returned { value } => {
                     self.physical
                         .complete_forward(task, retained.frame, value)?;
-                    return Ok(ExecutorExit::Syscall);
+                    return self.loaded_syscall_boundary();
                 }
                 DispatchOutcome::Errno { errno } => {
                     self.physical
                         .complete_forward(task, retained.frame, errno.guest_retval())?;
-                    return Ok(ExecutorExit::Syscall);
+                    return self.loaded_syscall_boundary();
                 }
                 other => {
                     let mut slot = binding
@@ -1234,19 +1424,35 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
         self.physical.arm_loaded_kick(task, &self.idle_kick)?;
         #[cfg(feature = "kvm-pool-test-control")]
-        if let Some(hook) = self.loaded_pre_entry_hook.take() {
+        if let Some(hook) = self.loaded_pre_entry_hook.clone() {
             hook(need_resched, &self.idle_kick);
         }
-        if need_resched.load(Ordering::Acquire)
-            || carrick_hal::vcpu_run::current_shutdown_requested()
-        {
-            M::disarm_run_kick(&self.idle_kick);
-            return Ok(ExecutorExit::Preempted);
+        // Disarm on every way out that does not enter the guest, the error
+        // included (the vCPU still revokes its publication before reuse).
+        match self.reschedule(task, need_resched) {
+            Ok(Reschedule::Continue) => {}
+            decision => {
+                M::disarm_run_kick(&self.idle_kick);
+                decision?;
+                return Ok(ExecutorExit::Preempted);
+            }
         }
+        #[cfg(feature = "kvm-pool-test-control")]
+        let armed_off_root = match self.arm_pending_off_root_kick_on_entry() {
+            Ok(armed) => armed,
+            Err(error) => {
+                M::disarm_run_kick(&self.idle_kick);
+                return Err(error);
+            }
+        };
         let stopped = self.physical.cpu_mut().run_loaded(task);
         M::disarm_run_kick(&self.idle_kick);
         let stopped = stopped
             .map_err(|error| TrapError::Hypervisor(format!("KVM stopped run boundary: {error}")))?;
+        #[cfg(feature = "kvm-pool-test-control")]
+        if let Some(armed) = armed_off_root {
+            self.observe_off_root_kick(task, armed, &stopped)?;
+        }
         match &stopped.exit {
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let binding = self.binding.as_ref().ok_or_else(|| {
@@ -1321,7 +1527,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     }
                 } else {
                     #[cfg(feature = "kvm-pool-test-control")]
-                    self.maybe_inject_death_after_exec_seal()?;
+                    {
+                        self.maybe_inject_death_after_exec_seal()?;
+                        let expected_binding = binding.arch();
+                        self.maybe_arm_off_root_kick_after_doorbell(*port, expected_binding)?;
+                    }
                     Ok(ExecutorExit::ResumeEl1)
                 }
             }
@@ -1332,7 +1542,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     .map_or(task, |state| state.binding().task());
                 self.service_syscall_trap(forward_task, exited, Some(submission))
             }
-            CarrierRunExit::Kick => Ok(ExecutorExit::Preempted),
+            // A kick preempts here or leaves its reschedule owed; re-entry
+            // is not a syscall boundary, so the generic loop cannot preempt
+            // around this rule.
+            CarrierRunExit::Kick => match self.reschedule(task, need_resched)? {
+                Reschedule::Preempt => Ok(ExecutorExit::Preempted),
+                Reschedule::Continue => Ok(ExecutorExit::ResumeEl1),
+            },
             CarrierRunExit::FaultDoorbellWord(first) => {
                 let record = self.physical.capture_fault_record(task, *first)?;
                 self.publish_exit(InitialProcessExit::Fault {
@@ -1577,6 +1793,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutor for Cpl0Persisten
             }
         };
         self.loaded_generation = None;
+        if carrick_hal::vcpu_run::current_shutdown_requested() {
+            if let Err(error) = self.physical.cpu_mut().reset_for_shutdown(task) {
+                return Err(ExecutorSaveError::new(
+                    TrapError::Hypervisor(format!("KVM shutdown detach: {error}")),
+                    lease,
+                ));
+            }
+            self.binding = None;
+            return Ok(SavedRunnable::new(lease));
+        }
         let stack = match self.physical.save_kernel_stack(task) {
             Ok(stack) => stack,
             Err(error) => return Err(ExecutorSaveError::new(error, lease)),

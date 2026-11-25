@@ -1,3 +1,12 @@
+# #2962: an interrupted KVM_RUN surfaces `Kicked` only for a request into the
+# run that is live now: the run's own `immediate_exit` byte (published while
+# armed, read atomically on EINTR, cleared on disarm), the shutdown latch or a
+# pending host signal. External stops (SIGSTOP/SIGCONT, ptrace/gdb attach)
+# re-enter KVM_RUN; no kick record outlives its run. `CarrierCpu` admits a kick
+# on `maintenance_root` (`state: None`) and `reset_for_shutdown` without
+# poisoning the carrier or demanding a task CR3. Existing shutdown-entry
+# semantics and work budgets are unchanged; KVM container witnesses live in
+# `x86_kvm_run`.
 # #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
 # (enter_mm_executor_then_register, the leased-root check and
 # open_first_address_space) and the stopped zone-slot publication move to
@@ -106,6 +115,10 @@ vm_free = [
   "carrick-x86-cpl0-host::carrier_cpu::tests::kicked_child_on_root_executor_keeps_its_issued_root (component: a kicked CPU switched to a registered child root captures that child's issued binding; red before #2581 fix; does not qualify KVM container shutdown)",
   "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_a_registered_child_resolves_its_binding (component, #2581: a fault doorbell from a child CR3 registered with the carrier resolves that child's issued binding instead of the loaded root; red before the fix; does not qualify the KVM container)",
   "carrick-x86-cpl0-host::carrier_cpu::tests::loaded_fault_doorbell_from_an_unregistered_child_root_is_refused (component, #2581: an unregistered child root is refused, never bound to the loaded root)",
+  "carrick-hal::posix_signal_kick::tests::a_kick_reaches_only_the_run_armed_when_it_lands (component, #2962: a kick between runs records nothing for the next run; a kick through any handle of the thread reaches the run armed now; the window clears on close)",
+  "carrick-hal::posix_signal_kick::tests::a_caller_armed_run_keeps_its_owner (component, #2962: a nested run window neither re-zeroes nor disarms a caller-armed run)",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::maintenance_root_kick_does_not_poison_or_require_a_task_root (component, #2962: a requested kick on maintenance_root returns state None without poisoning the carrier and resets cleanly on shutdown; KVM container witnesses live in cpl0_initial_mm and x86_kvm_run)",
+  "carrick-x86-cpl0-host::carrier_cpu::tests::kick_on_a_retired_childs_root_keeps_loaded_custody (component, #2962: a kick after child-retire unregistration keeps loaded custody with state None and resets cleanly on shutdown)",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
@@ -115,6 +128,7 @@ embed = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 bindings (#2962): carrick-vmm-kvm::kvm::run_kick_tests::{a_kick_racing_a_completed_exit_does_not_surface_on_a_later_external_interrupt,an_unarmed_run_reenters_on_external_interrupts_and_surfaces_its_own_kick} drive the production HvVcpu::run on a real vCPU (red on d500fdec7: a stale kick surfaced Kicked on a later external interrupt); carrick-cli::x86_kvm_run::serial_host::{mounted_static_x86_multithreaded_guest_survives_sigstop_and_ptrace_cycles,mounted_static_x86_gdb_attach_preserves_parked_wait_carrier} drive the production carrier. carrick-vmm-kvm::cpl0_initial_mm::reschedule_owed_inside_cpl0_preempts_inside_a_crossing_free_user_spin publishes a reschedule at a kick stop inside CPL0 on the production pool entry and requires the leader's lease saved before the guest's crossing-free user spin ends (red on d500fdec7: never honoured); carrick-vmm-kvm::cpl0_initial_mm::{maintenance_root_kick_keeps_loaded_custody_without_a_task_snapshot,kick_off_the_loaded_root_keeps_loaded_custody_without_a_task_snapshot} drive the production pool through KvmOffRootKickProbe to kick on the next actual entry after WORK_PORT on maintenance_root and after NATIVE_CHILD_RETIRE_PORT child unregistration, verifying state.is_none(), retained loaded custody, and exact stopped root CR3. Requires real KVM; the contract evaluator has no registered KVM observation layer."
 docker = "Physical vCPU cancellation is host-internal; Linux supplies no equivalent HVF oracle."
 embed_structural = "Before-entry latch qualified on the director Mac. Signed el1_files stress must be rerun for the native exception terminal ownership changes."
 embed_timing = "No guest runtime ratio is claimed; the signed qualification bounds raw run return to two seconds and reports reason/time."

@@ -2594,6 +2594,10 @@ fn exec_owner_census_of<Mem: CarrierMemoryIo>(
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
+    pub const fn cpu(&self) -> &CarrierCpu<M> {
+        &self.cpu
+    }
+
     pub fn cpu_mut(&mut self) -> &mut CarrierCpu<M> {
         &mut self.cpu
     }
@@ -2734,6 +2738,38 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
         execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
+    }
+
+    /// Whether a reschedule may save the host root lease here: the loaded
+    /// CPU stands on the lease's root ([`CarrierCpu::can_save_loaded`]), in
+    /// user mode or in CPL0 supervisor code, and the CPL0 execution issued on
+    /// this slot is the lease's own leader thread. A `CLONE_THREAD` member
+    /// sharing the root, a forked child or the maintenance root never stands
+    /// in for the leader's saved image (#2962). Every save the executor
+    /// starts for a reschedule, after a kick or after a completed crossing,
+    /// checks this one rule.
+    pub fn can_save_loaded_leader(
+        &self,
+        task: carrick_guest_arch::TaskIdentity,
+    ) -> Result<bool, TrapError> {
+        if !self.cpu.can_save_loaded(task)? {
+            return Ok(false);
+        }
+        let Some(slot) = self.physical_slot() else {
+            return Ok(true);
+        };
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let Some(initial) = custody.initial_task else {
+            return Ok(true);
+        };
+        let current = custody.task(slot);
+        let binding = carrick_core::entry::binding(&current.execution, &current.mm);
+        Ok(binding.issued()
+            && binding.task == carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
+            && binding.mm.raw() == initial.mm.raw().get())
     }
 
     pub fn save_kernel_stack(

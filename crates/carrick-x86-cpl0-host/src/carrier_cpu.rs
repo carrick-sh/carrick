@@ -198,7 +198,9 @@ impl<B: CarrierCpuBackend> CarrierCpuBackend for OwnedCpuIo<B> {
 /// Physical doorbells remain distinct from the authenticated syscall trap.
 #[derive(Debug)]
 pub struct StoppedTaskExit {
-    /// A maintenance-root work crossing has no task address context to save.
+    /// Present whenever the exit carries a task snapshot; `None` on every
+    /// [`CarrierRunExit::Kick`] (a kick interrupts without serving a crossing)
+    /// and on maintenance-root `WORK_PORT` / `NATIVE_EXEC_PORT` crossings.
     pub state: Option<X86ArchContext>,
     pub exit: CarrierRunExit,
 }
@@ -805,26 +807,46 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 Ordering::Release,
             );
         }
-        if let CarrierRunExit::PhysicalDoorbell { port, .. } = &exit {
+        let stopped_root = image.cr3 & !0xfff;
+        let on_maintenance_root = self
+            .maintenance_root
+            .is_some_and(|root| root.address().raw() == stopped_root);
+        if matches!(&exit, CarrierRunExit::Kick) {
+            // A kick interrupts the CPU wherever it stands; it is not a
+            // crossing, so nothing is served on its behalf and no root has
+            // to authenticate it. CPL0 may stand on the loaded root, a
+            // descendant's root, a child's root it is still retiring after
+            // the retire crossing, or the maintenance root (its idle
+            // scheduler at HLT after `leave_space`) (#2962). The kick keeps
+            // loaded custody and captures no snapshot: a save attributes the
+            // stopped image itself (`save_and_detach`), and the executor
+            // saves only where `can_save_loaded` holds.
+            self.custody = Custody::Loaded {
+                binding,
+                resume,
+                pending_io,
+            };
+            return Ok(StoppedTaskExit { state: None, exit });
+        }
+        if on_maintenance_root
+            && matches!(
+                &exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_x86::cpl0_entry::WORK_PORT | carrick_el1_abi::NATIVE_EXEC_PORT,
+                    ..
+                }
+            )
+        {
             // Exit work can be published after the last child has left its
-            // process root. Only the boot-published maintenance root may
-            // serve that work; it is never a task snapshot or a child MM.
-            // An exec settlement crosses after its CPU left the predecessor
-            // and before it loads the successor; the service authenticates
-            // the settling task and its successor's root.
-            if (*port == carrick_x86::cpl0_entry::WORK_PORT
-                || *port == carrick_el1_abi::NATIVE_EXEC_PORT)
-                && self
-                    .maintenance_root
-                    .is_some_and(|root| root.address().raw() == image.cr3)
-            {
-                self.custody = Custody::Loaded {
-                    binding,
-                    resume,
-                    pending_io,
-                };
-                return Ok(StoppedTaskExit { state: None, exit });
-            }
+            // process root, and an exec settlement crosses after leaving the
+            // predecessor root. Only the boot-published maintenance root may
+            // stand here; it has no user task snapshot to save.
+            self.custody = Custody::Loaded {
+                binding,
+                resume,
+                pending_io,
+            };
+            return Ok(StoppedTaskExit { state: None, exit });
         }
         let target_binding = match &exit {
             // CPL0 schedules descendants in-zone without changing the
@@ -844,11 +866,11 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                     },
                 )
             }
-            // A kick may interrupt a descendant after CPL0 switches CR3 in
-            // zone, without changing the executor's loaded root task. So may
-            // a user fault: its record is captured from the live child.
+            // A descendant's syscall or user fault stops on its own root
+            // after CPL0 switches CR3 in zone, without changing the
+            // executor's loaded root task: its record is captured from the
+            // live child.
             CarrierRunExit::SyscallTrap
-            | CarrierRunExit::Kick
             | CarrierRunExit::FaultDoorbellWord(_)
             | CarrierRunExit::FaultException { .. } => {
                 self.stopped_binding(binding, &image, true, "forward")
@@ -935,6 +957,79 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             debug.phase.store(0, Ordering::Release);
         }
         Ok(saved)
+    }
+    /// Whether the loaded CPU stands on `task`'s own root address space, so
+    /// [`Self::save_and_detach`] produces an image that reloads under the
+    /// lease's binding. A user stop and a CPL0 supervisor stop both qualify:
+    /// the save captures the slot's kernel stack, and the image resumes on
+    /// this slot exactly where it stopped. On `maintenance_root` or a forked
+    /// child's root there is no reloadable image for this lease (#2962).
+    pub fn can_save_loaded(&self, task: TaskIdentity) -> Result<bool, TrapError> {
+        let Custody::Loaded { binding, .. } = self.custody else {
+            return Err(boundary_error(
+                "carrier save check requires its exact loaded task generation",
+            ));
+        };
+        if binding.task() != task {
+            return Err(boundary_error(
+                "carrier save check requires its exact loaded task generation",
+            ));
+        }
+        let cr3 = self.io.get_gpr(X86Reg::Cr3)?;
+        Ok((cr3 & !0xfff) == binding.context().root.address().raw())
+    }
+    /// Current hardware CR3 root GPA of this CPU.
+    pub fn live_root(&self) -> Result<RootGpa, TrapError> {
+        let cr3 = self.io.get_gpr(X86Reg::Cr3)?;
+        RootGpa::page_aligned(FrameGpa::new(cr3 & !0xfff))
+            .ok_or_else(|| boundary_error("unaligned live CR3"))
+    }
+    /// Boot-published maintenance root, if this CPU carries one.
+    pub const fn maintenance_root(&self) -> Option<RootGpa> {
+        self.maintenance_root
+    }
+    /// The task and address binding currently holding loaded custody, if any.
+    pub const fn loaded_binding(&self) -> Option<GuestArchBinding> {
+        match self.custody {
+            Custody::Loaded { binding, .. } => Some(binding),
+            Custody::Idle | Custody::Poisoned => None,
+        }
+    }
+    /// Whether `root` currently has a registered live child binding.
+    pub fn has_child_binding(&self, root: RootGpa) -> Result<bool, TrapError> {
+        Ok(self.child_bindings.get(root)?.is_some())
+    }
+    /// Detach and reset the hardware CPU to its neutral image during carrier
+    /// shutdown without requiring the stopped CPU to stand on a user task
+    /// root (`maintenance_root` or in-zone CPL0 state has no reloadable user
+    /// snapshot, and the closing pool cancels dormant leases without reload).
+    pub fn reset_for_shutdown(&mut self, task: TaskIdentity) -> Result<(), TrapError> {
+        let pending_io = match self.custody {
+            Custody::Loaded {
+                binding,
+                pending_io,
+                ..
+            } if binding.task() == task => pending_io,
+            _ => {
+                return Err(boundary_error(
+                    "carrier shutdown reset requires its exact loaded task generation",
+                ));
+            }
+        };
+        self.custody = Custody::Poisoned;
+        if pending_io {
+            self.io.complete_pending_io()?;
+        }
+        self.io.write_image(&self.neutral)?;
+        audit_image(&self.io.read_image()?, &self.neutral)?;
+        self.custody = Custody::Idle;
+        if let Some(debug) = &self.debug {
+            debug.image(&self.neutral);
+            debug.task_serial.store(0, Ordering::Relaxed);
+            debug.task_execution.store(0, Ordering::Release);
+            debug.phase.store(0, Ordering::Release);
+        }
+        Ok(())
     }
     pub fn audit_idle(&self) -> Result<(), TrapError> {
         if !matches!(self.custody, Custody::Idle) {
@@ -1033,6 +1128,8 @@ pub(crate) mod tests {
         fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
             match reg {
                 X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
                 _ => Err(boundary_error("unused test GPR")),
             }
         }
@@ -1208,8 +1305,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -1242,12 +1344,42 @@ pub(crate) mod tests {
         cpu.register_child_binding(child.binding()).unwrap();
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert_eq!(stopped.exit, CarrierRunExit::Kick);
-        assert_eq!(stopped.state.unwrap().binding(), child.binding());
+        assert!(stopped.state.is_none(), "a kick captures no snapshot");
         let detached = cpu
             .save_and_detach(root.binding().task())
             .expect("a kicked child keeps its issued binding during detach");
         assert_eq!(detached.binding(), child.binding());
         cpu.audit_idle().expect("detached CPU is neutral");
+    }
+
+    /// #2962: CPL0 still stands on a child's root after the host served that
+    /// child's retire crossing and dropped its binding. A kick there is not
+    /// a crossing and needs no root: it keeps loaded custody with no
+    /// snapshot, where attributing it refused the unregistered CR3 and
+    /// poisoned the carrier.
+    #[test]
+    fn kick_on_a_retired_childs_root_keeps_loaded_custody() {
+        let root = context(1);
+        let retired = context(2);
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: retired.hardware_image(),
+            port: 0,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        let stopped = cpu
+            .run_loaded(root.binding().task())
+            .expect("a kick on an unregistered root is not refused");
+        assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert!(stopped.state.is_none());
+        assert!(
+            !cpu.can_save_loaded(root.binding().task()).unwrap(),
+            "the retiring child's root is not the loaded root's saveable image"
+        );
+        cpu.reset_for_shutdown(root.binding().task())
+            .expect("the kicked CPU still holds loaded custody");
+        cpu.audit_idle().expect("shutdown-reset CPU is neutral");
     }
     #[test]
     fn child_owner_grant_on_root_executor_is_a_physical_boundary() {
@@ -1292,6 +1424,32 @@ pub(crate) mod tests {
                 data: vec![0, 0, 0, 0],
             }
         );
+    }
+
+    #[test]
+    fn maintenance_root_kick_does_not_poison_or_require_a_task_root() {
+        let root = context(1);
+        let mut maintenance_image = context(2).hardware_image();
+        maintenance_image.rip = 0xffff_ffff_8010_8539;
+        let maintenance_root = RootGpa::page_aligned(FrameGpa::new(maintenance_image.cr3)).unwrap();
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: maintenance_image,
+            port: 0,
+        })
+        .unwrap();
+        cpu.maintenance_root = Some(maintenance_root);
+        cpu.load(root.clone()).unwrap();
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert!(stopped.state.is_none());
+        assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert!(
+            !cpu.can_save_loaded(root.binding().task()).unwrap(),
+            "maintenance_root state must not claim a saveable user root snapshot"
+        );
+        cpu.reset_for_shutdown(root.binding().task())
+            .expect("shutdown reset from maintenance_root restores neutral idle custody");
+        cpu.audit_idle().expect("shutdown-reset CPU is neutral");
     }
 
     #[test]
@@ -1765,8 +1923,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -1948,8 +2111,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {
@@ -2140,8 +2308,13 @@ pub(crate) mod tests {
             None
         }
 
-        fn get_gpr(&self, _: X86Reg) -> Result<u64, TrapError> {
-            Err(boundary_error("unused test GPR"))
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            match reg {
+                X86Reg::Cr3 => Ok(self.image.cr3),
+                X86Reg::Rip => Ok(self.image.rip),
+                X86Reg::Rsp => Ok(self.image.rsp),
+                _ => Err(boundary_error("unused test GPR")),
+            }
         }
 
         fn read_msr(&self, _: u32) -> Result<u64, TrapError> {

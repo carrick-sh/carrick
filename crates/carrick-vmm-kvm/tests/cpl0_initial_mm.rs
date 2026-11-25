@@ -30,19 +30,14 @@ fn try_run_pool_fixture_with_root_affinity(
     kvm_pool_fixture::try_run_program_with_root_affinity(&program, max_exits, affinity, |_| {})
 }
 
-fn try_run_pool_fixture_with_loaded_pre_entry_hook(
+fn boot_initial_mm_carrier(
     elf: &[u8],
-    loaded_exits: usize,
-    idle_exits: usize,
     affinity: u64,
-    hook: impl Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle)
-    + Send
-    + Sync
-    + 'static,
-) -> Result<
-    carrick_runtime::prepare::PreparedKvmPoolOutcome,
-    carrick_kernel::run_result::RuntimeError,
-> {
+) -> (
+    Cpl0Carrier,
+    carrick_kernel::kernel::KernelContext,
+    carrick_kernel::dispatch::SyscallDispatcher,
+) {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
     let image = prepare_x86_elf(&program).expect("x86 ELF program");
     let extent =
@@ -91,6 +86,23 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
+    (carrier, root, dispatcher)
+}
+
+fn try_run_pool_fixture_with_loaded_pre_entry_hook(
+    elf: &[u8],
+    loaded_exits: usize,
+    idle_exits: usize,
+    affinity: u64,
+    hook: impl Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle)
+    + Send
+    + Sync
+    + 'static,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let (carrier, root, dispatcher) = boot_initial_mm_carrier(elf, affinity);
     carrick_runtime::prepare::try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
         carrier,
         root,
@@ -98,6 +110,26 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
         loaded_exits,
         idle_exits,
         std::sync::Arc::new(hook),
+    )
+    .map_err(|failure| failure.error)
+}
+
+fn try_run_pool_fixture_with_test_control(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
+    test_control: carrick_runtime::prepare::KvmPoolTestControl,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let (carrier, root, dispatcher) = boot_initial_mm_carrier(elf, affinity);
+    carrick_runtime::prepare::try_run_prepared_kvm_pool_with_test_control(
+        carrier,
+        root,
+        dispatcher,
+        max_exits,
+        test_control,
     )
     .map_err(|failure| failure.error)
 }
@@ -4606,6 +4638,169 @@ fn loaded_lane_shutdown_kick_between_check_and_entry_is_sticky() {
         "hook did not inject the kick"
     );
     assert_eq!(outcome.run.exit_code, 7);
+}
+
+/// #2962: a real reschedule whose kick stopped the loaded CPU inside CPL0
+/// supervisor code (after a crossing, before the guest returned to user
+/// space) must preempt there, not wait for the guest's next voluntary
+/// crossing. The guest then spins in user space with no host crossing for
+/// most of the run, so a reschedule left owed at that stop has no boundary
+/// until the spin ends.
+///
+/// Call 2 kicks the run at its armed entry (an immediate exit inside CPL0);
+/// call 3 publishes the reschedule at that stop. The lease must be saved,
+/// which clears `need_resched` through unbind, so call 4 must see it clear,
+/// and call 4 must come before the spin ends rather than after the second
+/// write: the gap to call 4 is under half the gap to the run's end. Both gaps
+/// stretch together under load; only a boundary taken after the spin makes
+/// them equal. Red on the PR head: the reschedule was never honoured, not
+/// even at the guest's later crossings.
+#[test]
+fn reschedule_owed_inside_cpl0_preempts_inside_a_crossing_free_user_spin() {
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let elf = native_exit_fixture("owed_reschedule_spin.S");
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (hook_calls, hook_seen) = (std::sync::Arc::clone(&calls), std::sync::Arc::clone(&seen));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = try_run_pool_fixture_with_loaded_pre_entry_hook(
+            &elf,
+            256,
+            256,
+            ROOT_AFFINITY_LOADED,
+            move |need_resched, kick| {
+                let call = hook_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                hook_seen
+                    .lock()
+                    .expect("hook record")
+                    .push((need_resched.load(Ordering::Acquire), Instant::now()));
+                match call {
+                    2 => kick.kick(),
+                    3 => need_resched.store(true, Ordering::Release),
+                    _ => {}
+                }
+            },
+        );
+        let _ = tx.send(result);
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("owed reschedule run must complete")
+        .expect("owed reschedule run");
+    let ended = Instant::now();
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"A\nB\n");
+    let seen = seen.lock().expect("hook record").clone();
+    let owed: Vec<bool> = seen.iter().map(|(owed, _)| *owed).collect();
+    assert!(
+        seen.len() >= 4,
+        "the hook ran only {} times: {owed:?}",
+        seen.len()
+    );
+    assert_eq!(
+        &owed[..3],
+        &[false, false, false],
+        "nothing was owed before the injected reschedule"
+    );
+    assert!(
+        !owed[3],
+        "the reschedule published inside CPL0 was still owed at the next entry: {owed:?}"
+    );
+    let published = seen[2].1;
+    let honoured = seen[3].1.duration_since(published);
+    let run_rest = ended.duration_since(published);
+    assert!(
+        honoured * 2 < run_rest,
+        "the reschedule waited for the guest's next crossing instead of a boundary inside the spin: honoured after {honoured:?} of {run_rest:?}"
+    );
+}
+
+/// #2962, pre-review P0 3: a kick that stops the production carrier off the
+/// loaded task's root keeps loaded custody for the same loaded generation,
+/// returns `StoppedTaskExit { state: None, exit: CarrierRunExit::Kick }`, and
+/// the run continues to its real exit.
+///
+/// Two off-root boundaries are triggered deterministically through
+/// `KvmOffRootKickProbe` on the exact next actual entry of the same loaded CPU:
+/// - `WORK_PORT` while standing on `maintenance_root`;
+/// - `NATIVE_CHILD_RETIRE_PORT` right after `unregister_child_binding` drops
+///   the retiring child's binding while CR3 still stands on that child's root.
+fn assert_off_root_kicks(arm_maintenance: bool, arm_retired_child: bool) {
+    use carrick_runtime::prepare::{KvmOffRootKickProbe, KvmOffRootKickTarget, KvmPoolTestControl};
+
+    let elf = native_exit_fixture("native_child_sleep.S");
+    let probe = KvmOffRootKickProbe::new(arm_maintenance, arm_retired_child);
+    let run_probe = probe.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = try_run_pool_fixture_with_test_control(
+            &elf,
+            1024,
+            ROOT_AFFINITY_LOADED,
+            KvmPoolTestControl {
+                off_root_kick_probe: Some(run_probe),
+                ..KvmPoolTestControl::default()
+            },
+        );
+        let _ = tx.send(result);
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("kicked run must complete")
+        .expect("kicked run");
+    assert_eq!(outcome.run.exit_code, 8, "child nanosleep and parent wait");
+    let observations = probe.observations();
+    eprintln!("off-root kick observations: {observations:?}");
+    let assert_target = |target: KvmOffRootKickTarget| {
+        let matched: Vec<_> = observations
+            .iter()
+            .filter(|obs| obs.target == target)
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "expected exactly one {target:?} kick observation, got {observations:?}"
+        );
+        let obs = matched[0];
+        assert!(obs.exit_is_kick, "{target:?}: {obs:?}");
+        assert!(
+            obs.state_is_none,
+            "{target:?} must return state: None: {obs:?}"
+        );
+        assert_eq!(obs.stopped_root, obs.expected_root, "{target:?}: {obs:?}");
+        assert!(!obs.child_binding_present, "{target:?}: {obs:?}");
+        assert!(!obs.can_save_loaded, "{target:?}: {obs:?}");
+        assert!(obs.retained_loaded_custody, "{target:?}: {obs:?}");
+        obs.stopped_root
+    };
+    let expected_count = usize::from(arm_maintenance) + usize::from(arm_retired_child);
+    assert_eq!(
+        observations.len(),
+        expected_count,
+        "unexpected observation count: {observations:?}"
+    );
+    let maintenance = arm_maintenance.then(|| assert_target(KvmOffRootKickTarget::MaintenanceRoot));
+    let retired = arm_retired_child.then(|| assert_target(KvmOffRootKickTarget::RetiredChildRoot));
+    if let (Some(maintenance_root), Some(retired_child_root)) = (maintenance, retired) {
+        assert_ne!(
+            maintenance_root, retired_child_root,
+            "maintenance and retired child roots must be distinct physical roots"
+        );
+    }
+}
+
+#[test]
+fn maintenance_root_kick_keeps_loaded_custody_without_a_task_snapshot() {
+    assert_off_root_kicks(true, false);
+}
+
+#[test]
+fn kick_off_the_loaded_root_keeps_loaded_custody_without_a_task_snapshot() {
+    assert_off_root_kicks(true, true);
 }
 
 fn forward_authority_fixture(variant: &str) -> Vec<u8> {

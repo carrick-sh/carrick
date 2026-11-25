@@ -4015,14 +4015,14 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:vmm_kvm::vcpu_fd",
-      "owner": "carrick_vmm_kvm::kvm::KvmVcpu::fd",
+      "owner": "carrick_vmm_kvm::kvm::KvmVcpu::fd_mut",
       "lane": "kvm",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:vmm_kvm::vcpu_fd",
-      "owner": "carrick_vmm_kvm::kvm::KvmVcpu::fd_mut",
+      "owner": "carrick_vmm_kvm::kvm::KvmVcpu::vcpu_fd",
       "lane": "kvm",
       "ceiling": 1
     },

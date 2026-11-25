@@ -12,7 +12,6 @@ use kvm_bindings::{
     KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_MP_STATE_RUNNABLE, Msrs, kvm_guest_debug,
     kvm_mp_state, kvm_msi, kvm_msr_entry,
 };
-use kvm_ioctls::VcpuExit as KvmExit;
 use kvm_ioctls::VmFd;
 
 use carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE;
@@ -1711,12 +1710,12 @@ impl Cpl0Carrier {
                     return Ok(());
                 }
                 let exit = watchdog
-                    .during_guest(|| cpu.fd_mut().run())
+                    .during_guest(|| cpu.vcpu_fd().enter())
                     .map_err(|e| fail(format!("KVM_RUN single-step: {e}")))?;
                 if watchdog.expired() {
                     return Err(fail("fixture single-step exceeded deadline"));
                 }
-                if !matches!(exit, KvmExit::Debug(_)) {
+                if !matches!(exit, crate::kvm::RawKvmExit::Debug(_)) {
                     return Err(fail("fixture single-step exited without debug trap"));
                 }
             }
@@ -1837,7 +1836,7 @@ impl Cpl0Carrier {
             .cpus
             .get_mut(index)
             .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
-        cpu.fd_mut().set_kvm_immediate_exit(1);
+        cpu.run_map().set_immediate_exit(true);
         Ok(())
     }
     fn task(&self, index: usize) -> &CurrentTask {
@@ -2315,9 +2314,9 @@ impl Cpl0Carrier {
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).linux.mark_pending_host_work();
-                    self.cpus[index].fd_mut().set_kvm_immediate_exit(1);
+                    self.cpus[index].run_map().set_immediate_exit(true);
                     let kicked = self.run_cpu(index);
-                    self.cpus[index].fd_mut().set_kvm_immediate_exit(0);
+                    self.cpus[index].run_map().set_immediate_exit(false);
                     if !matches!(kicked, Ok(VcpuExit::Kicked)) {
                         return Err(fail("boundary kick did not interrupt KVM_RUN"));
                     }

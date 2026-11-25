@@ -2973,6 +2973,435 @@ mod serial_host {
             capture_path.display()
         );
     }
+
+    /// Kills a carrier's exclusive process group when a witness ends early,
+    /// so a failed assertion never leaves a stopped or running carrier.
+    struct CarrierGroup(i32);
+
+    impl CarrierGroup {
+        /// The carrier was reaped: its group id may be reused, so never
+        /// signal it again.
+        fn reaped(self) {
+            std::mem::forget(self);
+        }
+    }
+
+    impl Drop for CarrierGroup {
+        fn drop(&mut self) {
+            // SAFETY: the group was created for this test's child; SIGKILL
+            // ends even a ptrace-stopped member. ESRCH after reaping is fine.
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// Wait for one seized thread's ptrace stop with a bound, never a
+    /// blocking `waitpid`. `None`: no stop within the bound.
+    fn wait_ptrace_stop(tid: libc::pid_t, deadline: Instant) -> Option<libc::c_int> {
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: non-blocking wait for a thread this process traces.
+            let waited = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if waited == tid {
+                return libc::WIFSTOPPED(status).then_some(status);
+            }
+            if waited != 0 || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Seize every carrier thread, interrupt each into a ptrace stop, and
+    /// detach. Returns how many threads were stopped and then successfully
+    /// detached (running again); any thread that stopped but failed to
+    /// detach is an error, since it would leave the carrier stopped.
+    fn ptrace_stop_and_detach_all_threads(carrier_pid: i32) -> Result<usize, String> {
+        const PTRACE_SEIZE: libc::c_uint = 0x4206;
+        const PTRACE_INTERRUPT: libc::c_uint = 0x4207;
+
+        let task_dir = format!("/proc/{carrier_pid}/task");
+        let Ok(entries) = std::fs::read_dir(&task_dir) else {
+            return Ok(0);
+        };
+        let mut tids = Vec::new();
+        for entry in entries.flatten() {
+            if let Ok(tid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() {
+                // SAFETY: PTRACE_SEIZE attaches without injecting SIGSTOP; ESRCH
+                // on a concurrently exiting worker thread is harmless.
+                if unsafe { libc::ptrace(PTRACE_SEIZE, tid, 0, 0) } == 0 {
+                    tids.push(tid);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut detached = 0usize;
+        let mut failures = Vec::new();
+        for tid in tids {
+            // SAFETY: `tid` was seized above by this parent test process.
+            let interrupted = unsafe { libc::ptrace(PTRACE_INTERRUPT, tid, 0, 0) } == 0;
+            let stop = if interrupted {
+                wait_ptrace_stop(tid, deadline)
+            } else {
+                None
+            };
+            // Preserve a non-event signal that raced the interrupt.
+            let inject = stop.map_or(0, |status| {
+                if (status >> 16) != 0 {
+                    0
+                } else {
+                    libc::WSTOPSIG(status)
+                }
+            });
+            // SAFETY: detaches a thread this process seized.
+            let released = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, inject) } == 0;
+            match (stop.is_some(), released) {
+                (true, true) => detached += 1,
+                (true, false) => failures.push(format!(
+                    "thread {tid} stopped but PTRACE_DETACH failed: {}",
+                    std::io::Error::last_os_error()
+                )),
+                // A thread that exited was not counted. One that is still
+                // alive but neither stopped nor released is a failure.
+                (false, false)
+                    if std::path::Path::new(&format!("/proc/{carrier_pid}/task/{tid}"))
+                        .exists() =>
+                {
+                    failures.push(format!(
+                        "thread {tid} did not stop within the bound and could not be detached"
+                    ))
+                }
+                (false, _) => {}
+            }
+        }
+        if failures.is_empty() {
+            Ok(detached)
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn wait_carrier_job_state(child: &mut Child, flag: libc::c_int, what: &str) -> bool {
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut timed_out = true;
+        while Instant::now() < deadline {
+            if child.try_wait().expect("poll carrier exit").is_some() {
+                return false;
+            }
+            // SAFETY: zeroed siginfo_t for non-reaping stop/continue poll.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, flag | libc::WNOHANG) };
+            // SAFETY: POSIX si_pid union field populated on waitid match.
+            if rc == 0 && unsafe { info.si_pid() } == pid as i32 {
+                timed_out = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!timed_out, "timed out waiting for carrier {pid} {what}");
+        true
+    }
+
+    /// #2962: a multi-threaded + forked guest running on KVM must survive
+    /// repeated host `SIGSTOP`/`SIGCONT` and `ptrace` stop/detach cycles mid-run
+    /// and finish with the exact native Linux output and exit code.
+    #[test]
+    fn mounted_static_x86_multithreaded_guest_survives_sigstop_and_ptrace_cycles() {
+        if skip_without_kvm() {
+            return;
+        }
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let elf = fixture_dir.path().join("threads-stop-cont");
+        compile_assembly_with_flags(
+            "x86_threads_stop_cont.c",
+            &elf,
+            &[
+                "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-O1",
+            ],
+        );
+        let native = Command::new(&elf)
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("run native threads-stop-cont oracle");
+        assert_eq!(native.status.code(), Some(7), "native oracle status");
+        assert_eq!(native.stdout, b"READY\nOK 2672\n", "native oracle stdout");
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("image.tar");
+        std::fs::write(&archive, empty_image_archive()).unwrap();
+        let cli = assert_cmd::cargo::cargo_bin("carrick");
+        let home = dir.path().join("home");
+        let load = Command::new(&cli)
+            .timeout(Duration::from_secs(5))
+            .env("CARRICK_HOME", &home)
+            .args(["load", "--input", archive.to_str().unwrap()])
+            .output()
+            .expect("load local image");
+        assert!(
+            load.status.success(),
+            "load stderr: {}",
+            String::from_utf8_lossy(&load.stderr)
+        );
+
+        let scoped_run_id = mounted_carrier_scope("threads-stop-cont", dir.path());
+        let mut command = std::process::Command::new(&cli);
+        command
+            .env("CARRICK_HOME", &home)
+            .env("CARRICK_RUN_ID", &scoped_run_id)
+            .args([
+                "run",
+                "--platform",
+                "linux/amd64",
+                "--pull",
+                "never",
+                "--volume",
+                &format!("{}:/hello:ro", elf.display()),
+                "x86-kvm-hello:latest",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn KVM carrier");
+        let carrier_pid = child.id() as i32;
+        let group = CarrierGroup(carrier_pid);
+        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let stdout_reader = std::thread::spawn(move || {
+            let mut collected = Vec::new();
+            let mut buf = [0u8; 64];
+            let mut signalled_ready = false;
+            loop {
+                match stdout_pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if !signalled_ready && collected.starts_with(b"READY\n") {
+                            signalled_ready = true;
+                            let _ = ready_tx.send(());
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        assert_eq!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted,
+                            "read carrier stdout: {e}"
+                        );
+                        break;
+                    }
+                }
+            }
+            collected
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut collected = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut collected);
+            collected
+        });
+
+        let reached_ready = ready_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        if !reached_ready {
+            let status = child.wait_timeout(Duration::from_secs(2)).unwrap();
+            if status.is_none() {
+                unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
+                let _ = child.wait();
+            }
+            group.reaped();
+            let out = stdout_reader.join().unwrap_or_default();
+            let err = stderr_reader.join().unwrap_or_default();
+            assert!(
+                reached_ready,
+                "guest did not reach READY barrier: status={status:?} stdout={:?} stderr={}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+            return;
+        }
+
+        let mut stop_cycles = 0usize;
+        let mut ptrace_cycles = 0usize;
+        for cycle in 0..8 {
+            if child.try_wait().expect("poll carrier").is_some() {
+                break;
+            }
+            if cycle % 2 == 0 {
+                // SAFETY: `carrier_pid` is our live child process.
+                if unsafe { libc::kill(carrier_pid, libc::SIGSTOP) } == 0
+                    && wait_carrier_job_state(&mut child, libc::WSTOPPED, "SIGSTOP")
+                {
+                    stop_cycles += 1;
+                    assert_eq!(unsafe { libc::kill(carrier_pid, libc::SIGCONT) }, 0);
+                    let _ = wait_carrier_job_state(&mut child, libc::WCONTINUED, "SIGCONT");
+                } else {
+                    let _ = unsafe { libc::kill(carrier_pid, libc::SIGCONT) };
+                    break;
+                }
+            } else {
+                let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid)
+                    .unwrap_or_else(|error| panic!("ptrace cycle {cycle}: {error}"));
+                if stopped_threads == 0 {
+                    break;
+                }
+                ptrace_cycles += 1;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+
+        let waited = child
+            .wait_timeout(Duration::from_secs(15))
+            .expect("wait for KVM carrier");
+        if waited.is_none() {
+            // SAFETY: exclusive process group created for this child.
+            unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        group.reaped();
+        let Some(status) = waited else {
+            assert!(
+                waited.is_some(),
+                "KVM carrier hung after {stop_cycles} SIGSTOP and {ptrace_cycles} ptrace cycles"
+            );
+            return;
+        };
+        let guest_stdout = stdout_reader.join().expect("join stdout reader");
+        let guest_stderr = stderr_reader.join().expect("join stderr reader");
+        assert!(
+            stop_cycles >= 2 && ptrace_cycles >= 2,
+            "carrier ended before mid-run stop/ptrace cycles completed (stop_cycles={stop_cycles}, ptrace_cycles={ptrace_cycles}, status={status:?}, stderr={})",
+            String::from_utf8_lossy(&guest_stderr)
+        );
+        assert_eq!(
+            (status.code(), guest_stdout.as_slice()),
+            (native.status.code(), native.stdout.as_slice()),
+            "stdout: {:?} stderr: {}",
+            String::from_utf8_lossy(&guest_stdout),
+            String::from_utf8_lossy(&guest_stderr)
+        );
+    }
+
+    /// #2962: attaching gdb (a ptrace stop) to a live KVM carrier blocked in a
+    /// guest wait and detaching must leave the carrier running until its
+    /// deadline kills it, never ending it with `unregistered forward CR3`.
+    #[test]
+    fn mounted_static_x86_gdb_attach_preserves_parked_wait_carrier() {
+        if skip_without_kvm() {
+            return;
+        }
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let elf = fixture_dir.path().join("wait-forever-gdb");
+        compile_assembly("x86_wait_forever.S", &elf);
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("image.tar");
+        std::fs::write(&archive, empty_image_archive()).unwrap();
+        let cli = assert_cmd::cargo::cargo_bin("carrick");
+        let home = dir.path().join("home");
+        let load = Command::new(&cli)
+            .timeout(Duration::from_secs(5))
+            .env("CARRICK_HOME", &home)
+            .args(["load", "--input", archive.to_str().unwrap()])
+            .output()
+            .expect("load local image");
+        assert!(load.status.success());
+
+        let scoped_run_id = mounted_carrier_scope("gdb-parked-wait", dir.path());
+        let mut child = std::process::Command::new(&cli)
+            .env("CARRICK_HOME", &home)
+            .env("CARRICK_RUN_ID", &scoped_run_id)
+            .args([
+                "run",
+                "--platform",
+                "linux/amd64",
+                "--pull",
+                "never",
+                "--volume",
+                &format!("{}:/hello:ro", elf.display()),
+                "x86-kvm-hello:latest",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn parked KVM carrier");
+        let carrier_pid = child.id() as i32;
+        let group = CarrierGroup(carrier_pid);
+
+        let park_deadline = Instant::now() + Duration::from_secs(5);
+        let mut parked = false;
+        while Instant::now() < park_deadline {
+            let dump = Command::new(&cli)
+                .timeout(Duration::from_secs(2))
+                .args(["debug", "zonedump", "--run-id", &scoped_run_id])
+                .output()
+                .expect("poll zonedump for parked wait");
+            if dump.status.success()
+                && String::from_utf8_lossy(&dump.stdout).contains(": claim=Parked ")
+            {
+                parked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            parked,
+            "carrier never reached parked guest wait before gdb attach"
+        );
+
+        let yama_allows_sibling = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .map(|s| s.trim() == "0")
+            .unwrap_or(true);
+        let gdb_attached = if yama_allows_sibling {
+            Command::new("gdb")
+                .timeout(Duration::from_secs(30))
+                .args([
+                    "-nx",
+                    "--batch",
+                    "-ex",
+                    "info threads",
+                    "-p",
+                    &carrier_pid.to_string(),
+                ])
+                .output()
+                .ok()
+                .filter(|out| {
+                    out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Thread ")
+                })
+                .is_some()
+        } else {
+            false
+        };
+        let stopped_threads = ptrace_stop_and_detach_all_threads(carrier_pid)
+            .unwrap_or_else(|error| panic!("ptrace stop/detach: {error}"));
+        assert!(
+            gdb_attached || stopped_threads >= 2,
+            "neither gdb nor direct ptrace attached to live carrier threads (gdb_attached={gdb_attached}, stopped_threads={stopped_threads})"
+        );
+
+        std::thread::sleep(Duration::from_millis(150));
+        let early = child.try_wait().expect("poll carrier after detach");
+        if let Some(early_status) = early {
+            let output = child
+                .wait_with_output()
+                .expect("collect failed carrier output");
+            group.reaped();
+            assert!(
+                early.is_none(),
+                "carrier died after debugger detach instead of staying parked (gdb_attached={gdb_attached}, stopped_threads={stopped_threads}, status={early_status:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: exclusive process group created for this child.
+        unsafe { libc::killpg(carrier_pid, libc::SIGKILL) };
+        let output = child.wait_with_output().expect("reap killed carrier");
+        group.reaped();
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+    }
 }
 
 #[test]

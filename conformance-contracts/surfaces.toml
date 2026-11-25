@@ -1565,6 +1565,7 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/src/guest_setup.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-vmm-kvm/src/kvm.rs", contract = "kernel.x86.ring-syscall-exits" },
   { path = "crates/carrick-vmm-kvm/src/kvm.rs", contract = "x86.cpuid.v3" },
+  { path = "crates/carrick-vmm-kvm/src/kvm/run_map.rs", contract = "kernel.x86.ring-syscall-exits" },
   { path = "crates/carrick-vmm-kvm/src/kvm_x86_engine.rs", contract = "x86.vmx.segment-entry" },
   { path = "crates/carrick-vmm-kvm/tests/common/kvm_pool_fixture.rs", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs", contract = "core.entry.completion" },
