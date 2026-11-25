@@ -1471,7 +1471,11 @@ mod tests {
             stock.owner.set_carrier(custody.transfer_carrier);
             stock
                 .owner
-                .install(table_pages.clone(), vec![ForkLifecycleLoan::ARM_DEFAULT])
+                .install(
+                    table_pages.clone(),
+                    carrick_hal::fork_stock::TableReserve::EMPTY,
+                    vec![ForkLifecycleLoan::ARM_DEFAULT],
+                )
                 .unwrap();
             stock
                 .owner
