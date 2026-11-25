@@ -1330,7 +1330,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
 /// states and crossing ports whose meaning one side must share with the
 /// other. Hashed into [`EL1_ABI_LAYOUT_HASH`], so a host and an image that
 /// disagree on any of them refuse each other at boot.
-pub const EL1_ABI_BOUNDARY_FACTS: [u64; 8] = [
+pub const EL1_ABI_BOUNDARY_FACTS: [u64; 12] = [
     EL1_APERTURE_CONTROL_OFFSET,
     core::mem::size_of::<ApertureControl>() as u64,
     core::mem::align_of::<ApertureControl>() as u64,
@@ -1339,6 +1339,13 @@ pub const EL1_ABI_BOUNDARY_FACTS: [u64; 8] = [
     2,                          // control encoding: zero is strict; bit 3 opts out.
     SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
     PortalGrantSlot::PREPARED_SELECTION_STATE,
+    // The table supply (#3017, #3030): a fault refused for capacity, a
+    // fault parked on the reservation pool, the space-retired crossing,
+    // and the image licensing the extent's table reserve.
+    PortalGrantSlot::REFUSED_SELECTION_STATE,
+    PortalGrantSlot::POOL_WAIT_STATE,
+    NATIVE_SPACE_RETIRED_PORT as u64,
+    carrick_core_abi::X86TableReserve::LICENSE_PROTOCOL,
 ];
 
 /// Fingerprint ordered layout facts with one shared FNV-1a implementation.
