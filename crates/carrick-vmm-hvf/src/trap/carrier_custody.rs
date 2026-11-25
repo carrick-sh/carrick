@@ -2258,6 +2258,8 @@ pub(crate) const REPLAY_REMAP_DURING_PHASE1_LOOKUP: &str = "replay remap during 
 #[cfg(test)]
 pub(crate) const REPLAY_SLICE_BETWEEN_LOCKS: &str = "replay slice between locks";
 #[cfg(test)]
+pub(crate) const REPLAY_PHASE1_BEFORE_LIVENESS_PROBE: &str = "replay phase1 before liveness probe";
+#[cfg(test)]
 pub(crate) const REPLAY_REMAP_BEFORE_GUARD: &str = "replay remap before guard";
 #[cfg(test)]
 pub(crate) const REPLAY_REMAP_LOOKED_UP: &str = "replay remap looked up";

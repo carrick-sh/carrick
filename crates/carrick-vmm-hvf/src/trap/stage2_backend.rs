@@ -539,6 +539,8 @@ pub(crate) unsafe fn stage2_map_replay(
     #[cfg(test)]
     let mut fired_phase1_lookup_hook = false;
     #[cfg(test)]
+    let mut fired_before_liveness_probe_hook = false;
+    #[cfg(test)]
     let mut fired_before_guard_hook = false;
     #[cfg(test)]
     let mut fired_looked_up_hook = false;
@@ -620,6 +622,13 @@ pub(crate) unsafe fn stage2_map_replay(
                 candidates.sort_by_key(|(seq, _)| *seq);
             } else {
                 candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+            }
+            #[cfg(test)]
+            if !fired_before_liveness_probe_hook {
+                fired_before_liveness_probe_hook = true;
+                custody
+                    .stage2
+                    .at_client_point(super::carrier_custody::REPLAY_PHASE1_BEFORE_LIVENESS_PROBE);
             }
             let found_live = candidates.iter().copied().find(|&(_, entry)| {
                 let check_addr = match lookup {

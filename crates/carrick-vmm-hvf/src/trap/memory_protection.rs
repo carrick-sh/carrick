@@ -315,19 +315,27 @@ impl AliasClassIndex {
         }
     }
 
-    pub(crate) fn insert(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
+    pub(crate) fn insert(&mut self, start_key: u64, seq: u64, alias: AliasBacking) -> (u32, usize) {
         let class = Self::class(self.width(&alias));
         let rows = self.by_class_start.entry((class, start_key)).or_default();
         let at = rows.partition_point(|&(row_seq, _)| row_seq <= seq);
         rows.insert(at, (seq, alias));
         *self.class_counts.entry(class).or_default() += 1;
+        (class, at)
     }
 
-    pub(crate) fn remove(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
+    pub(crate) fn remove(
+        &mut self,
+        start_key: u64,
+        seq: u64,
+        alias: AliasBacking,
+    ) -> Option<(u32, usize)> {
         let class = Self::class(self.width(&alias));
+        let mut removed_at = None;
         if let Some(rows) = self.by_class_start.get_mut(&(class, start_key)) {
             if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
                 rows.remove(at);
+                removed_at = Some(at);
             }
             if rows.is_empty() {
                 self.by_class_start.remove(&(class, start_key));
@@ -341,6 +349,7 @@ impl AliasClassIndex {
                 count.remove();
             }
         }
+        removed_at.map(|at| (class, at))
     }
 
     pub(crate) fn clear(&mut self) {
@@ -745,6 +754,10 @@ pub(crate) enum ReplayWatchTarget {
 pub(crate) struct ActiveReplayWatch {
     pub(crate) target: ReplayWatchTarget,
     pub(crate) dirty: bool,
+    pub(crate) paused_scope_index: usize,
+    pub(crate) paused_class: u32,
+    pub(crate) paused_start_key: u64,
+    pub(crate) paused_next_pos: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1455,9 +1468,10 @@ impl AliasRegistry {
     }
 
     pub(crate) fn index_insert(&mut self, seq: u64, alias: AliasBacking) {
-        self.va_classes.insert(alias.start, seq, alias);
-        self.ipa_classes.insert(alias.ipa, seq, alias);
-        self.va_classes_by_scope
+        let va_edit = self.va_classes.insert(alias.start, seq, alias);
+        let ipa_edit = self.ipa_classes.insert(alias.ipa, seq, alias);
+        let scope_edit = self
+            .va_classes_by_scope
             .entry(alias.ownership_scope)
             .or_default()
             .insert(alias.start, seq, alias);
@@ -1480,37 +1494,83 @@ impl AliasRegistry {
             .entry(alias.physical_size as u64)
             .or_default() += 1;
         *self.exact_row_counts.entry(alias).or_insert(0) += 1;
-        self.notify_replay_watches_for_alias(alias);
+        self.notify_replay_watches_for_edit(
+            alias,
+            true,
+            Some(ipa_edit),
+            Some(va_edit),
+            Some(scope_edit),
+        );
     }
 
-    fn bucket_overlaps_probe(probe: u64, class: u32, start_key: u64) -> bool {
-        let lower = probe.saturating_sub(AliasClassIndex::class_radius(class).saturating_sub(1));
-        start_key >= lower && start_key <= probe
-    }
-
-    pub(crate) fn notify_replay_watches_for_alias(&mut self, alias: AliasBacking) {
+    fn notify_replay_watches_for_edit(
+        &mut self,
+        alias: AliasBacking,
+        is_insert: bool,
+        ipa_edit: Option<(u32, usize)>,
+        va_edit: Option<(u32, usize)>,
+        scope_edit: Option<(u32, usize)>,
+    ) {
         if self.active_replay_watches.is_empty() {
             return;
         }
-        let class = AliasClassIndex::class(alias.size as u64);
         for watch in self.active_replay_watches.values_mut() {
             if watch.dirty {
                 continue;
             }
-            let hit = match watch.target {
+            match watch.target {
                 ReplayWatchTarget::Ipa { gpa } => {
-                    Self::bucket_overlaps_probe(gpa, class, alias.ipa)
+                    if gpa >= alias.ipa && gpa < alias.ipa.saturating_add(alias.size as u64) {
+                        watch.dirty = true;
+                    } else if let Some((class, at)) = ipa_edit
+                        && watch.paused_next_pos > 0
+                        && watch.paused_class == class
+                        && watch.paused_start_key == alias.ipa
+                        && at < watch.paused_next_pos
+                    {
+                        watch.paused_next_pos = if is_insert {
+                            watch.paused_next_pos.saturating_add(1)
+                        } else {
+                            watch.paused_next_pos.saturating_sub(1)
+                        };
+                    }
                 }
                 ReplayWatchTarget::VaAnyScope { va } => {
-                    Self::bucket_overlaps_probe(va, class, alias.start)
+                    if va >= alias.start && va < alias.start.saturating_add(alias.size as u64) {
+                        watch.dirty = true;
+                    } else if let Some((class, at)) = va_edit
+                        && watch.paused_next_pos > 0
+                        && watch.paused_class == class
+                        && watch.paused_start_key == alias.start
+                        && at < watch.paused_next_pos
+                    {
+                        watch.paused_next_pos = if is_insert {
+                            watch.paused_next_pos.saturating_add(1)
+                        } else {
+                            watch.paused_next_pos.saturating_sub(1)
+                        };
+                    }
                 }
                 ReplayWatchTarget::VaProcess { va, scopes } => {
-                    scopes.contains(&alias.ownership_scope)
-                        && Self::bucket_overlaps_probe(va, class, alias.start)
+                    if !scopes.contains(&alias.ownership_scope) {
+                        continue;
+                    }
+                    if va >= alias.start && va < alias.start.saturating_add(alias.size as u64) {
+                        watch.dirty = true;
+                    } else if let Some((class, at)) = scope_edit
+                        && watch.paused_next_pos > 0
+                        && scopes.get(watch.paused_scope_index) == Some(&alias.ownership_scope)
+                        && watch.paused_class == class
+                        && watch.paused_start_key == alias.start
+                        && at < watch.paused_next_pos
+                    {
+                        watch.paused_next_pos = if is_insert {
+                            watch.paused_next_pos.saturating_add(1)
+                        } else {
+                            watch.paused_next_pos.saturating_sub(1)
+                        };
+                    }
                 }
-            };
-            if hit {
-                watch.dirty = true;
             }
         }
     }
@@ -1521,7 +1581,12 @@ impl AliasRegistry {
         }
     }
 
-    pub(crate) fn open_replay_watch(&mut self, target: ReplayWatchTarget) -> u64 {
+    pub(crate) fn open_replay_watch(
+        &mut self,
+        target: ReplayWatchTarget,
+        scope_index: usize,
+        class_cursor: ClassSliceCursor,
+    ) -> u64 {
         let id = self.next_replay_watch_id.max(1);
         self.next_replay_watch_id = id.saturating_add(1);
         self.active_replay_watches.insert(
@@ -1529,15 +1594,39 @@ impl AliasRegistry {
             ActiveReplayWatch {
                 target,
                 dirty: false,
+                paused_scope_index: scope_index,
+                paused_class: class_cursor.class,
+                paused_start_key: class_cursor.start_key,
+                paused_next_pos: class_cursor.next_pos,
             },
         );
         id
     }
 
-    pub(crate) fn is_replay_watch_dirty(&self, watch_id: u64) -> bool {
-        self.active_replay_watches
-            .get(&watch_id)
-            .is_none_or(|watch| watch.dirty)
+    pub(crate) fn update_replay_watch(
+        &mut self,
+        watch_id: u64,
+        scope_index: usize,
+        class_cursor: ClassSliceCursor,
+    ) {
+        if let Some(watch) = self.active_replay_watches.get_mut(&watch_id) {
+            watch.paused_scope_index = scope_index;
+            watch.paused_class = class_cursor.class;
+            watch.paused_start_key = class_cursor.start_key;
+            watch.paused_next_pos = class_cursor.next_pos;
+        }
+    }
+
+    pub(crate) fn resume_replay_watch_cursor(
+        &self,
+        mut cursor: ReplaySliceCursor,
+    ) -> Option<ReplaySliceCursor> {
+        let watch = self.active_replay_watches.get(&cursor.watch_id)?;
+        if watch.dirty {
+            return None;
+        }
+        cursor.class_cursor.next_pos = watch.paused_next_pos;
+        Some(cursor)
     }
 
     pub(crate) fn take_replay_watch_dirty(&mut self, watch_id: u64) -> bool {
@@ -1551,14 +1640,16 @@ impl AliasRegistry {
     }
 
     pub(crate) fn index_remove(&mut self, seq: u64, alias: AliasBacking) {
-        self.index_remove_carrier_wide(seq, alias);
         let scope = alias.ownership_scope;
-        if let Some(index) = self.va_classes_by_scope.get_mut(&scope) {
-            index.remove(alias.start, seq, alias);
+        let scope_edit = if let Some(index) = self.va_classes_by_scope.get_mut(&scope) {
+            let edit = index.remove(alias.start, seq, alias);
             if index.is_empty() {
                 self.va_classes_by_scope.remove(&scope);
             }
-        }
+            edit
+        } else {
+            None
+        };
         if let Some(index) = self.physical_classes_by_scope.get_mut(&scope) {
             index.remove(alias.physical_ipa, seq, alias);
             if index.is_empty() {
@@ -1589,14 +1680,20 @@ impl AliasRegistry {
                     .remove(&alias.ownership_scope);
             }
         }
+        self.index_remove_carrier_wide_with_scope_edit(seq, alias, scope_edit);
     }
 
     /// Remove one row from the indexes shared by every scope. A row's own
     /// scope indexes are removed by [`Self::index_remove`], or dropped whole
     /// when the scope retires ([`Self::retire_scope`]).
-    fn index_remove_carrier_wide(&mut self, seq: u64, alias: AliasBacking) {
-        self.va_classes.remove(alias.start, seq, alias);
-        self.ipa_classes.remove(alias.ipa, seq, alias);
+    fn index_remove_carrier_wide_with_scope_edit(
+        &mut self,
+        seq: u64,
+        alias: AliasBacking,
+        scope_edit: Option<(u32, usize)>,
+    ) {
+        let va_edit = self.va_classes.remove(alias.start, seq, alias);
+        let ipa_edit = self.ipa_classes.remove(alias.ipa, seq, alias);
         if let Some(rows) = self.by_physical_start.get_mut(&alias.physical_ipa) {
             if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
                 rows.remove(at);
@@ -1611,7 +1708,11 @@ impl AliasRegistry {
                 self.exact_row_counts.remove(&alias);
             }
         }
-        self.notify_replay_watches_for_alias(alias);
+        self.notify_replay_watches_for_edit(alias, false, ipa_edit, va_edit, scope_edit);
+    }
+
+    fn index_remove_carrier_wide(&mut self, seq: u64, alias: AliasBacking) {
+        self.index_remove_carrier_wide_with_scope_edit(seq, alias, None);
     }
 
     #[cfg(test)]
@@ -1740,12 +1841,16 @@ impl AliasRegistry {
         slice_buf: &mut Vec<(u64, AliasBacking)>,
         matches: impl FnMut(&AliasBacking) -> bool,
     ) -> ReplaySliceStep {
-        if let Some(c) = cursor
-            && self.is_replay_watch_dirty(c.watch_id)
-        {
-            self.remove_replay_watch(c.watch_id);
-            return ReplaySliceStep::RestartFromRevision;
-        }
+        let resumed_cursor = match cursor {
+            Some(c) => match self.resume_replay_watch_cursor(c) {
+                Some(resumed) => Some(resumed),
+                None => {
+                    self.remove_replay_watch(c.watch_id);
+                    return ReplaySliceStep::RestartFromRevision;
+                }
+            },
+            None => None,
+        };
         let (index, probe) = match target {
             ReplayWatchTarget::Ipa { gpa } => (&self.ipa_classes, gpa),
             ReplayWatchTarget::VaAnyScope { va } => (&self.va_classes, va),
@@ -1753,16 +1858,19 @@ impl AliasRegistry {
         };
         let (next, _) = index.collect_containing_slice(
             probe,
-            cursor.map(|c| c.class_cursor),
+            resumed_cursor.map(|c| c.class_cursor),
             budget,
             slice_buf,
             matches,
         );
         match next {
             Some(class_cursor) => {
-                let watch_id = match cursor {
-                    Some(c) => c.watch_id,
-                    None => self.open_replay_watch(target),
+                let watch_id = match resumed_cursor {
+                    Some(c) => {
+                        self.update_replay_watch(c.watch_id, 0, class_cursor);
+                        c.watch_id
+                    }
+                    None => self.open_replay_watch(target, 0, class_cursor),
                 };
                 ReplaySliceStep::Continue(ReplaySliceCursor {
                     scope_index: 0,
@@ -3101,23 +3209,27 @@ impl AliasRegistry {
         budget: usize,
         slice_buf: &mut Vec<(u64, AliasBacking)>,
     ) -> ReplaySliceStep {
-        if let Some(c) = cursor
-            && self.is_replay_watch_dirty(c.watch_id)
-        {
-            self.remove_replay_watch(c.watch_id);
-            return ReplaySliceStep::RestartFromRevision;
-        }
+        let resumed_cursor = match cursor {
+            Some(c) => match self.resume_replay_watch_cursor(c) {
+                Some(resumed) => Some(resumed),
+                None => {
+                    self.remove_replay_watch(c.watch_id);
+                    return ReplaySliceStep::RestartFromRevision;
+                }
+            },
+            None => None,
+        };
         if budget == 0 {
-            return cursor.map_or(ReplaySliceStep::Complete, ReplaySliceStep::Continue);
+            return resumed_cursor.map_or(ReplaySliceStep::Complete, ReplaySliceStep::Continue);
         }
         let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
         let mut remaining = budget;
-        let start_scope = cursor.map_or(0, |c| c.scope_index);
+        let start_scope = resumed_cursor.map_or(0, |c| c.scope_index);
         for (scope_index, scope) in scopes.iter().enumerate().skip(start_scope) {
             let Some(index) = self.va_classes_by_scope.get(scope) else {
                 continue;
             };
-            let class_cursor = cursor
+            let class_cursor = resumed_cursor
                 .filter(|c| c.scope_index == scope_index)
                 .map(|c| c.class_cursor);
             let (next, scanned) =
@@ -3127,9 +3239,16 @@ impl AliasRegistry {
                 });
             remaining = remaining.saturating_sub(scanned);
             if let Some(next_class_cursor) = next {
-                let watch_id = match cursor {
-                    Some(c) => c.watch_id,
-                    None => self.open_replay_watch(ReplayWatchTarget::VaProcess { va, scopes }),
+                let watch_id = match resumed_cursor {
+                    Some(c) => {
+                        self.update_replay_watch(c.watch_id, scope_index, next_class_cursor);
+                        c.watch_id
+                    }
+                    None => self.open_replay_watch(
+                        ReplayWatchTarget::VaProcess { va, scopes },
+                        scope_index,
+                        next_class_cursor,
+                    ),
                 };
                 return ReplaySliceStep::Continue(ReplaySliceCursor {
                     scope_index,
@@ -3140,18 +3259,26 @@ impl AliasRegistry {
             if remaining == 0 {
                 let next_scope = scope_index + 1;
                 return if next_scope < scopes.len() {
-                    let watch_id = match cursor {
-                        Some(c) => c.watch_id,
-                        None => self.open_replay_watch(ReplayWatchTarget::VaProcess { va, scopes }),
+                    let next_cursor = ClassSliceCursor {
+                        class: 0,
+                        start_key: 0,
+                        next_pos: 0,
+                    };
+                    let watch_id = match resumed_cursor {
+                        Some(c) => {
+                            self.update_replay_watch(c.watch_id, next_scope, next_cursor);
+                            c.watch_id
+                        }
+                        None => self.open_replay_watch(
+                            ReplayWatchTarget::VaProcess { va, scopes },
+                            next_scope,
+                            next_cursor,
+                        ),
                     };
                     ReplaySliceStep::Continue(ReplaySliceCursor {
                         scope_index: next_scope,
                         watch_id,
-                        class_cursor: ClassSliceCursor {
-                            class: 0,
-                            start_key: 0,
-                            next_pos: 0,
-                        },
+                        class_cursor: next_cursor,
                     })
                 } else {
                     ReplaySliceStep::Complete

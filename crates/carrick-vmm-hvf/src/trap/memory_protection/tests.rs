@@ -3989,10 +3989,17 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_single, 0x4000));
     assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single, 0x1000));
 
-    // Subcase 4 (Codex #16 P0-1 & P0-2): Even when 600 unrelated writes (> 512)
-    // AND an identical sole-row `Global` upsert (emptying and recreating
-    // `va_classes_by_scope[Global]`) land on EVERY one of 10 inter-slice pauses,
-    // replay completes with ZERO restarts for both IPA and `VaProcess`.
+    // Subcase 4 (Codex #17 P0-1 & P0-2): Disjoint 48 KiB edits ending right at
+    // the probe (inside the 64 KiB class AND inside a paused 64 KiB bucket),
+    // 600 disjoint edits in ONE SINGLE inter-slice pause (> 512), and identical
+    // sole-row `Global` upserts run on a dedicated helper thread so the replay
+    // thread's `alias_state_rows_scanned()` reflects ONLY production replay scans.
+    let live_128k = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        0x2_0000,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("allocate 128 KiB backing");
+    let host_128k = live_128k.as_ptr() as usize;
     let ipa_unrel = 0x7c80_0000_u64;
     let va_unrel = 0x4800_0000_u64;
     let unrel_mm_scope = AliasOwnershipScope::MmRootSlot {
@@ -4000,14 +4007,32 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         size: 0x20_0000,
     };
     let unrel_container = ContainerRootToken(7788);
+    let bucket64_start_ipa = ipa_unrel - 0xC000;
+    let early_disjoint_48k_ipa = AliasBacking {
+        start: 0x37f0_0000,
+        ipa: bucket64_start_ipa,
+        host_addr: 0,
+        size: 0xC000,
+        physical_ipa: bucket64_start_ipa,
+        physical_host_addr: 0,
+        physical_size: 0xC000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(4999)),
+        inventory_backing: InventoryBackingIdentity::Private(9999),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
     let live_ipa_unrel = AliasBacking {
         start: 0x3800_0000,
         ipa: ipa_unrel,
-        host_addr: host_16k,
-        size: 0x4000,
+        host_addr: host_128k,
+        size: 0x2_0000,
         physical_ipa: ipa_unrel,
-        physical_host_addr: host_16k,
-        physical_size: 0x4000,
+        physical_host_addr: host_128k,
+        physical_size: 0x2_0000,
         perms,
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
@@ -4053,6 +4078,9 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     };
     mutate_external_alias_state(|registry| {
         *registry = AliasRegistry::default();
+        // Put early disjoint 48 KiB row at index 0 of class-16 bucket `(16, ipa_unrel - 0xC000)`,
+        // followed by 70 dead 64 KiB rows at the SAME bucket start so slice 11 pauses at index 64.
+        registry.push(early_disjoint_48k_ipa);
         for i in 1..=640_u64 {
             registry.push(AliasBacking {
                 start: 0x3810_0000 + i * 0x4000,
@@ -4089,13 +4117,120 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
                 owner_generation: 0,
             });
         }
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: 0x37f1_0000 + i * 0x1_0000,
+                ipa: bucket64_start_ipa,
+                host_addr: 0,
+                size: 0x1_0000,
+                physical_ipa: bucket64_start_ipa,
+                physical_host_addr: 0,
+                physical_size: 0x1_0000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(6000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(11_900 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
         registry.push(live_ipa_unrel);
         registry.push(live_va_unrel);
+        registry.push(sole_global_row);
         registry.clear_replay_mappings_in();
+    });
+
+    let (pause_tx, pause_rx) = std::sync::mpsc::channel::<Option<u64>>();
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+    let mutator = std::thread::spawn(move || {
+        while let Ok(Some(k)) = pause_rx.recv() {
+            mutate_external_alias_state(|registry| {
+                // Sole-row `Global` identical upsert empties + recreates `va_classes_by_scope[Global]`.
+                assert_eq!(
+                    registry.upsert_by_key(sole_global_row),
+                    Some(sole_global_row)
+                );
+                // On pause 1 alone, push 600 disjoint rows (> 512 single-pause log cap!).
+                let batch = if k == 1 { 600_u64 } else { 1_u64 };
+                for j in 0..batch {
+                    let id = k * 1000 + j;
+                    registry.push(AliasBacking {
+                        start: 0x9900_0000 + id * 0x1_0000,
+                        ipa: 0x8900_0000 + id * 0x1_0000,
+                        host_addr: 0,
+                        size: 0x4000,
+                        physical_ipa: 0x8900_0000 + id * 0x1_0000,
+                        physical_host_addr: 0,
+                        physical_size: 0x4000,
+                        perms,
+                        guest_writable: true,
+                        sharing: GuestMappingSharing::ForkSharedAnonymous,
+                        ownership_scope: AliasOwnershipScope::MmRootSlot {
+                            base: 0xc000_0000 + id * 0x20_0000,
+                            size: 0x20_0000,
+                        },
+                        inventory_backing: InventoryBackingIdentity::Private(12_000 + id),
+                        shared_key_base: None,
+                        shared_key_offset: 0,
+                        owner_generation: 0,
+                    });
+                }
+                // On every pause, insert a disjoint 48 KiB row ending at `ipa_unrel` and `va_unrel`
+                // (inside the 64 KiB search window), and on pause 11 (paused inside bucket64)
+                // remove `early_disjoint_48k_ipa` at index 0 < paused_next_pos = 64.
+                registry.push(AliasBacking {
+                    start: 0x3b00_0000 + k * 0x1_0000,
+                    ipa: bucket64_start_ipa,
+                    host_addr: 0,
+                    size: 0xC000,
+                    physical_ipa: bucket64_start_ipa,
+                    physical_host_addr: 0,
+                    physical_size: 0xC000,
+                    perms,
+                    guest_writable: true,
+                    sharing: GuestMappingSharing::GlobalShared,
+                    ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(
+                        7000 + k,
+                    )),
+                    inventory_backing: InventoryBackingIdentity::Private(13_000 + k),
+                    shared_key_base: None,
+                    shared_key_offset: 0,
+                    owner_generation: 0,
+                });
+                registry.push(AliasBacking {
+                    start: va_unrel - 0xC000,
+                    ipa: 0x8b00_0000 + k * 0x1_0000,
+                    host_addr: 0,
+                    size: 0xC000,
+                    physical_ipa: 0x8b00_0000 + k * 0x1_0000,
+                    physical_host_addr: 0,
+                    physical_size: 0xC000,
+                    perms,
+                    guest_writable: true,
+                    sharing: GuestMappingSharing::ForkSharedAnonymous,
+                    ownership_scope: unrel_mm_scope,
+                    inventory_backing: InventoryBackingIdentity::Private(13_500 + k),
+                    shared_key_base: None,
+                    shared_key_offset: 0,
+                    owner_generation: 0,
+                });
+                if k == 11 {
+                    let retired = registry
+                        .retire_scope(AliasOwnershipScope::ContainerRoot(ContainerRootToken(4999)));
+                    assert_eq!(retired.len(), 1);
+                }
+            });
+            let _ = ack_tx.send(());
+        }
     });
 
     let unrel_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let unrel_seq_hook = std::sync::Arc::clone(&unrel_seq);
+    let pause_tx_hook = std::sync::Arc::new(parking_lot::Mutex::new(pause_tx));
+    let pause_tx_hook_clone = std::sync::Arc::clone(&pause_tx_hook);
+    let ack_rx_hook = std::sync::Arc::new(parking_lot::Mutex::new(ack_rx));
     custody
         .stage2
         .set_hook(Some(std::sync::Arc::new(move |point| {
@@ -4103,45 +4238,15 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
                 && name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS
             {
                 let k = unrel_seq_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                mutate_external_alias_state(|registry| {
-                    // Temporarily empty + recreate `va_classes_by_scope[Global]` via identical upsert,
-                    // OR upsert sole Global row + push 60 unrelated rows (600+ across 10 pauses).
-                    if registry.contains(&sole_global_row) {
-                        assert_eq!(
-                            registry.upsert_by_key(sole_global_row),
-                            Some(sole_global_row)
-                        );
-                    } else {
-                        registry.push(sole_global_row);
-                    }
-                    for j in 0..60_u64 {
-                        let id = k * 100 + j;
-                        registry.push(AliasBacking {
-                            start: 0x9900_0000 + id * 0x1_0000,
-                            ipa: 0x8900_0000 + id * 0x1_0000,
-                            host_addr: 0,
-                            size: 0x4000,
-                            physical_ipa: 0x8900_0000 + id * 0x1_0000,
-                            physical_host_addr: 0,
-                            physical_size: 0x4000,
-                            perms,
-                            guest_writable: true,
-                            sharing: GuestMappingSharing::ForkSharedAnonymous,
-                            ownership_scope: AliasOwnershipScope::MmRootSlot {
-                                base: 0xc000_0000 + id * 0x20_0000,
-                                size: 0x20_0000,
-                            },
-                            inventory_backing: InventoryBackingIdentity::Private(12_000 + id),
-                            shared_key_base: None,
-                            shared_key_offset: 0,
-                            owner_generation: 0,
-                        });
-                    }
-                });
+                pause_tx_hook_clone
+                    .lock()
+                    .send(Some(k))
+                    .expect("send pause");
+                ack_rx_hook.lock().recv().expect("recv ack");
             }
         })));
 
-    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x2_0000));
     let before_unrel_ipa = alias_state_rows_scanned();
     let res_unrel_ipa = unsafe {
         stage2_map_replay(
@@ -4152,14 +4257,12 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         )
     };
     let ipa_pauses = unrel_seq.swap(0, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(
-        ipa_pauses, 10,
-        "expected 10 inter-slice pauses (> 8 restart limit)"
-    );
+    assert_eq!(ipa_pauses, 11, "expected 11 inter-slice pauses (> 8 limit)");
+    // 640 (class 14) + 64 (slice 11 before pause) + 7 (remaining class-16 64K) + 10 (k=1..10 48K pushed into class 16 after slice 10) + 1 (k=11 48K pushed in slice 12) + 1 (live class 17) = 723
     assert_eq!(
         alias_state_rows_scanned() - before_unrel_ipa,
-        641,
-        "600 disjoint edits across 10 slices must cause ZERO restarts"
+        723,
+        "disjoint 48K edits, index-0 paused-bucket removal, and 600 single-pause writes must cause ZERO restarts"
     );
     assert_eq!(
         res_unrel_ipa,
@@ -4168,14 +4271,8 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
             carrick_aarch64::stage2::Stage2Status::SUCCESS
         )))
     );
-    assert!(ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x4000));
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x2_0000));
 
-    // Isolate `VaProcess` with ONLY `sole_global_row` in `Global` (identical upsert empties/recreates Global).
-    mutate_external_alias_state(|registry| {
-        registry.retire_scope(AliasOwnershipScope::Global);
-        registry.push(sole_global_row);
-        registry.clear_replay_mappings_in();
-    });
     assert!(!ScopedStage2MapTestStub::is_mapped(0x7c90_0000, 0x4000));
     let before_unrel_va = alias_state_rows_scanned();
     let res_unrel_va = unsafe {
@@ -4191,15 +4288,18 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         )
     };
     custody.stage2.set_hook(None);
+    let _ = pause_tx_hook.lock().send(None);
+    mutator.join().expect("mutator joined");
     let va_pauses = unrel_seq.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         va_pauses, 10,
         "expected 10 inter-slice pauses for VaProcess"
     );
+    // 640 (class 14 dead) + 1 (live_va_unrel) + 11 (48K rows from ipa_unrel pauses) + 10 (48K rows from va_unrel pauses) = 662
     assert_eq!(
         alias_state_rows_scanned() - before_unrel_va,
-        641,
-        "disjoint sole-row Global upserts and foreign MmRootSlot edits must cause ZERO VaProcess restarts"
+        662,
+        "disjoint 48K VaProcess edits, sole-row Global upserts, and 600 single-pause writes must cause ZERO restarts"
     );
     assert_eq!(
         res_unrel_va,
@@ -4209,9 +4309,10 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         )))
     );
     assert!(ScopedStage2MapTestStub::is_mapped(0x7c90_0000, 0x4000));
+    drop(live_128k);
 
-    // Subcase 5 (Codex #16 P0-3 & P1): Post-slice replacement that ALSO drops the
-    // old host backing before Phase 1's liveness probe must retry and map `new_keep_16k`
+    // Subcase 5a (Codex #16 P0-3 & P1): Single-slice replacement that ALSO drops
+    // the old host backing before Phase 1's liveness probe retries via `registry.revision()`
     // while firing `REPLAY_REMAP_DURING_PHASE1_LOOKUP` strictly once.
     let (addr_tx, addr_rx) = std::sync::mpsc::channel::<usize>();
     let (start_drop_tx, start_drop_rx) = std::sync::mpsc::channel::<()>();
@@ -4306,6 +4407,132 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     );
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_drop, 0x4000));
     assert!(!ScopedStage2MapTestStub::is_mapped(ipa_drop, 0x1000));
+
+    // Subcase 5b (Codex #17 P0-3): Multi-slice lookup keeps its watch armed AFTER
+    // the final slice (`Complete`) into `REPLAY_PHASE1_BEFORE_LIVENESS_PROBE`.
+    // Replacing and dropping the old backing there MUST dirty the live watch and
+    // retry to map `new_multi_keep_16k`.
+    let (m_addr_tx, m_addr_rx) = std::sync::mpsc::channel::<usize>();
+    let (m_start_drop_tx, m_start_drop_rx) = std::sync::mpsc::channel::<()>();
+    let (m_did_drop_tx, m_did_drop_rx) = std::sync::mpsc::channel::<()>();
+    let m_dropper = std::thread::spawn(move || {
+        let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x1000,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate disposable multi-slice 4 KiB backing");
+        let addr = owned.as_ptr() as usize;
+        m_addr_tx.send(addr).expect("send disposable addr");
+        let _ = m_start_drop_rx.recv();
+        drop(owned);
+        let _ = m_did_drop_tx.send(());
+    });
+    let m_drop_4k_host = m_addr_rx.recv().expect("receive disposable addr");
+    let ipa_multi_drop = 0x7cb0_0000_u64;
+    let old_multi_drop_4k = AliasBacking {
+        start: 0x3910_0000,
+        ipa: ipa_multi_drop,
+        host_addr: m_drop_4k_host,
+        size: 0x1000,
+        physical_ipa: ipa_multi_drop,
+        physical_host_addr: m_drop_4k_host,
+        physical_size: 0x1000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: upsert_scope,
+        inventory_backing: InventoryBackingIdentity::Private(15_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let new_multi_keep_16k = AliasBacking {
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        inventory_backing: InventoryBackingIdentity::Private(15_001),
+        ..old_multi_drop_4k
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: 0x3920_0000 + i * 0x1000,
+                ipa: ipa_multi_drop,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: ipa_multi_drop,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(8000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(15_100 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.push(old_multi_drop_4k);
+        registry.clear_replay_mappings_in();
+    });
+    let before_liveness_fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let before_liveness_clone = std::sync::Arc::clone(&before_liveness_fires);
+    let m_start_drop_tx = std::sync::Arc::new(parking_lot::Mutex::new(Some(m_start_drop_tx)));
+    let m_did_drop_rx = std::sync::Arc::new(parking_lot::Mutex::new(m_did_drop_rx));
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_PHASE1_BEFORE_LIVENESS_PROBE
+            {
+                before_liveness_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(tx) = m_start_drop_tx.lock().take() {
+                    mutate_external_alias_state(|registry| {
+                        assert!(
+                            !registry.active_replay_watches.is_empty(),
+                            "multi-slice watch must remain live into liveness probe"
+                        );
+                        assert_eq!(
+                            registry.upsert_by_key(new_multi_keep_16k),
+                            Some(old_multi_drop_4k)
+                        );
+                        registry.clear_replay_mappings_in();
+                    });
+                    let _ = tx.send(());
+                    let _ = m_did_drop_rx.lock().recv();
+                }
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_multi_drop, 0x4000));
+    let res_multi_drop = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa {
+                gpa: ipa_multi_drop,
+            },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    m_dropper.join().expect("multi-slice dropper joined");
+    assert_eq!(
+        before_liveness_fires.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "REPLAY_PHASE1_BEFORE_LIVENESS_PROBE must fire strictly once per replay call"
+    );
+    assert_eq!(
+        res_multi_drop,
+        Ok(Some((
+            new_multi_keep_16k,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_multi_drop, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_multi_drop, 0x1000));
 
     mutate_external_alias_state(|registry| {
         assert!(
