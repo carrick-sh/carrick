@@ -299,6 +299,15 @@ fn serial_host_native_sparse_address_space_gets_its_page_tables() {
         "root descriptor faults and ForkStock::loan on the second live child \
          each draw at least one 512-page run from the table reserve: {counters:?}"
     );
+    // rev3022b P0-2: the children's later sparse touches also draw (through
+    // descriptor preparation), so the total alone cannot show the second
+    // fork's own draw. Only `ForkStock::loan` grows this share, and only
+    // the second loan (child 1 still holding its arenas) needs the reserve.
+    assert!(
+        counters.fork_loan_tables_drawn >= TABLE_RESERVE_DRAW_PAGES as u64,
+        "the second live child's fork loan drew its arenas from the reserve \
+         itself: {counters:?}"
+    );
 }
 
 /// #3017 review P0-1: when the carrier's bounded page-table window and reserve

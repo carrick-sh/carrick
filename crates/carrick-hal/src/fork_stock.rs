@@ -898,8 +898,12 @@ pub struct ForkStockCounters {
     pub reclaim_deferrals: u64,
     /// Exec successor table reservations refused for capacity.
     pub successor_table_refusals: u64,
-    /// Never-issued pages the stock drew from its [`TableReserve`].
+    /// Never-issued pages the stock drew from its [`TableReserve`], for
+    /// every demand.
     pub reserve_tables_drawn: u64,
+    /// The part of [`Self::reserve_tables_drawn`] a fork loan's own table
+    /// arenas drew ([`ForkStock::loan`]).
+    pub fork_loan_tables_drawn: u64,
 }
 
 impl ForkStockCounters {
@@ -924,6 +928,7 @@ impl ForkStockCounters {
             ("reclaim_deferral", self.reclaim_deferrals),
             ("successor_table_refusal", self.successor_table_refusals),
             ("reserve_table_drawn", self.reserve_tables_drawn),
+            ("fork_loan_table_drawn", self.fork_loan_tables_drawn),
         ]
         .into_iter()
         .filter(|(_, count)| *count != 0)
@@ -1210,6 +1215,17 @@ impl Extend<RootGpa> for TableStock {
     }
 }
 
+/// Whose demand a draw from the [`TableReserve`] serves, for its counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableDemand {
+    /// A fork loan's child and parent table arenas.
+    ForkLoan,
+    /// An exec successor build's tables.
+    ExecSuccessor,
+    /// A native backing's descriptor tables.
+    Descriptor,
+}
+
 /// Table pages reserved from the fork stock for one exec successor build.
 /// They are out of the reusable stock until the build is committed to the
 /// successor or returned with [`ForkStock::return_successor_tables`].
@@ -1461,14 +1477,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         }
     }
 
-    /// Draw at least `pages` from the reserve into the reusable stock,
-    /// counted; false (nothing drawn) when the reserve holds fewer.
-    fn draw_tables(&mut self, pages: usize) -> bool {
-        let drawn = self.tables.draw(pages);
-        self.counters.reserve_tables_drawn = self
-            .counters
-            .reserve_tables_drawn
-            .saturating_add(drawn as u64);
+    /// Draw at least `pages` from the reserve into the reusable stock for
+    /// `demand`, counted under it; false (nothing drawn) when the reserve
+    /// holds fewer.
+    fn draw_tables(&mut self, demand: TableDemand, pages: usize) -> bool {
+        let drawn = self.tables.draw(pages) as u64;
+        self.counters.reserve_tables_drawn =
+            self.counters.reserve_tables_drawn.saturating_add(drawn);
+        if demand == TableDemand::ForkLoan {
+            self.counters.fork_loan_tables_drawn =
+                self.counters.fork_loan_tables_drawn.saturating_add(drawn);
+        }
         drawn != 0
     }
 
@@ -1479,13 +1498,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// run then holds it), a demand of loose pages only its shortfall.
     fn take_tables<R>(
         &mut self,
+        demand: TableDemand,
         draw: usize,
         mut take: impl FnMut(&mut Vec<RootGpa>) -> Option<R>,
     ) -> Option<R> {
         if let Some(taken) = take(self.tables.taking()) {
             return Some(taken);
         }
-        if !self.draw_tables(draw.max(1)) {
+        if !self.draw_tables(demand, draw.max(1)) {
             return None;
         }
         take(self.tables.taking())
@@ -1499,7 +1519,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
 
         let short = MAX_TABLE_GRANTS.saturating_sub(self.tables.len());
-        self.draw_tables(short.min(self.tables.reserve.pages()));
+        self.draw_tables(
+            TableDemand::Descriptor,
+            short.min(self.tables.reserve.pages()),
+        );
         self.tables.iter().take(MAX_TABLE_GRANTS).copied().collect()
     }
 
@@ -1678,7 +1701,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
             });
         }
-        if self.tables.len() < count && !self.draw_tables(count - self.tables.len()) {
+        if self.tables.len() < count
+            && !self.draw_tables(TableDemand::Descriptor, count - self.tables.len())
+        {
             self.refuse_descriptor_capacity();
             return Err(ForkStockServiceError::DescriptorTableCapacity);
         }
@@ -2515,8 +2540,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         count: usize,
     ) -> Result<SuccessorTables, ForkStockServiceError> {
         let short = count.saturating_sub(self.tables.len());
-        let Some(pages) = self.take_tables(short, |stock| take_successor_table_runs(stock, count))
-        else {
+        let Some(pages) = self.take_tables(TableDemand::ExecSuccessor, short, |stock| {
+            take_successor_table_runs(stock, count)
+        }) else {
             self.counters.successor_table_refusals =
                 self.counters.successor_table_refusals.saturating_add(1);
             return Err(ForkStockServiceError::SuccessorTableCapacity);
@@ -2721,9 +2747,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .checked_add(request.parent_bytes)
             .and_then(|bytes| usize::try_from(bytes / TABLE_PAGE_BYTES).ok())
             .unwrap_or(usize::MAX);
-        let Some((child_tables, parent_tables)) = self.take_tables(demand, |stock| {
-            take_fork_table_stock(stock, request.child_bytes, request.parent_bytes)
-        }) else {
+        let Some((child_tables, parent_tables)) =
+            self.take_tables(TableDemand::ForkLoan, demand, |stock| {
+                take_fork_table_stock(stock, request.child_bytes, request.parent_bytes)
+            })
+        else {
             return self.refuse_capacity(exchange, ForkCapacityResource::Tables, execution.cpu);
         };
         let Some(next) = self.next_loan.checked_add(1) else {
