@@ -249,6 +249,10 @@ impl Vfs for ResolvConfVfs {
         true
     }
 
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        super::check_readonly_truncate(self, path)
+    }
+
     fn name(&self) -> &'static str {
         "resolvconf"
     }

@@ -211,9 +211,19 @@ fn mmap_placement(args: [u64; 6]) -> reservations::Placement {
 /// `mmap` before forwarding to the host (which reserves carrier window slots for
 /// `MapShared`), so `MAP_FIXED_NOREPLACE` over an occupied VA answers `-EEXIST`
 /// and invalid lengths/offsets answer `-EINVAL` before window-slot exhaustion
-/// can mask them (#2975 Codex P0 #3). Returns `None` when the call should
-/// proceed normally (including when the root lock is contended or a pending/fork
-/// edit must settle first).
+/// Outcome of preflighting a delegated file `mmap(2)` against the reservation
+/// root before staging a host source or consuming carrier window slots
+/// (#2975 r30 P0 #2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileMmapPreflight {
+    Proceed,
+    Return(i64),
+    Park(SpaceWaitCause),
+}
+
+/// Preflight a delegated file `mmap(2)` against reservation placement, pending
+/// edits, and lock contention before staging a host source or claiming carrier
+/// window slots (#2975 P0 #3, r30 P0 #2).
 #[inline(never)]
 pub fn preflight_file_mmap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
     frame: &(impl AnonymousCallView + ?Sized),
@@ -221,42 +231,59 @@ pub fn preflight_file_mmap<G: ReservationGeometry, C: Copy + Send + Sync + zeroc
     spaces: SpaceAccess<'_, C>,
     table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     window: bool,
-) -> Option<i64> {
+) -> FileMmapPreflight {
     let nr = frame.canonical().raw();
     if nr != SYS_MMAP {
-        return None;
+        return FileMmapPreflight::Proceed;
     }
     let args = frame.arguments();
-    delegated_file_mmap_sharing(window, args[2], args[3])?;
+    if delegated_file_mmap_sharing(window, args[2], args[3]).is_none() {
+        return FileMmapPreflight::Proceed;
+    }
     if !matches!(
         MmapProtectionRoute::decode(args[2]),
         MmapProtectionRoute::Reservation(_)
     ) {
-        return None;
+        return FileMmapPreflight::Proceed;
     }
     if !args[5].is_multiple_of(PAGE_SIZE) || args[5].checked_add(args[1]).is_none() {
-        return Some(-EINVAL);
+        return FileMmapPreflight::Return(-EINVAL);
     }
-    let (mm, index) = delegated_anonymous_root(nr, current, spaces, table)?;
-    let slot = frame.slot().map_or(u32::MAX, |slot| slot.index() as u32);
-    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, slot) else {
-        return None;
+    let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
+        return FileMmapPreflight::Proceed;
     };
-    if !model.is_admitted() || model.pending().is_some() || model.fork_pending() {
-        return None;
+    let slot = frame.slot().map_or(u32::MAX, |slot| slot.index() as u32);
+    let mut model = match table.lock_in(spaces, index.index(), mm, slot) {
+        Ok(model) => model,
+        Err(reservations::Refusal::Busy) => {
+            return FileMmapPreflight::Park(SpaceWaitCause::Reservations);
+        }
+        Err(_) => return FileMmapPreflight::Proceed,
+    };
+    if !model.is_admitted() {
+        return FileMmapPreflight::Proceed;
+    }
+    if model.pending().is_some() || model.fork_pending() {
+        return FileMmapPreflight::Park(SpaceWaitCause::PendingEdit);
     }
     match model.place(mmap_placement(args), args[1]) {
-        Ok(_) => None,
-        Err(reservations::Refusal::Collision) => Some(-17),
-        Err(reservations::Refusal::Invalid) => Some(-EINVAL),
-        Err(reservations::Refusal::Hole | reservations::Refusal::Limit) => Some(-ENOMEM),
+        Ok(_) => FileMmapPreflight::Proceed,
+        Err(reservations::Refusal::Collision) => FileMmapPreflight::Return(-17),
+        Err(reservations::Refusal::Invalid) => FileMmapPreflight::Return(-EINVAL),
+        Err(reservations::Refusal::Hole | reservations::Refusal::Limit) => {
+            FileMmapPreflight::Return(-ENOMEM)
+        }
+        Err(reservations::Refusal::Busy) => {
+            FileMmapPreflight::Park(busy_root_cause(&model).unwrap_or(SpaceWaitCause::Reservations))
+        }
+        Err(reservations::Refusal::PreparedConflict) => {
+            FileMmapPreflight::Park(SpaceWaitCause::PreparedOverlap)
+        }
         Err(
             reservations::Refusal::ForeignMapping
-            | reservations::Refusal::Busy
-            | reservations::Refusal::PreparedConflict
             | reservations::Refusal::Stale
             | reservations::Refusal::MetadataRequired,
-        ) => None,
+        ) => FileMmapPreflight::Proceed,
     }
 }
 
@@ -1617,6 +1644,20 @@ pub fn probe_parked_anonymous_edit<
         Err(reservations::Refusal::Busy) => return Some(Some(SpaceWaitCause::Reservations)),
         Err(_) => return None,
     };
+    // Parked file `mmap` probes omit the host source (`file = None`), so keep
+    // them parked until any pending edit, fork, or claimed return settlement
+    // clears rather than letting `decide_reservation_syscall_for_origin` treat
+    // the call as `Forward` (#2975 r30 P0 #2).
+    if frame.canonical().raw() == SYS_MMAP
+        && frame.arguments()[3] & MAP_ANONYMOUS == 0
+        && (root.pending().is_some() || root.fork_pending() || root.return_settlement_claimed())
+    {
+        return Some(Some(if root.pending().is_some() || root.fork_pending() {
+            SpaceWaitCause::PendingEdit
+        } else {
+            SpaceWaitCause::Reservations
+        }));
+    }
     match decide_reservation_syscall_for_origin(frame, current, &mut root, None, origin) {
         ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
             return Some(Some(SpaceWaitCause::PreparedOverlap));
@@ -5358,6 +5399,177 @@ mod tests {
             assert_eq!(
                 cause(&words, va + 0x10000, 0x12000),
                 ForeignBacking::TooManyRuns
+            );
+        }
+
+        /// r30 P0 #2 (#2975): when an MM reservation root has a pending edit
+        /// or fork, a parked `MAP_SHARED` file mmap reprobe must stay parked
+        /// (`SpaceWaitCause::PendingEdit`) instead of immediately returning
+        /// `Some(None)` because `probe_parked_anonymous_edit` passes `file = None`.
+        #[test]
+        fn probe_parked_file_mmap_keeps_pending_edit_parked() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 27, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, addr) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!((route, addr), (DelegatedAnonymous::Served, ARENA as i64));
+            let mut guard = root(&spaces, &table, &delegated);
+            let request = match guard.munmap(ReservationRange::new(ARENA, ARENA + 0x1000).unwrap())
+            {
+                Ok(reservations::Decision::Work(req)) => req,
+                other => panic!("expected pending munmap Work, got {other:?}"),
+            };
+            assert!(guard.pending().is_some());
+            drop(guard);
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let index = spaces
+                .find(delegated.task.mm.key.load(Ordering::Acquire))
+                .unwrap();
+            let mm_id =
+                carrick_el1_abi::ReservationMm::new(delegated.task.mm.key.load(Ordering::Acquire))
+                    .unwrap();
+            let shared_frame = AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED_NOREPLACE,
+                    3,
+                    0,
+                ],
+                0,
+                carrick_sched_core::SlotId::from_index(0).unwrap(),
+                UserVa::new(0x4000),
+            );
+            let probe = probe_parked_anonymous_edit(
+                &shared_frame,
+                &delegated.task,
+                access,
+                &table,
+                index,
+                mm_id,
+                0,
+                ServiceOrigin::Initial,
+                &crate::alloc::GLOBAL_ALLOCATOR,
+            );
+            assert_eq!(
+                probe,
+                Some(Some(SpaceWaitCause::PendingEdit)),
+                "parked MAP_SHARED file mmap must stay parked while pending edit is unsettled (#2975 r30 P0 #2)"
+            );
+            let _ = request;
+        }
+
+        /// r30 P0 #2 (#2975): under reservation contention (`Busy` or an unsettled
+        /// pending edit), `preflight_file_mmap` for a `MAP_SHARED | MAP_FIXED_NOREPLACE`
+        /// window mapping must return `Contended` (never `Proceed`), and once
+        /// settled over an occupied address must return `-EEXIST` without touching
+        /// host window slot reservation.
+        #[test]
+        fn preflight_file_mmap_contended_parks_and_rechecks_eexist() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 28, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            for va in [ARENA, ARENA + 0x2000] {
+                let (route, addr) = syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    [
+                        va,
+                        0x1000,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ],
+                );
+                assert_eq!((route, addr), (DelegatedAnonymous::Served, va as i64));
+            }
+            let mut guard = root(&spaces, &table, &delegated);
+            let request = match guard
+                .munmap(ReservationRange::new(ARENA + 0x2000, ARENA + 0x3000).unwrap())
+            {
+                Ok(reservations::Decision::Work(req)) => req,
+                other => panic!("expected pending munmap Work, got {other:?}"),
+            };
+            drop(guard);
+
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let index = spaces
+                .find(delegated.task.mm.key.load(Ordering::Acquire))
+                .unwrap();
+            let mm_id =
+                carrick_el1_abi::ReservationMm::new(delegated.task.mm.key.load(Ordering::Acquire))
+                    .unwrap();
+            let shared_frame = AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+                [
+                    ARENA,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED_NOREPLACE,
+                    3,
+                    0,
+                ],
+                0,
+                carrick_sched_core::SlotId::from_index(0).unwrap(),
+                UserVa::new(0x4000),
+            );
+
+            // Contended root lock (held by another slot) parks on Reservations.
+            let busy_lock = table.lock_in(access, index.index(), mm_id, 1).unwrap();
+            assert_eq!(
+                preflight_file_mmap(&shared_frame, &delegated.task, access, &table, true),
+                FileMmapPreflight::Park(SpaceWaitCause::Reservations)
+            );
+            drop(busy_lock);
+
+            // Unsettled pending edit parks on PendingEdit.
+            assert_eq!(
+                preflight_file_mmap(&shared_frame, &delegated.task, access, &table, true),
+                FileMmapPreflight::Park(SpaceWaitCause::PendingEdit)
+            );
+
+            // Once settled, occupied ARENA immediately returns -EEXIST before MapShared.
+            let mut guard = root(&spaces, &table, &delegated);
+            let completion = unsafe {
+                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    carrick_el1_abi::ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            };
+            guard.complete(completion.unwrap()).unwrap();
+            drop(guard);
+
+            assert_eq!(
+                preflight_file_mmap(&shared_frame, &delegated.task, access, &table, true),
+                FileMmapPreflight::Return(-17)
             );
         }
     }

@@ -341,6 +341,10 @@ impl Vfs for DevptsVfs {
         carrick_vfs::FsIdentity::DevPts
     }
 
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        carrick_vfs::check_readonly_truncate(self, path)
+    }
+
     fn name(&self) -> &'static str {
         "devpts"
     }

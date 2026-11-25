@@ -16457,6 +16457,7 @@ mod window_size_door {
                     .unwrap()
             });
             entered_rx.recv().unwrap();
+            let before_writes = carrick_vfs::host_size::test_resize_hook::write_attempts();
             let hb = scope.spawn(move || {
                 let mut mem =
                     LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 8192]);
@@ -16480,6 +16481,9 @@ mod window_size_door {
                 let _ = b_done_tx.send(());
                 res
             });
+            while carrick_vfs::host_size::test_resize_hook::write_attempts() == before_writes {
+                std::thread::yield_now();
+            }
             let overtook = b_done_rx
                 .recv_timeout(std::time::Duration::from_millis(25))
                 .is_ok();
@@ -16498,5 +16502,149 @@ mod window_size_door {
                 "concurrent pwrite must never turn an admitted growth ftruncate into a 12288->8192 shrink"
             );
         });
+    }
+
+    /// Codex r30 P0 1 (#2975): a whole-file `HostFsBackend::set_file_contents`
+    /// rewrite on an empty windowed file releases its truncate guard before
+    /// `write_all`; a concurrent `ftruncate` growth must wait behind the
+    /// in-flight write rather than sampling EOF=0 and later shrinking 12 KiB
+    /// back down to 8 KiB.
+    #[test]
+    fn set_file_contents_never_extends_during_admitted_resize() {
+        let mut run = Run::new();
+        let backing = run.rootfs_file("/win", 0);
+        let _pin = window(&run, &backing);
+        let fd1 = match run.open("/win", LINUX_O_RDWR) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("open fd1: {other:?}"),
+        };
+
+        let (b_entered_tx, b_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (b_proceed_tx, b_proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let (a_entered_tx, a_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (a_proceed_tx, a_proceed_rx) = std::sync::mpsc::sync_channel(1);
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let ctx = &ctx;
+        let dispatcher = &run.dispatcher;
+        std::thread::scope(|scope| {
+            let hb = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install_write(b_entered_tx, b_proceed_rx);
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .set_file_contents("/win", vec![0x43; 12288])
+                    .unwrap();
+            });
+            b_entered_rx.recv().unwrap();
+            let before_resizes = carrick_vfs::host_size::test_resize_hook::resize_attempts();
+            let ha = scope.spawn(move || {
+                carrick_vfs::host_size::test_resize_hook::install(a_entered_tx, a_proceed_rx);
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(
+                            SYS_FTRUNCATE,
+                            SyscallArgs::from([fd1, 8192, 0, 0, 0, 0]),
+                        ),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap()
+            });
+            while carrick_vfs::host_size::test_resize_hook::resize_attempts() == before_resizes {
+                std::thread::yield_now();
+            }
+            let a_entered = a_entered_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_ok();
+            let _ = b_proceed_tx.send(());
+            hb.join().unwrap();
+            let _ = a_proceed_tx.send(());
+            let ra = ha.join().unwrap();
+            assert!(
+                !a_entered,
+                "admitted ftruncate must wait behind whole-file set_file_contents write"
+            );
+            assert_eq!(ra, DispatchOutcome::errno(LINUX_ENOSYS));
+            assert_eq!(
+                size(&backing),
+                12288,
+                "set_file_contents must never extend past a concurrent admitted resize"
+            );
+        });
+    }
+
+    /// Codex r30 P0 4 (#2975): custom writable mounts implementing `truncate`
+    /// without overriding `Vfs::check_truncate` must remain truncatable via
+    /// `SYS_TRUNCATE`, while directories, FIFOs, and RLIMIT_FSIZE still reject.
+    #[test]
+    fn writable_mount_truncate_without_check_truncate_override_succeeds() {
+        struct DefaultCheckWritableWrap {
+            inner: Box<dyn carrick_vfs::Vfs>,
+        }
+        impl carrick_vfs::Vfs for DefaultCheckWritableWrap {
+            fn lookup(&self, path: &str) -> Result<carrick_vfs::Metadata, carrick_vfs::VfsError> {
+                self.inner.lookup(path)
+            }
+            fn open(
+                &self,
+                path: &str,
+                flags: carrick_vfs::OpenFlags,
+                ctx: &carrick_vfs::OpenContext,
+            ) -> Result<carrick_vfs::VfsHandle, carrick_vfs::VfsError> {
+                self.inner.open(path, flags, ctx)
+            }
+            fn readdir(
+                &self,
+                path: &str,
+            ) -> Result<Vec<carrick_vfs::DirEnt>, carrick_vfs::VfsError> {
+                self.inner.readdir(path)
+            }
+            fn readlink(&self, path: &str) -> Result<std::path::PathBuf, carrick_vfs::VfsError> {
+                self.inner.readlink(path)
+            }
+            fn truncate(&self, path: &str, len: u64) -> Result<(), carrick_vfs::VfsError> {
+                self.inner.truncate(path, len)
+            }
+        }
+
+        let mut run = Run::new();
+        let rw = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rw.path().join("dir")).unwrap();
+        std::fs::write(rw.path().join("reg"), b"abcdefgh").unwrap();
+        let fifo_path = rw.path().join("fifo");
+        let cfifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cfifo.as_ptr(), 0o644) }, 0);
+
+        run.dispatcher.register_mount(
+            "/wrap",
+            Box::new(DefaultCheckWritableWrap {
+                inner: Box::new(carrick_vfs::BindVfs::new("/wrap", rw.path(), false)),
+            }),
+        );
+
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/wrap/reg"), [PATH, 4, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(std::fs::read(rw.path().join("reg")).unwrap(), b"abcd");
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/wrap/dir"), [PATH, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_EISDIR)
+        );
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/wrap/fifo"), [PATH, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_EINVAL)
+        );
+        assert_eq!(
+            run.call(SYS_TRUNCATE, Some("/wrap/missing"), [PATH, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_ENOENT)
+        );
     }
 }

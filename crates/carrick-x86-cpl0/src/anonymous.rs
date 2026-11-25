@@ -153,8 +153,13 @@ type StagedFileSource = (
     crate::rust_alloc::boxed::Box<[u8]>,
 );
 
+enum FileSourceAbort {
+    Returned(SyscallResult),
+    Park(SpaceWaitCause),
+}
+
 impl X86AnonymousVenue<'_> {
-    fn source(&self, zone: &X86Cpl0Zone) -> Result<Option<StagedFileSource>, SyscallResult> {
+    fn source(&self, zone: &X86Cpl0Zone) -> Result<Option<StagedFileSource>, FileSourceAbort> {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
         };
@@ -165,10 +170,12 @@ impl X86AnonymousVenue<'_> {
             return Ok(None);
         };
         let slot = self.frame.slot();
-        let venue = carrick_el1_linux::ipc::guest_venue(slot.index() as u32)
-            .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
-        let table = carrick_el1_linux::ipc::native_table(&venue, self.task)
-            .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
+        let venue = carrick_el1_linux::ipc::guest_venue(slot.index() as u32).ok_or(
+            FileSourceAbort::Returned(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
+        )?;
+        let table = carrick_el1_linux::ipc::native_table(&venue, self.task).ok_or(
+            FileSourceAbort::Returned(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
+        )?;
         let mut resolve = |fd| carrick_el1_linux::ipc::native_descriptor(&venue, table, fd);
         // Before popping source releases or calling `forward_to_host` (which
         // reserves carrier window slots on `MapShared`), preflight reservation
@@ -188,14 +195,20 @@ impl X86AnonymousVenue<'_> {
                         != 0);
             if !eacces {
                 let is_window = shared && access.writable();
-                if let Some(errno) = carrick_el1::memory::preflight_file_mmap(
+                match carrick_el1::memory::preflight_file_mmap(
                     &self.frame,
                     self.task,
                     carrick_core::wait::space_access(zone, slot, crate::native_process::release),
                     shared_x86_cpl0_guest(),
                     is_window,
                 ) {
-                    return Err(SyscallResult::new(errno));
+                    carrick_el1::memory::FileMmapPreflight::Proceed => {}
+                    carrick_el1::memory::FileMmapPreflight::Return(errno) => {
+                        return Err(FileSourceAbort::Returned(SyscallResult::new(errno)));
+                    }
+                    carrick_el1::memory::FileMmapPreflight::Park(cause) => {
+                        return Err(FileSourceAbort::Park(cause));
+                    }
                 }
             }
         }
@@ -259,22 +272,26 @@ impl X86AnonymousVenue<'_> {
                     ..Default::default()
                 };
                 carrick_x86_carrier::entry::forward_to_host(&frame);
-                native_host_file::map_source(&record).map(|reply| {
-                    Some((
-                        pages(carrick_el1_abi::HostBackingIdentity::new(
-                            reply.handle,
-                            reply.generation,
-                            0,
-                        )),
-                        record,
-                    ))
-                })
+                native_host_file::map_source(&record)
+                    .map(|reply| {
+                        Some((
+                            pages(carrick_el1_abi::HostBackingIdentity::new(
+                                reply.handle,
+                                reply.generation,
+                                0,
+                            )),
+                            record,
+                        ))
+                    })
+                    .map_err(FileSourceAbort::Returned)
             }
-            Some(HostFileStage::Returned(result)) => Err(result),
+            Some(HostFileStage::Returned(result)) => Err(FileSourceAbort::Returned(result)),
             // The venue does not serve this mapping: no source, so the owner
             // leaves it unrouted.
             None => Ok(None),
-            _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
+            _ => Err(FileSourceAbort::Returned(SyscallResult::from_errno(
+                carrick_syscall_abi::LINUX_ENOSYS,
+            ))),
         }
     }
 
@@ -343,7 +360,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
         let staged = match self.source(zone) {
             Ok(staged) => staged,
-            Err(result) => {
+            Err(FileSourceAbort::Returned(result)) => {
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval() {
                     counters.record_refusal(
                         self.native,
@@ -352,6 +369,9 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     );
                 }
                 return DelegatedStep::Served(result);
+            }
+            Err(FileSourceAbort::Park(cause)) => {
+                return DelegatedStep::Contended(cause);
             }
         };
         let file = staged.as_ref().map(|(source, _)| *source);

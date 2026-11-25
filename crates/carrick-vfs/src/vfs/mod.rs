@@ -1075,6 +1075,28 @@ impl<'a> std::fmt::Debug for OpenContext<'a> {
 /// The trait is `Send + Sync` because the mount table is shared across the
 /// guest's per-thread vCPUs; mounts that hold mutable host state (the pty
 /// table, the writable overlay) carry their own interior locking.
+/// Default writable `truncate(2)` path and object-type check: regular files and
+/// resolved symlinks succeed, directories return `EISDIR`, and special nodes
+/// return `EINVAL` (#2975 r30 P0 4).
+pub fn check_writable_truncate_kind<V: Vfs + ?Sized>(vfs: &V, path: &str) -> Result<(), VfsError> {
+    let md = vfs.lookup(path)?;
+    match md.kind {
+        EntryKind::Directory => Err(carrick_abi::LINUX_EISDIR),
+        EntryKind::Fifo | EntryKind::CharDevice | EntryKind::Socket => {
+            Err(carrick_abi::LINUX_EINVAL)
+        }
+        EntryKind::File | EntryKind::Symlink => Ok(()),
+    }
+}
+
+/// `truncate(2)` precheck for read-only [`Vfs`] implementations: preserves
+/// `ENOENT` / `EISDIR` / `EINVAL` ordering and returns `EROFS` for regular
+/// files before task `RLIMIT_FSIZE` (`EFBIG`) is checked (#2975 P0 5, r30 P0 4).
+pub fn check_readonly_truncate<V: Vfs + ?Sized>(vfs: &V, path: &str) -> Result<(), VfsError> {
+    check_writable_truncate_kind(vfs, path)?;
+    Err(carrick_abi::LINUX_EROFS)
+}
+
 pub trait Vfs: Send + Sync {
     fn bind_source(&self) -> Option<&std::path::Path> {
         None
@@ -1231,13 +1253,14 @@ pub trait Vfs: Send + Sync {
     }
 
     /// Validate path resolution, object type, and writeability for `truncate(2)`
-    /// before enforcing task `RLIMIT_FSIZE` (#2975 P0 5).
+    /// before enforcing task `RLIMIT_FSIZE` (#2975 P0 5, r30 P0 4).
+    ///
+    /// Defaults to [`check_writable_truncate_kind`] so writable mounts that
+    /// implement [`truncate`](Self::truncate) work without overriding this gate.
+    /// Read-only filesystems should override it via [`check_readonly_truncate`]
+    /// so `EROFS` precedes task `RLIMIT_FSIZE` (`EFBIG`).
     fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
-        let md = self.lookup(path)?;
-        if md.kind == EntryKind::Directory {
-            return Err(carrick_abi::LINUX_EISDIR);
-        }
-        Err(carrick_abi::LINUX_EROFS)
+        check_writable_truncate_kind(self, path)
     }
 
     fn truncate(&self, _path: &str, _len: u64) -> Result<(), VfsError> {
