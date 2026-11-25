@@ -3570,6 +3570,63 @@ fn a_fork_loan_takes_its_arenas_from_a_fresh_run() {
     assert_eq!(stock.table_capacity(), 40 + 2048 - 560);
 }
 
+/// rev3022c P0-3: a loan refuses only when drawing the whole reserve could
+/// not serve it. A reusable contiguous run holds the child's 300-page arena
+/// and the reserve's last 199 pages hold the parent's: the loan draws only
+/// those 199, never the 499 the whole demand would need.
+#[test]
+fn a_fork_loan_draws_only_the_run_the_stock_lacks() {
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..300).map(|n| page(0x20_0000 + n * 0x1000)).collect(),
+            TableReserve::new(
+                FrameGpa::new(RESERVE_BASE),
+                FrameGpa::new(RESERVE_BASE + 199 * 4096),
+            )
+            .unwrap(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let loan = loan(&mut stock, parent(), 302, 300, 199)
+        .expect("the stock's run and the reserve's pages hold both arenas");
+    assert_eq!(
+        [loan.request.child_tables, loan.request.parent_tables]
+            .map(|arena| (arena.base, arena.len)),
+        [(0x20_0000, 300 * 4096), (RESERVE_BASE, 199 * 4096)]
+    );
+    let counters = stock.counters();
+    assert_eq!(
+        (
+            counters.reserve_tables_drawn,
+            counters.fork_loan_tables_drawn,
+            counters.capacity_refusals
+        ),
+        (199, 199, 0),
+        "{counters:?}"
+    );
+    assert_eq!(stock.table_capacity(), 0);
+}
+
+/// A loan the stock and the whole reserve cannot hold refuses, counted,
+/// and draws nothing.
+#[test]
+fn a_fork_loan_beyond_stock_and_reserve_refuses_without_drawing() {
+    let mut stock = reserved_stock(40, 300);
+    assert!(loan(&mut stock, parent(), 302, 300, 2).is_err());
+    let counters = stock.counters();
+    assert_eq!(
+        (counters.reserve_tables_drawn, counters.capacity_refusals),
+        (0, 1),
+        "{counters:?}"
+    );
+    assert_eq!(stock.table_capacity(), 340);
+}
+
 /// rev3022b P0-2: `fork_loan_tables_drawn` counts only what a fork loan
 /// itself drew: descriptor and successor draws grow the total, never the
 /// loan's share.
