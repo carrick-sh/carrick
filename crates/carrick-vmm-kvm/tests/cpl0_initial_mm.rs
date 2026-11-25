@@ -598,6 +598,198 @@ fn production_temporary_table_shortage_parks_enrols_and_succeeds_after_return() 
     );
 }
 
+/// #3030 (rev3022b P0-1): a fault whose only returnable page-table custody
+/// is a retired fork child still installed on its slot must wake when that
+/// slot vacates, not when some unrelated crossing happens to drain. The child
+/// (pinned to CPU 1) touches its own sparse slots and exits: CPU 1 is stopped
+/// right after its retire crossing quarantined those tables, while the child
+/// is still installed there. The parent (CPU 0) then touches more slots than
+/// a tight 2 MiB window holds without the child's tables: the touch that
+/// finds the window spent must park on the stock's release (`Returnable`),
+/// not fault. Resuming CPU 1 alone must reclaim the child's tables and wake
+/// the parent at the vacate, before the child's own exit-work crossing
+/// (`WORK_PORT`, which also drains) reaches the host. The parent then
+/// completes every touch and exits 0.
+#[test]
+fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() {
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+
+    let elf = native_exit_fixture("native_quarantined_child_table_shortage.S");
+    let (parts, root_tid, _dispatcher) = native_exit_workers_in(&elf, None, Some(2 * 1024 * 1024));
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let cpu0 = carrick_guest_arch::CpuId::new(0);
+    let cpu1 = carrick_guest_arch::CpuId::new(1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut child = factory.claim(1).expect("peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    let counters = || factory.fork_stock_counters().expect("fork stock counters");
+    let waiters = || {
+        factory
+            .fork_stock_release_waiters()
+            .expect("release waiters")
+    };
+    let capacity = || factory.fork_table_capacity().expect("table capacity");
+
+    // 1. Fork. CPU 0 then stays stopped until the child has retired.
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(child_tid, cpu1)
+        .expect("pin child to CPU 1");
+
+    // 2. The child touches its slots and exits. Serve its crossings up to
+    //    and including the retire crossing, then hold CPU 1 stopped there:
+    //    the child is quarantined and still installed on slot 1.
+    let mut retired = false;
+    for _ in 0..4096 {
+        let exit = child.fixture_run_idle_peer().expect("child run");
+        match &exit {
+            CarrierRunExit::PhysicalDoorbell { port, .. } => {
+                let port = *port;
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("child doorbell")
+                        .is_none()
+                );
+                if port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT {
+                    retired = true;
+                    break;
+                }
+            }
+            CarrierRunExit::Kick => {}
+            other => panic!("unexpected child exit before retire: {other:?}"),
+        }
+    }
+    assert!(retired, "child reached its retire crossing");
+    let quarantined = counters();
+    assert_eq!(
+        (
+            quarantined.quarantined_children,
+            quarantined.returned_children
+        ),
+        (1, 0),
+        "the retire crossing quarantined the still-installed child: {quarantined:?}"
+    );
+
+    // 3. The parent touches its slots until the window is spent; with only
+    //    the quarantined child's tables returnable, it parks, never faults.
+    run_until_idle_within(
+        4096,
+        &factory,
+        cpu0,
+        || {
+            let exit = parent
+                .fixture_run_loaded(task)
+                .expect("parent touches under the quarantine")
+                .exit;
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    parent
+                        .service_physical_doorbell(task, &exit, |_, _| {})
+                        .expect("parent doorbell")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+    let parked = counters();
+    assert_eq!(
+        waiters(),
+        1,
+        "the parent's fault enrolled on the stock's release: capacity {} {parked:?}",
+        capacity()
+    );
+    assert!(
+        matches!(
+            factory
+                .fixture_native_wait_state(root_tid)
+                .expect("parent wait")
+                .0,
+            Claim::Parked { .. }
+        ),
+        "the parent parked on the reservation pool"
+    );
+    assert_eq!(
+        (
+            parked.descriptor_capacity_refusals,
+            parked.returned_children
+        ),
+        (0, 0),
+        "a quarantined child's tables are returnable: not now, never a refusal: {parked:?}"
+    );
+
+    // 4. Resume only CPU 1: the child leaves its slot in ring, settles its
+    //    own exit work (a `WORK_PORT` crossing, which also drains) and idles.
+    //    The vacate itself must return the tables and wake the parent: no
+    //    later, unrelated crossing may be what delivers the wake.
+    run_until_idle_within(
+        4096,
+        &factory,
+        cpu1,
+        || {
+            let exit = child.fixture_run_idle_peer().expect("child vacate");
+            if let CarrierRunExit::PhysicalDoorbell { port, .. } = &exit
+                && *port == carrick_x86::cpl0_entry::WORK_PORT
+            {
+                assert_eq!(
+                    (waiters(), counters().returned_children),
+                    (0, 1),
+                    "the child's slot vacate, not its later exit-work crossing, \
+                     reclaimed its tables and woke the parent: {:?}",
+                    counters()
+                );
+            }
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("child vacate doorbell")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+    let vacated = counters();
+    assert_eq!(
+        (waiters(), vacated.returned_children),
+        (0, 1),
+        "the child's slot vacate reclaimed its quarantined tables and woke the \
+         parked parent: {vacated:?}"
+    );
+
+    // 5. The parent reruns its touch, finishes every slot and exits 0.
+    run_to_marker(&mut parent, task, 2, &factory);
+    let status = (0..256)
+        .find_map(|_| {
+            let exit = parent
+                .fixture_run_loaded(task)
+                .expect("parent completion")
+                .exit;
+            match exit {
+                CarrierRunExit::PhysicalDoorbell { .. } => parent
+                    .service_physical_doorbell(task, &exit, |_, _| {})
+                    .expect("parent completion doorbell"),
+                CarrierRunExit::Kick => None,
+                other => panic!("unexpected parent exit: {other:?}"),
+            }
+        })
+        .expect("root exit");
+    assert_eq!(
+        status,
+        carrick_vmm_kvm::cpl0_boot::PhysicalProcessExit::Exited(
+            carrick_sched_core::process::TerminationStatus::exited(0)
+        )
+    );
+    assert_eq!(counters().descriptor_capacity_refusals, 0);
+}
+
 fn assert_root_hint_exact(outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome, who: &str) {
     let counters = outcome
         .physical
@@ -2190,10 +2382,26 @@ fn native_exit_workers_on(
     carrick_el1_abi::El1TaskId,
     carrick_kernel::dispatch::SyscallDispatcher,
 ) {
+    native_exit_workers_in(elf, entry, None)
+}
+
+/// As [`native_exit_workers_on`], in a carrier of `extent` bytes instead of
+/// the image's production extent (a tight page-table window).
+fn native_exit_workers_in(
+    elf: &[u8],
+    entry: Option<&[u8]>,
+    extent: Option<usize>,
+) -> (
+    carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
+    carrick_el1_abi::El1TaskId,
+    carrick_kernel::dispatch::SyscallDispatcher,
+) {
     let program = carrick_mem::elf::ElfProgram::load(elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("ELF program");
     let image = prepare_x86_elf(&program).expect("static ELF");
-    let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
+    let extent = extent.unwrap_or_else(|| {
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent")
+    });
     // Match production preparation: native descriptor owners require the
     // shared IPC window and this exact root table's publication.
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -2932,12 +3140,23 @@ fn parked_bucket(
 fn run_until_idle(
     factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
     cpu: carrick_guest_arch::CpuId,
+    run: impl FnMut() -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit,
+    done: impl Fn() -> bool,
+) {
+    run_until_idle_within(128, factory, cpu, run, done);
+}
+
+/// [`run_until_idle`] for a workload that crosses up to `budget` times.
+fn run_until_idle_within(
+    budget: usize,
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    cpu: carrick_guest_arch::CpuId,
     mut run: impl FnMut() -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit,
     done: impl Fn() -> bool,
 ) {
     use carrick_hal::VcpuKick;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
-    for _ in 0..128 {
+    for _ in 0..budget {
         // Already idle with nothing queued (its work finished earlier): a
         // kick sent before the vCPU enters the guest would be lost.
         if factory.fixture_native_cpu_idle(cpu).expect("idle census") {
