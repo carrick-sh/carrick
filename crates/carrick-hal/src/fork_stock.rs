@@ -2473,6 +2473,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         MmKey::of(mm).is_some_and(|key| self.quarantine.contains_key(&key))
     }
 
+    /// The retired children waiting for reclaim, in key order.
+    pub fn quarantined_mms(&self) -> Vec<ReservationMm> {
+        self.quarantine.keys().filter_map(|key| key.mm()).collect()
+    }
+
     /// A publication undo is unknown. Preserve all pending table and physical
     /// journals and close this exact incarnation before the carrier fails.
     /// This is not an ordinary retirement or permission to reclaim anything.
