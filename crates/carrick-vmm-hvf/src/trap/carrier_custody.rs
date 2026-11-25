@@ -1004,6 +1004,7 @@ impl CarrierVmCustody {
             Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
             _ => return None,
         }
+        self.stage2.at_client_point(FRAME_POOL_ADMITTED);
         let mut guard = self.frame_pool.lock();
         match &*guard {
             CarrierFramePoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
@@ -1040,6 +1041,7 @@ impl CarrierVmCustody {
             Stage2Lifecycle::Creating(_) | Stage2Lifecycle::Live(_) => drop(state),
             _ => return None,
         }
+        self.stage2.at_client_point(ROOT_SLOT_POOL_ADMITTED);
         let mut guard = self.root_slot_pool.lock();
         match &*guard {
             CarrierRootSlotPoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
@@ -1565,6 +1567,13 @@ impl CarrierVmCustody {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const RECORD_UNMAP_PREPARED: &str = "record unmap prepared";
 
+/// The custody hook points where a pre-mapped pool's construction has been
+/// admitted for the current generation and is about to map the pool.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const FRAME_POOL_ADMITTED: &str = "frame pool admitted";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const ROOT_SLOT_POOL_ADMITTED: &str = "root slot pool admitted";
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierPinVenue(std::sync::Weak<CarrierVmCustody>);
@@ -1910,6 +1919,117 @@ mod carrier_vm_custody_tests {
              it hit G2's stage 2"
         );
         assert_eq!(outcome, CarrierStage2RetireOutcome::RetiredUnmapped);
+    }
+
+    /// A pre-mapped pool's construction was admitted in G1 while a rival
+    /// destroys G1. The pool must be mapped in G1's stage 2 before its raw
+    /// destroy (so G1's settlement forgets it), never after it into a
+    /// custody with no VM, which would then serve the pool to G2 although
+    /// G2's stage 2 never mapped it. The hook parks the construction at its
+    /// admission until the rival either finished (nothing excluded it: the
+    /// bug) or reported that it waits for the custody lock (the fix).
+    #[allow(clippy::expect_used)]
+    fn a_pool_built_for_a_destroyed_generation_is_never_kept(
+        point: &'static str,
+        build: impl FnOnce(&CarrierVmCustody) -> bool,
+        take_active: impl FnOnce(&CarrierVmCustody) -> Option<Box<dyn FnOnce()>>,
+    ) {
+        use carrick_aarch64::stage2::custody::{Stage2HookPoint, Stage2Lifecycle};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let mapped_after_rival = std::sync::Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<&'static str>();
+        let hook_event_tx = event_tx.clone();
+        let event_rx = std::sync::Mutex::new(event_rx);
+        {
+            let mapped_after_rival = std::sync::Arc::clone(&mapped_after_rival);
+            custody.stage2.set_hook(Some(std::sync::Arc::new(
+                move |hook_point| match hook_point {
+                    Stage2HookPoint::Client(name) if name == point => {
+                        start_tx.send(()).expect("rival alive");
+                        let event = event_rx
+                            .lock()
+                            .expect("event receiver")
+                            .recv()
+                            .expect("rival reports");
+                        assert!(matches!(event, "contended" | "done"));
+                        // The pool's map follows this point in the same
+                        // thread: a finished rival means it maps after G1's
+                        // raw destroy.
+                        mapped_after_rival.store(event == "done", Ordering::SeqCst);
+                    }
+                    Stage2HookPoint::LockContended(_) => {
+                        let _ = hook_event_tx.send("contended");
+                    }
+                    _ => {}
+                },
+            )));
+        }
+
+        let rival = {
+            let custody = std::sync::Arc::clone(&custody);
+            std::thread::spawn(move || {
+                start_rx.recv().expect("construction parked");
+                destroy_vm_with_custody_using(
+                    &custody,
+                    "rival G1 destroy",
+                    carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                    || {},
+                )
+                .expect("rival destroys G1");
+                let _ = event_tx.send("done");
+            })
+        };
+
+        let built = build(&custody);
+        rival.join().expect("rival");
+        custody.stage2.set_hook(None);
+
+        assert_eq!(custody.stage2.lifecycle(), Stage2Lifecycle::Vacant);
+        // Settle a pool the bug left behind before asserting, so the failure
+        // reports the race instead of a mapped lease's drop check.
+        let kept = take_active(&custody).map(|forget| forget()).is_some();
+        assert!(built, "G1 admitted the construction, so it builds a pool");
+        assert!(
+            !mapped_after_rival.load(Ordering::SeqCst) && !kept,
+            "a pool admitted in G1 was mapped after G1's raw destroy and kept by a custody \
+             with no VM (mapped after destroy: {}, kept: {kept}); G2 would be served a pool \
+             its stage 2 never mapped (g1 {g1:?})",
+            mapped_after_rival.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn a_frame_pool_built_for_a_destroyed_generation_is_never_kept() {
+        use super::CarrierFramePoolState;
+        a_pool_built_for_a_destroyed_generation_is_never_kept(
+            super::FRAME_POOL_ADMITTED,
+            |custody| custody.frame_pool().is_some(),
+            |custody| match std::mem::take(&mut *custody.frame_pool.lock()) {
+                CarrierFramePoolState::Active(pool) => {
+                    Some(Box::new(move || pool.forget_backend_mapping()) as Box<dyn FnOnce()>)
+                }
+                CarrierFramePoolState::Uninitialized | CarrierFramePoolState::Failed => None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_root_slot_pool_built_for_a_destroyed_generation_is_never_kept() {
+        use super::CarrierRootSlotPoolState;
+        a_pool_built_for_a_destroyed_generation_is_never_kept(
+            super::ROOT_SLOT_POOL_ADMITTED,
+            |custody| custody.root_slot_pool().is_some(),
+            |custody| match std::mem::take(&mut *custody.root_slot_pool.lock()) {
+                CarrierRootSlotPoolState::Active(pool) => {
+                    Some(Box::new(move || pool.forget_backend_mapping()) as Box<dyn FnOnce()>)
+                }
+                CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => None,
+            },
+        );
     }
 
     fn stage2_spec(
