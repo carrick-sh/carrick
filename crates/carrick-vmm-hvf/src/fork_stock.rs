@@ -309,7 +309,11 @@ impl ForkStockHostCustody {
         .ok_or_else(|| fail("native fork lifecycle extent layout"))?;
         stock
             .owner
-            .install(tables, lifecycles)
+            .install(
+                tables,
+                carrick_hal::fork_stock::TableReserve::EMPTY,
+                lifecycles,
+            )
             .map_err(|error| fail(&format!("native fork stock install: {error:?}")))?;
         stock.backing = Some(NativeForkBacking {
             resources,
@@ -599,6 +603,7 @@ mod tests {
         stock
             .install(
                 (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 vec![ForkLifecycleLoan::ARM_DEFAULT],
             )
             .unwrap();
@@ -815,6 +820,7 @@ mod tests {
                     (0..8)
                         .map(|index| page(stock_base + index * 4096))
                         .collect(),
+                    carrick_hal::fork_stock::TableReserve::EMPTY,
                     vec![ForkLifecycleLoan::ARM_DEFAULT],
                 )
                 .unwrap();
@@ -1010,6 +1016,7 @@ mod tests {
                     (0..8)
                         .map(|index| page(stock_base + index * 4096))
                         .collect(),
+                    carrick_hal::fork_stock::TableReserve::EMPTY,
                     vec![ForkLifecycleLoan::ARM_DEFAULT],
                 )
                 .unwrap();

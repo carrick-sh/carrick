@@ -2107,9 +2107,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         ))
     }
 
-    /// Reusable fork-stock table pages.
-    pub fn fork_table_stock(&self) -> usize {
-        self.0.fork_stock.table_stock().len()
+    /// Fork-stock table pages the carrier can issue: the reusable stock
+    /// and the never-issued reserve it draws from.
+    pub fn fork_table_capacity(&self) -> usize {
+        self.0.fork_stock.table_capacity()
     }
 
     /// Waiters enrolled on the fork stock's release and not yet woken.
@@ -2218,7 +2219,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     /// live children) would.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture_hold_fork_stock(&mut self, left: usize) -> Result<SuccessorTables, TrapError> {
-        let count = self.fork_table_stock().saturating_sub(left);
+        let count = self.fork_table_capacity().saturating_sub(left);
         self.0
             .fork_stock
             .reserve_successor_tables(count)

@@ -255,6 +255,24 @@ fn serial_host_native_forked_child_out_of_arena_hint_is_exact() {
     assert_root_hint_exact(&outcome, "forked child");
 }
 
+/// #3017 (npm's `owner grant physical table plan refused: TablesExhausted`):
+/// a sparse address space, the shape V8 builds, needs page tables far beyond
+/// what the initial image's tables cover. The root and then its forked child
+/// (while the root waits live) each touch a page in 64 separate 512 GiB
+/// slots, three fresh tables apiece, and the child rewrites every inherited
+/// page. Linux serves it all; the carrier must neither die nor refuse.
+#[test]
+fn serial_host_native_sparse_address_space_gets_its_page_tables() {
+    let elf = native_exit_fixture_with_flags("native_sparse_table_supply.S", &[]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 1 << 16, ROOT_AFFINITY_LOADED)
+        .expect("a sparse address space must not exhaust the carrier's page tables");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "92 = hint placed elsewhere, 91 = wrong byte, 93 = wait failed or child \
+         signalled, 94 = fork failed, else the mmap errno"
+    );
+}
+
 fn assert_root_hint_exact(outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome, who: &str) {
     let counters = outcome
         .physical
@@ -2001,7 +2019,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
         demand.tables >= bare.tables && demand.data >= bare.data + 2,
         "the staged successor carries the vvar and vDSO pages: {demand:?} over {bare:?}"
     );
-    let stock = carrier.fork_table_stock();
+    let stock = carrier.fork_table_capacity();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
     let receipt = carrier
@@ -2018,11 +2036,11 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     assert_eq!(data.len(), demand.data);
     assert_eq!(backing.root, tables[0]);
     assert_eq!(entry.entry, request().image.entry().entry);
-    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+    assert_eq!(carrier.fork_table_capacity(), stock - demand.tables);
     carrier
         .release_exec_successor(receipt)
         .expect("unused preparation returns");
-    assert_eq!(carrier.fork_table_stock(), stock);
+    assert_eq!(carrier.fork_table_capacity(), stock);
     assert!(carrier.exec_reservation(successor).is_none());
 
     let held = carrier
@@ -2041,7 +2059,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     else {
         panic!("a holder has the stock: not now");
     };
-    assert_eq!(carrier.fork_table_stock(), demand.tables - 1);
+    assert_eq!(carrier.fork_table_capacity(), demand.tables - 1);
     assert!(carrier.exec_reservation(successor).is_none());
     assert_eq!(carrier.fork_stock_release_waiters(), 1, "enrolled");
     assert!(wakes.try_recv().is_err(), "nothing has returned yet");
@@ -2064,7 +2082,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
             .expect("service"),
         X86ExecStage::Staged(..)
     ));
-    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+    assert_eq!(carrier.fork_table_capacity(), stock - demand.tables);
 }
 
 fn run_to_marker(

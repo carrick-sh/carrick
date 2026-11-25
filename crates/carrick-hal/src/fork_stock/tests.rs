@@ -41,6 +41,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(1),
         )
         .unwrap();
@@ -140,6 +141,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(1),
         )
         .unwrap();
@@ -567,6 +569,7 @@ fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_
             stock
                 .install(
                     (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+                    crate::fork_stock::TableReserve::EMPTY,
                     lifecycles(1),
                 )
                 .unwrap();
@@ -721,6 +724,7 @@ fn stock<T: ChildAddressTags>(tags: T, pages: u64, records: u64) -> ForkStock<T>
     stock
         .install(
             (0..pages).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(records),
         )
         .unwrap();
@@ -876,6 +880,7 @@ fn arm_control_windows_scale_past_eight_live_children() {
     stock
         .install(
             (0..64).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(12),
         )
         .unwrap();
@@ -1276,6 +1281,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             x86_lifecycles(2),
         )
         .unwrap();
@@ -1319,6 +1325,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             x86_lifecycles(1),
         )
         .unwrap();
@@ -1382,6 +1389,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             x86_lifecycles(1),
         )
         .unwrap();
@@ -1426,6 +1434,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     stock
         .install(
             (0..32).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             x86_lifecycles(8),
         )
         .unwrap();
@@ -1951,6 +1960,7 @@ fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() 
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(1),
         )
         .unwrap();
@@ -2043,6 +2053,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             lifecycles(1),
         )
         .unwrap();
@@ -2782,6 +2793,7 @@ fn accepted_cold_lifecycle_publishes_all_affinity_aliases_and_abort_scrubs_them(
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             x86_lifecycles(1),
         )
         .unwrap();
@@ -2860,6 +2872,7 @@ fn lifecycle_alias_preparation_never_dirties_a_refused_loan() {
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
             vec![lifecycle],
         )
         .unwrap();
@@ -3032,7 +3045,11 @@ fn successor_table_reservation_is_busy_on_exhaustion_and_returns_whole() {
         UntaggedRoots,
     );
     stock
-        .install(pages(&[(0x20_0000, 4), (0x60_0000, 4)]), lifecycles(1))
+        .install(
+            pages(&[(0x20_0000, 4), (0x60_0000, 4)]),
+            crate::fork_stock::TableReserve::EMPTY,
+            lifecycles(1),
+        )
         .unwrap();
     assert_eq!(
         stock.reserve_successor_tables(9),
@@ -3425,4 +3442,169 @@ fn a_built_exec_successor_commits_its_linked_tables_and_returns_the_rest() {
         "the successor's linked tables return"
     );
     assert_eq!(stock.table_stock().len(), before + 1);
+}
+
+/// Base of the never-issued reserve in the #3017 fixtures, clear of the
+/// stock pages at 0x20_0000.
+const RESERVE_BASE: u64 = 0x80_0000;
+
+/// `pages` scattered stock pages (one in every other page, so no two are
+/// contiguous) and a reserve of `reserve` pages behind them.
+fn reserved_stock(pages: u64, reserve: u64) -> ForkStock<UntaggedRoots> {
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..pages).map(|n| page(0x20_0000 + n * 0x2000)).collect(),
+            TableReserve::new(
+                FrameGpa::new(RESERVE_BASE),
+                FrameGpa::new(RESERVE_BASE + reserve * 4096),
+            )
+            .unwrap(),
+            lifecycles(1),
+        )
+        .unwrap();
+    stock
+}
+
+fn registered_root(stock: &mut ForkStock<UntaggedRoots>) -> (El1MmHandle, RootGpa) {
+    let root = parent();
+    // SAFETY: this fixture owns the admitted root incarnation.
+    let owner =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN) };
+    stock.register_root(owner, root.context.root).unwrap();
+    (owner, root.context.root)
+}
+
+/// #3017: a stock seeded from a small image runs dry while the guest's
+/// address spaces still need tables. The demand draws a 2 MiB run from the
+/// reserve instead of refusing, counted, and capacity is conserved.
+#[test]
+fn descriptor_tables_draw_the_reserve_when_the_stock_runs_dry() {
+    let mut stock = reserved_stock(2, 1024);
+    let (owner, root) = registered_root(&mut stock);
+    assert_eq!(stock.table_capacity(), 1026);
+    let reservation = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 7)
+        .expect("the reserve serves what the stock cannot");
+    assert_eq!(reservation.pages().len(), 7);
+    let counters = stock.counters();
+    assert_eq!(
+        counters.reserve_tables_drawn,
+        TABLE_RESERVE_DRAW_PAGES as u64
+    );
+    assert_eq!(counters.descriptor_capacity_refusals, 0);
+    assert_eq!(stock.table_capacity(), 1026 - 7);
+    assert_eq!(stock.table_stock().len(), 2 + TABLE_RESERVE_DRAW_PAGES - 7);
+    stock.cancel_native_descriptor_tables(&mut NoTableLedger, reservation);
+    assert_eq!(
+        stock.table_capacity(),
+        1026,
+        "drawn pages return to the stock"
+    );
+}
+
+/// The read-only plan's candidates draw too, so a plan never refuses
+/// `TablesExhausted` while the reserve holds pages.
+#[test]
+fn descriptor_candidates_draw_the_reserve() {
+    let mut stock = reserved_stock(1, 3);
+    let candidates = stock.descriptor_table_candidates();
+    assert_eq!(candidates.len(), 4, "the whole stock and reserve");
+    assert_eq!(stock.table_capacity(), 4, "candidates stay in the stock");
+    let mut stock = reserved_stock(1, 1024);
+    assert_eq!(
+        stock.descriptor_table_candidates().len(),
+        carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS
+    );
+}
+
+/// Real exhaustion (the stock and its reserve together short of the demand)
+/// is a counted capacity refusal that leaves both untouched; a demand they
+/// can meet still succeeds afterwards.
+#[test]
+fn an_exhausted_reserve_refuses_counted_and_keeps_the_stock() {
+    let mut stock = reserved_stock(2, 3);
+    let (owner, root) = registered_root(&mut stock);
+    assert!(matches!(
+        stock.reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 7),
+        Err(ForkStockServiceError::DescriptorTableCapacity)
+    ));
+    assert_eq!(stock.counters().descriptor_capacity_refusals, 1);
+    assert_eq!(stock.counters().reserve_tables_drawn, 0);
+    assert_eq!(stock.table_capacity(), 5);
+    let reservation = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 5)
+        .expect("exactly what is left");
+    assert_eq!(reservation.pages().len(), 5);
+    assert_eq!(stock.table_capacity(), 0);
+}
+
+/// A fork's child and parent arenas are contiguous runs: scattered stock
+/// pages cannot hold them, so the loan draws one fresh run holding both.
+#[test]
+fn a_fork_loan_takes_its_arenas_from_a_fresh_run() {
+    let mut stock = reserved_stock(40, 2048);
+    let loan = loan(&mut stock, parent(), 302, 300, 260).expect("the reserve holds both arenas");
+    let arenas = [loan.request.child_tables, loan.request.parent_tables];
+    assert_eq!(arenas.map(|arena| arena.len), [300 * 4096, 260 * 4096]);
+    for arena in arenas {
+        assert!(
+            arena.base >= RESERVE_BASE,
+            "{arena:?} is drawn, not scattered stock"
+        );
+    }
+    assert_eq!(stock.counters().reserve_tables_drawn, 560);
+    assert_eq!(stock.table_capacity(), 40 + 2048 - 560);
+}
+
+/// An exec successor's tables need not be contiguous: it draws only its
+/// shortfall, so a reserve smaller than the whole demand still serves it.
+#[test]
+fn a_successor_draws_only_its_shortfall() {
+    let mut stock = reserved_stock(10, 4);
+    let tables = stock
+        .reserve_successor_tables(12)
+        .expect("ten stock pages and two drawn");
+    assert_eq!(tables.pages().len(), 12);
+    assert_eq!(
+        stock.counters().reserve_tables_drawn,
+        4,
+        "the reserve's rest"
+    );
+    assert_eq!(stock.table_capacity(), 2);
+    assert!(matches!(
+        stock.reserve_successor_tables(3),
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    ));
+    stock.return_successor_tables(tables);
+    assert_eq!(stock.table_capacity(), 14);
+}
+
+/// Pages the stock was seeded with may not also lie in its reserve.
+#[test]
+fn install_refuses_a_page_inside_the_reserve() {
+    let mut stock: ForkStock<UntaggedRoots> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    assert!(
+        stock
+            .install(
+                vec![page(RESERVE_BASE + 4096)],
+                TableReserve::new(
+                    FrameGpa::new(RESERVE_BASE),
+                    FrameGpa::new(RESERVE_BASE + 0x10000)
+                )
+                .unwrap(),
+                lifecycles(1),
+            )
+            .is_err()
+    );
+    assert!(TableReserve::new(FrameGpa::new(0x1001), FrameGpa::new(0x3000)).is_none());
+    assert!(TableReserve::new(FrameGpa::new(0x3000), FrameGpa::new(0x1000)).is_none());
 }

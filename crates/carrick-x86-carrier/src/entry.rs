@@ -559,7 +559,7 @@ pub struct InitialWords {
     start: u64,
     end: u64,
     edit_root: Option<carrick_guest_arch::RootGpa>,
-    working: Option<carrick_core_abi::X86PrepareTableSpan>,
+    extent: Option<table_span::ExtentTableLicense>,
     pub context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
 }
 
@@ -568,14 +568,14 @@ impl InitialWords {
         start: u64,
         end: u64,
         edit_root: Option<carrick_guest_arch::RootGpa>,
-        working: Option<carrick_core_abi::X86PrepareTableSpan>,
+        extent: Option<table_span::ExtentTableLicense>,
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     ) -> Self {
         Self {
             start,
             end,
             edit_root,
-            working,
+            extent,
             context,
         }
     }
@@ -585,7 +585,7 @@ impl InitialWords {
             start: table_start,
             end: table_end,
             edit_root: None,
-            working: table_span::working_tables(),
+            extent: table_span::extent_tables(),
             context: None,
         }
     }
@@ -594,13 +594,13 @@ impl InitialWords {
         table_start: u64,
         table_end: u64,
         context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-        working: carrick_core_abi::X86PrepareTableSpan,
+        extent: table_span::ExtentTableLicense,
     ) -> Self {
         Self {
             start: table_start,
             end: table_end,
             edit_root: None,
-            working: Some(working),
+            extent: Some(extent),
             context: Some(context),
         }
     }
@@ -619,10 +619,11 @@ impl InitialWords {
         } else {
             self.start >= 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa)
         };
-        let in_working = self
-            .working
-            .is_some_and(|span| span.contains_word(carrick_guest_arch::FrameGpa::new(pa)));
-        if pa & 7 != 0 || !(in_grants || in_working || source_root) {
+        let in_extent = self.extent.is_some_and(|license| {
+            let word = carrick_guest_arch::FrameGpa::new(pa);
+            license.working.contains_word(word) || license.reserve.contains_word(word)
+        });
+        if pa & 7 != 0 || !(in_grants || in_extent || source_root) {
             return Err(DescriptorRefusal::TableOutsidePrimary);
         }
         let mapped = carrick_el1::isa::x86::user_tables::table_alias(

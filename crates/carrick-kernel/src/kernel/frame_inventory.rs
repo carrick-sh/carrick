@@ -3043,6 +3043,7 @@ mod tests {
                         .expect("table page")
                     })
                     .collect(),
+                carrick_hal::fork_stock::TableReserve::EMPTY,
                 lifecycle_slots(base, base + 0x8_8000, 2).expect("x86 lifecycle slots"),
             )
             .expect("install");

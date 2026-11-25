@@ -898,6 +898,8 @@ pub struct ForkStockCounters {
     pub reclaim_deferrals: u64,
     /// Exec successor table reservations refused for capacity.
     pub successor_table_refusals: u64,
+    /// Never-issued pages the stock drew from its [`TableReserve`].
+    pub reserve_tables_drawn: u64,
 }
 
 impl ForkStockCounters {
@@ -921,6 +923,7 @@ impl ForkStockCounters {
             ("returned_child", self.returned_children),
             ("reclaim_deferral", self.reclaim_deferrals),
             ("successor_table_refusal", self.successor_table_refusals),
+            ("reserve_table_drawn", self.reserve_tables_drawn),
         ]
         .into_iter()
         .filter(|(_, count)| *count != 0)
@@ -1065,15 +1068,77 @@ impl core::fmt::Debug for StockReleaseWake {
     }
 }
 
+/// Pages one draw from a [`TableReserve`] moves into the stock at least:
+/// one 2 MiB run, so small demands do not fragment the reserve page by page
+/// and a fork's contiguous arenas find their run in one draw.
+pub const TABLE_RESERVE_DRAW_PAGES: usize = 512;
+
+/// A contiguous run of never-issued, zero table pages in the carrier's
+/// licensed table storage. The stock draws from it on demand, so table
+/// capacity follows what the guest's address spaces use, the way Linux
+/// takes page tables from ordinary memory, not a pool fixed at boot
+/// (#3017). Pages leave it in address order and never return to it: a
+/// drawn page that comes back joins the reusable stock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TableReserve {
+    next: u64,
+    end: u64,
+}
+
+impl TableReserve {
+    /// No reserve: the stock holds only what it was installed with.
+    pub const EMPTY: Self = Self { next: 0, end: 0 };
+
+    /// The page-aligned run `start..end` (empty when equal). The carrier
+    /// proves every page zero, unissued and licensed as a table by the guest.
+    pub fn new(
+        start: carrick_guest_arch::FrameGpa,
+        end: carrick_guest_arch::FrameGpa,
+    ) -> Option<Self> {
+        let (start, end) = (start.raw(), end.raw());
+        (start.is_multiple_of(TABLE_PAGE_BYTES)
+            && end.is_multiple_of(TABLE_PAGE_BYTES)
+            && start <= end)
+            .then_some(Self { next: start, end })
+    }
+
+    /// Pages not yet drawn.
+    pub fn pages(&self) -> usize {
+        usize::try_from((self.end - self.next) / TABLE_PAGE_BYTES).unwrap_or(usize::MAX)
+    }
+
+    fn contains(&self, page: RootGpa) -> bool {
+        (self.next..self.end).contains(&page.address().raw())
+    }
+
+    /// Take the next `count` pages, all or nothing.
+    fn take(&mut self, count: usize) -> Option<Vec<RootGpa>> {
+        if count > self.pages() {
+            return None;
+        }
+        let start = self.next;
+        self.next = start.checked_add(u64::try_from(count).ok()? * TABLE_PAGE_BYTES)?;
+        Some(
+            (start..self.next)
+                .step_by(TABLE_PAGE_BYTES as usize)
+                .filter_map(|page| RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(page)))
+                .collect(),
+        )
+    }
+}
+
 /// The reusable table pages, their [`StockRelease`] and the waiters
-/// enrolled on it. Reads see the pages; adding pages goes through
-/// [`Extend`], which advances the release and wakes every waiter; taking
-/// pages goes through [`TableStock::taking`], which never does.
+/// enrolled on it, and the never-issued [`TableReserve`] behind them. Reads
+/// see the pages; adding pages goes through [`Extend`], which advances the
+/// release and wakes every waiter; taking pages goes through
+/// [`TableStock::taking`], which never does. A demand the pages cannot meet
+/// first draws from the reserve ([`TableStock::draw`]).
 #[derive(Debug, Default)]
 struct TableStock {
     pages: Vec<RootGpa>,
     returns: u64,
     waiters: Vec<StockReleaseWake>,
+    reserve: TableReserve,
 }
 
 impl TableStock {
@@ -1081,6 +1146,30 @@ impl TableStock {
     /// release; return pages with `extend`.
     fn taking(&mut self) -> &mut Vec<RootGpa> {
         &mut self.pages
+    }
+
+    /// Move at least `pages` reserve pages into the stock as one contiguous
+    /// run: [`TABLE_RESERVE_DRAW_PAGES`] or `pages`, whichever is larger,
+    /// bounded by what the reserve holds. Nothing moves, and the count is
+    /// zero, when the reserve holds fewer than `pages`. New stock is a
+    /// release: it wakes the waiters enrolled on the stock's next return.
+    fn draw(&mut self, pages: usize) -> usize {
+        if pages == 0 || pages > self.reserve.pages() {
+            return 0;
+        }
+        let count = pages
+            .max(TABLE_RESERVE_DRAW_PAGES)
+            .min(self.reserve.pages());
+        let Some(drawn) = self.reserve.take(count) else {
+            return 0;
+        };
+        self.extend(drawn);
+        count
+    }
+
+    /// Pages the stock can issue: its reusable pages and its reserve.
+    fn capacity(&self) -> usize {
+        self.pages.len().saturating_add(self.reserve.pages())
     }
 }
 
@@ -1266,9 +1355,64 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         self.counters
     }
 
-    /// Reusable table pages (excludes loaned, committed and quarantined).
+    /// Reusable table pages (excludes loaned, committed and quarantined,
+    /// and the reserve not yet drawn).
     pub fn table_stock(&self) -> &[RootGpa] {
         &self.tables
+    }
+
+    /// Table pages the stock can issue: its reusable pages and its reserve.
+    pub fn table_capacity(&self) -> usize {
+        self.tables.capacity()
+    }
+
+    /// Draw at least `pages` from the reserve into the reusable stock,
+    /// counted; false (nothing drawn) when the reserve holds fewer.
+    fn draw_tables(&mut self, pages: usize) -> bool {
+        let drawn = self.tables.draw(pages);
+        self.counters.reserve_tables_drawn = self
+            .counters
+            .reserve_tables_drawn
+            .saturating_add(drawn as u64);
+        drawn != 0
+    }
+
+    /// Take with `take`, which leaves the stock unchanged when it cannot
+    /// serve; when the stock alone cannot, draw at least `draw` pages from
+    /// the reserve and take once more. `draw` is what the second take needs
+    /// fresh: a demand of whole contiguous runs draws all of it (the fresh
+    /// run then holds it), a demand of loose pages only its shortfall.
+    fn take_tables<R>(
+        &mut self,
+        draw: usize,
+        mut take: impl FnMut(&mut Vec<RootGpa>) -> Option<R>,
+    ) -> Option<R> {
+        if let Some(taken) = take(self.tables.taking()) {
+            return Some(taken);
+        }
+        if !self.draw_tables(draw.max(1)) {
+            return None;
+        }
+        take(self.tables.taking())
+    }
+
+    /// Up to `MAX_TABLE_GRANTS` zero table pages for a read-only descriptor
+    /// plan to link, drawing from the reserve when the stock holds fewer.
+    /// They stay in the stock: the plan only counts what it would link, and
+    /// [`Self::reserve_native_descriptor_tables`] takes that many.
+    pub fn descriptor_table_candidates(&mut self) -> Vec<RootGpa> {
+        use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+        let short = MAX_TABLE_GRANTS.saturating_sub(self.tables.len());
+        self.draw_tables(short.min(self.tables.reserve.pages()));
+        self.tables.iter().take(MAX_TABLE_GRANTS).copied().collect()
+    }
+
+    /// Count a native backing supply refused because the stock and its
+    /// reserve together held fewer tables than its plan links.
+    pub fn refuse_descriptor_capacity(&mut self) {
+        self.counters.descriptor_capacity_refusals =
+            self.counters.descriptor_capacity_refusals.saturating_add(1);
     }
 
     /// Reusable lifecycle records.
@@ -1438,9 +1582,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
             });
         }
-        if self.tables.len() < count {
-            self.counters.descriptor_capacity_refusals =
-                self.counters.descriptor_capacity_refusals.saturating_add(1);
+        if self.tables.len() < count && !self.draw_tables(count - self.tables.len()) {
+            self.refuse_descriptor_capacity();
             return Err(ForkStockServiceError::DescriptorTableCapacity);
         }
         let stock = self.tables.taking();
@@ -2262,7 +2405,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         count: usize,
     ) -> Result<SuccessorTables, ForkStockServiceError> {
-        let Some(pages) = take_successor_table_runs(self.tables.taking(), count) else {
+        let short = count.saturating_sub(self.tables.len());
+        let Some(pages) = self.take_tables(short, |stock| take_successor_table_runs(stock, count))
+        else {
             self.counters.successor_table_refusals =
                 self.counters.successor_table_refusals.saturating_add(1);
             return Err(ForkStockServiceError::SuccessorTableCapacity);
@@ -2294,11 +2439,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(tables.pages)
     }
 
-    /// Seed the bounded stock before any guest can request it. Pages and
-    /// records must be distinct; nothing may be outstanding.
+    /// Seed the stock before any guest can request it: its reusable pages,
+    /// the never-issued reserve it draws from on demand, and the lifecycle
+    /// records. Pages and records must be distinct, no page may lie in the
+    /// reserve, and nothing may be outstanding.
     pub fn install(
         &mut self,
         tables: Vec<RootGpa>,
+        reserve: TableReserve,
         lifecycles: Vec<ForkLifecycleLoan>,
     ) -> Result<(), ForkStockServiceError> {
         let mut unique = tables.clone();
@@ -2308,8 +2456,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         records.sort_unstable();
         records.dedup();
         if unique.len() != tables.len()
+            || tables.iter().any(|page| reserve.contains(*page))
             || records.len() != lifecycles.len()
             || !self.tables.is_empty()
+            || self.tables.reserve.pages() != 0
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
             || !self.committed_tables.is_empty()
@@ -2320,6 +2470,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::InvalidRecord);
         }
         self.tables.extend(tables);
+        self.tables.reserve = reserve;
         self.lifecycles = lifecycles;
         Ok(())
     }
@@ -2446,11 +2597,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if self.controls.is_empty() && self.unused_control.is_none() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
         }
-        let Some((child_tables, parent_tables)) = take_fork_table_stock(
-            self.tables.taking(),
-            request.child_bytes,
-            request.parent_bytes,
-        ) else {
+        let demand = request
+            .child_bytes
+            .checked_add(request.parent_bytes)
+            .and_then(|bytes| usize::try_from(bytes / TABLE_PAGE_BYTES).ok())
+            .unwrap_or(usize::MAX);
+        let Some((child_tables, parent_tables)) = self.take_tables(demand, |stock| {
+            take_fork_table_stock(stock, request.child_bytes, request.parent_bytes)
+        }) else {
             return self.refuse_capacity(exchange, ForkCapacityResource::Tables, execution.cpu);
         };
         let Some(next) = self.next_loan.checked_add(1) else {
