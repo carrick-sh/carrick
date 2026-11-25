@@ -4700,6 +4700,7 @@ mod tests {
     /// windowed file.
     #[test]
     fn materialized_writeback_of_a_windowed_file_is_fenced() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         const SYS_FALLOCATE: u64 = 47;
         // `--fs host`: the files are host inodes, as a window's are.
         let scratch = tempfile::tempdir().unwrap();

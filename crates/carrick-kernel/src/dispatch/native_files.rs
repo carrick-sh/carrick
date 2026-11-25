@@ -6244,6 +6244,7 @@ mod tests {
     /// private snapshot.
     #[test]
     fn native_shared_map_serves_only_a_read_write_host_file() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("window");
