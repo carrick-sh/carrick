@@ -5311,20 +5311,41 @@ fn mutate_known_external_alias_state_in<R>(
             if before.map(Vec::as_slice) == Some(&after) {
                 continue;
             }
-            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
-                || {
-                    carrick_fatal!(
-                        "hvpatch::host_alias",
-                        "external replay mutation epoch exhausted"
-                    );
-                },
-            );
-            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after) {
-                bucket.versions.replay_version_owner.remove(&id);
+            if !record_external_replay_insertion_in_bucket_with_rows(bucket, physical_ipa, after) {
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "external replay mutation epoch exhausted"
+                );
             }
         }
     }
     result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[must_use]
+fn record_external_replay_insertion_in_bucket_with_rows(
+    bucket: &mut AliasScopeBucket,
+    physical_ipa: u64,
+    after: Vec<ReplayMappingKey>,
+) -> bool {
+    if bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).is_none() {
+        return false;
+    }
+    for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after) {
+        bucket.versions.replay_version_owner.remove(&id);
+    }
+    true
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[must_use]
+pub(crate) fn record_external_replay_insertion_in_bucket(
+    bucket: &mut AliasScopeBucket,
+    physical_ipa: u64,
+) -> bool {
+    let after = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+    record_external_replay_insertion_in_bucket_with_rows(bucket, physical_ipa, after)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6846,10 +6867,13 @@ impl HvpatchCarrierTaskState {
                     }
                     return Ok(());
                 };
+                let mut first_error = None;
                 for lease in &mut stage2_leases {
-                    lease.try_retire(custody)?;
+                    if let Err(error) = lease.try_retire(custody) {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                Ok(())
+                first_error.map_or(Ok(()), Err)
             }
             #[cfg(test)]
             Self::LeaseTest { mut stage2_leases } => {
@@ -6861,10 +6885,13 @@ impl HvpatchCarrierTaskState {
                     }
                     return Ok(());
                 };
+                let mut first_error = None;
                 for lease in &mut stage2_leases {
-                    lease.try_retire(custody)?;
+                    if let Err(error) = lease.try_retire(custody) {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                Ok(())
+                first_error.map_or(Ok(()), Err)
             }
             #[cfg(test)]
             Self::Test { rollbacks, order } => {
@@ -7258,10 +7285,16 @@ impl HvfVmState {
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&structural_owner),
                             );
+                            let mut stage2_lease = mapping.stage2_lease;
+                            if let Some(lease) = stage2_lease.as_mut() {
+                                lease.set_backing_keeper(LeaseBackingKeeper::Structural(
+                                    std::sync::Arc::clone(&structural_owner),
+                                ));
+                            }
                             (
                                 None,
                                 Some(structural_owner),
-                                mapping.stage2_lease,
+                                stage2_lease,
                                 mapping.owner_generation,
                                 GlobalFrameOwnerRole::Borrowed,
                             )

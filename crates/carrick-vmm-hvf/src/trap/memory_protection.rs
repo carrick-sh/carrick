@@ -2650,6 +2650,10 @@ pub(crate) enum CowDiagnosticRetirementOutcome {
         current_generation: u64,
         expected_generation: u64,
     },
+    MismatchedHost {
+        current_host: usize,
+        expected_host: usize,
+    },
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3136,6 +3140,13 @@ pub(crate) enum GlobalFrameRetirementOutcome {
         current_generation: u64,
         expected_generation: u64,
     },
+    /// An owner was present, but its physical host backing did not match.
+    MismatchedHost {
+        ipa: u64,
+        length: u64,
+        current_host: usize,
+        expected_host: usize,
+    },
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3166,6 +3177,14 @@ impl From<&GlobalFrameRetirementOutcome> for CowDiagnosticRetirementOutcome {
             } => Self::MismatchedGeneration {
                 current_generation,
                 expected_generation,
+            },
+            GlobalFrameRetirementOutcome::MismatchedHost {
+                current_host,
+                expected_host,
+                ..
+            } => Self::MismatchedHost {
+                current_host,
+                expected_host,
             },
         }
     }

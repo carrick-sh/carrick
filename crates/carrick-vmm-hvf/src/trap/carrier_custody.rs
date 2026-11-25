@@ -434,6 +434,9 @@ pub struct CarrierVmCustody {
     /// physical custody for a selected IPA.
     pub(crate) carrier_stage2_records:
         parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
+    pub(crate) carrier_lease_keepers: parking_lot::Mutex<
+        std::collections::BTreeMap<CarrierStage2RecordId, super::global_frame::LeaseBackingKeeper>,
+    >,
     pub(crate) global_frame_host_owners: GlobalFrameHostOwnerDirectory,
     pub(crate) pending_global_frame_owners: parking_lot::Mutex<
         std::collections::BTreeMap<CarrierStage2RecordId, std::sync::Arc<GlobalFrameHostOwner>>,
@@ -837,6 +840,7 @@ impl CarrierVmCustody {
             ),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            carrier_lease_keepers: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_global_frame_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_global_frame_retirement_retry: std::sync::atomic::AtomicBool::new(false),
@@ -6431,5 +6435,446 @@ mod carrier_vm_custody_tests {
             !super::alias_backing_is_live(host_addr),
             "destroyed G1 must drop retained backing outside custody locks"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn retire_stage2_extent_refuses_reused_ipa_with_mismatched_host_owner() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let stale_host_a = 0x1111_0000_usize;
+
+        // 1. Reusable global owner B reuses (ipa, len) with host B != stale_host_a.
+        let global_lease =
+            super::GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global ipa");
+        let global_ipa = global_lease.base();
+        let global_backing_b = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("map global backing B");
+        let global_host_b = global_backing_b.as_ptr() as usize;
+        let global_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            global_backing_b.as_ptr().cast(),
+            global_ipa,
+            0x4000,
+            perms,
+        );
+        let mut mapped_global_lease = global_lease;
+        mapped_global_lease.mark_mapped(global_stage2);
+        let global_gen_b = super::register_global_frame_host_owner_in(
+            &custody,
+            mapped_global_lease,
+            global_backing_b,
+            perms,
+        )
+        .expect("register global owner B");
+        let mut mappings = super::TaskMappingIndex::new();
+        let global_err = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            global_ipa,
+            0x4000,
+            Some(stale_host_a),
+        )
+        .expect_err("stale host A must not retire global owner B");
+        let _ = global_err;
+        assert_eq!(
+            super::global_frame_host_owner_generation_in(&custody, global_ipa, 0x4000),
+            global_gen_b,
+            "global owner B must stay live"
+        );
+        assert!(
+            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(global_ipa, 0x4000)
+        );
+        assert!(
+            super::retire_global_frame_host_owner_if_generation_in(
+                &custody,
+                global_ipa,
+                0x4000,
+                global_gen_b
+            )
+            .is_retired()
+        );
+
+        // 2. Structural owner B in TaskMappingIndex with host B != stale_host_a.
+        let struct_ipa = 0x2000_0000_u64;
+        let struct_len = 0x4000_usize;
+        let struct_backing_b = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            struct_len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("map structural backing B");
+        let struct_ptr_b = struct_backing_b.as_ptr();
+        let struct_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            struct_ptr_b.cast(),
+            struct_ipa,
+            struct_len,
+            perms,
+        );
+        let mut struct_lease = super::GlobalFrameStage2Lease::fixed(struct_ipa, struct_len as u64);
+        struct_lease.mark_mapped(struct_stage2);
+        let epoch_b = super::next_structural_epoch().expect("epoch");
+        let owner_b = super::StructuralBackingOwner::new_in(
+            &custody,
+            struct_backing_b,
+            struct_lease,
+            perms,
+            epoch_b,
+            struct_ipa,
+            struct_len,
+        )
+        .expect("structural owner B");
+        let struct_id_b = owner_b.record_identity();
+        let mut struct_mappings = super::TaskMappingIndex::from_region(super::HvfMappedRegion {
+            start: 0x3000_0000,
+            end: 0x3000_0000 + struct_len as u64,
+            ipa: struct_ipa,
+            physical_ipa: struct_ipa,
+            physical_size: struct_len,
+            owner_generation: epoch_b.raw(),
+            host_addr: struct_ptr_b,
+            size: struct_len,
+            perms: carrick_hal::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            structural_owner: Some(owner_b),
+            stage2_lease: None,
+            stage2_generation: Some(g1),
+            is_dynamic_alias: false,
+            sharing: super::GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: None,
+            shared_key_offset: 0,
+        });
+        let struct_err = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut struct_mappings,
+            struct_ipa,
+            struct_len as u64,
+            Some(stale_host_a),
+        )
+        .expect_err("stale host A must not retire structural owner B");
+        let _ = struct_err;
+        assert!(
+            custody
+                .stage2_record_snapshot(struct_id_b.record_id)
+                .is_some()
+        );
+        assert!(
+            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(
+                struct_ipa, struct_len
+            )
+        );
+        super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut struct_mappings,
+            struct_ipa,
+            struct_len as u64,
+            Some(struct_ptr_b as usize),
+        )
+        .expect("exact host B retires structural owner B");
+
+        // 3. Row-local stage2_lease B in TaskMappingIndex with host B != stale_host_a.
+        let local_ipa = 0x2100_0000_u64;
+        let local_len = 0x4000_usize;
+        let local_backing_b = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            local_len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("map local backing B");
+        let local_ptr_b = local_backing_b.as_ptr();
+        let local_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            local_ptr_b.cast(),
+            local_ipa,
+            local_len,
+            perms,
+        );
+        let mut local_lease = super::GlobalFrameStage2Lease::fixed(local_ipa, local_len as u64);
+        local_lease.mark_mapped(local_stage2);
+        let mut local_mappings = super::TaskMappingIndex::from_region(super::HvfMappedRegion {
+            start: 0x3100_0000,
+            end: 0x3100_0000 + local_len as u64,
+            ipa: local_ipa,
+            physical_ipa: local_ipa,
+            physical_size: local_len,
+            owner_generation: 0,
+            host_addr: local_ptr_b,
+            size: local_len,
+            perms: carrick_hal::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: Some(local_backing_b.into()),
+            structural_owner: None,
+            stage2_lease: Some(local_lease),
+            stage2_generation: Some(g1),
+            is_dynamic_alias: false,
+            sharing: super::GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: None,
+            shared_key_offset: 0,
+        });
+        let local_err = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut local_mappings,
+            local_ipa,
+            local_len as u64,
+            Some(stale_host_a),
+        )
+        .expect_err("stale host A must not retire local lease B");
+        let _ = local_err;
+        assert!(local_mappings.first().unwrap().stage2_lease.is_some());
+        assert!(
+            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(local_ipa, local_len)
+        );
+        super::HvfVmState::retire_stage2_extent_from_mappings_in(
+            &custody,
+            &mut local_mappings,
+            local_ipa,
+            local_len as u64,
+            Some(local_ptr_b as usize),
+        )
+        .expect("exact host B retires local lease B");
+        let _ = (global_host_b, stale_host_a);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn failed_carrier_batch_rollback_retains_all_host_backings_until_vm_destroy() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let len = 0x4000_usize;
+
+        let make_mapped_lease = || {
+            let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                len,
+                crate::host_mapping::HostMappingKind::FrameCow,
+            )
+            .expect("allocate lease backing");
+            let host_addr = backing.as_ptr() as usize;
+            let mut lease = super::GlobalFrameStage2Lease::reserve(len as u64, len as u64)
+                .expect("reserve IPA");
+            let ipa = lease.base();
+            let stage2_mapping = super::super::stage2_backend::test_stage2_map(
+                &custody,
+                backing.as_ptr().cast(),
+                ipa,
+                len,
+                perms,
+            );
+            lease.mark_mapped(stage2_mapping);
+            lease.set_backing_keeper(super::LeaseBackingKeeper::Host(std::sync::Arc::new(
+                super::GlobalFrameSharedMapping::new(backing),
+            )));
+            (lease, ipa, host_addr)
+        };
+
+        // 1. Mid-batch register_carrier_stage2_leases failure on Destroying VM:
+        // lease 0 registers first; then VM enters Destroying & unmap fails ->
+        // lease 1 fails registration and keeps backing; lease 2 also settles!
+        let (lease0, ipa0, host0) = make_mapped_lease();
+        let (lease1, ipa1, host1) = make_mapped_lease();
+        let (lease2, ipa2, host2) = make_mapped_lease();
+        let owners = std::collections::BTreeMap::from([
+            ((ipa0, len as u64), host0),
+            ((ipa1, len as u64), host1),
+            ((ipa2, len as u64), host2),
+        ]);
+        // Force collision on lease1 with duplicate key? Even stronger: fail lease0 unmap
+        // via Destroying/fail_next_unmap on LeaseTest::abort with 3 leases!
+        let mut leases = vec![lease0, lease1, lease2];
+        // Test multi-lease LeaseTest::abort where lease 0 fails unmap: leases 1 & 2 MUST
+        // still unmap and release their IPAs immediately, while lease 0 retains host0 + ipa0
+        // until VM destroy.
+        stub.set_fail_next_unmap(true);
+        let abort_err = super::HvpatchCarrierTaskState::LeaseTest {
+            stage2_leases: std::mem::take(&mut leases),
+        }
+        .abort(Some(&custody))
+        .expect_err("lease 0 unmap refusal must report rollback error");
+        let _ = abort_err;
+        stub.set_fail_next_unmap(false);
+
+        assert!(
+            super::alias_backing_is_live(host0),
+            "refused lease 0 backing must stay live until VM destroy"
+        );
+        assert!(
+            super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa0, len),
+            "refused lease 0 mapping must remain tracked until destroy"
+        );
+        assert!(
+            !super::alias_backing_is_live(host1) && !super::alias_backing_is_live(host2),
+            "abort loop must continue settling leases 1 and 2 after lease 0 failure"
+        );
+        assert!(
+            !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa1, len)
+                && !super::super::stage2_backend::ScopedStage2MapTestStub::is_mapped(ipa2, len)
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(ipa1, len as u64)
+                && !super::global_frame_ipa_allocator()
+                    .lock()
+                    .is_live(ipa2, len as u64)
+        );
+        assert!(
+            super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(ipa0, len as u64)
+        );
+
+        // 2. Also exercise register_carrier_stage2_leases validation-error rollback
+        // where bad1 hits unmap refusal while bad0 unmaps cleanly.
+        let (bad0, bad_ipa0, bad_host0) = make_mapped_lease();
+        let (bad1, bad_ipa1, bad_host1) = make_mapped_lease();
+        // Omit bad_ipa0 from owner_hosts so validation fails while both leases stay active.
+        let bad_owners = std::collections::BTreeMap::from([((bad_ipa1, len as u64), bad_host1)]);
+        let mut bad_batch = vec![bad1, bad0];
+        stub.set_fail_next_unmap(true);
+        let batch_err =
+            super::register_carrier_stage2_leases(&custody, &mut bad_batch, &bad_owners)
+                .expect_err("invalid batch must fail validation and settle all leases");
+        let _ = batch_err;
+        stub.set_fail_next_unmap(false);
+        assert!(
+            super::alias_backing_is_live(bad_host1),
+            "failed unmap in register_carrier_stage2_leases validation must retain host backing"
+        );
+        assert!(
+            !super::alias_backing_is_live(bad_host0),
+            "remaining batch lease bad0 must settle cleanly after bad1 unmap failure"
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(bad_ipa0, len as u64)
+        );
+        let _ = owners;
+
+        custody.begin_destroy(g1).expect("begin destroy");
+        custody.destroy_stage2_for_test(g1);
+        custody.commit_destroy(g1).expect("commit destroy");
+        assert!(
+            !super::alias_backing_is_live(host0) && !super::alias_backing_is_live(bad_host1),
+            "VM destroy must release all retained backings and IPAs"
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(ipa0, len as u64)
+        );
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(bad_ipa1, len as u64)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn structural_retry_and_replay_serialize_terminal_finalization_under_directory_lock() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let ipa = 0xa081_f900_0000_u64;
+        let len = 0x4000_usize;
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("structural backing");
+        let host_addr = backing.as_ptr() as usize;
+        let stage2_mapping = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            backing.as_ptr().cast(),
+            ipa,
+            len,
+            perms,
+        );
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_mapped(stage2_mapping);
+        let epoch = super::next_structural_epoch().expect("epoch");
+        let owner =
+            super::StructuralBackingOwner::new_in(&custody, backing, lease, perms, epoch, ipa, len)
+                .expect("structural owner");
+        let identity = owner.record_identity();
+
+        // Owner retires before G1 destroys; record remains terminal until finalization.
+        drop(owner);
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+
+        // Park retry inside `release_ipa` (which holds `structural_backings` and has claimed
+        // terminal release) while concurrent `reconcile_global_frame_owners_after_replay_in_using`
+        // enters Loop 4. Loop 4 must serialize behind `structural_backings` instead of failing
+        // with RecordNotFound / ReleaseInFlight / missing record.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let retry_custody = std::sync::Arc::clone(&custody);
+        let retry_releases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_releases_worker = std::sync::Arc::clone(&retry_releases);
+        let retry_thread = std::thread::spawn(move || {
+            super::retry_structural_backing_identities_in_using(
+                &retry_custody,
+                &[identity],
+                &mut |_, _| Ok(()),
+                &mut |_, _| {
+                    retry_releases_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entered_tx.send(()).expect("notify main");
+                    go_rx.recv().expect("resume retry");
+                    Ok(())
+                },
+            )
+        });
+
+        entered_rx.recv().expect("retry inside release_ipa");
+        let reconcile_custody = std::sync::Arc::clone(&custody);
+        let reconcile_releases = std::sync::Arc::clone(&retry_releases);
+        let reconcile_thread = std::thread::spawn(move || {
+            super::reconcile_global_frame_owners_after_replay_in_using(
+                &reconcile_custody,
+                &[],
+                true,
+                &mut |_, _| {
+                    reconcile_releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        go_tx.send(()).expect("unblock retry");
+
+        retry_thread
+            .join()
+            .expect("retry thread panicked")
+            .expect("retry finalization failed");
+        let report = reconcile_thread
+            .join()
+            .expect("reconcile thread panicked")
+            .expect("reconcile must not race retry terminal finalization");
+        let _ = (g1, report);
+        assert_eq!(
+            retry_releases.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "terminal IPA release must run at most once"
+        );
+        assert!(custody.structural_backings.lock().is_empty());
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        assert!(!super::alias_backing_is_live(host_addr));
     }
 }

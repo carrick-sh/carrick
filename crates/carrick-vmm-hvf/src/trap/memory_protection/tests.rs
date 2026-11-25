@@ -3096,4 +3096,136 @@ fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
     }
 }
 
+#[test]
+#[allow(clippy::expect_used)]
+fn stage2_map_replay_miss_and_cache_hit_never_scan_unrelated_registry() {
+    use crate::trap::stage2_backend::{
+        ReplayAliasLookup, ScopedStage2MapTestStub, stage2_map_replay,
+    };
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+
+    let target_len = 0x4000_usize;
+    let target_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        target_len,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("target alias backing");
+    let target_ipa = 0x7e00_1000_u64;
+    let target_va = 0x6000_1000_u64;
+    let scope = AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT);
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+    let target_alias = AliasBacking {
+        start: target_va,
+        ipa: target_ipa,
+        host_addr: target_backing.as_ptr() as usize,
+        size: target_len,
+        physical_ipa: target_ipa,
+        physical_host_addr: target_backing.as_ptr() as usize,
+        physical_size: target_len,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: scope,
+        inventory_backing: InventoryBackingIdentity::Private(7001),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+
+    for population in [16_u64, 256, 2000] {
+        let _stub = ScopedStage2MapTestStub::enable();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
+
+        mutate_external_alias_state(|registry| {
+            *registry = AliasRegistry::default();
+            registry.push(target_alias);
+            for i in 1..=population {
+                let va = 0x1000_0000 + i * 0x8000;
+                let ipa = 0x8000_0000 + i * 0x8000;
+                registry.push(AliasBacking {
+                    start: va,
+                    ipa,
+                    host_addr: (0x2000_0000 + i * 0x8000) as usize,
+                    size: 0x4000,
+                    physical_ipa: ipa,
+                    physical_host_addr: (0x2000_0000 + i * 0x8000) as usize,
+                    physical_size: 0x4000,
+                    perms,
+                    guest_writable: true,
+                    sharing: GuestMappingSharing::GlobalShared,
+                    ownership_scope: scope,
+                    inventory_backing: InventoryBackingIdentity::Private(8000 + i),
+                    shared_key_base: None,
+                    shared_key_offset: 0,
+                    owner_generation: 0,
+                });
+            }
+        });
+
+        // Warm initial target replay entry into replay cache (exactly one map).
+        let mapped = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: target_ipa },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(
+            mapped,
+            Ok(Some((
+                target_alias,
+                carrick_aarch64::stage2::Stage2Status::SUCCESS
+            )))
+        );
+
+        // Miss, limiter refusal, and cache hit must NOT clone or scan the registry.
+        let before = alias_state_rows_scanned();
+        let miss = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: 0x7f00_0000 },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(miss, Ok(None));
+
+        let limited = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: target_ipa },
+                &mut |_| false,
+            )
+        };
+        assert_eq!(limited, Ok(None));
+
+        let hit = unsafe {
+            stage2_map_replay(
+                &custody,
+                g1,
+                ReplayAliasLookup::Ipa { gpa: target_ipa },
+                &mut |_| true,
+            )
+        };
+        assert_eq!(
+            hit,
+            Ok(Some((
+                target_alias,
+                carrick_aarch64::stage2::Stage2Status::SUCCESS
+            )))
+        );
+        let scanned = alias_state_rows_scanned() - before;
+        assert_eq!(
+            scanned, 0,
+            "stage2_map_replay miss/limit/hit scanned {scanned} rows at population {population}"
+        );
+    }
+    mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
+    drop(target_backing);
+}
+
 mod maintenance_lookup_budget;

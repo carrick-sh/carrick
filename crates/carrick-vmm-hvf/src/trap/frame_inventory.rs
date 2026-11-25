@@ -1432,7 +1432,8 @@ impl HvfVmState {
         length: u64,
         expected_host: Option<usize>,
     ) -> Result<(), TrapError> {
-        let outcome = retire_global_frame_host_owner_in(custody, ipa, length);
+        let outcome =
+            retire_global_frame_host_owner_in_matching(custody, ipa, length, expected_host);
         if outcome.is_retired()
             || matches!(
                 outcome,
@@ -1442,7 +1443,9 @@ impl HvfVmState {
         {
             return Ok(());
         }
-        if let Some((row, owner)) = mappings.take_structural_owner(ipa, length) {
+        if let Some((row, owner)) =
+            mappings.take_structural_owner_matching(ipa, length, expected_host)
+        {
             let Some(mapping) = mappings.row(row) else {
                 unreachable!("structural claim named a row that is not in the index")
             };
@@ -1491,7 +1494,7 @@ impl HvfVmState {
             drop(owner);
             return Ok(());
         }
-        if let Some(lease) = mappings.take_stage2_lease(ipa, length) {
+        if let Some(lease) = mappings.take_stage2_lease_matching(ipa, length, expected_host) {
             drop(lease);
             return Ok(());
         }

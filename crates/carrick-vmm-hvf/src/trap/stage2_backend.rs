@@ -510,73 +510,82 @@ pub(crate) unsafe fn stage2_map_replay(
     custody
         .stage2
         .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
-    Ok(mutate_external_alias_state(|registry| {
-        let backing = match lookup {
-            ReplayAliasLookup::Ipa { gpa } => registry.oldest_containing_ipa(gpa, |e| {
-                gpa >= e.ipa
-                    && gpa < e.ipa.saturating_add(e.size as u64)
-                    && super::alias_backing_is_live(e.host_addr)
-            }),
-            ReplayAliasLookup::VaProcess {
-                va,
-                mm_root_slot,
-                container_root,
-            } => {
-                registry.newest_process_alias_containing_va(va, mm_root_slot, container_root, |e| {
-                    va.saturating_add(1) <= e.start.saturating_add(e.size as u64)
-                        && super::alias_backing_is_live(
-                            e.host_addr.saturating_add((va - e.start) as usize),
-                        )
-                })
+    let mut registry = super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
+    let backing = match lookup {
+        ReplayAliasLookup::Ipa { gpa } => registry.oldest_containing_ipa(gpa, |e| {
+            gpa >= e.ipa
+                && gpa < e.ipa.saturating_add(e.size as u64)
+                && super::alias_backing_is_live(e.host_addr)
+        }),
+        ReplayAliasLookup::VaProcess {
+            va,
+            mm_root_slot,
+            container_root,
+        } => registry.newest_process_alias_containing_va(va, mm_root_slot, container_root, |e| {
+            va.saturating_add(1) <= e.start.saturating_add(e.size as u64)
+                && super::alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
+        }),
+        ReplayAliasLookup::VaAnyScope { va } => registry.newest_containing_va(va, |entry| {
+            va >= entry.start
+                && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
+                && super::alias_backing_is_live(
+                    entry.host_addr.saturating_add((va - entry.start) as usize),
+                )
+        }),
+    };
+    let Some(backing) = backing else {
+        return Ok(None);
+    };
+    if !super::alias_backing_is_live(backing.physical_host_addr) {
+        return Ok(None);
+    }
+    if !allow_ipa(backing.physical_ipa) {
+        return Ok(None);
+    }
+    let key = replay_mapping_key(backing);
+    if registry.contains_replay(&key) {
+        return Ok(Some((backing, Stage2Status::SUCCESS)));
+    }
+    if registry
+        .by_scope
+        .get(&backing.ownership_scope)
+        .and_then(|bucket| bucket.versions.replay_epochs.get(&backing.physical_ipa))
+        .is_some_and(|&epoch| epoch == u64::MAX)
+    {
+        return Ok(Some((backing, Stage2Status::from_raw(HV_BAD_ARGUMENT))));
+    }
+    // SAFETY: forwarded from caller; `stage2` guard proves `expected_generation` is live.
+    let status = match unsafe {
+        stage2_map(
+            &mut stage2,
+            backing.physical_host_addr as *mut std::ffi::c_void,
+            backing.physical_ipa,
+            backing.physical_size,
+            backing.perms,
+        )
+    } {
+        Ok(mapping) => {
+            stage2.untracked_mappings.insert(
+                (mapping.ipa(), mapping.size()),
+                super::carrier_custody::UntrackedStage2Mapping {
+                    mapping,
+                    host_addr: backing.physical_host_addr,
+                    perms: backing.perms,
+                },
+            );
+            let bucket = registry
+                .by_scope
+                .entry(backing.ownership_scope)
+                .or_default();
+            if bucket.replay.insert(key) {
+                let _ =
+                    super::record_external_replay_insertion_in_bucket(bucket, backing.physical_ipa);
             }
-            ReplayAliasLookup::VaAnyScope { va } => registry.newest_containing_va(va, |entry| {
-                va >= entry.start
-                    && va.saturating_add(1) <= entry.start.saturating_add(entry.size as u64)
-                    && super::alias_backing_is_live(
-                        entry.host_addr.saturating_add((va - entry.start) as usize),
-                    )
-            }),
-        }?;
-        if !super::alias_backing_is_live(backing.physical_host_addr) {
-            return None;
+            Stage2Status::SUCCESS
         }
-        if !allow_ipa(backing.physical_ipa) {
-            return None;
-        }
-        let key = replay_mapping_key(backing);
-        if registry.contains_replay(&key) {
-            return Some((backing, Stage2Status::SUCCESS));
-        }
-        // SAFETY: forwarded from caller; `stage2` guard proves `expected_generation` is live.
-        let status = match unsafe {
-            stage2_map(
-                &mut stage2,
-                backing.physical_host_addr as *mut std::ffi::c_void,
-                backing.physical_ipa,
-                backing.physical_size,
-                backing.perms,
-            )
-        } {
-            Ok(mapping) => {
-                stage2.untracked_mappings.insert(
-                    (mapping.ipa(), mapping.size()),
-                    super::carrier_custody::UntrackedStage2Mapping {
-                        mapping,
-                        host_addr: backing.physical_host_addr,
-                        perms: backing.perms,
-                    },
-                );
-                let bucket = registry
-                    .by_scope
-                    .entry(backing.ownership_scope)
-                    .or_default();
-                bucket.replay.insert(key);
-                Stage2Status::SUCCESS
-            }
-            Err(status) => status,
-        };
-        Some((backing, status))
-    }))
+        Err(status) => status,
+    };
+    Ok(Some((backing, status)))
 }
 
 /// Unmap an untracked mapping stored by `map_region_raw_in` / `map_stage2` /

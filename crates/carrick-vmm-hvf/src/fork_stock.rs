@@ -169,7 +169,8 @@ impl NativeFrameBacking {
             crate::trap::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
             | crate::trap::GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
             | crate::trap::GlobalFrameRetirementOutcome::NotFound { .. }
-            | crate::trap::GlobalFrameRetirementOutcome::MismatchedGeneration { .. } => {
+            | crate::trap::GlobalFrameRetirementOutcome::MismatchedGeneration { .. }
+            | crate::trap::GlobalFrameRetirementOutcome::MismatchedHost { .. } => {
                 carrier
                     .native_frame_backings
                     .lock()

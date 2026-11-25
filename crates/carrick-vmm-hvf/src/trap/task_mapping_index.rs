@@ -914,23 +914,41 @@ impl TaskMappingIndex {
         self.assert_invariants();
     }
 
-    /// Detach the structural owner claiming `[ipa, ipa + length)`, naming the
-    /// row so a failed retirement can put it back.
+    /// Detach the structural owner claiming `[ipa, ipa + length)` (and, when
+    /// specified, matching `expected_host`), naming the row so a failed
+    /// retirement can put it back.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn take_structural_owner(
         &mut self,
         ipa: u64,
         length: u64,
     ) -> Option<(MappingRowRef, std::sync::Arc<StructuralBackingOwner>)> {
+        self.take_structural_owner_matching(ipa, length, None)
+    }
+
+    pub(crate) fn take_structural_owner_matching(
+        &mut self,
+        ipa: u64,
+        length: u64,
+        expected_host: Option<usize>,
+    ) -> Option<(MappingRowRef, std::sync::Arc<StructuralBackingOwner>)> {
         let claims = |mapping: &HvfMappedRegion| {
             mapping.structural_owner.as_ref().is_some_and(|owner| {
-                (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
+                let extent_matches = (mapping.physical_ipa, mapping.physical_size as u64)
+                    == (ipa, length)
                     || (owner.physical_ipa <= ipa
                         && ipa.checked_add(length).is_some_and(|candidate_end| {
                             owner
                                 .physical_ipa
                                 .checked_add(owner.physical_size as u64)
                                 .is_some_and(|owner_end| candidate_end <= owner_end)
-                        }))
+                        }));
+                let host_matches = expected_host.is_none_or(|expected| {
+                    owner.ptr() as usize == expected
+                        && mapped_region_physical_host_addr(mapping) == Some(expected as *mut u8)
+                });
+                extent_matches && host_matches
             })
         };
         for (position, mapping) in self.shadowed.iter_mut().enumerate() {
@@ -969,18 +987,37 @@ impl TaskMappingIndex {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn take_stage2_lease(
         &mut self,
         ipa: u64,
         length: u64,
     ) -> Option<GlobalFrameStage2Lease> {
+        self.take_stage2_lease_matching(ipa, length, None)
+    }
+
+    pub(crate) fn take_stage2_lease_matching(
+        &mut self,
+        ipa: u64,
+        length: u64,
+        expected_host: Option<usize>,
+    ) -> Option<GlobalFrameStage2Lease> {
         self.iter_mut().find_map(|mapping| {
-            (mapping.stage2_lease.as_ref().is_some_and(|lease| {
+            let host_matches = expected_host.is_none_or(|expected| {
+                mapped_region_physical_host_addr(mapping) == Some(expected as *mut u8)
+            });
+            let lease_matches = mapping.stage2_lease.as_ref().is_some_and(|lease| {
                 let (base, len) = lease.key();
-                base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
-            }))
-            .then(|| mapping.stage2_lease.take())
-            .flatten()
+                if expected_host.is_some() {
+                    base == ipa && len == length
+                } else {
+                    base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
+                }
+            });
+            (host_matches && lease_matches)
+                .then(|| mapping.stage2_lease.take())
+                .flatten()
         })
     }
 

@@ -2454,7 +2454,18 @@ impl HvfVmState {
                     });
                 let mut stage2_leases = Vec::new();
                 for region in &mut self.mappings {
-                    if let Some(stage2_lease) = region.stage2_lease.take() {
+                    if let Some(mut stage2_lease) = region.stage2_lease.take() {
+                        if let Some(structural) = region.structural_owner.as_ref() {
+                            stage2_lease.set_backing_keeper(LeaseBackingKeeper::Structural(
+                                std::sync::Arc::clone(structural),
+                            ));
+                        } else if let Some(crate::trap::RegionHostOwner::BirthZone(bz)) =
+                            region.host_mapping.as_ref()
+                        {
+                            stage2_lease.set_backing_keeper(LeaseBackingKeeper::BirthZone(
+                                std::sync::Arc::clone(bz),
+                            ));
+                        }
                         stage2_leases.push(stage2_lease);
                     }
                 }

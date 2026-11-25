@@ -3927,10 +3927,11 @@ impl HvfTaskState {
             Ok(split) => split,
             Err(error) => {
                 if fresh_destination && !guest_lane {
-                    let _ = retire_global_frame_host_owner_in(
+                    let _ = retire_global_frame_host_owner_if_generation_in(
                         custody,
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE,
+                        owner_generation,
                     );
                 }
                 return Err(error);
@@ -4250,10 +4251,11 @@ impl HvfTaskState {
                 }
             }
             if fresh_destination && !guest_lane {
-                let _ = retire_global_frame_host_owner_in(
+                let _ = retire_global_frame_host_owner_if_generation_in(
                     custody,
                     new_physical_ipa,
                     CowArmedRanges::COMPOUND_SIZE,
+                    owner_generation,
                 );
             }
             return Err(error);
