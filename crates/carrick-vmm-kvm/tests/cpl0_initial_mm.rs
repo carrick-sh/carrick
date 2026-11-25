@@ -225,19 +225,344 @@ fn serial_host_native_forked_child_out_of_arena_hint_is_exact() {
 
 /// #3017 (npm's `owner grant physical table plan refused: TablesExhausted`):
 /// a sparse address space, the shape V8 builds, needs page tables far beyond
-/// what the initial image's tables cover. The root and then its forked child
-/// (while the root waits live) each touch a page in 64 separate 512 GiB
-/// slots, three fresh tables apiece, and the child rewrites every inherited
-/// page. Linux serves it all; the carrier must neither die nor refuse.
+/// what the initial image's tables cover. The root touches 64 separate 512 GiB
+/// slots (192 tables: one 512-page reserve draw, leaving ~376 stock pages),
+/// then forks two live children gated on a pipe before releasing either: child
+/// 1's ~200-page fork loan leaves ~176 stock pages, so `ForkStock::loan` for
+/// child 2 must draw a second 512-page run from the reserve itself. Once
+/// released, both children touch 64 more slots each and rewrite every
+/// inherited page without mutating the root's pages.
 #[test]
 fn serial_host_native_sparse_address_space_gets_its_page_tables() {
+    use carrick_hal::fork_stock::TABLE_RESERVE_DRAW_PAGES;
+
     let elf = native_exit_fixture_with_flags("native_sparse_table_supply.S", &[]);
     let outcome = try_run_pool_fixture_with_root_affinity(&elf, 1 << 16, ROOT_AFFINITY_LOADED)
         .expect("a sparse address space must not exhaust the carrier's page tables");
+    let counters = outcome
+        .physical
+        .fork_stock_counters()
+        .expect("fork stock counters");
+    let refusal = outcome.physical.fork_admission_refusal();
     assert_eq!(
         outcome.run.exit_code, 0,
-        "92 = hint placed elsewhere, 91 = wrong byte, 93 = wait failed or child \
-         signalled, 94 = fork failed, else the mmap errno"
+        "92 = hint placed elsewhere, 91 = wrong byte, 93 = wait/pipe failed or child \
+         signalled, 94 = fork failed, else the mmap errno; counters={counters:?} refusal={refusal:?}"
+    );
+    assert!(
+        counters.loans >= 2,
+        "at least two fork loans served (including any residency-growth retry): {counters:?}"
+    );
+    assert_eq!(
+        counters.returned_children, 2,
+        "both children's tables reclaimed cleanly"
+    );
+    assert_eq!(counters.capacity_refusals, 0, "fork loans were not refused");
+    assert_eq!(
+        counters.descriptor_capacity_refusals, 0,
+        "sparse backing never refused for table capacity"
+    );
+    assert!(
+        counters.reserve_tables_drawn >= 2 * TABLE_RESERVE_DRAW_PAGES as u64,
+        "root descriptor faults and ForkStock::loan on the second live child \
+         each draw at least one 512-page run from the table reserve: {counters:?}"
+    );
+}
+
+/// #3017 review P0-1: when the carrier's bounded page-table window and reserve
+/// are genuinely spent into live committed MM custody (`returnable_tables == 0`),
+/// an in-ring pipe copyout into an unbackable sparse slot answers `-EFAULT`
+/// without consuming the unread pipe byte, a direct user-mode access delivers
+/// `SIGSEGV` to the faulting process, every terminal capacity refusal is
+/// counted, and the carrier and waiting parent survive cleanly.
+#[test]
+fn serial_host_native_terminal_table_exhaustion_signals_or_faults_and_keeps_carrier_alive() {
+    let elf = native_exit_fixture("native_terminal_table_exhaustion.S");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("x86 ELF program");
+    // Size a tight 2 MiB window (~407 total table pages across boot grants and
+    // reserve) so 160 sparse 512 GiB slots (480 tables) genuinely exhaust it
+    // into live committed MM custody with zero returnable tables.
+    let extent = 2 * 1024 * 1024;
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, ipc)
+        .expect("production KVM image");
+    let root = dispatcher.capture_one_task_context().expect("issued root");
+    root.resources()
+        .files()
+        .publish_ipc(
+            root.kernel().ipc().expect("IPC owner"),
+            carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
+                carrier.ipc_table_map().expect("retained descriptor map"),
+            ),
+        )
+        .expect("publish exact table");
+    root.kernel()
+        .bind_initial_birth_source(
+            carrier
+                .birth_serial_source()
+                .expect("stopped carrier source"),
+        )
+        .expect("bind initial carrier birth and MM source");
+    carrier
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: root.task().key(),
+            mm: carrick_hal::MmGeneration::new(root.shared().mm().id().nonzero()),
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(root.thread().key().tid.raw())
+                    .raw(),
+                serial: root.thread().key().serial.raw(),
+                mm: 0,
+                file_table: root.resources().files().id().raw(),
+                generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: ROOT_AFFINITY_LOADED,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .expect("bind issued root");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("initial guest MM");
+    let outcome = carrick_runtime::prepare::try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
+        carrier,
+        root,
+        dispatcher,
+        1 << 16,
+        1 << 16,
+        std::sync::Arc::new(|_, _| {}),
+    )
+    .expect("terminal table exhaustion must not kill the carrier");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "88=pipe byte lost, 89=pipe write, 90=wrong read errno, 91=byte mismatch, \
+         92=mmap, 93=wait4, 94=setup, 95=no SIGSEGV, 96=child exited 0, 97=not exhausted, \
+         100+=wrong signal: {:?}",
+        outcome.run
+    );
+    let counters = outcome
+        .physical
+        .fork_stock_counters()
+        .expect("fork stock counters");
+    assert!(
+        counters.reserve_tables_drawn > 0,
+        "the carrier drew its entire reserve before refusing: {counters:?}"
+    );
+    assert_eq!(
+        counters.descriptor_capacity_refusals, 2,
+        "one refusal on the in-ring pipe copyout (-EFAULT) and one on the user #PF (SIGSEGV): {counters:?}"
+    );
+    assert_eq!(
+        outcome
+            .physical
+            .fork_stock_release_waiters()
+            .expect("release waiters"),
+        0,
+        "terminal exhaustion leaves no waiter enrolled"
+    );
+}
+
+/// #3017 review P0-1: when returnable custody (an exec successor reservation)
+/// temporarily holds the remaining page tables, neither a user-mode fault nor
+/// an in-ring pipe copyout may fail or kill the carrier. Both enrol on the
+/// stock's release, park on the carrier's reservation-pool queue without
+/// counting a capacity refusal, wake when the holder returns its tables, and
+/// complete the unchanged access.
+#[test]
+fn production_temporary_table_shortage_parks_enrols_and_succeeds_after_return() {
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+
+    let elf = native_exit_fixture("native_temporary_table_shortage.S");
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let cpu0 = carrick_guest_arch::CpuId::new(0);
+    let cpu1 = carrick_guest_arch::CpuId::new(1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut child = factory.claim(1).expect("peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(child_tid, cpu1)
+        .expect("pin child to CPU 1");
+
+    // 1. User-mode #PF on CPU 0 while returnable custody holds all tables.
+    let held_parent = factory
+        .fixture_hold_fork_stock(0)
+        .expect("hold fork stock for parent #PF");
+    run_until_idle(
+        &factory,
+        cpu0,
+        || {
+            let exit = parent
+                .fixture_run_loaded(task)
+                .expect("parent #PF under table hold")
+                .exit;
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    parent
+                        .service_physical_doorbell(task, &exit, |_, _| {})
+                        .expect("parent doorbell")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+    assert_eq!(
+        factory
+            .fork_stock_release_waiters()
+            .expect("parent release waiters"),
+        1,
+        "parent #PF enrolled on fork-stock release"
+    );
+    assert!(
+        matches!(
+            factory
+                .fixture_native_wait_state(root_tid)
+                .expect("parent wait")
+                .0,
+            Claim::Parked { .. }
+        ),
+        "parent parked on reservation pool"
+    );
+    assert_eq!(
+        factory
+            .fork_stock_counters()
+            .expect("counters")
+            .descriptor_capacity_refusals,
+        0,
+        "temporary shortage is contention, never a capacity refusal"
+    );
+    factory
+        .fixture_release_fork_stock(held_parent)
+        .expect("release parent held stock");
+    assert_eq!(
+        factory
+            .fork_stock_release_waiters()
+            .expect("woken parent waiters"),
+        0,
+        "holder return delivered the enrolled wake once"
+    );
+
+    // Parent completes its sparse store/load and reaches marker 2, then parks in wait4.
+    run_to_marker(&mut parent, task, 2, &factory);
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+
+    // 2. In-ring pipe read copyout (`ServiceOperation::Fault`) on CPU 1 while
+    //    returnable custody holds all tables.
+    let held_child = factory
+        .fixture_hold_fork_stock(0)
+        .expect("hold fork stock for child copyout");
+    run_until_idle(
+        &factory,
+        cpu1,
+        || {
+            let exit = child
+                .fixture_run_idle_peer()
+                .expect("child copyout under table hold");
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("child doorbell")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+    assert_eq!(
+        factory
+            .fork_stock_release_waiters()
+            .expect("child release waiters"),
+        1,
+        "child copyout fault enrolled on fork-stock release"
+    );
+    assert!(
+        matches!(
+            factory
+                .fixture_native_wait_state(child_tid)
+                .expect("child wait")
+                .0,
+            Claim::Parked { .. }
+        ),
+        "child parked on reservation pool"
+    );
+    assert_eq!(
+        factory
+            .fork_stock_counters()
+            .expect("counters")
+            .descriptor_capacity_refusals,
+        0,
+        "temporary shortage on copyout is contention, never a capacity refusal"
+    );
+    factory
+        .fixture_release_fork_stock(held_child)
+        .expect("release child held stock");
+    assert_eq!(
+        factory
+            .fork_stock_release_waiters()
+            .expect("woken child waiters"),
+        0,
+        "holder return delivered the child's enrolled wake once"
+    );
+
+    // Child finishes its retained pipe copyout into the sparse page and exits 0.
+    run_until_idle(
+        &factory,
+        cpu1,
+        || {
+            let exit = child.fixture_run_idle_peer().expect("child completion");
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("child exit doorbell")
+                        .is_none()
+                );
+            }
+            exit
+        },
+        || false,
+    );
+
+    // Parent wakes from wait4, checks child status == 0 and its own sparse page, and exits 0.
+    let status = (0..128)
+        .find_map(|_| {
+            let exit = parent
+                .fixture_run_loaded(task)
+                .expect("parent completion")
+                .exit;
+            match exit {
+                CarrierRunExit::PhysicalDoorbell { .. } => parent
+                    .service_physical_doorbell(task, &exit, |_, _| {})
+                    .expect("parent completion doorbell"),
+                CarrierRunExit::Kick => None,
+                other => panic!("unexpected parent exit: {other:?}"),
+            }
+        })
+        .expect("root exit");
+    assert_eq!(
+        status,
+        carrick_vmm_kvm::cpl0_boot::PhysicalProcessExit::Exited(
+            carrick_sched_core::process::TerminationStatus::exited(0)
+        )
+    );
+    assert_eq!(
+        factory
+            .fork_stock_counters()
+            .expect("final counters")
+            .descriptor_capacity_refusals,
+        0
     );
 }
 
