@@ -3212,7 +3212,7 @@ mod custody_tests {
         stock.register_root(owner, root).unwrap();
         let mut loans = Vec::new();
         for _ in 0..13 {
-            let offered = prepare_table_candidates(stock.table_stock());
+            let offered = stock.descriptor_table_candidates();
             assert!(!offered.is_empty());
             loans.push(
                 stock
@@ -3222,6 +3222,27 @@ mod custody_tests {
         }
         assert_eq!(loans.len(), 13);
         assert_eq!(stock.table_stock().len(), 11);
+    }
+    /// #3017: the host's reserve is exactly the span the CPL0 editor
+    /// licenses: from the occupied end up to the Prepare working suffix.
+    #[test]
+    fn initial_table_reserve_is_the_span_between_grants_and_working_tables() {
+        let extent = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
+        let occupied = 0x40_0000;
+        let working = prepare_table_suffix(extent, occupied).unwrap();
+        let reserve = initial_table_reserve(occupied, working).unwrap();
+        let expected = (working.start().raw() - (INITIAL_EXTENT_GPA + occupied as u64)) / 4096;
+        assert_eq!(reserve.pages() as u64, expected);
+        assert!(
+            expected > 100_000,
+            "the window, not the image, bounds the tables"
+        );
+        assert!(initial_table_reserve(occupied + 1, working).is_none());
+        let full = working.start().raw() - INITIAL_EXTENT_GPA;
+        assert_eq!(
+            initial_table_reserve(full as usize, working).map(|reserve| reserve.pages()),
+            Some(0)
+        );
     }
     #[test]
     fn native_backing_editor_exclusion_busy_once_then_success() {
