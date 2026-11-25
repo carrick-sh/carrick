@@ -188,7 +188,7 @@ where
                         machine,
                         SignalDeliveryFailure {
                             original: sig,
-                            blocked: thread_blocked,
+                            blocked: saved_mask,
                         },
                     );
                 }
@@ -219,7 +219,7 @@ where
             machine,
             SignalDeliveryFailure {
                 original: sig,
-                blocked: thread_blocked,
+                blocked: saved_mask,
             },
         );
     };
@@ -323,7 +323,7 @@ where
                                 machine,
                                 SignalDeliveryFailure {
                                     original: sig,
-                                    blocked: thread_blocked,
+                                    blocked: saved_mask,
                                 },
                             );
                         }
@@ -355,7 +355,7 @@ where
                     machine,
                     SignalDeliveryFailure {
                         original: sig,
-                        blocked: thread_blocked,
+                        blocked: saved_mask,
                     },
                 );
             }

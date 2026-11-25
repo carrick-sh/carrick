@@ -1239,6 +1239,9 @@ pub struct NativeMember<'a, C: ProcessContext> {
     >,
     /// The exact birth receipt host retirement owes for this member.
     expected_host: carrick_core::terminal::ThreadBirthIdentity,
+    /// True while this member executes host-loaded (`!has_native_execution_owner`)
+    /// and drops its temporary `AdmissionHome` `ZoneRecord` between EL1 calls.
+    host_loaded: bool,
 }
 impl<C: ProcessContext> ExitMember for NativeMember<'_, C> {
     fn exit_task(&self) -> TaskKey {
@@ -2080,8 +2083,37 @@ impl<'a> PendingTable<'a> {
             _ => unreachable!(),
         }
     }
+    fn take_member(&mut self, record: &RecordRef) -> Option<MemberWaitState<'a>> {
+        match self.take_row(&PendingKey::Member(*record))? {
+            PendingState::Member(state) => Some(state),
+            _ => unreachable!(),
+        }
+    }
+    fn insert_member(&mut self, record: RecordRef, state: MemberWaitState<'a>) {
+        if !state.is_empty() {
+            self.insert_row(PendingKey::Member(record), PendingState::Member(state));
+        }
+    }
     fn remove_member(&mut self, record: &RecordRef) {
         self.take_row(&PendingKey::Member(*record));
+    }
+    fn rehome_member_pending(
+        &mut self,
+        old_record: RecordRef,
+        new_record: RecordRef,
+        same_host: bool,
+    ) {
+        if old_record == new_record && same_host {
+            return;
+        }
+        let Some(state) = self.take_member(&old_record) else {
+            return;
+        };
+        if same_host {
+            self.insert_member(new_record, state);
+        } else if state.suspend_mask.is_some() {
+            NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
+        }
     }
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -2759,6 +2791,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         let old_record = resources.members[member_index].record;
+        let old_expected_host = resources.members[member_index].expected_host;
         let (_, keys) = state
             .by_process
             .get(&(key.carrier, process))
@@ -2874,6 +2907,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
         resources.members[member_index].expected_host = host_identity;
+        resources.members[member_index].host_loaded = !source
+            .zone
+            .record(reference.id)
+            .has_native_execution_owner();
+        graph.pending.rehome_member_pending(
+            old_record,
+            reference,
+            old_expected_host == host_identity,
+        );
         state.members.remove(&old_key);
         state
             .records
@@ -3682,28 +3724,32 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             if let Some(thread) = prepared_thread {
                 row.threads.threads.push(thread);
             }
+            let host_loaded = !source.zone.record(record).has_native_execution_owner();
+            let mut replaced_pending = None;
             if let Some(index) = member_index {
                 let member = &mut row.native_mut().resources_mut().members[index];
                 let old_record = member.record;
-                let replaced =
-                    member.thread != key.task || old_record != source.zone.record_ref(record);
+                let new_record = source.zone.record_ref(record);
+                let replaced = member.thread != key.task || old_record != new_record;
                 member.thread = key.task;
-                member.record = source.zone.record_ref(record);
+                member.record = new_record;
                 if old_record != member.record
                     && let Some(projection) = &member.signal_projection
                 {
                     projection.rehome(member.record);
                 }
                 member.expected_host = host_identity;
+                member.host_loaded = host_loaded;
                 if replaced {
                     let resources = row.native_mut().resources_mut();
-                    if old_record != source.zone.record_ref(record) {
+                    if old_record != new_record {
                         let now = live_cpu_now(resources.zone);
                         resources.retire_record_cpu(old_record, now);
                     }
                     resources.interrupted_child_waits.remove(&old_record);
                     resources.pending_signal_deliveries.remove(&old_record);
                     resources.map_stash.remove(&old_record);
+                    replaced_pending = Some((old_record, new_record));
                 }
             } else if let Some((retained, pending)) = prepared_member {
                 retained.commit_registration();
@@ -3720,6 +3766,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     signal_projection: Some(projection),
                     control: retained,
                     expected_host: host_identity,
+                    host_loaded,
                 });
             }
             if let Some(claim) = namespace_claim.as_mut() {
@@ -3730,6 +3777,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     .append(&mut claim.claims);
             }
             row.native().resources().sync_non_interrupting_signals();
+            if let Some((old_record, new_record)) = replaced_pending {
+                graph
+                    .pending
+                    .rehome_member_pending(old_record, new_record, false);
+            }
             (graph.pending.has_exit(&process), registry_control)
         };
         process_members.push(key);
@@ -4080,14 +4132,26 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         process_key: TaskKey,
         zone: &'a ZoneTables<C>,
         member: &NativeMember<'a, C>,
-    ) -> Option<(RecordRef, &'a ThreadControlSlot)> {
+    ) -> Option<(RecordRef, Option<RecordRef>, &'a ThreadControlSlot)> {
         let control = member.control.control();
         if member.process != process_key || !self.is_live_member_control(member) {
             return None;
         }
         let record = control.zone_record().unwrap_or(member.record);
         if !signal_record_exists(zone, record) {
-            return None;
+            // A live host-loaded SignalOwner (host-born or pool-born and
+            // host-adopted) releases its temporary AdmissionHome zone record
+            // between EL1 calls while SignalShared retains its queue and
+            // projection under `member.record`. Ring-owned NativeOwner
+            // members (`!member.host_loaded`) stay fail-closed when their
+            // permanent ZoneRecord is freed, and absent zone_record stays
+            // `None` so CPU clock lookups cannot sample a released or recycled
+            // slot.
+            return (member.host_loaded && control.native_signal_owner()).then_some((
+                member.record,
+                None,
+                control,
+            ));
         }
         let thread = zone.record(record.id).identity();
         (thread.tid == member.thread.id().raw() as u64
@@ -4100,7 +4164,7 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
                     .thread
                     .issued()
                     .is_none_or(|issued| thread.generation == issued.generation.raw())))
-        .then_some((record, control))
+        .then_some((member.record, Some(record), control))
     }
     fn live_signal_member(
         &self,
@@ -4108,14 +4172,22 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         leader_tid: u32,
         zone: &'a ZoneTables<C>,
         visible_tid: u32,
-    ) -> Option<(RecordRef, &'a ThreadControlSlot)> {
+    ) -> Option<(RecordRef, Option<RecordRef>, &'a ThreadControlSlot)> {
         if visible_tid == leader_tid {
             // The process leader is not necessarily the caller: a
             // sibling's tgkill(tgid, leader_tid, ...) names the leader's
             // exact retained control, never the caller's current record.
             let record = self.control.zone_record().unwrap_or(self.record);
             if signal_record_exists(zone, record) {
-                return Some((record, self.control));
+                return Some((self.record, Some(record), self.control));
+            }
+            if let Some(resolved) = self
+                .members
+                .iter()
+                .find(|member| core::ptr::eq(member.control.control(), self.control))
+                .and_then(|member| self.authenticated_signal_member(process_key, zone, member))
+            {
+                return Some(resolved);
             }
         }
         for member in &self.members {
@@ -4156,7 +4228,7 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
             {
                 continue;
             }
-            return Some((record, control));
+            return Some((record, Some(record), control));
         }
         None
     }
@@ -4164,21 +4236,32 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         &self,
         process_key: TaskKey,
         zone: &'a ZoneTables<C>,
-        mut visit: impl FnMut(RecordRef, &'a ThreadControlSlot),
+        mut visit: impl FnMut(RecordRef, Option<RecordRef>, &'a ThreadControlSlot),
     ) {
         let leader = self.control.zone_record().unwrap_or(self.record);
-        if signal_record_exists(zone, leader) {
-            visit(leader, self.control);
-        }
+        let leader_member = if signal_record_exists(zone, leader) {
+            Some((self.record, Some(leader), self.control))
+        } else {
+            self.members
+                .iter()
+                .find(|member| core::ptr::eq(member.control.control(), self.control))
+                .and_then(|member| self.authenticated_signal_member(process_key, zone, member))
+        };
+        let leader_zone = if let Some((signal_record, zone_record, control)) = leader_member {
+            visit(signal_record, zone_record, control);
+            zone_record
+        } else {
+            None
+        };
         for member in &self.members {
             if core::ptr::eq(member.control.control(), self.control) {
                 continue;
             }
-            if let Some((record, control)) =
+            if let Some((signal_record, zone_record, control)) =
                 self.authenticated_signal_member(process_key, zone, member)
-                && record != leader
+                && zone_record.is_none_or(|record| Some(record) != leader_zone)
             {
-                visit(record, control);
+                visit(signal_record, zone_record, control);
             }
         }
         for index in 0..self.page.entry_count() {
@@ -4199,10 +4282,10 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
                 continue;
             }
             if let Some(record) = control.zone_record()
-                && record != leader
+                && Some(record) != leader_zone
                 && signal_record_exists(zone, record)
             {
-                visit(record, control);
+                visit(record, Some(record), control);
             }
         }
     }
@@ -4465,6 +4548,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     signal_projection: None,
                     control: retain_member_control(control)?,
                     expected_host: member_host_identity(page, control)?,
+                    host_loaded: !zone.record(record.id).has_native_execution_owner(),
                 },
                 visible,
                 identity.thread_serial,
@@ -4715,6 +4799,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             signal_projection: None,
             control: retain_member_control(control)?,
             expected_host: member_host_identity(page, control)?,
+            host_loaded: !source.zone.record(record).has_native_execution_owner(),
         }];
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let signals = NativeProcessSignals::fresh_root(key, page);
@@ -5687,7 +5772,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 continue;
             }
             let resources = row.native().resources();
-            if let Some((record, control)) = resources.live_signal_member(
+            if let Some((signal_record, zone_record, control)) = resources.live_signal_member(
                 row.key(),
                 row.metadata().namespace_pid,
                 self.source.zone,
@@ -5695,7 +5780,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ) {
                 selected = Some((
                     row.key(),
-                    record,
+                    signal_record,
+                    zone_record,
                     control,
                     resources.signals().clone(),
                     resources.channel.clone(),
@@ -5703,7 +5789,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 break;
             }
         }
-        let (target_key, record, control, signals, channel) = selected.ok_or(LINUX_ESRCH)?;
+        let (target_key, signal_record, zone_record, control, signals, channel) =
+            selected.ok_or(LINUX_ESRCH)?;
         use carrick_personality_linux::signal::SignalTargetScope;
         info.check_target(if target_key == self.key {
             SignalTargetScope::CallingProcess
@@ -5730,16 +5817,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 0,
             )
         });
-        signals.enqueue_thread(record, signal, Some(info));
+        signals.enqueue_thread(signal_record, signal, Some(info));
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
         );
         if signal == carrick_signal_core::policy::Signal::KILL
-            || signals.has_default_terminating_deliverable(record, blocked)
+            || signals.has_default_terminating_deliverable(signal_record, blocked)
         {
             self.current.linux.mark_native_signal_work();
         }
-        let interrupt = signals.has_deliverable(record, blocked);
+        let interrupt = signals.has_deliverable(signal_record, blocked);
         let ipc_channels = if interrupt {
             graph.pending.ipc_channels(&target_key)
         } else {
@@ -5750,8 +5837,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.publish_channel(&channel)
                 .map_err(|e| carrick_syscall_abi::LinuxErrno::new(-e.errno() as i32))?;
         }
-        if interrupt {
-            self.interrupt_signal_record(record);
+        if interrupt && let Some(zone_record) = zone_record {
+            self.interrupt_signal_record(zone_record);
         }
         if let Some(channel) = channel {
             self.publish_channel(&channel)
@@ -9913,6 +10000,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ),
                 control: member_custody,
                 expected_host,
+                host_loaded: false,
             }],
             thread_stock: Some(thread_stock),
             mm: self.service.prepared_mm(&prepared),
@@ -10179,8 +10267,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                             self.source.zone,
                             tid.get(),
                         ) {
-                            Some((record, _)) => record,
-                            None => return Some(Err(LINUX_EINVAL)),
+                            Some((_, Some(zone_record), _)) => zone_record,
+                            Some((_, None, _)) | None => return Some(Err(LINUX_EINVAL)),
                         }
                     }
                     _ => self.record,
@@ -12587,7 +12675,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 self.source.zone,
                                 target_pid,
                             )
-                            .map(|(record, _)| record);
+                            .and_then(|(_, zone_record, _)| zone_record);
                         targets.push((task.key(), resources.signals().clone(), task.parent()));
                         break;
                     }
@@ -12680,7 +12768,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut interrupts = Vec::new();
         let mut fatal_signal_work = signal == carrick_signal_core::policy::Signal::KILL;
         for (target_key, target_signals, _) in targets {
-            let before = interrupts.len();
+            let mut wake_target = false;
             // kill() is process-directed: the signal sits in the process inbox
             // and every member that could take it is kicked, whichever tid
             // was named. If one stops being eligible before its checkpoint
@@ -12690,21 +12778,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 row.native().resources().for_each_live_signal_member(
                     target_key,
                     self.source.zone,
-                    |record, control| {
+                    |signal_record, zone_record, control| {
                         let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
                         );
                         fatal_signal_work |=
-                            target_signals.has_default_terminating_deliverable(record, mask);
+                            target_signals.has_default_terminating_deliverable(signal_record, mask);
                         if (preferred_member.is_none() || !mask.contains(signal))
-                            && target_signals.has_deliverable(record, mask)
+                            && target_signals.has_deliverable(signal_record, mask)
                         {
-                            interrupts.push(record);
+                            wake_target = true;
+                            if let Some(zone_record) = zone_record {
+                                interrupts.push(zone_record);
+                            }
                         }
                     },
                 );
             }
-            if interrupts.len() != before {
+            if wake_target {
                 wake_channels.extend(graph.pending.ipc_channels(&target_key));
             }
             if let Some(channel) = graph
