@@ -1663,6 +1663,9 @@ impl<'a> FsView<'a> {
         // size door, a read-only mount answers EROFS, and a rootfs file the
         // mount shadows is never touched.
         if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
+            if let Err(errno) = m.vfs.check_truncate(&m.full_path) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
             if context.is_some()
                 && let Some(errno) = self.rlimit_fsize_errno(length)
             {
@@ -2307,6 +2310,9 @@ impl<'a> FsView<'a> {
         // size, which on a tmpfs/host-backed file is a no-op success.
         let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
         let new_size = (offset as u64).saturating_add(length as u64);
+        // Serialize concurrent two-stage materialized resizes across rewrite
+        // and apply on the same open file description (#2975 P0 6).
+        let _materialized_resize = description.common().lock_materialized_resize();
         // Snapshot the writeback path/contents in a scope so the borrow
         // drops before we touch this.fs.rootfs_vfs.overlay (mirrors ftruncate).
         let writeback: Option<(String, Vec<u8>)>;
@@ -2366,6 +2372,8 @@ impl<'a> FsView<'a> {
                         if new_size <= cur_len {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
+                        #[cfg(test)]
+                        test_materialized_resize_hook::notify_after_rewrite();
                         return Ok(this.apply_materialized_resize(description, new_size));
                     }
                     if new_size > cur_len {
@@ -2545,6 +2553,9 @@ impl<'a> FsView<'a> {
         if length < 0 {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
+        // Serialize concurrent two-stage materialized resizes across rewrite
+        // and apply on the same open file description (#2975 P0 6).
+        let _materialized_resize = description.common().lock_materialized_resize();
         // Snapshot the path + new contents in a scope so the borrow drops
         // before we touch this.fs.rootfs_vfs.overlay.
         let writeback: Option<(String, Vec<u8>)>;
@@ -2608,6 +2619,8 @@ impl<'a> FsView<'a> {
                         if let Err(errno) = this.rewrite_materialized(&path, vec) {
                             return Ok(DispatchOutcome::errno(errno));
                         }
+                        #[cfg(test)]
+                        test_materialized_resize_hook::notify_after_rewrite();
                         return Ok(this.apply_materialized_resize(description, length as u64));
                     }
                     if let Err(errno) = contents.resize(length as u64) {
@@ -3493,6 +3506,37 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         self.fs_view()
             .setxattr(memory, target, name_ptr, value_ptr, size, flags)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::dispatch) mod test_materialized_resize_hook {
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+
+    struct Hook {
+        entered: mpsc::SyncSender<()>,
+        proceed: mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static AFTER_REWRITE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(in crate::dispatch) fn install(
+        entered: mpsc::SyncSender<()>,
+        proceed: mpsc::Receiver<()>,
+    ) {
+        AFTER_REWRITE.with(|slot| *slot.borrow_mut() = Some(Hook { entered, proceed }));
+    }
+
+    pub(in crate::dispatch) fn notify_after_rewrite() {
+        AFTER_REWRITE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                let _ = hook.entered.send(());
+                let _ = hook.proceed.recv();
+            }
+        });
     }
 }
 

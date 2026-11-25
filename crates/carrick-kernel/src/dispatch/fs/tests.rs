@@ -16117,4 +16117,303 @@ mod window_size_door {
             "the windowed file now at /m keeps its bytes"
         );
     }
+
+    /// Review P0 5 (#2975): bind-mount path `truncate(2)` checks path existence,
+    /// directory/non-regular object type, and read-only mount before `RLIMIT_FSIZE`,
+    /// and never blocks opening a bind-mounted FIFO without a peer.
+    #[test]
+    fn bind_mount_truncate_fifo_never_blocks_and_checks_path_before_rlimit_fsize() {
+        let mut run = Run::new();
+        let rw = tempfile::tempdir().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        std::fs::write(rw.path().join("reg"), vec![1; 4096]).unwrap();
+        std::fs::create_dir(rw.path().join("dir")).unwrap();
+        std::fs::write(ro.path().join("file"), vec![2; 4096]).unwrap();
+        let fifo_path = rw.path().join("fifo");
+        let cfifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cfifo.as_ptr(), 0o644) }, 0);
+
+        run.dispatcher.register_mount(
+            "/rw",
+            Box::new(carrick_vfs::BindVfs::new("/rw", rw.path(), false)),
+        );
+        run.dispatcher.register_mount(
+            "/ro",
+            Box::new(carrick_vfs::BindVfs::new("/ro", ro.path(), true)),
+        );
+
+        // Non-blocking FIFO rejection even with length == 0 and no reader.
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let fifo_res = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let dispatcher = &run.dispatcher;
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let mut mem = LinearMemory::new(
+                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                    vec![0; 4096],
+                );
+                mem.write_bytes_raw(PATH, b"/rw/fifo\0").unwrap();
+                let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                let reg = crate::thread::ThreadRegistry::new(tid);
+                let futex = crate::thread::FutexTable::new();
+                let res = dispatcher
+                    .dispatch_threaded(
+                        ctx,
+                        SyscallRequest::new(SYS_TRUNCATE, SyscallArgs::from([PATH, 0, 0, 0, 0, 0])),
+                        &mut mem,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                    )
+                    .unwrap();
+                let _ = tx.send(res);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(res) => res,
+                Err(_) => {
+                    // Unblock a hung O_WRONLY FIFO open before failing.
+                    let _rd =
+                        unsafe { libc::open(cfifo.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+                    panic!("truncate on bind-mounted FIFO blocked");
+                }
+            }
+        });
+        assert_eq!(fifo_res, DispatchOutcome::errno(LINUX_EINVAL));
+
+        // Set soft RLIMIT_FSIZE = 100 and check error precedence above 100.
+        let rlim_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE + 512;
+        run.memory
+            .write_bytes_raw(rlim_addr, &[100_u64.to_le_bytes(), 4096_u64.to_le_bytes()].concat())
+            .unwrap();
+        assert_eq!(
+            run.call(
+                261,
+                None,
+                [0, carrick_abi::LINUX_RLIMIT_FSIZE, rlim_addr, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        for (path, expected) in [
+            ("/rw/absent", LINUX_ENOENT),
+            ("/rw/dir", LINUX_EISDIR),
+            ("/rw/fifo", LINUX_EINVAL),
+            ("/ro/absent", LINUX_ENOENT),
+            ("/ro/file", LINUX_EROFS),
+            ("/rw/reg", LINUX_EFBIG),
+        ] {
+            assert_eq!(
+                run.call(SYS_TRUNCATE, Some(path), [PATH, 1024, 0, 0, 0, 0]),
+                DispatchOutcome::errno(expected),
+                "truncate({path}, 1024) above RLIMIT_FSIZE"
+            );
+        }
+    }
+
+    /// Review P0 6 (#2975): concurrent materialized ftruncate/fallocate on the
+    /// same open description must serialize rewrite and copy resize so host
+    /// path size, copy length, and metadata size never diverge.
+    #[test]
+    fn concurrent_materialized_resize_keeps_path_and_description_consistent() {
+        let run = Run::new();
+        let plain = run.rootfs_file("/m", 8192);
+        let desc = OpenDescription::File {
+            path: "/m".to_string(),
+            contents: FileContents::dense(vec![0x42; 8192]),
+            offset: 0,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/m"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 8192,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
+            panic!("install_fd");
+        };
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let dispatcher = &run.dispatcher;
+        for round in 0..200 {
+            let barrier = std::sync::Barrier::new(2);
+            let (r1, r2) = std::thread::scope(|scope| {
+                let h1 = scope.spawn(|| {
+                    let mut mem = LinearMemory::new(
+                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                        vec![0; 4096],
+                    );
+                    let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                    let reg = crate::thread::ThreadRegistry::new(tid);
+                    let futex = crate::thread::FutexTable::new();
+                    barrier.wait();
+                    dispatcher
+                        .dispatch_threaded(
+                            &ctx,
+                            SyscallRequest::new(
+                                SYS_FTRUNCATE,
+                                SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0]),
+                            ),
+                            &mut mem,
+                            &CompatReporter::default(),
+                            crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                        )
+                        .unwrap()
+                });
+                let mut mem2 = LinearMemory::new(
+                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                    vec![0; 4096],
+                );
+                let tid2 = crate::thread::ThreadId::from_guest_supplied_tid(2);
+                let reg2 = crate::thread::ThreadRegistry::new(tid2);
+                let futex2 = crate::thread::FutexTable::new();
+                barrier.wait();
+                let (nr, args) = if round % 2 == 0 {
+                    (SYS_FTRUNCATE, [fd as u64, 12288, 0, 0, 0, 0])
+                } else {
+                    (47, [fd as u64, 0, 0, 16384, 0, 0])
+                };
+                let r2 = dispatcher
+                    .dispatch_threaded(
+                        &ctx,
+                        SyscallRequest::new(nr, SyscallArgs::from(args)),
+                        &mut mem2,
+                        &CompatReporter::default(),
+                        crate::dispatch::ThreadCtx::new(tid2, &reg2, &futex2),
+                    )
+                    .unwrap();
+                (h1.join().unwrap(), r2)
+            });
+            assert_eq!(r1, DispatchOutcome::Returned { value: 0 });
+            assert_eq!(r2, DispatchOutcome::Returned { value: 0 });
+
+            let host_len = size(&plain);
+            let file = dispatcher.open_file(fd as i32).unwrap();
+            let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+            let OpenDescription::File {
+                contents,
+                metadata,
+                ..
+            } = &*open
+            else {
+                panic!("materialized");
+            };
+            let copy_len = contents.len().unwrap();
+            assert_eq!(
+                host_len, copy_len,
+                "round {round}: host path len {host_len} != copy len {copy_len}"
+            );
+            assert_eq!(
+                metadata.size as u64, copy_len,
+                "round {round}: metadata size {} != copy len {copy_len}",
+                metadata.size
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_materialized_resize_never_splits_path_and_copy() {
+        let run = Run::new();
+        let plain = run.rootfs_file("/m", 8192);
+        let desc = OpenDescription::File {
+            path: "/m".to_string(),
+            contents: FileContents::dense(vec![0x42; 8192]),
+            offset: 0,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/m"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 8192,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let DispatchOutcome::Returned { value: fd } = run.dispatcher.install_fd(desc, 0) else {
+            panic!("install_fd");
+        };
+        let ctx = run.dispatcher.capture_one_task_context().unwrap();
+        let ctx = &ctx;
+        let dispatcher = &run.dispatcher;
+        for (a_req, b_req) in [
+            (
+                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0])),
+                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 12288, 0, 0, 0, 0])),
+            ),
+            (
+                SyscallRequest::new(47, SyscallArgs::from([fd as u64, 0, 0, 16384, 0, 0])),
+                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0])),
+            ),
+        ] {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+            let (b_done_tx, b_done_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let ha = scope.spawn(move || {
+                    super::test_materialized_resize_hook::install(entered_tx, proceed_rx);
+                    let mut mem = LinearMemory::new(
+                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                        vec![0; 4096],
+                    );
+                    let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+                    let reg = crate::thread::ThreadRegistry::new(tid);
+                    let futex = crate::thread::FutexTable::new();
+                    dispatcher
+                        .dispatch_threaded(
+                            ctx,
+                            a_req,
+                            &mut mem,
+                            &CompatReporter::default(),
+                            crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                        )
+                        .unwrap()
+                });
+                entered_rx.recv().unwrap();
+                let hb = scope.spawn(move || {
+                    let mut mem = LinearMemory::new(
+                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
+                        vec![0; 4096],
+                    );
+                    let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
+                    let reg = crate::thread::ThreadRegistry::new(tid);
+                    let futex = crate::thread::FutexTable::new();
+                    let res = dispatcher
+                        .dispatch_threaded(
+                            ctx,
+                            b_req,
+                            &mut mem,
+                            &CompatReporter::default(),
+                            crate::dispatch::ThreadCtx::new(tid, &reg, &futex),
+                        )
+                        .unwrap();
+                    let _ = b_done_tx.send(());
+                    res
+                });
+                let overtook = b_done_rx
+                    .recv_timeout(std::time::Duration::from_millis(25))
+                    .is_ok();
+                let _ = proceed_tx.send(());
+                let ra = ha.join().unwrap();
+                let rb = hb.join().unwrap();
+                assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
+                assert_eq!(rb, DispatchOutcome::Returned { value: 0 });
+                let host_len = size(&plain);
+                let file = dispatcher.open_file(fd as i32).unwrap();
+                let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+                let OpenDescription::File {
+                    contents,
+                    metadata,
+                    ..
+                } = &*open
+                else {
+                    panic!("materialized");
+                };
+                let copy_len = contents.len().unwrap();
+                assert!(
+                    !overtook,
+                    "thread B must wait behind thread A's materialized resize"
+                );
+                assert_eq!(host_len, copy_len, "host path len != copy len");
+                assert_eq!(metadata.size as u64, copy_len);
+            });
+        }
+    }
 }

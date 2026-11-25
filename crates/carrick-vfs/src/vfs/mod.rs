@@ -1230,6 +1230,16 @@ pub trait Vfs: Send + Sync {
         Err(carrick_abi::LINUX_EROFS)
     }
 
+    /// Validate path resolution, object type, and writeability for `truncate(2)`
+    /// before enforcing task `RLIMIT_FSIZE` (#2975 P0 5).
+    fn check_truncate(&self, path: &str) -> Result<(), VfsError> {
+        let md = self.lookup(path)?;
+        if md.kind == EntryKind::Directory {
+            return Err(carrick_abi::LINUX_EISDIR);
+        }
+        Err(carrick_abi::LINUX_EROFS)
+    }
+
     fn truncate(&self, _path: &str, _len: u64) -> Result<(), VfsError> {
         Err(carrick_abi::LINUX_EROFS)
     }

@@ -849,6 +849,9 @@ pub struct DescriptionCommon {
     socket_flows: Mutex<Option<SocketFlows>>,
     cork: Mutex<SocketCork>,
     writeback_err: AtomicI32,
+    /// Serializes two-stage materialized `ftruncate`/`fallocate` across host
+    /// path rewrite and description copy resize (#2975 P0 6).
+    materialized_resize: Mutex<()>,
     /// The description's one chance to enter the EL1 zone, taken at open
     /// (`el1_delegation::enter_zone_at_open`). Once taken it never returns:
     /// a description refused at open, or demoted later, stays on the host.
@@ -876,6 +879,7 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
+            materialized_resize: Mutex::new(()),
             zone_entry: AtomicBool::new(true),
         }
     }
@@ -900,8 +904,13 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
+            materialized_resize: Mutex::new(()),
             zone_entry: AtomicBool::new(true),
         }
+    }
+
+    pub(crate) fn lock_materialized_resize(&self) -> MutexGuard<'_, ()> {
+        self.materialized_resize.lock()
     }
 
     pub(crate) fn shared_seals(&self) -> Arc<Mutex<Option<u32>>> {
