@@ -267,7 +267,10 @@ fn open_truncating_with(
 }
 
 #[cfg(target_os = "linux")]
-fn reopen_writable_self_fd(owned: BorrowedFd<'_>, flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
+fn reopen_writable_self_fd(
+    owned: BorrowedFd<'_>,
+    flags: libc::c_int,
+) -> Result<OwnedFd, libc::c_int> {
     let path = std::ffi::CString::new(format!("/proc/self/fd/{}", owned.as_raw_fd()))
         .map_err(|_| libc::EINVAL)?;
     let wr_flags = libc::O_WRONLY | libc::O_CLOEXEC | (flags & libc::O_NONBLOCK);
@@ -283,7 +286,10 @@ fn reopen_writable_self_fd(owned: BorrowedFd<'_>, flags: libc::c_int) -> Result<
 /// No window exists on a host without one (#2972): refuse rather than open
 /// untruncated.
 #[cfg(not(target_os = "linux"))]
-fn reopen_writable_self_fd(_owned: BorrowedFd<'_>, _flags: libc::c_int) -> Result<OwnedFd, libc::c_int> {
+fn reopen_writable_self_fd(
+    _owned: BorrowedFd<'_>,
+    _flags: libc::c_int,
+) -> Result<OwnedFd, libc::c_int> {
     Err(Fenced::ERRNO)
 }
 
@@ -586,7 +592,10 @@ mod tests {
                 Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
         });
-        assert!(opened.is_ok(), "O_CREAT|O_EXCL|O_RDONLY|O_TRUNC 0444 failed: {opened:?}");
+        assert!(
+            opened.is_ok(),
+            "O_CREAT|O_EXCL|O_RDONLY|O_TRUNC 0444 failed: {opened:?}"
+        );
         assert_eq!(calls, 1);
         assert_eq!(size(&path), 0);
     }
@@ -665,7 +674,13 @@ mod tests {
         // Same (st_dev, st_ino), another birth: the inode was reused.
         WINDOWED
             .write()
-            .insert(identity, WindowEntry { birth: Birth(Some((0, 0))), refs: 1 })
+            .insert(
+                identity,
+                WindowEntry {
+                    birth: Birth(Some((0, 0))),
+                    refs: 1,
+                },
+            )
             .unwrap();
         if birth(windowed.as_raw_fd(), &fstat(windowed.as_raw_fd()).unwrap()) != Birth(None) {
             assert_eq!(resize(windowed.as_fd(), 0), Ok(()));

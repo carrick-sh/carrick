@@ -3523,10 +3523,7 @@ pub(in crate::dispatch) mod test_materialized_resize_hook {
         static AFTER_REWRITE: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
-    pub(in crate::dispatch) fn install(
-        entered: mpsc::SyncSender<()>,
-        proceed: mpsc::Receiver<()>,
-    ) {
+    pub(in crate::dispatch) fn install(entered: mpsc::SyncSender<()>, proceed: mpsc::Receiver<()>) {
         AFTER_REWRITE.with(|slot| *slot.borrow_mut() = Some(Hook { entered, proceed }));
     }
 

@@ -16149,10 +16149,8 @@ mod window_size_door {
             let dispatcher = &run.dispatcher;
             let ctx = &ctx;
             scope.spawn(move || {
-                let mut mem = LinearMemory::new(
-                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                    vec![0; 4096],
-                );
+                let mut mem =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                 mem.write_bytes_raw(PATH, b"/rw/fifo\0").unwrap();
                 let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
                 let reg = crate::thread::ThreadRegistry::new(tid);
@@ -16183,7 +16181,10 @@ mod window_size_door {
         // Set soft RLIMIT_FSIZE = 100 and check error precedence above 100.
         let rlim_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE + 512;
         run.memory
-            .write_bytes_raw(rlim_addr, &[100_u64.to_le_bytes(), 4096_u64.to_le_bytes()].concat())
+            .write_bytes_raw(
+                rlim_addr,
+                &[100_u64.to_le_bytes(), 4096_u64.to_le_bytes()].concat(),
+            )
             .unwrap();
         assert_eq!(
             run.call(
@@ -16238,10 +16239,8 @@ mod window_size_door {
             let barrier = std::sync::Barrier::new(2);
             let (r1, r2) = std::thread::scope(|scope| {
                 let h1 = scope.spawn(|| {
-                    let mut mem = LinearMemory::new(
-                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        vec![0; 4096],
-                    );
+                    let mut mem =
+                        LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                     let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
                     let reg = crate::thread::ThreadRegistry::new(tid);
                     let futex = crate::thread::FutexTable::new();
@@ -16259,10 +16258,8 @@ mod window_size_door {
                         )
                         .unwrap()
                 });
-                let mut mem2 = LinearMemory::new(
-                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                    vec![0; 4096],
-                );
+                let mut mem2 =
+                    LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                 let tid2 = crate::thread::ThreadId::from_guest_supplied_tid(2);
                 let reg2 = crate::thread::ThreadRegistry::new(tid2);
                 let futex2 = crate::thread::FutexTable::new();
@@ -16290,9 +16287,7 @@ mod window_size_door {
             let file = dispatcher.open_file(fd as i32).unwrap();
             let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
             let OpenDescription::File {
-                contents,
-                metadata,
-                ..
+                contents, metadata, ..
             } = &*open
             else {
                 panic!("materialized");
@@ -16335,12 +16330,21 @@ mod window_size_door {
         let dispatcher = &run.dispatcher;
         for (a_req, b_req) in [
             (
-                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0])),
-                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 12288, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    SYS_FTRUNCATE,
+                    SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0]),
+                ),
+                SyscallRequest::new(
+                    SYS_FTRUNCATE,
+                    SyscallArgs::from([fd as u64, 12288, 0, 0, 0, 0]),
+                ),
             ),
             (
                 SyscallRequest::new(47, SyscallArgs::from([fd as u64, 0, 0, 16384, 0, 0])),
-                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    SYS_FTRUNCATE,
+                    SyscallArgs::from([fd as u64, 4096, 0, 0, 0, 0]),
+                ),
             ),
         ] {
             let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -16349,10 +16353,8 @@ mod window_size_door {
             std::thread::scope(|scope| {
                 let ha = scope.spawn(move || {
                     super::test_materialized_resize_hook::install(entered_tx, proceed_rx);
-                    let mut mem = LinearMemory::new(
-                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        vec![0; 4096],
-                    );
+                    let mut mem =
+                        LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                     let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
                     let reg = crate::thread::ThreadRegistry::new(tid);
                     let futex = crate::thread::FutexTable::new();
@@ -16368,10 +16370,8 @@ mod window_size_door {
                 });
                 entered_rx.recv().unwrap();
                 let hb = scope.spawn(move || {
-                    let mut mem = LinearMemory::new(
-                        crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        vec![0; 4096],
-                    );
+                    let mut mem =
+                        LinearMemory::new(crate::memory::LINUX_IDENTITY_PAGE_BASE, vec![0; 4096]);
                     let tid = crate::thread::ThreadId::from_guest_supplied_tid(2);
                     let reg = crate::thread::ThreadRegistry::new(tid);
                     let futex = crate::thread::FutexTable::new();
@@ -16399,9 +16399,7 @@ mod window_size_door {
                 let file = dispatcher.open_file(fd as i32).unwrap();
                 let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
                 let OpenDescription::File {
-                    contents,
-                    metadata,
-                    ..
+                    contents, metadata, ..
                 } = &*open
                 else {
                     panic!("materialized");
