@@ -4632,7 +4632,7 @@ fn kick_off_the_loaded_root_keeps_loaded_custody_without_a_task_snapshot() {
             1024,
             ROOT_AFFINITY_LOADED,
             move |_, kick| {
-                if hook_calls.fetch_add(1, Ordering::AcqRel) % 2 == 0 {
+                if hook_calls.fetch_add(1, Ordering::AcqRel).is_multiple_of(2) {
                     kick.kick();
                 }
             },
