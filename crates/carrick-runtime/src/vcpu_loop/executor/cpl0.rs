@@ -102,6 +102,8 @@ pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMem
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    off_root_kick_probe: Option<crate::prepare::KvmOffRootKickProbe>,
 }
 
 /// The run root's current task binding, shared by every executor of one
@@ -298,6 +300,8 @@ pub(crate) struct Cpl0PersistentExecutorConfig<M: CarrierCpuIo, Mem: CarrierMemo
     pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     pub(crate) injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    pub(crate) off_root_kick_probe: Option<crate::prepare::KvmOffRootKickProbe>,
 }
 
 /// The CPL0 run's completion, applying the scheduler's executor-death
@@ -358,6 +362,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
             loaded_pre_entry_hook: config.loaded_pre_entry_hook,
             #[cfg(feature = "kvm-pool-test-control")]
             injected_death: config.injected_death,
+            #[cfg(feature = "kvm-pool-test-control")]
+            off_root_kick_probe: config.off_root_kick_probe,
         })
     }
 }
@@ -409,6 +415,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutorFactory
             loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
             #[cfg(feature = "kvm-pool-test-control")]
             injected_death: self.injected_death,
+            #[cfg(feature = "kvm-pool-test-control")]
+            off_root_kick: self
+                .off_root_kick_probe
+                .clone()
+                .map(OffRootKickTracker::new),
         })
     }
 }
@@ -437,7 +448,37 @@ pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo =
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
     #[cfg(feature = "kvm-pool-test-control")]
     injected_death: Option<crate::prepare::KvmInjectedExecutorDeath>,
+    #[cfg(feature = "kvm-pool-test-control")]
+    off_root_kick: Option<OffRootKickTracker>,
     external_signals: HostSignalIngressProducer,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+struct ArmedOffRootKick {
+    target: crate::prepare::KvmOffRootKickTarget,
+    expected_root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
+    expected_binding: GuestArchBinding,
+    expected_generation: ExecutionGeneration,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+struct OffRootKickTracker {
+    probe: crate::prepare::KvmOffRootKickProbe,
+    maintenance_armed: bool,
+    retired_child_armed: bool,
+    pending: Option<ArmedOffRootKick>,
+}
+
+#[cfg(feature = "kvm-pool-test-control")]
+impl OffRootKickTracker {
+    fn new(probe: crate::prepare::KvmOffRootKickProbe) -> Self {
+        Self {
+            probe,
+            maintenance_armed: false,
+            retired_child_armed: false,
+            pending: None,
+        }
+    }
 }
 
 /// A reschedule check's verdict at one loaded boundary.
@@ -723,6 +764,105 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             return Err(TrapError::Hypervisor(
                 "injected executor death after exec seal".into(),
             ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn arm_pending_off_root_kick_on_entry(
+        &mut self,
+    ) -> Result<Option<ArmedOffRootKick>, TrapError> {
+        let Some(tracker) = &mut self.off_root_kick else {
+            return Ok(None);
+        };
+        let Some(armed) = tracker.pending.take() else {
+            return Ok(None);
+        };
+        if self.physical.cpu().live_root()? != armed.expected_root {
+            return Err(TrapError::Hypervisor(
+                "off-root kick test control lost its target root before entry".into(),
+            ));
+        }
+        carrick_hal::VcpuKickDyn::kick(&self.idle_kick);
+        Ok(Some(armed))
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn observe_off_root_kick(
+        &self,
+        task: TaskIdentity,
+        armed: ArmedOffRootKick,
+        stopped: &carrick_x86_cpl0_host::carrier_cpu::StoppedTaskExit,
+    ) -> Result<(), TrapError> {
+        let Some(tracker) = &self.off_root_kick else {
+            return Ok(());
+        };
+        let cpu = self.physical.cpu();
+        let stopped_root = cpu.live_root()?;
+        let retained_loaded_custody = cpu.loaded_binding() == Some(armed.expected_binding)
+            && self.task == Some(armed.expected_binding.task())
+            && self.loaded_generation == Some(armed.expected_generation)
+            && self.binding.as_ref().is_some_and(|loaded| {
+                loaded.arch() == armed.expected_binding
+                    && loaded.generation() == armed.expected_generation
+            });
+        tracker
+            .probe
+            .record(crate::prepare::KvmOffRootKickObservation {
+                target: armed.target,
+                expected_root: armed.expected_root,
+                stopped_root,
+                exit_is_kick: stopped.exit == CarrierRunExit::Kick,
+                state_is_none: stopped.state.is_none(),
+                child_binding_present: cpu.has_child_binding(stopped_root)?,
+                can_save_loaded: cpu.can_save_loaded(task)?,
+                retained_loaded_custody,
+            })
+            .map_err(TrapError::Hypervisor)
+    }
+
+    #[cfg(feature = "kvm-pool-test-control")]
+    fn maybe_arm_off_root_kick_after_doorbell(
+        &mut self,
+        port: u16,
+        expected_binding: GuestArchBinding,
+    ) -> Result<(), TrapError> {
+        let Some(tracker) = &mut self.off_root_kick else {
+            return Ok(());
+        };
+        let cpu = self.physical.cpu();
+        let live_root = cpu.live_root()?;
+        let target = if port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT
+            && tracker.probe.arm_retired_child_root
+            && !tracker.retired_child_armed
+        {
+            if cpu.has_child_binding(live_root)? {
+                return Err(TrapError::Hypervisor(
+                    "ChildRetire left the retired child's binding registered".into(),
+                ));
+            }
+            tracker.retired_child_armed = true;
+            Some(crate::prepare::KvmOffRootKickTarget::RetiredChildRoot)
+        } else if port == carrick_x86::cpl0_entry::WORK_PORT
+            && tracker.probe.arm_maintenance_root
+            && !tracker.maintenance_armed
+            && cpu.maintenance_root() == Some(live_root)
+        {
+            tracker.maintenance_armed = true;
+            Some(crate::prepare::KvmOffRootKickTarget::MaintenanceRoot)
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            let expected_generation = self.loaded_generation.ok_or_else(|| {
+                TrapError::Hypervisor("off-root kick has no loaded generation".into())
+            })?;
+            tracker.pending = Some(ArmedOffRootKick {
+                target,
+                expected_root: live_root,
+                expected_binding,
+                expected_generation,
+            });
         }
         Ok(())
     }
@@ -1297,10 +1437,22 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 return Ok(ExecutorExit::Preempted);
             }
         }
+        #[cfg(feature = "kvm-pool-test-control")]
+        let armed_off_root = match self.arm_pending_off_root_kick_on_entry() {
+            Ok(armed) => armed,
+            Err(error) => {
+                M::disarm_run_kick(&self.idle_kick);
+                return Err(error);
+            }
+        };
         let stopped = self.physical.cpu_mut().run_loaded(task);
         M::disarm_run_kick(&self.idle_kick);
         let stopped = stopped
             .map_err(|error| TrapError::Hypervisor(format!("KVM stopped run boundary: {error}")))?;
+        #[cfg(feature = "kvm-pool-test-control")]
+        if let Some(armed) = armed_off_root {
+            self.observe_off_root_kick(task, armed, &stopped)?;
+        }
         match &stopped.exit {
             CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let binding = self.binding.as_ref().ok_or_else(|| {
@@ -1375,7 +1527,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     }
                 } else {
                     #[cfg(feature = "kvm-pool-test-control")]
-                    self.maybe_inject_death_after_exec_seal()?;
+                    {
+                        self.maybe_inject_death_after_exec_seal()?;
+                        let expected_binding = binding.arch();
+                        self.maybe_arm_off_root_kick_after_doorbell(*port, expected_binding)?;
+                    }
                     Ok(ExecutorExit::ResumeEl1)
                 }
             }

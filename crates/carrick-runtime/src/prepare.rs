@@ -313,7 +313,7 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
         None,
         KvmPoolTestControl {
             loaded_pre_entry_hook: Some(hook),
-            injected_death: None,
+            ..KvmPoolTestControl::default()
         },
         Some((loaded_exits, idle_exits)),
     )
@@ -591,6 +591,85 @@ pub enum KvmInjectedExecutorDeath {
     AfterExecSealed,
 }
 
+/// Which off-loaded-root CPL0 boundary a test-control probe should kick (#2962).
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvmOffRootKickTarget {
+    /// Physical `WORK_PORT` crossing while CR3 stands on `maintenance_root`.
+    MaintenanceRoot,
+    /// Physical `NATIVE_CHILD_RETIRE_PORT` crossing after child unregistration.
+    RetiredChildRoot,
+}
+
+/// Real-KVM observation captured on the CPU right after an off-root kick.
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvmOffRootKickObservation {
+    pub target: KvmOffRootKickTarget,
+    pub expected_root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
+    pub stopped_root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
+    pub exit_is_kick: bool,
+    pub state_is_none: bool,
+    pub child_binding_present: bool,
+    pub can_save_loaded: bool,
+    pub retained_loaded_custody: bool,
+}
+
+/// Request and record one deterministic kick on the next actual entry of the
+/// same loaded CPU after each selected off-root boundary (#2962).
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Debug)]
+pub struct KvmOffRootKickProbe {
+    pub arm_maintenance_root: bool,
+    pub arm_retired_child_root: bool,
+    observations: Arc<std::sync::Mutex<Vec<KvmOffRootKickObservation>>>,
+}
+
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+impl KvmOffRootKickProbe {
+    pub fn new(arm_maintenance_root: bool, arm_retired_child_root: bool) -> Self {
+        Self {
+            arm_maintenance_root,
+            arm_retired_child_root,
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn record(&self, observation: KvmOffRootKickObservation) -> Result<(), String> {
+        self.observations
+            .lock()
+            .map_err(|_| "off-root kick probe poisoned".to_string())?
+            .push(observation);
+        Ok(())
+    }
+
+    pub fn observations(&self) -> Vec<KvmOffRootKickObservation> {
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Test control for the production KVM pool, compiled only into test
 /// targets.
 #[doc(hidden)]
@@ -603,6 +682,7 @@ pub enum KvmInjectedExecutorDeath {
 pub struct KvmPoolTestControl {
     pub loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
     pub injected_death: Option<KvmInjectedExecutorDeath>,
+    pub off_root_kick_probe: Option<KvmOffRootKickProbe>,
 }
 
 /// Run the production KVM pool under `test_control`.
@@ -730,6 +810,8 @@ fn assemble_kvm_root_pool(
             loaded_pre_entry_hook: test_control.loaded_pre_entry_hook,
             #[cfg(feature = "kvm-pool-test-control")]
             injected_death: test_control.injected_death,
+            #[cfg(feature = "kvm-pool-test-control")]
+            off_root_kick_probe: test_control.off_root_kick_probe,
         },
     )?);
     Ok(KvmRootPool {
