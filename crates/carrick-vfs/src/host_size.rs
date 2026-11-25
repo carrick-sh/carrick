@@ -184,6 +184,9 @@ pub mod test_resize_hook {
         proceed: mpsc::Receiver<()>,
     }
 
+    static TEST_WINDOW_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
+
     thread_local! {
         static BEFORE_FTRUNCATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_WRITE_ALL: RefCell<Option<Hook>> = const { RefCell::new(None) };
@@ -191,6 +194,13 @@ pub mod test_resize_hook {
         static AFTER_WRITE_LOCK: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
         static BEFORE_RESIZE_LOCK: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
         static AFTER_RESIZE_LOCK: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Serialize parallel tests that register process-wide `WINDOWED` entries or
+    /// pause while holding `WINDOWED` locks so `RwLock` write-preference cannot
+    /// deadlock a pause-hook test against a concurrent writer.
+    pub fn lock_window_tests() -> parking_lot::MutexGuard<'static, ()> {
+        TEST_WINDOW_LOCK.lock()
     }
 
     pub fn install(entered: mpsc::SyncSender<()>, proceed: mpsc::Receiver<()>) {
@@ -625,8 +635,13 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
-    static TEST_REGISTRY_MUTEX: LazyLock<parking_lot::Mutex<()>> =
-        LazyLock::new(|| parking_lot::Mutex::new(()));
+    struct TestRegistryMutex;
+    impl TestRegistryMutex {
+        fn lock(&self) -> parking_lot::MutexGuard<'static, ()> {
+            test_resize_hook::lock_window_tests()
+        }
+    }
+    static TEST_REGISTRY_MUTEX: TestRegistryMutex = TestRegistryMutex;
 
     fn file(len: u64) -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
         let dir = tempfile::tempdir().unwrap();

@@ -15897,6 +15897,7 @@ mod window_size_door {
     /// file through the descriptor, before the by-path open was fenced.
     #[test]
     fn proc_fd_reopen_truncation_of_a_windowed_file_changes_nothing() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let windowed = run.rootfs_file("/windowed", 8192);
         let plain = run.rootfs_file("/plain", 8192);
@@ -15941,6 +15942,7 @@ mod window_size_door {
     /// to the shadowed rootfs file and the door answered ENOSYS.
     #[test]
     fn a_mount_over_a_windowed_rootfs_file_never_shrinks_it() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let shadowed = run.rootfs_file("/mnt/x", 8192);
         let _pin = window(&run, &shadowed);
@@ -15965,6 +15967,7 @@ mod window_size_door {
     /// Red before: both answered EROFS (the rootfs had no such object).
     #[test]
     fn path_truncate_reaches_the_mount_that_claims_the_path() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let writable = tempfile::tempdir().unwrap();
         let readonly = tempfile::tempdir().unwrap();
@@ -15997,6 +16000,7 @@ mod window_size_door {
     /// offset and its metadata are untouched: ENOSYS and no partial state.
     #[test]
     fn a_fenced_materialized_resize_changes_nothing() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let windowed = run.rootfs_file("/m", 8192);
         let _pin = window(&run, &windowed);
@@ -16056,6 +16060,7 @@ mod window_size_door {
     /// shrunk.
     #[test]
     fn a_materialized_resize_whose_name_now_holds_a_windowed_file_changes_nothing() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let plain = run.rootfs_file("/m", 8192);
         let cached = run.dispatcher.fs.rootfs_vfs.path_inode_identity("/m");
@@ -16123,6 +16128,7 @@ mod window_size_door {
     /// and never blocks opening a bind-mounted FIFO without a peer.
     #[test]
     fn bind_mount_truncate_fifo_never_blocks_and_checks_path_before_rlimit_fsize() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let rw = tempfile::tempdir().unwrap();
         let ro = tempfile::tempdir().unwrap();
@@ -16215,6 +16221,7 @@ mod window_size_door {
     /// path size, copy length, and metadata size never diverge.
     #[test]
     fn concurrent_materialized_resize_keeps_path_and_description_consistent() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let run = Run::new();
         let plain = run.rootfs_file("/m", 8192);
         let desc = OpenDescription::File {
@@ -16307,6 +16314,7 @@ mod window_size_door {
 
     #[test]
     fn interleaved_materialized_resize_never_splits_path_and_copy() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let run = Run::new();
         let plain = run.rootfs_file("/m", 8192);
         let desc = OpenDescription::File {
@@ -16434,6 +16442,7 @@ mod window_size_door {
 
     #[test]
     fn interleaved_pwrite_and_growth_ftruncate_never_shrinks_windowed_file() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let backing = run.rootfs_file("/win", 4096);
         let _pin = window(&run, &backing);
@@ -16530,6 +16539,7 @@ mod window_size_door {
     /// back down to 8 KiB.
     #[test]
     fn set_file_contents_never_extends_during_admitted_resize() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let backing = run.rootfs_file("/win", 0);
         let _pin = window(&run, &backing);
@@ -16613,6 +16623,7 @@ mod window_size_door {
     /// `SYS_TRUNCATE`, while directories, FIFOs, and RLIMIT_FSIZE still reject.
     #[test]
     fn writable_mount_truncate_without_check_truncate_override_succeeds() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         struct DefaultCheckWritableWrap {
             inner: Box<dyn carrick_vfs::Vfs>,
         }
@@ -16681,6 +16692,7 @@ mod window_size_door {
     /// creates the target cleanly.
     #[test]
     fn bind_creat_rdonly_trunc_through_dangling_symlink_creates_target() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
         let mut run = Run::new();
         let rw = tempfile::tempdir().unwrap();
         let missing = rw.path().join("created_via_link");
