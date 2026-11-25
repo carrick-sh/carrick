@@ -1144,7 +1144,7 @@ pub struct ScalerArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum ScalerAction {
     /// Standing Willow mode ON Willow: serve kernel-runtime.yml KVM jobs for
-    /// pushes to main and owner dispatches on main.
+    /// pushes to main, nightly schedules on main, and owner dispatches on main.
     Standing {
         #[arg(long, default_value = "/root/carrick-ci/state")]
         state_dir: PathBuf,

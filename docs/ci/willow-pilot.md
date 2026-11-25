@@ -69,7 +69,8 @@ times per job key.
 
 Pushes to main create runs; both controllers coalesce queued pushes to the
 newest run, recording older ones as `superseded by <newer sha>` before
-cancellation. No merge-group, PR or schedule runs are admitted. The trusted pre-push selector walks back from event.before
+cancellation. Pushes, nightly `schedule` runs, and owner `workflow_dispatch`
+runs on main are admitted; merge-group and PR runs are refused. The trusted pre-push selector walks back from event.before
 to the nearest receipted first-parent ancestor (50 commits maximum). The
 comparison uses that ancestor's code and reports unreceipted commits as a
 range in the summary/notice. Missing baselines and walk-limit exhaustion
@@ -192,7 +193,8 @@ build and CPL0 execution logs.
 Restart recovers successful JIT registration by its exact ledger name. Failed
 recorded tasks and absent reservations are distinguished from ambiguous clone
 POST outcomes. A successful recorded clone resumes preparation in place only
-for the same queued job/attempt, labels and approved SHA, using its live
+for the same queued job, attempt, labels, and standing run identity
+(`pending_owned_job`; SHA binding is vetted before registration), using its live
 configuration and existing transport key. Historical failures stay in the
 ledger.
 An ambiguous submission with neither an observable VM nor a
