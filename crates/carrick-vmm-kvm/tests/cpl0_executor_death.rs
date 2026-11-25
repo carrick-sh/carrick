@@ -42,8 +42,8 @@ fn run(
         &elf,
         256,
         KvmPoolTestControl {
-            loaded_pre_entry_hook: None,
             injected_death: Some(death),
+            ..KvmPoolTestControl::default()
         },
     )
 }
@@ -121,8 +121,8 @@ fn exec_sealed_then_executor_death_drains_at_carrier_exit() {
             inventory,
             dispatcher,
             KvmPoolTestControl {
-                loaded_pre_entry_hook: None,
                 injected_death: Some(KvmInjectedExecutorDeath::AfterExecSealed),
+                ..KvmPoolTestControl::default()
             },
             || baseline_mappings.set(authority.snapshot().mappings.len()),
         )
