@@ -664,99 +664,153 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
         Ok(ProcessSpec::new(self.vm.clone(), plan))
     }
     fn settle(mut self: Box<Self>, committed: bool) -> Result<(), TrapError> {
-        for owner in &self.published {
-            if !committed {
-                // Physical retirement is exact and precedes logical slot return.
-                let identity = owner.record_identity();
-                if identity.record_id.0 != 0 {
-                    match retire_structural_stage2_record_at_safe_point(
-                        &self.physical.custody,
-                        identity,
-                    ) {
-                        Ok(crate::trap::StructuralSafePointRetirement::Retired) => {}
-                        Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
-                            self.rollback_failed = true;
-                            return Err(TrapError::Hypervisor(
-                                "fork rollback structural backing retirement is still pinned"
-                                    .to_owned(),
-                            ));
-                        }
-                        Err(error) => {
-                            self.rollback_failed = true;
-                            return Err(error);
-                        }
-                    }
-                    if owner.record_identity().record_id.0 != 0
-                        || self
-                            .physical
-                            .custody
-                            .stage2_record_snapshot(identity.record_id)
-                            .is_some()
-                    {
-                        self.rollback_failed = true;
-                        return Err(TrapError::Hypervisor(
-                            "fork rollback structural backing remained unretired".to_owned(),
-                        ));
-                    }
-                }
+        if committed {
+            for owner in &self.published {
+                self.state
+                    .structural_owners
+                    .write()
+                    .remove(&(owner.physical_ipa, owner.physical_size));
             }
-            self.state
-                .structural_owners
-                .write()
-                .remove(&(owner.physical_ipa, owner.physical_size));
+            self.settled = true;
+            return Ok(());
         }
-        self.settled = true;
-        Ok(())
+        match retire_or_defer_published_fork_owners(
+            &self.physical.custody,
+            &self.state,
+            &self.published,
+        ) {
+            Ok(ForkOwnerRollbackOutcome::Settled) => {
+                self.settled = true;
+                Ok(())
+            }
+            Ok(ForkOwnerRollbackOutcome::DeferredActivePins) => {
+                self.rollback_failed = true;
+                Err(TrapError::Hypervisor(
+                    "fork rollback structural backing retirement is still pinned".to_owned(),
+                ))
+            }
+            Err(error) => {
+                self.rollback_failed = true;
+                Err(error)
+            }
+        }
     }
 }
-impl Drop for OwnerPhysicalForkBuilder {
-    fn drop(&mut self) {
-        if self.settled {
-            return;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) enum ForkOwnerRollbackOutcome {
+    Settled,
+    DeferredActivePins,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_or_defer_published_fork_owners(
+    custody: &CarrierVmCustody,
+    state: &Arc<MmAccessState>,
+    owners: &[Arc<StructuralBackingOwner>],
+) -> Result<ForkOwnerRollbackOutcome, TrapError> {
+    let mut deferred = false;
+    let mut first_error: Option<TrapError> = None;
+    for owner in owners {
+        let identity = owner.record_identity();
+        if identity.record_id.0 == 0 {
+            state.release_exact_structural_owner(owner);
+            continue;
         }
-        for owner in &self.published {
-            let identity = owner.record_identity();
-            if identity.record_id.0 == 0 {
-                self.state
-                    .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
-                continue;
+        match retire_structural_stage2_record_at_safe_point(custody, identity) {
+            Ok(crate::trap::StructuralSafePointRetirement::Retired) => {
+                if owner.record_identity().record_id.0 == 0
+                    && custody.stage2_record_snapshot(identity.record_id).is_none()
+                {
+                    state.release_exact_structural_owner(owner);
+                } else {
+                    custody.deferred_structural_owner_releases.lock().insert(
+                        identity.record_id,
+                        crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
+                            state: Arc::downgrade(state),
+                            owner: Arc::clone(owner),
+                        },
+                    );
+                    first_error.get_or_insert_with(|| {
+                        TrapError::Hypervisor(
+                            "fork rollback structural backing remained unretired".to_owned(),
+                        )
+                    });
+                }
             }
-            if self.rollback_failed {
-                continue;
-            }
-            let retired = match retire_structural_stage2_record_at_safe_point(
-                &self.physical.custody,
-                identity,
-            ) {
-                Ok(crate::trap::StructuralSafePointRetirement::Retired) => {
-                    if owner.record_identity().record_id.0 != 0
-                        || self
-                            .physical
-                            .custody
-                            .stage2_record_snapshot(identity.record_id)
-                            .is_some()
+            Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
+                custody.deferred_structural_owner_releases.lock().insert(
+                    identity.record_id,
+                    crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
+                        state: Arc::downgrade(state),
+                        owner: Arc::clone(owner),
+                    },
+                );
+                // Re-probe after registration so a concurrent last unpin between
+                // the initial probe and registration still settles logically.
+                match retire_structural_stage2_record_at_safe_point(custody, identity) {
+                    Ok(crate::trap::StructuralSafePointRetirement::Retired)
+                        if owner.record_identity().record_id.0 == 0
+                            && custody.stage2_record_snapshot(identity.record_id).is_none() =>
                     {
-                        Err("structural backing left live record".to_owned())
-                    } else {
-                        Ok(())
+                        if let Some(entry) =
+                            custody.take_deferred_structural_logical_release(identity.record_id)
+                        {
+                            entry.drain();
+                        } else {
+                            state.release_exact_structural_owner(owner);
+                        }
+                    }
+                    Ok(crate::trap::StructuralSafePointRetirement::Retired)
+                    | Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
+                        deferred = true;
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
                     }
                 }
-                Ok(crate::trap::StructuralSafePointRetirement::DeferredActivePins) => {
-                    // Active pins retain both the physical record and logical
-                    // structural owner slot until pin drain settles them.
-                    continue;
-                }
-                Err(error) => Err(error.to_string()),
-            };
-            retired.unwrap_or_else(|error| {
+            }
+            Err(error) => {
+                custody.deferred_structural_owner_releases.lock().insert(
+                    identity.record_id,
+                    crate::trap::carrier_custody::DeferredStructuralLogicalRelease {
+                        state: Arc::downgrade(state),
+                        owner: Arc::clone(owner),
+                    },
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else if deferred {
+        Ok(ForkOwnerRollbackOutcome::DeferredActivePins)
+    } else {
+        Ok(ForkOwnerRollbackOutcome::Settled)
+    }
+}
+
+impl Drop for OwnerPhysicalForkBuilder {
+    fn drop(&mut self) {
+        if self.settled || self.rollback_failed {
+            return;
+        }
+        retire_or_defer_published_fork_owners(&self.physical.custody, &self.state, &self.published)
+            .map(|_| ())
+            .unwrap_or_else(|error| {
                 carrick_fatal::carrick_fatal!(
                     "hvpatch::stage2_lifecycle",
                     "unpublished owner Fork capacity retirement failed: {error}"
                 );
             });
-            self.state
-                .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
-        }
     }
 }
 
@@ -805,13 +859,19 @@ impl HvfVmState {
             carrick_hal::MemPerms::ReadWriteExec,
             &mut raw,
         ) {
-            for region in &raw {
-                if let Some(owner) = &region.structural_owner {
-                    retire_carrier_stage2_record_at_safe_point(&custody, owner.record_identity())?;
-                }
-                state.release_structural_owner_at(region.physical_ipa, region.physical_size);
+            let owners = raw
+                .iter()
+                .filter_map(|region| region.structural_owner.clone())
+                .collect::<Vec<_>>();
+            let rollback = retire_or_defer_published_fork_owners(&custody, &state, &owners);
+            if !state
+                .structural_owners
+                .read()
+                .contains_key(&(control, ARENA as usize))
+            {
+                source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
             }
-            source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
+            let _ = rollback?;
             return Err(error);
         }
         let published = raw
@@ -819,16 +879,22 @@ impl HvfVmState {
             .filter_map(|region| region.structural_owner.clone())
             .collect::<Vec<_>>();
         if published.len() != 2 {
-            for region in &raw {
-                if let Some(owner) = &region.structural_owner {
-                    retire_carrier_stage2_record_at_safe_point(&custody, owner.record_identity())?;
-                }
-                state.release_structural_owner_at(region.physical_ipa, region.physical_size);
+            let rollback = retire_or_defer_published_fork_owners(&custody, &state, &published);
+            if !state
+                .structural_owners
+                .read()
+                .contains_key(&(control, ARENA as usize))
+            {
+                source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
             }
-            source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
-            return Err(TrapError::Hypervisor(
-                "owner child physical capacity was already published".into(),
-            ));
+            return Err(match rollback? {
+                ForkOwnerRollbackOutcome::Settled => TrapError::Hypervisor(
+                    "owner child physical capacity was already published".into(),
+                ),
+                ForkOwnerRollbackOutcome::DeferredActivePins => TrapError::Hypervisor(
+                    "owner child physical capacity cleanup deferred while pinned".into(),
+                ),
+            });
         }
         let authority = runtime.authority;
         let physical = ForkPhysicalCustody::new(

@@ -410,6 +410,24 @@ pub(crate) struct CarrierLeaseKeeperDirectory {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
+pub(crate) struct DeferredStructuralLogicalRelease {
+    pub(crate) state: std::sync::Weak<super::MmAccessState>,
+    pub(crate) owner: std::sync::Arc<super::global_frame::StructuralBackingOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl DeferredStructuralLogicalRelease {
+    pub(crate) fn drain(self) {
+        if let Some(mm) = self.state.upgrade() {
+            mm.release_exact_structural_owner(&self.owner);
+        } else {
+            self.owner.release_pooled_root_slot();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) enum TerminalReleaseClaim {
     AlreadyTerminal(Option<super::global_frame::LeaseBackingKeeper>),
     NeedsRelease { ipa: u64, length: u64 },
@@ -470,6 +488,9 @@ pub struct CarrierVmCustody {
             CarrierStage2RecordId,
             std::sync::Arc<StructuralBackingCustodyEntry>,
         >,
+    >,
+    pub(crate) deferred_structural_owner_releases: parking_lot::Mutex<
+        std::collections::BTreeMap<CarrierStage2RecordId, DeferredStructuralLogicalRelease>,
     >,
     /// IPA lookup for mapped structural and carrier-owned stage-2 records.
     /// The record-ID table owns their lifetime; this index only finds exact
@@ -879,6 +900,9 @@ impl CarrierVmCustody {
                 },
             ),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            deferred_structural_owner_releases: parking_lot::Mutex::new(
+                std::collections::BTreeMap::new(),
+            ),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_lease_keepers: parking_lot::Mutex::new(CarrierLeaseKeeperDirectory::default()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -2154,14 +2178,47 @@ pub(crate) type CarrierStage2Pin = carrick_core::mm::retirement::RecordPin<Carri
 impl CarrierVmCustody {
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
+    pub(crate) fn has_deferred_structural_logical_release(
+        &self,
+        record_id: CarrierStage2RecordId,
+    ) -> bool {
+        self.deferred_structural_owner_releases
+            .lock()
+            .contains_key(&record_id)
+    }
+
+    pub(crate) fn take_deferred_structural_logical_release(
+        &self,
+        record_id: CarrierStage2RecordId,
+    ) -> Option<DeferredStructuralLogicalRelease> {
+        self.deferred_structural_owner_releases
+            .lock()
+            .remove(&record_id)
+    }
+
+    pub(crate) fn rebind_deferred_structural_logical_release(
+        &self,
+        old_id: CarrierStage2RecordId,
+        new_id: CarrierStage2RecordId,
+    ) {
+        let mut deferred = self.deferred_structural_owner_releases.lock();
+        if let Some(entry) = deferred.remove(&old_id) {
+            deferred.insert(new_id, entry);
+        }
+    }
+
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
         use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
-        let (outcome, predecessor_keeper, abandoned_settlement) = {
+        let (outcome, settles_last_pin, predecessor_keeper, abandoned_settlement) = {
             let mut state = self.stage2.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return;
             };
             let outcome = release_record_pin_outcome(record, identity);
+            let settles_last_pin = matches!(
+                outcome,
+                RecordPinRelease::ReadyToRetry | RecordPinRelease::ReadyToRetire { .. }
+            );
             let mut predecessor_keeper = None;
             let mut abandoned_settlement = None;
             if outcome == RecordPinRelease::RemovePredecessor {
@@ -2172,7 +2229,7 @@ impl CarrierVmCustody {
                     .entries
                     .remove(&identity.record_id)
                     .map(CarrierLeaseKeeperState::into_keeper);
-            } else if outcome == RecordPinRelease::ReadyToRetry
+            } else if settles_last_pin
                 && record.snapshot.terminalized_by_vm_destroy
                 && record.snapshot.pin_count == 0
                 && !record.snapshot.release_in_flight
@@ -2194,7 +2251,12 @@ impl CarrierVmCustody {
                     abandoned_settlement = Some((keeper, release_ipa));
                 }
             }
-            (outcome, predecessor_keeper, abandoned_settlement)
+            (
+                outcome,
+                settles_last_pin,
+                predecessor_keeper,
+                abandoned_settlement,
+            )
         };
         drop(predecessor_keeper);
         if let Some((keeper, release_ipa)) = abandoned_settlement {
@@ -2204,7 +2266,9 @@ impl CarrierVmCustody {
             }
             return;
         }
-        if outcome == RecordPinRelease::ReadyToRetry {
+        if settles_last_pin && self.has_deferred_structural_logical_release(identity.record_id) {
+            let _ = super::retire_structural_stage2_record_at_safe_point(self, identity);
+        } else if outcome == RecordPinRelease::ReadyToRetry {
             self.request_global_frame_retirement_retry();
         } else if let RecordPinRelease::ReadyToRetire { ipa } = outcome {
             if self.is_active_root_slot_pool_ipa(ipa) {
@@ -7563,6 +7627,296 @@ mod carrier_vm_custody_tests {
             "dropping last predecessor pin must release backing"
         );
         let _ = g1;
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn pinned_abandoned_fixed_and_reserved_batch_records_drain_on_last_unpin_after_destroy() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g0) = live_custody();
+        destroy_vm_with_custody_using(
+            &custody,
+            "destroy G0 before G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G0");
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let len = 0x4000_usize;
+
+        // 1. Fixed-IPA (`release_ipa == false`) prefix lease pinned across mid-batch failure.
+        let fixed_ipa = 0x2400_0000_u64;
+        let fixed_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate fixed backing");
+        let fixed_host = fixed_backing.as_ptr() as usize;
+        let fixed_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            fixed_backing.as_ptr().cast(),
+            fixed_ipa,
+            len,
+            perms,
+        );
+        let mut fixed_lease = super::GlobalFrameStage2Lease::fixed(fixed_ipa, len as u64);
+        fixed_lease.mark_mapped(fixed_stage2);
+        fixed_lease.set_backing_keeper(super::LeaseBackingKeeper::Host(std::sync::Arc::new(
+            super::GlobalFrameSharedMapping::new(fixed_backing),
+        )));
+
+        // 2. Allocator-reserved (`release_ipa == true`) prefix lease also pinned across mid-batch failure.
+        let res_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate reserved backing");
+        let res_host = res_backing.as_ptr() as usize;
+        let mut res_lease =
+            super::GlobalFrameStage2Lease::reserve(len as u64, len as u64).expect("reserve IPA");
+        let res_ipa = res_lease.base();
+        let res_stage2 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            res_backing.as_ptr().cast(),
+            res_ipa,
+            len,
+            perms,
+        );
+        res_lease.mark_mapped(res_stage2);
+        res_lease.set_backing_keeper(super::LeaseBackingKeeper::Host(std::sync::Arc::new(
+            super::GlobalFrameSharedMapping::new(res_backing),
+        )));
+
+        // 3. Stale G0 lease in the same batch triggers mid-batch failure; pin both prefixes
+        // deterministically when rollback reaches CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE.
+        let stale_backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate stale backing");
+        let stale_host = stale_backing.as_ptr() as usize;
+        let mut stale_lease =
+            super::GlobalFrameStage2Lease::reserve(len as u64, len as u64).expect("reserve stale");
+        let stale_ipa = stale_lease.base();
+        stale_lease.mark_pre_mapped_in(Some(g0));
+        stale_lease.set_backing_keeper(super::LeaseBackingKeeper::Host(std::sync::Arc::new(
+            super::GlobalFrameSharedMapping::new(stale_backing),
+        )));
+
+        let (pin_ready_tx, pin_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        custody
+            .stage2
+            .set_hook(Some(std::sync::Arc::new(move |point| {
+                if matches!(
+                    point,
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                        super::CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE
+                    )
+                ) {
+                    pin_ready_tx.send(()).expect("notify rollback hook");
+                    resume_rx
+                        .lock()
+                        .expect("resume lock")
+                        .recv()
+                        .expect("resume rollback");
+                }
+            })));
+        let owners = std::collections::BTreeMap::from([
+            ((fixed_ipa, len as u64), fixed_host),
+            ((res_ipa, len as u64), res_host),
+            ((stale_ipa, len as u64), stale_host),
+        ]);
+        let batch_custody = std::sync::Arc::clone(&custody);
+        let batch_thread = std::thread::spawn(move || {
+            let mut batch = vec![fixed_lease, res_lease, stale_lease];
+            super::register_carrier_stage2_leases(&batch_custody, &mut batch, &owners)
+        });
+        pin_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("batch rollback must hit CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE");
+        let fixed_id = custody.carrier_stage2_records.lock()[&(fixed_ipa, len as u64)];
+        let res_id = custody.carrier_stage2_records.lock()[&(res_ipa, len as u64)];
+        let fixed_pin = custody
+            .pin_stage2_record(fixed_id)
+            .expect("pin fixed prefix");
+        let res_pin = custody
+            .pin_stage2_record(res_id)
+            .expect("pin reserved prefix");
+        resume_tx.send(()).expect("resume batch rollback");
+        let batch_err = batch_thread
+            .join()
+            .expect("batch thread")
+            .expect_err("mid-batch stale lease must roll back");
+        let _ = batch_err;
+        custody.stage2.set_hook(None);
+
+        // Pinned prefixes MUST be detached from `carrier_stage2_records`, marked Abandoned,
+        // and retained across `destroy_stage2` + `commit_destroy(g1)`.
+        assert!(
+            custody.carrier_stage2_records.lock().is_empty(),
+            "deferred batch rollback must detach pinned prefixes from replay directory"
+        );
+        assert!(custody.carrier_lease_keepers.lock().entries[&fixed_id.record_id].is_abandoned());
+        assert!(custody.carrier_lease_keepers.lock().entries[&res_id.record_id].is_abandoned());
+        assert!(!super::alias_backing_is_live(stale_host));
+
+        custody.begin_destroy(g1).expect("begin destroy G1");
+        custody.destroy_stage2_for_test(g1);
+        custody.commit_destroy(g1).expect("commit destroy G1");
+        assert_eq!(custody.carrier_lease_keepers.lock().drained_through, g1.0);
+        assert!(super::alias_backing_is_live(fixed_host));
+        assert!(super::alias_backing_is_live(res_host));
+        assert!(custody.stage2_record_snapshot(fixed_id.record_id).is_some());
+        assert!(custody.stage2_record_snapshot(res_id.record_id).is_some());
+
+        // Dropping each pin AFTER destroy must settle both fixed (`ReadyToRetire`) and
+        // reserved (`ReadyToRetry`) abandoned records immediately!
+        drop(fixed_pin);
+        assert!(
+            custody.stage2_record_snapshot(fixed_id.record_id).is_none(),
+            "fixed-IPA abandoned record must settle on last unpin after destroy"
+        );
+        assert!(!super::alias_backing_is_live(fixed_host));
+
+        drop(res_pin);
+        assert!(
+            custody.stage2_record_snapshot(res_id.record_id).is_none(),
+            "reserved-IPA abandoned record must settle on last unpin after destroy"
+        );
+        assert!(!super::alias_backing_is_live(res_host));
+        assert!(
+            !super::global_frame_ipa_allocator()
+                .lock()
+                .is_live(res_ipa, len as u64)
+        );
+        assert!(custody.carrier_lease_keepers.lock().entries.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn fork_builder_rollback_with_pinned_owner_retains_slot_until_last_unpin_and_settles_sibling() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let g1 = custody.begin_create().expect("begin G1");
+        custody.commit_create(g1).expect("commit G1");
+
+        let pool = custody
+            .root_slot_pool()
+            .expect("create root slot pool in G1");
+        let handle0 = pool.allocate_slot().expect("checkout pooled root slot");
+        let ipa0 = handle0.ipa();
+        let len0 = handle0.len();
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+        let mut lease0 = super::GlobalFrameStage2Lease::fixed(ipa0, len0 as u64);
+        lease0.mark_pre_mapped_in(Some(g1));
+        let epoch0 = super::next_structural_epoch().expect("epoch0");
+        let owner0 = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody, handle0, lease0, perms, epoch0, ipa0, len0,
+        )
+        .expect("structural owner0");
+        let id0 = owner0.record_identity();
+
+        let ipa1 = 0x2500_0000_u64;
+        let len1 = 0x4000_usize;
+        let backing1 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len1,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("backing1");
+        let ptr1 = backing1.as_ptr() as usize;
+        let stage2_1 = super::super::stage2_backend::test_stage2_map(
+            &custody,
+            backing1.as_ptr().cast(),
+            ipa1,
+            len1,
+            perms,
+        );
+        let mut lease1 = super::GlobalFrameStage2Lease::fixed(ipa1, len1 as u64);
+        lease1.mark_mapped(stage2_1);
+        let epoch1 = super::next_structural_epoch().expect("epoch1");
+        let owner1 = super::StructuralBackingOwner::new_in(
+            &custody, backing1, lease1, perms, epoch1, ipa1, len1,
+        )
+        .expect("structural owner1");
+        let id1 = owner1.record_identity();
+
+        let mm_access = super::MmAccessState::new_unbound(
+            carrick_aarch64::Stage1Authority::new(),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                super::MemoryProtections::default(),
+            )),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                super::HvpatchFrameInventory::default(),
+            )),
+            std::sync::Arc::new(parking_lot::Mutex::new(super::CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+        );
+        mm_access.install_structural_owner(std::sync::Arc::clone(&owner0));
+        mm_access.install_structural_owner(std::sync::Arc::clone(&owner1));
+
+        // Pin owner0 across fork rollback while owner1 has zero pins.
+        let pin0 = custody.pin_stage2_record(id0).expect("pin owner0");
+        let outcome = super::owner_fork::retire_or_defer_published_fork_owners(
+            &custody,
+            &mm_access,
+            &[
+                std::sync::Arc::clone(&owner0),
+                std::sync::Arc::clone(&owner1),
+            ],
+        )
+        .expect("defer outcome cleanly");
+        assert_eq!(
+            outcome,
+            super::owner_fork::ForkOwnerRollbackOutcome::DeferredActivePins
+        );
+
+        // Sibling owner1 MUST be settled and removed from BOTH structural_backings and MM structural_owners.
+        assert!(custody.stage2_record_snapshot(id1.record_id).is_none());
+        assert!(
+            !custody
+                .structural_backings
+                .lock()
+                .contains_key(&id1.record_id)
+        );
+        assert!(mm_access.structural_owner_host_ptr(ipa1, len1).is_none());
+        assert_eq!(
+            owner1.record_identity(),
+            super::cleared_stage2_record_identity()
+        );
+        drop(owner1);
+        assert!(!super::alias_backing_is_live(ptr1));
+
+        // Pinned owner0 MUST stay in structural_owners and pooled root slot stays allocated!
+        assert!(custody.stage2_record_snapshot(id0.record_id).is_some());
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&id0.record_id)
+        );
+        assert!(mm_access.structural_owner_host_ptr(ipa0, len0).is_some());
+        assert!(custody.has_deferred_structural_logical_release(id0.record_id));
+        drop(owner0);
+
+        // Once last pin drops, BOTH physical record AND parent MM structural_owners + pooled slot release!
+        drop(pin0);
+        assert!(custody.stage2_record_snapshot(id0.record_id).is_none());
+        assert!(custody.structural_backings.lock().is_empty());
+        assert!(mm_access.structural_owner_host_ptr(ipa0, len0).is_none());
+        assert!(!custody.has_deferred_structural_logical_release(id0.record_id));
+        // Pooled root slot was returned to pool -> can allocate again.
+        let reallocated = pool
+            .allocate_slot()
+            .expect("pooled root slot released on last unpin");
+        reallocated.release_slot();
     }
 
     #[test]

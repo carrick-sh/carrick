@@ -2150,11 +2150,26 @@ pub(crate) fn register_carrier_stage2_leases(
     }
     if let Some((error, mut failed_lease)) = transfer_error {
         drop(registered);
+        #[cfg(test)]
+        custody
+            .stage2
+            .at_client_point(CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE);
         let mut rollback_error = None;
         for identity in identities {
-            if let Err(retire_err) = retire_carrier_stage2_record_at_safe_point(custody, identity) {
-                rollback_error.get_or_insert(retire_err);
-                custody.abandon_carrier_stage2_record(identity);
+            match retire_carrier_stage2_record_at_safe_point_outcome(custody, identity) {
+                Ok(CarrierSafePointRetirement::Retired) => {}
+                Ok(CarrierSafePointRetirement::DeferredActivePins) => {
+                    rollback_error.get_or_insert_with(|| {
+                        TrapError::Hypervisor(
+                            "carrier stage-2 batch rollback deferred while pinned".to_owned(),
+                        )
+                    });
+                    custody.abandon_carrier_stage2_record(identity);
+                }
+                Err(retire_err) => {
+                    rollback_error.get_or_insert(retire_err);
+                    custody.abandon_carrier_stage2_record(identity);
+                }
             }
         }
         if let Err(retire_err) = failed_lease.try_retire(custody) {
@@ -2243,10 +2258,35 @@ pub(crate) fn take_carrier_stage2_record_if_owner(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(crate) enum CarrierSafePointRetirement {
+    Retired,
+    DeferredActivePins,
+}
+
+#[cfg(test)]
+pub(crate) const CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE: &str =
+    "carrier batch rollback before retire";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_carrier_stage2_record_at_safe_point(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
 ) -> Result<(), TrapError> {
+    retire_carrier_stage2_record_at_safe_point_outcome(custody, identity).map(|_| ())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_carrier_stage2_record_at_safe_point_outcome(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+) -> Result<CarrierSafePointRetirement, TrapError> {
     retire_carrier_stage2_record_at_safe_point_with(
         custody,
         identity,
@@ -2268,6 +2308,7 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
         move |custody, identity| custody.retire_stage2_record_using(identity, unmap),
         &mut release,
     )
+    .map(|_| ())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2314,13 +2355,24 @@ pub(crate) fn retire_structural_stage2_record_at_safe_point(
             };
             drop(extracted);
             drop_carrier_lease_keeper(custody, identity.record_id);
+            if let Some(deferred) =
+                custody.take_deferred_structural_logical_release(identity.record_id)
+            {
+                deferred.drain();
+            }
             Ok(StructuralSafePointRetirement::Retired)
         }
         CarrierStage2RetireOutcome::NotFound => {
             let retained_by_record = custody.structural_backings.lock();
-            if !retained_by_record.contains_key(&identity.record_id)
-                && custody.stage2_record_snapshot(identity.record_id).is_none()
-            {
+            let absent = !retained_by_record.contains_key(&identity.record_id)
+                && custody.stage2_record_snapshot(identity.record_id).is_none();
+            drop(retained_by_record);
+            if absent {
+                if let Some(deferred) =
+                    custody.take_deferred_structural_logical_release(identity.record_id)
+                {
+                    deferred.drain();
+                }
                 Ok(StructuralSafePointRetirement::Retired)
             } else {
                 Err(TrapError::Hypervisor(
@@ -2344,7 +2396,7 @@ fn retire_carrier_stage2_record_at_safe_point_with(
     identity: CarrierStage2RecordIdentity,
     retire: impl FnOnce(&CarrierVmCustody, CarrierStage2RecordIdentity) -> CarrierStage2RetireOutcome,
     release: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
-) -> Result<(), TrapError> {
+) -> Result<CarrierSafePointRetirement, TrapError> {
     let snapshot = custody
         .stage2_record_snapshot(identity.record_id)
         .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
@@ -2368,7 +2420,12 @@ fn retire_carrier_stage2_record_at_safe_point_with(
                 };
                 drop(extracted);
                 drop_carrier_lease_keeper(custody, identity.record_id);
-                return Ok(());
+                if let Some(deferred) =
+                    custody.take_deferred_structural_logical_release(identity.record_id)
+                {
+                    deferred.drain();
+                }
+                return Ok(CarrierSafePointRetirement::Retired);
             }
             match custody.claim_terminal_stage2_release_with_keeper(identity) {
                 Ok(super::carrier_custody::TerminalReleaseClaim::AlreadyTerminal(keeper)) => {
@@ -2386,7 +2443,7 @@ fn retire_carrier_stage2_record_at_safe_point_with(
                 | Err(CarrierStage2RecordError::RecordIdentityMismatch)
                     if custody.carrier_stage2_records.lock().get(&key) != Some(&identity) =>
                 {
-                    return Ok(());
+                    return Ok(CarrierSafePointRetirement::Retired);
                 }
                 Err(error) => {
                     return Err(TrapError::Hypervisor(format!(
@@ -2398,9 +2455,11 @@ fn retire_carrier_stage2_record_at_safe_point_with(
             if records.get(&key) == Some(&identity) {
                 records.remove(&key);
             }
-            Ok(())
+            Ok(CarrierSafePointRetirement::Retired)
         }
-        CarrierStage2RetireOutcome::DeferredActivePins => Ok(()),
+        CarrierStage2RetireOutcome::DeferredActivePins => {
+            Ok(CarrierSafePointRetirement::DeferredActivePins)
+        }
         outcome => Err(TrapError::Hypervisor(format!(
             "retire carrier stage-2 record at safe point: {outcome:?}"
         ))),
@@ -3736,6 +3795,11 @@ fn retry_structural_backing_identities_with(
                 };
                 drop(extracted);
                 drop_carrier_lease_keeper(custody, identity.record_id);
+                if let Some(deferred) =
+                    custody.take_deferred_structural_logical_release(identity.record_id)
+                {
+                    deferred.drain();
+                }
             }
             CarrierStage2RetireOutcome::DeferredActivePins
             | CarrierStage2RetireOutcome::NotFound => {}
@@ -4317,6 +4381,10 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             *retained.record_identity.lock() = new_identity;
             retained_by_record.remove(&old_identity.record_id);
             retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
+            custody.rebind_deferred_structural_logical_release(
+                old_identity.record_id,
+                new_identity.record_id,
+            );
             drop(stage2);
             drop(retained_by_record);
             let _ = custody.remove_terminal_stage2_record(old_identity);
@@ -4343,6 +4411,10 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         drop(retained_by_record);
         drop(extracted);
         drop_carrier_lease_keeper(custody, identity.record_id);
+        if let Some(deferred) = custody.take_deferred_structural_logical_release(identity.record_id)
+        {
+            deferred.drain();
+        }
         report.retired += 1;
     }
     Ok(report)

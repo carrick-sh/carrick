@@ -1240,6 +1240,30 @@ impl MmAccessState {
         }
     }
 
+    pub(crate) fn release_exact_structural_owner(
+        &self,
+        expected: &std::sync::Arc<StructuralBackingOwner>,
+    ) {
+        let key = (expected.physical_ipa, expected.physical_size);
+        let removed = {
+            let mut owners = self.structural_owners.write();
+            if owners
+                .get(&key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, expected))
+            {
+                owners.remove(&key)
+            } else {
+                None
+            }
+        };
+        if let Some(owner) = removed {
+            owner.release_pooled_root_slot();
+            drop(owner);
+        } else {
+            expected.release_pooled_root_slot();
+        }
+    }
+
     pub(crate) fn install_structural_owner(&self, owner: std::sync::Arc<StructuralBackingOwner>) {
         let key = (owner.physical_ipa, owner.physical_size);
         self.structural_owners.write().insert(key, owner);
