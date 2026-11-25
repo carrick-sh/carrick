@@ -2594,6 +2594,10 @@ fn exec_owner_census_of<Mem: CarrierMemoryIo>(
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
+    pub const fn cpu(&self) -> &CarrierCpu<M> {
+        &self.cpu
+    }
+
     pub fn cpu_mut(&mut self) -> &mut CarrierCpu<M> {
         &mut self.cpu
     }
