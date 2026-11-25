@@ -43,11 +43,11 @@ impl MemoryTestIo {
             fail_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
-    fn fail_region_call(&self, call: usize) {
+    pub fn fail_region_call(&self, call: usize) {
         self.calls.store(0, Ordering::Relaxed);
         self.fail_at.store(call, Ordering::Relaxed);
     }
-    fn clear_region_failure(&self) {
+    pub fn clear_region_failure(&self) {
         self.fail_at.store(usize::MAX, Ordering::Relaxed);
     }
 }

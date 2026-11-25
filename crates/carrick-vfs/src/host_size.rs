@@ -231,6 +231,11 @@ fn reopen_truncating(owned: OwnedFd, _flags: libc::c_int) -> Result<OwnedFd, lib
 /// Record the host file `fd` names as mapped by a shared file window,
 /// before the window's source is retained. `None` (nothing recorded) when
 /// its identity cannot be read: the caller must not window it.
+/// Return the `(device, inode)` identity of `fd` without pinning it.
+pub fn identity(fd: BorrowedFd<'_>) -> Option<InodeIdentity> {
+    fstat(fd.as_raw_fd()).map(|stat| identity_of(&stat))
+}
+
 pub fn record(fd: BorrowedFd<'_>) -> Option<InodeIdentity> {
     let stat = fstat(fd.as_raw_fd())?;
     let identity = identity_of(&stat);

@@ -3080,8 +3080,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         reply: &carrick_el1_abi::PortalGrantSlot,
         stock_observed: carrick_hal::fork_stock::StockRelease,
     ) -> Result<Result<BackingPreparation, PlanBusy>, TrapError> {
-        use carrick_core::mm::window::{WINDOW_CHUNK_BYTES, WindowChunk};
-        use std::os::fd::AsFd;
+        use carrick_core::mm::window::WindowChunk;
         let source = window
             .host_backing
             .ok_or_else(|| fail("window fault source absent"))?;
@@ -3097,34 +3096,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let chunk = WindowChunk::of_offset(offset);
         let key = (file.device, file.inode, chunk.index());
-        let (handle, base, identity) = match self.window_slots.get(&key) {
-            Some(slot) => *slot,
-            None => {
-                let base = self.anonymous_next_gpa;
-                self.anonymous_next_gpa = FrameGpa::new(
-                    base.raw()
-                        .checked_add(WINDOW_CHUNK_BYTES)
-                        .ok_or_else(|| fail("window slot GPA exhausted"))?,
-                );
-                let extent = BackingExtent::host_file_window(
-                    base,
-                    file.fd.as_fd(),
-                    chunk.start(),
-                    WINDOW_CHUNK_BYTES as usize,
-                )
-                .map_err(|error| fail(error.to_string()))?;
-                let identity = crate::cpl0_boot::backing_identity(&*self.frame_inventory)?;
-                let handle = self
-                    ._vm
-                    .install(&[PreparedBacking {
-                        extent: Arc::new(extent),
-                        identity,
-                    }])
-                    .map_err(|error| fail(error.to_string()))?[0];
-                self.window_slots.insert(key, (handle, base, identity));
-                (handle, base, identity)
-            }
-        };
+        let (handle, base, identity) = self
+            .window_slots
+            .get(&key)
+            .copied()
+            .ok_or_else(|| fail("missing admitted window slot"))?;
         let edge = self
             ._vm
             .share(handle)
@@ -3489,23 +3465,168 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         Ok(bytes)
     }
 
+    /// Admit and install every host-file window chunk overlapping a replied
+    /// `MapShared` mapping before the guest sees the mapping reply, so slot
+    /// exhaustion fails `mmap` with `-ENOSYS` instead of trapping on touch.
+    fn install_window_mapping(
+        &mut self,
+        bytes: &mut [u8],
+        source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+        admit_window_inode: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> bool,
+    ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, TrapError> {
+        use carrick_core::mm::window::{WINDOW_CHUNK_BYTES, WindowChunk};
+        use carrick_core_abi::host_file::{refuse_written_reply, replied_parts};
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let Some((header, _, _)) = replied_parts(bytes) else {
+            return Err(fail("replied window record absent"));
+        };
+        let refuse = |bytes: &mut [u8], errno: i64| -> Result<Option<_>, TrapError> {
+            refuse_written_reply(bytes, errno)
+                .map_err(|_| fail("host file window refusal reply"))?;
+            Ok(None)
+        };
+        const PAGE: u64 = 4096;
+        let offset = header.args[0];
+        let length = header.args[1];
+        let Some(aligned_len) = length.checked_next_multiple_of(PAGE) else {
+            return refuse(bytes, carrick_abi::LINUX_EINVAL.guest_retval());
+        };
+        if aligned_len == 0 || !offset.is_multiple_of(PAGE) {
+            return refuse(bytes, carrick_abi::LINUX_EINVAL.guest_retval());
+        }
+        let Some(end) = offset.checked_add(aligned_len) else {
+            return refuse(bytes, carrick_abi::LINUX_EINVAL.guest_retval());
+        };
+        let last_chunk_obj = WindowChunk::of_offset(end - 1);
+        let first_chunk = WindowChunk::of_offset(offset).index();
+        let last_chunk = last_chunk_obj.index();
+        if libc::off_t::try_from(last_chunk_obj.start()).is_err() {
+            return refuse(bytes, carrick_abi::LINUX_EINVAL.guest_retval());
+        }
+
+        let file = std::fs::File::from(
+            source
+                .host_file()
+                .ok_or_else(|| fail("shared file window source has no host file"))?,
+        );
+        let metadata = file
+            .metadata()
+            .map_err(|error| fail(format!("shared file window stat: {error}")))?;
+        let device = metadata.dev();
+        let inode = metadata.ino();
+
+        let available = self.custody._vm.available_window_slots();
+        let span_chunks = last_chunk - first_chunk + 1;
+        if span_chunks.saturating_sub(self.custody.window_slots.len() as u64) > available as u64 {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        }
+        let mut missing = Vec::new();
+        for chunk_index in first_chunk..=last_chunk {
+            let key = (device, inode, chunk_index);
+            if !self.custody.window_slots.contains_key(&key) {
+                if missing.len() >= available {
+                    return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+                }
+                missing.push(key);
+            }
+        }
+
+        let Some(budget) = self.custody._vm.admit_window_slots(missing.len()) else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+        if missing.is_empty() {
+            self.custody
+                ._vm
+                .install_window_slots(budget, &[])
+                .map_err(|error| fail(error.to_string()))?;
+            return Ok(Some(source));
+        }
+
+        let Some(needed_gpa) = (missing.len() as u64).checked_mul(WINDOW_CHUNK_BYTES) else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+        let Some(next_gpa) = self
+            .custody
+            .anonymous_next_gpa
+            .raw()
+            .checked_add(needed_gpa)
+        else {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        };
+        if next_gpa > (1u64 << 52) {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        }
+
+        if !admit_window_inode(file.as_fd()) {
+            return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+        }
+
+        let start_gpa = self.custody.anonymous_next_gpa.raw();
+        let mut prepared = Vec::with_capacity(missing.len());
+        let mut staged = Vec::with_capacity(missing.len());
+        for (index, &key) in missing.iter().enumerate() {
+            let base = FrameGpa::new(start_gpa + index as u64 * WINDOW_CHUNK_BYTES);
+            let chunk_start = key.2 * WINDOW_CHUNK_BYTES;
+            let Ok(extent) = BackingExtent::host_file_window(
+                base,
+                file.as_fd(),
+                chunk_start,
+                WINDOW_CHUNK_BYTES as usize,
+            ) else {
+                return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+            };
+            let identity = crate::cpl0_boot::backing_identity(&*self.custody.frame_inventory)?;
+            prepared.push(PreparedBacking {
+                extent: Arc::new(extent),
+                identity,
+            });
+            staged.push((key, base, identity));
+        }
+
+        let handles = match self.custody._vm.install_window_slots(budget, &prepared) {
+            Ok(handles) => handles,
+            Err(error) => {
+                if self.custody._vm.is_quarantined() {
+                    return Err(fail(error.to_string()));
+                }
+                return refuse(bytes, carrick_abi::LINUX_ENOSYS.guest_retval());
+            }
+        };
+        self.custody.anonymous_next_gpa = FrameGpa::new(next_gpa);
+        for ((key, base, identity), handle) in staged.into_iter().zip(handles) {
+            self.custody
+                .window_slots
+                .insert(key, (handle, base, identity));
+        }
+        Ok(Some(source))
+    }
+
     /// Retain the source before making its reply visible in the exact caller MM.
     pub fn complete_host_file(
         &mut self,
         address: carrick_guest_arch::KernelVa,
-        bytes: &[u8],
+        bytes: &mut [u8],
         source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+        admit_window_inode: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> bool,
     ) -> Result<(), TrapError> {
         // Reauthenticate the entire retained output after the host service ran.
         self.custody
             .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
         if let Some(source) = source {
-            let window = replied_map_source_is_window(bytes)?;
-            let sources = self.custody.sources_mut(self.execution.context)?;
-            if window {
-                sources.inherit_window(source);
+            if replied_map_source_is_window(bytes)? {
+                if let Some(source) =
+                    self.install_window_mapping(bytes, source, admit_window_inode)?
+                {
+                    self.custody
+                        .sources_mut(self.execution.context)?
+                        .inherit_window(source);
+                }
             } else {
-                sources.inherit(source);
+                self.custody
+                    .sources_mut(self.execution.context)?
+                    .inherit(source);
             }
         }
         let physical =
@@ -3554,7 +3675,6 @@ pub(super) enum FileContents {
 }
 /// The host file behind a shared file window, read outside carrier custody.
 pub(super) struct WindowFile {
-    fd: std::os::fd::OwnedFd,
     device: u64,
     inode: u64,
     /// The file's size when the fault was served.
@@ -3583,7 +3703,6 @@ impl FileSupplyRequest {
                     device: metadata.dev(),
                     inode: metadata.ino(),
                     len: metadata.len(),
-                    fd: file.into(),
                 }),
             });
         }

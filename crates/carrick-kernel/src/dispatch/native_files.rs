@@ -391,6 +391,16 @@ impl SyscallDispatcher {
 
     /// Serve a request whose authenticated member retains host-root resources.
     /// Descriptor allocation still belongs exclusively to the ring namespace.
+    /// Record `fd` in the host size door and recall any in-zone delegation once
+    /// the carrier's `WindowSlotBudget` admits a shared file window (#1338 A1).
+    pub fn admit_window_inode(&self, fd: std::os::fd::BorrowedFd<'_>) -> bool {
+        let Some(identity) = carrick_vfs::host_size::record(fd) else {
+            return false;
+        };
+        crate::el1_delegation::recall_inode(identity);
+        true
+    }
+
     pub fn serve_host_root_file(
         &self,
         resources: &super::resources::HostRootResources,
@@ -1928,26 +1938,22 @@ impl SyscallDispatcher {
             Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
             _ => return Served::Refused,
         };
-        // A window maps the host file's own pages: record its inode before
-        // the source exists, so every later shrink of it, by any process of
-        // the run, is fenced (#1338 A1). An inode the fence cannot name is
-        // never windowed.
-        if route == NativeMapRoute::Window {
-            let identity = description
+        // Verify the host file's inode can be named by the shrink fence before
+        // returning a window source. Actual pinning in `host_size::WINDOWED`
+        // and delegation recall wait until the carrier's `WindowSlotBudget`
+        // admits the mapping (#1338 A1, #2975 P0 3).
+        if route == NativeMapRoute::Window
+            && !description
                 .inspect_kind(|open| match open {
                     crate::dispatch::OpenDescription::HostFile { host_fd, .. } => {
-                        carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(host_fd))
+                        carrick_vfs::host_size::identity(std::os::fd::AsFd::as_fd(host_fd))
+                            .is_some()
                     }
-                    _ => None,
+                    _ => false,
                 })
-                .flatten();
-            let Some(identity) = identity else {
-                return Served::Refused;
-            };
-            // An in-zone copy of the inode leaves the zone first: its later
-            // writeback would rewrite the window's pages from older bytes.
-            // Delegation refuses a windowed inode from now on.
-            crate::el1_delegation::recall_inode(identity);
+                .unwrap_or(false)
+        {
+            return Served::Refused;
         }
         match self.mem().retain_native_private_source(reference, label) {
             Some((source, identity)) => Served::Source(
