@@ -3608,3 +3608,129 @@ fn install_refuses_a_page_inside_the_reserve() {
     assert!(TableReserve::new(FrameGpa::new(0x1001), FrameGpa::new(0x3000)).is_none());
     assert!(TableReserve::new(FrameGpa::new(0x3000), FrameGpa::new(0x1000)).is_none());
 }
+
+/// #3017 review P0-1: returnable custody distinguishes temporary table
+/// contention from terminal exhaustion, and when the last returnable holder
+/// commits 100% of its tables (or becomes indeterminate) with zero unused
+/// pages returned, enrolled waiters still wake once to observe terminal
+/// exhaustion instead of waiting forever.
+#[test]
+fn returnable_tables_distinguishes_temporary_custody_and_wakes_when_exhausted() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut stock = stock(UntaggedRoots, 6, 2);
+    let root = parent();
+    // SAFETY: this fixture owns the admitted initial MM.
+    let root_owner =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(PARENT_MM), NonZeroU64::MIN) };
+    stock.register_root(root_owner, root.context.root).unwrap();
+    assert_eq!(stock.returnable_tables(), 0);
+    let before = stock.table_release();
+    assert_eq!(stock.table_shortage(before), TableShortage::Spent);
+
+    // 1. Exec successor reservation: returnable while held, wakes even when 100% used.
+    let reserved = stock.reserve_successor_tables(2).unwrap();
+    assert_eq!(stock.returnable_tables(), 2);
+    assert_eq!(stock.table_shortage(before), TableShortage::Returnable);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let observed = stock.table_release();
+    let count = Arc::clone(&wakes);
+    assert!(!stock.enrol_release(
+        observed,
+        StockReleaseWake::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+    let _used = stock.take_built_successor_tables(reserved, 2).unwrap();
+    assert_eq!(stock.returnable_tables(), 0);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        1,
+        "100%-used successor reservation wakes waiter as returnable_tables reaches 0"
+    );
+    // Nothing returnable is left, yet the epoch moved since `before`: a
+    // probe that observed `before` reruns once; a fresh one sees the window
+    // spent.
+    assert_eq!(stock.table_shortage(before), TableShortage::Returnable);
+    assert_eq!(
+        stock.table_shortage(stock.table_release()),
+        TableShortage::Spent
+    );
+
+    // 2. Pending fork loan: returnable while pending, wakes even when 100% committed.
+    let granted = loan(&mut stock, root, 302, 2, 1).unwrap();
+    assert_eq!(stock.returnable_tables(), 3);
+    let observed = stock.table_release();
+    let count = Arc::clone(&wakes);
+    assert!(!stock.enrol_release(
+        observed,
+        StockReleaseWake::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+    commit(&mut stock, root, granted, 2, 1).unwrap();
+    assert_eq!(stock.returnable_tables(), 0);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2,
+        "100%-committed fork loan wakes waiter as returnable_tables reaches 0"
+    );
+
+    // 3. Pending descriptor tables: returnable while tracked, wakes when 100% linked.
+    let child = child_of(granted, 44);
+    let child_owner = stock.child_owner(granted.request.child_mm).unwrap();
+    let desc = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, child_owner, child.context.root, 1)
+        .unwrap();
+    let txn = backing_txn(child_owner, child.context.root, 1, desc.descriptor_tables());
+    stock
+        .track_native_descriptor_tables(&mut NoTableLedger, desc, txn)
+        .unwrap();
+    assert_eq!(stock.returnable_tables(), 1);
+    let observed = stock.table_release();
+    let count = Arc::clone(&wakes);
+    assert!(!stock.enrol_release(
+        observed,
+        StockReleaseWake::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+    let receipt = applied_backing_receipt(&txn, 1);
+    stock
+        .settle_native_descriptor_tables(
+            &mut NoTableLedger,
+            child_owner,
+            child.context.root,
+            &receipt,
+        )
+        .unwrap();
+    assert_eq!(stock.returnable_tables(), 0);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        3,
+        "100%-linked descriptor receipt wakes waiter as returnable_tables reaches 0"
+    );
+
+    // 4. Determinate quarantine is returnable (3 child pages); indeterminate is not.
+    let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+    stock.retire_child(child, &mut retire).unwrap();
+    assert_eq!(stock.returnable_tables(), 3);
+    let observed = stock.table_release();
+    let count = Arc::clone(&wakes);
+    assert!(!stock.enrol_release(
+        observed,
+        StockReleaseWake::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+    stock
+        .quarantine_native_supply(child_owner, child.context.root)
+        .unwrap();
+    assert_eq!(stock.returnable_tables(), 0);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        4,
+        "indeterminate quarantine wakes waiter as returnable_tables reaches 0"
+    );
+}

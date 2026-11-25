@@ -919,21 +919,29 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if let Some(wait) = wait {
             drop(guard);
             // The queue the owner wait parked on: a host-readiness wait
-            // (#231) parks on the member's own queue, every other cause on
-            // its MM resource's (`park_owner_wait`).
-            let key = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
-                if wait.handle() != request.identity.birth.mm {
-                    return Err(NativeFailure::Stale);
+            // (#231) parks on the member's own queue, a reservation-pool wait
+            // on the carrier's pool queue, and every other cause on its MM
+            // resource's (`park_owner_wait`).
+            let key = match wait.cause() {
+                carrick_core_abi::PortalWaitCause::HostReadiness => {
+                    if wait.handle() != request.identity.birth.mm {
+                        return Err(NativeFailure::Stale);
+                    }
+                    ObjectWaitKey::native_host_ready(record).ok_or(NativeFailure::Stale)?
                 }
-                ObjectWaitKey::native_host_ready(record).ok_or(NativeFailure::Stale)?
-            } else {
-                carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+                carrick_core_abi::PortalWaitCause::ReservationPool => {
+                    if wait.handle() != request.identity.birth.mm {
+                        return Err(NativeFailure::Stale);
+                    }
+                    ObjectWaitKey::reservation_pool(request.identity.birth.mm.carrier())
+                }
+                _ => carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
                     self.zone,
                     request.identity.birth.mm,
                     wait,
                 )
                 .map_err(|_| NativeFailure::Stale)?
-                .key()
+                .key(),
             };
             let completion =
                 |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
@@ -3369,35 +3377,59 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service_phase = NativeServicePhase::Park;
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
-        // A host-readiness wait (#231) parks on the member's own queue, which
-        // its carrier sampled before the probe; every other cause is an MM
+        // A host-readiness wait (#231) parks on the member's own queue and a
+        // reservation-pool wait on the carrier's pool queue, both sampled by
+        // the carrier before its failed probe; every other cause is an MM
         // resource's.
-        let enrollment = if wait.cause() == carrick_core_abi::PortalWaitCause::HostReadiness {
-            if wait.handle() != request.identity.birth.mm {
-                return Err(NativeProcessError::Stale);
+        let enrollment = match wait.cause() {
+            carrick_core_abi::PortalWaitCause::HostReadiness
+            | carrick_core_abi::PortalWaitCause::ReservationPool => {
+                if wait.handle() != request.identity.birth.mm {
+                    return Err(NativeProcessError::Stale);
+                }
+                None
             }
-            None
-        } else {
-            Some(
+            _ => Some(
                 carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
                     zone,
                     request.identity.birth.mm,
                     wait,
                 )
                 .map_err(|_| NativeProcessError::Stale)?,
-            )
+            ),
         };
         let operation = self.take_preparation_operation(request)?;
         let park = match &enrollment {
             Some(enrollment) => enrollment.owner_request(operation),
-            None => match carrick_core_abi::wait::ObjectParkRequest::host_readiness_owner(
-                self.record,
-                wait,
-                operation,
-                None,
-            ) {
-                Ok(park) => park,
-                Err(operation) => {
+            None => match wait.cause() {
+                carrick_core_abi::PortalWaitCause::HostReadiness => {
+                    match carrick_core_abi::wait::ObjectParkRequest::host_readiness_owner(
+                        self.record,
+                        wait,
+                        operation,
+                        None,
+                    ) {
+                        Ok(park) => park,
+                        Err(operation) => {
+                            self.restore_preparation_operation(operation)?;
+                            return Err(NativeProcessError::Stale);
+                        }
+                    }
+                }
+                carrick_core_abi::PortalWaitCause::ReservationPool => {
+                    match carrick_core_abi::wait::ObjectParkRequest::reservation_pool_owner(
+                        request.identity.birth.mm,
+                        wait,
+                        operation,
+                    ) {
+                        Ok(park) => park,
+                        Err(operation) => {
+                            self.restore_preparation_operation(operation)?;
+                            return Err(NativeProcessError::Stale);
+                        }
+                    }
+                }
+                _ => {
                     self.restore_preparation_operation(operation)?;
                     return Err(NativeProcessError::Stale);
                 }
