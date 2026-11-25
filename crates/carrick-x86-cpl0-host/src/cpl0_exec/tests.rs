@@ -632,6 +632,7 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
                     |_| true,
                     |_| true,
                     |_| true,
+                    &mut Vec::new(),
                 )
                 .unwrap();
         });
