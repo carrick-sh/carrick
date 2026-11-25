@@ -4601,6 +4601,61 @@ fn reschedule_owed_inside_cpl0_preempts_inside_a_crossing_free_user_spin() {
     );
 }
 
+/// #2962, pre-review P0 3: a kick that stops the production carrier off the
+/// loaded task's root keeps loaded custody, captures no task snapshot, and
+/// the run continues to its real exit. Two such stops are real here: CPL0 on
+/// the boot-published maintenance root (after the last child left its root),
+/// and CPL0 still on a child's root just after the host served that child's
+/// retire crossing (`retire_mm`'s `out` to port 0xd6) and dropped its binding.
+///
+/// The hook kicks every other loaded entry, so each real exit is followed by
+/// an entry that stops at once (`immediate_exit`) on exactly the state that
+/// exit left: no timing decides where a kick lands. The fixture forks, the
+/// child sleeps and exits, and the parent reaps it in `wait4`. The carrier
+/// must count at least one kick stop of each kind. Red on `719b65f6e` 20 of
+/// 20 (`unregistered forward CR3: root 0x4a0f000, rip 0xffffffff80011d64`,
+/// the instruction after the retire `out`): the kick was attributed to the
+/// retired root and the carrier was poisoned.
+#[test]
+fn kick_off_the_loaded_root_keeps_loaded_custody_without_a_task_snapshot() {
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let elf = native_exit_fixture("native_child_sleep.S");
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let hook_calls = std::sync::Arc::clone(&calls);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = try_run_pool_fixture_with_loaded_pre_entry_hook(
+            &elf,
+            1024,
+            1024,
+            ROOT_AFFINITY_LOADED,
+            move |_, kick| {
+                if hook_calls.fetch_add(1, Ordering::AcqRel) % 2 == 0 {
+                    kick.kick();
+                }
+            },
+        );
+        let _ = tx.send(result);
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("kicked run must complete")
+        .expect("kicked run");
+    assert_eq!(outcome.run.exit_code, 8, "child nanosleep and parent wait");
+    let kicks = outcome.physical.kick_stops();
+    eprintln!(
+        "kick stops off the loaded root: {kicks:?} over {} loaded entries",
+        calls.load(Ordering::Acquire)
+    );
+    assert!(
+        kicks.foreign_root >= 1 && kicks.maintenance_root >= 1,
+        "a kick must stop the carrier on the retiring child's root and on the maintenance root: {kicks:?} over {} loaded entries",
+        calls.load(Ordering::Acquire)
+    );
+}
+
 fn forward_authority_fixture(variant: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(
         "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",

@@ -2471,6 +2471,7 @@ pub struct ProductionCpuFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
     cpus: std::sync::Mutex<[Option<CarrierCpu<M>>; 2]>,
     custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
     debug_cpus: [Arc<CarrierCpuDebug>; 2],
+    kick_stops: Arc<crate::carrier_cpu::KickStopCounts>,
 }
 
 /// Bounded physical observations owned by the carrier.
@@ -3732,6 +3733,13 @@ mod production_work_port_tests {
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
+    /// Kicks that stopped either loaded CPU off its task's root, on the
+    /// maintenance root or another, and were admitted with loaded custody
+    /// kept and no task snapshot (#2962).
+    pub fn kick_stops(&self) -> crate::carrier_cpu::KickStops {
+        self.kick_stops.snapshot()
+    }
+
     /// Attach per-exit mirrors only after the run's debug endpoint is live.
     pub fn attach_debug(&self) {
         let mut cpus = self
@@ -4412,12 +4420,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
         ProductionCpuFactory<M, Mem>,
     ) {
         let Self {
-            cpus,
+            mut cpus,
             custody,
             root_state,
         } = self;
         let debug_cpus: [Arc<CarrierCpuDebug>; 2] =
             std::array::from_fn(|_| Arc::new(CarrierCpuDebug::default()));
+        let kick_stops = Arc::new(crate::carrier_cpu::KickStopCounts::default());
+        for cpu in &mut cpus {
+            cpu.share_kick_stops(Arc::clone(&kick_stops));
+        }
         (
             root_state,
             ProductionCpuFactory {
@@ -4425,6 +4437,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
                 cpus: std::sync::Mutex::new(cpus.map(Some)),
                 custody: Arc::new(std::sync::Mutex::new(custody)),
                 debug_cpus,
+                kick_stops,
             },
         )
     }

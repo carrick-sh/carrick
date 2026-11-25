@@ -17,6 +17,32 @@ impl carrick_hal::VcpuKickDyn for NoopKick {
     fn kick(&self) {}
 }
 
+/// Kicks that stopped a loaded CPU off its task's root and were admitted
+/// with loaded custody kept and no task snapshot (#2962).
+#[derive(Default)]
+pub(crate) struct KickStopCounts {
+    /// On the boot-published maintenance root.
+    maintenance_root: AtomicU64,
+    /// On any other root: a descendant's, or a child's CPL0 is retiring.
+    foreign_root: AtomicU64,
+}
+
+/// A snapshot of [`KickStopCounts`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KickStops {
+    pub maintenance_root: u64,
+    pub foreign_root: u64,
+}
+
+impl KickStopCounts {
+    pub(crate) fn snapshot(&self) -> KickStops {
+        KickStops {
+            maintenance_root: self.maintenance_root.load(Ordering::Relaxed),
+            foreign_root: self.foreign_root.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Scalar last-stopped image and live phase. Readers never alias a `VcpuFd`.
 #[derive(Default)]
 pub(crate) struct CarrierCpuDebug {
@@ -327,6 +353,9 @@ pub struct CarrierCpu<I: CarrierCpuIo> {
     root_binding: CarrierRootBinding,
     child_bindings: CarrierChildBindings,
     maintenance_root: Option<RootGpa>,
+    /// Kicks this CPU stopped off the loaded task's root (#2962); the
+    /// factory shares one count across its CPUs.
+    kick_stops: Arc<KickStopCounts>,
     debug: Option<Arc<CarrierCpuDebug>>,
     /// The successor MM of a run-root exec this CPU settled whose custody
     /// move is still owed (#2142). Guest entry is refused until
@@ -354,9 +383,15 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             root_binding: CarrierRootBinding::default(),
             child_bindings,
             maintenance_root: None,
+            kick_stops: Arc::default(),
             debug: None,
             root_exec_settling: None,
         })
+    }
+
+    /// Count this CPU's kicks off the loaded root into `counts`.
+    pub(crate) fn share_kick_stops(&mut self, counts: Arc<KickStopCounts>) {
+        self.kick_stops = counts;
     }
 
     pub fn new_with_maintenance(
@@ -805,25 +840,47 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 Ordering::Release,
             );
         }
-        if self
+        let stopped_root = image.cr3 & !0xfff;
+        let on_maintenance_root = self
             .maintenance_root
-            .is_some_and(|root| root.address().raw() == (image.cr3 & !0xfff))
+            .is_some_and(|root| root.address().raw() == stopped_root);
+        if matches!(&exit, CarrierRunExit::Kick) {
+            // A kick interrupts the CPU wherever it stands; it is not a
+            // crossing, so nothing is served on its behalf and no root has
+            // to authenticate it. CPL0 may stand on the loaded root, a
+            // descendant's root, a child's root it is still retiring after
+            // the retire crossing, or the maintenance root (its idle
+            // scheduler at HLT after `leave_space`) (#2962). The kick keeps
+            // loaded custody and captures no snapshot: a save attributes the
+            // stopped image itself (`save_and_detach`), and the executor
+            // saves only where `can_save_loaded` holds.
+            if on_maintenance_root {
+                self.kick_stops
+                    .maintenance_root
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if stopped_root != binding.context().root.address().raw() {
+                self.kick_stops.foreign_root.fetch_add(1, Ordering::Relaxed);
+            }
+            self.custody = Custody::Loaded {
+                binding,
+                resume,
+                pending_io,
+            };
+            return Ok(StoppedTaskExit { state: None, exit });
+        }
+        if on_maintenance_root
             && matches!(
                 &exit,
-                CarrierRunExit::Kick
-                    | CarrierRunExit::PhysicalDoorbell {
-                        port: carrick_x86::cpl0_entry::WORK_PORT
-                            | carrick_el1_abi::NATIVE_EXEC_PORT,
-                        ..
-                    }
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_x86::cpl0_entry::WORK_PORT | carrick_el1_abi::NATIVE_EXEC_PORT,
+                    ..
+                }
             )
         {
             // Exit work can be published after the last child has left its
-            // process root, an exec settlement crosses after leaving the
-            // predecessor root, and a kick can interrupt CPL0's idle scheduler
-            // parked at HLT after `leave_space` (#2962). Only the
-            // boot-published maintenance root may stand here; it has no user
-            // task snapshot to save.
+            // process root, and an exec settlement crosses after leaving the
+            // predecessor root. Only the boot-published maintenance root may
+            // stand here; it has no user task snapshot to save.
             self.custody = Custody::Loaded {
                 binding,
                 resume,
@@ -849,11 +906,11 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                     },
                 )
             }
-            // A kick may interrupt a descendant after CPL0 switches CR3 in
-            // zone, without changing the executor's loaded root task. So may
-            // a user fault: its record is captured from the live child.
+            // A descendant's syscall or user fault stops on its own root
+            // after CPL0 switches CR3 in zone, without changing the
+            // executor's loaded root task: its record is captured from the
+            // live child.
             CarrierRunExit::SyscallTrap
-            | CarrierRunExit::Kick
             | CarrierRunExit::FaultDoorbellWord(_)
             | CarrierRunExit::FaultException { .. } => {
                 self.stopped_binding(binding, &image, true, "forward")
@@ -1306,12 +1363,50 @@ pub(crate) mod tests {
         cpu.register_child_binding(child.binding()).unwrap();
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert_eq!(stopped.exit, CarrierRunExit::Kick);
-        assert_eq!(stopped.state.unwrap().binding(), child.binding());
+        assert!(stopped.state.is_none(), "a kick captures no snapshot");
+        assert_eq!(
+            cpu.kick_stops.snapshot(),
+            KickStops {
+                maintenance_root: 0,
+                foreign_root: 1
+            }
+        );
         let detached = cpu
             .save_and_detach(root.binding().task())
             .expect("a kicked child keeps its issued binding during detach");
         assert_eq!(detached.binding(), child.binding());
         cpu.audit_idle().expect("detached CPU is neutral");
+    }
+
+    /// #2962: CPL0 still stands on a child's root after the host served that
+    /// child's retire crossing and dropped its binding. A kick there is not
+    /// a crossing and needs no root: it keeps loaded custody with no
+    /// snapshot, where attributing it refused the unregistered CR3 and
+    /// poisoned the carrier.
+    #[test]
+    fn kick_on_a_retired_childs_root_keeps_loaded_custody() {
+        let root = context(1);
+        let retired = context(2);
+        let mut cpu = CarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: retired.hardware_image(),
+            port: 0,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        let stopped = cpu
+            .run_loaded(root.binding().task())
+            .expect("a kick on an unregistered root is not refused");
+        assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert!(stopped.state.is_none());
+        assert_eq!(cpu.kick_stops.snapshot().foreign_root, 1);
+        assert!(
+            !cpu.can_save_loaded(root.binding().task()).unwrap(),
+            "the retiring child's root is not the loaded root's saveable image"
+        );
+        cpu.reset_for_shutdown(root.binding().task())
+            .expect("the kicked CPU still holds loaded custody");
+        cpu.audit_idle().expect("shutdown-reset CPU is neutral");
     }
     #[test]
     fn child_owner_grant_on_root_executor_is_a_physical_boundary() {
@@ -1375,6 +1470,13 @@ pub(crate) mod tests {
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
         assert!(stopped.state.is_none());
         assert_eq!(stopped.exit, CarrierRunExit::Kick);
+        assert_eq!(
+            cpu.kick_stops.snapshot(),
+            KickStops {
+                maintenance_root: 1,
+                foreign_root: 0
+            }
+        );
         assert!(
             !cpu.can_save_loaded(root.binding().task()).unwrap(),
             "maintenance_root state must not claim a saveable user root snapshot"
