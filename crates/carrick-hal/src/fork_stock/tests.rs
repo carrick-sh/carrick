@@ -3496,6 +3496,10 @@ fn descriptor_tables_draw_the_reserve_when_the_stock_runs_dry() {
         counters.reserve_tables_drawn,
         TABLE_RESERVE_DRAW_PAGES as u64
     );
+    assert_eq!(
+        counters.fork_loan_tables_drawn, 0,
+        "a descriptor draw is never a fork loan's"
+    );
     assert_eq!(counters.descriptor_capacity_refusals, 0);
     assert_eq!(stock.table_capacity(), 1026 - 7);
     assert_eq!(stock.table_stock().len(), 2 + TABLE_RESERVE_DRAW_PAGES - 7);
@@ -3558,7 +3562,44 @@ fn a_fork_loan_takes_its_arenas_from_a_fresh_run() {
         );
     }
     assert_eq!(stock.counters().reserve_tables_drawn, 560);
+    assert_eq!(
+        stock.counters().fork_loan_tables_drawn,
+        560,
+        "the loan's own draw is attributed to it"
+    );
     assert_eq!(stock.table_capacity(), 40 + 2048 - 560);
+}
+
+/// rev3022b P0-2: `fork_loan_tables_drawn` counts only what a fork loan
+/// itself drew: descriptor and successor draws grow the total, never the
+/// loan's share.
+#[test]
+fn only_a_fork_loans_own_draw_counts_as_the_loans() {
+    let mut stock = reserved_stock(2, 2048);
+    let _first = loan(&mut stock, parent(), 302, 8, 4).expect("the first loan draws a run");
+    let drawn = TABLE_RESERVE_DRAW_PAGES as u64;
+    assert_eq!(
+        (
+            stock.counters().reserve_tables_drawn,
+            stock.counters().fork_loan_tables_drawn
+        ),
+        (drawn, drawn),
+        "the first loan drew one run"
+    );
+    let (owner, root) = registered_root(&mut stock);
+    let held = stock
+        .reserve_successor_tables(stock.table_stock().len())
+        .expect("hold the reusable stock");
+    let descriptors = stock
+        .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 7)
+        .expect("descriptor draw");
+    let successor = stock.reserve_successor_tables(600).expect("successor draw");
+    let counters = stock.counters();
+    assert!(counters.reserve_tables_drawn >= drawn + 600, "{counters:?}");
+    assert_eq!(counters.fork_loan_tables_drawn, drawn, "{counters:?}");
+    stock.return_successor_tables(successor);
+    stock.return_successor_tables(held);
+    stock.cancel_native_descriptor_tables(&mut NoTableLedger, descriptors);
 }
 
 /// An exec successor's tables need not be contiguous: it draws only its
