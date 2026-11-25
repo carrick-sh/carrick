@@ -247,6 +247,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         FrameGpa::new(occupied_end),
         core::num::NonZeroUsize::new(2)?,
     )?;
+    let reserve = carrick_core_abi::X86TableReserve::derive(FrameGpa::new(occupied_end), working)?;
     let staged_end = first_grant;
     areas.push(area(
         first_grant,
@@ -377,7 +378,12 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     request.result_table_used = source.tables_taken as u32;
     request.result_data_used = source.data_taken as u32;
     request.result_initial_break = loaded.initial_break.raw();
-    crate::table_span::admit_tables(first_grant, table_end, loaded.address, working);
+    crate::table_span::admit_tables(
+        first_grant,
+        table_end,
+        loaded.address,
+        crate::table_span::ExtentTableLicense { working, reserve },
+    );
     Some((request.entry, loaded.stack_pointer))
 }
 
