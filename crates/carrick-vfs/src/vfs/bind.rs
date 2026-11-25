@@ -363,6 +363,21 @@ fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> M
     }
 }
 
+fn host_stat(vfs: &BindVfs, path: &str, follow: bool) -> Option<(PathBuf, libc::stat)> {
+    let host = vfs.to_host(path).ok()?;
+    let cpath = CString::new(host.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `cpath` is a NUL-terminated path and `st` is initialized below by libc.
+    let rc = unsafe {
+        if follow {
+            libc::stat(cpath.as_ptr(), &mut st)
+        } else {
+            libc::lstat(cpath.as_ptr(), &mut st)
+        }
+    };
+    (rc == 0).then_some((host, st))
+}
+
 fn real_stat_from_host(
     host: &Path,
     st: &libc::stat,
@@ -429,22 +444,16 @@ impl Vfs for BindVfs {
     }
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<crate::fs_backend::RealStat> {
-        let host = self.to_host(path).ok()?;
-        let cpath = CString::new(host.as_os_str().as_bytes()).ok()?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            if follow {
-                libc::stat(cpath.as_ptr(), &mut st)
-            } else {
-                libc::lstat(cpath.as_ptr(), &mut st)
-            }
-        };
-        (rc == 0).then(|| real_stat_from_host(&host, &st, !follow))
+        let (host, st) = host_stat(self, path, follow)?;
+        Some(real_stat_from_host(&host, &st, !follow))
     }
 
     fn host_inode_identity(&self, path: &str) -> Option<super::InodeIdentity> {
-        let meta = std::fs::metadata(self.to_host(path).ok()?).ok()?;
-        Some(super::InodeIdentity::new(meta.dev(), meta.ino()))
+        let (_, st) = host_stat(self, path, true)?;
+        Some(super::InodeIdentity::new(
+            st.st_dev as u64,
+            st.st_ino as u64,
+        ))
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {

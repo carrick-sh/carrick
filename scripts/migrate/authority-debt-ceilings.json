@@ -34110,7 +34110,7 @@
       "operation": "write_for_io",
       "owner": "carrick_kernel::dispatch::fs::proc_synthetic::FsView<'a>::reopen_proc_self_fd",
       "lane": "shared",
-      "ceiling": 2
+      "ceiling": 1
     },
     {
       "family": "k1_create_install",

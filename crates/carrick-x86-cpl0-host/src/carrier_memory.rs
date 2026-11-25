@@ -596,7 +596,7 @@ const WINDOW_SLOT_NON_WINDOW_HEADROOM: usize = 512;
 
 /// Typed admission token reserving carrier window slots at `mmap(MAP_SHARED)` time
 /// so first touch never discovers memslot exhaustion (#1338, #2975).
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 #[must_use = "WindowSlotBudget must be consumed by CarrierMemory::install_window_slots"]
 pub struct WindowSlotBudget {
     identity: CarrierVmId,
