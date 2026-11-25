@@ -660,8 +660,8 @@ impl AddressSpaces {
             entry.notifications.empty(),
             "retire MM notification source before entry"
         );
-        entry.notifications.claim_entry_retirement();
-        entry.notifications.finish_entry_retirement(self, index);
+        entry.notifications.claim_entry_retirement(self, index);
+        entry.notifications.finish_entry_retirement();
     }
     fn clear_retired_entry(&self, index: SpaceIndex) {
         let entry = self.entry(index);

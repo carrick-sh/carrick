@@ -289,6 +289,9 @@ pub fn space_has_resident_slot<C: Copy + Send + Sync + zerocopy::FromZeros>(
 /// free its exact space entry so both indices can be reused. The carrier
 /// quarantines physical stock before this call and releases the whole MM's
 /// inventory only after entry removal; deferred returns retire with that MM.
+/// Success means the entry is unpublished now, even while a notification
+/// borrower still holds its index, so the crossing a drain owes for it
+/// finds the MM reclaimable.
 pub fn retire_closed_space<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
