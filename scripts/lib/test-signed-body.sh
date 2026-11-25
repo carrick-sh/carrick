@@ -473,6 +473,12 @@ if [ "$pkg" = "carrick-conformance-next" ]; then
         CARGO_TARGET_DIR="$PWD/target/elf-exec-errno" \
         cargo build --locked --manifest-path "$elf_errno_fixture/Cargo.toml" \
         --target aarch64-unknown-linux-musl --release
+    sigaltstack_fixture="crates/carrick-conformance-next/tests/fixtures/signal-untouched-altstack-threads"
+    sigaltstack_source_sha256="$(shasum -a 256 "$sigaltstack_fixture/src/main.rs" | cut -d ' ' -f 1)"
+    CARRICK_SIGNAL_UNTOUCHED_ALTSTACK_SOURCE_SHA256="$sigaltstack_source_sha256" \
+        CARGO_TARGET_DIR="$PWD/target/signal-untouched-altstack-threads" \
+        cargo build --locked --manifest-path "$sigaltstack_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release
 fi
 
 # 1. Build (never run) the package's test executables and collect their
