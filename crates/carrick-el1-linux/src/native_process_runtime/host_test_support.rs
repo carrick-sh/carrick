@@ -232,6 +232,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         TERMINAL_VACATES.with(|count| count.set(count.get() + 1));
         Ok(())
     }
+    fn release_terminal_space(&mut self, source: carrick_el1_abi::BornInZoneSource<'a, C>) {
+        let _ = source.zone.release_space(source.slot);
+    }
 
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;

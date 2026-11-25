@@ -35,6 +35,15 @@ pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd6;
 /// supervisor stack ([`NativeExecAdoption`], [`NativeExecCancellation`] or
 /// [`NativeExecSettlement`]).
 pub const NATIVE_EXEC_PORT: u16 = 0xda;
+/// x86 synchronous I/O port a CPU rings after its in-ring retired-space
+/// drain retired at least one closed space's entry: the last guest step a
+/// retired fork child's quarantined tables wait for (the carrier reclaims a
+/// child only once no slot runs it and its entry is unpublished). It
+/// carries no record. The carrier drains the fork quarantine (outside any MM
+/// on the maintenance root, else excluding the stopped execution's MM) and
+/// probes its parked execs, so every waiter on the stock's release hears the
+/// return (#3030).
+pub const NATIVE_SPACE_RETIRED_PORT: u16 = 0xdb;
 
 /// One synchronous, consuming native-exec adoption request. The carrier
 /// authenticates the manifest against the retained service identity and the
@@ -1246,6 +1255,7 @@ const _: () = {
     assert!(FORK_STOCK_PORT == 0xd2);
     assert!(NATIVE_PEER_READY_PORT == 0xd4);
     assert!(NATIVE_CHILD_RETIRE_PORT == 0xd6);
+    assert!(NATIVE_SPACE_RETIRED_PORT == 0xdb);
     assert!(NativeChildRetire::MAGIC == 0x4352_4348_5245_5449);
     assert!(GRANT_OP_CHILD_RETIRE == 5);
     assert!(GRANT_OP_FORK_STOCK == 3);

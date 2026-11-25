@@ -642,7 +642,7 @@ impl AddressSpaces {
         self.entry(index).gate.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// The gate word (tests and diagnostics).
+    /// The gate word: [`GATE_CLOSED`] and raised pauses.
     pub fn gate(&self, index: SpaceIndex) -> u64 {
         self.entry(index).gate.load(Ordering::SeqCst)
     }

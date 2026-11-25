@@ -997,7 +997,7 @@ impl Cpl0Carrier {
         self.custody.exec_owner_census()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 5] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 6] {
         self.custody.physical_crossing_counts()
     }
 

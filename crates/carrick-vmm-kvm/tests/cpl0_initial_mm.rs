@@ -614,6 +614,7 @@ fn production_temporary_table_shortage_parks_enrols_and_succeeds_after_return() 
 fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
 
     let elf = native_exit_fixture("native_quarantined_child_table_shortage.S");
     let (parts, root_tid, _dispatcher) = native_exit_workers_in(&elf, None, Some(2 * 1024 * 1024));
@@ -632,6 +633,14 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
             .expect("release waiters")
     };
     let capacity = || factory.fork_table_capacity().expect("table capacity");
+    let retired_crossings = || {
+        factory
+            .physical_crossing_counts()
+            .expect("crossing counts")
+            .into_iter()
+            .find(|(family, _)| *family == PhysicalCrossingFamily::SpaceRetired)
+            .map(|(_, count)| count)
+    };
 
     // 1. Fork. CPU 0 then stays stopped until the child has retired.
     run_to_marker(&mut parent, task, 1, &factory);
@@ -715,6 +724,11 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
         "the parent parked on the reservation pool"
     );
     assert_eq!(
+        retired_crossings(),
+        Some(0),
+        "nothing retired the space yet"
+    );
+    assert_eq!(
         (
             parked.descriptor_capacity_refusals,
             parked.returned_children
@@ -757,6 +771,11 @@ fn production_fault_parked_on_a_quarantined_child_wakes_when_its_slot_vacates() 
         || false,
     );
     let vacated = counters();
+    assert_eq!(
+        retired_crossings(),
+        Some(1),
+        "exactly the child's last slot vacate retired its space and crossed"
+    );
     assert_eq!(
         (waiters(), vacated.returned_children),
         (0, 1),

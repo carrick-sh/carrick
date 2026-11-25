@@ -27,6 +27,9 @@ impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
         let _ = source;
         Ok(())
     }
+    fn release_terminal_space(&mut self, source: carrick_el1_abi::BornInZoneSource<'a, Words>) {
+        let _ = source.zone.release_space(source.slot);
+    }
 
     type Mm = Address;
     type PreparedMm = Address;

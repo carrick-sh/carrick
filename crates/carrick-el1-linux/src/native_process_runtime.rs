@@ -836,6 +836,11 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         &mut self,
         source: BornInZoneSource<'a, C>,
     ) -> Result<(), NativeFailure>;
+    /// After [`Self::vacate_terminal_space`] and the member's retirement,
+    /// publish the executing CPU's slot absence. The ISA tells the owner of
+    /// a retiring space's retained custody (x86: the fork quarantine the
+    /// stock's release waiters wait on, #3030) that this absence happened.
+    fn release_terminal_space(&mut self, source: BornInZoneSource<'a, C>);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn apply_fault_reply(
         &mut self,
@@ -8038,7 +8043,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.record.id,
             )
             .map_err(|_| NativeFailure::Quarantined)?;
-        self.source.zone.release_space(self.source.slot);
+        self.service.release_terminal_space(self.source);
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
             entry,
@@ -8373,7 +8378,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(Some(LifecycleOutcome::HostCustody));
                 }
                 carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
-                    self.source.zone.release_space(self.source.slot);
+                    self.service.release_terminal_space(self.source);
                     self.current
                         .linux
                         .mark_native_terminal_work(self.source.slot);
@@ -10550,7 +10555,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .retire_current(self.binding, self.source, record.id)
             .ok();
         if self.handoff.is_some() {
-            self.source.zone.release_space(self.source.slot);
+            self.service.release_terminal_space(self.source);
         }
         self.handoff.is_some()
     }
@@ -19475,6 +19480,9 @@ mod tests {
         ) -> Result<(), NativeFailure> {
             let _ = source;
             Ok(())
+        }
+        fn release_terminal_space(&mut self, source: BornInZoneSource<'a, ParkedContextWords>) {
+            let _ = source.zone.release_space(source.slot);
         }
 
         type Mm = AddressContext<RootGpa>;

@@ -105,9 +105,14 @@ pub fn park_on_maintenance_root(source: BornInZoneSource<'static, ParkedContextW
 }
 
 /// Leave the installed process root for the carrier's maintenance root, then
-/// publish the slot's absence.
-pub fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+/// publish the slot's absence. `None` when the carrier published no
+/// maintenance root (the slot is still released); otherwise what left the
+/// slot, which a [`carrick_sched_core::VacatedSpace::Retiring`] caller hands
+/// to the retired-space owner.
+pub fn leave_space(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+) -> Option<carrick_sched_core::VacatedSpace> {
     let parked = park_on_maintenance_root(source);
-    source.zone.release_space(source.slot);
-    parked
+    let vacated = source.zone.release_space(source.slot);
+    parked.then_some(vacated)
 }

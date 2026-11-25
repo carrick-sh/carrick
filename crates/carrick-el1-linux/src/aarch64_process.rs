@@ -1916,6 +1916,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     carrick_sched_core::ZONE_SLOTS,
                     self.worker(),
                 )
+                .result
                 .map_err(|_| {
                     NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::ExecRetiredSpaceDrain,
@@ -2686,6 +2687,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
         }
         Ok(())
+    }
+
+    fn release_terminal_space(&mut self, source: BornInZoneSource<'a, Aarch64ParkedContext>) {
+        // No HVF waiter parks on the fork stock's release (ARM tables come
+        // from per-MM arenas): a retiring space's quarantine returns at the
+        // next drain, and nothing waits for it sooner.
+        let _ = source.zone.release_space(source.slot);
     }
 
     fn retire_mm(&mut self, mm: Self::Mm) {
