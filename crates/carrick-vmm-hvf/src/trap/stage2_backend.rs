@@ -508,12 +508,6 @@ pub(crate) unsafe fn stage2_map_replay(
             self.0 = Some(watch_id);
         }
 
-        fn clear_in(&mut self, registry: &mut super::AliasRegistry) {
-            if let Some(id) = self.0.take() {
-                registry.remove_replay_watch(id);
-            }
-        }
-
         fn take_dirty_and_remove_in(
             &mut self,
             registry: &mut super::AliasRegistry,
@@ -630,19 +624,23 @@ pub(crate) unsafe fn stage2_map_replay(
                     .stage2
                     .at_client_point(super::carrier_custody::REPLAY_PHASE1_BEFORE_LIVENESS_PROBE);
             }
-            let found_live = candidates.iter().copied().find(|&(_, entry)| {
-                let check_addr = match lookup {
-                    ReplayAliasLookup::Ipa { .. } => entry.host_addr,
-                    ReplayAliasLookup::VaProcess { va, .. }
-                    | ReplayAliasLookup::VaAnyScope { va } => {
-                        entry.host_addr.saturating_add((va - entry.start) as usize)
-                    }
-                };
-                super::alias_backing_is_live(check_addr)
-                    && (entry.physical_host_addr == check_addr
-                        || super::alias_backing_is_live(entry.physical_host_addr))
-            });
-            let Some((_, backing)) = found_live else {
+            let found_live = candidates
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|&(_, (_, entry))| {
+                    let check_addr = match lookup {
+                        ReplayAliasLookup::Ipa { .. } => entry.host_addr,
+                        ReplayAliasLookup::VaProcess { va, .. }
+                        | ReplayAliasLookup::VaAnyScope { va } => {
+                            entry.host_addr.saturating_add((va - entry.start) as usize)
+                        }
+                    };
+                    super::alias_backing_is_live(check_addr)
+                        && (entry.physical_host_addr == check_addr
+                            || super::alias_backing_is_live(entry.physical_host_addr))
+                });
+            let Some((found_idx, (_, backing))) = found_live else {
                 let retry_needed = {
                     let mut registry = super::alias_registry().lock();
                     match watch_guard.take_dirty_and_remove_in(&mut registry) {
@@ -656,6 +654,7 @@ pub(crate) unsafe fn stage2_map_replay(
                 }
                 return Ok(None);
             };
+            let skipped_higher_priority = found_idx > 0;
             if !allowed_ipas.contains(&backing.physical_ipa) {
                 if !allow_ipa(backing.physical_ipa) {
                     return Ok(None);
@@ -683,8 +682,12 @@ pub(crate) unsafe fn stage2_map_replay(
             }
             let mut registry =
                 super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
-            watch_guard.clear_in(&mut registry);
-            if registry.contains_exact_physical_row(&backing) {
+            let watch_dirty = watch_guard.take_dirty_and_remove_in(&mut registry);
+            let stale_snapshot = match watch_dirty {
+                Some(dirty) => dirty,
+                None => skipped_higher_priority && registry.revision() != phase1_start_rev,
+            };
+            if !stale_snapshot && registry.contains_exact_physical_row(&backing) {
                 break 'retry (backing, stage2, registry);
             }
             if attempt >= MAX_REPLAY_PHASE2_RETRIES {

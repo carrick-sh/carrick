@@ -4036,7 +4036,7 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         perms,
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
-        ownership_scope: AliasOwnershipScope::Global,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(4998)),
         inventory_backing: InventoryBackingIdentity::Private(10_000),
         shared_key_base: None,
         shared_key_offset: 0,
@@ -4148,6 +4148,7 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         while let Ok(Some(k)) = pause_rx.recv() {
             mutate_external_alias_state(|registry| {
                 // Sole-row `Global` identical upsert empties + recreates `va_classes_by_scope[Global]`.
+                assert_eq!(registry.scope_rows(AliasOwnershipScope::Global).len(), 1);
                 assert_eq!(
                     registry.upsert_by_key(sole_global_row),
                     Some(sole_global_row)
@@ -4408,27 +4409,62 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_drop, 0x4000));
     assert!(!ScopedStage2MapTestStub::is_mapped(ipa_drop, 0x1000));
 
-    // Subcase 5b (Codex #17 P0-3): Multi-slice lookup keeps its watch armed AFTER
-    // the final slice (`Complete`) into `REPLAY_PHASE1_BEFORE_LIVENESS_PROBE`.
-    // Replacing and dropping the old backing there MUST dirty the live watch and
-    // retry to map `new_multi_keep_16k`.
+    // Subcase 5b (Codex #17 P0-3 & Codex #18 P1): Multi-slice lookup keeps its
+    // watch armed AFTER the final slice (`Complete`) into
+    // `REPLAY_PHASE1_BEFORE_LIVENESS_PROBE`. Performing BOTH `upsert_by_key` AND
+    // backing disposal on the owner thread there dirties the live watch and
+    // retries to map `new_multi_keep_16k`.
+    let ipa_multi_drop = 0x7cb0_0000_u64;
     let (m_addr_tx, m_addr_rx) = std::sync::mpsc::channel::<usize>();
     let (m_start_drop_tx, m_start_drop_rx) = std::sync::mpsc::channel::<()>();
     let (m_did_drop_tx, m_did_drop_rx) = std::sync::mpsc::channel::<()>();
-    let m_dropper = std::thread::spawn(move || {
+    let m_owner = std::thread::spawn(move || {
         let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             0x1000,
             crate::host_mapping::HostMappingKind::FrameCow,
         )
         .expect("allocate disposable multi-slice 4 KiB backing");
         let addr = owned.as_ptr() as usize;
+        let old_row = AliasBacking {
+            start: 0x3910_0000,
+            ipa: ipa_multi_drop,
+            host_addr: addr,
+            size: 0x1000,
+            physical_ipa: ipa_multi_drop,
+            physical_host_addr: addr,
+            physical_size: 0x1000,
+            perms,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: upsert_scope,
+            inventory_backing: InventoryBackingIdentity::Private(15_000),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let new_row = AliasBacking {
+            host_addr: host_16k,
+            size: 0x4000,
+            physical_host_addr: host_16k,
+            physical_size: 0x4000,
+            inventory_backing: InventoryBackingIdentity::Private(15_001),
+            ..old_row
+        };
         m_addr_tx.send(addr).expect("send disposable addr");
-        let _ = m_start_drop_rx.recv();
-        drop(owned);
-        let _ = m_did_drop_tx.send(());
+        if m_start_drop_rx.recv().is_ok() {
+            mutate_external_alias_state(|registry| {
+                assert!(
+                    !registry.active_replay_watches.is_empty(),
+                    "multi-slice watch must remain live into liveness probe"
+                );
+                assert_eq!(registry.upsert_by_key(new_row), Some(old_row));
+                registry.clear_replay_mappings_in();
+            });
+            drop(owned);
+            let _ = m_did_drop_tx.send(());
+        }
     });
     let m_drop_4k_host = m_addr_rx.recv().expect("receive disposable addr");
-    let ipa_multi_drop = 0x7cb0_0000_u64;
     let old_multi_drop_4k = AliasBacking {
         start: 0x3910_0000,
         ipa: ipa_multi_drop,
@@ -4490,17 +4526,6 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
             {
                 before_liveness_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some(tx) = m_start_drop_tx.lock().take() {
-                    mutate_external_alias_state(|registry| {
-                        assert!(
-                            !registry.active_replay_watches.is_empty(),
-                            "multi-slice watch must remain live into liveness probe"
-                        );
-                        assert_eq!(
-                            registry.upsert_by_key(new_multi_keep_16k),
-                            Some(old_multi_drop_4k)
-                        );
-                        registry.clear_replay_mappings_in();
-                    });
                     let _ = tx.send(());
                     let _ = m_did_drop_rx.lock().recv();
                 }
@@ -4518,7 +4543,7 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
         )
     };
     custody.stage2.set_hook(None);
-    m_dropper.join().expect("multi-slice dropper joined");
+    m_owner.join().expect("multi-slice owner joined");
     assert_eq!(
         before_liveness_fires.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4533,6 +4558,170 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     );
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_multi_drop, 0x4000));
     assert!(!ScopedStage2MapTestStub::is_mapped(ipa_multi_drop, 0x1000));
+
+    // Subcase 5c (Codex #18 P0-1): Even when an older live fallback VA alias
+    // (`older_fallback_va`) survives in Phase 2, replacing and dropping the newer
+    // preferred VA alias (`preferred_drop_4k` -> `replacement_va_16k`) on an owner
+    // thread before `find` MUST NOT map `older_fallback_va`; dirty watch in Phase 2
+    // forces retry and maps `replacement_va_16k`.
+    let va_pref = 0x4a00_0000_u64;
+    let ipa_old_fb = 0x7cc0_0000_u64;
+    let ipa_new_pref = 0x7cd0_0000_u64;
+    let (fb_addr_tx, fb_addr_rx) = std::sync::mpsc::channel::<usize>();
+    let (fb_start_tx, fb_start_rx) = std::sync::mpsc::channel::<()>();
+    let (fb_done_tx, fb_done_rx) = std::sync::mpsc::channel::<()>();
+    let fb_owner = std::thread::spawn(move || {
+        let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x1000,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate disposable VA backing");
+        let addr = owned.as_ptr() as usize;
+        let old_pref = AliasBacking {
+            start: va_pref,
+            ipa: 0x7cc8_0000,
+            host_addr: addr,
+            size: 0x1000,
+            physical_ipa: 0x7cc8_0000,
+            physical_host_addr: addr,
+            physical_size: 0x1000,
+            perms,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: upsert_scope,
+            inventory_backing: InventoryBackingIdentity::Private(16_001),
+            shared_key_base: None,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        let replacement = AliasBacking {
+            ipa: ipa_new_pref,
+            host_addr: host_16k,
+            size: 0x4000,
+            physical_ipa: ipa_new_pref,
+            physical_host_addr: host_16k,
+            physical_size: 0x4000,
+            inventory_backing: InventoryBackingIdentity::Private(16_002),
+            ..old_pref
+        };
+        fb_addr_tx.send(addr).expect("send VA disposable addr");
+        if fb_start_rx.recv().is_ok() {
+            mutate_external_alias_state(|registry| {
+                assert!(!registry.active_replay_watches.is_empty());
+                assert_eq!(registry.upsert_by_key(replacement), Some(old_pref));
+                registry.clear_replay_mappings_in();
+            });
+            drop(owned);
+            let _ = fb_done_tx.send(());
+        }
+    });
+    let fb_drop_host = fb_addr_rx.recv().expect("recv VA disposable addr");
+    let older_fallback_va = AliasBacking {
+        start: va_pref,
+        ipa: ipa_old_fb,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_old_fb,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(9000)),
+        inventory_backing: InventoryBackingIdentity::Private(16_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let preferred_drop_4k = AliasBacking {
+        start: va_pref,
+        ipa: 0x7cc8_0000,
+        host_addr: fb_drop_host,
+        size: 0x1000,
+        physical_ipa: 0x7cc8_0000,
+        physical_host_addr: fb_drop_host,
+        physical_size: 0x1000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: upsert_scope,
+        inventory_backing: InventoryBackingIdentity::Private(16_001),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let replacement_va_16k = AliasBacking {
+        ipa: ipa_new_pref,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_new_pref,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        inventory_backing: InventoryBackingIdentity::Private(16_002),
+        ..preferred_drop_4k
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(older_fallback_va);
+        for i in 1..=70_u64 {
+            registry.push(AliasBacking {
+                start: va_pref,
+                ipa: 0x7ce0_0000 + i * 0x1000,
+                host_addr: 0,
+                size: 0x1000,
+                physical_ipa: 0x7ce0_0000 + i * 0x1000,
+                physical_host_addr: 0,
+                physical_size: 0x1000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(9100 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(16_100 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.push(preferred_drop_4k);
+        registry.clear_replay_mappings_in();
+    });
+    let fb_start_tx = std::sync::Arc::new(parking_lot::Mutex::new(Some(fb_start_tx)));
+    let fb_done_rx = std::sync::Arc::new(parking_lot::Mutex::new(fb_done_rx));
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_PHASE1_BEFORE_LIVENESS_PROBE
+                && let Some(tx) = fb_start_tx.lock().take()
+            {
+                let _ = tx.send(());
+                let _ = fb_done_rx.lock().recv();
+            }
+        })));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_old_fb, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_new_pref, 0x4000));
+    let res_fb = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaAnyScope { va: va_pref },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    fb_owner.join().expect("fallback owner joined");
+    assert_eq!(
+        res_fb,
+        Ok(Some((
+            replacement_va_16k,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(ipa_old_fb, 0x4000),
+        "must not map older live fallback after preferred row was replaced"
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_new_pref, 0x4000));
 
     mutate_external_alias_state(|registry| {
         assert!(
