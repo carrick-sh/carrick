@@ -193,7 +193,7 @@ pub(super) enum BackingPreparation {
 
 /// Why preparing an owner-selected window must wait and rerun ("not now")
 /// rather than refuse or fail: either the MM's EL1 editor was held under the
-/// outer exclusion (#2941), or returnable custody in [`ForkStock`] temporarily
+/// outer exclusion (#2941), or returnable custody in `ForkStock` temporarily
 /// holds the remaining page tables (#3017).
 #[derive(::core::fmt::Debug)]
 pub(super) enum PlanBusy {

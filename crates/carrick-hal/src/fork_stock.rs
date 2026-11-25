@@ -1193,8 +1193,12 @@ impl TableStock {
     /// count until one serves and bisects between the last two. Serving is
     /// monotone in the count (a larger draw holds every smaller one), and
     /// no probe exceeds twice the answer, so a small shortage never
-    /// materializes the whole reserve: only a demand nothing short of it
-    /// serves, or that it cannot serve at all, probes it.
+    /// materializes far more than it needs. The doubling is capped at the
+    /// whole reserve, so the whole reserve is probed whenever the answer
+    /// exceeds the last doubled count below it (a 600-page reserve and a
+    /// 513-page answer probe the floor of 512, then 600, then bisect down
+    /// to 513, and 600 is still under twice 513), as well as when no draw
+    /// serves at all.
     fn smallest_serving_draw(
         &self,
         mut accepts: impl FnMut(&mut Vec<RootGpa>) -> bool,
