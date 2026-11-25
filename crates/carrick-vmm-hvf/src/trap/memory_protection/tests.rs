@@ -3910,6 +3910,287 @@ fn stage2_map_replay_restarts_coherently_on_concurrent_class_upsert() {
     );
     assert!(ScopedStage2MapTestStub::is_mapped(ipa_shrink, 0x1000));
 
+    // Subcase 3 (Codex #15 P0-2): Single-slice lookup (1 row, no slice yields)
+    // followed by `upsert_by_key` during `REPLAY_REMAP_BEFORE_GUARD` keeping
+    // `live_4k` live. Phase 2 retry must re-collect and map `new_16k_single`
+    // while charging `allow_ipa` only once for `ipa_single`.
+    let ipa_single = 0x7c70_0000_u64;
+    let old_4k_single = AliasBacking {
+        start: 0x3700_0000,
+        ipa: ipa_single,
+        host_addr: host_4k,
+        size: 0x1000,
+        physical_ipa: ipa_single,
+        physical_host_addr: host_4k,
+        physical_size: 0x1000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: upsert_scope,
+        inventory_backing: InventoryBackingIdentity::Private(9900),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let new_16k_single = AliasBacking {
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        inventory_backing: InventoryBackingIdentity::Private(9901),
+        ..old_4k_single
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        registry.push(old_4k_single);
+        registry.clear_replay_mappings_in();
+    });
+    let did_single_guard_upsert = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let did_single_hook = std::sync::Arc::clone(&did_single_guard_upsert);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_REMAP_BEFORE_GUARD
+                && !did_single_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                mutate_external_alias_state(|registry| {
+                    assert_eq!(registry.upsert_by_key(new_16k_single), Some(old_4k_single));
+                    registry.clear_replay_mappings_in();
+                });
+            }
+        })));
+    let mut allow_calls = 0_usize;
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single, 0x4000));
+    let res_single = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: ipa_single },
+            &mut |_| {
+                allow_calls += 1;
+                true
+            },
+        )
+    };
+    custody.stage2.set_hook(None);
+    assert!(did_single_guard_upsert.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        allow_calls, 1,
+        "Phase-2 retry must not re-charge allow_ipa for the same IPA"
+    );
+    assert_eq!(
+        res_single,
+        Ok(Some((
+            new_16k_single,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_single, 0x4000));
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_single, 0x1000));
+
+    // Subcase 4 (Codex #15 P0-1): Unrelated writes landing between EVERY slice
+    // across > 8 slice yields (640 dead rows -> 10 slices) must NOT trigger
+    // revision-restart exhaustion for either IPA or `VaProcess`.
+    let ipa_unrel = 0x7c80_0000_u64;
+    let va_unrel = 0x4800_0000_u64;
+    let unrel_mm_scope = AliasOwnershipScope::MmRootSlot {
+        base: 0xb000_0000,
+        size: 0x20_0000,
+    };
+    let unrel_container = ContainerRootToken(7788);
+    let live_ipa_unrel = AliasBacking {
+        start: 0x3800_0000,
+        ipa: ipa_unrel,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: ipa_unrel,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::GlobalShared,
+        ownership_scope: AliasOwnershipScope::Global,
+        inventory_backing: InventoryBackingIdentity::Private(10_000),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    let live_va_unrel = AliasBacking {
+        start: va_unrel,
+        ipa: 0x7c90_0000,
+        host_addr: host_16k,
+        size: 0x4000,
+        physical_ipa: 0x7c90_0000,
+        physical_host_addr: host_16k,
+        physical_size: 0x4000,
+        perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::ForkSharedAnonymous,
+        ownership_scope: unrel_mm_scope,
+        inventory_backing: InventoryBackingIdentity::Private(10_001),
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    mutate_external_alias_state(|registry| {
+        *registry = AliasRegistry::default();
+        for i in 1..=640_u64 {
+            registry.push(AliasBacking {
+                start: 0x3810_0000 + i * 0x4000,
+                ipa: ipa_unrel,
+                host_addr: 0,
+                size: 0x4000,
+                physical_ipa: ipa_unrel,
+                physical_host_addr: 0,
+                physical_size: 0x4000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::GlobalShared,
+                ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(5000 + i)),
+                inventory_backing: InventoryBackingIdentity::Private(10_100 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+            registry.push(AliasBacking {
+                start: va_unrel,
+                ipa: 0x7d00_0000 + i * 0x4000,
+                host_addr: 0,
+                size: 0x4000,
+                physical_ipa: 0x7d00_0000 + i * 0x4000,
+                physical_host_addr: 0,
+                physical_size: 0x4000,
+                perms,
+                guest_writable: true,
+                sharing: GuestMappingSharing::ForkSharedAnonymous,
+                ownership_scope: unrel_mm_scope,
+                inventory_backing: InventoryBackingIdentity::Private(11_100 + i),
+                shared_key_base: None,
+                shared_key_offset: 0,
+                owner_generation: 0,
+            });
+        }
+        registry.push(live_ipa_unrel);
+        registry.push(live_va_unrel);
+        registry.clear_replay_mappings_in();
+    });
+
+    let unrel_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let unrel_seq_hook = std::sync::Arc::clone(&unrel_seq);
+    custody
+        .stage2
+        .set_hook(Some(std::sync::Arc::new(move |point| {
+            if let carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name) = point
+                && name == crate::trap::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS
+            {
+                let k = unrel_seq_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                mutate_external_alias_state(|registry| {
+                    // Unrelated foreign process MmRootSlot + unrelated disjoint Global IPA/VA.
+                    registry.push(AliasBacking {
+                        start: 0x9900_0000 + k * 0x1_0000,
+                        ipa: 0x8900_0000 + k * 0x1_0000,
+                        host_addr: 0,
+                        size: 0x4000,
+                        physical_ipa: 0x8900_0000 + k * 0x1_0000,
+                        physical_host_addr: 0,
+                        physical_size: 0x4000,
+                        perms,
+                        guest_writable: true,
+                        sharing: GuestMappingSharing::ForkSharedAnonymous,
+                        ownership_scope: AliasOwnershipScope::MmRootSlot {
+                            base: 0xc000_0000 + k * 0x20_0000,
+                            size: 0x20_0000,
+                        },
+                        inventory_backing: InventoryBackingIdentity::Private(12_000 + k),
+                        shared_key_base: None,
+                        shared_key_offset: 0,
+                        owner_generation: 0,
+                    });
+                    registry.push(AliasBacking {
+                        start: 0x9a00_0000 + k * 0x1_0000,
+                        ipa: 0x8a00_0000 + k * 0x1_0000,
+                        host_addr: 0,
+                        size: 0x4000,
+                        physical_ipa: 0x8a00_0000 + k * 0x1_0000,
+                        physical_host_addr: 0,
+                        physical_size: 0x4000,
+                        perms,
+                        guest_writable: true,
+                        sharing: GuestMappingSharing::GlobalShared,
+                        ownership_scope: AliasOwnershipScope::Global,
+                        inventory_backing: InventoryBackingIdentity::Private(13_000 + k),
+                        shared_key_base: None,
+                        shared_key_offset: 0,
+                        owner_generation: 0,
+                    });
+                });
+            }
+        })));
+
+    assert!(!ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x4000));
+    let before_unrel_ipa = alias_state_rows_scanned();
+    let res_unrel_ipa = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::Ipa { gpa: ipa_unrel },
+            &mut |_| true,
+        )
+    };
+    let ipa_pauses = unrel_seq.swap(0, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        ipa_pauses, 10,
+        "expected 10 inter-slice pauses (> 8 restart limit)"
+    );
+    assert_eq!(
+        alias_state_rows_scanned() - before_unrel_ipa,
+        641,
+        "unrelated writes must cause ZERO restarts across 10 slices"
+    );
+    assert_eq!(
+        res_unrel_ipa,
+        Ok(Some((
+            live_ipa_unrel,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(ipa_unrel, 0x4000));
+
+    assert!(!ScopedStage2MapTestStub::is_mapped(0x7c90_0000, 0x4000));
+    let before_unrel_va = alias_state_rows_scanned();
+    let res_unrel_va = unsafe {
+        stage2_map_replay(
+            &custody,
+            g1,
+            ReplayAliasLookup::VaProcess {
+                va: va_unrel,
+                mm_root_slot: Some((0xb000_0000, 0x20_0000)),
+                container_root: unrel_container,
+            },
+            &mut |_| true,
+        )
+    };
+    custody.stage2.set_hook(None);
+    let va_pauses = unrel_seq.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        va_pauses, 10,
+        "expected 10 inter-slice pauses for VaProcess"
+    );
+    assert_eq!(
+        alias_state_rows_scanned() - before_unrel_va,
+        641,
+        "unrelated foreign MmRootSlot and Global VA writes must cause ZERO VaProcess restarts"
+    );
+    assert_eq!(
+        res_unrel_va,
+        Ok(Some((
+            live_va_unrel,
+            carrick_aarch64::stage2::Stage2Status::SUCCESS
+        )))
+    );
+    assert!(ScopedStage2MapTestStub::is_mapped(0x7c90_0000, 0x4000));
+
     mutate_external_alias_state(|registry| *registry = AliasRegistry::default());
     drop(live_4k);
     drop(live_16k);

@@ -237,20 +237,39 @@ pub(crate) type AliasExactFirstIndex = std::collections::BTreeMap<
 /// across active classes (<= 40 classes), eliminating full scans across thousands
 /// of irrelevant rows.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::default::Default,
-    ::core::clone::Clone,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-)]
+const ALIAS_CLASS_MUTATION_LOG_CAP: usize = 512;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug, ::core::default::Default, ::core::clone::Clone)]
 pub(crate) struct AliasClassIndex {
     pub(crate) by_class_start: std::collections::BTreeMap<(u32, u64), Vec<(u64, AliasBacking)>>,
     pub(crate) class_counts: std::collections::BTreeMap<u32, usize>,
     /// Which window of a row this index keys: its semantic window (`size`
     /// bytes from the caller's start key) or its physical stage-2 extent.
     pub(crate) domain: AliasWindowDomain,
+    /// Stable instance id assigned when placed into `va_classes_by_scope` so a
+    /// retired and recreated scope cannot alias an older cursor revision.
+    pub(crate) index_id: u64,
+    /// Monotonic structural mutation counter for THIS index alone.
+    pub(crate) revision: u64,
+    /// Revision of the most recent `clear()` (cursors older than this restart).
+    pub(crate) clear_revision: u64,
+    /// Bounded `(rev, class, start_key)` log so slice continuation proves no
+    /// bucket matching `probe` changed between lock holds.
+    pub(crate) recent_mutations: std::collections::VecDeque<(u64, u32, u64)>,
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ::core::cmp::PartialEq for AliasClassIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.by_class_start == other.by_class_start
+            && self.class_counts == other.class_counts
+            && self.domain == other.domain
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ::core::cmp::Eq for AliasClassIndex {}
 
 /// The window an [`AliasClassIndex`] classifies and bounds rows by. The start
 /// key is supplied by the caller (guest VA, stage-1 IPA or physical IPA); the
@@ -315,19 +334,58 @@ impl AliasClassIndex {
         }
     }
 
+    fn record_mutation(&mut self, class: u32, start_key: u64) {
+        self.revision = self.revision.saturating_add(1);
+        if self.recent_mutations.len() >= ALIAS_CLASS_MUTATION_LOG_CAP {
+            self.recent_mutations.pop_front();
+        }
+        self.recent_mutations
+            .push_back((self.revision, class, start_key));
+    }
+
+    /// True iff no structural edit since `since_rev` touched any bucket `(class, start_key)`
+    /// capable of appearing in `by_class_start.range((class, lower(probe))..=(class, probe))`.
+    pub(crate) fn probe_buckets_unchanged_since(&self, since_rev: u64, probe: u64) -> bool {
+        if since_rev == self.revision {
+            return true;
+        }
+        if since_rev < self.clear_revision || since_rev > self.revision {
+            return false;
+        }
+        let Some(&(oldest_rev, _, _)) = self.recent_mutations.front() else {
+            return false;
+        };
+        if oldest_rev > since_rev.saturating_add(1) {
+            return false;
+        }
+        for &(rev, class, start_key) in self.recent_mutations.iter().rev() {
+            if rev <= since_rev {
+                break;
+            }
+            let lower = probe.saturating_sub(Self::class_radius(class).saturating_sub(1));
+            if start_key >= lower && start_key <= probe {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn insert(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
         let class = Self::class(self.width(&alias));
         let rows = self.by_class_start.entry((class, start_key)).or_default();
         let at = rows.partition_point(|&(row_seq, _)| row_seq <= seq);
         rows.insert(at, (seq, alias));
         *self.class_counts.entry(class).or_default() += 1;
+        self.record_mutation(class, start_key);
     }
 
     pub(crate) fn remove(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
         let class = Self::class(self.width(&alias));
+        let mut removed = false;
         if let Some(rows) = self.by_class_start.get_mut(&(class, start_key)) {
             if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
                 rows.remove(at);
+                removed = true;
             }
             if rows.is_empty() {
                 self.by_class_start.remove(&(class, start_key));
@@ -341,11 +399,17 @@ impl AliasClassIndex {
                 count.remove();
             }
         }
+        if removed {
+            self.record_mutation(class, start_key);
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.by_class_start.clear();
         self.class_counts.clear();
+        self.revision = self.revision.saturating_add(1);
+        self.clear_revision = self.revision;
+        self.recent_mutations.clear();
     }
 
     /// Exact rows matching `start_key` and `size`.
@@ -723,7 +787,8 @@ pub(crate) struct ClassSliceCursor {
 )]
 pub(crate) struct ReplaySliceCursor {
     pub(crate) scope_index: usize,
-    pub(crate) revision: u64,
+    pub(crate) index_ids: [u64; 2],
+    pub(crate) revisions: [u64; 2],
     pub(crate) class_cursor: ClassSliceCursor,
 }
 
@@ -1225,6 +1290,8 @@ pub(crate) struct AliasRegistry {
     pub(crate) writer_site: Option<&'static std::panic::Location<'static>>,
     /// Row-changing mutations, attributed to their writer.
     pub(crate) mutation_log: AliasRegistryMutationLog,
+    /// Monotonic id generator for `va_classes_by_scope` instances.
+    pub(crate) next_class_index_id: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1419,10 +1486,18 @@ impl AliasRegistry {
     pub(crate) fn index_insert(&mut self, seq: u64, alias: AliasBacking) {
         self.va_classes.insert(alias.start, seq, alias);
         self.ipa_classes.insert(alias.ipa, seq, alias);
-        self.va_classes_by_scope
-            .entry(alias.ownership_scope)
-            .or_default()
-            .insert(alias.start, seq, alias);
+        let scope_index = match self.va_classes_by_scope.entry(alias.ownership_scope) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let id = self.next_class_index_id.max(1);
+                self.next_class_index_id = id.saturating_add(1);
+                slot.insert(AliasClassIndex {
+                    index_id: id,
+                    ..AliasClassIndex::default()
+                })
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+        };
+        scope_index.insert(alias.start, seq, alias);
         self.physical_classes_by_scope
             .entry(alias.ownership_scope)
             .or_insert_with(AliasClassIndex::physical)
@@ -1634,7 +1709,7 @@ impl AliasRegistry {
         matches: impl FnMut(&AliasBacking) -> bool,
     ) -> ReplaySliceStep {
         if let Some(c) = cursor
-            && c.revision != self.revision
+            && !index.probe_buckets_unchanged_since(c.revisions[0], probe)
         {
             return ReplaySliceStep::RestartFromRevision;
         }
@@ -1648,7 +1723,8 @@ impl AliasRegistry {
         match next {
             Some(class_cursor) => ReplaySliceStep::Continue(ReplaySliceCursor {
                 scope_index: 0,
-                revision: self.revision,
+                index_ids: [index.index_id, 0],
+                revisions: [index.revision, 0],
                 class_cursor,
             }),
             None => ReplaySliceStep::Complete,
@@ -2983,15 +3059,40 @@ impl AliasRegistry {
         budget: usize,
         slice_buf: &mut Vec<(u64, AliasBacking)>,
     ) -> ReplaySliceStep {
-        if let Some(c) = cursor
-            && c.revision != self.revision
-        {
-            return ReplaySliceStep::RestartFromRevision;
+        let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
+        let mut index_ids = [0_u64; 2];
+        let mut revisions = [0_u64; 2];
+        for (idx, scope) in scopes.iter().enumerate() {
+            if let Some(index) = self.va_classes_by_scope.get(scope) {
+                index_ids[idx] = index.index_id;
+                revisions[idx] = index.revision;
+            }
+        }
+        if let Some(c) = cursor {
+            for (idx, scope) in scopes.iter().enumerate() {
+                let unchanged = match self.va_classes_by_scope.get(scope) {
+                    Some(index) => {
+                        let same_instance =
+                            c.index_ids[idx] == index.index_id || c.index_ids[idx] == 0;
+                        same_instance && index.probe_buckets_unchanged_since(c.revisions[idx], va)
+                    }
+                    None => c.index_ids[idx] == 0,
+                };
+                if !unchanged {
+                    return ReplaySliceStep::RestartFromRevision;
+                }
+            }
         }
         if budget == 0 {
-            return cursor.map_or(ReplaySliceStep::Complete, ReplaySliceStep::Continue);
+            return match cursor {
+                Some(mut c) => {
+                    c.index_ids = index_ids;
+                    c.revisions = revisions;
+                    ReplaySliceStep::Continue(c)
+                }
+                None => ReplaySliceStep::Complete,
+            };
         }
-        let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
         let mut remaining = budget;
         let start_scope = cursor.map_or(0, |c| c.scope_index);
         for (scope_index, scope) in scopes.iter().enumerate().skip(start_scope) {
@@ -3010,7 +3111,8 @@ impl AliasRegistry {
             if let Some(next_class_cursor) = next {
                 return ReplaySliceStep::Continue(ReplaySliceCursor {
                     scope_index,
-                    revision: self.revision,
+                    index_ids,
+                    revisions,
                     class_cursor: next_class_cursor,
                 });
             }
@@ -3019,7 +3121,8 @@ impl AliasRegistry {
                 return if next_scope < scopes.len() {
                     ReplaySliceStep::Continue(ReplaySliceCursor {
                         scope_index: next_scope,
-                        revision: self.revision,
+                        index_ids,
+                        revisions,
                         class_cursor: ClassSliceCursor {
                             class: 0,
                             start_key: 0,

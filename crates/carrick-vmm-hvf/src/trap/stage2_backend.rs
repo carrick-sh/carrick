@@ -498,103 +498,129 @@ pub(crate) unsafe fn stage2_map_replay(
     allow_ipa: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Option<(AliasBacking, Stage2Status)>, Stage2Status> {
     const MAX_REPLAY_REVISION_RESTARTS: usize = 8;
-    let mut candidates: Vec<(u64, AliasBacking)> = Vec::new();
+    const MAX_REPLAY_PHASE2_RETRIES: usize = 4;
     let mut slice_buf: Vec<(u64, AliasBacking)> = Vec::with_capacity(super::LAZY_REPLAY_ROW_BUDGET);
-    let mut slice_cursor: Option<super::ReplaySliceCursor> = None;
-    let mut restarts = 0_usize;
-    loop {
-        let step = {
-            let registry = super::alias_registry().lock();
-            match lookup {
-                ReplayAliasLookup::Ipa { gpa } => registry.collect_replay_ipa_slice(
-                    gpa,
-                    slice_cursor,
-                    super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut slice_buf,
-                ),
-                ReplayAliasLookup::VaProcess {
-                    va,
-                    mm_root_slot,
-                    container_root,
-                } => registry.collect_replay_process_va_slice(
-                    va,
-                    mm_root_slot,
-                    container_root,
-                    slice_cursor,
-                    super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut slice_buf,
-                ),
-                ReplayAliasLookup::VaAnyScope { va } => registry.collect_replay_any_va_slice(
-                    va,
-                    slice_cursor,
-                    super::LAZY_REPLAY_ROW_BUDGET,
-                    &mut slice_buf,
-                ),
-            }
-        };
-        candidates.append(&mut slice_buf);
-        #[cfg(test)]
-        if slice_cursor.is_none() {
-            custody
-                .stage2
-                .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
-        }
-        match step {
-            super::ReplaySliceStep::Complete => break,
-            super::ReplaySliceStep::Continue(next) => {
+    let mut candidates: Vec<(u64, AliasBacking)> = Vec::new();
+    let mut allowed_ipas: Vec<u64> = Vec::new();
+
+    let (backing, mut stage2, mut registry) = 'retry: {
+        let mut attempt = 0_usize;
+        loop {
+            candidates.clear();
+            let mut slice_cursor: Option<super::ReplaySliceCursor> = None;
+            let mut restarts = 0_usize;
+            loop {
+                let step = {
+                    let registry = super::alias_registry().lock();
+                    match lookup {
+                        ReplayAliasLookup::Ipa { gpa } => registry.collect_replay_ipa_slice(
+                            gpa,
+                            slice_cursor,
+                            super::LAZY_REPLAY_ROW_BUDGET,
+                            &mut slice_buf,
+                        ),
+                        ReplayAliasLookup::VaProcess {
+                            va,
+                            mm_root_slot,
+                            container_root,
+                        } => registry.collect_replay_process_va_slice(
+                            va,
+                            mm_root_slot,
+                            container_root,
+                            slice_cursor,
+                            super::LAZY_REPLAY_ROW_BUDGET,
+                            &mut slice_buf,
+                        ),
+                        ReplayAliasLookup::VaAnyScope { va } => registry
+                            .collect_replay_any_va_slice(
+                                va,
+                                slice_cursor,
+                                super::LAZY_REPLAY_ROW_BUDGET,
+                                &mut slice_buf,
+                            ),
+                    }
+                };
+                candidates.append(&mut slice_buf);
                 #[cfg(test)]
-                custody
-                    .stage2
-                    .at_client_point(super::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS);
-                slice_cursor = Some(next);
-            }
-            super::ReplaySliceStep::RestartFromRevision => {
-                candidates.clear();
-                slice_cursor = None;
-                restarts += 1;
-                if restarts > MAX_REPLAY_REVISION_RESTARTS {
-                    return Ok(None);
+                if attempt == 0 && slice_cursor.is_none() {
+                    custody
+                        .stage2
+                        .at_client_point(super::carrier_custody::REPLAY_REMAP_DURING_PHASE1_LOOKUP);
+                }
+                match step {
+                    super::ReplaySliceStep::Complete => break,
+                    super::ReplaySliceStep::Continue(next) => {
+                        #[cfg(test)]
+                        custody
+                            .stage2
+                            .at_client_point(super::carrier_custody::REPLAY_SLICE_BETWEEN_LOCKS);
+                        slice_cursor = Some(next);
+                    }
+                    super::ReplaySliceStep::RestartFromRevision => {
+                        candidates.clear();
+                        slice_cursor = None;
+                        restarts += 1;
+                        if restarts > MAX_REPLAY_REVISION_RESTARTS {
+                            return Ok(None);
+                        }
+                    }
                 }
             }
-        }
-    }
-    if matches!(lookup, ReplayAliasLookup::Ipa { .. }) {
-        candidates.sort_by_key(|(seq, _)| *seq);
-    } else {
-        candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-    }
-    let Some((_, backing)) = candidates.into_iter().find(|&(_, entry)| {
-        let check_addr = match lookup {
-            ReplayAliasLookup::Ipa { .. } => entry.host_addr,
-            ReplayAliasLookup::VaProcess { va, .. } | ReplayAliasLookup::VaAnyScope { va } => {
-                entry.host_addr.saturating_add((va - entry.start) as usize)
+            if matches!(lookup, ReplayAliasLookup::Ipa { .. }) {
+                candidates.sort_by_key(|(seq, _)| *seq);
+            } else {
+                candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
             }
-        };
-        super::alias_backing_is_live(check_addr)
-            && (entry.physical_host_addr == check_addr
-                || super::alias_backing_is_live(entry.physical_host_addr))
-    }) else {
-        return Ok(None);
+            let Some((_, backing)) = candidates.iter().copied().find(|&(_, entry)| {
+                let check_addr = match lookup {
+                    ReplayAliasLookup::Ipa { .. } => entry.host_addr,
+                    ReplayAliasLookup::VaProcess { va, .. }
+                    | ReplayAliasLookup::VaAnyScope { va } => {
+                        entry.host_addr.saturating_add((va - entry.start) as usize)
+                    }
+                };
+                super::alias_backing_is_live(check_addr)
+                    && (entry.physical_host_addr == check_addr
+                        || super::alias_backing_is_live(entry.physical_host_addr))
+            }) else {
+                return Ok(None);
+            };
+            if !allowed_ipas.contains(&backing.physical_ipa) {
+                if !allow_ipa(backing.physical_ipa) {
+                    return Ok(None);
+                }
+                allowed_ipas.push(backing.physical_ipa);
+            }
+            #[cfg(test)]
+            if attempt == 0 {
+                custody
+                    .stage2
+                    .at_client_point(super::carrier_custody::REPLAY_REMAP_BEFORE_GUARD);
+            }
+            let Ok(stage2) =
+                custody.admitting_stage2_in(expected_generation, "lazy alias replay map")
+            else {
+                return Err(Stage2Status::NO_LIVE_VM);
+            };
+            #[cfg(test)]
+            if attempt == 0 {
+                custody
+                    .stage2
+                    .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
+            }
+            let registry =
+                super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
+            if registry.contains_exact_physical_row(&backing) {
+                break 'retry (backing, stage2, registry);
+            }
+            if attempt >= MAX_REPLAY_PHASE2_RETRIES {
+                return Ok(None);
+            }
+            drop(registry);
+            drop(stage2);
+            attempt += 1;
+        }
     };
-    if !allow_ipa(backing.physical_ipa) {
-        return Ok(None);
-    }
-    #[cfg(test)]
-    custody
-        .stage2
-        .at_client_point(super::carrier_custody::REPLAY_REMAP_BEFORE_GUARD);
-    let Ok(mut stage2) = custody.admitting_stage2_in(expected_generation, "lazy alias replay map")
-    else {
-        return Err(Stage2Status::NO_LIVE_VM);
-    };
-    #[cfg(test)]
-    custody
-        .stage2
-        .at_client_point(super::carrier_custody::REPLAY_REMAP_LOOKED_UP);
-    let mut registry = super::alias_registry_write(super::AliasRegistryWriter::ExternalMutation);
-    if !registry.contains_exact_physical_row(&backing) {
-        return Ok(None);
-    }
     let key = replay_mapping_key(backing);
     if registry.contains_replay(&key) {
         return Ok(Some((backing, Stage2Status::SUCCESS)));
