@@ -1059,8 +1059,10 @@ impl CarrierVmCustody {
                     ..
                 } if vm_generation.0 <= generation.0 => {
                     let record = state.stage2_records.get(&record_id);
-                    let busy = record
-                        .is_some_and(|r| r.snapshot.pin_count != 0 || r.snapshot.release_in_flight);
+                    let busy = record.is_some_and(|r| {
+                        !carrick_core::mm::retirement::record_is_unpinned(r)
+                            || r.snapshot.release_in_flight
+                    });
                     if busy {
                         None
                     } else {
@@ -1163,7 +1165,7 @@ impl CarrierVmCustody {
                             .then_some((record.snapshot.ipa, record.snapshot.len as u64));
                         if identity.vm_generation.0 <= keepers.drained_through
                             && record.snapshot.terminalized_by_vm_destroy
-                            && record.snapshot.pin_count == 0
+                            && carrick_core::mm::retirement::record_is_unpinned(record)
                         {
                             let _ = state.remove_record(identity.record_id);
                             settled_keeper = keepers
@@ -1600,7 +1602,7 @@ impl CarrierVmCustody {
         let mut state = self.stage2.lock();
         let record = state.stage2_records.get(&identity.record_id)?;
         if Self::stage2_identity_mismatch(record, identity).is_some()
-            || record.snapshot.pin_count != 0
+            || !carrick_core::mm::retirement::record_is_unpinned(record)
             || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
         {
             return None;
@@ -1632,7 +1634,7 @@ impl CarrierVmCustody {
             .get_mut(&identity.record_id)
             .ok_or(CarrierStage2RecordError::RecordNotFound)?;
         if has_pinned_predecessor
-            || record.snapshot.pin_count != 0
+            || !carrick_core::mm::retirement::record_is_unpinned(record)
             || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
         {
             return Err(CarrierStage2RecordError::RecordNotTerminal);
@@ -2145,7 +2147,8 @@ impl CarrierVmCustody {
         test_unmap: Option<&mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>>,
     ) -> CarrierStage2RetireOutcome {
         use carrick_core::mm::retirement::{
-            RecordRetirement, prepare_record_retirement, settle_record_retirement,
+            RecordRetirement, prepare_record_retirement_with_external_pins,
+            settle_record_retirement,
         };
         // The decision to unmap, the backend unmap and its settlement run
         // under one guard of the record's own generation: no raw destroy, and
@@ -2162,14 +2165,11 @@ impl CarrierVmCustody {
                 let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                     return CarrierStage2RetireOutcome::NotFound;
                 };
-                if has_pinned_predecessor
-                    && Self::stage2_identity_mismatch(record, identity).is_none()
-                {
-                    record.snapshot.retirement_requested = true;
-                    record.snapshot.retry_eligible = false;
-                    return CarrierStage2RetireOutcome::DeferredActivePins;
-                }
-                return match prepare_record_retirement(record, identity) {
+                return match prepare_record_retirement_with_external_pins(
+                    record,
+                    identity,
+                    has_pinned_predecessor,
+                ) {
                     RecordRetirement::Complete(outcome) => outcome,
                     RecordRetirement::Unmap { .. } => {
                         // Every record created under a generation is terminalized by
@@ -2190,12 +2190,11 @@ impl CarrierVmCustody {
         let Some(record) = stage2.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
-        if has_pinned_predecessor && Self::stage2_identity_mismatch(record, identity).is_none() {
-            record.snapshot.retirement_requested = true;
-            record.snapshot.retry_eligible = false;
-            return CarrierStage2RetireOutcome::DeferredActivePins;
-        }
-        let (ipa, len) = match prepare_record_retirement(record, identity) {
+        let (ipa, len) = match prepare_record_retirement_with_external_pins(
+            record,
+            identity,
+            has_pinned_predecessor,
+        ) {
             RecordRetirement::Complete(outcome) => return outcome,
             RecordRetirement::Unmap { ipa, len } => (ipa, len),
         };
@@ -2334,7 +2333,9 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
-        use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
+        use carrick_core::mm::retirement::{
+            RecordPinRelease, record_is_unpinned, release_record_pin_outcome,
+        };
         let (
             outcome,
             settles_last_pin,
@@ -2389,7 +2390,7 @@ impl CarrierVmCustody {
                     .map(CarrierLeaseKeeperState::into_keeper);
             } else if settles_last_pin
                 && record.snapshot.terminalized_by_vm_destroy
-                && record.snapshot.pin_count == 0
+                && record_is_unpinned(record)
                 && !record.snapshot.release_in_flight
             {
                 let mut keepers = self.carrier_lease_keepers.lock();

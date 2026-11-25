@@ -534,8 +534,23 @@ pub fn prepare_record_retirement(
     record: &mut CarrierStage2Record,
     identity: CarrierStage2RecordIdentity,
 ) -> RecordRetirement {
+    prepare_record_retirement_with_external_pins(record, identity, false)
+}
+
+/// Prepare record retirement while also honoring external predecessor pins
+/// held across stage-2 replay/rebind.
+pub fn prepare_record_retirement_with_external_pins(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+    has_external_pins: bool,
+) -> RecordRetirement {
     if let Some(mismatch) = record_identity_mismatch(record, identity) {
         return RecordRetirement::Complete(mismatch);
+    }
+    if has_external_pins {
+        record.snapshot.retirement_requested = true;
+        record.snapshot.retry_eligible = false;
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::DeferredActivePins);
     }
     if record.snapshot.terminalized_by_vm_destroy {
         return RecordRetirement::Complete(CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
@@ -658,6 +673,11 @@ pub fn release_record_pin(
     identity: CarrierStage2RecordIdentity,
 ) -> bool {
     release_record_pin_outcome(record, identity) == RecordPinRelease::RemovePredecessor
+}
+
+/// Whether a carrier stage-2 record has no active pins remaining.
+pub fn record_is_unpinned(record: &CarrierStage2Record) -> bool {
+    record.snapshot.pin_count == 0
 }
 pub fn terminalize_record(record: &mut CarrierStage2Record) {
     record.snapshot.mapped = false;
@@ -937,9 +957,19 @@ mod nonce_tests {
         predecessor.snapshot.pin_count = 1;
         predecessor.snapshot.superseded_by_rebind = true;
         terminalize_record(&mut predecessor);
+        assert!(!record_is_unpinned(&predecessor));
         assert_eq!(
             release_record_pin_outcome(&mut predecessor, identity),
             RecordPinRelease::RemovePredecessor
         );
+        assert!(record_is_unpinned(&predecessor));
+
+        let mut external_pinned = base_record;
+        assert_eq!(
+            prepare_record_retirement_with_external_pins(&mut external_pinned, identity, true),
+            RecordRetirement::Complete(CarrierStage2RetireOutcome::DeferredActivePins)
+        );
+        assert!(external_pinned.snapshot.retirement_requested);
+        assert!(!external_pinned.snapshot.retry_eligible);
     }
 }
