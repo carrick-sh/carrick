@@ -2149,6 +2149,10 @@ pub(crate) fn register_carrier_stage2_leases(
         }
     }
     if let Some((error, mut failed_lease)) = transfer_error {
+        #[cfg(test)]
+        custody
+            .stage2
+            .at_client_point(CARRIER_BATCH_PREFIX_BEFORE_DETACH);
         custody.detach_and_abandon_carrier_batch_prefix_locked(&mut registered, &identities);
         drop(registered);
         #[cfg(test)]
@@ -2273,6 +2277,9 @@ pub(crate) enum CarrierSafePointRetirement {
     Retired,
     DeferredActivePins,
 }
+
+#[cfg(test)]
+pub(crate) const CARRIER_BATCH_PREFIX_BEFORE_DETACH: &str = "carrier batch prefix before detach";
 
 #[cfg(test)]
 pub(crate) const CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE: &str =
@@ -2408,9 +2415,14 @@ fn retire_carrier_stage2_record_at_safe_point_with(
     retire: impl FnOnce(&CarrierVmCustody, CarrierStage2RecordIdentity) -> CarrierStage2RetireOutcome,
     release: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<CarrierSafePointRetirement, TrapError> {
-    let snapshot = custody
-        .stage2_record_snapshot(identity.record_id)
-        .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
+    let Some(snapshot) = custody.stage2_record_snapshot(identity.record_id) else {
+        if custody.is_abandoned_record_settled_by_destroy(identity) {
+            return Ok(CarrierSafePointRetirement::Retired);
+        }
+        return Err(TrapError::Hypervisor(
+            "carrier stage-2 record disappeared".to_owned(),
+        ));
+    };
     let key = (snapshot.ipa, snapshot.len as u64);
     match retire(custody, identity) {
         CarrierStage2RetireOutcome::RetiredUnmapped
@@ -3787,6 +3799,7 @@ fn retry_structural_backing_identities_with(
     ) -> CarrierStage2RetireOutcome,
     release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
+    let mut first_error: Option<TrapError> = None;
     for &identity in identities {
         let eligible = {
             let retained_by_record = custody.structural_backings.lock();
@@ -3806,33 +3819,49 @@ fn retry_structural_backing_identities_with(
         match retire(custody, identity) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
-                let extracted = {
+                if custody
+                    .stage2_record_snapshot(identity.record_id)
+                    .is_some_and(|snapshot| snapshot.pin_count != 0)
+                    || custody.has_pinned_structural_predecessor(identity.record_id)
+                {
+                    continue;
+                }
+                let finalized = {
                     let mut retained_by_record = custody.structural_backings.lock();
                     finalize_structural_backing_terminal_locked(
                         custody,
                         &mut retained_by_record,
                         identity,
                         release_ipa,
-                    )?
+                    )
                 };
-                drop(extracted);
-                drop_carrier_lease_keeper(custody, identity.record_id);
-                if let Some(deferred) =
-                    custody.take_deferred_structural_logical_release(identity.record_id)
-                {
-                    deferred.drain();
+                match finalized {
+                    Ok(extracted) => {
+                        drop(extracted);
+                        drop_carrier_lease_keeper(custody, identity.record_id);
+                        if let Some(deferred) =
+                            custody.take_deferred_structural_logical_release(identity.record_id)
+                        {
+                            deferred.drain();
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
             CarrierStage2RetireOutcome::DeferredActivePins
             | CarrierStage2RetireOutcome::NotFound => {}
             outcome => {
-                return Err(TrapError::Hypervisor(format!(
-                    "retire structural backing at explicit safe point: {outcome:?}"
-                )));
+                first_error.get_or_insert_with(|| {
+                    TrapError::Hypervisor(format!(
+                        "retire structural backing at explicit safe point: {outcome:?}"
+                    ))
+                });
             }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4377,15 +4406,10 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                 continue;
             }
             let old_identity = identity;
-            let mut inherited_preds = stage2
-                .pinned_structural_predecessors
-                .remove(&old_identity.record_id)
-                .unwrap_or_default();
             let direct_pinned = stage2
                 .stage2_records
                 .get(&old_identity.record_id)
                 .is_some_and(|record| record.snapshot.pin_count != 0);
-            let old_pinned = direct_pinned || !inherited_preds.is_empty();
             let new_identity = CarrierVmCustody::rebind_terminal_stage2_record(
                 &mut stage2,
                 old_identity,
@@ -4397,6 +4421,11 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "rebind structural backing after VM replay: {error:?}"
                 ))
             })?;
+            let mut inherited_preds = stage2
+                .pinned_structural_predecessors
+                .remove(&old_identity.record_id)
+                .unwrap_or_default();
+            let old_pinned = direct_pinned || !inherited_preds.is_empty();
             if is_retired_or_deferred
                 && let Some(record) = stage2.stage2_records.get_mut(&new_identity.record_id)
             {
@@ -5326,7 +5355,12 @@ fn retry_pending_global_frame_retirements_at_idle_with(
         .collect::<Vec<_>>();
     let structural_remaining = retired_structural_ids
         .into_iter()
-        .filter(|&id| custody.stage2_record_snapshot(id).is_some())
+        .filter(|&id| {
+            custody
+                .stage2_record_snapshot(id)
+                .is_some_and(|snapshot| snapshot.pin_count == 0)
+                && !custody.has_pinned_structural_predecessor(id)
+        })
         .count();
     report.remaining = custody.pending_global_frame_directory_retries.lock().len()
         + custody.pending_global_frame_detached_retries.lock().len()

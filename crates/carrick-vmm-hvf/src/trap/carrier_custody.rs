@@ -7867,15 +7867,35 @@ mod carrier_vm_custody_tests {
         let (pin_ready_tx, pin_ready_rx) = std::sync::mpsc::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
         let resume_rx = std::sync::Mutex::new(resume_rx);
+        let captured_pins = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let hook_custody = std::sync::Arc::clone(&custody);
+        let hook_pins = std::sync::Arc::clone(&captured_pins);
         custody
             .stage2
-            .set_hook(Some(std::sync::Arc::new(move |point| {
-                if matches!(
-                    point,
-                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
-                        super::CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE
-                    )
-                ) {
+            .set_hook(Some(std::sync::Arc::new(move |point| match point {
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::CARRIER_BATCH_PREFIX_BEFORE_DETACH,
+                ) => {
+                    let fixed_id = hook_custody
+                        .stage2_record_covering(fixed_ipa, len)
+                        .expect("fixed prefix mapped before detach");
+                    let res_id = hook_custody
+                        .stage2_record_covering(res_ipa, len)
+                        .expect("reserved prefix mapped before detach");
+                    *hook_pins.lock() = Some((
+                        fixed_id,
+                        res_id,
+                        hook_custody
+                            .pin_stage2_record(fixed_id)
+                            .expect("pin fixed prefix before retirement request"),
+                        hook_custody
+                            .pin_stage2_record(res_id)
+                            .expect("pin reserved prefix before retirement request"),
+                    ));
+                }
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE,
+                ) => {
                     pin_ready_tx.send(()).expect("notify rollback hook");
                     resume_rx
                         .lock()
@@ -7883,6 +7903,7 @@ mod carrier_vm_custody_tests {
                         .recv()
                         .expect("resume rollback");
                 }
+                _ => {}
             })));
         let owners = std::collections::BTreeMap::from([
             ((fixed_ipa, len as u64), fixed_host),
@@ -7897,24 +7918,16 @@ mod carrier_vm_custody_tests {
         pin_ready_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("batch rollback must hit CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE");
+        let (fixed_id, res_id, fixed_pin, res_pin) = captured_pins
+            .lock()
+            .take()
+            .expect("pins captured before detach");
         assert!(
             custody.carrier_stage2_records.lock().is_empty(),
             "batch rollback must detach prefix entries before releasing carrier_stage2_records"
         );
-        let fixed_id = custody
-            .stage2_record_covering(fixed_ipa, len)
-            .expect("fixed prefix record still mapped until safe point");
-        let res_id = custody
-            .stage2_record_covering(res_ipa, len)
-            .expect("reserved prefix record still mapped until safe point");
         assert!(custody.carrier_lease_keepers.lock().entries[&fixed_id.record_id].is_abandoned());
         assert!(custody.carrier_lease_keepers.lock().entries[&res_id.record_id].is_abandoned());
-        let fixed_pin = custody
-            .pin_stage2_record(fixed_id)
-            .expect("pin fixed prefix");
-        let res_pin = custody
-            .pin_stage2_record(res_id)
-            .expect("pin reserved prefix");
         resume_tx.send(()).expect("resume batch rollback");
         let batch_err = batch_thread
             .join()
@@ -8164,15 +8177,35 @@ mod carrier_vm_custody_tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
         let resume_rx = std::sync::Mutex::new(resume_rx);
+        let captured_pins = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let hook_custody = std::sync::Arc::clone(&custody);
+        let hook_pins = std::sync::Arc::clone(&captured_pins);
         custody
             .stage2
-            .set_hook(Some(std::sync::Arc::new(move |point| {
-                if matches!(
-                    point,
-                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
-                        super::CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE
-                    )
-                ) {
+            .set_hook(Some(std::sync::Arc::new(move |point| match point {
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::CARRIER_BATCH_PREFIX_BEFORE_DETACH,
+                ) => {
+                    let fixed_id = hook_custody
+                        .stage2_record_covering(fixed_ipa, len)
+                        .expect("fixed prefix mapped before detach");
+                    let res_id = hook_custody
+                        .stage2_record_covering(res_ipa, len)
+                        .expect("reserved prefix mapped before detach");
+                    *hook_pins.lock() = Some((
+                        fixed_id,
+                        res_id,
+                        hook_custody
+                            .pin_stage2_record(fixed_id)
+                            .expect("pin fixed before detach"),
+                        hook_custody
+                            .pin_stage2_record(res_id)
+                            .expect("pin reserved before detach"),
+                    ));
+                }
+                carrick_aarch64::stage2::custody::Stage2HookPoint::Client(
+                    super::CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE,
+                ) => {
                     ready_tx.send(()).expect("notify rollback hook");
                     resume_rx
                         .lock()
@@ -8180,6 +8213,7 @@ mod carrier_vm_custody_tests {
                         .recv()
                         .expect("resume rollback");
                 }
+                _ => {}
             })));
         let owners = std::collections::BTreeMap::from([
             ((fixed_ipa, len as u64), fixed_host),
@@ -8195,14 +8229,10 @@ mod carrier_vm_custody_tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("batch rollback must hit CARRIER_BATCH_ROLLBACK_BEFORE_RETIRE");
 
-        let fixed_id = custody
-            .stage2_record_covering(fixed_ipa, len)
-            .expect("fixed prefix mapped");
-        let res_id = custody
-            .stage2_record_covering(res_ipa, len)
-            .expect("reserved prefix mapped");
-        let fixed_pin = custody.pin_stage2_record(fixed_id).expect("pin fixed");
-        let res_pin = custody.pin_stage2_record(res_id).expect("pin reserved");
+        let (fixed_id, res_id, fixed_pin, res_pin) = captured_pins
+            .lock()
+            .take()
+            .expect("pins captured before detach");
         assert!(custody.carrier_stage2_records.lock().is_empty());
 
         // Competing VM destroy + G2 replay attempts to rebind both prefix entries before rollback resumes.
@@ -8350,10 +8380,10 @@ mod carrier_vm_custody_tests {
         let (custody, g1) = live_custody();
         let pool = custody.root_slot_pool().expect("root slot pool");
         let h0 = pool.allocate_slot().expect("slot0");
-        let slot0_ipa = h0.ipa();
-        h0.release_slot();
         let h1 = pool.allocate_slot().expect("slot1");
+        let slot0_ipa = h0.ipa();
         let slot1_ipa = h1.ipa();
+        h0.release_slot();
         h1.release_slot();
         assert_ne!(slot0_ipa, slot1_ipa);
 
@@ -8602,8 +8632,10 @@ mod carrier_vm_custody_tests {
             )
             .expect("unreplayed pinned deferred rollback must defer rather than RecordNotTerminal");
             assert_eq!(report.deferred, 1);
-            let pool2 = custody.root_slot_pool().expect("G2 pool");
-            assert!(pool.allocate_slot_at(slot0_ipa).is_none());
+            assert!(
+                pool.allocate_slot_at(slot0_ipa).is_none(),
+                "retained G1 pool must keep exact slot0 checked out while pinned across G2"
+            );
             assert!(state.structural_owner_host_ptr(slot0_ipa, ARENA).is_some());
             drop(pin0);
             assert!(custody.stage2_record_snapshot(id0.record_id).is_none());
@@ -8614,7 +8646,6 @@ mod carrier_vm_custody_tests {
                 .allocate_slot_at(slot0_ipa)
                 .expect("exact slot0 freed after last unpin post-destroy");
             freed.release_slot();
-            drop(pool2);
             std::mem::forget(vm);
         }
 
@@ -8720,6 +8751,48 @@ mod carrier_vm_custody_tests {
             // Retry pass before predecessor unpin drops MUST defer and keep slot0 out of pool.
             super::retry_structural_backing_retirements_in(&custody)
                 .expect("retry defers while predecessor pinned");
+            assert!(pool.allocate_slot_at(slot0_ipa).is_none());
+            assert!(state.structural_owner_host_ptr(slot0_ipa, ARENA).is_some());
+
+            // Now destroy G2 and inject a failed G2->G3 rebind (missing untracked G3 map):
+            // the predecessor pin fence on `new_id` MUST survive the failed rebind!
+            destroy_vm_with_custody_using(
+                &custody,
+                "destroy G2 before refused G3 rebind",
+                carrick_aarch64::stage2::Stage2Status::SUCCESS,
+                || {},
+            )
+            .expect("destroy G2");
+            let g3 = custody.begin_create().expect("begin G3");
+            custody.commit_create(g3).expect("commit G3");
+            let rebind_err = super::reconcile_global_frame_owners_after_replay_in_using(
+                &custody,
+                &[super::GlobalFrameReplayExtent {
+                    ipa: slot0_ipa,
+                    length: ARENA as u64,
+                    host_addr: slot0_host,
+                    perms,
+                    vm_generation: g3,
+                }],
+                false,
+                &mut super::release_retired_stage2_ipa,
+            )
+            .expect_err("missing G3 untracked map must fail rebind");
+            assert!(
+                rebind_err
+                    .to_string()
+                    .contains("rebind structural backing after VM replay"),
+                "unexpected refused G3 rebind error: {rebind_err}"
+            );
+            assert!(custody.has_pinned_structural_predecessor(new_id.record_id));
+            assert!(custody.has_deferred_structural_logical_release(new_id.record_id));
+            assert_eq!(
+                super::retire_structural_stage2_record_at_safe_point(&custody, new_id)
+                    .expect("terminal safe-point retirement must stay deferred while G1 pin holds"),
+                super::StructuralSafePointRetirement::DeferredActivePins
+            );
+            super::retry_structural_backing_retirements_in(&custody)
+                .expect("retry after refused G3 rebind must still keep G1 pin fence");
             assert!(pool.allocate_slot_at(slot0_ipa).is_none());
             assert!(state.structural_owner_host_ptr(slot0_ipa, ARENA).is_some());
 
@@ -8836,6 +8909,93 @@ mod carrier_vm_custody_tests {
                 .is_none()
         );
         assert!(!super::alias_backing_is_live(host_ptr));
+        std::mem::forget(vm);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn deferred_structural_idle_retry_does_not_starve_later_owner_when_earlier_refuses() {
+        const ARENA: usize = 2 * 1024 * 1024;
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let vm = make_fork_test_vm(&custody, g1);
+        let state = vm.task.mm_access_authority();
+        let ipa_low = 0x2800_0000_u64;
+        let ipa_high = 0x2840_0000_u64;
+        let mut raw = Vec::new();
+        state
+            .publish_raw_stage1_arenas_into(
+                &custody,
+                &[ipa_low, ipa_high],
+                carrick_hal::MemPerms::ReadWriteExec,
+                &mut raw,
+            )
+            .expect("publish two non-pooled structural arenas");
+        let owners = raw
+            .iter()
+            .filter_map(|r| r.structural_owner.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 2);
+        let id_low = owners[0].record_identity();
+        let id_high = owners[1].record_identity();
+        assert!(id_low.record_id < id_high.record_id);
+        let ptr_low = owners[0].ptr() as usize;
+        let ptr_high = owners[1].ptr() as usize;
+
+        let pin_low = custody.pin_stage2_record(id_low).expect("pin low");
+        let pin_high = custody.pin_stage2_record(id_high).expect("pin high");
+        assert_eq!(
+            super::owner_fork::retire_or_defer_published_fork_owners(&custody, &state, &owners)
+                .expect("defer both pinned owners"),
+            super::owner_fork::ForkOwnerRollbackOutcome::DeferredActivePins
+        );
+        drop(owners);
+        drop(raw);
+
+        stub.set_fail_next_unmap(true);
+        drop(pin_low);
+        stub.set_fail_next_unmap(true);
+        drop(pin_high);
+        assert!(
+            custody
+                .pending_global_frame_retirement_retry
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        // Idle retry where lower-ID owner keeps refusing unmap MUST NOT starve later owner!
+        let turn1 = super::retry_pending_global_frame_retirements_at_idle_in_using(
+            &custody,
+            &mut |ipa, _| {
+                if ipa == ipa_low {
+                    Err(super::CarrierStage2BackendError::HvReturn(1))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(turn1.remaining, 1);
+        assert!(
+            custody
+                .pending_global_frame_retirement_retry
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(custody.stage2_record_snapshot(id_high.record_id).is_none());
+        assert!(!custody.has_deferred_structural_logical_release(id_high.record_id));
+        assert!(state.structural_owner_host_ptr(ipa_high, ARENA).is_none());
+        assert!(!super::alias_backing_is_live(ptr_high));
+
+        assert!(custody.stage2_record_snapshot(id_low.record_id).is_some());
+        assert!(custody.has_deferred_structural_logical_release(id_low.record_id));
+        assert!(state.structural_owner_host_ptr(ipa_low, ARENA).is_some());
+
+        let turn2 = super::retry_pending_global_frame_retirements_at_idle_in(&custody);
+        assert_eq!(turn2.remaining, 0);
+        assert!(custody.stage2_record_snapshot(id_low.record_id).is_none());
+        assert!(custody.structural_backings.lock().is_empty());
+        assert!(!custody.has_deferred_structural_logical_release(id_low.record_id));
+        assert!(state.structural_owner_host_ptr(ipa_low, ARENA).is_none());
+        assert!(!super::alias_backing_is_live(ptr_low));
         std::mem::forget(vm);
     }
 
