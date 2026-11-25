@@ -248,6 +248,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     view.header().op,
                     carrick_core_abi::host_file::HostFileOp::MapPrivate
                         | carrick_core_abi::host_file::HostFileOp::MapShared
+                        | carrick_core_abi::host_file::HostFileOp::ReleaseWindow
                 ) {
                     return Err(fail("CPL0 file mapping uses HostFileCrossing"));
                 }
@@ -357,13 +358,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 anonymous_owner::BackingPreparation::FilePastEnd
                                 | anonymous_owner::BackingPreparation::TablesExhausted,
                             ) => false,
-                            // No rerun owner exists on this copy path yet:
-                            // an EFAULT here would be a wrong answer (#2686).
-                            Ok(anonymous_owner::BackingPreparation::Raced(refusal)) => {
-                                return Err(fail(format!(
-                                    "native backing plan raced a publication: {refusal:?}"
-                                )));
-                            }
+                            // A peer published into the fault window or closed MM
+                            // release after this selection was staged. Report
+                            // `Supplied` with an empty reply slot so the ring
+                            // reruns user copy or fault resolution against live
+                            // descriptors instead of trapping the carrier (#2975 P0 7).
+                            Ok(anonymous_owner::BackingPreparation::Raced) => true,
                             Err(wait) => {
                                 owner_wait = Some(wait);
                                 false

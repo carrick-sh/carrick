@@ -152,7 +152,13 @@ impl X86AnonymousVenue<'_> {
     fn source(
         &self,
         zone: &X86Cpl0Zone,
-    ) -> Result<Option<carrick_el1::memory::NativeFileSource>, SyscallResult> {
+    ) -> Result<
+        Option<(
+            carrick_el1::memory::NativeFileSource,
+            crate::rust_alloc::boxed::Box<[u8]>,
+        )>,
+        SyscallResult,
+    > {
         use carrick_personality_linux::native_host_file::{
             self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
         };
@@ -229,11 +235,14 @@ impl X86AnonymousVenue<'_> {
                 };
                 carrick_x86_carrier::entry::forward_to_host(&frame);
                 native_host_file::map_source(&record).map(|reply| {
-                    Some(pages(carrick_el1_abi::HostBackingIdentity::new(
-                        reply.handle,
-                        reply.generation,
-                        0,
-                    )))
+                    Some((
+                        pages(carrick_el1_abi::HostBackingIdentity::new(
+                            reply.handle,
+                            reply.generation,
+                            0,
+                        )),
+                        record,
+                    ))
                 })
             }
             Some(HostFileStage::Returned(result)) => Err(result),
@@ -242,6 +251,56 @@ impl X86AnonymousVenue<'_> {
             None => Ok(None),
             _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
         }
+    }
+
+    /// Release a retained `MapPrivate` or `MapShared` source and roll back any
+    /// unshared, uncommitted window slots when `serve_delegated_mapping` did
+    /// not commit the mapping into a reservation (#2975 P0 3). Reuses the
+    /// already-allocated POD record.
+    #[inline(never)]
+    fn release_unplaced_file(
+        staged: Option<(
+            carrick_el1::memory::NativeFileSource,
+            crate::rust_alloc::boxed::Box<[u8]>,
+        )>,
+    ) {
+        let Some((source, mut record)) = staged else {
+            return;
+        };
+        let identity = match source {
+            carrick_el1::memory::NativeFileSource::Copied(id)
+            | carrick_el1::memory::NativeFileSource::Window(id) => id,
+        };
+        let Some(len) = carrick_core_abi::host_file::record_len(0, 0) else {
+            return;
+        };
+        let Some(slice) = record.get_mut(..len) else {
+            return;
+        };
+        if carrick_core_abi::host_file::encode(
+            slice,
+            carrick_core_abi::host_file::HostFileHeader {
+                op: carrick_core_abi::host_file::HostFileOp::ReleaseWindow,
+                table: [0; 3],
+                fd: -1,
+                flags: 0,
+                args: [identity.handle().get(), identity.generation().get(), 0, 0],
+            },
+            &[],
+            0,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let frame = carrick_el1::isa::x86::context::native::NativeFrame {
+            rax: carrick_el1_abi::HostFileCrossing::NUMBER,
+            rcx: carrick_el1_abi::HostFileCrossing::FRAME_TAG,
+            rdi: slice.as_ptr() as u64,
+            rsi: slice.len() as u64,
+            ..Default::default()
+        };
+        carrick_x86_carrier::entry::forward_to_host(&frame);
     }
 }
 
@@ -262,8 +321,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         };
         // SAFETY: this CPU's binding retains its initialized atomic counters.
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
-        let file = match self.source(zone) {
-            Ok(file) => file,
+        let staged = match self.source(zone) {
+            Ok(staged) => staged,
             Err(result) => {
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval() {
                     counters.record_refusal(
@@ -275,6 +334,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 return DelegatedStep::Served(result);
             }
         };
+        let file = staged.as_ref().map(|(source, _)| *source);
+        let has_file = file.is_some();
         match carrick_el1::memory::serve_delegated_mapping(
             &mut self.frame,
             counters,
@@ -288,6 +349,11 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             },
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
+                let result = self.frame.result().0 as i64;
+                if result < 0 {
+                    Self::release_unplaced_file(staged);
+                    return DelegatedStep::Served(SyscallResult::new(result));
+                }
                 // A parked edit's token outlives its wake; the replay owns it.
                 #[cfg(feature = "test-support")]
                 let refused = crate::test_support::take_replay_settlement_refusal();
@@ -305,15 +371,20 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     // ownership failure no errno repairs: fatal, as on ARM.
                     fatal_reservation();
                 }
-                DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
+                DelegatedStep::Served(SyscallResult::new(result))
             }
-            carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+            carrick_el1::memory::DelegatedAnonymous::NotDelegated => {
+                Self::release_unplaced_file(staged);
+                DelegatedStep::NotDelegated
+            }
             carrick_el1::memory::DelegatedAnonymous::Contended(cause) => {
+                Self::release_unplaced_file(staged);
                 #[cfg(feature = "test-support")]
                 crate::test_support::arm_metadata_for_reprobe();
                 DelegatedStep::Contended(cause)
             }
-            carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
+            carrick_el1::memory::DelegatedAnonymous::Forward if has_file => {
+                Self::release_unplaced_file(staged);
                 counters.record_refusal(
                     self.native,
                     self.origin,
@@ -321,8 +392,14 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 );
                 DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
             }
-            carrick_el1::memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
-            carrick_el1::memory::DelegatedAnonymous::Settle(_) => DelegatedStep::Settle,
+            carrick_el1::memory::DelegatedAnonymous::Forward => {
+                Self::release_unplaced_file(staged);
+                DelegatedStep::Forward
+            }
+            carrick_el1::memory::DelegatedAnonymous::Settle(_) => {
+                Self::release_unplaced_file(staged);
+                DelegatedStep::Settle
+            }
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {

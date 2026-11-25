@@ -1288,6 +1288,8 @@ fn mounted_static_x86_shared_file_window_slot_budget_is_enforced() {
         (
             Some(7),
             vec![
+                "noreplace_err=ffffffffffffffef",
+                "noreplace_truncate=0000000000000000",
                 "chunks_gt_zero=0000000000000001",
                 "coarse_err=ffffffffffffffda",
                 "fine_err=ffffffffffffffda",

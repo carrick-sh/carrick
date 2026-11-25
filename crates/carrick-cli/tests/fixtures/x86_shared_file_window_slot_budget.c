@@ -44,10 +44,12 @@ enum {
 #define MAP_SHARED 1
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
+#define MAP_FIXED_NOREPLACE 0x100000
 #define CHUNK (2ULL << 20)
 #define BATCH_CHUNKS 4ULL
 #define BATCH_BYTES (BATCH_CHUNKS * CHUNK)
 #define FILE_SIZE (72ULL << 30)
+#define EEXIST (-17L)
 #define ENOSYS (-38L)
 
 static void row(const char *name, long ret) {
@@ -68,6 +70,33 @@ static int is_err(long p) {
 }
 
 void _start(void) {
+    // Rejected MAP_FIXED_NOREPLACE over an occupied VA must never leak
+    // window_slots or pin the file in the shrink fence (#2975 P0 3).
+    long nr_fd = sc(OPENAT, AT_FDCWD, (long)"window-noreplace",
+                    O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    if (nr_fd < 0 || sc(FTRUNCATE, nr_fd, FILE_SIZE, 0, 0, 0, 0) != 0) {
+        row("noreplace_setup", nr_fd);
+        sc(EXIT, 88, 0, 0, 0, 0, 0);
+    }
+    long occ = sc(MMAP, 0, 4096, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (is_err(occ)) {
+        row("noreplace_occ", occ);
+        sc(EXIT, 88, 0, 0, 0, 0, 0);
+    }
+    long noreplace_err = EEXIST;
+    for (unsigned long i = 0; i < 600; i++) {
+        long p = sc(MMAP, occ, BATCH_BYTES, PROT_RW,
+                    MAP_SHARED | MAP_FIXED_NOREPLACE, nr_fd,
+                    (long)(i * BATCH_BYTES));
+        if (p != EEXIST) {
+            noreplace_err = p;
+            break;
+        }
+    }
+    sc(MUNMAP, occ, 4096, 0, 0, 0, 0);
+    long noreplace_truncate = sc(FTRUNCATE, nr_fd, 0, 0, 0, 0, 0);
+    sc(CLOSE, nr_fd, 0, 0, 0, 0, 0);
+
     long fd = sc(OPENAT, AT_FDCWD, (long)"window-budget",
                  O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
     long r = fd >= 0 ? sc(FTRUNCATE, fd, FILE_SIZE, 0, 0, 0, 0) : fd;
@@ -166,6 +195,8 @@ void _start(void) {
     int status = -1;
     long w = sc(WAIT4, pid, (long)&status, 0, 0, 0, 0);
 
+    row("noreplace_err", noreplace_err);
+    row("noreplace_truncate", noreplace_truncate);
     row("chunks_gt_zero", total_chunks > 1 ? 1 : 0);
     row("coarse_err", coarse_err);
     row("fine_err", fine_err);

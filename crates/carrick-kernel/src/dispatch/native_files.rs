@@ -1216,7 +1216,8 @@ impl SyscallDispatcher {
             | HostFileOp::Fchmodat
             | HostFileOp::Fchownat
             | HostFileOp::NetSyscall
-            | HostFileOp::EpollSocketCtl => Served::Refused,
+            | HostFileOp::EpollSocketCtl
+            | HostFileOp::ReleaseWindow => Served::Refused,
         }
     }
 
