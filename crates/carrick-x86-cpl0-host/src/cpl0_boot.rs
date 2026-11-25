@@ -4356,6 +4356,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock.release_waiters())
     }
 
+    /// Fork-stock table pages the carrier can issue now: the reusable stock
+    /// and the never-issued reserve it draws from.
+    pub fn fork_table_capacity(&self) -> Result<usize, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.fork_stock.table_capacity())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture_hold_fork_stock(
         &self,
