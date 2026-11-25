@@ -1552,14 +1552,31 @@ mod forward_execution_tests {
             let files =
                 unsafe { BootstrapFileRegion::initialize(Arc::clone(&extent), file_binding) }
                     .unwrap();
+            let kernel_region = if with_pod {
+                let identity = backing_identity(&*frame_inventory).unwrap();
+                Some(
+                    memory
+                        .install(&[PreparedBacking { extent, identity }])
+                        .unwrap()[0],
+                )
+            } else {
+                None
+            };
             let pod = if with_pod {
                 vec![anonymous_owner::KernelPodStorage::for_bootstrap()]
             } else {
                 Vec::new()
             };
-            let mut custody =
-                BootstrapCustody::new(memory, ram, None, None, files, frame_inventory, pod)
-                    .unwrap();
+            let mut custody = BootstrapCustody::new(
+                memory,
+                ram,
+                None,
+                kernel_region,
+                files,
+                frame_inventory,
+                pod,
+            )
+            .unwrap();
             let root_gpa = RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap();
             let initial_mm = MmGeneration::new(nz(INITIAL_MM_KEY));
             let initial = InitialTaskBinding {
@@ -2394,6 +2411,562 @@ mod forward_execution_tests {
             0,
             "carrier teardown must release all shrink-fence pins (#2975 P0 2)"
         );
+    }
+
+    #[test]
+    fn capture_host_file_release_window_rolls_back_unplaced_slots_and_preserves_shared_holders() {
+        use carrick_core::mm::window::WINDOW_CHUNK_BYTES;
+        use carrick_core_abi::host_file::{
+            HostFileHeader, HostFileOp, HostFileRequestView, MapSourceReply, encode, record_len,
+            reply,
+        };
+        use carrick_hal::fork_stock::{
+            HostBackingRead, HostBackingReadError, HostBackingRetention,
+        };
+        use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, WRITE};
+        use std::os::fd::AsFd;
+
+        struct FileSource {
+            identity: carrick_el1_abi::HostBackingIdentity,
+            file: std::fs::File,
+        }
+        impl HostBackingRetention for FileSource {
+            fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
+                self.identity
+            }
+            fn read(&self, _: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError> {
+                Err(HostBackingReadError::Unavailable)
+            }
+            fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+                self.file.as_fd().try_clone_to_owned().ok()
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "carrick-release-window-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(WINDOW_CHUNK_BYTES * 4).unwrap();
+
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+        let live_pins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct TrackedPin {
+            _pin: Arc<dyn std::any::Any + Send + Sync>,
+            live: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for TrackedPin {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let admit = |fd: std::os::fd::BorrowedFd<'_>| {
+            let pin = dispatcher.admit_window_inode(fd)?;
+            live_pins.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Some(Arc::new(TrackedPin {
+                _pin: pin,
+                live: Arc::clone(&live_pins),
+            }) as Arc<dyn std::any::Any + Send + Sync>)
+        };
+
+        let mut fx = ForwardVenueFixture::with_pod();
+        let context = fx.root_binding.context();
+        let root = context.root;
+        let pod_va = carrick_guest_arch::KernelVa::new(X86_CPL0_BOOTSTRAP_METADATA_BASE);
+        let pod_gpa = FrameGpa::new(ALLOCATOR_GPA);
+        {
+            let va = pod_va.raw();
+            let mut write_pte = |table: u64, shift: u32, entry: u64| {
+                let offset = ((va >> shift) & 0x1ff) * 8;
+                fx.custody
+                    .0
+                    ._vm
+                    .write(FrameGpa::new(table + offset), &entry.to_le_bytes())
+                    .unwrap();
+            };
+            write_pte(root.address().raw(), 39, 0x3000 | PRESENT | WRITE);
+            write_pte(0x3000, 30, 0x4000 | PRESENT | WRITE);
+            write_pte(0x4000, 21, 0x5000 | PRESENT | WRITE);
+            write_pte(0x5000, 12, pod_gpa.raw() | PRESENT | WRITE | NX);
+        }
+        let initial_avail = fx.custody.0._vm.available_window_slots();
+
+        let install_map =
+            |fx: &mut ForwardVenueFixture, offset: u64, len: u64, h: u64, input: &[u8]| {
+                let mut bytes = vec![0u8; record_len(input.len(), MapSourceReply::BYTES).unwrap()];
+                encode(
+                    &mut bytes,
+                    HostFileHeader {
+                        op: HostFileOp::MapShared,
+                        table: [1, 2, 3],
+                        fd: 4,
+                        flags: 0,
+                        args: [offset, len, 0, 0],
+                    },
+                    input,
+                    MapSourceReply::BYTES,
+                )
+                .unwrap();
+                fx.custody.0._vm.write(pod_gpa, &bytes).unwrap();
+                {
+                    let mut io = TestIo {
+                        image: context_with_root(1, root).hardware_image(),
+                    };
+                    let lease = StoppedCpuLease {
+                        cpu: carrick_guest_arch::CpuId::new(0),
+                        io: &mut io,
+                    };
+                    let mut venue =
+                        ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+                    bytes = venue.capture_host_file(pod_va, bytes.len()).unwrap();
+                }
+                let id = carrick_el1_abi::HostBackingIdentity::new(
+                    NonZeroU64::new(h).unwrap(),
+                    NonZeroU64::MIN,
+                    0,
+                );
+                let encoded = MapSourceReply {
+                    handle: id.handle(),
+                    generation: id.generation(),
+                }
+                .encode();
+                HostFileRequestView::parse(&mut bytes)
+                    .unwrap()
+                    .reply(0, &encoded)
+                    .unwrap();
+                let source: Arc<dyn HostBackingRetention> = Arc::new(FileSource {
+                    identity: id,
+                    file: file.try_clone().unwrap(),
+                });
+                fx.custody.0._vm.write(pod_gpa, &bytes).unwrap();
+                {
+                    let mut io = TestIo {
+                        image: context_with_root(1, root).hardware_image(),
+                    };
+                    let lease = StoppedCpuLease {
+                        cpu: carrick_guest_arch::CpuId::new(0),
+                        io: &mut io,
+                    };
+                    let mut venue =
+                        ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+                    venue
+                        .complete_host_file(pod_va, &mut bytes, Some(source), admit)
+                        .unwrap();
+                }
+                id
+            };
+
+        let send_release = |fx: &mut ForwardVenueFixture,
+                            id: carrick_el1_abi::HostBackingIdentity| {
+            let mut bytes = vec![0u8; record_len(0, 0).unwrap()];
+            encode(
+                &mut bytes,
+                HostFileHeader {
+                    op: HostFileOp::ReleaseWindow,
+                    table: [0; 3],
+                    fd: -1,
+                    flags: 0,
+                    args: [id.handle().get(), id.generation().get(), 0, 0],
+                },
+                &[],
+                0,
+            )
+            .unwrap();
+            fx.custody.0._vm.write(pod_gpa, &bytes).unwrap();
+            let mut io = TestIo {
+                image: context_with_root(1, root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(0),
+                io: &mut io,
+            };
+            let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+            let mut captured = venue.capture_host_file(pod_va, bytes.len()).unwrap();
+            venue
+                .complete_host_file(pod_va, &mut captured, None, |_fd| None)
+                .unwrap();
+            let guest_bytes = fx.custody.0._vm.read(pod_gpa, captured.len()).unwrap();
+            assert_eq!(reply(&guest_bytes).unwrap().result, 0);
+        };
+
+        // 1. Single unplaced two-chunk mapping rolls back completely: slots=0,
+        // tail GPA rewinds to start, source released, shrink-fence pin dropped.
+        let id1 = install_map(&mut fx, 0, 2 * WINDOW_CHUNK_BYTES, 31, &[]);
+        assert_eq!(fx.custody.0._vm.window_slots(), 2);
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 1);
+        send_release(&mut fx, id1);
+        assert_eq!(fx.custody.0._vm.window_slots(), 0);
+        assert_eq!(fx.custody.0._vm.available_window_slots(), initial_avail);
+        assert_eq!(
+            fx.custody.0.anonymous_next_gpa,
+            FrameGpa::new(DYNAMIC_GRANT_GPA)
+        );
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(!fx.custody.0.sources_mut(context).unwrap().is_window(id1));
+
+        // 2. Overlapping holder: id_a covers chunk 0, id_b covers chunks 0..2.
+        // Rolling back id_b keeps shared chunk 0 alive, revokes chunk 1, and
+        // rewinds tail GPA to DYNAMIC_GRANT_GPA + WINDOW_CHUNK_BYTES.
+        let id_a = install_map(&mut fx, 0, WINDOW_CHUNK_BYTES, 32, &[]);
+        let id_b = install_map(&mut fx, 0, 2 * WINDOW_CHUNK_BYTES, 33, &[]);
+        assert_eq!(fx.custody.0._vm.window_slots(), 2);
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 2);
+        send_release(&mut fx, id_b);
+        assert_eq!(fx.custody.0._vm.window_slots(), 1);
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            fx.custody.0.anonymous_next_gpa,
+            FrameGpa::new(DYNAMIC_GRANT_GPA + WINDOW_CHUNK_BYTES)
+        );
+        assert!(fx.custody.0.sources_mut(context).unwrap().is_window(id_a));
+
+        // 3. Releasing a previously committed holder via MapSourceReply::decode_releases
+        // marks chunk 0 committed so a later ReleaseWindow does not revoke it.
+        let rel_bytes = MapSourceReply {
+            handle: id_a.handle(),
+            generation: id_a.generation(),
+        }
+        .encode();
+        let id_c = install_map(&mut fx, 0, WINDOW_CHUNK_BYTES, 34, &rel_bytes);
+        send_release(&mut fx, id_c);
+        send_release(&mut fx, id_a);
+        assert_eq!(fx.custody.0._vm.window_slots(), 1);
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        drop(fx);
+        assert_eq!(live_pins.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn service_native_notice_treats_raced_window_publication_as_supplied() {
+        use carrick_core::mm::window::WINDOW_CHUNK_BYTES;
+        use carrick_core_abi::host_file::{
+            HostFileHeader, HostFileOp, HostFileRequestView, MapSourceReply, encode, record_len,
+        };
+        use carrick_core_abi::service::{
+            ServiceBirth, ServiceOperation, ServiceOrigin, ServiceResult, ServiceSelector,
+        };
+        use carrick_el1_abi::{
+            PortalOperation, ReservationIncarnation, ReservationMm, ReservationProtection,
+            ReservationRange,
+        };
+        use carrick_guest_arch::FaultInfo;
+        use carrick_hal::fork_stock::{
+            HostBackingRead, HostBackingReadError, HostBackingRetention,
+        };
+        use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
+        use std::os::fd::AsFd;
+
+        struct FileSource {
+            identity: carrick_el1_abi::HostBackingIdentity,
+            file: std::fs::File,
+        }
+        impl HostBackingRetention for FileSource {
+            fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
+                self.identity
+            }
+            fn read(&self, _: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError> {
+                Err(HostBackingReadError::Unavailable)
+            }
+            fn host_file(&self) -> Option<std::os::fd::OwnedFd> {
+                self.file.as_fd().try_clone_to_owned().ok()
+            }
+        }
+        fn dummy_entropy(
+            _: &mut [u8],
+        ) -> Result<(), carrick_core_abi::service::entropy::InvalidEntropyRecord> {
+            Ok(())
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "carrick-native-raced-window-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(WINDOW_CHUNK_BYTES).unwrap();
+
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+        let mut fx = ForwardVenueFixture::with_pod();
+        fx.custody.0.bind_grant_portal().unwrap();
+        let context = fx.root_binding.context();
+        let root = context.root;
+        let carrier_id = fx.custody.0._vm.identity().nonzero();
+        let fault_va = 0x1000_0000u64;
+        let pod_va = carrick_guest_arch::KernelVa::new(X86_CPL0_BOOTSTRAP_METADATA_BASE);
+        let pod_gpa = FrameGpa::new(ALLOCATOR_GPA);
+        let control_va = METADATA_VA + CONTROL_OFFSET;
+        let control_gpa = META_GPA + CONTROL_OFFSET;
+        {
+            let mut write_pte = |table: u64, va: u64, shift: u32, entry: u64| {
+                let offset = ((va >> shift) & 0x1ff) * 8;
+                fx.custody
+                    .0
+                    ._vm
+                    .write(FrameGpa::new(table + offset), &entry.to_le_bytes())
+                    .unwrap();
+            };
+            // Kernel PDPT/PD at 0x3000/0x4000, separate PTs for pod_va (0x5000) and control (0x6000).
+            write_pte(
+                root.address().raw(),
+                pod_va.raw(),
+                39,
+                0x3000 | PRESENT | WRITE,
+            );
+            write_pte(0x3000, pod_va.raw(), 30, 0x4000 | PRESENT | WRITE);
+            write_pte(0x4000, pod_va.raw(), 21, 0x5000 | PRESENT | WRITE);
+            write_pte(
+                0x5000,
+                pod_va.raw(),
+                12,
+                pod_gpa.raw() | PRESENT | WRITE | NX,
+            );
+            write_pte(0x4000, control_va, 21, 0x6000 | PRESENT | WRITE);
+            write_pte(0x6000, control_va, 12, control_gpa | PRESENT | WRITE | NX);
+            // User PT hierarchy at 0x7000/0x8000/0x9000 with an already-present leaf at fault_va
+            // modelling a peer CPU publishing into the fault window before native service plans it.
+            write_pte(
+                root.address().raw(),
+                fault_va,
+                39,
+                0x7000 | PRESENT | WRITE | USER,
+            );
+            write_pte(0x7000, fault_va, 30, 0x8000 | PRESENT | WRITE | USER);
+            write_pte(0x8000, fault_va, 21, 0x9000 | PRESENT | WRITE | USER);
+            write_pte(0x9000, fault_va, 12, 0x1_0000 | PRESENT | WRITE | USER);
+        }
+
+        // Admit a shared file window slot and host backing identity.
+        let id = carrick_el1_abi::HostBackingIdentity::new(
+            NonZeroU64::new(51).unwrap(),
+            NonZeroU64::MIN,
+            0,
+        );
+        let mut bytes = vec![0u8; record_len(0, MapSourceReply::BYTES).unwrap()];
+        encode(
+            &mut bytes,
+            HostFileHeader {
+                op: HostFileOp::MapShared,
+                table: [1, 2, 3],
+                fd: 4,
+                flags: 0,
+                args: [0, WINDOW_CHUNK_BYTES, 0, 0],
+            },
+            &[],
+            MapSourceReply::BYTES,
+        )
+        .unwrap();
+        HostFileRequestView::parse(&mut bytes)
+            .unwrap()
+            .reply(
+                0,
+                &MapSourceReply {
+                    handle: id.handle(),
+                    generation: id.generation(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        let source: Arc<dyn HostBackingRetention> = Arc::new(FileSource {
+            identity: id,
+            file: file.try_clone().unwrap(),
+        });
+        fx.custody.0._vm.write(pod_gpa, &bytes).unwrap();
+        {
+            let mut io = TestIo {
+                image: context_with_root(1, root).hardware_image(),
+            };
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(0),
+                io: &mut io,
+            };
+            let mut venue = ForwardVenue::new(&mut fx.custody.0, lease, &fx.children).unwrap();
+            venue
+                .complete_host_file(pod_va, &mut bytes, Some(source), |fd| {
+                    dispatcher.admit_window_inode(fd)
+                })
+                .unwrap();
+        }
+        // Clear the pod reply page before reusing pod_va for the fault reply slot.
+        fx.custody.0._vm.write(pod_gpa, &vec![0u8; 4096]).unwrap();
+
+        // Publish zone membership, service cell request, portal selection, and notice.
+        let mm_key = INITIAL_MM_KEY;
+        let ram = Arc::clone(&fx.custody.0.ram);
+        let zone_ptr = ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .unwrap();
+        let zone = unsafe { &*zone_ptr.cast::<X86Cpl0Zone>() };
+        let space_idx = zone
+            .spaces
+            .publish_closed(mm_key, root.address().raw(), root.address().raw())
+            .unwrap();
+        let entry = zone.space_entry(NonZeroU64::new(mm_key).unwrap()).unwrap();
+        entry
+            .admit_notifications(
+                NonZeroU64::MIN,
+                &carrick_sched_core::BoundedSpin(0),
+                &|_| {},
+            )
+            .unwrap();
+        let wake_no_delivery = |_z: &X86Cpl0Zone,
+                                _w: Waker,
+                                _o: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| {};
+        carrick_sched_core::spaces::notification::SpaceAccess::notified(SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &wake_no_delivery,
+            ),
+        })
+        .open(space_idx);
+        let record_id = zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: mm_key,
+                file_table: 5,
+                generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: METADATA_VA,
+                control_slot: control_va,
+            })
+            .unwrap();
+        let record = zone.record_ref(record_id);
+        assert!(zone.mark_native_owned(record_id));
+        let service_key =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+        zone.bind_object_wait(service_key, &carrick_sched_core::ShortLockSpin, &|_| {})
+            .unwrap();
+        unsafe {
+            zone.record(record_id)
+                .publish_owner_continuation(carrick_sched_core::object_wait::OwnerEntry::Syscall);
+        }
+
+        let control_ptr = ram
+            .host_ptr(META_GPA + CONTROL_OFFSET, size_of::<ThreadControlSlot>())
+            .unwrap();
+        let control: &ThreadControlSlot = unsafe { &*control_ptr.cast::<ThreadControlSlot>() };
+        control.bind_zone_record(record);
+        let member_custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        member_custody.commit_registration();
+        member_custody.commit_native_signal_owner();
+        let mm_handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier_id,
+                ReservationMm::new(mm_key).unwrap(),
+                NonZeroU64::MIN,
+            )
+        };
+        let birth = ServiceBirth {
+            origin: ServiceOrigin::Initial,
+            process: carrick_sched_core::process::TaskKey {
+                id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                    core::num::NonZeroI32::new(41).unwrap(),
+                ),
+                serial: carrick_sched_core::process::TaskSerial::from_raw_u64(7).unwrap(),
+            },
+            thread: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            record,
+            mm: mm_handle,
+        };
+        control.service.bind(birth).unwrap();
+        let fault_seq = NonZeroU64::MIN;
+        let req = control
+            .service
+            .publish_with_reply(
+                birth,
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                ServiceOperation::Fault(FaultInfo {
+                    address: UserVa::new(fault_va),
+                    access: carrick_guest_arch::Access::Read,
+                    present: false,
+                }),
+                Some(fault_seq),
+                Some(pod_va),
+            )
+            .unwrap();
+        let window = carrick_el1_abi::PortalGrantWindow {
+            operation: PortalOperation {
+                carrier: carrier_id,
+                mm: ReservationMm::new(mm_key).unwrap(),
+                incarnation: NonZeroU64::MIN,
+                sequence: fault_seq,
+            },
+            mapping_incarnation: ReservationIncarnation::new(1).unwrap(),
+            range: ReservationRange::new(fault_va, fault_va + 4096).unwrap(),
+            protection: ReservationProtection::READ_WRITE,
+            fault_page: fault_va,
+            host_backing: Some(id),
+            fork_sequence: None,
+        };
+        assert!(
+            fx.custody
+                .0
+                .grant_portal()
+                .unwrap()
+                .grant(0)
+                .unwrap()
+                .publish_fault_selection(fault_seq.get(), window)
+        );
+        fx.custody
+            .0
+            .task(carrick_guest_arch::CpuId::new(0))
+            .service_notice
+            .publish(ServiceSelector::from(req.identity))
+            .unwrap();
+
+        // Read the file supply outside carrier custody and service the native notice
+        // via the exact production methods.
+        let mut io = TestIo {
+            image: context_with_root(1, root).hardware_image(),
+        };
+        let lease = StoppedCpuLease {
+            cpu: carrick_guest_arch::CpuId::new(0),
+            io: &mut io,
+        };
+        let supply = fx
+            .custody
+            .0
+            .file_supply_request(&lease, true)
+            .unwrap()
+            .map(|r| r.read().unwrap());
+        let step = fx
+            .custody
+            .0
+            .service_native_notice(&lease, supply, dummy_entropy)
+            .expect("raced native fault publication must settle for rerun, not fail the carrier (#2975 P0 7)");
+        assert!(matches!(
+            step,
+            anonymous_owner::native_service::NativeNoticeStep::Settled
+        ));
+        assert_eq!(
+            control.service.consume(req.identity),
+            Ok(ServiceResult::Supplied),
+            "raced window fault must complete as Supplied so the ring retries the user copy (#2975 P0 7)"
+        );
+        drop(member_custody);
     }
 
     fn execution() -> (carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>) {
@@ -4992,12 +5565,11 @@ impl<'a> core::ops::Deref for StoppedFileTables<'a> {
 // and their existing inode/descriptor owners for concurrent guest access.
 unsafe impl Send for RetainedFileRegion {}
 
-#[allow(dead_code)]
 pub(crate) struct WindowSlotEntry {
     pub(crate) handle: BackingHandle,
     pub(crate) gpa: FrameGpa,
     pub(crate) identity: BackingIdentity,
-    pub(crate) inode_lease: Arc<dyn std::any::Any + Send + Sync>,
+    pub(crate) _inode_lease: Arc<dyn std::any::Any + Send + Sync>,
     pub(crate) committed: bool,
     pub(crate) pending_holders: std::collections::BTreeSet<(NonZeroU64, NonZeroU64)>,
 }

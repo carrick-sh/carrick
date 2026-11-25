@@ -147,6 +147,11 @@ pub enum HostFileOp {
     /// maps the file's own pages for it rather than copying them, so a store
     /// reaches the file. Only a carrier that installs windows admits it.
     MapShared = 41,
+    /// Release a previously retained `MapPrivate` or `MapShared` source and
+    /// roll back any unshared, uncommitted window slots before returning an
+    /// unplaced `mmap` failure (#2975 P0 3). Synchronous `HostFileCrossing`
+    /// only (`args[0]` handle, `args[1]` generation).
+    ReleaseWindow = 42,
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -793,6 +798,7 @@ impl HostFileOp {
             39 => Self::SetXattr,
             40 => Self::Ioctl,
             41 => Self::MapShared,
+            42 => Self::ReleaseWindow,
             _ => return None,
         })
     }
@@ -1622,5 +1628,28 @@ mod tests {
         let written = reply(&bytes).unwrap();
         assert_eq!(written.result, -38);
         assert!(written.output.is_empty());
+    }
+
+    #[test]
+    fn release_window_round_trips_and_decodes() {
+        let mut bytes = vec![0u8; record_len(0, 0).unwrap()];
+        encode(
+            &mut bytes,
+            HostFileHeader {
+                op: HostFileOp::ReleaseWindow,
+                table: [0; 3],
+                fd: -1,
+                flags: 0,
+                args: [77, 3, 0, 0],
+            },
+            &[],
+            0,
+        )
+        .unwrap();
+        let view = HostFileRequestView::parse(&mut bytes).unwrap();
+        assert_eq!(view.header().op, HostFileOp::ReleaseWindow);
+        assert_eq!(view.header().args, [77, 3, 0, 0]);
+        view.reply(0, &[]).unwrap();
+        assert_eq!(reply(&bytes).unwrap().result, 0);
     }
 }

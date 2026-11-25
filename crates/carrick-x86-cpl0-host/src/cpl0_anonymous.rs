@@ -188,7 +188,7 @@ pub(super) enum BackingPreparation {
     TablesExhausted,
     /// The read-only plan met another CPU's publication in the selected
     /// window (the shared policy's inherited-Prepared or MM-release decline).
-    Raced(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
+    Raced,
 }
 
 /// Why preparing an owner-selected window must wait and rerun ("not now")
@@ -2384,7 +2384,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Ok(())
     }
 
-    fn file_supply_request<I: CarrierCpuIo>(
+    pub(in crate::cpl0_boot) fn file_supply_request<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
         native_service: bool,
@@ -2574,7 +2574,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // Another CPU holds this MM's editor, or published into this
             // window after its selection: the selection is returned unserved
             // and its member reruns the access after that editor's release.
-            Ok(BackingPreparation::Raced(_)) => {
+            Ok(BackingPreparation::Raced) => {
                 if !reply.cancel_fault_selection(window, generation) {
                     return Err(fail("contended owner fault selection changed"));
                 }
@@ -3242,7 +3242,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     // published or inherited-Prepared output.
                     PublicationDecline::InheritedPrepared
                     | PublicationDecline::NotNow(PublicationNotNow::MmRelease) => {
-                        Ok(Ok(BackingPreparation::Raced(refusal)))
+                        Ok(Ok(BackingPreparation::Raced))
                     }
                     // When returnable custody still holds tables, shortage is
                     // temporary contention ("not now", never fatal or an errno):
@@ -3449,20 +3449,112 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         let mut bytes =
             self.custody
                 .read_kernel_pod_bytes(self.execution.context, address, len, 1)?;
-        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
-            .map_err(|_| fail("host file record encoding"))?;
-        if !matches!(
-            view.header().op,
-            carrick_core_abi::host_file::HostFileOp::MapPrivate
-                | carrick_core_abi::host_file::HostFileOp::MapShared
-        ) {
-            return Err(fail("unsupported synchronous host file operation"));
+        {
+            let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
+                .map_err(|_| fail("host file record encoding"))?;
+            match view.header().op {
+                carrick_core_abi::host_file::HostFileOp::MapPrivate
+                | carrick_core_abi::host_file::HostFileOp::MapShared => {
+                    let releases =
+                        carrick_core_abi::host_file::MapSourceReply::decode_releases(view.input())
+                            .ok_or_else(|| fail("host file map release encoding"))?;
+                    for release in releases {
+                        let released = (release.handle, release.generation);
+                        for entry in self.custody.window_slots.values_mut() {
+                            if entry.pending_holders.remove(&released) {
+                                entry.committed = true;
+                            }
+                        }
+                    }
+                }
+                carrick_core_abi::host_file::HostFileOp::ReleaseWindow => {
+                    let args = view.header().args;
+                    let (Some(handle), Some(generation)) =
+                        (NonZeroU64::new(args[0]), NonZeroU64::new(args[1]))
+                    else {
+                        return Err(fail("release window identity"));
+                    };
+                    view.reply(0, &[])
+                        .map_err(|_| fail("release window reply"))?;
+                    self.custody
+                        .sources_mut(self.execution.context)?
+                        .release(handle, generation);
+                    self.rollback_unplaced_window_slots((handle, generation))?;
+                    return Ok(bytes);
+                }
+                _ => return Err(fail("unsupported synchronous host file operation")),
+            }
         }
         self.custody
             .sources_mut(self.execution.context)?
             .prepare_private_mapping(&mut bytes)
             .map_err(|_| fail("host file source admission"))?;
         Ok(bytes)
+    }
+
+    /// Revoke any unexposed, uncommitted shared file window slots whose last
+    /// pending mapping holder rolled back before placing a reservation (#2975 P0 3).
+    fn rollback_unplaced_window_slots(
+        &mut self,
+        holder: (NonZeroU64, NonZeroU64),
+    ) -> Result<(), TrapError> {
+        use crate::carrier_memory::{
+            InventoryRetirement, MemoryError, ShootdownPlan, TranslationDrain,
+        };
+        use carrick_core::mm::window::WINDOW_CHUNK_BYTES;
+
+        struct UnexposedWindowDrain;
+        // SAFETY: unplaced window slots were never mapped into any guest page
+        // table; fail closed if carrier custody unexpectedly recorded a drain.
+        unsafe impl TranslationDrain for UnexposedWindowDrain {
+            fn drain(&mut self, _: ShootdownPlan) -> Result<(), MemoryError> {
+                Err(MemoryError(
+                    "unexposed window slot had active translation drain".into(),
+                ))
+            }
+        }
+
+        struct WindowSlotRetirement;
+        impl InventoryRetirement for WindowSlotRetirement {
+            fn retire(&mut self, _: BackingIdentity) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn rollback(&mut self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for (key, entry) in &mut self.custody.window_slots {
+            if entry.pending_holders.remove(&holder)
+                && !entry.committed
+                && entry.pending_holders.is_empty()
+            {
+                candidates.push((*key, entry.gpa));
+            }
+        }
+        // Unwind highest tail GPAs first so contiguous allocations rewind
+        // `anonymous_next_gpa` cleanly.
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1.raw()));
+        for (key, gpa) in candidates {
+            let Some(handle) = self
+                .custody
+                .window_slots
+                .get(&key)
+                .map(|entry| entry.handle)
+            else {
+                continue;
+            };
+            self.custody
+                ._vm
+                .revoke(handle, &mut UnexposedWindowDrain, &mut WindowSlotRetirement)
+                .map_err(|error| fail(error.to_string()))?;
+            self.custody.window_slots.remove(&key);
+            if gpa.raw() + WINDOW_CHUNK_BYTES == self.custody.anonymous_next_gpa.raw() {
+                self.custody.anonymous_next_gpa = gpa;
+            }
+        }
+        Ok(())
     }
 
     /// Admit and install every host-file window chunk overlapping a replied
@@ -3546,7 +3638,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
                 .install_window_slots(budget, &[])
                 .map_err(|error| fail(error.to_string()))?;
             for chunk_index in first_chunk..=last_chunk {
-                if let Some(entry) = self.custody.window_slots.get_mut(&(device, inode, chunk_index)) {
+                if let Some(entry) =
+                    self.custody
+                        .window_slots
+                        .get_mut(&(device, inode, chunk_index))
+                {
                     entry.pending_holders.insert(source_id);
                 }
             }
@@ -3605,7 +3701,11 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         };
         self.custody.anonymous_next_gpa = FrameGpa::new(next_gpa);
         for chunk_index in first_chunk..=last_chunk {
-            if let Some(entry) = self.custody.window_slots.get_mut(&(device, inode, chunk_index)) {
+            if let Some(entry) = self
+                .custody
+                .window_slots
+                .get_mut(&(device, inode, chunk_index))
+            {
                 entry.pending_holders.insert(source_id);
             }
         }
@@ -3618,7 +3718,7 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
                     handle,
                     gpa: base,
                     identity,
-                    inode_lease: Arc::clone(&inode_lease),
+                    _inode_lease: Arc::clone(&inode_lease),
                     committed: false,
                     pending_holders,
                 },
@@ -3679,20 +3779,20 @@ fn replied_map_source_is_window(bytes: &[u8]) -> Result<bool, TrapError> {
     }
 }
 
-struct FileSupplyRequest {
+pub(in crate::cpl0_boot) struct FileSupplyRequest {
     execution: GrantExecution,
     window: PortalGrantWindow,
     source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
     /// The source is a shared file window (#1338).
     shared: bool,
 }
-pub(super) struct FileSupply {
+pub(in crate::cpl0_boot) struct FileSupply {
     execution: GrantExecution,
     window: PortalGrantWindow,
     contents: FileContents,
 }
 /// What a file fault publishes.
-pub(super) enum FileContents {
+pub(in crate::cpl0_boot) enum FileContents {
     /// A private copy of the file's bytes from the window's start (`None`:
     /// the source could not be read).
     Copied(Option<Vec<u8>>),
@@ -3700,14 +3800,14 @@ pub(super) enum FileContents {
     Window(WindowFile),
 }
 /// The host file behind a shared file window, read outside carrier custody.
-pub(super) struct WindowFile {
+pub(in crate::cpl0_boot) struct WindowFile {
     device: u64,
     inode: u64,
     /// The file's size when the fault was served.
     len: u64,
 }
 impl FileSupplyRequest {
-    fn read(self) -> Result<FileSupply, TrapError> {
+    pub(in crate::cpl0_boot) fn read(self) -> Result<FileSupply, TrapError> {
         let identity = self
             .window
             .host_backing
