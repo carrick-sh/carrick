@@ -1325,6 +1325,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
     use super::super::native_process_runtime::NativeResume;
     use carrick_core::lifecycle::Lifecycle;
     use carrick_core_abi::service::{ServiceCell, ServiceError};
+    use carrick_sched_core::SavedSyscallPc::{AfterSyscall, AtSyscall};
     use carrick_sched_core::object_wait::ObjectWaitKey;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -1410,10 +1411,12 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         // SAFETY: the real native owner retains these published allocations.
         let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
         let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
-        let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
         frame.x[0] = 73;
         frame.elr = 0x4004;
         frame.esr = 0x15 << 26;
+        // The EL1 vector's SVC hook stores "after its SVC" (#2900); the
+        // interrupt and fault hooks below store a resume point.
+        frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(AfterSyscall);
         let action = match witness {
             ServiceWitness::Completed => {
                 fixture.task.linux.record_completed_with_work();
@@ -1454,12 +1457,14 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             }
             ServiceWitness::Interrupt => {
                 frame.esr = 0;
+                frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(AtSyscall);
                 fixture.task.linux.mark_pending_host_work();
                 carrick_el1_abi::Action::Forward
             }
             ServiceWitness::Exception { esr, .. } => {
                 frame.esr = esr;
                 frame.far = 0x6000000fd8;
+                frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(AtSyscall);
                 carrick_el1_abi::Action::Forward
             }
             ServiceWitness::Fault
@@ -1468,6 +1473,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             | ServiceWitness::MmRelease => {
                 frame.esr = 0x9200004f;
                 frame.far = 0x6000000fd8;
+                frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(AtSyscall);
                 carrick_el1_abi::Action::Forward
             }
         };
@@ -1483,18 +1489,31 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
             ));
         }
-        saved.native.x[0] = frame.x[0];
-        saved.native.pc = frame.elr;
+        // Where the boundary left the PC: a `ForwardOriginal` rerun is now on
+        // its `SVC` (0x4000); every other exit keeps the hook's position.
+        let boundary = (frame.elr, frame.syscall_position.get());
+        assert_eq!(
+            boundary,
+            match witness {
+                ServiceWitness::Retry => (0x4000, Some(AtSyscall)),
+                ServiceWitness::Completed | ServiceWitness::ExecRefusal =>
+                    (0x4004, Some(AfterSyscall)),
+                _ => (0x4004, Some(AtSyscall)),
+            },
+            "{witness:?}"
+        );
         let grant = fixture
             .zone
             .spaces
             .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
             .unwrap();
         assert_eq!(page.claimed_count(), 0);
-        let result = with_process_entry(
+        // The production service-exit admission saves this exact frame.
+        let result = crate::dispatch::arm_native_service_entry(
+            &mut cpu,
+            &frame,
             source,
             &fixture.task,
-            &saved.native,
             grant.ttbr0,
             page,
             control,
@@ -1524,6 +1543,32 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             fixture.zone.record(child).claim(),
             carrick_sched_core::Claim::Parked { .. }
         ));
+        // The parked context keeps the PC with the position the frame
+        // carried (#2900): a rerun already on its `SVC`, or an interrupt or
+        // fault's resume point, is never relabelled "after its SVC".
+        // SAFETY: the child is parked; nothing runs it until the wake below.
+        let parked = unsafe { *fixture.zone.record(child).ctx_mut() };
+        assert_eq!(
+            (parked.native.pc, parked.saved_syscall_pc()),
+            boundary,
+            "{witness:?}: the park keeps the boundary's PC and position"
+        );
+        // A ring switch-in that reruns the call loads this context and puts
+        // the PC on its `SVC` from the loaded position, once.
+        let mut rerun = carrick_el1_abi::TrapFrame::default();
+        crate::sched::ThreadCpu::load(&mut crate::sched::FakeCpu::default(), &mut rerun, &parked);
+        assert_eq!(
+            carrick_guest_arch::SyscallReturnFrame::rewind_to_syscall(&mut rerun),
+            Some(match witness {
+                // The rerun is already on its SVC; the others' SVC is 4 back.
+                ServiceWitness::Retry | ServiceWitness::Completed | ServiceWitness::ExecRefusal => {
+                    0x4000
+                }
+                // An interrupt or fault PC is its own resume point.
+                _ => 0x4004,
+            }),
+            "{witness:?}: a rerun rewinds the parked PC at most once"
+        );
         assert_eq!(page.claimed_count(), 1);
         let selector = fixture.task.service_notice.take().unwrap().unwrap();
         // No real wake sources are attached in this fixture; consume the
