@@ -320,13 +320,24 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             ServiceOperation::CarrierWork { demand, .. } => carrier_work_supplied(demand),
             ServiceOperation::Fault(_) => {
-                let slot = self
-                    .grant_portal()?
+                let portal = self.grant_portal()?;
+                let slot = portal
                     .grant(lease.cpu.raw() as usize)
                     .ok_or_else(|| fail("native fault selection slot"))?;
-                let selected = ticket
-                    .take_fault_selection(slot)
-                    .map_err(|_| fail("native fault selection identity"))?;
+                let selected = match ticket.take_fault_selection(slot) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        return Err(fail(format!(
+                            "native fault selection identity: refused ({error:?}) on cpu {} \
+                             request identity={:?} operation={:?} fault_sequence={:?};{}",
+                            lease.cpu.raw(),
+                            ticket.request().identity,
+                            ticket.request().operation,
+                            ticket.request().fault_sequence,
+                            portal.selection_report(lease.cpu.raw() as usize),
+                        )));
+                    }
+                };
                 match (selected, ticket.reply_address()) {
                     (
                         Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)),

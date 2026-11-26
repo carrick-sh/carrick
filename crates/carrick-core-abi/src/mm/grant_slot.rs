@@ -145,6 +145,17 @@ impl PortalGrantSlot {
             .or_else(|| self.pending_fault_selection(mm, address))?;
         (generation == window.operation.sequence.get()).then_some(window.operation.sequence)
     }
+    /// Read-only diagnostic view of this lane slot: its protocol state, the
+    /// stamped request generation and, when it decodes, the stamped window.
+    /// Grants no authority; a refused intake reports it with real values.
+    pub fn selection_snapshot(&self) -> (u64, u64, Option<PortalGrantWindow>) {
+        let state = self.state.load(Ordering::Acquire);
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let window = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }));
+        (state, generation, window)
+    }
     /// Transfer only the selection stamped into the retained native request.
     pub(crate) fn take_native_fault_selection<
         P: core::ops::Deref<Target = crate::service::ServiceCell>,

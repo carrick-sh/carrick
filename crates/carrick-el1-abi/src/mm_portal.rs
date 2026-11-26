@@ -267,6 +267,39 @@ impl MmPortalSlots {
     pub fn slot(&self, slot: usize) -> Option<&PortalTransferSlot> {
         self.slots.get(slot)
     }
+    /// Read-only report of the lane grant slots for a refused fault-selection
+    /// intake: the delivering CPU's slot and every slot holding a selection.
+    pub fn selection_report(&self, cpu: usize) -> PortalSelectionReport<'_> {
+        PortalSelectionReport { slots: self, cpu }
+    }
+}
+/// Diagnostic [`core::fmt::Display`] of [`MmPortalSlots::selection_report`].
+pub struct PortalSelectionReport<'a> {
+    slots: &'a MmPortalSlots,
+    cpu: usize,
+}
+impl core::fmt::Display for PortalSelectionReport<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, slot) in self.slots.grants.iter().enumerate() {
+            let (state, generation, window) = slot.selection_snapshot();
+            if index != self.cpu && state == 0 {
+                continue;
+            }
+            write!(f, " slot{index}{{state={state} generation={generation}")?;
+            if let Some(window) = window {
+                write!(
+                    f,
+                    " sequence={} mm={} incarnation={} page={:#x}",
+                    window.operation.sequence,
+                    window.operation.mm.raw(),
+                    window.operation.incarnation,
+                    window.fault_page,
+                )?;
+            }
+            f.write_str("}")?;
+        }
+        Ok(())
+    }
 }
 const _: () =
     assert!(EL1_MM_PORTAL_OFFSET >= crate::EL1_COW_COPY_OFFSET + crate::EL1_COW_COPY_SIZE);
