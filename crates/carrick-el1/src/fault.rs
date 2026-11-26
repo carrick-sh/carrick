@@ -1286,13 +1286,44 @@ impl<'s> FaultSupply<'s> {
             Err(_) => None,
         }
     }
-    fn editor<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    /// The fault's one MM-editor admission, for every leaf edit it makes:
+    /// a copy-on-write repoint, a prepared commit, a fresh grant.
+    ///
+    /// A fork publishes its parent fork-pending under this editor, then
+    /// releases it while the carrier checks every frame it selected against
+    /// the parent's live leaf, and owns those leaves until its commit. So an
+    /// editor taken while a publication is pending is released at once and
+    /// the fault waits on that publication's release (`PendingEdit`); the
+    /// rerun edits after the commit. Checked under the editor, the answer
+    /// cannot change before the edit: a fork publishes only under it. A
+    /// fault admitted before the fork, with its copy-on-write grant already
+    /// in the pool, edits nothing the fork selected (#2923).
+    fn editor<
+        'a,
+        C: Copy + Send + Sync + zerocopy::FromZeros,
+        G: carrick_core::mm::reservation::ReservationGeometry,
+    >(
         self,
         spaces: SpaceAccess<'a, C>,
+        roots: Option<
+            &carrick_core::mm::reservation::SharedReservations<
+                carrick_personality_linux::mm::LinuxReservationPolicy,
+                G,
+            >,
+        >,
         index: carrick_sched_core::SpaceIndex,
         mm: u64,
-        owner: NonZeroU64,
+        slot: u64,
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, C>> {
+        let owner = NonZeroU64::new(slot.checked_add(1)?)?;
+        // Every fault on the MM, a Mailbox one included, answers to the
+        // same pending publication.
+        let publication_settled = || match (roots, carrick_el1_abi::ReservationMm::new(mm)) {
+            (Some(roots), Some(reservation)) => {
+                lock_supply_root(roots, spaces, index.index(), reservation, slot).map(drop)
+            }
+            _ => Ok(()),
+        };
         if matches!(self, Self::Mailbox { .. })
             && let Some(editor) = spaces.try_begin_edit_bounded(
                 index,
@@ -1301,26 +1332,34 @@ impl<'s> FaultSupply<'s> {
                 carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
             )
         {
-            return Some(editor);
+            if publication_settled().is_ok() {
+                return Some(editor);
+            }
+            // Pending or busy: the owner's contended admission below
+            // waits on it, and with no owner the host resolves the fault.
+            drop(editor);
         }
         use carrick_sched_core::spaces::{EditAdmissionRefusal, notification::SpaceWaitCause};
         self.owner()?;
         self.contend(spaces, mm, || {
-            match spaces
+            let editor = match spaces
                 .table()
                 .try_begin_edit_cause(index, mm, owner, spaces.venue())
             {
-                Ok(editor) => Ok(Some(editor)),
-                Err(EditAdmissionRefusal::Editor) => Err(SpaceWaitCause::Editor),
+                Ok(editor) => editor,
+                Err(EditAdmissionRefusal::Editor) => return Err(SpaceWaitCause::Editor),
                 // An owner fault waits out a closed target like the owner
                 // portal's transfers: the gate key is published when the
                 // entry opens, and the source's terminal publication ends
                 // the wait at retirement.
                 Err(EditAdmissionRefusal::Gate | EditAdmissionRefusal::Closed) => {
-                    Err(SpaceWaitCause::Gate)
+                    return Err(SpaceWaitCause::Gate);
                 }
-                Err(EditAdmissionRefusal::Stale) => Ok(None),
-            }
+                Err(EditAdmissionRefusal::Stale) => return Ok(None),
+            };
+            // A refusal drops the editor before the wait is enrolled.
+            publication_settled()?;
+            Ok(Some(editor))
         })
         .flatten()
     }
@@ -1540,10 +1579,6 @@ fn dispatch_classified_fault<
             supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(slot + 1) else {
-            supply.note(FaultVerdict::NoSpace);
-            return Action::Forward;
-        };
         if supply.owner().is_some() {
             match supply
                 .contend(spaces, mm_key, || {
@@ -1589,7 +1624,8 @@ fn dispatch_classified_fault<
         // the host resolves this fault.
         // Sibling threads fault on the same forked MM together; each COW
         // holds the editor only for one compound copy and repoint.
-        let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
+        let roots = prepared.as_ref().and_then(|path| path.roots);
+        let Some(_editor) = supply.editor(spaces, roots, index, mm_key, slot) else {
             cow_resolver.editor_busy();
             supply.note(FaultVerdict::EditorBusy);
             return Action::Forward;
@@ -1759,11 +1795,8 @@ fn dispatch_classified_fault<
             supply.note(FaultVerdict::NoSpace);
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(slot + 1) else {
-            supply.note(FaultVerdict::NoSpace);
-            return Action::Forward;
-        };
-        let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
+        let roots = prepared.as_ref().and_then(|path| path.roots);
+        let Some(_editor) = supply.editor(spaces, roots, index, mm_key, slot) else {
             supply.note(FaultVerdict::EditorBusy);
             return Action::Forward;
         };
@@ -1821,7 +1854,7 @@ fn dispatch_classified_fault<
             let roots = prepared.as_ref()?.roots?;
             let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
             let index = spaces.find(mm_key)?;
-            let editor = supply.editor(spaces, index, mm_key, NonZeroU64::new(slot + 1)?)?;
+            let editor = supply.editor(spaces, Some(roots), index, mm_key, slot)?;
             let mut root = supply
                 .contend(spaces, mm_key, || {
                     lock_supply_root(roots, spaces, index.index(), mm, slot)
