@@ -3966,7 +3966,7 @@ mod task_only_materializer_tests {
             .expect("compatibility process preparation");
         for shared_stage in [
             "stage2_map",
-            "lease.mark_mapped(",
+            "lease.mark_composition_mapped(",
             "rebind_inherited_alias_to_process",
             "Self::stage_mapping",
             "process_reservation.commit(())",

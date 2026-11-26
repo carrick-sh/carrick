@@ -10926,10 +10926,20 @@ fn full_vm_partial_map_failure_uses_exact_fail_stop_rollback_static_audit() {
         .next()
         .and_then(|tail| tail.split(concat!("fn global_frame_", "exec_plan")).next())
         .expect("from_process_spec source body");
-    assert!(from_process.contains("rollback_partial_process_stage2_authorities"));
-    assert!(from_process.contains("&structural_identities"));
-    assert!(from_process.contains("fail_stop_partial_process_stage2_rollback"));
+    // The full-VM composition is the same transaction as the task-only one:
+    // its rows are lent to the state only while publication can fail, and
+    // the composition's Drop is the one exact fail-stop rollback.
+    assert!(from_process.contains("ProcessStage2Composition::<TaskMappingIndex>::begin("));
+    assert!(from_process.contains("composition.rows = std::mem::take(&mut state.mappings);"));
+    assert!(!from_process.contains("rollback_partial_process_stage2_authorities("));
     assert!(!from_process.contains("retry_structural_backing_retirements_in_using"));
+    let composition_drop = source
+        .split("impl<R: ProcessCompositionRows> Drop for ProcessStage2Composition<R>")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("composition rollback body");
+    assert!(composition_drop.contains("rollback_partial_process_stage2_authorities("));
+    assert!(composition_drop.contains("fail_stop_partial_process_stage2_rollback("));
 }
 
 #[test]

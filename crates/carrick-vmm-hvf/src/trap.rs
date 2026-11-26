@@ -7053,6 +7053,145 @@ mod cow_engine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use cow_engine::*;
 
+/// The rows a process composition publishes. Rollback takes every stage-2
+/// lease out of them before their structural owner references drop.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+trait ProcessCompositionRows: Default {
+    fn take_stage2_leases(&mut self, leases: &mut Vec<GlobalFrameStage2Lease>);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessCompositionRows for Vec<HvpatchTaskMappingState> {
+    fn take_stage2_leases(&mut self, _leases: &mut Vec<GlobalFrameStage2Lease>) {
+        // Task-only rows hold no lease: the composition keeps them.
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessCompositionRows for TaskMappingIndex {
+    fn take_stage2_leases(&mut self, leases: &mut Vec<GlobalFrameStage2Lease>) {
+        leases.extend(self.iter_mut().filter_map(|row| row.stage2_lease.take()));
+    }
+}
+
+/// One process stage-2 composition (task-only or full-VM) as one
+/// transaction. Every stage-2 map is admitted in the single VM generation
+/// authenticated at [`Self::begin`]; publication is refused once that
+/// generation stops admitting mappings. Every row, registered owner and
+/// structural owner it collects is either published together by
+/// [`Self::commit`], or rolled back exactly by `Drop` on any early return,
+/// fail-stopping if the rollback cannot terminalize.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ProcessStage2Composition<R: ProcessCompositionRows> {
+    custody: std::sync::Arc<CarrierVmCustody>,
+    context: &'static str,
+    vm_generation: CarrierVmGeneration,
+    stage2_leases: Vec<GlobalFrameStage2Lease>,
+    registered_global_owners: Vec<(u64, u64, u64)>,
+    structural_identities: Vec<CarrierStage2RecordIdentity>,
+    structural_owners:
+        std::collections::BTreeMap<(u64, usize), std::sync::Arc<StructuralBackingOwner>>,
+    mm_root_stage2: Option<MmRootStage2Authority>,
+    rows: R,
+    committed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CommittedProcessStage2<R> {
+    stage2_leases: Vec<GlobalFrameStage2Lease>,
+    rows: R,
+    mm_root_stage2: Option<MmRootStage2Authority>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<R: ProcessCompositionRows> ProcessStage2Composition<R> {
+    fn begin(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        context: &'static str,
+    ) -> Result<Self, TrapError> {
+        let vm_generation = custody.admitting_stage2(context)?.generation();
+        Ok(Self {
+            custody: std::sync::Arc::clone(custody),
+            context,
+            vm_generation,
+            stage2_leases: Vec::new(),
+            registered_global_owners: Vec::new(),
+            structural_identities: Vec::new(),
+            structural_owners: std::collections::BTreeMap::new(),
+            mm_root_stage2: None,
+            rows: R::default(),
+            committed: false,
+        })
+    }
+
+    fn vm_generation(&self) -> CarrierVmGeneration {
+        self.vm_generation
+    }
+
+    /// The admitting guard of exactly this composition's generation.
+    fn admitting_stage2(
+        &self,
+        context: &str,
+    ) -> Result<stage2_backend::CarrierStage2<'_>, TrapError> {
+        self.custody
+            .admitting_stage2_in(self.vm_generation, context)
+    }
+
+    /// A pooled root slot is pre-mapped by its pool; it joins only the
+    /// composition of the generation that pool was mapped in.
+    fn admit_pooled_root(
+        &self,
+        handle_generation: Option<CarrierVmGeneration>,
+    ) -> Result<(), TrapError> {
+        if handle_generation == Some(self.vm_generation) {
+            return Ok(());
+        }
+        Err(TrapError::Hypervisor(format!(
+            "{}: pooled root slot of stage-2 generation {handle_generation:?} cannot join generation {:?}",
+            self.context, self.vm_generation
+        )))
+    }
+
+    /// Refuse publication once this generation no longer admits mappings.
+    /// It does not consume the composition, so a caller's later locals drop
+    /// before the rollback runs.
+    fn ensure_publishable(&self) -> Result<(), TrapError> {
+        drop(self.admitting_stage2(self.context)?);
+        Ok(())
+    }
+
+    fn commit(mut self) -> CommittedProcessStage2<R> {
+        self.committed = true;
+        CommittedProcessStage2 {
+            stage2_leases: std::mem::take(&mut self.stage2_leases),
+            rows: std::mem::take(&mut self.rows),
+            mm_root_stage2: self.mm_root_stage2.take(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<R: ProcessCompositionRows> Drop for ProcessStage2Composition<R> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut leases = std::mem::take(&mut self.stage2_leases);
+        self.rows.take_stage2_leases(&mut leases);
+        drop(std::mem::take(&mut self.rows));
+        drop(self.mm_root_stage2.take());
+        if let Err(error) = rollback_partial_process_stage2_authorities(
+            &self.custody,
+            &mut leases,
+            &self.registered_global_owners,
+            &self.structural_identities,
+            std::mem::take(&mut self.structural_owners),
+        ) {
+            fail_stop_partial_process_stage2_rollback(self.context, &error);
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     fn prepare_task_only_process_spec(
@@ -7080,22 +7219,17 @@ impl HvfVmState {
     fn prepare_task_only_plan(
         plan: ProcessSpecPlan,
     ) -> Result<(Vec<GlobalFrameStage2Lease>, HvpatchPreparedTaskAuthority), TrapError> {
-        // Authenticate one VM generation for the whole composition. A
-        // successor must not receive the remainder of this plan.
-        let vm_generation = plan
-            .carrier_foreign_mm_transport
-            .custody
-            .admitting_stage2("task-only stage-2 composition")?
-            .generation();
-        let mut mapped = Vec::with_capacity(plan.mappings.len());
-        let mut stage2_leases = Vec::with_capacity(plan.mappings.len());
-        let mut structural_owners = std::collections::BTreeMap::new();
-        let mut structural_identities = Vec::new();
-        let mut registered_global_owners = Vec::new();
+        // One transaction for the whole composition, in the one VM
+        // generation authenticated here: every early return below rolls back
+        // each installed row and owner (the composition's `Drop`) and each
+        // in-flight mapped lease (its own `Drop`).
+        let mut composition = ProcessStage2Composition::<Vec<HvpatchTaskMappingState>>::begin(
+            &plan.carrier_foreign_mm_transport.custody,
+            "task-only stage-2 composition",
+        )?;
         let inventory_mappings = plan.inventory_mappings;
         let mut pending_aliases = Vec::new();
         let mut pending_receipts = Vec::new();
-        let mut mm_root_stage2 = None;
         for mut mapping in plan.mappings {
             let semantic_physical_offset = mapping
                 .ipa
@@ -7117,6 +7251,7 @@ impl HvfVmState {
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
             if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
+                composition.admit_pooled_root(handle.vm_generation())?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped_in(handle.vm_generation());
                 }
@@ -7129,10 +7264,8 @@ impl HvfVmState {
                     }
                 )
             {
-                let map_result = plan
-                    .carrier_foreign_mm_transport
-                    .custody
-                    .admitting_stage2_in(vm_generation, "task-only stage-2 map")
+                let map_result = composition
+                    .admitting_stage2("task-only stage-2 map")
                     .and_then(|mut stage2| {
                         let result = unsafe {
                             stage2_map(
@@ -7161,31 +7294,12 @@ impl HvfVmState {
                             }
                         })
                     });
-                let stage2_mapping = match map_result {
-                    Ok(stage2_mapping) => stage2_mapping,
-                    Err(error) => {
-                        drop(mapping.stage2_lease.take());
-                        drop(mapped);
-                        drop(mm_root_stage2.take());
-                        if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
-                            &plan.carrier_foreign_mm_transport.custody,
-                            &mut stage2_leases,
-                            &registered_global_owners,
-                            &structural_identities,
-                            structural_owners,
-                        ) {
-                            fail_stop_partial_process_stage2_rollback(
-                                "task-only mapping composition",
-                                &TrapError::Hypervisor(format!(
-                                    "{error}; exact rollback failed: {rollback_error}"
-                                )),
-                            );
-                        }
-                        return Err(error);
-                    }
-                };
+                let stage2_mapping = map_result?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped(stage2_mapping);
+                    lease.mark_composition_mapped(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        stage2_mapping,
+                    );
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
@@ -7201,7 +7315,7 @@ impl HvfVmState {
                                 host_mapping,
                                 carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                             )?;
-                            registered_global_owners.push((
+                            composition.registered_global_owners.push((
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                                 owner_generation,
@@ -7267,8 +7381,10 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
-                            structural_owners.insert(
+                            composition
+                                .structural_identities
+                                .push(owner.record_identity());
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
                             );
@@ -7298,8 +7414,10 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
-                            structural_owners.insert(
+                            composition
+                                .structural_identities
+                                .push(owner.record_identity());
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
                             );
@@ -7331,7 +7449,7 @@ impl HvfVmState {
                                     mapping.physical_ipa
                                 )));
                             }
-                            structural_owners.insert(
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&structural_owner),
                             );
@@ -7380,7 +7498,7 @@ impl HvfVmState {
                 });
             }
             if let Some(lease) = stage2_lease {
-                stage2_leases.push(lease);
+                composition.stage2_leases.push(lease);
             }
             if mapping.physical_ipa == plan.mm_root_slot.0 {
                 let owner = structural_owner.as_ref().cloned().ok_or_else(|| {
@@ -7389,13 +7507,13 @@ impl HvfVmState {
                     )
                 })?;
                 let candidate = MmRootStage2Authority::new(plan.mm_root_slot, owner)?;
-                if mm_root_stage2.replace(candidate).is_some() {
+                if composition.mm_root_stage2.replace(candidate).is_some() {
                     return Err(TrapError::Hypervisor(
                         "task-only process published duplicate stage-1 root mappings".to_owned(),
                     ));
                 }
             }
-            mapped.push(HvpatchTaskMappingState {
+            composition.rows.push(HvpatchTaskMappingState {
                 start: mapping.start,
                 ipa: mapping.ipa,
                 physical_ipa: mapping.physical_ipa,
@@ -7416,6 +7534,8 @@ impl HvfVmState {
                 global_frame_owner_role: owner_role,
             });
         }
+        // Publication only in the generation every row was admitted in.
+        composition.ensure_publishable()?;
         let mut process_reservation = plan
             .frame_inventory
             .lock()
@@ -7451,7 +7571,7 @@ impl HvfVmState {
                         },
                     }
                 } else if let Ok(size) = usize::try_from(mapping.length)
-                    && let Some(owner) = structural_owners.get(&(mapping.gpa, size))
+                    && let Some(owner) = composition.structural_owners.get(&(mapping.gpa, size))
                 {
                     InventoryStage2OwnerIdentity {
                         host_addr: owner.ptr() as usize,
@@ -7487,24 +7607,6 @@ impl HvfVmState {
                             )
                         });
                         drop(inventory);
-                        drop(mapped);
-                        drop(mm_root_stage2.take());
-                        let stage2_rollback_error = rollback_partial_process_stage2_authorities(
-                            &plan.carrier_foreign_mm_transport.custody,
-                            &mut stage2_leases,
-                            &registered_global_owners,
-                            &structural_identities,
-                            structural_owners,
-                        )
-                        .err();
-                        if let Some(rollback_error) = stage2_rollback_error {
-                            fail_stop_partial_process_stage2_rollback(
-                                "task-only inventory composition",
-                                &TrapError::Hypervisor(format!(
-                                    "{error}; exact rollback failed: {rollback_error}"
-                                )),
-                            );
-                        }
                         return Err(error);
                     }
                 };
@@ -7542,8 +7644,9 @@ impl HvfVmState {
             process_commit = process_reservation.commit(());
         }
         let process_challenge = process_commit.receipt_challenge();
+        let committed = composition.commit();
         Ok((
-            stage2_leases,
+            committed.stage2_leases,
             HvpatchPreparedTaskAuthority {
                 custody: Some(std::sync::Arc::clone(
                     &plan.carrier_foreign_mm_transport.custody,
@@ -7551,9 +7654,9 @@ impl HvfVmState {
                 foreign_mm_transport: Some(std::sync::Arc::clone(
                     &plan.carrier_foreign_mm_transport,
                 )),
-                mappings: mapped,
+                mappings: committed.rows,
                 mm_root_slot: Some(plan.mm_root_slot),
-                mm_root_stage2,
+                mm_root_stage2: committed.mm_root_stage2,
                 container_root: plan.container_root,
                 inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
                     ledger: plan.frame_inventory,
@@ -7582,17 +7685,14 @@ impl HvfVmState {
         let (vm, plan) = spec.into_plan();
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
-        // Authenticate one VM generation for the whole composition. A
-        // successor must not receive the remainder of this plan.
-        let vm_generation = plan
-            .carrier_foreign_mm_transport
-            .custody
-            .admitting_stage2("full-VM stage-2 composition")?
-            .generation();
-        let mut mapped = TaskMappingIndex::new();
-        let mut structural_owners = std::collections::BTreeMap::new();
-        let mut structural_identities = Vec::new();
-        let mut registered_global_owners = Vec::new();
+        // One transaction for the whole composition, in the one VM
+        // generation authenticated here: every early return below rolls back
+        // each installed row and owner (the composition's `Drop`) and each
+        // in-flight mapped lease (its own `Drop`).
+        let mut composition = ProcessStage2Composition::<TaskMappingIndex>::begin(
+            &plan.carrier_foreign_mm_transport.custody,
+            "full-VM stage-2 composition",
+        )?;
         let inventory_mappings = plan.inventory_mappings;
         let mut aliases_to_publish = Vec::new();
         let mut pending_fork_frame_receipts = Vec::new();
@@ -7617,6 +7717,7 @@ impl HvfVmState {
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
             if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
+                composition.admit_pooled_root(handle.vm_generation())?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
                     lease.mark_pre_mapped_in(handle.vm_generation());
                 }
@@ -7629,10 +7730,8 @@ impl HvfVmState {
                     }
                 )
             {
-                let map_result = plan
-                    .carrier_foreign_mm_transport
-                    .custody
-                    .admitting_stage2_in(vm_generation, "full-VM stage-2 map")
+                let map_result = composition
+                    .admitting_stage2("full-VM stage-2 map")
                     .and_then(|mut stage2| {
                         let result = unsafe {
                             stage2_map(
@@ -7661,34 +7760,12 @@ impl HvfVmState {
                             }
                         })
                     });
-                let stage2_mapping = match map_result {
-                    Ok(stage2_mapping) => stage2_mapping,
-                    Err(error) => {
-                        drop(mapping.stage2_lease.take());
-                        let mut prior_stage2_leases = mapped
-                            .iter_mut()
-                            .filter_map(|mapping| mapping.stage2_lease.take())
-                            .collect::<Vec<_>>();
-                        drop(mapped);
-                        if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
-                            &plan.carrier_foreign_mm_transport.custody,
-                            &mut prior_stage2_leases,
-                            &registered_global_owners,
-                            &structural_identities,
-                            structural_owners,
-                        ) {
-                            fail_stop_partial_process_stage2_rollback(
-                                "full-VM mapping composition",
-                                &TrapError::Hypervisor(format!(
-                                    "{error}; exact rollback failed: {rollback_error}"
-                                )),
-                            );
-                        }
-                        return Err(error);
-                    }
-                };
+                let stage2_mapping = map_result?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_mapped(stage2_mapping);
+                    lease.mark_composition_mapped(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        stage2_mapping,
+                    );
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =
@@ -7704,7 +7781,7 @@ impl HvfVmState {
                                 host_mapping,
                                 carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
                             )?;
-                            registered_global_owners.push((
+                            composition.registered_global_owners.push((
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                                 owner_generation,
@@ -7755,8 +7832,10 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
-                            structural_owners.insert(
+                            composition
+                                .structural_identities
+                                .push(owner.record_identity());
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
                             );
@@ -7780,8 +7859,10 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
-                            structural_owners.insert(
+                            composition
+                                .structural_identities
+                                .push(owner.record_identity());
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
                             );
@@ -7807,7 +7888,7 @@ impl HvfVmState {
                                     mapping.physical_ipa
                                 )));
                             }
-                            structural_owners.insert(
+                            composition.structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&structural_owner),
                             );
@@ -7848,7 +7929,7 @@ impl HvfVmState {
                     rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
                 });
             }
-            mapped.insert(HvfMappedRegion {
+            composition.rows.insert(HvfMappedRegion {
                 start: mapping.start,
                 ipa: mapping.ipa,
                 physical_ipa: mapping.physical_ipa,
@@ -7870,6 +7951,8 @@ impl HvfVmState {
                 owner_generation,
             });
         }
+        // Publication only in the generation every row was admitted in.
+        composition.ensure_publishable()?;
         let mut process_reservation = plan
             .frame_inventory
             .lock()
@@ -7895,7 +7978,7 @@ impl HvfVmState {
                 &plan.carrier_foreign_mm_transport.custody,
             )),
         );
-        for mapping in &mapped {
+        for mapping in &composition.rows {
             if let Some(owner) = &mapping.structural_owner {
                 mm_access.install_structural_mapping_authority(
                     Some(plan.mm_root_slot),
@@ -7911,7 +7994,8 @@ impl HvfVmState {
             task: HvfTaskState {
                 #[cfg(not(test))]
                 custody,
-                mappings: mapped,
+                // Lent until publication commits; a refusal hands them back.
+                mappings: std::mem::take(&mut composition.rows),
                 mm_root_slot: Some(plan.mm_root_slot),
                 container_root: plan.container_root,
                 pending_exec_mm_root_slot: None,
@@ -7941,128 +8025,124 @@ impl HvfVmState {
             carrier_mappings: None,
             mailbox_slots: plan.mailbox_slots,
             syscall_transport: plan.syscall_transport,
-            vm_generation: plan.carrier_foreign_mm_transport.custody.setup_generation(),
+            vm_generation: Some(composition.vm_generation()),
             executor_vcpu: Some(ExecutorVcpuIdentity::of(&vcpu)),
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
         state.publish_live_vcpu();
-        let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
+        // Every refusal in publication returns here, never past the
+        // composition: `HvfVmState::drop` leaks live process mappings, so the
+        // lent rows go back to the composition, `state` drops first (its MM
+        // authority's owner references with it), and the rollback is exact.
+        let published = (|| -> Result<MailboxBinding, TrapError> {
+            let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+            {
+                let mut inventory = state.frame_inventory.lock();
+                let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
+                for mapping in inventory_mappings {
+                    let stage2_owner =
+                        if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
+                            let generation = global_frame_host_owner_generation_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                mapping.gpa,
+                                mapping.length,
+                            );
+                            InventoryStage2OwnerIdentity {
+                                host_addr: mapping.stage2_owner.host_addr,
+                                // If registered in `global_frame_host_owners()` above, use the authoritative
+                                // freshly registered owner generation. If generation is 0, this mapping represents
+                                // an unowned extent whose generation was already recorded on the descriptor
+                                // during preparation rather than a registration failure (which fails fast with Err).
+                                generation: if generation != 0 {
+                                    generation
+                                } else {
+                                    mapping.stage2_owner.generation
+                                },
+                            }
+                        } else if let Ok(size) = usize::try_from(mapping.length)
+                            && let Some(owner) =
+                                composition.structural_owners.get(&(mapping.gpa, size))
+                        {
+                            InventoryStage2OwnerIdentity {
+                                host_addr: owner.ptr() as usize,
+                                generation: owner.epoch().raw(),
+                            }
+                        } else {
+                            mapping.stage2_owner
+                        };
+                    let staged = match Self::stage_mapping_in(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        &mut inventory,
+                        &mut process_reservation,
+                        InventoryMappingStage {
+                            gpa: mapping.gpa,
+                            length: mapping.length,
+                            permissions: mapping.permissions,
+                            backing: mapping.backing,
+                            inherited_frame: mapping.inherited_frame,
+                            stage2_lease: Some(mapping.stage2_lease),
+                            stage2_owner,
+                        },
+                    ) {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
+                                .unwrap_or_else(|rollback_error| {
+                                    carrick_fatal!(
+                                        "hvpatch::frame_inventory",
+                                        "rollback HVPatch child inventory staging: {rollback_error}"
+                                    )
+                                });
+                            drop(inventory);
+                            return Err(error);
+                        }
+                    };
+                    record_cow_inventory_lifecycle(
+                        CowDiagnosticLifecycleKind::InventoryPublished,
+                        CowDiagnosticLifecycleSite::ForkMaterialization,
+                        &CowInventoryLifecycleScope {
+                            custody: &plan.carrier_foreign_mm_transport.custody,
+                            identity: None,
+                            mm_root_slot: Some(plan.mm_root_slot),
+                            semantic_va: 0,
+                            semantic_length: 0,
+                        },
+                        (mapping.gpa, mapping.length),
+                        staged,
+                    );
+                    staged_mappings.push(((mapping.gpa, mapping.length), staged));
+                    if let (Some(parent_mapping), Some(frame), Some(kind)) = (
+                        mapping.inherited_mapping,
+                        mapping.inherited_frame,
+                        mapping.fork_frame_receipt_kind,
+                    ) {
+                        pending_fork_frame_receipts.push(PendingForkFrameReceipt {
+                            transaction: process_transaction,
+                            kind,
+                            parent_mapping,
+                            child_mapping: staged.mapping,
+                            frame,
+                            ipa: mapping.gpa,
+                            length: mapping.length,
+                        });
+                    }
+                }
+                inventory.initialized = true;
+                inventory.process_commit = Some(process_reservation.commit(()));
+            }
+            Ok(mailbox)
+        })();
+        let mailbox = match published {
             Ok(mailbox) => mailbox,
             Err(error) => {
-                // `HvfVmState::drop` intentionally leaks live process mappings.
-                // Materialization has not committed, so explicitly drop the
-                // fresh RAII leases and host owners instead.
-                drop(std::mem::take(&mut state.mappings));
+                composition.rows = std::mem::take(&mut state.mappings);
+                drop(state);
                 return Err(error);
             }
         };
-        {
-            let mut inventory = state.frame_inventory.lock();
-            let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
-            for mapping in inventory_mappings {
-                let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
-                    let generation = global_frame_host_owner_generation_in(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        mapping.gpa,
-                        mapping.length,
-                    );
-                    InventoryStage2OwnerIdentity {
-                        host_addr: mapping.stage2_owner.host_addr,
-                        // If registered in `global_frame_host_owners()` above, use the authoritative
-                        // freshly registered owner generation. If generation is 0, this mapping represents
-                        // an unowned extent whose generation was already recorded on the descriptor
-                        // during preparation rather than a registration failure (which fails fast with Err).
-                        generation: if generation != 0 {
-                            generation
-                        } else {
-                            mapping.stage2_owner.generation
-                        },
-                    }
-                } else if let Ok(size) = usize::try_from(mapping.length)
-                    && let Some(owner) = structural_owners.get(&(mapping.gpa, size))
-                {
-                    InventoryStage2OwnerIdentity {
-                        host_addr: owner.ptr() as usize,
-                        generation: owner.epoch().raw(),
-                    }
-                } else {
-                    mapping.stage2_owner
-                };
-                let staged = match Self::stage_mapping_in(
-                    &plan.carrier_foreign_mm_transport.custody,
-                    &mut inventory,
-                    &mut process_reservation,
-                    InventoryMappingStage {
-                        gpa: mapping.gpa,
-                        length: mapping.length,
-                        permissions: mapping.permissions,
-                        backing: mapping.backing,
-                        inherited_frame: mapping.inherited_frame,
-                        stage2_lease: Some(mapping.stage2_lease),
-                        stage2_owner,
-                    },
-                ) {
-                    Ok(staged) => staged,
-                    Err(error) => {
-                        Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
-                            .unwrap_or_else(|rollback_error| {
-                                carrick_fatal!(
-                                    "hvpatch::frame_inventory",
-                                    "rollback HVPatch child inventory staging: {rollback_error}"
-                                )
-                            });
-                        drop(inventory);
-                        for mapping in &state.mappings {
-                            if is_reusable_global_frame_extent(
-                                mapping.physical_ipa,
-                                mapping.physical_size as u64,
-                            ) {
-                                plan.carrier_foreign_mm_transport
-                                    .custody
-                                    .global_frame_host_owners
-                                    .lock()
-                                    .remove(&(mapping.physical_ipa, mapping.physical_size as u64));
-                            }
-                        }
-                        drop(std::mem::take(&mut state.mappings));
-                        return Err(error);
-                    }
-                };
-                record_cow_inventory_lifecycle(
-                    CowDiagnosticLifecycleKind::InventoryPublished,
-                    CowDiagnosticLifecycleSite::ForkMaterialization,
-                    &CowInventoryLifecycleScope {
-                        custody: &plan.carrier_foreign_mm_transport.custody,
-                        identity: None,
-                        mm_root_slot: Some(plan.mm_root_slot),
-                        semantic_va: 0,
-                        semantic_length: 0,
-                    },
-                    (mapping.gpa, mapping.length),
-                    staged,
-                );
-                staged_mappings.push(((mapping.gpa, mapping.length), staged));
-                if let (Some(parent_mapping), Some(frame), Some(kind)) = (
-                    mapping.inherited_mapping,
-                    mapping.inherited_frame,
-                    mapping.fork_frame_receipt_kind,
-                ) {
-                    pending_fork_frame_receipts.push(PendingForkFrameReceipt {
-                        transaction: process_transaction,
-                        kind,
-                        parent_mapping,
-                        child_mapping: staged.mapping,
-                        frame,
-                        ipa: mapping.gpa,
-                        length: mapping.length,
-                    });
-                }
-            }
-            inventory.initialized = true;
-            inventory.process_commit = Some(process_reservation.commit(()));
-        }
+        drop(composition.commit());
         state.pending_fork_frame_receipts = pending_fork_frame_receipts;
         Ok((state, vcpu.into_inner(), mailbox))
     }
