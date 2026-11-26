@@ -178,16 +178,30 @@ pub struct ReadinessSetEntry {
     pub data: u64,
 }
 
+/// Little-endian wire layout of a [`ReadinessSetEntry`].
+#[derive(zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[repr(C)]
+struct ReadinessSetEntryWire {
+    token: zerocopy::little_endian::U64,
+    file_key: zerocopy::little_endian::U64,
+    fd: zerocopy::little_endian::I32,
+    events: zerocopy::little_endian::U32,
+    data: zerocopy::little_endian::U64,
+}
+
 impl ReadinessSetEntry {
-    pub const BYTES: usize = 32;
+    pub const BYTES: usize = core::mem::size_of::<ReadinessSetEntryWire>();
 
     pub fn encode(&self) -> [u8; Self::BYTES] {
+        let wire = ReadinessSetEntryWire {
+            token: self.token.into(),
+            file_key: self.file_key.into(),
+            fd: self.fd.into(),
+            events: self.events.into(),
+            data: self.data.into(),
+        };
         let mut bytes = [0u8; Self::BYTES];
-        bytes[0..8].copy_from_slice(&self.token.to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.file_key.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.fd.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.events.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.data.to_le_bytes());
+        bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&wire));
         bytes
     }
 
@@ -197,12 +211,16 @@ impl ReadinessSetEntry {
         if (input.len() as u64) != count.checked_mul(Self::BYTES as u64)? {
             return None;
         }
-        Some(input.chunks_exact(Self::BYTES).map(|bytes| Self {
-            token: u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default()),
-            file_key: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default()),
-            fd: i32::from_le_bytes(bytes[16..20].try_into().unwrap_or_default()),
-            events: u32::from_le_bytes(bytes[20..24].try_into().unwrap_or_default()),
-            data: u64::from_le_bytes(bytes[24..32].try_into().unwrap_or_default()),
+        Some(input.chunks_exact(Self::BYTES).filter_map(|bytes| {
+            let wire =
+                <ReadinessSetEntryWire as zerocopy::FromBytes>::read_from_bytes(bytes).ok()?;
+            Some(Self {
+                token: wire.token.get(),
+                file_key: wire.file_key.get(),
+                fd: wire.fd.get(),
+                events: wire.events.get(),
+                data: wire.data.get(),
+            })
         }))
     }
 }
