@@ -7649,6 +7649,10 @@ impl HvfVmState {
         let process_commit;
         {
             let mut inventory = plan.frame_inventory.lock();
+            // Publish only in the generation every row was admitted in. The
+            // inventory lock is held from here through the commit; nothing is
+            // staged yet, so a refusal leaves only the composition to roll back.
+            composition.ensure_publishable()?;
             for mapping in inventory_mappings {
                 let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
                     let generation = global_frame_host_owner_generation_in(
@@ -7737,17 +7741,6 @@ impl HvfVmState {
                         length: mapping.length,
                     });
                 }
-            }
-            // Publish only in the generation every row was admitted in.
-            if let Err(error) = composition.ensure_publishable() {
-                Self::rollback_unpublished_mappings(&mut inventory, &staged_inventory_mappings)
-                    .unwrap_or_else(|rollback_error| {
-                        carrick_fatal!(
-                            "hvpatch::frame_inventory",
-                            "rollback task-only child inventory: {rollback_error}"
-                        )
-                    });
-                return Err(error);
             }
             inventory.initialized = true;
             process_commit = process_reservation.commit(());
@@ -8169,6 +8162,10 @@ impl HvfVmState {
             let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
             {
                 let mut inventory = state.frame_inventory.lock();
+                // Publish only in the generation every row was admitted in. The
+                // inventory lock is held from here through the commit; nothing is
+                // staged yet, so a refusal leaves only the composition to roll back.
+                composition.ensure_publishable()?;
                 let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
                 for mapping in inventory_mappings {
                     let stage2_owner =
@@ -8257,17 +8254,6 @@ impl HvfVmState {
                             length: mapping.length,
                         });
                     }
-                }
-                // Publish only in the generation every row was admitted in.
-                if let Err(error) = composition.ensure_publishable() {
-                    Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
-                        .unwrap_or_else(|rollback_error| {
-                            carrick_fatal!(
-                                "hvpatch::frame_inventory",
-                                "rollback HVPatch child inventory staging: {rollback_error}"
-                            )
-                        });
-                    return Err(error);
                 }
                 inventory.initialized = true;
                 inventory.process_commit = Some(process_reservation.commit(()));
