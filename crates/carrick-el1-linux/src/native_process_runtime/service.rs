@@ -1366,16 +1366,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(outcome)
     }
 
+    /// Take this record's retained delivery, putting back on the record the
+    /// operation the delivery held while its frame copy was parked. A record
+    /// that cannot take it back is broken custody (`Stale`).
     #[inline(never)]
-    pub(crate) fn take_pending_signal_delivery(&mut self) -> Option<Box<PendingSignalDelivery>> {
+    pub(crate) fn take_pending_signal_delivery(
+        &mut self,
+    ) -> Result<Option<Box<PendingSignalDelivery>>, NativeProcessError> {
         let mut graph = self.runtime.graph.lock();
-        let resources = graph
-            .owner
-            .task_mut(self.key)
-            .ok()?
-            .native_mut()
-            .resources_mut();
-        let pending = resources.pending_signal_deliveries.remove(&self.record)?;
+        let Ok(task) = graph.owner.task_mut(self.key) else {
+            return Ok(None);
+        };
+        let resources = task.native_mut().resources_mut();
+        let Some(mut pending) = resources.pending_signal_deliveries.remove(&self.record) else {
+            return Ok(None);
+        };
+        if let Some(operation) = pending.borrowed_operation.take() {
+            carrick_core::wait::restore_object_operation(
+                self.source.zone,
+                self.source.slot,
+                self.source.zone.record(self.record.id).identity(),
+                operation,
+            )
+            .map_err(|_| NativeProcessError::Stale)?;
+        }
         // A terminal cancellation outranks a delivery retained for its frame
         // supply (#3018). Replaying it would skip the fatal signal's own
         // selection and request again the supply the cancellation discards,
@@ -1387,19 +1401,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .cancellation()
             .is_some_and(carrick_core::terminal::ProcessCancellation::is_terminal)
         {
-            return None;
+            return Ok(None);
         }
-        if signal_record_exists(self.source.zone, self.record)
+        Ok((signal_record_exists(self.source.zone, self.record)
             && resources.members.iter().any(|member| {
                 member.record == self.record
                     && core::ptr::eq(member.control.control(), self.control)
                     && member.expected_host == pending.expected_host
-            })
-        {
-            Some(pending)
-        } else {
-            None
-        }
+            }))
+        .then_some(pending))
     }
 
     fn cancel_unpublished_fault(&self, operation: ServiceOperation, sequence: Option<NonZeroU64>) {
@@ -1459,6 +1469,52 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             resources
                 .pending_signal_deliveries
                 .insert(self.record, retained);
+        }
+        // A caught signal's handler borrows execution while the wait it
+        // interrupted keeps its replay operation on the record. The frame
+        // copy's park needs the record's operation slot for its own service
+        // token, so the retained delivery holds the borrowed one until it
+        // reruns. An adapter's operation (an IPC pin) is not borrowed here:
+        // its owner retires it, so the park still refuses it.
+        let record = self.source.zone.record(self.record.id);
+        if record.has_object_operation() && !record.has_adapter_operation() {
+            let borrowed = carrick_core::wait::take_object_operation(
+                self.source.zone,
+                self.source.slot,
+                record.identity(),
+            );
+            let mut graph = self.runtime.graph.lock();
+            let retained = graph.owner.task_mut(self.key).ok().and_then(|task| {
+                task.native_mut()
+                    .resources_mut()
+                    .pending_signal_deliveries
+                    .get_mut(&self.record)
+            });
+            let held = match (borrowed, retained) {
+                (Ok(Some(operation)), Some(retained)) => {
+                    retained.borrowed_operation = Some(operation);
+                    true
+                }
+                (Ok(None), _) => true,
+                (Ok(Some(operation)), None) => {
+                    let _ = carrick_core::wait::restore_object_operation(
+                        self.source.zone,
+                        self.source.slot,
+                        record.identity(),
+                        operation,
+                    );
+                    false
+                }
+                (Err(_), _) => false,
+            };
+            drop(graph);
+            if !held {
+                let _ = self.take_pending_signal_delivery();
+                if let SignalCopyDeferral::Supply { fault, sequence } = deferral {
+                    self.service.cancel_copyout_fault(fault.address, sequence);
+                }
+                return Err(NativeProcessError::Stale);
+            }
         }
         let carrier_work = ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,

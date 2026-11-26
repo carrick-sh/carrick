@@ -53,6 +53,9 @@ pub enum SignalReturnRefusal {
     FramePrepare,
     /// Retaining the deferred delivery failed, with the owner's error.
     RetainDelivery(NativeProcessError),
+    /// The retained delivery's rerun could not put the operation it held
+    /// back on its record.
+    RetainedOperation,
     /// Forcing SIGSEGV after a failed delivery failed.
     ForceSigsegv,
 }
@@ -100,6 +103,7 @@ impl SignalReturnRefusal {
             Self::FrameCopy => "signal return refused: frame_copy",
             Self::FramePrepare => "signal return refused: frame_prepare",
             Self::RetainDelivery(_) => "signal return refused: retain_delivery",
+            Self::RetainedOperation => "signal return refused: retained_operation",
             Self::ForceSigsegv => "signal return refused: force_sigsegv",
         }
     }
@@ -224,8 +228,11 @@ where
         return None;
     }
 
+    let Ok(retained) = process.take_pending_signal_delivery() else {
+        return Some(SignalReturnRoute::Refused(Refusal::RetainedOperation));
+    };
     let (sig, mut info, action, saved_mask, thread_blocked, frame_refused) = if let Some(retained) =
-        process.take_pending_signal_delivery()
+        retained
     {
         let PendingSignalDelivery {
             sig,
