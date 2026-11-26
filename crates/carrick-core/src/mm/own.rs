@@ -27,8 +27,12 @@
 //! - **V5** a pinned extent is never released, and only a live extent is
 //!   found or pinned;
 //! - **V6** nothing is dropped silently: a core whose generation is not
-//!   `Vacant` or `Gone`, or that still holds a mapping or an extent, is a
+//!   `Vacant` or `Gone`, or that still holds a mapping, an extent or a
+//!   copy-on-write grant, or whose shell still holds an MM's editor, is a
 //!   broken invariant reported through its venue.
+//!
+//! PR 1a adds the MMs (`own/mm.rs`), their editor (`own/editor.rs`) and
+//! their copy-on-write grants (`own/grant.rs`, invariants G1 to G3).
 //!
 //! The index structure is the step-1a table (#1236): records never overlap,
 //! so the only record that can hold an address is the one with the greatest
@@ -38,8 +42,15 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 
+mod editor;
 #[cfg(test)]
 mod explore;
+mod grant;
+mod mm;
+
+pub use editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
+pub use grant::{CowDemand, GrantId, GrantPayload, MmRefusal, SettleProof, Supplied, SupplyTicket};
+pub use mm::MmKey;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
 #[cfg(all(test, not(feature = "loom")))]
@@ -51,6 +62,9 @@ pub struct Holding {
     pub state: GenerationState,
     pub mappings: usize,
     pub extents: usize,
+    pub grants: usize,
+    /// MMs whose editor the shell or the guest still holds.
+    pub editors: usize,
 }
 
 /// The shell's answer to a broken invariant. Production venues end the
@@ -352,7 +366,7 @@ pub struct Destroyed<M, B> {
 /// See the module documentation.
 #[derive(Debug)]
 #[cfg_attr(test, derive(Clone, Hash, PartialEq, Eq))]
-pub struct CarrierCore<V: CoreVenue, M, B> {
+pub struct CarrierCore<V: CoreVenue, M, B, G = ()> {
     carrier: CarrierId,
     generation: GenerationId,
     state: GenerationState,
@@ -362,6 +376,10 @@ pub struct CarrierCore<V: CoreVenue, M, B> {
     next_extent: u64,
     mappings: BTreeMap<u64, Mapping<M>>,
     extents: BTreeMap<u64, FrameExtent<B>>,
+    next_grant: u64,
+    mms: BTreeMap<MmKey, mm::MmRecord>,
+    /// Copy-on-write grants, by replacement base (G1: they never overlap).
+    grants: BTreeMap<u64, grant::CowGrantRecord<G>>,
     _venue: core::marker::PhantomData<fn() -> V>,
 }
 
@@ -390,7 +408,7 @@ fn host_range_fits(host_addr: usize, extent: GpaExtent) -> bool {
             .is_some()
 }
 
-impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
+impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
     pub fn new(carrier: CarrierId) -> Self {
         Self {
             carrier,
@@ -401,6 +419,9 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
             next_extent: 1,
             mappings: BTreeMap::new(),
             extents: BTreeMap::new(),
+            next_grant: 1,
+            mms: BTreeMap::new(),
+            grants: BTreeMap::new(),
             _venue: core::marker::PhantomData,
         }
     }
@@ -834,22 +855,34 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
 
     fn holding(&self) -> Option<Holding> {
         let ended = matches!(self.state, GenerationState::Vacant | GenerationState::Gone);
-        (!ended || !self.mappings.is_empty() || !self.extents.is_empty()).then_some(Holding {
-            state: self.state,
-            mappings: self.mappings.len(),
-            extents: self.extents.len(),
-        })
+        let editors = self
+            .mms
+            .values()
+            .filter(|record| record.editor != MmEditor::Free)
+            .count();
+        (!ended
+            || !self.mappings.is_empty()
+            || !self.extents.is_empty()
+            || !self.grants.is_empty()
+            || editors != 0)
+            .then_some(Holding {
+                state: self.state,
+                mappings: self.mappings.len(),
+                extents: self.extents.len(),
+                grants: self.grants.len(),
+                editors,
+            })
     }
 
     /// Consume a core that holds nothing: its generation is `Vacant` or
     /// `Gone`, and every mapping and extent is settled. Otherwise it comes
     /// back, and its owner must destroy the generation and settle its pins.
-    pub fn teardown(self) -> Result<(), Self> {
+    pub fn teardown(self) -> Result<(), alloc::boxed::Box<Self>> {
         if self.holding().is_none() {
             drop(self);
             Ok(())
         } else {
-            Err(self)
+            Err(alloc::boxed::Box::new(self))
         }
     }
 
@@ -861,9 +894,11 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
         self.state = GenerationState::Gone;
         self.mappings.clear();
         self.extents.clear();
+        self.mms.clear();
+        self.grants.clear();
     }
 
-    /// Check V1 to V4 and the carve accounting (V5 and V6 hold by the
+    /// Check V1 to V4, G1 to G3 and the carve accounting (V5 and V6 hold by the
     /// transitions' types; the explorer checks V5 against the pins it holds).
     pub fn check_invariants(&self) -> Result<(), Violation> {
         let mut previous_end = None;
@@ -919,6 +954,7 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
                 return Err(Violation::CarveCount);
             }
         }
+        self.check_grant_invariants()?;
         match self.state {
             GenerationState::Vacant | GenerationState::Gone if !self.mappings.is_empty() => {
                 Err(Violation::MappingOutlivesGeneration)
@@ -941,9 +977,12 @@ pub enum Violation {
     TerminalExtent,
     MappingOutlivesGeneration,
     InFlightAtDestroy,
+    GrantsOverlap,
+    GrantWithoutMm,
+    SupplyWithoutEditor,
 }
 
-impl<V: CoreVenue, M, B> Drop for CarrierCore<V, M, B> {
+impl<V: CoreVenue, M, B, G> Drop for CarrierCore<V, M, B, G> {
     /// V6: a core dropped with its generation not ended, or with anything
     /// unsettled, would lose a VM or free memory the backend may still map.
     fn drop(&mut self) {
