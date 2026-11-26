@@ -2343,6 +2343,16 @@ pub(in crate::dispatch) enum MaterializedChange {
     Zero { start: u64, end: u64 },
 }
 
+/// Whether a materialized copy's changes are written back to its host file
+/// by path: a copy of a rootfs file. Never an anonymous file (a memfd,
+/// `O_TMPFILE`), and never a host-backed copy (an unlinked file reopened
+/// through /proc/self/fd), which is its own host inode and changes through
+/// its own descriptor: a path could name another file, or recreate an
+/// unlinked one (#2975 r36).
+fn rewrites_by_path(path: &str, contents: &FileContents) -> bool {
+    !is_anon_overlay_path(path) && contents.host_backed_fd().is_none()
+}
+
 /// Zero `[start, end)` of a materialized copy in place: a served hole punch.
 fn zero_file_contents(contents: &mut FileContents, start: u64, end: u64) -> DispatchOutcome {
     let zero_chunk = [0u8; 4096];
@@ -2490,7 +2500,7 @@ impl<'a> FsView<'a> {
                         if !contents.accepts_len(new_size) {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        if !is_anon_overlay_path(path) {
+                        if rewrites_by_path(path, contents) {
                             // Sync the grown contents to the overlay backing so
                             // a later fstat of the path agrees. The rewrite is
                             // admitted first, through the host size door on the
@@ -2566,7 +2576,7 @@ impl<'a> FsView<'a> {
                                 },
                             );
                         }
-                        if !is_anon_overlay_path(path) {
+                        if rewrites_by_path(path, contents) {
                             // A materialized copy of a host file: the host
                             // rewrite goes through the size door first, and only
                             // then does the copy change (#2975 r36 P0 1). A
@@ -2608,12 +2618,7 @@ impl<'a> FsView<'a> {
                     ServedFallocate::Preallocate => {}
                     ServedFallocate::Allocate => {
                         match carrick_vfs::host_size::extend_to(host_fd.as_fd(), new_size) {
-                            Ok(true) => {
-                                // The new tail is a hole until written.
-                                this.fs
-                                    .truncate_host_sparse_extents(host_fd.raw(), new_size);
-                                this.invalidate_dentry_host_fd(host_fd.raw());
-                            }
+                            Ok(true) => this.invalidate_dentry_host_fd(host_fd.raw()),
                             Ok(false) => {}
                             Err(errno) => {
                                 return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
@@ -2743,7 +2748,7 @@ impl<'a> FsView<'a> {
                     ) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
-                    if !is_anon_overlay_path(path) {
+                    if rewrites_by_path(path, contents) {
                         // Its writeback rewrites the host file by path from
                         // this copy. The rewrite is admitted first, through
                         // the host size door on the object it opens, and
