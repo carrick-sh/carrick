@@ -17289,6 +17289,47 @@ mod window_size_door {
                 "{path} {flags:#o} created a host file"
             );
         }
+        // `O_CREAT` is decided from the name alone, before any host open: an
+        // existing FIFO with no writer answers `EEXIST` at once (a host open
+        // would block), a missing directory is `ENOENT`, and an existing
+        // directory is `EISDIR` (`EEXIST` with `O_EXCL`).
+        std::fs::create_dir(mounted.path().join("sub")).unwrap();
+        let fifo =
+            std::ffi::CString::new(mounted.path().join("fifo").as_os_str().as_encoded_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        for (path, flags, expected) in [
+            (
+                "/ro/fifo",
+                o(carrick_abi::LINUX_O_RDONLY
+                    | carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_EXCL),
+                carrick_abi::LINUX_EEXIST,
+            ),
+            (
+                "/ro/missing/new",
+                o(carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_CREAT),
+                carrick_abi::LINUX_ENOENT,
+            ),
+            (
+                "/ro/sub",
+                o(carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_CREAT),
+                carrick_abi::LINUX_EISDIR,
+            ),
+            (
+                "/ro/sub",
+                o(carrick_abi::LINUX_O_RDONLY
+                    | carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_EXCL),
+                carrick_abi::LINUX_EEXIST,
+            ),
+        ] {
+            assert_eq!(
+                run.call(SYS_OPENAT, Some(path), [AT_FDCWD, PATH, flags, 0o644, 0, 0]),
+                DispatchOutcome::errno(expected),
+                "openat({path}, {flags:#o})"
+            );
+        }
         // An existing file opens read-only as named, `O_CREAT` or not.
         for flags in [
             o(carrick_abi::LINUX_O_RDONLY),
@@ -17303,5 +17344,92 @@ mod window_size_door {
             );
         }
         assert_eq!(std::fs::read(&file).unwrap(), b"keep these bytes");
+    }
+
+    /// #2975 r36 pre-review P0 1: a hole punch of a host-backed description
+    /// (a memfd, or an unlinked file reopened through /proc/self/fd) acts on
+    /// its own descriptor through the size door. Red before: the punch went
+    /// by path, recreating the unlinked name, and never asked the door for
+    /// a windowed descriptor.
+    #[test]
+    fn host_backed_hole_punch_acts_on_its_descriptor_and_never_recreates_a_name() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let install = |run: &Run, path: &str| {
+            let host = counting_file(run, path, 8192);
+            let backing = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&host)
+                .unwrap();
+            std::fs::remove_file(&host).unwrap();
+            let pin = backing.try_clone().unwrap();
+            let desc = OpenDescription::File {
+                path: path.to_string(),
+                contents: FileContents::host_backed(std::os::fd::OwnedFd::from(backing)),
+                offset: 0,
+                writable: true,
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(path),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 8192,
+                },
+                base: OpenDescriptionBase::new(0),
+            };
+            let DispatchOutcome::Returned { value } = run.dispatcher.install_fd(desc, 0) else {
+                panic!("install_fd {path}");
+            };
+            (value as u64, host, pin)
+        };
+        let (plain_fd, plain_host, plain_pin) = install(&run, "/victim");
+        let (windowed_fd, windowed_host, windowed_pin) = install(&run, "/windowed");
+        let _window =
+            carrick_vfs::host_size::record(std::os::fd::AsFd::as_fd(&windowed_pin)).unwrap();
+        let punch = FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE;
+        let read_all = |file: &std::fs::File| {
+            let mut bytes = vec![0u8; 8192];
+            std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0).unwrap();
+            bytes
+        };
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [windowed_fd, punch, 1000, 2000, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_bytes(&read_all(&windowed_pin), &counting_bytes(8192), "windowed");
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [plain_fd, punch, 1000, 2000, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let mut expected = counting_bytes(8192);
+        expected[1000..3000].fill(0);
+        assert_bytes(&read_all(&plain_pin), &expected, "the punched descriptor");
+        assert!(!plain_host.exists(), "the unlinked name was recreated");
+        assert!(!windowed_host.exists(), "the unlinked name was recreated");
+    }
+
+    /// #2975 r36 pre-review P1: `O_CREAT` of an existing file on a writable
+    /// bind mount leaves its mode alone (only a file this open creates gets
+    /// the guest's exact mode).
+    #[test]
+    fn o_creat_of_an_existing_bind_mounted_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let mounted = tempfile::tempdir().unwrap();
+        let file = mounted.path().join("x");
+        std::fs::write(&file, b"bytes").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        run.dispatcher.register_mount(
+            "/rw",
+            Box::new(carrick_vfs::BindVfs::new("/rw", mounted.path(), false)),
+        );
+        let flags = carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_CREAT;
+        assert!(matches!(
+            run.call(SYS_OPENAT, Some("/rw/x"), [AT_FDCWD, PATH, flags, 0o604, 0, 0]),
+            DispatchOutcome::Returned { value } if value >= 0
+        ));
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
     }
 }

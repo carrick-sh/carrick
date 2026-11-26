@@ -8161,3 +8161,32 @@ pub(crate) mod test_write_range_hook {
         }
     }
 }
+
+#[cfg(test)]
+mod size_door_leaf_tests {
+    use super::*;
+
+    /// #2975 r36 pre-review P0 4: the size door's `EMFILE` fallback runs
+    /// the guest's own open under its registry, and the registry is a leaf.
+    /// A refused open there must not reclaim the directory cache (a lock
+    /// taken under the registry); outside the door it still does.
+    #[test]
+    fn a_refused_open_under_the_size_door_never_reclaims_the_dir_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let backend = HostFsBackend::from_path(dir.path()).unwrap();
+        backend.dir_fd_for(Path::new("d")).unwrap();
+        assert!(!backend.dir_cache.lock().is_empty());
+        let file = tempfile::tempfile().unwrap();
+        let reclaimed = crate::host_size::write_admitted(std::os::fd::AsFd::as_fd(&file), |_| {
+            backend.reclaim_for_host_refusal(libc::EMFILE)
+        });
+        assert!(!reclaimed, "no reclaim under the size door's registry");
+        assert!(
+            !backend.dir_cache.lock().is_empty(),
+            "the cache is untouched"
+        );
+        assert!(backend.reclaim_for_host_refusal(libc::EMFILE));
+        assert!(backend.dir_cache.lock().is_empty());
+    }
+}
