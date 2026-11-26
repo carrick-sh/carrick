@@ -303,7 +303,7 @@ fn retained_executable_bytes(
             error
                 .raw_os_error()
                 .map(crate::host_to_linux_errno)
-                .unwrap_or(crate::linux_abi::LINUX_EIO)
+                .unwrap_or(LINUX_EIO)
         })
 }
 
@@ -535,13 +535,110 @@ pub(crate) fn punch_host_file_hole(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[inline]
-pub(crate) fn punch_host_file_hole(
-    _raw_fd: std::os::raw::c_int,
-    _offset: u64,
-    _length: u64,
+/// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` of a host file,
+/// served exactly (#2975 r36): `[offset, offset + length)` reads back as
+/// zeros and the size never changes. A Linux host punches the hole itself
+/// (its own errno, e.g. `EOPNOTSUPP` on a filesystem without holes, is the
+/// answer a Linux guest gets on that filesystem).
+#[cfg(target_os = "linux")]
+pub(crate) fn zero_host_file_range(
+    raw_fd: libc::c_int,
+    offset: u64,
+    length: u64,
 ) -> Result<(), LinuxErrno> {
+    if length == 0 {
+        return Ok(());
+    }
+    let off = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
+    let len = libc::off_t::try_from(length).map_err(|_| LINUX_EFBIG)?;
+    // SAFETY: a plain host call on a descriptor the caller keeps open.
+    let rc = unsafe {
+        libc::fallocate(
+            raw_fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            off,
+            len,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(crate::host_to_linux_errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ))
+    }
+}
+
+/// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` of a host file
+/// without Linux's `fallocate`, served exactly (#2975 r36): the range,
+/// clamped to the current end of file, reads back as zeros and the size
+/// never changes. macOS deallocates the whole blocks inside the range
+/// (`F_PUNCHHOLE`) and writes zeros over the partial blocks at its edges;
+/// other hosts write zeros.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn zero_host_file_range(
+    raw_fd: libc::c_int,
+    offset: u64,
+    length: u64,
+) -> Result<(), LinuxErrno> {
+    let host_errno = || {
+        crate::host_to_linux_errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        )
+    };
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    // SAFETY: `fstat` writes the whole record on success.
+    if unsafe { libc::fstat(raw_fd, &mut st) } != 0 {
+        return Err(host_errno());
+    }
+    let eof = u64::try_from(st.st_size).unwrap_or(0);
+    let start = offset.min(eof);
+    let end = offset.saturating_add(length).min(eof);
+    if end <= start {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    let (head_end, tail_start) = {
+        let blksize = u64::try_from(st.st_blksize)
+            .ok()
+            .filter(|b| *b > 0)
+            .unwrap_or(4096);
+        let first_whole = start.div_ceil(blksize) * blksize;
+        let last_whole = end / blksize * blksize;
+        if last_whole > first_whole {
+            punch_host_file_hole(raw_fd, first_whole, last_whole - first_whole)?;
+            (first_whole, last_whole)
+        } else {
+            (end, end)
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (head_end, tail_start) = (end, end);
+    let zeros = [0u8; 65536];
+    for (mut cur, to) in [(start, head_end), (tail_start, end)] {
+        while cur < to {
+            let chunk = usize::try_from(to - cur)
+                .unwrap_or(usize::MAX)
+                .min(zeros.len());
+            let at = libc::off_t::try_from(cur).map_err(|_| LINUX_EFBIG)?;
+            // SAFETY: `zeros` provides `chunk` readable bytes.
+            let n = unsafe { libc::pwrite(raw_fd, zeros.as_ptr().cast(), chunk, at) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(host_errno());
+            }
+            if n == 0 {
+                return Err(LINUX_EIO);
+            }
+            cur += n as u64;
+        }
+    }
     Ok(())
 }
 
@@ -636,16 +733,17 @@ pub(crate) fn commit_bytes_at_offset(
             if !*writable {
                 return Err(LINUX_EBADF);
             }
-            let _write_guard =
-                carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(host_fd));
-            let res = unsafe {
-                libc::pwrite(
-                    host_fd.raw(),
-                    bytes.as_ptr() as *const libc::c_void,
-                    bytes.len(),
-                    offset as libc::off_t,
-                )
-            };
+            let res = carrick_vfs::host_size::write_admitted(
+                std::os::fd::AsFd::as_fd(host_fd),
+                |fd| unsafe {
+                    libc::pwrite(
+                        std::os::fd::AsRawFd::as_raw_fd(&fd),
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                        offset as libc::off_t,
+                    )
+                },
+            );
             if res < 0 {
                 return Err(crate::host_to_linux_errno(
                     std::io::Error::last_os_error()
@@ -1272,9 +1370,8 @@ impl<'a> FsView<'a> {
                 // The writer's own limit is unlimited (`CarrierWrite`).
                 HostFileWriter::Carrier(_) => None,
             };
-            let _write_guard = carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(
-                host_io.host_fd_ref(),
-            ));
+            // The host write itself goes through the size door inside
+            // `write_host_pipe` (the registry is a leaf, #2975 r36).
             let offset_may_be_nonzero = host_io.offset_may_be_nonzero();
             let pos = if is_append {
                 unsafe { libc::lseek(host_io.raw(), 0, libc::SEEK_END) }
@@ -1767,7 +1864,7 @@ impl<'a> FsView<'a> {
                             is_master: true, ..
                         }),
                         DispatchOutcome::Returned { value: 0 },
-                    ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                    ) => DispatchOutcome::errno(LINUX_EIO),
                     (_, outcome) => outcome,
                 });
             }
@@ -2223,7 +2320,7 @@ impl<'a> FsView<'a> {
                     error
                         .raw_os_error()
                         .map(crate::host_to_linux_errno)
-                        .unwrap_or(crate::linux_abi::LINUX_EIO)
+                        .unwrap_or(LINUX_EIO)
                 })?;
                 if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
                     if offset < 0 || offset as usize >= file_size {
@@ -3329,7 +3426,7 @@ impl<'a> FsView<'a> {
                                 is_master: true, ..
                             }),
                             DispatchOutcome::Returned { value: 0 },
-                        ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                        ) => DispatchOutcome::errno(LINUX_EIO),
                         (_, outcome) => outcome,
                     });
                 }
@@ -4325,9 +4422,8 @@ impl<'a> FsView<'a> {
                 if !host_io.is_writable() {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let _write_guard = carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(
-                    host_io.host_fd_ref(),
-                ));
+                // The host write goes through the size door inside
+                // `write_host_pipe_owned_at` (#2975 r36).
                 let raw_fd = host_io.raw();
                 let old_len = if !is_append {
                     let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -4674,8 +4770,6 @@ impl<'a> FsView<'a> {
                 }
                 (hfd, host_fd_owner, is_append, at_current)
             };
-            let _write_guard =
-                carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(&host_fd_owner));
             let old_len = if !at_current {
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 if unsafe { libc::fstat(hfd, &mut st) } == 0 {
@@ -4709,19 +4803,26 @@ impl<'a> FsView<'a> {
                 }
                 let iovcnt = i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
                 let mut n = 0;
+                // The size door is taken inside the host operation, after
+                // the CPU and MM are lent and released before they are
+                // reclaimed: the registry is never held across the host-wait
+                // handoff (#2975 r36 P0 2).
                 let mut write = || {
-                    n = unsafe {
-                        if at_current {
-                            libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
-                        } else {
-                            libc::pwritev(
-                                hfd,
-                                borrowed_iovecs.as_ptr(),
-                                iovcnt,
-                                offset as libc::off_t,
-                            )
-                        }
-                    };
+                    n = carrick_vfs::host_size::write_admitted(
+                        std::os::fd::AsFd::as_fd(&host_fd_owner),
+                        |_| unsafe {
+                            if at_current {
+                                libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
+                            } else {
+                                libc::pwritev(
+                                    hfd,
+                                    borrowed_iovecs.as_ptr(),
+                                    iovcnt,
+                                    offset as libc::off_t,
+                                )
+                            }
+                        },
+                    );
                 };
                 // Retained HostRead owners stay live while the caller
                 // releases its execution capacity for the host syscall.
@@ -5367,11 +5468,8 @@ impl<'a> FsView<'a> {
                 Ok(DispatchOutcome::Returned { value: 0 })
             };
         }
-        let _write_guard = host_target
-            .host_fd_owner
-            .as_ref()
-            .filter(|_| host_target.write_kind == HostWriteKind::RegularFile)
-            .map(|fd| carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(fd)));
+        // A regular-file write goes through the size door inside
+        // `write_host_pipe_owned`, around the host call only (#2975 r36).
         if host_target.append {
             unsafe { libc::lseek(host_target.host_fd, 0, libc::SEEK_END) };
         }
@@ -5724,9 +5822,6 @@ impl<'a> FsView<'a> {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
-                            let _write_guard = carrick_vfs::host_size::admit_write(
-                                std::os::fd::AsFd::as_fd(host_fd),
-                            );
                             // Mirror `write`(64): O_APPEND seeks to EOF, then
                             // libc::write to the real fd advances the shared
                             // kernel offset (visible across fork and to the

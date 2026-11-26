@@ -1731,13 +1731,14 @@ impl<'a> FsView<'a> {
         Ok(())
     }
 
-    /// Resize a materialized copy after its host rewrite was admitted and
-    /// applied ([`Self::rewrite_materialized`]): the copy, its offset and
-    /// its metadata follow the host file.
-    pub(in crate::dispatch) fn apply_materialized_resize(
+    /// Apply a change to a materialized copy after its host rewrite was
+    /// admitted and applied ([`Self::rewrite_materialized`]): the copy, its
+    /// offset and its metadata follow the host file. The one place a
+    /// materialized change takes the description a second time.
+    pub(in crate::dispatch) fn apply_materialized(
         &self,
         description: &Arc<crate::kernel::FileDescription>,
-        new_len: u64,
+        change: MaterializedChange,
     ) -> DispatchOutcome {
         let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
             return DispatchOutcome::errno(LINUX_EBADF);
@@ -1750,6 +1751,12 @@ impl<'a> FsView<'a> {
         } = &mut *open
         else {
             return DispatchOutcome::errno(LINUX_EBADF);
+        };
+        let new_len = match change {
+            MaterializedChange::Resize(new_len) => new_len,
+            MaterializedChange::Zero { start, end } => {
+                return zero_file_contents(contents, start, end);
+            }
         };
         if let Err(errno) = contents.resize(new_len) {
             return DispatchOutcome::errno(errno);
@@ -2259,18 +2266,112 @@ impl<'a> FsView<'a> {
     }
 }
 
+/// What one `fallocate(2)` asks for, decided from its mode alone (#2975 r36
+/// P0 1). Carrick serves three modes exactly; every other mode Linux
+/// defines is [`FallocateMode::Unserved`], a counted `ENOSYS` before
+/// anything changes, never a silent success.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(in crate::dispatch) enum FallocateMode {
+    Served(ServedFallocate),
+    /// `FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE` (they shift
+    /// bytes), `FALLOC_FL_ZERO_RANGE` (it writes them),
+    /// `FALLOC_FL_UNSHARE_RANGE`, `FALLOC_FL_PUNCH_HOLE` without
+    /// `FALLOC_FL_KEEP_SIZE`, and every combination of them.
+    Unserved,
+}
+
+/// A `fallocate(2)` mode Carrick serves exactly, on every kind of file.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(in crate::dispatch) enum ServedFallocate {
+    /// Mode 0: allocate `[offset, offset + len)`, extending the file to at
+    /// least `offset + len` bytes; the contents never change.
+    Allocate,
+    /// `FALLOC_FL_KEEP_SIZE`: preallocate; the size and contents never
+    /// change.
+    Preallocate,
+    /// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: the range reads back as
+    /// zeros; the size never changes.
+    PunchHole,
+}
+
+impl FallocateMode {
+    pub(in crate::dispatch) fn of(mode: u64) -> Self {
+        match mode {
+            0 => Self::Served(ServedFallocate::Allocate),
+            LINUX_FALLOC_FL_KEEP_SIZE => Self::Served(ServedFallocate::Preallocate),
+            m if m == LINUX_FALLOC_FL_PUNCH_HOLE | LINUX_FALLOC_FL_KEEP_SIZE => {
+                Self::Served(ServedFallocate::PunchHole)
+            }
+            _ => Self::Unserved,
+        }
+    }
+}
+
+/// A validated `fallocate(2)`: its mode and its byte range, with
+/// `offset + len` known to fit `off_t`.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(in crate::dispatch) struct FallocateRequest {
+    pub(in crate::dispatch) mode: FallocateMode,
+    pub(in crate::dispatch) offset: u64,
+    pub(in crate::dispatch) len: u64,
+}
+
+/// A change to a materialized copy, applied after its host rewrite
+/// ([`FsView::apply_materialized`]).
+pub(in crate::dispatch) enum MaterializedChange {
+    /// Resize to this many bytes (`ftruncate`, an allocating `fallocate`).
+    Resize(u64),
+    /// Zero `[start, end)`, the size unchanged (a hole punch).
+    Zero { start: u64, end: u64 },
+}
+
+/// Zero `[start, end)` of a materialized copy in place: a served hole punch.
+fn zero_file_contents(contents: &mut FileContents, start: u64, end: u64) -> DispatchOutcome {
+    let zero_chunk = [0u8; 4096];
+    let mut cur = start;
+    while cur < end {
+        let chunk_len = usize::try_from(end - cur)
+            .unwrap_or(usize::MAX)
+            .min(zero_chunk.len());
+        match contents.write_at(cur, &zero_chunk[..chunk_len]) {
+            Ok(0) => break,
+            Ok(n) => cur += n as u64,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        }
+    }
+    DispatchOutcome::Returned { value: 0 }
+}
+
 impl<'a> FsView<'a> {
     define_syscall! {
 
         fn fallocate_syscall(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
-            let range = Self::validate_fallocate(mode, offset, len)?;
+            let request = Self::validate_fallocate(mode, offset, len)?;
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            this.fallocate(&open_file.description, mode, range)
+            this.fallocate(&open_file.description, request)
         }
 
         fn ftruncate(this, cx, fd: Fd, length: u64) {
@@ -2300,7 +2401,7 @@ impl<'a> FsView<'a> {
         mode: u64,
         offset: u64,
         length: u64,
-    ) -> Result<(i64, i64), LinuxErrno> {
+    ) -> Result<FallocateRequest, LinuxErrno> {
         let offset = i64::from_ne_bytes(offset.to_ne_bytes());
         let length = i64::from_ne_bytes(length.to_ne_bytes());
         if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
@@ -2316,21 +2417,26 @@ impl<'a> FsView<'a> {
         if offset.checked_add(length).is_none() {
             return Err(LINUX_EFBIG);
         }
-        Ok((offset, length))
+        Ok(FallocateRequest {
+            mode: FallocateMode::of(mode),
+            offset: offset as u64,
+            len: length as u64,
+        })
     }
 
     pub(in crate::dispatch) fn fallocate(
         &self,
         description: &Arc<crate::kernel::FileDescription>,
-        mode: u64,
-        (offset, length): (i64, i64),
+        request: FallocateRequest,
     ) -> Result<DispatchOutcome, DispatchError> {
         let this = self;
-        // Only mode-0 (default allocation) is implemented as a real grow;
-        // FALLOC_FL_KEEP_SIZE preallocates without changing the apparent
-        // size, which on a tmpfs/host-backed file is a no-op success.
-        let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
-        let new_size = (offset as u64).saturating_add(length as u64);
+        let FallocateRequest { mode, offset, len } = request;
+        // A mode no Carrick file serves exactly is a counted ENOSYS before
+        // anything changes, never a silent success (#2975 r36 P0 1).
+        let FallocateMode::Served(op) = mode else {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        };
+        let new_size = offset.saturating_add(len);
         // Serialize concurrent two-stage materialized resizes across rewrite
         // and apply on the same open file description (#2975 P0 6).
         #[cfg(test)]
@@ -2338,175 +2444,142 @@ impl<'a> FsView<'a> {
         let _materialized_resize = description.common().lock_materialized_resize();
         #[cfg(test)]
         test_materialized_resize_hook::signal_after_lock();
-        // Snapshot the writeback path/contents in a scope so the borrow
-        // drops before we touch this.fs.rootfs_vfs.overlay (mirrors ftruncate).
-        let writeback: Option<(String, Vec<u8>)>;
-        let outcome: DispatchOutcome;
-        {
-            let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            match &mut *open {
-                OpenDescription::File {
-                    path,
-                    contents,
-                    metadata,
-                    writable,
-                    ..
-                } if grow => {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    // memfd seals: an allocating (non-KEEP_SIZE) fallocate is
-                    // blocked only by F_SEAL_GROW when it extends the file —
-                    // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
-                    // seals WRITE then grows via fallocate successfully).
-                    let cur_len = match contents.len() {
-                        Ok(l) => l,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    if matches!(
-                        description.common()
-                            .seals()
-                            .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
-                        Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
-                    ) && new_size > cur_len
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EPERM));
-                    }
-                    if !contents.accepts_len(new_size) {
-                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                    }
-                    if !is_anon_overlay_path(path) {
-                        // Sync the grown contents to the overlay backing so
-                        // a later fstat of the path agrees. The rewrite is
-                        // admitted first, through the host size door on the
-                        // object it opens, and only then does the copy grow
-                        // (#1338 A1): a fenced rewrite changes nothing.
-                        let len = usize::try_from(new_size.max(cur_len)).unwrap_or(usize::MAX);
-                        let mut vec = vec![0u8; len];
-                        let keep = usize::try_from(cur_len).unwrap_or(usize::MAX).min(len);
-                        if let Err(errno) = contents.read_at(0, &mut vec[..keep]) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        let path = path.clone();
-                        drop(open);
-                        if let Err(errno) = this.rewrite_materialized(&path, vec) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        if new_size <= cur_len {
-                            return Ok(DispatchOutcome::Returned { value: 0 });
-                        }
-                        #[cfg(test)]
-                        test_materialized_resize_hook::notify_after_rewrite();
-                        return Ok(this.apply_materialized_resize(description, new_size));
-                    }
-                    if new_size > cur_len {
-                        if let Err(errno) = contents.resize(new_size) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        let confirmed_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
-                    }
-                    // Anonymous files (memfd, O_TMPFILE) have no overlay
-                    // path to sync.
-                    writeback = None;
-                    outcome = DispatchOutcome::Returned { value: 0 };
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        match &mut *open {
+            OpenDescription::File {
+                path,
+                contents,
+                metadata,
+                writable,
+                ..
+            } => {
+                if !*writable {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::File {
-                    contents, writable, ..
-                } => {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                let cur_len = match contents.len() {
+                    Ok(l) => l,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                match op {
+                    ServedFallocate::Preallocate => {}
+                    ServedFallocate::Allocate => {
+                        // memfd seals: an allocating fallocate is blocked only
+                        // by F_SEAL_GROW when it extends the file — F_SEAL_WRITE
+                        // does NOT block a pure grow (memfd_create01 seals WRITE
+                        // then grows via fallocate successfully).
+                        if matches!(
+                            description.common()
+                                .seals()
+                                .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                            Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
+                        ) && new_size > cur_len
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                        }
+                        if !contents.accepts_len(new_size) {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        if !is_anon_overlay_path(path) {
+                            // Sync the grown contents to the overlay backing so
+                            // a later fstat of the path agrees. The rewrite is
+                            // admitted first, through the host size door on the
+                            // object it opens, and only then does the copy grow
+                            // (#1338 A1): a fenced rewrite changes nothing.
+                            let len = usize::try_from(new_size.max(cur_len)).unwrap_or(usize::MAX);
+                            let mut vec = vec![0u8; len];
+                            let keep = usize::try_from(cur_len).unwrap_or(usize::MAX).min(len);
+                            if let Err(errno) = contents.read_at(0, &mut vec[..keep]) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            let path = path.clone();
+                            drop(open);
+                            if let Err(errno) = this.rewrite_materialized(&path, vec) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            if new_size <= cur_len {
+                                return Ok(DispatchOutcome::Returned { value: 0 });
+                            }
+                            #[cfg(test)]
+                            test_materialized_resize_hook::notify_after_rewrite();
+                            return Ok(this.apply_materialized(
+                                description,
+                                MaterializedChange::Resize(new_size),
+                            ));
+                        }
+                        // Anonymous files (memfd, O_TMPFILE) have no overlay
+                        // path to sync.
+                        if new_size > cur_len {
+                            if let Err(errno) = contents.resize(new_size) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            let confirmed_len = match contents.len() {
+                                Ok(l) => l,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
+                        }
                     }
-                    // A hole punch modifies content, so F_SEAL_WRITE blocks it
-                    // (memfd_create01 check_mfd_non_writeable). A plain
-                    // KEEP_SIZE preallocate changes nothing and is unaffected.
-                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                    ServedFallocate::PunchHole => {
+                        // A hole punch modifies content, so F_SEAL_WRITE blocks
+                        // it (memfd_create01 check_mfd_non_writeable).
                         if let Err(errno) =
                             memfd_seal_write_check(description.common().seals(), 0, 0, 0)
                         {
                             return Ok(DispatchOutcome::errno(errno));
                         }
-                        // The punched range reads back as zeros; the
-                        // apparent size never changes (KEEP_SIZE is
-                        // mandatory with PUNCH_HOLE).
-                        let cur_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        let start = (offset as u64).min(cur_len);
-                        let end = (offset as u64).saturating_add(length as u64).min(cur_len);
-                        if end > start {
-                            let zero_chunk = [0u8; 4096];
-                            let mut cur = start;
-                            while cur < end {
-                                let chunk_len = ((end - cur) as usize).min(zero_chunk.len());
-                                match contents.write_at(cur, &zero_chunk[..chunk_len]) {
-                                    Ok(0) => break,
-                                    Ok(n) => cur += n as u64,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                }
+                        // The punched range reads back as zeros; the apparent
+                        // size never changes (KEEP_SIZE is part of the mode).
+                        let start = offset.min(cur_len);
+                        let end = new_size.min(cur_len);
+                        if end <= start {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        if !is_anon_overlay_path(path) {
+                            // A materialized copy of a host file: the host
+                            // rewrite goes through the size door first, and only
+                            // then does the copy change (#2975 r36 P0 1). A
+                            // fenced rewrite changes nothing.
+                            let len = usize::try_from(cur_len).unwrap_or(usize::MAX);
+                            let mut vec = vec![0u8; len];
+                            if let Err(errno) = contents.read_at(0, &mut vec) {
+                                return Ok(DispatchOutcome::errno(errno));
                             }
+                            let zero_from = usize::try_from(start).unwrap_or(len).min(len);
+                            let zero_to = usize::try_from(end).unwrap_or(len).min(len);
+                            vec[zero_from..zero_to].fill(0);
+                            let path = path.clone();
+                            drop(open);
+                            if let Err(errno) = this.rewrite_materialized(&path, vec) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            return Ok(this.apply_materialized(
+                                description,
+                                MaterializedChange::Zero { start, end },
+                            ));
+                        }
+                        let zeroed = zero_file_contents(contents, start, end);
+                        if !matches!(zeroed, DispatchOutcome::Returned { .. }) {
+                            return Ok(zeroed);
                         }
                     }
-                    // KEEP_SIZE: don't change apparent size.
-                    writeback = None;
-                    outcome = DispatchOutcome::Returned { value: 0 };
                 }
-                OpenDescription::HostFile {
-                    host_fd, writable, ..
-                } => {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    // A hole punch or a collapse discards a window's pages
-                    // under its live leaves: the host size door refuses it on
-                    // this descriptor before the host applies it (#1338 A1).
-                    let discard = if mode
-                        & (LINUX_FALLOC_FL_PUNCH_HOLE | carrick_abi::LINUX_FALLOC_FL_COLLAPSE_RANGE)
-                        != 0
-                    {
-                        use std::os::fd::AsFd as _;
-                        match carrick_vfs::host_size::admit_discard(host_fd.as_fd()) {
-                            Ok(change) => Some(change),
-                            Err(carrick_vfs::host_size::Fenced) => {
-                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
-                        let punched = match discard {
-                            Some(change) => change.apply(|fd| {
-                                use std::os::fd::AsRawFd as _;
-                                rw::punch_host_file_hole(
-                                    fd.as_raw_fd(),
-                                    offset as u64,
-                                    length as u64,
-                                )
-                            }),
-                            None => rw::punch_host_file_hole(
-                                host_fd.raw(),
-                                offset as u64,
-                                length as u64,
-                            ),
-                        };
-                        if let Err(errno) = punched {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                    } else if grow {
-                        use std::os::fd::AsFd as _;
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            OpenDescription::HostFile {
+                host_fd, writable, ..
+            } => {
+                use std::os::fd::AsFd as _;
+                if !*writable {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                match op {
+                    ServedFallocate::Preallocate => {}
+                    ServedFallocate::Allocate => {
                         match carrick_vfs::host_size::extend_to(host_fd.as_fd(), new_size) {
-                            Ok(grew) => {
-                                if grew {
-                                    this.invalidate_dentry_host_fd(host_fd.raw());
-                                }
-                            }
+                            Ok(true) => this.invalidate_dentry_host_fd(host_fd.raw()),
+                            Ok(false) => {}
                             Err(errno) => {
                                 return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
                                     errno,
@@ -2514,30 +2587,47 @@ impl<'a> FsView<'a> {
                             }
                         }
                     }
-                    writeback = None;
-                    outcome = DispatchOutcome::Returned { value: 0 };
-                }
-                OpenDescription::SyntheticFile { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EROFS));
-                }
-                OpenDescription::ProcExecutable { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EROFS));
-                }
-                OpenDescription::InMemoryFile {
-                    path,
-                    contents,
-                    writable,
-                    max_size,
-                    ..
-                } => {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    ServedFallocate::PunchHole => {
+                        // A hole punch discards a window's pages under its live
+                        // leaves: the host size door refuses it on this
+                        // descriptor before the host applies it (#1338 A1), and
+                        // otherwise applies it inside the door, the one host
+                        // operation under the registry (#2975 r36).
+                        match carrick_vfs::host_size::discard(host_fd.as_fd(), |fd| {
+                            use std::os::fd::AsRawFd as _;
+                            rw::zero_host_file_range(fd.as_raw_fd(), offset, len)
+                        }) {
+                            Ok(Ok(())) => this.invalidate_dentry_host_fd(host_fd.raw()),
+                            Ok(Err(errno)) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(carrick_vfs::host_size::Fenced) => {
+                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+                            }
+                        }
                     }
-                    if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            OpenDescription::SyntheticFile { .. } | OpenDescription::ProcExecutable { .. } => {
+                Ok(DispatchOutcome::errno(LINUX_EROFS))
+            }
+            OpenDescription::InMemoryFile {
+                path,
+                contents,
+                writable,
+                max_size,
+                ..
+            } => {
+                if !*writable {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                match op {
+                    ServedFallocate::Preallocate => {}
+                    ServedFallocate::PunchHole => {
                         let mut data = contents.write();
-                        data.punch_hole(offset as usize, length as usize);
+                        data.punch_hole(offset as usize, len as usize);
                         this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                    } else {
+                    }
+                    ServedFallocate::Allocate => {
                         if new_size as usize > *max_size {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
@@ -2547,21 +2637,12 @@ impl<'a> FsView<'a> {
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
                         }
                     }
-                    writeback = None;
-                    outcome = DispatchOutcome::Returned { value: 0 };
                 }
-                OpenDescription::Directory { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                }
-                _ => {
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
+            OpenDescription::Directory { .. } => Ok(DispatchOutcome::errno(LINUX_EISDIR)),
+            _ => Ok(DispatchOutcome::errno(LINUX_ESPIPE)),
         }
-        if let Some((path, contents)) = writeback {
-            let _ = this.fs.rootfs_vfs.set_file_contents(&path, contents);
-        }
-        Ok(outcome)
     }
 
     pub(in crate::dispatch) fn truncate_description(
@@ -2646,7 +2727,10 @@ impl<'a> FsView<'a> {
                         }
                         #[cfg(test)]
                         test_materialized_resize_hook::notify_after_rewrite();
-                        return Ok(this.apply_materialized_resize(description, length as u64));
+                        return Ok(this.apply_materialized(
+                            description,
+                            MaterializedChange::Resize(length as u64),
+                        ));
                     }
                     if let Err(errno) = contents.resize(length as u64) {
                         return Ok(DispatchOutcome::errno(errno));

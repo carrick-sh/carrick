@@ -1101,13 +1101,14 @@ impl SyscallDispatcher {
             }
             HostFileOp::Fallocate => {
                 let mode = header.args[0];
-                let range =
+                let request =
                     match super::FsView::validate_fallocate(mode, header.args[1], header.args[2]) {
-                        Ok(range) => range,
+                        Ok(request) => request,
                         Err(errno) => return Served::errno(errno),
                     };
-                match self.fs_view().fallocate(description, mode, range) {
-                    // ENOSYS is the window shrink fence: a counted refusal.
+                match self.fs_view().fallocate(description, request) {
+                    // ENOSYS is the window shrink fence or an unserved mode:
+                    // a counted refusal.
                     Ok(outcome) => served_mutation(outcome),
                     Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
                     Err(_) => Served::Refused,

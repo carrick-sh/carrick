@@ -5719,11 +5719,13 @@ impl FsBackend for HostFsBackend {
                 None => Err(BackendError::Io),
             };
         }
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let _write_guard = crate::host_size::admit_write(std::os::fd::AsFd::as_fd(&file));
-        #[cfg(any(test, feature = "test-support"))]
-        crate::host_size::test_resize_hook::pause_before_write_all();
-        file.write_all(&contents).map_err(|_| BackendError::Io)?;
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        crate::host_size::write_admitted(std::os::fd::AsFd::as_fd(&file), |_| {
+            #[cfg(any(test, feature = "test-support"))]
+            crate::host_size::test_resize_hook::pause_before_write_all();
+            (&file).write_all(&contents)
+        })
+        .map_err(|_| BackendError::Io)?;
         self.clear_whiteout_normalized(&normalized);
         self.coherence.bump_generation();
         Ok(())
@@ -5759,23 +5761,23 @@ impl FsBackend for HostFsBackend {
             .into_backend_result()?;
         let result = (|| {
             {
-                // SAFETY: `host_fd` is open until the close below; release the
-                // write guard before the post-write `host_size::resize` call.
-                let _write_guard =
-                    crate::host_size::admit_write(unsafe { BorrowedFd::borrow_raw(host_fd) });
+                // SAFETY: `host_fd` is open until the close below.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(host_fd) };
                 let mut written = 0usize;
                 while written < bytes.len() {
                     let write_offset = offset.checked_add(written).ok_or(BackendError::Invalid)?;
                     let write_offset =
                         i64::try_from(write_offset).map_err(|_| BackendError::Invalid)?;
-                    let n = unsafe {
+                    // Each host write goes through the door alone (the
+                    // registry is a leaf, #2975 r36).
+                    let n = crate::host_size::write_admitted(borrowed, |fd| unsafe {
                         libc::pwrite(
-                            host_fd,
+                            fd.as_raw_fd(),
                             bytes[written..].as_ptr() as *const libc::c_void,
                             bytes.len() - written,
                             write_offset as libc::off_t,
                         )
-                    }
+                    })
                     .host_syscall_errno()
                     .map_err(|_| BackendError::Io)?;
                     if n == 0 {

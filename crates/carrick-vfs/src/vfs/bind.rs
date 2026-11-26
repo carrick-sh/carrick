@@ -599,9 +599,18 @@ impl Vfs for BindVfs {
             });
         }
 
-        if self.readonly && flags.write {
+        // A read-only mount changes nothing on the host (#2975 r36 P0 3):
+        // write access and `O_TRUNC` are `EROFS`, and `O_CREAT` creates
+        // nothing (below). Before, `O_RDONLY | O_TRUNC` reached the host and
+        // truncated the file behind `--volume host:guest:ro`, and `O_CREAT`
+        // created one.
+        if self.readonly && (flags.write || flags.trunc) {
             return Err(LINUX_EROFS);
         }
+        // On a read-only mount the host open never creates: an existing file
+        // opens as named (`O_EXCL` answers `EEXIST`), a missing one is
+        // `EROFS`.
+        let create = flags.create && !self.readonly;
 
         let mut host_flags = if flags.read && flags.write {
             libc::O_RDWR
@@ -616,11 +625,11 @@ impl Vfs for BindVfs {
         if flags.append {
             host_flags |= libc::O_APPEND;
         }
-        if flags.create {
+        if create {
             host_flags |= libc::O_CREAT;
-        }
-        if flags.excl {
-            host_flags |= libc::O_EXCL;
+            if flags.excl {
+                host_flags |= libc::O_EXCL;
+            }
         }
         if flags.trunc {
             host_flags |= libc::O_TRUNC;
@@ -632,14 +641,21 @@ impl Vfs for BindVfs {
             host_flags |= libc::O_CLOEXEC;
         }
 
-        let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
+        let existed_before_create = create && std::fs::symlink_metadata(&host).is_ok();
         // An O_TRUNC open goes through the host size door (#1338 A1), resolving
         // dangling symlinks to atomic `O_EXCL` leaf creation (`#2975` r33 P0 #1).
         let host_fd =
             crate::host_size::open_truncating_path(&host, host_flags, flags.mode as libc::c_uint)
-                .map_err(host_to_linux_errno)?
-                .into_raw_fd();
-        if flags.create && !existed_before_create {
+                .map_err(|errno| match errno {
+                libc::ENOENT if flags.create && self.readonly => LINUX_EROFS,
+                errno => host_to_linux_errno(errno),
+            })?;
+        if flags.create && flags.excl && self.readonly {
+            // The file exists (the open found it): `O_CREAT | O_EXCL` fails.
+            return Err(carrick_abi::LINUX_EEXIST);
+        }
+        let host_fd = host_fd.into_raw_fd();
+        if create && !existed_before_create {
             self.publish_namespace();
         }
         // The macOS open(2) applied the HOST process umask to the create mode,
@@ -648,12 +664,12 @@ impl Vfs for BindVfs {
         // — otherwise a 0-mode node (the dispatcher passes the guest's
         // umask-adjusted bits) would deny a later O_RDWR reopen (glibc sem_open's
         // SemLock._rebuild → EACCES under the multiprocessing forkserver).
-        if flags.create && flags.mode != 0 {
+        if create && flags.mode != 0 {
             unsafe {
                 libc::fchmod(host_fd, (flags.mode & 0o7777) as libc::mode_t);
             }
         }
-        if flags.create && !existed_before_create {
+        if create && !existed_before_create {
             let _ = write_owner_xattrs(
                 &self.coherence,
                 &host,

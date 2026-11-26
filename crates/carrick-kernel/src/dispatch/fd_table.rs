@@ -1051,7 +1051,6 @@ impl FileContents {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsFd as _;
                 use std::os::fd::AsRawFd;
-                let _write_guard = carrick_vfs::host_size::admit_write(fd.as_fd());
                 let raw_fd = fd.as_raw_fd();
                 let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -1062,14 +1061,16 @@ impl FileContents {
                 };
                 let mut written = 0usize;
                 while written < data.len() {
-                    let n = unsafe {
+                    // Each host write goes through the size door alone
+                    // (the registry is a leaf, #2975 r36).
+                    let n = carrick_vfs::host_size::write_admitted(fd.as_fd(), |_| unsafe {
                         libc::pwrite(
                             raw_fd,
                             data[written..].as_ptr().cast(),
                             data.len() - written,
                             start.saturating_add(written as libc::off_t),
                         )
-                    };
+                    });
                     if n < 0 {
                         let errno = std::io::Error::last_os_error()
                             .raw_os_error()

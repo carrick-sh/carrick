@@ -458,15 +458,17 @@ impl<'a> FsView<'a> {
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
-        let _write_guard = carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(&host_fd));
-        let n = unsafe {
-            libc::pwrite(
-                host_fd.raw(),
-                bytes.as_ptr() as *const _,
-                bytes.len(),
-                out_off as libc::off_t,
-            )
-        };
+        let n = carrick_vfs::host_size::write_admitted(
+            std::os::fd::AsFd::as_fd(&host_fd),
+            |fd| unsafe {
+                libc::pwrite(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    out_off as libc::off_t,
+                )
+            },
+        );
         let n = match n.host_syscall_errno() {
             Ok(value) => value as usize,
             Err(errno) => return DispatchOutcome::errno(errno),
@@ -925,8 +927,6 @@ impl<'a> FsView<'a> {
                         else {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         };
-                        let _write_guard =
-                            carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(host_fd));
                         host_fd.record_sequential_io();
                         return write_host_pipe(
                             bytes,
