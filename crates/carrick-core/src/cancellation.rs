@@ -16,8 +16,9 @@ pub enum ProcessCancellation {
 impl ProcessCancellation {
     /// A fatal signal or a group exit is irrevocable: the group ends, so it
     /// outranks any work a member retained for later (a deferred signal
-    /// frame, a rerun). Exec is a temporary drain cause that a failed exec
-    /// retracts, so work retained under it must survive.
+    /// frame, a rerun). Exec is a temporary drain cause: only settled exec
+    /// custody retracts it, and the committed successor continues the
+    /// process, so it is not terminal.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::FatalSignal | Self::GroupExit)
     }
