@@ -2569,6 +2569,97 @@ pub(crate) fn sync_to_host(description: &FileDescription) -> Result<(), carrick_
     result
 }
 
+/// Production-entry recall witness support for VFS implementations that live
+/// above the kernel crate. Only test builds can call this entry.
+#[cfg(feature = "test-support")]
+#[allow(clippy::unwrap_used)] // Assertions in this test-only production-entry witness.
+pub mod host_fd_recall_test_support {
+    use super::*;
+    use crate::compat::{CompatReporter, SyscallArgs};
+    use crate::dispatch::fd_table::{HostFdRef, OpenDescriptionBase};
+    use crate::dispatch::{DispatchOutcome, SyscallRequest, ThreadCtx};
+    use carrick_guest_mem::GuestMemory;
+    use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Caller owns the live test EL1 region and supplies the real mounted VFS.
+    pub fn mounted_truncate_after_delegated_write(
+        host_path: &Path,
+        mounted_vfs: Box<dyn carrick_vfs::Vfs>,
+        guest_path: &str,
+    ) -> Vec<u8> {
+        let path = std::ffi::CString::new(host_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and the file lives through recall.
+        let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        assert!(raw >= 0);
+        let size = std::fs::metadata(host_path).unwrap().len() as usize;
+        let description = OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            host_fd: HostFdRef::new(raw),
+            metadata: RootFsMetadata {
+                path: host_path.to_path_buf(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size,
+            },
+            writable: true,
+        };
+        let file = crate::dispatch::fd_table::kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(description)),
+            LINUX_O_RDWR,
+        );
+        file.common().retain_fd_ref();
+        let open = OpenFile::new(file, 0);
+        let fs = FsState::new_with_host_resolver(None);
+        enter_zone_at_open(
+            &open,
+            FileTableId::from_raw_u64(1).unwrap(),
+            3,
+            &fs,
+            Some(&RlimitSet::carrick_defaults()),
+            None,
+        )
+        .unwrap();
+
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        dispatcher.register_mount("/mount", mounted_vfs);
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        let mut mem = crate::dispatch::outcome::LinearMemory::new(0x1000, vec![0; 4096]);
+        mem.write_bytes_raw(0x1000, b"DIRTY!").unwrap();
+        let mut path_bytes = guest_path.as_bytes().to_vec();
+        path_bytes.push(0);
+        mem.write_bytes_raw(0x1100, &path_bytes).unwrap();
+        assert_eq!(
+            serve_on_host(&ctx, &open.description, 64, [0x1000, 6, 0], &mut mem),
+            Some(DispatchOutcome::Returned { value: 6 })
+        );
+        assert_eq!(std::fs::read(host_path).unwrap(), b"abcdef");
+
+        let tid = crate::thread::ThreadId::from_guest_supplied_tid(1);
+        let reg = crate::thread::ThreadRegistry::new(tid);
+        let futex = crate::thread::FutexTable::new();
+        let outcome = dispatcher
+            .dispatch_threaded(
+                &ctx,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::TRUNCATE.raw(),
+                    SyscallArgs::from([0x1100, 2, 0, 0, 0, 0]),
+                ),
+                &mut mem,
+                &CompatReporter::default(),
+                ThreadCtx::new(tid, &reg, &futex),
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        recall(&open.description).unwrap();
+        let bytes = std::fs::read(host_path).unwrap();
+        open.description.release_fd_ref();
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

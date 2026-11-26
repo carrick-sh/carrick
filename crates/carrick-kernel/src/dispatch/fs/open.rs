@@ -2455,7 +2455,7 @@ impl<'a> FsView<'a> {
                 // EISDIR in both cases (a directory is never "created" by
                 // open(), and its dentry rejects write access). O_RDONLY
                 // without O_CREAT still yields a readable directory fd.
-                if write_intent {
+                if write_intent || want_trunc {
                     return Err(LINUX_EISDIR);
                 }
                 OpenDescription::Directory {
