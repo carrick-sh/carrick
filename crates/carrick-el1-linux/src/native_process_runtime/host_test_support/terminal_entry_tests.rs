@@ -2517,6 +2517,268 @@ fn closing_before_fault_service_publication_withdraws_selection_for<
     );
 }
 
+fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) where
+    HostArmSignalMachine: crate::signal_delivery::SignalMachine<C, Backend = HostArmBackend>,
+{
+    struct ResetTestFaultSlot;
+    impl Drop for ResetTestFaultSlot {
+        fn drop(&mut self) {
+            set_test_fault_slot(None);
+        }
+    }
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert_eq!(fixture.page.live(), 2);
+
+    let slot = Box::leak(Box::new(carrick_el1_abi::PortalGrantSlot::new()));
+    let window = carrick_el1_abi::PortalGrantWindow::decode([
+        1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    let next_window = carrick_el1_abi::PortalGrantWindow::decode([
+        1, 77, 2, 4, 4, 0x6000, 0x7000, 3, 0x6000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    assert!(slot.publish_fault_selection(3, window));
+    assert!(
+        !slot.publish_fault_selection(4, next_window),
+        "occupied grant slot must reject a new selection until withdrawn or taken"
+    );
+    set_test_fault_slot(Some((slot, 77)));
+    let _reset_slot = ResetTestFaultSlot;
+
+    let mut sibling_service = fixture.service();
+    sibling_service.waker_slot = sibling.slot;
+    sibling_service.child_copy_error = Some(NativeProcessError::NeedsSupply);
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &(fixture.make_words)(fixture.address),
+            &mut sibling_service,
+        )
+        .unwrap();
+    let (fault, sequence) = member.service.copyout_fault(UserVa::new(0x4000)).unwrap();
+
+    let member_key = member.key;
+    let action = carrick_signal_core::policy::Action {
+        disposition: carrick_signal_core::policy::Disposition::Handler(
+            carrick_signal_core::policy::HandlerAddress(0x2000),
+        ),
+        flags: carrick_signal_core::policy::ActionFlags {
+            on_stack: true,
+            siginfo: true,
+            ..Default::default()
+        },
+        ..carrick_signal_core::policy::Action::default()
+    };
+    // The sibling's SIGURG frame lands on an untouched page: the delivery is
+    // retained and the sibling parks on the frame's fault supply.
+    let outcome = member.retain_and_defer_signal_delivery(
+        carrick_signal_core::policy::Signal::from_number(23).unwrap(),
+        &mut None,
+        action,
+        carrick_signal_core::policy::SigBlockMask::NONE,
+        carrick_signal_core::policy::SigBlockMask::NONE,
+        super::super::SignalCopyDeferral::Supply { fault, sequence },
+    );
+    assert!(
+        outcome.is_ok(),
+        "the frame supply must park the sibling: {outcome:?}"
+    );
+    assert!(member.take_run_failure().is_none());
+    drop(member);
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&sibling.record),
+        "the sibling waits on its frame supply"
+    );
+
+    // While the supply is outstanding, the root's production
+    // `kill(41, SIGKILL)` publishes FatalSignal cancellation and queues
+    // SIGKILL. Nobody has dequeued SIGKILL yet, so no exit is pending: the
+    // supply completion sees cancellation with `has_exit == false`.
+    {
+        use carrick_personality_linux::signal::{
+            ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+        };
+        let mut root_service = fixture.service();
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut root_service,
+            )
+            .unwrap();
+        root.kill(
+            SignalProcessSelector::from_abi(41),
+            SignalRequest::Deliver(carrick_signal_core::policy::Signal::KILL),
+            SignalInfo::Generated(None),
+        )
+        .unwrap();
+        assert!(root.take_run_failure().is_none());
+    }
+    {
+        use carrick_el1_abi::Lifecycle;
+        assert_eq!(
+            fixture.page.process_exit_custody().cancellation(),
+            Some(carrick_core::terminal::ProcessCancellation::FatalSignal)
+        );
+    }
+    assert!(!fixture.runtime.graph.lock().pending.has_exit(&member_key));
+
+    // The host supplies the frame page and completes the sibling's service.
+    {
+        let notice = sibling.task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(sibling.record)
+                    .unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap();
+        // SAFETY: claims this exact sibling's published fault notice under
+        // the production intake queue.
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &sibling.control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(sibling.record.id).identity(),
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            ticket.request().operation,
+            carrick_core_abi::service::ServiceOperation::Fault(_)
+        ));
+        drop(queue);
+        assert!(
+            ticket.complete(true).is_ok(),
+            "the carrier settles the frame supply"
+        );
+    }
+
+    // The sibling's production resume consumes the completed supply. The
+    // cancellation discards the reply and withdraws the selection.
+    let resume_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .expect("the completed supply wakes its exact member");
+    assert_eq!(
+        fixture.zone.switch_in_full(resume_slot).unwrap().record,
+        sibling.record.id
+    );
+    // SAFETY: switch_in_full selected this exact record just above.
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut resume_service = fixture.service();
+    resume_service.waker_slot = resume_slot;
+    resume_service.child_copy_error = Some(NativeProcessError::NeedsSupply);
+    let mut resumed = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: resume_slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut resume_service,
+        )
+        .unwrap();
+    let resume = resumed.resume_checkpoint(|_| Ok(None));
+    assert!(
+        resume.is_ok(),
+        "the cancelled supply leaves through the owner checkpoint: {:?}",
+        resume.as_ref().err()
+    );
+    assert!(resumed.take_run_failure().is_none());
+    assert!(
+        slot.publish_fault_selection(4, next_window),
+        "cancelled supply must withdraw the unpublished selection"
+    );
+    assert!(!fixture.runtime.graph.lock().pending.has_exit(&member_key));
+
+    // The sibling's next production signal checkpoint. SIGKILL must win: the
+    // retained SIGURG delivery is void, the fresh selection dequeues SIGKILL
+    // and the group's exit is pending. Replaying the retained delivery
+    // instead skips SIGKILL and re-enters the same frame supply, which the
+    // cancellation discards again on every round.
+    assert!(resumed.signal_checkpoint_needed());
+    // The carrier drains the work SIGKILL's publication and the supply
+    // completion owed it, then re-enters the member's checkpoint.
+    if let Some(doorbell) = sibling.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = HostArmSignalMachine {
+        backend: HostArmBackend,
+    };
+    let route = crate::signal_delivery::deliver_signal_on_syscall_return(
+        sibling.task,
+        sibling.control,
+        &mut resumed,
+        &mut frame,
+        zerocopy::IntoBytes::as_bytes(&fp),
+        &mut machine,
+    );
+    assert_ne!(
+        frame.elr, 0x2000,
+        "the retained SIGURG handler must never run once SIGKILL is published: {route:?}"
+    );
+    assert!(
+        fixture.runtime.graph.lock().pending.has_exit(&member_key),
+        "the checkpoint after a fatal cancellation must select SIGKILL and \
+         publish the group's exit, not replay the retained delivery and \
+         re-request its frame supply: {route:?}"
+    );
+}
+
+#[test]
+fn arm_fatal_cancellation_during_signal_frame_supply_clears_retained_delivery() {
+    fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_fatal_cancellation_during_signal_frame_supply_clears_retained_delivery() {
+    fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
 #[test]
 fn arm_closing_before_fault_service_publication_withdraws_selection() {
     closing_before_fault_service_publication_withdraws_selection_for::<
