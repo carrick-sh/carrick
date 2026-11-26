@@ -1462,12 +1462,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 task: self.task,
                 validator: &carrick_el1_linux::file::HardwareValidator,
             });
-        if carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes)
-            .is_done()
-        {
-            Ok(())
-        } else {
-            Err(NativeProcessError::Fault)
+        match carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes) {
+            carrick_core::user_copy::CopyOutcome::Done => Ok(()),
+            carrick_core::user_copy::CopyOutcome::Fault => {
+                panic!("DXF {:#x} {}", address.raw(), bytes.len())
+            }
+            carrick_core::user_copy::CopyOutcome::NotYet(r) => {
+                panic!("DXN {:#x} {} {:?}", address.raw(), bytes.len(), r.access)
+            }
         }
     }
     /// A continued socket send's next bytes (#2414) from the caller's own
