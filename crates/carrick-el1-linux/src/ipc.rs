@@ -3540,10 +3540,20 @@ mod tests {
             let mut ctx = ThreadCtx::ZERO;
             ctx.x = frame.x;
             ctx.pc = svc;
+            // About to issue its SVC: the PC is its resume point (#2900).
+            let saved = carrick_el1_abi::Aarch64ParkedContext::trapped(
+                ctx,
+                carrick_guest_arch::SavedSyscallPc::AtSyscall,
+            );
             // SAFETY: freshly allocated and unpublished.
             unsafe {
                 *self.zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, mm, 1)
+                    carrick_el1_abi::Aarch64ParkedContext::admitted(
+                        carrick_sched_core::Aarch64EntryContext::saved(&saved),
+                        0,
+                        mm,
+                        1,
+                    )
             };
             let seq = self.zone.next_seq(record);
             self.zone
@@ -3585,10 +3595,14 @@ mod tests {
         frame.x[8] = nr as u64;
         frame
     }
-    /// A switched-in thread re-executes its SVC: the trap's ELR is past it.
+    /// A switched-in thread re-executes its SVC: the SVC hook's trap names
+    /// the next PC and says it is after its SVC (#2900).
     fn reenter(frame: &mut TrapFrame, svc: u64) {
         assert_eq!(frame.elr, svc, "resumes at its SVC");
         frame.elr = svc + 4;
+        frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(
+            carrick_guest_arch::SavedSyscallPc::AfterSyscall,
+        );
     }
     const NONBLOCK: StatusFlags = StatusFlags {
         append: false,
