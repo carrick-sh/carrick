@@ -2221,14 +2221,14 @@ impl MultiSlotEnv {
         cpu: &mut crate::sched::FakeCpu,
     ) -> carrick_personality_linux::dispatch::CompletionRoute {
         let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-        let saved_native = match self.fixture.zone.slot(slot).current() {
-            // SAFETY: `slot` exclusively owns `current` while OnCpu.
-            Some(current) => unsafe { self.fixture.zone.record(current).ctx_mut().native },
-            None => ThreadCtx::ZERO,
-        };
         let ttbr0 = cpu.ttbr.0;
         frame.slot = u64::from(slot.raw());
         frame.esr = 0x15 << 26;
+        // The vector admits the trapped thread's own registers, as the
+        // production entry does: a call that parks reruns from them.
+        let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+        crate::sched::ThreadCpu::save(cpu, frame, &mut saved);
+        let saved_native = saved.native;
         let mut service = self.service(slot);
         super::super::dispatch::dispatch_arm_syscall_with_native_process(
             frame,
@@ -2333,7 +2333,9 @@ impl MultiSlotEnv {
         let mut service = self.service(slot);
         let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
         let mut machine = FirstEntryArmMachine {
-            backend: crate::arm_signal::LinuxAarch64Backend,
+            backend: crate::arm_signal::LinuxAarch64Backend::on_stack(
+                carrick_guest_arch::UserVa::new(user_sp),
+            ),
             user_sp: carrick_guest_arch::UserVa::new(user_sp),
         };
         with_process_entry(
@@ -2411,7 +2413,12 @@ impl MultiSlotEnv {
         let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
         let ptid = carrick_test_support::GuestUserBuffer::from_value(0u32);
         let ctid = carrick_test_support::GuestUserBuffer::from_value(0xffffu32);
-        let mut clone = carrick_el1_abi::TrapFrame::default();
+        // A real `SVC` trap returns after its instruction, so a parked clone
+        // reruns by rewinding onto the `SVC` (#2900).
+        let mut clone = carrick_el1_abi::TrapFrame {
+            elr: 0x40_0204,
+            ..Default::default()
+        };
         clone.x[8] = 220; // SYS_clone
         clone.x[..5].copy_from_slice(&[
             TGKILL_AFTER_CLONE_FLAGS,

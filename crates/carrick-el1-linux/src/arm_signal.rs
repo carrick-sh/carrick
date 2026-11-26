@@ -9,8 +9,8 @@ use carrick_personality_linux::signal::arm::RtSigframe;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ArmSignalMachine<'l> {
+    /// The codec, carrying the user stack pointer the frame resumes on.
     backend: LinuxAarch64Backend,
-    user_sp: carrick_guest_arch::UserVa,
     /// The running thread's registers, for a frame that returns to EL0
     /// directly; `None` for a frame rebuilt from a parked context, whose
     /// stack goes back into that context instead.
@@ -111,7 +111,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     }
 
     fn user_sp(&self, _frame: &TrapFrame) -> carrick_guest_arch::UserVa {
-        self.user_sp
+        self.backend.user_sp
     }
 
     fn restart(
@@ -128,7 +128,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     }
 
     fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
-        self.user_sp = sp;
+        self.backend.user_sp = sp;
         if let Some(live) = self.live.as_mut() {
             live.publish_user_sp(sp);
         }
@@ -142,7 +142,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         ctx.native.x = frame.x;
         ctx.replace_saved_pc_word(frame.elr, frame.syscall_position);
         ctx.native.pstate = frame.spsr;
-        ctx.native.sp_el0 = self.user_sp.raw();
+        ctx.native.sp_el0 = self.backend.user_sp.raw();
     }
 
     fn group_exit_custody(
@@ -271,8 +271,7 @@ pub(crate) fn deliver_on_user_return_live<'a, X: super::aarch64_process::ForkSto
         frame,
         fp.as_bytes(),
         &mut ArmSignalMachine {
-            backend: LinuxAarch64Backend,
-            user_sp: sp,
+            backend: LinuxAarch64Backend::on_stack(sp),
             live: Some(&mut live),
         },
     )
@@ -320,8 +319,9 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
     let mut machine = ArmSignalMachine {
-        backend: LinuxAarch64Backend,
-        user_sp: carrick_guest_arch::UserVa::new(saved.native.sp_el0),
+        backend: LinuxAarch64Backend::on_stack(carrick_guest_arch::UserVa::new(
+            saved.native.sp_el0,
+        )),
         live: None,
     };
     let control = process.resume_signal_control();
@@ -469,46 +469,13 @@ pub(crate) fn apply_restored_context(
     context.fpcr = u64::from(fp.fpcr);
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static TEST_SIGNAL_STACK: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
-}
-
+/// `rt_sigreturn` on the running thread, for every ARM scheduler CPU: the
+/// vector's hardware CPU and the VM-free witnesses' CPU take this one path.
+/// The CPU supplies the interrupted stack pointer and FP/SIMD state, and
+/// receives the restored context only after the whole frame validated.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn current_signal_stack() -> carrick_guest_arch::UserVa {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        carrick_el1::isa::aarch64::signal_stack()
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        carrick_guest_arch::UserVa::new(TEST_SIGNAL_STACK.with(core::cell::Cell::get))
-    }
-}
-
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn publish_signal_stack(sp: carrick_guest_arch::UserVa) {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        carrick_el1::isa::aarch64::set_signal_stack(sp);
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    TEST_SIGNAL_STACK.with(|slot| slot.set(sp.raw()));
-}
-
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-pub(crate) fn restore_live_arm_signal_frame(
-    frame: &mut TrapFrame,
-    copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
-{
-    restore_live_arm_signal_frame_with_cpu(&mut crate::sched::HardwareCpu, frame, copy_in)
-}
-
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-#[inline(always)]
-pub(crate) fn restore_live_arm_signal_frame_with_cpu<C: crate::sched::ThreadCpu>(
+pub(crate) fn restore_live_arm_signal_frame<C: crate::sched::ThreadCpu>(
     cpu: &mut C,
     frame: &mut TrapFrame,
     copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
@@ -521,21 +488,20 @@ pub(crate) fn restore_live_arm_signal_frame_with_cpu<C: crate::sched::ThreadCpu>
     // Retain the context off the 16 KiB EL1 stack until validation commits.
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     cpu.save(frame, &mut saved);
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    publish_signal_stack(carrick_guest_arch::UserVa::new(saved.native.sp_el0));
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
-    let mask = LinuxAarch64Backend
+    let mut backend =
+        LinuxAarch64Backend::on_stack(carrick_guest_arch::UserVa::new(saved.native.sp_el0));
+    let mask = backend
         .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
             copy_in.copy_in(dst, src).is_done()
         })
         .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
-    // restore_signal_frame validates and then publishes SP_EL0. Re-read it
-    // only after success; a failed copy leaves the saved hardware untouched.
-    let restored_sp = current_signal_stack().raw();
-    apply_restored_context(&mut saved.native, frame, &fp, restored_sp);
+    // Only a validated frame reaches the CPU: a failed copy or decode
+    // returned above and left the saved hardware untouched.
+    apply_restored_context(&mut saved.native, frame, &fp, backend.user_sp.raw());
     saved.replace_saved_pc_word(saved.native.pc, frame.syscall_position);
     cpu.load(frame, &saved);
     Ok(mask)
@@ -589,8 +555,23 @@ pub(crate) fn build(
 use carrick_guest_arch::UserVa;
 
 /// The Linux signal-frame codec over the neutral ARM backend's types.
+///
+/// An ARM `TrapFrame` has no `SP_EL0`, so the codec carries the user stack
+/// pointer the frame resumes on: it reads the signal frame there on
+/// `rt_sigreturn` and holds the restored or handler stack afterwards. Its
+/// owner, never the codec, publishes that stack to a CPU or a context.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub struct LinuxAarch64Backend;
+pub struct LinuxAarch64Backend {
+    user_sp: UserVa,
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+impl LinuxAarch64Backend {
+    /// A codec for a frame that resumes on `user_sp`.
+    pub(crate) const fn on_stack(user_sp: UserVa) -> Self {
+        Self { user_sp }
+    }
+}
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_guest_arch::ArchTypes for LinuxAarch64Backend {
@@ -641,7 +622,11 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         _fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
     ) -> Result<carrick_personality_linux::signal::SignalFrameSetup, Self::Error> {
-        setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
+        let setup = setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)?;
+        if let carrick_personality_linux::signal::SignalFrameSetup::Installed(sp) = setup {
+            self.user_sp = sp;
+        }
+        Ok(setup)
     }
 
     fn restore_signal_frame(
@@ -651,7 +636,7 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
         use zerocopy::FromBytes;
-        let sp = current_signal_stack();
+        let sp = self.user_sp;
         // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
         // EL1 stack and borrow it throughout decode.
         let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
@@ -663,8 +648,7 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         };
 
         let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
-
-        publish_signal_stack(UserVa::new(saved_sp));
+        self.user_sp = UserVa::new(saved_sp);
 
         Ok(carrick_personality_linux::signal::RestoredSignalFrame {
             mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -740,9 +724,8 @@ pub(crate) fn setup_arm_signal_frame(
         UserVa::raw,
     );
 
-    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-    publish_signal_stack(UserVa::new(new_sp));
-
+    // The caller publishes the handler stack: the live CPU's `SP_EL0`, or a
+    // parked context's saved stack. The codec writes no register itself.
     Ok(carrick_personality_linux::signal::SignalFrameSetup::Installed(UserVa::new(new_sp)))
 }
 
