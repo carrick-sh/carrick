@@ -277,7 +277,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended => {
                                 suspended = true
                             }
-                            refused => fatal_boot!(refused.name()),
+                            refused => fatal_boot!(refused),
                         }
                     }
                     words = context::context_words::from_native(
