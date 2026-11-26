@@ -70,6 +70,33 @@ fn after_svc(native: ThreadCtx) -> Aarch64ParkedContext {
     Aarch64ParkedContext::trapped(native, SavedSyscallPc::AfterSyscall)
 }
 
+/// The frame the EL1 SVC hook builds for an `SVC` at `svc`: ELR names the
+/// next instruction and the position says so (#2900). A real `SVC` is never
+/// at address zero, so a rerun's rewind always names an instruction.
+#[cfg(test)]
+fn svc_frame(svc: u64) -> carrick_el1_abi::TrapFrame {
+    carrick_el1_abi::TrapFrame {
+        elr: svc + carrick_guest_arch::AARCH64_SVC_LEN,
+        syscall_position: carrick_guest_arch::SavedSyscallPcWord::new(SavedSyscallPc::AfterSyscall),
+        ..Default::default()
+    }
+}
+
+/// The guest executes the `SVC` a rerun left its frame on: the hook traps
+/// it again, after the instruction.
+#[cfg(test)]
+fn reexecute_svc(frame: &mut carrick_el1_abi::TrapFrame) {
+    assert_eq!(
+        frame.syscall_position.get(),
+        Some(SavedSyscallPc::AtSyscall),
+        "only a call rewound onto its SVC executes it again"
+    );
+    *frame = carrick_el1_abi::TrapFrame {
+        x: frame.x,
+        ..svc_frame(frame.elr)
+    };
+}
+
 #[cfg(test)]
 mod exit_group_hang_tests;
 
@@ -5718,12 +5745,15 @@ fn arm_sigprocmask_nonresident_input_is_not_efault() {
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
-    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut frame = svc_frame(0x40_0000);
     let mask = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
     let old_mask = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
     // The physical user-copy boundary refuses the first read, as it does
     // for an absent stage-1 leaf. Both addresses remain valid user buffers.
     for attempt in 0..2 {
+        if attempt == 1 {
+            reexecute_svc(&mut frame);
+        }
         crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(attempt == 0, Ordering::Relaxed));
         let (nr, args) = (135, [0, mask.arg(), old_mask.arg(), 8, 0, 0]);
         let pc = frame.elr;
@@ -8132,7 +8162,7 @@ fn arm_raw_exit_refused_copy_after_membership_reservation_restores_live() {
     let live = fixture.page.live();
     let entry = control.entry().unwrap();
     let state = fixture.page.state(entry.index());
-    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut frame = svc_frame(0x40_0000);
     frame.x[8] = 93;
     super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     let route = arm_call(fixture, control, &mut service, &mut frame);
@@ -8194,7 +8224,7 @@ fn arm_raw_exit_refused_clear_tid_copy_reruns_in_ring() {
     let live = fixture.page.live();
     let entry = control.entry().unwrap();
     let state = fixture.page.state(entry.index());
-    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut frame = svc_frame(0x40_0000);
     frame.x[8] = 93;
     super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     let route = arm_call(fixture, control, &mut service, &mut frame);
@@ -8210,8 +8240,10 @@ fn arm_raw_exit_refused_clear_tid_copy_reruns_in_ring() {
     assert_eq!(fixture.page.live(), live);
     assert_eq!(fixture.page.state(entry.index()), state);
     assert_eq!(frame.x[8], 93, "the rerun is the same exit");
+    assert_eq!(frame.elr, 0x40_0000, "the exit reruns from its SVC");
 
     // The rerun finds the word writable and retires the thread in ring.
+    reexecute_svc(&mut frame);
     let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
     assert_ne!(
         route,
@@ -17782,7 +17814,7 @@ fn signal_setup_nonresident_input(nr: u64) {
         132 => [input.arg(), old.arg(), 0, 0, 0, 0],
         _ => [input.arg(), 8, 0, 0, 0, 0],
     };
-    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut frame = svc_frame(0x40_0000);
     frame.x[8] = nr;
     frame.x[..6].copy_from_slice(&args);
     let pc = frame.elr;
@@ -17797,6 +17829,7 @@ fn signal_setup_nonresident_input(nr: u64) {
     assert_eq!(&frame.x[..6], &args);
     assert_eq!(fixture.control.blocked().0, 0);
     assert_eq!(old.get::<[u8; 32]>(0), [0x55; 32]);
+    reexecute_svc(&mut frame);
     frame.x[..6].copy_from_slice(&args);
     let second = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
     if nr == 133 {
