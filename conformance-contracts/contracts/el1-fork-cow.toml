@@ -1,3 +1,10 @@
+# #3040: a kernel copy's COW selection is leased (PortalGrantSlot::
+# lease_cow_selection / supply_cow_selection) on ARM and x86: the carrier's
+# exact take or the lane's exact withdrawal ends it, so a refused or unserved
+# supply no longer leaves it published for the CPU's next native service
+# (before, ARM left it and that service was a carrier fatal). An unserved
+# supply or an occupied slot is "not now" (Busy); a crossing's own refusal is
+# kept. Semantics and budgets unchanged: one crossing per supply.
 # #2668/#2701: the shared owner selection takes its COW arm on whichever
 # translation reports the write refusal, including the one after it commits
 # an inherited prepared leaf; x86 resolves an executable armed leaf in ring.
@@ -94,6 +101,10 @@ vm_free = [
   "carrick-x86-cpl0-host::cpl0_boot::anonymous_owner::custody_tests::fork_residency_demand_counts_both_sides_and_admits_at_half_load (#2655: two rows per inherited page outside a grant window plus one per covering window; another MM's rows are not coverage; admission is exactly at half the table)",
   "carrick-core::mm::frames::fork_residency_growth_tests::{each_refused_fork_doubles_the_segments,partial_growth_reruns_and_no_growth_reports_the_refusal} (#2655: segments go 1, 2, 4, 8; a partial doubling reruns the fork, an empty one reports the allocator's refusal and succeeds once metadata is back)",
   "carrick-el1-abi::fork_stock::tests::residency_refusal_round_trips_as_its_own_reply (#2655: wire code 5 is distinct from the capacity EAGAIN reply)",
+  "carrick-core-abi::mm::grant_slot::layout_manifest::cow_take_leaves_a_selection_stamped_for_another_request (#3040: a withdrawal takes only the selection stamped for its own request; red on main, which took by window alone)",
+  "carrick-core-abi::mm::grant_slot::layout_manifest::cow_selection_lease_is_withdrawn_unless_the_carrier_takes_it (#3040: each end of a lease, dropped, unwound, settled unserved, taken, replaced, reserved elsewhere, is exactly one take or withdrawal, and a same-page successor of another generation is never consumed)",
+  "carrick-core-abi::service::tests::refused_cow_supply_leaves_the_lane_slot_for_the_next_request (#3040: after every supply outcome another MM's unselected fault on that CPU is served; a leaked selection makes it Stale)",
+  "carrick-el1-linux::aarch64_process::refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot (#3040: both ISAs read a supply through NativeProcessError::from_cow_supply; an occupied slot is Busy once, then the rerun is supplied)",
 ]
 embed = [
   "carrick-embed::el1_sched::{el1_fork_cow_resolves_in_guest,el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes} (prepared-fork: inherited untouched page reads zero, PROT_NONE data survives, child writes remain private while parent stays live, parent write remains private while child stays live; new binding awaits signed acceptance)",
