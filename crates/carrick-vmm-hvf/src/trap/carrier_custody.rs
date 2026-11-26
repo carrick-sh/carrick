@@ -4993,6 +4993,91 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn failed_creating_vm_rebuilds_both_pools_for_successor() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = CarrierVmCustody::new();
+        let g1 = custody.begin_create().expect("begin G1");
+        let frames1 = custody.frame_pool().expect("G1 frame pool");
+        let roots1 = custody.root_slot_pool().expect("G1 root pool");
+        assert_eq!(frames1.vm_generation(), Some(g1));
+        assert_eq!(roots1.vm_generation(), Some(g1));
+        super::super::stage2_backend::script_next_stage2_destroy(
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        );
+        let result = super::destroy_vm_with_custody_target(
+            &custody,
+            "failed G1 creation",
+            super::CarrierVmDestroyTarget::Creating(g1),
+        );
+        super::super::stage2_backend::script_next_stage2_destroy_clear();
+        result.expect("production failed-creation cleanup");
+        let g2 = custody.begin_create().expect("begin G2");
+        let frames2 = custody.frame_pool().expect("G2 frame pool");
+        let roots2 = custody.root_slot_pool().expect("G2 root pool");
+        let observed = (
+            frames2.vm_generation(),
+            roots2.vm_generation(),
+            std::sync::Arc::ptr_eq(&frames1, &frames2),
+            std::sync::Arc::ptr_eq(&roots1, &roots2),
+        );
+        custody.commit_create(g2).expect("commit G2");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G2 cleanup",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G2");
+        drop((frames1, roots1, frames2, roots2));
+        assert_eq!(
+            observed,
+            (Some(g2), Some(g2), false, false),
+            "G2 must own freshly mapped pools"
+        );
+    }
+
+    #[test]
+    fn stale_failed_creation_cleanup_cannot_drain_or_reset_gone_generation() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = CarrierVmCustody::new();
+        let g1 = custody.begin_create().expect("begin G1");
+        let frames = custody.frame_pool().expect("G1 frame pool");
+        let roots = custody.root_slot_pool().expect("G1 root pool");
+        custody.destroy_stage2_for_test(g1);
+        let before_keepers = custody.carrier_lease_keepers.lock().drained_through;
+        let before_ipc = custody.retained_ipc_backings.lock().drained_through;
+        let wrong = CarrierVmGeneration(g1.0 + 1);
+        let result = custody.abort_created_vm_after_raw_destroy(wrong);
+        let observed_keepers = custody.carrier_lease_keepers.lock().drained_through;
+        let observed_ipc = custody.retained_ipc_backings.lock().drained_through;
+        let observed_frames = matches!(&*custody.frame_pool.lock(), super::CarrierFramePoolState::Active(pool) if std::sync::Arc::ptr_eq(pool, &frames));
+        let observed_roots = matches!(&*custody.root_slot_pool.lock(), super::CarrierRootSlotPoolState::Active(pool) if std::sync::Arc::ptr_eq(pool, &roots));
+        custody
+            .abort_created_vm_after_raw_destroy(g1)
+            .expect("cleanup exact G1");
+        // Keep pre-fix fixture teardown from dropping mapped leases after
+        // raw destroy; the assertions below still observe the stale call.
+        frames.forget_backend_mapping();
+        roots.forget_backend_mapping();
+        drop((frames, roots));
+        assert!(result.is_err(), "wrong generation must be refused");
+        assert_eq!(
+            observed_keepers, before_keepers,
+            "stale cleanup must not advance keeper drain"
+        );
+        assert_eq!(
+            observed_ipc, before_ipc,
+            "stale cleanup must not advance IPC drain"
+        );
+        assert!(
+            observed_frames && observed_roots,
+            "stale cleanup must not change pools"
+        );
+    }
+
+    #[test]
     fn frame_pool_and_commit_destroy_concurrent_lock_order() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use std::sync::Arc;
