@@ -5899,7 +5899,7 @@ mod tests {
         for fd in 3..43 {
             set_host_socket(&w, epoll, fd, SELECT_INTERESTS[0], EPOLL_IN);
         }
-        let mut ready = readiness_set::harvest_ready(&w.region, epoll, &HostWait).unwrap();
+        let mut ready = readiness_set::harvest_ready(w.region, epoll, &HostWait).unwrap();
         ready.sort_by_key(|entry| entry.fd);
         assert_eq!(ready.len(), 40, "every ready carrier socket answers");
         for (entry, fd) in ready.iter().zip(3..43) {
@@ -5968,7 +5968,7 @@ mod tests {
         set_host_socket(&w, epoll, 3, SELECT_INTERESTS[0], EPOLL_IN);
         // Selected for writing, but not writable: never in the answer.
         set_host_socket(&w, epoll, 4, SELECT_INTERESTS[1], EPOLL_IN);
-        let answer = readiness_set::harvest_ready(&w.region, epoll, &HostWait).unwrap();
+        let answer = readiness_set::harvest_ready(w.region, epoll, &HostWait).unwrap();
         assert_eq!(
             answer,
             [SelectReady {
@@ -5976,8 +5976,8 @@ mod tests {
                 ready: SELECT_INTERESTS[0]
             }]
         );
-        readiness_set::record_answer(&w.region, epoll, &answer, &HostWait).unwrap();
-        let replayed = readiness_set::recorded_answer(&w.region, epoll, &HostWait).unwrap();
+        readiness_set::record_answer(w.region, epoll, &answer, &HostWait).unwrap();
+        let replayed = readiness_set::recorded_answer(w.region, epoll, &HostWait).unwrap();
         assert_eq!(
             replayed, answer,
             "the replay keeps the carrier socket's bits"
