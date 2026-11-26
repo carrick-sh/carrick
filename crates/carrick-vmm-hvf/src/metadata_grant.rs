@@ -2055,7 +2055,8 @@ fn service_native_cow_supply(
     address: u64,
     claimed_cpu: u64,
 ) -> Result<[u64; 4], TrapError> {
-    let denied = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    use carrick_el1_abi::CowSupplyAnswer;
+    let denied = [CowSupplyAnswer::Refused.status(), 0, 0, 0];
     let Some(region) = region else {
         return Ok(denied);
     };
@@ -2090,7 +2091,7 @@ fn service_native_cow_supply(
     let deny = |reason: &'static str| {
         tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), mm, address,
             sequence = window.operation.sequence.get(), reason,
-            "native COW supply denied; the lane withdraws its selection");
+            "native COW supply refused; the lane withdraws its selection");
         Ok(denied)
     };
     if slots.carrier() != Some(window.operation.carrier)
@@ -2102,28 +2103,100 @@ fn service_native_cow_supply(
     let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
         return deny("no COW grant pool");
     };
-    let Ok(Some(state)) = custody.guest_cow_state(mm) else {
-        return deny("no guest COW state");
+    let not_now = [CowSupplyAnswer::NotNow.status(), 0, 0, 0];
+    let supplied = [CowSupplyAnswer::Supplied.status(), 0, 0, 0];
+    let state = match custody.guest_cow_state(mm) {
+        Ok(Some(state)) => state,
+        // A native fork child or exec successor has no host MM state: its
+        // COW stock is the fork stock's, served by the same owner the native
+        // fault service uses (#3042), under the MM's exact editor.
+        Ok(None) => {
+            let Some((_, zone)) = stopped_records(region, cpu) else {
+                return deny("no stopped records");
+            };
+            let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
+                return deny("no wait-channel wake");
+            };
+            let Some(handle) = custody
+                .fork_stock
+                .lock()
+                .owner
+                .child_owner(window.operation.mm)
+                .filter(|owner| {
+                    owner.carrier() == window.operation.carrier
+                        && owner.incarnation() == window.operation.incarnation
+                })
+            else {
+                return deny("not a live native fork child");
+            };
+            let deliver =
+                |zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+                 _: carrick_sched_core::Waker,
+                 effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                    '_,
+                    carrick_el1_abi::Aarch64ParkedContext,
+                >| wake.complete_mm_wake(zone, effects);
+            let access = carrick_sched_core::spaces::notification::SpaceAccess::notified(
+                carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                    zone,
+                    waker: carrick_sched_core::Waker::Host,
+                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                        &deliver,
+                    ),
+                },
+            );
+            let Some(index) = zone.spaces.find(mm) else {
+                return deny("MM has no space");
+            };
+            let exclusion = match access.try_exclude_editor(index, mm) {
+                Ok(exclusion) => exclusion,
+                // Another CPU holds this MM's editor: not now. Nothing is
+                // supplied; the lane withdraws its selection and reruns.
+                Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                    return Ok(not_now);
+                }
+                Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Stale) => {
+                    return deny("MM editor retired");
+                }
+            };
+            let served =
+                native_service::supply_child_cow(custody, handle, window, exclusion.proof())?;
+            drop(exclusion);
+            return match served {
+                None => deny("not a live native fork child"),
+                Some(false) => Ok(not_now),
+                Some(true) if slot.take_cow_fault_selection(window) => Ok(supplied),
+                Some(true) => deny("selection take lost"),
+            };
+        }
+        Err(_) => return deny("guest COW state unavailable"),
     };
     // A first write into an armed block is served only by a grant carrying
     // its split tables (#2276); an unarmed fault takes any ready grant.
-    let split_tables = crate::trap::guest_cow_fault_split(&state, address);
-    let usable = || {
-        pool.ready(mm)
-            .any(|grant| split_tables.is_none_or(|split| grant.serves(split)))
+    let Some(split_tables) = crate::trap::guest_cow_fault_split(&state, address) else {
+        // A sibling resolved, remapped or unmapped the page after this lane
+        // selected it and released the editor. The selection is consumed
+        // with nothing supplied; the lane's rerun reads the page as it now
+        // stands.
+        return if slot.take_cow_fault_selection(window) {
+            Ok(supplied)
+        } else {
+            deny("selection take lost")
+        };
     };
-    let supplied = usable()
+    let usable = || pool.ready(mm).any(|grant| grant.serves(split_tables));
+    let ready = usable()
         || crate::trap::refill_guest_cow_pool(&state, custody, pool, address, |candidate| {
             candidate == mm && slots.carrier() == Some(window.operation.carrier)
         })?
         || usable();
-    if !supplied {
+    if !ready {
         return deny("no usable grant after refill");
     }
     if !slot.take_cow_fault_selection(window) {
         return deny("selection take lost");
     }
-    Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
+    Ok(supplied)
 }
 
 /// Serve the root fork seed crossing (#1392): write the host-served root's

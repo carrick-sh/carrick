@@ -357,7 +357,7 @@ pub fn cross_hvc_exec_cancel(record_gpa: u64, cpu: u64) -> Result<(), ()> {
 /// portal record. The host authenticates that record against the live root.
 // `Err(())` is the carrier's single refusal; callers own its meaning.
 #[allow(clippy::result_unit_err)]
-pub fn cross_hvc_cow_supply(address: u64, cpu: u64) -> Result<(), ()> {
+pub fn cross_hvc_cow_supply(address: u64, cpu: u64) -> carrick_el1_abi::CowSupplyAnswer {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status = carrick_el1_abi::GRANT_OP_COW_SUPPLY;
@@ -368,14 +368,12 @@ pub fn cross_hvc_cow_supply(address: u64, cpu: u64) -> Result<(), ()> {
                 inlateout("x1") address => _, inlateout("x2") cpu => _,
                 inlateout("x3") 0u64 => _, options(nostack));
         }
-        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
-            .then_some(())
-            .ok_or(())
+        carrick_el1_abi::CowSupplyAnswer::from_status(status)
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
         let _ = (address, cpu);
-        Err(())
+        carrick_el1_abi::CowSupplyAnswer::Refused
     }
 }
 

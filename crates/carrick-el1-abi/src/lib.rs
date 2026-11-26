@@ -664,6 +664,40 @@ pub const GRANT_OP_ROOT_EXIT: u64 = 4;
 pub const GRANT_OP_CHILD_RETIRE: u64 = 5;
 /// Physical COW supply selected by an exact-MM native user write.
 pub const GRANT_OP_COW_SUPPLY: u64 = 6;
+
+/// The carrier's answer to a [`GRANT_OP_COW_SUPPLY`] crossing (#3042), one
+/// type on both sides of the wire. Contention is its own answer, never a
+/// refusal: the lane withdraws its selection and reruns "not now".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CowSupplyAnswer {
+    /// The carrier published a usable replacement grant and took the
+    /// lane's exact selection.
+    Supplied,
+    /// The MM's owner is busy elsewhere (its editor held by another CPU) or
+    /// no grant could be made ready now; nothing was taken.
+    NotNow,
+    /// The crossing names no live demand of this CPU: nothing was taken.
+    Refused,
+}
+impl CowSupplyAnswer {
+    /// The wire status of [`Self::NotNow`], outside the metadata-grant
+    /// error range.
+    pub const NOT_NOW_STATUS: u64 = 0x100;
+    pub const fn status(self) -> u64 {
+        match self {
+            Self::Supplied => METADATA_GRANT_SUCCESS,
+            Self::NotNow => Self::NOT_NOW_STATUS,
+            Self::Refused => METADATA_GRANT_ERR_DENIED,
+        }
+    }
+    pub const fn from_status(status: u64) -> Self {
+        match status {
+            METADATA_GRANT_SUCCESS => Self::Supplied,
+            Self::NOT_NOW_STATUS => Self::NotNow,
+            _ => Self::Refused,
+        }
+    }
+}
 /// Runtime handback of a terminal child's unplaceable parent wait.
 pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
