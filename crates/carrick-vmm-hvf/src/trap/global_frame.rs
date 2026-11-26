@@ -4950,16 +4950,20 @@ fn retire_global_frame_host_owner_inner_in_with(
 pub(crate) fn drain_and_retry_pending_global_frame_retirements_in(
     custody: &CarrierVmCustody,
 ) -> Result<(), TrapError> {
-    drain_all_global_frame_retirements_in_using(custody, &mut |ipa, len| {
-        let _ = (ipa, len);
-        Ok(())
+    // The production retirement: each record's backend unmap runs under its
+    // own generation guard, so a backend failure is observed and reported.
+    drain_all_global_frame_retirements_in_with(custody, &mut |custody, identity| {
+        custody.retire_stage2_record(identity)
     })
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drain_all_global_frame_retirements_in_using(
+fn drain_all_global_frame_retirements_in_with(
     custody: &CarrierVmCustody,
-    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
 ) -> Result<(), TrapError> {
     let directory = custody
         .global_frame_host_owners
@@ -4968,18 +4972,19 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
         .filter_map(|(&key, entry)| entry.is_live().then_some((key, entry.owner().generation())))
         .collect::<Vec<_>>();
     for ((ipa, length), generation) in directory {
-        let _ = retire_global_frame_host_owner_inner_in_using(
+        let _ = retire_global_frame_host_owner_inner_in_with(
             custody,
             ipa,
             length,
             Some(generation),
-            unmap,
+            None,
+            &mut *retire,
         );
     }
 
     // A carrier safe point is also the explicit retry point for directory and
     // collision candidates whose first retirement attempt was deferred.
-    let _ = retry_pending_global_frame_retirements_in_using(custody, unmap);
+    let _ = retry_pending_global_frame_retirements_in_with(custody, retire);
     let directory_remaining = custody.global_frame_host_owners.lock().len();
     let collision_remaining = custody.pending_global_frame_owners.lock().len();
     if directory_remaining == 0 && collision_remaining == 0 {
@@ -4995,6 +5000,19 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
 pub(crate) fn retry_pending_global_frame_retirements_in_using(
     custody: &CarrierVmCustody,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Result<(), TrapError> {
+    retry_pending_global_frame_retirements_in_with(custody, &mut |custody, identity| {
+        custody.retire_stage2_record_using(identity, &mut *unmap)
+    })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn retry_pending_global_frame_retirements_in_with(
+    custody: &CarrierVmCustody,
+    retire: &mut dyn FnMut(
+        &CarrierVmCustody,
+        CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome,
 ) -> Result<(), TrapError> {
     let pending_directory = custody
         .global_frame_host_owners
@@ -5013,12 +5031,13 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         })
         .collect::<Vec<_>>();
     for ((ipa, length), generation) in pending_directory {
-        let _ = retire_global_frame_host_owner_inner_in_using(
+        let _ = retire_global_frame_host_owner_inner_in_with(
             custody,
             ipa,
             length,
             Some(generation),
-            unmap,
+            None,
+            &mut *retire,
         );
     }
 
@@ -5029,7 +5048,7 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         .cloned()
         .collect::<Vec<_>>();
     for owner in detached {
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        let outcome = retire(custody, owner.record_identity);
         if matches!(
             outcome,
             CarrierStage2RetireOutcome::RetiredUnmapped
