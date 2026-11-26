@@ -1441,6 +1441,10 @@ impl MmAccessState {
             // The record is terminal: the runtime may reissue this root slot the
             // moment it holds the proof below, so a pooled slot goes back to the
             // pool here rather than at the last `Arc` drop of the retained mapping.
+            #[cfg(test)]
+            custody
+                .stage2
+                .at_client_point(crate::trap::MM_ROOT_POOLED_SLOT_RELEASE);
             authority.owner.release_pooled_root_slot();
 
             let authority = slot.take().ok_or_else(|| {

@@ -2275,6 +2275,8 @@ pub(crate) const FORK_CONTROL_CAPACITY_BEFORE_INSTALL: &str =
 #[cfg(test)]
 pub(crate) const COMMIT_DESTROY_HOLDING_STAGE2: &str = "commit destroy holding stage2";
 #[cfg(test)]
+pub(crate) const MM_ROOT_POOLED_SLOT_RELEASE: &str = "mm root pooled slot release";
+#[cfg(test)]
 pub(crate) const REPLAY_REMAP_DURING_PHASE1_LOOKUP: &str = "replay remap during phase1 lookup";
 #[cfg(test)]
 pub(crate) const REPLAY_SLICE_BETWEEN_LOCKS: &str = "replay slice between locks";
@@ -2469,7 +2471,14 @@ impl CarrierVmCustody {
                 self.request_global_frame_retirement_retry();
             }
         } else if let RecordPinRelease::ReadyToRetire { .. } = outcome {
-            if self.is_structural_owner_retired(identity.record_id) {
+            // Last-unpin completes a retired owner's retirement here only when
+            // its record owes no backend unmap (a pooled slot the pool keeps
+            // mapped). A record that still owes an unmap waits for the idle
+            // turn: the pin venue never issues a hypervisor operation.
+            let owes_backend_unmap = self
+                .stage2_record_snapshot(identity.record_id)
+                .is_none_or(|snapshot| snapshot.backend_map_installed);
+            if self.is_structural_owner_retired(identity.record_id) && !owes_backend_unmap {
                 if super::retire_structural_stage2_record_at_safe_point(self, identity).is_err() {
                     self.enqueue_structural_retirement_retry(identity.record_id);
                 }
@@ -5222,6 +5231,16 @@ mod carrier_vm_custody_tests {
             );
         }
         custody.abort_terminal_stage2_release(identity);
+        // A rebind adopts G2's replayed map of the same extent, as the
+        // production replay installs it before rebinding.
+        let spec = stage2_spec(identity.vm_generation, 91);
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            spec.host_addr as *mut std::ffi::c_void,
+            spec.ipa,
+            spec.len,
+            spec.perms,
+        );
         {
             let mut stage2 = custody.admitting_stage2("test rebind").expect("admitting");
             assert!(
@@ -6088,6 +6107,15 @@ mod carrier_vm_custody_tests {
                 .contains_key(&identity.record_id)
         );
         drop(owner);
+        // Tear the live VM down through the production sequence: it forgets
+        // the pools' mappings with the VM instead of dropping mapped leases.
+        super::destroy_vm_with_custody_using(
+            &custody,
+            "test teardown",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("tear down live VM");
     }
 
     #[test]
@@ -7288,7 +7316,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn failed_lease_rollback_unmap_retains_host_backing_until_vm_destroy() {
+    fn serial_host_failed_lease_rollback_unmap_retains_host_backing_until_vm_destroy() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
@@ -8525,6 +8553,15 @@ mod carrier_vm_custody_tests {
             .allocate_slot_at(ipa0)
             .expect("exact pooled root slot released on last unpin");
         reallocated.release_slot();
+        // Tear the live VM down through the production sequence: it forgets
+        // the pools' mappings with the VM instead of dropping mapped leases.
+        super::destroy_vm_with_custody_using(
+            &custody,
+            "test teardown",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("tear down live VM");
     }
 
     #[test]
@@ -9692,5 +9729,14 @@ mod carrier_vm_custody_tests {
             &mut super::release_retired_stage2_ipa,
         )
         .expect("Loop 4 must succeed after pooled-root last unpin");
+        // Tear the live VM down through the production sequence: it forgets
+        // the pools' mappings with the VM instead of dropping mapped leases.
+        super::destroy_vm_with_custody_using(
+            &custody,
+            "test teardown",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("tear down live VM");
     }
 }

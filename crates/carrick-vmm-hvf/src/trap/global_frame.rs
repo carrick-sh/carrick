@@ -1182,9 +1182,6 @@ pub(crate) struct GlobalFrameStage2Lease {
     pub(crate) mapping: Option<carrick_aarch64::stage2::custody::Stage2Mapping>,
     pub(crate) pre_mapped_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     pub(crate) backing_keeper: Option<LeaseBackingKeeper>,
-    /// Set while the lease is mapped inside an unpublished process
-    /// composition: dropping it then unmaps it in exactly this custody.
-    pub(crate) composition_custody: Option<std::sync::Weak<CarrierVmCustody>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1202,7 +1199,6 @@ impl GlobalFrameStage2Lease {
             mapping: None,
             pre_mapped_generation: None,
             backing_keeper: None,
-            composition_custody: None,
         })
     }
 
@@ -1227,7 +1223,6 @@ impl GlobalFrameStage2Lease {
             mapping: None,
             pre_mapped_generation: None,
             backing_keeper: None,
-            composition_custody: None,
         }
     }
 
@@ -1238,7 +1233,6 @@ impl GlobalFrameStage2Lease {
     pub(crate) fn mark_mapped(&mut self, mapping: carrick_aarch64::stage2::custody::Stage2Mapping) {
         debug_assert_eq!(mapping.ipa(), self.base);
         debug_assert_eq!(mapping.size() as u64, self.length);
-        self.composition_custody = None;
         self.mapped = true;
         self.mapping = Some(mapping);
         self.pre_mapped_generation = None;
@@ -1248,7 +1242,6 @@ impl GlobalFrameStage2Lease {
         &mut self,
         generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     ) {
-        self.composition_custody = None;
         self.mapped = true;
         self.mapping = None;
         self.pre_mapped_generation = generation;
@@ -1324,18 +1317,6 @@ impl GlobalFrameStage2Lease {
         self.backing_keeper = None;
     }
 
-    /// Mark the lease mapped by a process composition. Until custody takes
-    /// the mapping over, dropping the lease unmaps it in exactly `custody`
-    /// instead of leaking a mapped stage-2 range.
-    pub(crate) fn mark_composition_mapped(
-        &mut self,
-        custody: &std::sync::Arc<CarrierVmCustody>,
-        mapping: carrick_aarch64::stage2::custody::Stage2Mapping,
-    ) {
-        self.mark_mapped(mapping);
-        self.composition_custody = Some(std::sync::Arc::downgrade(custody));
-    }
-
     pub(crate) fn try_retire(&mut self, custody: &CarrierVmCustody) -> Result<(), TrapError> {
         self.try_retire_with_backing(custody, None)
     }
@@ -1391,7 +1372,6 @@ impl GlobalFrameStage2Lease {
             }
         }
 
-        self.composition_custody = None;
         if !self.active {
             drop(backing);
             drop(attached_keeper);
@@ -1474,21 +1454,6 @@ impl GlobalFrameStage2Lease {
 impl Drop for GlobalFrameStage2Lease {
     fn drop(&mut self) {
         if !self.active {
-            return;
-        }
-        if self.mapped
-            && let Some(custody) = self
-                .composition_custody
-                .take()
-                .and_then(|custody| custody.upgrade())
-        {
-            // An in-flight row of an unpublished process composition.
-            if let Err(error) = self.try_retire(&custody) {
-                fail_stop_partial_process_stage2_rollback(
-                    "unpublished composition stage-2 lease",
-                    &error,
-                );
-            }
             return;
         }
         debug_assert!(
@@ -2705,7 +2670,6 @@ fn try_transfer_global_frame_stage2_lease_no_rollback(
     lease.pre_mapped_generation = None;
     lease.release_ipa = false;
     lease.backing_keeper = None;
-    lease.composition_custody = None;
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     {
         lease.drop_backing_audit = None;

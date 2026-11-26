@@ -198,7 +198,7 @@ pub use carrier_custody::CarrierVmCustody;
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use carrier_custody::{
     COMMIT_DESTROY_HOLDING_STAGE2, FORK_CONTROL_CAPACITY_BEFORE_INSTALL,
-    FORK_STOCK_INSTALL_BEFORE_ARENAS,
+    FORK_STOCK_INSTALL_BEFORE_ARENAS, MM_ROOT_POOLED_SLOT_RELEASE,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
@@ -7299,8 +7299,8 @@ impl HvfVmState {
     ) -> Result<(Vec<GlobalFrameStage2Lease>, HvpatchPreparedTaskAuthority), TrapError> {
         // One transaction for the whole composition, in the one VM
         // generation authenticated here: every early return below rolls back
-        // each installed row and owner (the composition's `Drop`) and each
-        // in-flight mapped lease (its own `Drop`).
+        // each installed row, owner and mapped lease (the composition's
+        // `Drop`). A mapped lease is never left to its own `Drop`.
         let mut composition = ProcessStage2Composition::<Vec<HvpatchTaskMappingState>>::begin(
             &plan.carrier_foreign_mm_transport.custody,
             "task-only stage-2 composition",
@@ -7384,10 +7384,7 @@ impl HvfVmState {
                     });
                 let stage2_mapping = map_result?;
                 match mapping.stage2_lease.as_mut() {
-                    Some(lease) => lease.mark_composition_mapped(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        stage2_mapping,
-                    ),
+                    Some(lease) => lease.mark_mapped(stage2_mapping),
                     // A borrowed reusable frame row installs with no lease
                     // of its own; the composition still unmaps it on
                     // rollback.
@@ -7434,7 +7431,10 @@ impl HvfVmState {
                                 GlobalFrameOwnerRole::Borrowed,
                             )
                         }
-                        (Some(_), ProcessMappingHost::Borrowed { .. }) => {
+                        (Some(lease), ProcessMappingHost::Borrowed { .. }) => {
+                            // Refused by validation before any map; if it is
+                            // ever reached the composition rolls the lease back.
+                            composition.stage2_leases.push(lease);
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has stage-2 lease without owned host backing",
                                 mapping.physical_ipa, mapping.physical_size
@@ -7446,7 +7446,8 @@ impl HvfVmState {
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
-                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                        (lease, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            composition.stage2_leases.extend(lease);
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
                                 mapping.physical_ipa, mapping.physical_size
@@ -7457,13 +7458,19 @@ impl HvfVmState {
                     match mapping.host {
                         ProcessMappingHost::Owned(host) => {
                             // Both exist by `validate_process_mapping_shape`
-                            // and the epoch taken before the install. The
-                            // let-else drops an unmatched lease before `host`.
-                            let (Some(epoch), Some(lease)) =
-                                (structural_epoch, mapping.stage2_lease.take())
-                            else {
+                            // and the epoch taken before the install. A
+                            // mapped lease is never dropped here: on a refusal
+                            // the composition owns it and rolls it back.
+                            let Some(lease) = mapping.stage2_lease.take() else {
                                 return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                )));
+                            };
+                            let Some(epoch) = structural_epoch else {
+                                composition.stage2_leases.push(lease);
+                                return Err(TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing structural epoch",
                                     mapping.physical_ipa
                                 )));
                             };
@@ -7494,13 +7501,19 @@ impl HvfVmState {
                         }
                         ProcessMappingHost::PooledRootSlot { handle } => {
                             // Both exist by `validate_process_mapping_shape`
-                            // and the epoch taken before the install. The
-                            // let-else drops an unmatched lease before `host`.
-                            let (Some(epoch), Some(lease)) =
-                                (structural_epoch, mapping.stage2_lease.take())
-                            else {
+                            // and the epoch taken before the install. A
+                            // mapped lease is never dropped here: on a refusal
+                            // the composition owns it and rolls it back.
+                            let Some(lease) = mapping.stage2_lease.take() else {
                                 return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                )));
+                            };
+                            let Some(epoch) = structural_epoch else {
+                                composition.stage2_leases.push(lease);
+                                return Err(TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing structural epoch",
                                     mapping.physical_ipa
                                 )));
                             };
@@ -7789,8 +7802,8 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         // One transaction for the whole composition, in the one VM
         // generation authenticated here: every early return below rolls back
-        // each installed row and owner (the composition's `Drop`) and each
-        // in-flight mapped lease (its own `Drop`).
+        // each installed row, owner and mapped lease (the composition's
+        // `Drop`). A mapped lease is never left to its own `Drop`.
         let mut composition = ProcessStage2Composition::<TaskMappingIndex>::begin(
             &plan.carrier_foreign_mm_transport.custody,
             "full-VM stage-2 composition",
@@ -7874,10 +7887,7 @@ impl HvfVmState {
                     });
                 let stage2_mapping = map_result?;
                 match mapping.stage2_lease.as_mut() {
-                    Some(lease) => lease.mark_composition_mapped(
-                        &plan.carrier_foreign_mm_transport.custody,
-                        stage2_mapping,
-                    ),
+                    Some(lease) => lease.mark_mapped(stage2_mapping),
                     // A borrowed reusable frame row installs with no lease
                     // of its own; the composition still unmaps it on
                     // rollback.
@@ -7909,7 +7919,10 @@ impl HvfVmState {
                             // The owner_generation stamped on the mapping is preserved.
                             (None, None, None, mapping.owner_generation)
                         }
-                        (Some(_), ProcessMappingHost::Borrowed { .. }) => {
+                        (Some(lease), ProcessMappingHost::Borrowed { .. }) => {
+                            // Refused by validation before any map; if it is
+                            // ever reached the composition rolls the lease back.
+                            composition.stage2_leases.push(lease);
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has stage-2 lease without owned host backing",
                                 mapping.physical_ipa, mapping.physical_size
@@ -7921,7 +7934,8 @@ impl HvfVmState {
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
-                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                        (lease, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            composition.stage2_leases.extend(lease);
                             return Err(TrapError::Hypervisor(format!(
                                 "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
                                 mapping.physical_ipa, mapping.physical_size
@@ -7932,13 +7946,19 @@ impl HvfVmState {
                     match mapping.host {
                         ProcessMappingHost::Owned(host) => {
                             // Both exist by `validate_process_mapping_shape`
-                            // and the epoch taken before the install. The
-                            // let-else drops an unmatched lease before `host`.
-                            let (Some(epoch), Some(lease)) =
-                                (structural_epoch, mapping.stage2_lease.take())
-                            else {
+                            // and the epoch taken before the install. A
+                            // mapped lease is never dropped here: on a refusal
+                            // the composition owns it and rolls it back.
+                            let Some(lease) = mapping.stage2_lease.take() else {
                                 return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                )));
+                            };
+                            let Some(epoch) = structural_epoch else {
+                                composition.stage2_leases.push(lease);
+                                return Err(TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing structural epoch",
                                     mapping.physical_ipa
                                 )));
                             };
@@ -7963,13 +7983,19 @@ impl HvfVmState {
                         }
                         ProcessMappingHost::PooledRootSlot { handle } => {
                             // Both exist by `validate_process_mapping_shape`
-                            // and the epoch taken before the install. The
-                            // let-else drops an unmatched lease before `host`.
-                            let (Some(epoch), Some(lease)) =
-                                (structural_epoch, mapping.stage2_lease.take())
-                            else {
+                            // and the epoch taken before the install. A
+                            // mapped lease is never dropped here: on a refusal
+                            // the composition owns it and rolls it back.
+                            let Some(lease) = mapping.stage2_lease.take() else {
                                 return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                )));
+                            };
+                            let Some(epoch) = structural_epoch else {
+                                composition.stage2_leases.push(lease);
+                                return Err(TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing structural epoch",
                                     mapping.physical_ipa
                                 )));
                             };

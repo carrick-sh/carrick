@@ -2418,6 +2418,7 @@ mod arena_pin_tests {
     }
 
     fn check_pinned_arena(size: usize) {
+        let _stub = crate::trap::ScopedStage2MapTestStub::enable();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
@@ -2427,13 +2428,22 @@ mod arena_pin_tests {
             crate::host_mapping::HostMappingKind::PerMmKernelState,
         )
         .unwrap();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        // A structural arena the backend really mapped: its record owes an
+        // unmap, so the last unpin leaves retirement to the explicit turn.
         let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
-        lease.mark_test_mapped_without_backend();
+        lease.mark_mapped(crate::trap::stage2_backend::test_stage2_map(
+            &custody,
+            host.as_ptr().cast(),
+            base,
+            size,
+            perms,
+        ));
         let owner = StructuralBackingOwner::new_in(
             &custody,
             host,
             lease,
-            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+            perms,
             next_structural_epoch().unwrap(),
             base,
             size,

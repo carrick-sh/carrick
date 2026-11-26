@@ -1969,5 +1969,14 @@ mod tests {
             custody.fork_stock.lock().owner.needs_control_capacity(),
             "G1 arena must never publish into G2 fork stock"
         );
+        // Tear G2 down through the production sequence: it forgets G2's
+        // pool mapping with the VM instead of dropping a mapped lease.
+        crate::trap::destroy_vm_with_custody_using(
+            &custody,
+            "test teardown G2",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("tear down G2");
     }
 }

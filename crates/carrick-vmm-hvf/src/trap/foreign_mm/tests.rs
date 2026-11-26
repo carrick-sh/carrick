@@ -10262,11 +10262,11 @@ fn full_vm_materializer_stamps_fresh_owner_before_alias_mapping_and_inventory() 
         .find(concat!("let alias = Alias", "Backing {"))
         .expect("full-VM alias construction");
     let mapped = full_vm
-        .find(concat!("mapped.insert(HvfMapped", "Region {"))
+        .find(concat!("composition.rows.insert(HvfMapped", "Region {"))
         .expect("full-VM mapping construction");
     let inventory = full_vm
         .find(concat!(
-            "let stage2_owner = if is_reusable_global_frame_",
+            "let stage2_owner =\n                        if is_reusable_global_frame_",
             "extent("
         ))
         .expect("full-VM inventory owner stamping");
@@ -10864,7 +10864,15 @@ fn task_only_stale_generation_pooled_root_is_refused_and_rolls_back() {
     let (slot_ipa, slot_len) = (g1_handle.ipa(), g1_handle.len());
     let slot_host = g1_handle.as_mut_ptr();
     drop(g1_pool);
-    destroy_vm_with_custody(&custody, "stale pooled root witness G1").expect("destroy G1");
+    // The production destroy sequence, with the backend's raw destroy
+    // scripted: the unsigned unit binary holds no hypervisor VM.
+    destroy_vm_with_custody_using(
+        &custody,
+        "stale pooled root witness G1",
+        carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        || {},
+    )
+    .expect("destroy G1");
     let g2 = custody.begin_create().expect("begin G2");
     custody.commit_create(g2).expect("commit G2");
     assert_ne!(g1_generation, Some(g2), "precondition: the slot is G1's");
@@ -10943,8 +10951,15 @@ fn composition_rollback_after_generation_destroy_accepts_the_retired_owner() {
         .registered_global_owners
         .push((key.0, key.1, generation));
 
-    destroy_vm_with_custody(&custody, "destroy-route witness G1")
-        .expect("destroy G1 through exact custody");
+    // The production destroy sequence, with the backend's raw destroy
+    // scripted: the unsigned unit binary holds no hypervisor VM.
+    destroy_vm_with_custody_using(
+        &custody,
+        "destroy-route witness G1",
+        carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        || {},
+    )
+    .expect("destroy G1 through exact custody");
     finalize_carrier_exit_global_frame_owners_in(&custody)
         .expect("finalize G1's terminal global owners");
     assert!(
@@ -12260,28 +12275,51 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     assert!(resolver.retained_owners.read().contains_key(&ext_ipa));
 
     // 3. Exercise real pooled-root retirement path: retire_mm_root_stage2_in -> release_pooled_root_slot
+    // A pooled root slot owes no backend unmap (its pool keeps the slot
+    // mapped): its backing retires when the slot returns to the pool. Observe
+    // that release, and the access exclusion around it, on the real path.
     let table_authority = installed.state.page_tables_authority();
-    let mut saw_unmap = false;
-    let mut retirement_excluded_access = false;
+    let saw_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_excluded_access = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let saw = Arc::clone(&saw_release);
+        let excluded = Arc::clone(&release_excluded_access);
+        let authority = table_authority.clone();
+        transport
+            .custody
+            .stage2
+            .set_hook(Some(Arc::new(move |point| {
+                if matches!(
+                    point,
+                    carrick_aarch64::stage2::custody::Stage2HookPoint::Client(name)
+                        if name == crate::trap::MM_ROOT_POOLED_SLOT_RELEASE
+                ) {
+                    saw.store(true, Ordering::SeqCst);
+                    excluded.store(
+                        authority.try_with_manager_until(
+                            std::time::Instant::now(),
+                            "busy",
+                            "absent",
+                            |_| Ok(()),
+                        ) == Err("busy"),
+                        Ordering::SeqCst,
+                    );
+                }
+            })));
+    }
     let retired_root = installed
         .state
         .retire_mm_root_stage2_in_using(&transport.custody, root_slot, true, &mut |_, _| {
-            saw_unmap = true;
-            retirement_excluded_access = table_authority.try_with_manager_until(
-                std::time::Instant::now(),
-                "busy",
-                "absent",
-                |_| Ok(()),
-            ) == Err("busy");
-            Ok(())
+            panic!("a pooled root slot owes no backend unmap")
         })
         .expect("retire pooled root slot via real path");
+    transport.custody.stage2.set_hook(None);
     assert!(
-        saw_unmap,
-        "retirement must exercise the injected backend boundary"
+        saw_release.load(Ordering::SeqCst),
+        "retirement must return the pooled slot through the real release"
     );
     assert!(
-        retirement_excluded_access,
+        release_excluded_access.load(Ordering::SeqCst),
         "root retirement released the page-table access guard before retiring backing"
     );
     assert!(

@@ -1257,7 +1257,7 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
         region.host_addr.cast(),
         root_slot.0,
         mapping.mapped_size as usize,
-        3,
+        carrick_aarch64::stage2::stage2_perms_bits(region.perms),
     );
     lease.mark_mapped(stage2_mapping);
 
@@ -1524,9 +1524,13 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
 
     assert!(alias_backing_is_live(host_addr as usize));
     HvfVmState::retire_task_state_exec_predecessor(&mut task).expect("post-TLBI detached cleanup");
+    // The detached cleanup retires the lease explicitly, with its backing
+    // still live (stage 2 first, host memory after); the lease's `Drop`
+    // never retires (static audit
+    // `creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit`).
     assert!(
-        !observed.load(std::sync::atomic::Ordering::SeqCst),
-        "lease Drop must not execute stage-2 retirement"
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        "detached cleanup must retire the lease while its backing is still live"
     );
     assert!(!alias_backing_is_live(host_addr as usize));
     assert!(task.pending_exec_stage2_cleanup.is_none());
@@ -4004,7 +4008,7 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
         region.host_addr.cast(),
         key.0,
         key.1 as usize,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(region.perms),
     );
     lease.mark_mapped(stage2_mapping);
     // Call the real production publication helper which registers the global
@@ -4110,7 +4114,7 @@ fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() 
         region2.host_addr.cast(),
         key2.0,
         key2.1 as usize,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(region2.perms),
     );
     lease2.mark_mapped(stage2_mapping2);
     let gen2 = publish_exec_region_host_owner(&mut region2, lease2)
@@ -4504,7 +4508,7 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
         host.as_ptr().cast(),
         key.0,
         key.1 as usize,
-        7,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
     lease.mark_mapped(stage2_mapping);
 
@@ -4661,7 +4665,7 @@ fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_ho
         host.as_ptr().cast(),
         key.0,
         key.1 as usize,
-        7,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
     lease.mark_mapped(stage2_mapping);
 
@@ -4744,7 +4748,7 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
         host.as_ptr().cast(),
         key.0,
         key.1 as usize,
-        7,
+        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
     );
     lease.mark_mapped(stage2_mapping);
 
@@ -7585,7 +7589,7 @@ fn exit_task_holding_owned_lease(
         region.host_addr.cast(),
         key.0,
         key.1 as usize,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        carrick_aarch64::stage2::stage2_perms_bits(region.perms),
     );
     lease.mark_mapped(stage2_mapping);
     let generation =
