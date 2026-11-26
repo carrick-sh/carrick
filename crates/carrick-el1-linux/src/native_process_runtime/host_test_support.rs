@@ -10303,6 +10303,182 @@ fn arm_native_service_exit_readiness_record_busy_retains_its_set_operation() {
     >(arm_words, true, false, true, AdapterRefusal::HostFileBusy);
 }
 
+/// #1051 (#3045 pre-review P0 3): a signal that cancels a readiness set's
+/// published `ReadinessSetCtl` record reruns the call with the set's
+/// operation still retained. The ring's one interrupted-wait path then
+/// answers EINTR with the call's remaining timeout written back and the
+/// temporary mask armed. Retiring the operation here instead answered a bare
+/// EINTR and lost the timeout's write-back.
+#[cfg(test)]
+#[test]
+fn native_readiness_record_cancelled_reruns_with_its_set_operation() {
+    readiness_record_cancelled_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn arm_native_readiness_record_cancelled_reruns_with_its_set_operation() {
+    readiness_record_cancelled_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[cfg(test)]
+fn readiness_record_cancelled_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_core_abi::service::ServiceCell;
+    use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+    use carrick_el1_abi::ipc::{IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey};
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let shared = Box::leak(Box::new(std::sync::Arc::new(
+        carrick_kernel::el1_ipc::HostIpc::with_limits(
+            1 << 20,
+            carrick_kernel::el1_ipc::IpcLimits::ZONE,
+        )
+        .unwrap(),
+    )));
+    let object = shared
+        .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let table = shared.create_table(64, 64).unwrap();
+    let description = shared
+        .admit_description(Description::new(
+            IpcBacking::EventFd { object }.encode(),
+            AccessMode::ReadOnly,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    description.install(table, Fd(0), false).unwrap();
+    drop(description);
+    let region = shared.region();
+    let (pin, _) = region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .pin(table, Fd(0))
+        .unwrap();
+    let binding = crate::common_entry::execution_binding(fixture.task);
+    let token = region
+        .begin_operation(IpcOperation {
+            kind: IpcOpKind::PollWait,
+            pin: pin.into_raw(),
+            object: object.to_raw(),
+            task: IpcTaskKey(binding.task.raw()),
+            mm: IpcMmKey(binding.mm.raw()),
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let token = carrick_el1::substrate::ipc::to_sched_token(token).unwrap();
+    let identity = token.identity();
+    let record_identity = fixture.zone.record(fixture.record.id).identity();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.native_ipc = Some(shared.region());
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        // The ring staged the set's record and kept its operation on the
+        // record for the rerun, as `readiness_set::stage_hosts` does.
+        carrick_core::wait::restore_object_operation(
+            fixture.zone,
+            fixture.slot,
+            record_identity,
+            token,
+        )
+        .unwrap();
+        let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+        let published = entry.begin_host_file_call(
+            readiness_set_record(),
+            None,
+            false,
+            None,
+            false,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(270), counters),
+        );
+        assert!(
+            matches!(published, Ok(NativeResume::Left(None))),
+            "the set's record publishes: {}",
+            resume_name(&published)
+        );
+    }
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    // SAFETY: the fixture retains this exact member and authenticates the notice under its service queue.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            record_identity,
+        )
+    }
+    .unwrap();
+    // A caught signal cancels the registration before the carrier answers.
+    fixture
+        .control
+        .service
+        .cancel(ticket.request().identity)
+        .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None));
+    assert!(
+        matches!(resumed, Ok(NativeResume::RetrySyscall)),
+        "a cancelled set record reruns its call for the ring's interrupted wait: {}",
+        resume_name(&resumed)
+    );
+    let retained =
+        carrick_core::wait::take_object_operation(fixture.zone, fixture.slot, record_identity)
+            .unwrap()
+            .expect("the rerun keeps the set's operation, still owed");
+    assert_eq!(retained.identity(), identity);
+    let retained = carrick_el1::substrate::ipc::from_sched_token(retained).unwrap();
+    region.finish_operation(retained, || {}).unwrap();
+}
+
 #[cfg(test)]
 #[test]
 fn native_service_exit_deferred_preparation_is_not_quarantined() {

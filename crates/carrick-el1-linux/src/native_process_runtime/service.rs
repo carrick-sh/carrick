@@ -4694,15 +4694,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// The one completion of a readiness set's `ReadinessSetCtl` record,
     /// total over every service result (#1051). The set kept its operation
     /// for this rerun: once the carrier registered its host members, the
-    /// rerun takes it and harvests the whole set. Anything else retires the
-    /// operation first, then answers:
+    /// rerun takes it and harvests the whole set. A cancelled record (a
+    /// signal interrupted the registration) also reruns with the operation
+    /// still owed: the ring's one interrupted-wait path then answers EINTR
+    /// with the call's remaining timeout written back and the temporary
+    /// mask armed for the signal checkpoint, or, when no signal is pending
+    /// any more, rebuilds the set and stages its record again. Anything
+    /// else retires the operation first, then answers:
     /// - the carrier's errno (nothing registered), or a counted ENOSYS for a
     ///   refused record (a member the venue cannot serve exactly): Linux
     ///   restores a `pselect6` mask before any return but EINTR, so the
     ///   temporary mask is disarmed here and no signal it unblocked is
     ///   delivered on this return;
-    /// - EINTR for a cancelled record, with the temporary mask still armed
-    ///   for the signal checkpoint, as a parked set's interruption is;
     /// - a broken service invariant (a backing fault, a failure, a wait or
     ///   a reply-less supply, none of which this record can produce)
     ///   quarantines the service.
@@ -4718,11 +4721,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.register_readiness_set()?;
                 return Ok(HostFileContinuation::Rerun);
             }
-            (ServiceResult::Supplied, Some(errno)) => Ok(Some(errno)),
-            (ServiceResult::Refused, _) => {
-                Ok(Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()))
-            }
-            (ServiceResult::Cancelled, _) => Ok(None),
+            (ServiceResult::Cancelled, _) => return Ok(HostFileContinuation::Rerun),
+            (ServiceResult::Supplied, Some(errno)) => Ok(errno),
+            (ServiceResult::Refused, _) => Ok(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
             (ServiceResult::Supplied, None) | (ServiceResult::Failed(_), _) => {
                 Err(NativeServiceQuarantine::UnexpectedFailureResult)
             }
@@ -4734,18 +4735,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         self.retire_readiness_set()?;
-        match answer {
-            Ok(Some(errno)) => {
-                if let Some(saved) = self.control.take_forwarded_wait_mask() {
-                    self.control.init_blocked(saved);
-                }
-                Ok(HostFileContinuation::Returned(SyscallResult::new(errno)))
-            }
-            Ok(None) => Ok(HostFileContinuation::Returned(SyscallResult::new(
-                carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-            ))),
-            Err(broken) => Err(NativeProcessError::ServiceQuarantined(broken)),
+        let errno = answer.map_err(NativeProcessError::ServiceQuarantined)?;
+        if let Some(saved) = self.control.take_forwarded_wait_mask() {
+            self.control.init_blocked(saved);
         }
+        Ok(HostFileContinuation::Returned(SyscallResult::new(errno)))
     }
 
     /// The carrier registered a readiness set's host members: the operation
