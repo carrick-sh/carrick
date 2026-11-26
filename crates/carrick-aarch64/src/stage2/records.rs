@@ -17,7 +17,7 @@
 //!   is owed only after its last pin returns.
 //! - **A table with records cannot be dropped silently.** [`Stage2RecordTable::teardown`]
 //!   returns every record (live, pinned or owing its unmap) to the owner;
-//!   dropping a non-empty table is a broken invariant and panics.
+//!   dropping a non-empty table is a broken invariant and is fatal.
 //!
 //! The table is plain data: its owner (the carrier's stage-2 custody) holds it
 //! under the custody lock, and drives the backend map and unmap around it.
@@ -456,12 +456,12 @@ impl<B> Stage2RecordTable<B> {
 
 impl<B> Drop for Stage2RecordTable<B> {
     /// Dropping a table that still holds records is a broken invariant: each
-    /// record names a backend mapping and a backing nobody would release.
-    /// It panics rather than leaking them silently (#3057's class); an
-    /// unwinding owner is already failing and isn't panicked twice.
+    /// record names a backend mapping and a backing nobody would release
+    /// (#3057's class). An unwinding owner is already failing.
     fn drop(&mut self) {
         if !self.by_base.is_empty() && !std::thread::panicking() {
-            panic!(
+            carrick_fatal::carrick_fatal!(
+                "aarch64::stage2_records",
                 "stage-2 record table dropped with {} records; its owner must tear it down",
                 self.by_base.len()
             );

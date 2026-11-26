@@ -288,25 +288,3 @@ fn teardown_returns_every_record_with_what_it_still_owes() {
     );
     drop((live_pin, retiring_pin));
 }
-
-#[test]
-fn dropping_a_table_with_records_panics_and_a_torn_down_one_does_not() {
-    let mut table = Stage2RecordTable::new();
-    table.register(spec(0, PAGE, 1)).expect("record");
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(table)))
-        .expect_err("dropping a table with a record must not pass silently");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .unwrap_or_default();
-    assert!(
-        message.contains("dropped with 1 records"),
-        "the panic names the broken invariant: {message:?}"
-    );
-
-    // An empty table drops quietly, and so does a torn-down one.
-    drop(Stage2RecordTable::<Lease>::new());
-    let mut table = Stage2RecordTable::new();
-    table.register(spec(0, PAGE, 1)).expect("record");
-    assert_eq!(table.teardown().len(), 1);
-}

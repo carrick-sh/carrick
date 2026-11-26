@@ -409,6 +409,13 @@
     },
     {
       "family": "fatal_carrier_fault",
+      "operation": "fatal:aarch64::stage2_records",
+      "owner": "carrick_aarch64::stage2::records::<Stage2RecordTable<B> as Drop>::drop",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "fatal_carrier_fault",
       "operation": "fatal:aarch64::fork_cow",
       "owner": "carrick_aarch64::engine::<Aarch64EngineCore<V> as ThreadedEngine>::build_process_spec",
       "lane": "shared",
