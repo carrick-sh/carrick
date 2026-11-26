@@ -56,7 +56,13 @@ impl ThreadCpu for HardwareCpu {
         } else {
             carrick_el1_abi::Action::Forward
         };
-        super::dispatch::capture_native_service_exit(frame, action, None, counters)
+        super::dispatch::capture_native_service_exit(
+            frame,
+            action,
+            None,
+            super::dispatch::StagedRingRecord::none(),
+            counters,
+        )
     }
     fn set_translation(&mut self, a: u64, b: u64) {
         carrick_el1::substrate::sched::hw::HardwareCpu.set_translation(a, b);
