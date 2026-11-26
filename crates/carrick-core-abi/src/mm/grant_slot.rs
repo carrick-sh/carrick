@@ -556,6 +556,27 @@ mod layout_manifest {
         assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
     }
 
+    /// #3040: a lane withdraws only the selection stamped for its own
+    /// request. A same-window selection stamped with another request
+    /// generation belongs to someone else and must stay published.
+    #[test]
+    fn cow_take_leaves_a_selection_stamped_for_another_request() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let slot = PortalGrantSlot::new();
+        let other = window.operation.sequence.get() + 1;
+        assert!(slot.publish_cow_fault_selection(other, window));
+        assert!(
+            !slot.take_cow_fault_selection(window),
+            "a take by window alone consumed another request's selection"
+        );
+        assert_eq!(
+            slot.pending_cow_fault_selection(77, 0x4000),
+            Some((other, window))
+        );
+    }
+
     #[test]
     fn fault_wait_and_refused_selection_preserve_identity_and_consume_once() {
         let window =
