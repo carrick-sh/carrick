@@ -95,6 +95,13 @@ fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
         Err(NativeProcessError::Fault)
     );
     assert_eq!(slot.selection_snapshot().0, 0);
+    // ARM: HVF answered "not now" (a fork child's editor held elsewhere,
+    // #3042): contention, never a fault.
+    assert_eq!(
+        supply(&|| Err(NativeProcessError::Busy)),
+        Err(NativeProcessError::Busy)
+    );
+    assert_eq!(slot.selection_snapshot().0, 0);
     // x86: the carrier met the MM's editor held and supplied nothing.
     assert_eq!(supply(&|| Ok(())), Err(NativeProcessError::Busy));
     assert_eq!(slot.selection_snapshot().0, 0);
@@ -1273,8 +1280,13 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            carrick_el1::isa::aarch64::cross_hvc_cow_supply(address.raw(), cpu)
-                .map_err(|_| NativeProcessError::Fault)
+            // Contention is "not now", never a fault (#3042): the lane
+            // withdraws its selection and reruns its copy.
+            match carrick_el1::isa::aarch64::cross_hvc_cow_supply(address.raw(), cpu) {
+                carrick_el1_abi::CowSupplyAnswer::Supplied => Ok(()),
+                carrick_el1_abi::CowSupplyAnswer::NotNow => Err(NativeProcessError::Busy),
+                carrick_el1_abi::CowSupplyAnswer::Refused => Err(NativeProcessError::Fault),
+            }
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
@@ -2886,8 +2898,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
             };
             let slot = slots.grant(usize::from(self.slot.raw()))?;
-            let mm = self.task.mm.key.load(Ordering::Acquire);
-            let (sequence, _) = slot.pending_fault_selection(mm, address.raw())?;
+            let mm = ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
+            // The slot's own selection names its page: a preparation that
+            // spans pages may select a later page than the one it starts on.
+            let (sequence, window) = slot.pending_fault_selection_for_mm(mm)?;
+            let address = if window.fault_page == address.raw() & !4095 {
+                address
+            } else {
+                UserVa::new(window.fault_page)
+            };
             Some((
                 carrick_guest_arch::FaultInfo {
                     address,

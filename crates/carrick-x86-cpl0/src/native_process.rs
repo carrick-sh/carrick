@@ -869,10 +869,17 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let layout = carrick_el1::isa::x86_kernel_layout();
         // SAFETY: boot retains the initialized per-CPU selection portal.
         let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
-        let mm = self.task.mm.key.load(Ordering::Acquire);
-        let (sequence, _) = slots
+        let mm = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
+        // The slot's own selection names its page: a preparation that spans
+        // pages may select a later page than the one it starts on.
+        let (sequence, window) = slots
             .grant(usize::from(self.slot.raw()))?
-            .pending_fault_selection(mm, address.raw())?;
+            .pending_fault_selection_for_mm(mm)?;
+        let address = if window.fault_page == address.raw() & !4095 {
+            address
+        } else {
+            UserVa::new(window.fault_page)
+        };
         Some((
             carrick_guest_arch::FaultInfo {
                 address,
