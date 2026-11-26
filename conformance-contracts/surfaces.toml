@@ -29,6 +29,8 @@ surfaces = [
   { path = "crates/carrick-aarch64/src/stage1_authority.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-aarch64/src/stage1_authority.rs", contract = "kernel.mm.metadata-refusal" },
   { path = "crates/carrick-aarch64/src/stage2.rs", contracts = [] },
+  { path = "crates/carrick-aarch64/src/stage2/records.rs", contracts = [] },
+  { path = "crates/carrick-aarch64/src/stage2/records/tests.rs", contracts = [] },
   { path = "crates/carrick-aarch64/src/staged_cpu.rs", contract = "kernel.vcpu.vm-lifetime" },
   { path = "crates/carrick-aarch64/src/stopped_abi.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-aarch64/src/stopped_abi.rs", contract = "process.native.terminal-child" },

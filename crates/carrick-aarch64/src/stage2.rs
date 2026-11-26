@@ -10,6 +10,8 @@
 
 use carrick_hal::MemPerms;
 
+pub mod records;
+
 /// A backend's raw status for one stage-2 operation. Zero is success; any
 /// other value is the backend's own refusal code, kept exact so a log or a
 /// [`carrick_core_abi::mm::custody::CarrierStage2BackendError`] names what the
