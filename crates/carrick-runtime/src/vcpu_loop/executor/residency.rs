@@ -399,8 +399,12 @@ mod tests {
             .expect("a repeated owner wait still owns its syscall");
             // SAFETY: this newly allocated record has not been published.
             unsafe {
-                *zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
+                *zone.record(record).ctx_mut() = carrick_el1_abi::Aarch64ParkedContext::admitted(
+                    carrick_sched_core::Aarch64EntryContext::saved(&ctx),
+                    0,
+                    1,
+                    1,
+                )
             };
             {
                 let guard = zone
@@ -510,8 +514,12 @@ mod tests {
         .unwrap();
         // SAFETY: the freshly allocated record has not been published.
         unsafe {
-            *zone.record(record).ctx_mut() =
-                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0x4000, 1, 1)
+            *zone.record(record).ctx_mut() = carrick_el1_abi::Aarch64ParkedContext::admitted(
+                carrick_sched_core::Aarch64EntryContext::saved(&ctx),
+                0x4000,
+                1,
+                1,
+            )
         };
         let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
             panic!("AArch64 fixture");

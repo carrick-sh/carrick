@@ -170,11 +170,14 @@ pub(super) enum ZoneExit {
     El0,
 }
 
-/// The EL0 context a thread resumes with, from a live-vCPU capture.
+/// The EL0 context a thread resumes with, from a live-vCPU capture, saved
+/// with where its PC sits (#2900): only a completed syscall resumes after its
+/// `SVC`; a call rewound to re-issue it and an EL0 stop are at their resume
+/// point. Unbound: [`parked_context`] binds it to the thread's root.
 pub(super) fn zone_ctx_from_state(
     state: &GuestCpuState,
     exit: ZoneExit,
-) -> Result<ThreadCtx, RuntimeError> {
+) -> Result<Aarch64ParkedContext, RuntimeError> {
     let GuestCpuState::Aarch64V1(s) = state else {
         return Err(RuntimeError::Configuration(
             "EL1 zone capture on a non-AArch64 task".to_owned(),
@@ -196,11 +199,22 @@ pub(super) fn zone_ctx_from_state(
         (s.elr_el1, s.spsr_el1),
         exit,
     )?;
-    Ok(ctx)
+    Ok(Aarch64ParkedContext::trapped(
+        ctx,
+        match exit {
+            ZoneExit::Syscall { completed: true } => {
+                carrick_sched_core::SavedSyscallPc::AfterSyscall
+            }
+            ZoneExit::Syscall { completed: false } | ZoneExit::El0 => {
+                carrick_sched_core::SavedSyscallPc::AtSyscall
+            }
+        },
+    ))
 }
 
+/// Bind a saved zone context to the thread's root, keeping its position.
 fn parked_context(
-    native: ThreadCtx,
+    saved: &Aarch64ParkedContext,
     state: &GuestCpuState,
     identity: ThreadIdentity,
 ) -> Result<Aarch64ParkedContext, RuntimeError> {
@@ -209,8 +223,8 @@ fn parked_context(
             "zone parked a non-AArch64 task".to_owned(),
         ));
     };
-    Ok(Aarch64ParkedContext::from_register(
-        native,
+    Ok(Aarch64ParkedContext::admitted(
+        carrick_sched_core::Aarch64EntryContext::saved(saved),
         cpu.ttbr0,
         identity.mm,
         cpu.asid_generation,
@@ -484,7 +498,7 @@ where
                 // handback below.
                 unsafe {
                     *zone.record(current).ctx_mut() =
-                        parked_context(ctx, &ctx_state, zone.record(current).identity())?
+                        parked_context(&ctx, &ctx_state, zone.record(current).identity())?
                 };
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
@@ -776,7 +790,7 @@ where
                     Ok(record) => {
                         // SAFETY: freshly allocated and not yet published.
                         unsafe {
-                            *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)?
+                            *zone.record(record).ctx_mut() = parked_context(&ctx, &state, identity)?
                         };
                         let seq = zone.next_seq(record);
                         let enrollment = carrick_sched_core::FutexEnrollment {
@@ -928,7 +942,7 @@ where
             RuntimeError::Configuration(format!("IPC lock wait record unavailable: {error:?}"))
         })?;
         // SAFETY: this freshly allocated record has not been published.
-        unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+        unsafe { *zone.record(record).ctx_mut() = parked_context(&ctx, &state, identity)? };
         let seq = zone.next_seq(record);
         if let Err((error, _token)) = pending.defer(record, token) {
             // Nothing was transferred; a release race is not an error here
@@ -1108,7 +1122,7 @@ where
         })?;
         // SAFETY: this freshly allocated record has not been published.
         if let Some((state, ctx, _)) = &syscall_state {
-            unsafe { *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity)? };
+            unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, state, identity)? };
         }
         let seq = zone.next_seq(record);
         let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
@@ -1905,8 +1919,8 @@ where
         let state = engine.snapshot_guest_state_for_publication()?;
         // Resume at the SVC with the original call's registers.
         let mut ctx = zone_ctx_from_state(&state, exit)?;
-        ctx.x[0] = request.args.0[0];
-        ctx.x[8] = request.number.raw();
+        ctx.native.x[0] = request.args.0[0];
+        ctx.native.x[8] = request.number.raw();
         let key = host_ipc::wait_key(park.object, park.lane)
             .ok_or_else(|| ipc_error("wait key", park.object))?;
         let deadline = park.deadline;
@@ -1924,7 +1938,7 @@ where
                 .alloc_record(identity)
                 .map_err(|error| ipc_error("park record", error))?;
             // SAFETY: freshly allocated and not yet published.
-            unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+            unsafe { *zone.record(record).ctx_mut() = parked_context(&ctx, &state, identity)? };
             let token = host_ipc::to_sched_token(park.token)
                 .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
             // The park's sequence (the same one `park` publishes).
@@ -2280,8 +2294,85 @@ mod ipc_tests {
             lifecycle_page: 0,
             control_slot: 0,
         };
-        let parked = parked_context(ThreadCtx::ZERO, &state, identity).unwrap();
+        let parked = parked_context(&Aarch64ParkedContext::ZERO, &state, identity).unwrap();
         assert_eq!(parked.generation(), 101);
+    }
+
+    /// A thread the host takes off its vCPU is parked with where its PC sits
+    /// (#2900): only a completed call resumes after its `SVC`. A call rewound
+    /// to re-issue it is on its `SVC` and an EL0 stop is at its resume
+    /// point, so a later rerun rewinds the first once and the second never.
+    #[test]
+    fn zone_parks_each_exit_with_its_syscall_position() {
+        use carrick_sched_core::SavedSyscallPc::{AfterSyscall, AtSyscall};
+        let GuestCpuState::Aarch64V1(cpu) =
+            crate::vcpu_loop::executor::tests::test_guest_cpu_state(0x100)
+        else {
+            unreachable!();
+        };
+        let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = 0x10000;
+        cpu.asid_generation = 101;
+        cpu.trap_pc = 0x8000;
+        cpu.trap_pstate = 0;
+        cpu.syscall_continuation = Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+            sequence: 1,
+            state: 1,
+            trap_kind: 1,
+            response_action: 0,
+            flags: 0,
+            native_nr: 63,
+            args: [7, 0, 0, 0, 0, 0],
+            x8: 63,
+            resume_pc: 0x4004,
+            spsr: 0,
+            fp: 0,
+            lr: 0,
+            sp: 0x7000,
+            esr: 0x15 << 26,
+            return_value: 0,
+            resume_x16: 0,
+            resume_x17: 0,
+        });
+        let state = GuestCpuState::from_aarch64_v1(cpu);
+        let identity = ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        for (exit, expected, rerun) in [
+            (
+                ZoneExit::Syscall { completed: true },
+                (0x4004, Some(AfterSyscall)),
+                0x4000,
+            ),
+            (
+                ZoneExit::Syscall { completed: false },
+                (0x4000, Some(AtSyscall)),
+                0x4000,
+            ),
+            (ZoneExit::El0, (0x8000, Some(AtSyscall)), 0x8000),
+        ] {
+            let saved = zone_ctx_from_state(&state, exit).unwrap();
+            let parked = parked_context(&saved, &state, identity).unwrap();
+            assert_eq!(
+                (parked.native.pc, parked.saved_syscall_pc()),
+                expected,
+                "{exit:?}"
+            );
+            assert_eq!(
+                parked.saved_syscall_pc().and_then(|position| position
+                    .syscall_instruction(parked.native.pc, carrick_guest_arch::AARCH64_SVC_LEN)),
+                Some(rerun),
+                "{exit:?}: a rerun rewinds at most once"
+            );
+        }
     }
 
     #[test]
