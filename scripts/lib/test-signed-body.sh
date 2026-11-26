@@ -479,6 +479,12 @@ if [ "$pkg" = "carrick-conformance-next" ]; then
         CARGO_TARGET_DIR="$PWD/target/signal-untouched-altstack-threads" \
         cargo build --locked --manifest-path "$sigaltstack_fixture/Cargo.toml" \
         --target aarch64-unknown-linux-musl --release
+    cow_read_fixture="crates/carrick-conformance-next/tests/fixtures/cow-read-threads"
+    cow_read_source_sha256="$(shasum -a 256 "$cow_read_fixture/src/main.rs" | cut -d ' ' -f 1)"
+    CARRICK_COW_READ_THREADS_SOURCE_SHA256="$cow_read_source_sha256" \
+        CARGO_TARGET_DIR="$PWD/target/cow-read-threads" \
+        cargo build --locked --manifest-path "$cow_read_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release
 fi
 
 # 1. Build (never run) the package's test executables and collect their
