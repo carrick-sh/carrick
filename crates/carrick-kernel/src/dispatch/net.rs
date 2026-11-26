@@ -119,6 +119,34 @@ pub(in crate::dispatch) fn host_poll_interest(requested: i16) -> i16 {
     host
 }
 
+/// Linux poll readiness of one host descriptor, sampled now (a zero
+/// timeout `poll(2)`): no bits when nothing requested is ready.
+pub(in crate::dispatch) fn host_fd_poll_revents(fd: i32, requested: i16) -> i16 {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: host_poll_interest(requested),
+        revents: 0,
+    };
+    // SAFETY: one pollfd on the stack, a zero timeout.
+    let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+    if n > 0 {
+        linux_poll_revents(pfd.revents, requested)
+    } else {
+        0
+    }
+}
+
+/// The bits a stdio stream reports whatever its host descriptor says: the
+/// established bare-stdio contract reports writable stdin even if the
+/// carrier's fd 0 is read-only.
+pub(in crate::dispatch) fn stdio_always_ready(fd: i32, requested: i16) -> i16 {
+    if fd == 0 {
+        requested & LINUX_POLLOUT
+    } else {
+        0
+    }
+}
+
 fn linux_poll_revents(native_events: i16, requested: i16) -> i16 {
     let mut linux = 0;
     for (guest, native) in [
@@ -1102,25 +1130,8 @@ impl<'a> NetView<'a> {
                     requested_events & LINUX_POLLOUT
                 }
                 Some(super::fs::state::StdioReadiness::Host(host_fd)) => {
-                    let mut pfd = libc::pollfd {
-                        fd: host_fd.raw(),
-                        events: host_poll_interest(requested_events),
-                        revents: 0,
-                    };
-                    let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                    let revents = if n > 0 {
-                        linux_poll_revents(pfd.revents, requested_events)
-                    } else {
-                        0
-                    };
-                    // The established bare-stdio contract reports writable
-                    // stdin even if the carrier's fd 0 is read-only.
-                    revents
-                        | if fd == 0 {
-                            requested_events & LINUX_POLLOUT
-                        } else {
-                            0
-                        }
+                    host_fd_poll_revents(host_fd.raw(), requested_events)
+                        | stdio_always_ready(fd, requested_events)
                 }
                 None => LINUX_POLLNVAL,
             }

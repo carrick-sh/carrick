@@ -740,16 +740,17 @@ enum SelectInterest {
     /// No set names a descriptor: served as an empty readiness set.
     None,
     /// Exactly one descriptor: the single-description owner, unless it is a
-    /// carrier socket (the readiness set serves that one, from the bitmaps).
+    /// host descriptor (the readiness set serves that one, from the bitmaps).
     One(crate::file_table::PollFd, alloc::vec::Vec<u64>),
     /// Several descriptors: the read, write and except bitmaps, `words`
     /// each, bits at or above `nfds` cleared.
     Many(alloc::vec::Vec<u64>),
 }
 
-/// Whether a one-descriptor select names a carrier socket the readiness set
-/// serves (#1051): the single-description owner waits on zone objects only.
-fn one_carrier_socket(
+/// Whether a one-descriptor select names a host descriptor the readiness set
+/// serves (#1051), of any kind: the single-description owner waits on zone
+/// objects only.
+fn one_host_descriptor(
     region: &IpcRegion<'_>,
     table: TableId,
     fd: i32,
@@ -1282,7 +1283,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     user,
                 ) {
                     Ok(SelectInterest::One(decoded, sets)) => {
-                        if one_carrier_socket(region, table, decoded.fd, frame) {
+                        if one_host_descriptor(region, table, decoded.fd, frame) {
                             Some(sets)
                         } else {
                             pollfd = decoded;
@@ -1403,7 +1404,7 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     user,
                 ) {
                     Ok(SelectInterest::One(decoded, sets)) => {
-                        if one_carrier_socket(region, table, decoded.fd, frame) {
+                        if one_host_descriptor(region, table, decoded.fd, frame) {
                             Some(sets)
                         } else {
                             pollfd = decoded;

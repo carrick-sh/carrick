@@ -25,20 +25,25 @@
 //! single-description protocol exactly; so does a full operation arena
 //! (`super::begin_readiness_operation`).
 //!
-//! A host-backed descriptor (a carrier socket) joins the same transient
-//! epoll as a carrier-socket item (#1051). The ring cannot register a host
+//! A host-backed descriptor of any kind (a carrier socket, a host file,
+//! pipe or terminal, a stdio stream) joins the same transient epoll as a
+//! carrier item (#1051): this set is the one owner of `select` and
+//! `pselect6` on a native venue. The ring cannot register a host
 //! descriptor itself, so a set naming one admits its operation, retains
 //! it, and hands the carrier one `ReadinessSetCtl` record naming each such
 //! member by the host resource token pinned at enrolment. The carrier
-//! registers them through the one ADD body a guest `epoll_ctl` uses and
-//! publishes each one's initial level as an edge; the venue then reruns the
-//! call, which takes its retained operation ([`resume`]) and harvests the
+//! registers them through the one ADD body a guest `epoll_ctl` uses, with
+//! Linux's readiness per kind (a regular file is always readable and
+//! writable), and publishes each one's initial level as an edge; a member
+//! it cannot serve exactly leaves the whole call unrouted (a counted
+//! ENOSYS); the venue then reruns the
+//! call, which takes its retained operation (`resume`) and harvests the
 //! whole set once before it parks on the epoll's lane, as a zone-only set
 //! does. A carrier-held epoll lock is "not now": the harvest enrols on the
 //! holder's release and reruns (`super::epoll_harvest`).
 //!
 //! Scope: every selected descriptor must be a zone object an epoll can
-//! hold (pipe ends, eventfds, stream ends) or a carrier socket, on a venue
+//! hold (pipe ends, eventfds, stream ends) or a host descriptor, on a venue
 //! that publishes ring records ([`GuestDispatchFrame::accepts_ring_record`]).
 //! A host descriptor on any other venue, a nested epoll, a member already
 //! watched by [`carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS`] epolls, or
