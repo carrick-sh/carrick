@@ -148,8 +148,10 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     fn group_exit_custody(
         &self,
         _task: &carrick_el1_abi::CurrentTask,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    ) -> super::signal_delivery::SignalReturnRoute {
+        super::signal_delivery::SignalReturnRoute::Refused(
+            super::signal_delivery::SignalReturnRefusal::GroupExitCustody,
+        )
     }
 }
 
@@ -372,6 +374,7 @@ where
     super::signal_delivery::deliver_signal_on_syscall_return(
         task, control, process, frame, fpstate, machine,
     )
+    .map(super::signal_delivery::SignalReturnRoute::completion_route)
 }
 
 /// Internal EL0t DAIF mask stored in `TrapFrame.spsr` and `ThreadCtx.pstate` across the EL1

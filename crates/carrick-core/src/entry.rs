@@ -400,30 +400,48 @@ pub fn yield_current_to_host<C: EntryContext>(
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
     completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
-) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    let start = prepare_handoff(binding, source, record)?;
+) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, HostYieldRefusal> {
+    let start = prepare_handoff(binding, source, record).ok_or(HostYieldRefusal::Binding)?;
     let retained = source.zone.record(record);
-    if retained.has_object_operation()
-        || retained.resume_disposition()
-            != carrick_sched_core::object_wait::ResumeDisposition::UserReturn
-    {
-        return None;
+    if retained.has_object_operation() {
+        return Err(HostYieldRefusal::ObjectOperation);
     }
-    if !matches!(
-        source.zone.claim_for_host(
-            source.zone.record_ref(record),
-            None,
-            carrick_sched_core::Handback::Control,
-            &carrick_sched_core::ShortLockSpin,
-         completion),
-        carrick_sched_core::HostClaim::El1Held { slot } if slot == source.slot
+    if retained.resume_disposition()
+        != carrick_sched_core::object_wait::ResumeDisposition::UserReturn
+    {
+        return Err(HostYieldRefusal::NotUserReturn);
+    }
+    match source.zone.claim_for_host(
+        source.zone.record_ref(record),
+        None,
+        carrick_sched_core::Handback::Control,
+        &carrick_sched_core::ShortLockSpin,
+        completion,
     ) {
-        return None;
+        carrick_sched_core::HostClaim::El1Held { slot } if slot == source.slot => {}
+        claim => return Err(HostYieldRefusal::Claim(claim)),
     }
     // The successful transition proves publication even if the host claims
     // the row immediately after the queue lock is released. Do not reread
     // its now independently owned custody to decide whether we handed off.
-    start.published_yield(source.zone.unswitch(source.slot, record))
+    start
+        .published_yield(source.zone.unswitch(source.slot, record))
+        .ok_or(HostYieldRefusal::Unpublished)
+}
+
+/// Why the current record could not yield to its host owner (#3043).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostYieldRefusal {
+    /// The record no longer carries this execution binding.
+    Binding,
+    /// The record still owns an object operation.
+    ObjectOperation,
+    /// The record does not resume with a user return.
+    NotUserReturn,
+    /// The scheduler's host claim did not find it held on this slot.
+    Claim(carrick_sched_core::HostClaim),
+    /// The slot's switch-out did not publish the record.
+    Unpublished,
 }
 
 /// Authenticate and retire the current record through its existing owner.

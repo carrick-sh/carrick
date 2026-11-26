@@ -3018,7 +3018,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         ))?;
         match outcome {
             LifecycleOutcome::HostCustody => {
-                if !self.yield_terminal_host_custody() {
+                if self.yield_terminal_host_custody().is_err() {
                     return Err(NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::RetainedHostCustody,
                     ));
@@ -4245,7 +4245,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source,
                 self.record.id,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-            );
+            )
+            .ok();
             if self.handoff.is_some() {
                 self.current.linux.mark_pending_host_work();
             }

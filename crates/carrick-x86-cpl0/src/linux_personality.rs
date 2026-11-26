@@ -473,7 +473,10 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
         carrick_guest_arch::rerun_interrupted_syscall(frame, original)
     }
 
-    fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
+    fn group_exit_custody(
+        &self,
+        task: &CurrentTask,
+    ) -> carrick_el1_linux::signal_delivery::SignalReturnRoute {
         complete_run_failure(
             task,
             carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody.at_caller(),
@@ -514,7 +517,7 @@ pub(crate) fn deliver_signal_on_syscall_return(
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
     machine: &mut X86SignalMachine,
-) -> Option<CompletionRoute> {
+) -> Option<carrick_el1_linux::signal_delivery::SignalReturnRoute> {
     let (_, control) = task.lifecycle_refs()?;
     #[cfg(feature = "test-support")]
     crate::test_support::block_sigusr1_at_checkpoint(control);
@@ -584,8 +587,8 @@ pub fn signal_user_return(
             xsave,
             &mut X86SignalMachine::new(address),
         ) {
-            if route != CompletionRoute::Suspended {
-                fatal_boot!();
+            if route != carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended {
+                fatal_boot!(route.name());
             }
             suspended = true;
         }
@@ -672,8 +675,8 @@ pub fn signal_irq_return(
             xsave,
             &mut X86SignalMachine::new(runtime_address),
         ) {
-            if route != CompletionRoute::Suspended {
-                fatal_boot!();
+            if route != carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended {
+                fatal_boot!(route.name());
             }
             suspended = true;
         }
@@ -2052,7 +2055,7 @@ impl Personality for LinuxPersonality {
                     &mut X86SignalMachine::new(address),
                 )
             {
-                route = r;
+                route = r.completion_route();
             }
             let root_exit = process.take_root_exit();
             (route, root_exit)

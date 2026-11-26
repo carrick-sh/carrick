@@ -3742,7 +3742,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                             backend: ArmWaitSignalBackend,
                         },
                     ),
-                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended),
+                    Some(crate::signal_delivery::SignalReturnRoute::Suspended),
                     "default SIGPIPE owns terminal disposition before EPIPE reaches EL0"
                 );
             }
@@ -11410,11 +11410,10 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         ctx.native.sp_el0 = self.user_sp.raw();
     }
 
-    fn group_exit_custody(
-        &self,
-        _task: &CurrentTask,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    fn group_exit_custody(&self, _task: &CurrentTask) -> crate::signal_delivery::SignalReturnRoute {
+        crate::signal_delivery::SignalReturnRoute::Refused(
+            crate::signal_delivery::SignalReturnRefusal::GroupExitCustody,
+        )
     }
 }
 

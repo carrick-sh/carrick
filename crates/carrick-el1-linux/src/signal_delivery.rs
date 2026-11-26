@@ -11,6 +11,120 @@ use carrick_personality_linux::lifecycle::LifecycleOutcome;
 use carrick_personality_linux::signal::{ProcessSignals, SignalBackend, SignalFrameSetup};
 use carrick_signal_core::policy::{self, SigBlockMask, Signal};
 
+/// What a signal-return checkpoint decided, for its caller to handle by name
+/// (#3043). A refusal names the site that refused, so a caller that must fail
+/// reports which invariant broke instead of one folded label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalReturnRoute {
+    /// The member left this return: a deferred frame copy parked it, it
+    /// yielded to its exact host owner, or it is exiting.
+    Suspended,
+    /// A host-loaded member's host custody: it returns to user, and its
+    /// executor retires it at that executor's next host-work boundary.
+    Served,
+    /// A broken invariant, at the named site.
+    Refused(SignalReturnRefusal),
+}
+
+/// The site at which a signal-return checkpoint refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalReturnRefusal {
+    /// The owed terminal user return transferred after it made progress.
+    TerminalTransferProgressed,
+    /// The owed terminal user return settled with an outcome a terminal
+    /// return cannot have (a return, a redispatch).
+    TerminalReturnOutcome,
+    /// Host custody on a slot that runs another record.
+    HostCustodyOtherRecord,
+    /// Host custody on a slot that runs no record, for a member that is not
+    /// the slot's host record.
+    HostCustodyUnowned,
+    /// Host custody: the switched-in record could not yield to its host owner.
+    HostCustodyYield(carrick_core::entry::HostYieldRefusal),
+    /// A default-terminating signal's group exit failed.
+    TerminateExit,
+    /// The machine has no group-exit custody transport.
+    GroupExitCustody,
+    /// The selected delivery has no handler.
+    NoHandler,
+    /// The handler frame copy found a stale or quarantined owner.
+    FrameCopy,
+    /// Preparing the handler frame's range found a broken owner.
+    FramePrepare,
+    /// Retaining the deferred delivery failed.
+    RetainDelivery,
+    /// Forcing SIGSEGV after a failed delivery failed.
+    ForceSigsegv,
+}
+
+impl SignalReturnRefusal {
+    /// The refusal's stable name, as a fatal report's message.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TerminalTransferProgressed => {
+                "signal return refused: terminal_transfer_progressed"
+            }
+            Self::TerminalReturnOutcome => "signal return refused: terminal_return_outcome",
+            Self::HostCustodyOtherRecord => "signal return refused: host_custody_other_record",
+            Self::HostCustodyUnowned => "signal return refused: host_custody_unowned",
+            Self::HostCustodyYield(refusal) => {
+                use carrick_core::entry::HostYieldRefusal as Y;
+                use carrick_sched_core::HostClaim as H;
+                match refusal {
+                    Y::Binding => "signal return refused: host_custody_yield: binding",
+                    Y::ObjectOperation => {
+                        "signal return refused: host_custody_yield: object_operation"
+                    }
+                    Y::NotUserReturn => {
+                        "signal return refused: host_custody_yield: not_user_return"
+                    }
+                    Y::Claim(H::Claimed) => {
+                        "signal return refused: host_custody_yield: claim_claimed"
+                    }
+                    Y::Claim(H::El1Held { .. }) => {
+                        "signal return refused: host_custody_yield: claim_other_slot"
+                    }
+                    Y::Claim(H::Deferred) => {
+                        "signal return refused: host_custody_yield: claim_deferred"
+                    }
+                    Y::Claim(H::AlreadyHost) => {
+                        "signal return refused: host_custody_yield: claim_already_host"
+                    }
+                    Y::Claim(H::Stale) => "signal return refused: host_custody_yield: claim_stale",
+                    Y::Unpublished => "signal return refused: host_custody_yield: unpublished",
+                }
+            }
+            Self::TerminateExit => "signal return refused: terminate_exit",
+            Self::GroupExitCustody => "signal return refused: group_exit_custody",
+            Self::NoHandler => "signal return refused: no_handler",
+            Self::FrameCopy => "signal return refused: frame_copy",
+            Self::FramePrepare => "signal return refused: frame_prepare",
+            Self::RetainDelivery => "signal return refused: retain_delivery",
+            Self::ForceSigsegv => "signal return refused: force_sigsegv",
+        }
+    }
+}
+
+impl SignalReturnRoute {
+    /// The verdict's stable name, as a fatal report's message.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Suspended => "signal return: suspended",
+            Self::Served => "signal return: served",
+            Self::Refused(refusal) => refusal.name(),
+        }
+    }
+
+    /// The common completion owner's route for this verdict.
+    pub const fn completion_route(self) -> CompletionRoute {
+        match self {
+            Self::Suspended => CompletionRoute::Suspended,
+            Self::Served => CompletionRoute::Served,
+            Self::Refused(_) => CompletionRoute::InvalidCompletion,
+        }
+    }
+}
+
 /// Machine-specific register operations surrounding the shared selection.
 pub trait SignalMachine<C> {
     type Backend: SignalBackend;
@@ -33,7 +147,7 @@ pub trait SignalMachine<C> {
     ) -> Option<bool> {
         None
     }
-    fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
+    fn group_exit_custody(&self, task: &CurrentTask) -> SignalReturnRoute;
     /// Reflect the successfully published frame in a saved execution context.
     fn published_stack(&mut self, _sp: UserVa) {}
     /// Copy the current pre-handler return frame into the parked context before
@@ -54,13 +168,14 @@ pub fn deliver_signal_on_syscall_return<'a, M, C, S, A>(
     frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
     fpstate: &[u8],
     machine: &mut A,
-) -> Option<CompletionRoute>
+) -> Option<SignalReturnRoute>
 where
     M: Clone,
     C: ProcessContext,
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    use SignalReturnRefusal as Refusal;
     if !process.matches_signal_return(task, slot) {
         return None;
     }
@@ -69,9 +184,14 @@ where
             LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
                 ..
-            } => CompletionRoute::Suspended,
+            } => SignalReturnRoute::Suspended,
+            LifecycleOutcome::Transferred { .. } => {
+                SignalReturnRoute::Refused(Refusal::TerminalTransferProgressed)
+            }
             LifecycleOutcome::HostCustody => process.user_return_host_custody(),
-            _ => CompletionRoute::InvalidCompletion,
+            LifecycleOutcome::Returned { .. } | LifecycleOutcome::Redispatch => {
+                SignalReturnRoute::Refused(Refusal::TerminalReturnOutcome)
+            }
         });
     }
     // A raw `exit` never returns to user mode: its resumed retry reruns the
@@ -151,9 +271,9 @@ where
                 return if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                     Some(match process.exit_with_signal(sig) {
                         Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
-                        Ok(_) => CompletionRoute::Suspended,
+                        Ok(_) => SignalReturnRoute::Suspended,
                         Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
-                        Err(_) => CompletionRoute::InvalidCompletion,
+                        Err(_) => SignalReturnRoute::Refused(Refusal::TerminateExit),
                     })
                 } else {
                     if carrick_signal_core::wait::interrupted_wait(
@@ -198,7 +318,7 @@ where
     };
 
     let policy::Disposition::Handler(handler) = action.disposition else {
-        return Some(CompletionRoute::InvalidCompletion);
+        return Some(SignalReturnRoute::Refused(Refusal::NoHandler));
     };
     let interrupted_sp = machine.user_sp(frame);
     let selected_stack = carrick_personality_linux::signal::delivery_stack(
@@ -292,7 +412,7 @@ where
             },
         );
         if invariant_failure {
-            return Some(CompletionRoute::InvalidCompletion);
+            return Some(SignalReturnRoute::Refused(Refusal::FrameCopy));
         }
         match setup {
             Ok(SignalFrameSetup::Installed(published_sp)) => {
@@ -309,7 +429,7 @@ where
                             | NativeProcessError::Quarantined
                             | NativeProcessError::Invalid
                             | NativeProcessError::ServiceQuarantined(_),
-                        ) => return Some(CompletionRoute::InvalidCompletion),
+                        ) => return Some(SignalReturnRoute::Refused(Refusal::FramePrepare)),
                         // The owner refuses the range (no mapping, no
                         // write permission, executable COW): Linux cannot
                         // write the frame either and forces SIGSEGV.
@@ -338,11 +458,11 @@ where
                     thread_blocked,
                     deferral,
                 ) {
-                    Ok(()) => return Some(CompletionRoute::Suspended),
+                    Ok(()) => return Some(SignalReturnRoute::Suspended),
                     Err(NativeProcessError::GroupExitCustody) => {
                         return Some(machine.group_exit_custody(task));
                     }
-                    Err(_) => return Some(CompletionRoute::InvalidCompletion),
+                    Err(_) => return Some(SignalReturnRoute::Refused(Refusal::RetainDelivery)),
                 }
             }
             Err(_) => {
@@ -402,13 +522,14 @@ fn force_delivery_fault<'a, M, C, S, A>(
     fpstate: &[u8],
     machine: &mut A,
     failure: SignalDeliveryFailure,
-) -> Option<CompletionRoute>
+) -> Option<SignalReturnRoute>
 where
     M: Clone,
     C: ProcessContext,
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    use SignalReturnRefusal as Refusal;
     let SignalDeliveryFailure { original, blocked } = failure;
     if let Some((_, code, address, _)) = slot.synchronous_fault() {
         // Match host synchronous injection: an unusable handler stack is
@@ -420,13 +541,13 @@ where
     if original == Signal::SEGV {
         return Some(match process.exit_with_signal(Signal::SEGV) {
             Ok(LifecycleOutcome::HostCustody) => process.user_return_host_custody(),
-            Ok(_) => CompletionRoute::Suspended,
+            Ok(_) => SignalReturnRoute::Suspended,
             Err(NativeFailure::GroupExitCustody) => machine.group_exit_custody(task),
-            Err(_) => CompletionRoute::InvalidCompletion,
+            Err(_) => SignalReturnRoute::Refused(Refusal::TerminateExit),
         });
     }
     if process.force_sigsegv(blocked).is_err() {
-        return Some(CompletionRoute::InvalidCompletion);
+        return Some(SignalReturnRoute::Refused(Refusal::ForceSigsegv));
     }
     let mask = blocked.signals().without(Signal::SEGV);
     let _ = slot.store_blocked_then_read_pending(BlockedMask(mask.bits()), slot.pending());

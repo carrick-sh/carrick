@@ -1181,10 +1181,7 @@ impl NativeSignalFixture {
         &self,
         queue: &carrick_el1_abi::SharedSignalIngressQueue,
         frame: &mut carrick_el1_abi::TrapFrame,
-    ) -> (
-        usize,
-        Option<carrick_personality_linux::dispatch::CompletionRoute>,
-    ) {
+    ) -> (usize, Option<crate::signal_delivery::SignalReturnRoute>) {
         use zerocopy::IntoBytes;
         let mut service = self.service();
         let drained = self
@@ -1269,11 +1266,10 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
-    fn group_exit_custody(
-        &self,
-        _: &CurrentTask,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    fn group_exit_custody(&self, _: &CurrentTask) -> crate::signal_delivery::SignalReturnRoute {
+        crate::signal_delivery::SignalReturnRoute::Refused(
+            crate::signal_delivery::SignalReturnRefusal::GroupExitCustody,
+        )
     }
 }
 
@@ -1301,11 +1297,10 @@ impl crate::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     fn restart_forwarded(&mut self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
-    fn group_exit_custody(
-        &self,
-        _: &CurrentTask,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    fn group_exit_custody(&self, _: &CurrentTask) -> crate::signal_delivery::SignalReturnRoute {
+        crate::signal_delivery::SignalReturnRoute::Refused(
+            crate::signal_delivery::SignalReturnRefusal::GroupExitCustody,
+        )
     }
 }
 
