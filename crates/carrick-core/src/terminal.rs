@@ -1719,6 +1719,10 @@ mod tests {
             page.terminal.cancellation(),
             Some(ProcessCancellation::FatalSignal)
         );
+        // Only the causes no settlement can retract are terminal.
+        assert!(ProcessCancellation::FatalSignal.is_terminal());
+        assert!(ProcessCancellation::GroupExit.is_terminal());
+        assert!(!ProcessCancellation::Exec.is_terminal());
     }
 
     #[test]
