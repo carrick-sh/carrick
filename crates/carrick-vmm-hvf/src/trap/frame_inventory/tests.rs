@@ -4734,6 +4734,10 @@ fn serial_host_shared_arc_global_frame_owner_transitions_to_pending_until_all_ho
 fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
+    // Its own live custody: the safe-point drain walks every owner in the
+    // custody, so an owner another test left in the shared legacy custody
+    // would take the injected failure meant for this one.
+    let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
     let mut lease =
         GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global frame IPA");
     let key = lease.key();
@@ -4742,46 +4746,47 @@ fn explicit_live_vm_safe_point_retries_pending_retirements_or_reports_failure() 
         crate::host_mapping::HostMappingKind::PerMmKernelState,
     )
     .expect("allocate kernel state host mapping");
-
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
     let stage2_mapping = crate::trap::stage2_backend::test_stage2_map(
-        legacy_test_carrier_vm_custody(),
+        &custody,
         host.as_ptr().cast(),
         key.0,
         key.1 as usize,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
+        perms,
     );
     lease.mark_mapped(stage2_mapping);
 
-    let owner_generation = register_global_frame_host_owner(
-        lease,
-        host,
-        carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite),
-    )
-    .expect("register global frame host owner");
+    let owner_generation = register_global_frame_host_owner_in(&custody, lease, host, perms)
+        .expect("register global frame host owner");
 
     // Injected unmap failure
     _stage2_stub.set_fail_next_unmap(true);
-    let _ = retire_global_frame_host_owner_if_generation(key.0, key.1, owner_generation);
+    let _ =
+        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, owner_generation);
     assert!(
-        global_frame_host_owners()
+        custody
+            .global_frame_host_owners
             .lock()
             .get(&key)
             .is_some_and(|e| e.is_pending()),
         "owner must be in RetirementPending",
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
 
     // Persistent failure during an explicit live-VM retry remains pending.
     _stage2_stub.set_fail_next_unmap(true);
-    let drain_err = drain_and_retry_pending_global_frame_retirements();
+    let drain_err = drain_and_retry_pending_global_frame_retirements_in(&custody);
     assert!(
         drain_err.is_err(),
         "safe-point retry must report persistent unmap failure",
     );
+    assert!(ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
 
     // Clearing unmap failure allows the explicit safe point to complete.
-    let drain_ok = drain_and_retry_pending_global_frame_retirements();
+    let drain_ok = drain_and_retry_pending_global_frame_retirements_in(&custody);
     assert!(drain_ok.is_ok(), "drain must succeed when unmap succeeds");
-    assert!(global_frame_host_owners().lock().is_empty());
+    assert!(custody.global_frame_host_owners.lock().is_empty());
+    assert!(!ScopedStage2MapTestStub::is_mapped(key.0, key.1 as usize));
 }
 
 #[test]
