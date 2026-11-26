@@ -233,16 +233,23 @@ struct Stage2Window {
     shared: bool,
 }
 
+/// The soft carrier's one answer to a broken invariant of its records: a
+/// core dropped holding something, a ticket the core refused at once, or a
+/// pin outliving its window. It ends the carrier (`carrick_fatal`).
+#[cold]
+fn soft_carrier_broken(what: core::fmt::Arguments<'_>) -> ! {
+    carrick_fatal::carrick_fatal!("softcpu::carrier_core", "{what}")
+}
+
 /// The soft carrier's venue: a core dropped holding a mapping or a pin is a
 /// broken invariant, and ends the carrier.
 enum SoftCoreVenue {}
 
 impl CoreVenue for SoftCoreVenue {
     fn dropped_holding(holding: Holding) -> ! {
-        carrick_fatal::carrick_fatal!(
-            "softcpu::stage2",
+        soft_carrier_broken(format_args!(
             "soft carrier core dropped holding {holding:?}"
-        )
+        ))
     }
 }
 
@@ -254,9 +261,8 @@ type SoftCore = CarrierCore<SoftCoreVenue, WindowHost, ()>;
 fn next_soft_carrier() -> CarrierId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let raw = NEXT.fetch_add(1, Ordering::Relaxed);
-    let raw = NonZeroU64::new(raw).unwrap_or_else(|| {
-        carrick_fatal::carrick_fatal!("softcpu::stage2", "soft carrier identities wrapped")
-    });
+    let raw = NonZeroU64::new(raw)
+        .unwrap_or_else(|| soft_carrier_broken(format_args!("soft carrier identities wrapped")));
     // SAFETY: a process-wide monotonic counter, never reused.
     unsafe { CarrierId::assume_unique(raw) }
 }
@@ -287,11 +293,10 @@ impl Drop for SoftStage2 {
         };
         match self.core.finish_destroy(ticket, BackendResult::Done) {
             Ok(destroyed) => drop(destroyed),
-            Err(refused) => carrick_fatal::carrick_fatal!(
-                "softcpu::stage2",
+            Err(refused) => soft_carrier_broken(format_args!(
                 "soft destroy ticket refused at once: {:?}",
                 refused.reason
-            ),
+            )),
         }
     }
 }
@@ -450,19 +455,17 @@ impl SoftStage2 {
             ))
         })?;
         if let Err(refused) = self.core.finish_map(ticket, BackendResult::Done) {
-            carrick_fatal::carrick_fatal!(
-                "softcpu::stage2",
+            soft_carrier_broken(format_args!(
                 "soft map ticket refused at once: {:?}",
                 refused.reason
-            );
+            ));
         }
         if let Err(refused) = self.core.carve(extent, ()) {
-            carrick_fatal::carrick_fatal!(
-                "softcpu::stage2",
+            soft_carrier_broken(format_args!(
                 "soft window {:#x} could not carve its own extent: {:?}",
                 extent.ipa(),
                 refused.reason
-            );
+            ));
         }
         Ok(())
     }
@@ -588,11 +591,10 @@ impl SoftStage2 {
         if let Some(carved) = self.core.live_extent_at(extent.ipa()) {
             match self.core.retire_extent(carved) {
                 Ok(Retire::Released(_)) => {}
-                Ok(Retire::Deferred) => carrick_fatal::carrick_fatal!(
-                    "softcpu::stage2",
+                Ok(Retire::Deferred) => soft_carrier_broken(format_args!(
                     "soft window {:#x} removed while a transfer pins it",
                     extent.ipa()
-                ),
+                )),
                 Err(reason) => {
                     return Err(TrapError::Hypervisor(format!(
                         "soft window extent retire refused: {reason:?}"
@@ -605,11 +607,10 @@ impl SoftStage2 {
         })?;
         match self.core.finish_unmap(ticket, BackendResult::Done) {
             Ok(host) => drop(host),
-            Err(refused) => carrick_fatal::carrick_fatal!(
-                "softcpu::stage2",
+            Err(refused) => soft_carrier_broken(format_args!(
                 "soft unmap ticket refused at once: {:?}",
                 refused.reason
-            ),
+            )),
         }
         Ok(())
     }
@@ -622,10 +623,9 @@ impl SoftStage2 {
     fn unpin_transfer(&mut self, pin: CorePin) {
         match self.core.unpin(pin) {
             Ok(None) => {}
-            Ok(Some(_)) | Err(_) => carrick_fatal::carrick_fatal!(
-                "softcpu::stage2",
-                "a soft transfer pin outlived its window"
-            ),
+            Ok(Some(_)) | Err(_) => {
+                soft_carrier_broken(format_args!("a soft transfer pin outlived its window"))
+            }
         }
     }
 
@@ -2915,10 +2915,7 @@ impl TransferPin for SoftRetainedUserData {
             return false;
         }
         if !self.publish_completed_write(bytes.len()) {
-            carrick_fatal::carrick_fatal!(
-                "softcpu::user_transfer",
-                "completed write publication failed"
-            );
+            soft_carrier_broken(format_args!("completed write publication failed"));
         }
         true
     }
@@ -2953,10 +2950,9 @@ impl Drop for SoftRetainedUserData {
         };
         match cell.try_borrow() {
             Ok(mut stage2) => stage2.unpin_transfer(pin),
-            Err(_) => carrick_fatal::carrick_fatal!(
-                "softcpu::user_transfer",
+            Err(_) => soft_carrier_broken(format_args!(
                 "a transfer pin dropped while the soft stage 2 was borrowed"
-            ),
+            )),
         }
     }
 }

@@ -36582,6 +36582,13 @@
       "owner": "carrick_vfs::fs_backend::host::note_scratch_root_in_use::at_exit",
       "lane": "netbsd_runtime",
       "ceiling": 1
+    },
+    {
+      "family": "fatal_carrier_fault",
+      "operation": "fatal:softcpu::carrier_core",
+      "owner": "carrick_softcpu_aarch64_host::facade::soft_carrier_broken",
+      "lane": "shared",
+      "ceiling": 1
     }
   ]
 }
