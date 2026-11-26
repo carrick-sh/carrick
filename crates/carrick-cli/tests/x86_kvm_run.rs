@@ -1614,7 +1614,9 @@ fn threads_vfork_exec_matches_native(flags: &[&str], run_id: &str) {
     assert_eq!(
         (guest.status.code(), guest.stdout.as_slice()),
         (native.status.code(), native.stdout.as_slice()),
-        "94 is a failed vfork clone (its errno is the printed status), 95 a failed \
+        "92 an unreadable image, 93 a host-file read into a fresh map that did not \
+         answer the image's size (its errno is printed), \
+         94 is a failed vfork clone (its errno is the printed status), 95 a failed \
          round (the exec errno is the status's exit code), 98 threads past five \
          seconds, 99 a memory edit that did not answer as Linux does. \
          Stdout: {} Stderr: {}",
@@ -1644,6 +1646,17 @@ fn mounted_static_x86_thread_vfork_exec_matches_native() {
 #[ignore = "red until the #2890 siblings shape lands; see #2890"]
 fn mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings() {
     threads_vfork_exec_matches_native(&[], "threads-vfork-exec-siblings");
+}
+
+/// #3050: Go's build reads package archives into fresh heap spans while
+/// another thread vforks and execs `compile`. Here four siblings `pread`
+/// this image (a host file) into never-touched anonymous maps beside the
+/// vforking thread. Linux makes each destination page resident as the read
+/// writes it; on main a read's completion copy is refused and the read
+/// answers EFAULT (exit 93, `read errno 0014`): Go's `read ...: bad address`.
+#[test]
+fn mounted_static_x86_host_file_reads_into_fresh_maps_beside_a_vfork() {
+    threads_vfork_exec_matches_native(&["-DREADERS"], "threads-vfork-exec-readers");
 }
 
 /// #3004: Go's preemption shape. Two clone threads each register a mapped,

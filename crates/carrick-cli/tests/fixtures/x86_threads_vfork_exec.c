@@ -17,7 +17,11 @@
 // a memory edit that did not return what Linux returns.
 //
 // Built with -DWORKERS=0 there are no siblings; with -DFROM_MAIN the root's
-// own thread forks, with no spawner thread.
+// own thread forks, with no spawner thread. With -DREADERS the siblings
+// instead `pread` this image (a host file) into a fresh, never-touched
+// anonymous map and check the byte count, as Go's build reads its package
+// archives into fresh heap spans (#3050: `read ...: bad address`). A read
+// that answers anything but the image's size exits 93, printing its errno.
 //
 // No libc: the threads are raw `clone` calls on mapped stacks.
 static long sc(long n, long a, long b, long c, long d, long e, long f) {
@@ -101,7 +105,29 @@ static volatile int bad;
 static volatile int failed_round = -1;
 static volatile int failed_status;
 static volatile int failed_clone;
+static volatile long read_answer;
+static long image_fd = -1;
+static long image_size;
 static struct exec_req req;
+
+static void read_image(void *unused) {
+    (void)unused;
+    while (!stop) {
+        long map = sc(9, 0, SPAN, 3, 0x22, -1, 0); // mmap PROT_READ|WRITE, PRIVATE|ANONYMOUS
+        if (map < 0 && map > -4096) {
+            __sync_fetch_and_add(&bad, 1);
+            break;
+        }
+        long got = sc(17, image_fd, map, SPAN, 0, 0, 0); // pread64 into untouched memory
+        if (got != image_size) __sync_val_compare_and_swap(&read_answer, 0, got);
+        if (sc(11, map, SPAN, 0, 0, 0, 0) != 0) // munmap
+            __sync_fetch_and_add(&bad, 1);
+        sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
+    }
+    __sync_fetch_and_add(&workers_done, 1);
+    long pause[2] = {1, 0};
+    for (;;) sc(35, (long)pause, 0, 0, 0, 0, 0);
+}
 
 static void edit_memory(void *unused) {
     (void)unused;
@@ -197,7 +223,16 @@ void start_c(long *sp) {
     req.fallback = "/proc/self/exe";
     req.argv = args;
     req.envp = envp;
+#ifdef READERS
+    image_fd = sc(257, -100, (long)argv[0], 0, 0, 0, 0); // openat(AT_FDCWD, image, O_RDONLY)
+    static char probe[SPAN];
+    probe[0] = 1;
+    image_size = image_fd < 0 ? -1 : sc(17, image_fd, (long)probe, SPAN, 0, 0, 0);
+    if (image_size <= 0 || image_size >= SPAN) sc(231, 92, 0, 0, 0, 0, 0);
+    for (int i = 0; i < WORKERS; i++) spawn(read_image);
+#else
     for (int i = 0; i < WORKERS; i++) spawn(edit_memory);
+#endif
 #ifdef FROM_MAIN
     // Control: the root's own thread forks, with no spawner thread.
     for (int round = 0; round < ROUNDS && failed_round < 0; round++) {
@@ -228,6 +263,14 @@ void start_c(long *sp) {
         for (int i = 0; i < 4; i++) line[21 - i] = "0123456789abcdef"[(failed_status >> (4 * i)) & 15];
         sc(1, 1, (long)line, sizeof line - 1, 0, 0, 0);
         sc(231, failed_clone ? 94 : 95, 0, 0, 0, 0, 0);
+    }
+    if (read_answer != 0) {
+        // The first wrong read answer, negated: an errno (14 is EFAULT).
+        char line[] = "read errno 0000\n";
+        long errno_ = read_answer < 0 ? -read_answer : 0;
+        for (int i = 0; i < 4; i++) line[14 - i] = '0' + (char)(errno_ / (i == 0 ? 1 : i == 1 ? 10 : i == 2 ? 100 : 1000) % 10);
+        sc(1, 1, (long)line, sizeof line - 1, 0, 0, 0);
+        sc(231, 93, 0, 0, 0, 0, 0);
     }
     sc(1, 1, (long)"ok=16\n", 6, 0, 0, 0);
     sc(231, bad ? 99 : 7, 0, 0, 0, 0, 0);
