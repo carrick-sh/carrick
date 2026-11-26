@@ -1101,9 +1101,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 break;
             };
             result = match self.finish_copyout(*output) {
-                Err(NativeProcessError::Fault) => Ok(NativeResume::Returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                )),
+                Err(NativeProcessError::Fault) => panic!("DIAG EFAULT A drain_copyout"),
                 result => result,
             };
         }
@@ -1570,8 +1568,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Bad user ranges are an ABI fault before they can be confused
         // with an invalid owner operation or overflowing transfer record.
         if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
-            observe(InputPreparationRefusal::Fault);
-            return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            panic!("DIAG EFAULT B1 range {:?}", request);
         }
         let mm = self
             .runtime
@@ -1601,8 +1598,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (operation, sequence, wait) = match prepared {
             Ok(()) => return Ok(LifecycleOutcome::Redispatch),
             Err(NativeProcessError::Fault) => {
-                observe(InputPreparationRefusal::Fault);
-                return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+                panic!("DIAG EFAULT B2 prepare refused {:?}", request);
             }
             Err(NativeProcessError::OwnerWait(wait)) => {
                 observe(InputPreparationRefusal::OwnerDependency);
@@ -4652,6 +4648,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let value = if result == ServiceResult::Supplied {
             None
         } else {
+            panic!("DIAG EFAULT C adapter {:?}", result);
+            #[allow(unreachable_code)]
             Some(self.retire_adapter_result(SyscallResult::new(
                 carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
             ))?)
@@ -4996,6 +4994,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     if let Some(output) = output.as_ref().filter(|output| output.prefix_on_fault) {
                         Ok(entropy_copy_fault(output.offset))
                     } else {
+                        panic!("DIAG EFAULT D fault-op output {:?} {:?}", result, request.operation);
+                        #[allow(unreachable_code)]
                         Ok(NativeResume::Returned(SyscallResult::new(
                             carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                         )))
@@ -5030,9 +5030,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ServiceResult::Refused
                     | ServiceResult::BackingFault
                     | ServiceResult::Cancelled
-                    | ServiceResult::Failed(_) => Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    ))),
+                    | ServiceResult::Failed(_) => {
+                        panic!("DIAG EFAULT E retry {:?} {:?}", result, request.operation)
+                    }
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
                         Err(NativeProcessError::ServiceQuarantined(
                             NativeServiceQuarantine::RelativeFutexReply,
@@ -5362,7 +5362,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 }
 fn entropy_copy_fault(committed: usize) -> NativeResume {
     NativeResume::Returned(if committed == 0 {
-        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
+        panic!("DIAG EFAULT F entropy prefix 0")
     } else {
         SyscallResult::new(committed as i64)
     })

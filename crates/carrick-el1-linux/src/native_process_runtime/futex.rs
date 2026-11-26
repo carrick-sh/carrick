@@ -373,7 +373,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         match adapter.refusal.get() {
             Some(CopyOutcome::Fault) => {
-                Some(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
+                panic!("DIAG EFAULT G futex {:#x} op {:#x}", call.args[0], call.args[1])
             }
             Some(CopyOutcome::NotYet(request)) => {
                 if let Some(retained) = adapter.retained {
