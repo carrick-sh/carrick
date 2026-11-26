@@ -12,7 +12,20 @@ use super::*;
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
-type Core = CarrierCore<ExplorerVenue, u8>;
+type Core = CarrierCore<ExplorerVenue, u8, u8>;
+
+fn carrier() -> CarrierId {
+    // SAFETY: each model run builds one core.
+    unsafe { CarrierId::assume_unique(NonZeroU64::MIN) }
+}
+
+fn spec(ipa: u64, len: u64) -> MappingSpec<u8> {
+    MappingSpec {
+        extent: extent(ipa, len),
+        host_addr: 0x1000,
+        host: 1,
+    }
+}
 
 struct Shell {
     core: Mutex<Core>,
@@ -44,7 +57,7 @@ fn a_map_in_flight_and_a_destroy_settle_in_either_order() {
     loom::model(|| {
         let shell = Arc::new(Shell {
             core: Mutex::new({
-                let mut core = Core::new(CarrierId(NonZeroU64::MIN));
+                let mut core = Core::new(carrier());
                 core.create().unwrap();
                 core.commit_create().unwrap();
                 core
@@ -53,7 +66,7 @@ fn a_map_in_flight_and_a_destroy_settle_in_either_order() {
         let mapper = {
             let shell = Arc::clone(&shell);
             thread::spawn(move || {
-                let Ok((ticket, action)) = shell.with(|core| core.begin_map(extent(0, 2))) else {
+                let Ok((ticket, action)) = shell.with(|core| core.begin_map(spec(0, 2))) else {
                     return false;
                 };
                 let result = shell.backend(action);
@@ -97,18 +110,12 @@ fn a_map_in_flight_and_a_destroy_settle_in_either_order() {
 #[test]
 fn a_pin_and_a_retire_release_the_extent_exactly_once() {
     loom::model(|| {
-        let mut core = Core::new(CarrierId(NonZeroU64::MIN));
+        let mut core = Core::new(carrier());
         core.create().unwrap();
-        let (ticket, _) = core.begin_map(extent(0, 4)).unwrap();
+        let (ticket, _) = core.begin_map(spec(0, 4)).unwrap();
         core.finish_map(ticket, BackendResult::Done).unwrap();
         core.commit_create().unwrap();
-        let id = core
-            .carve(ExtentSpec {
-                extent: extent(0, 1),
-                host_addr: 0x1000,
-                backing: 9,
-            })
-            .unwrap();
+        let id = core.carve(extent(0, 1), 9).unwrap();
         let shell = Arc::new(Shell {
             core: Mutex::new(core),
         });
