@@ -10515,6 +10515,23 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
 }
 
 fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVmCustody>) {
+    partial_structural_map_plan_in(root_ipa, Arc::new(CarrierForeignMmTransport::new()))
+}
+
+/// A transport over its own live carrier custody, for a witness that
+/// destroys or replaces its VM generation: the shared legacy test custody
+/// must stay live for every other test in the process.
+fn isolated_test_transport() -> Arc<CarrierForeignMmTransport> {
+    Arc::new(CarrierForeignMmTransport {
+        custody: Arc::new(CarrierVmCustody::new_live_fixture()),
+        ..CarrierForeignMmTransport::default()
+    })
+}
+
+fn partial_structural_map_plan_in(
+    root_ipa: u64,
+    transport: Arc<CarrierForeignMmTransport>,
+) -> (ProcessSpecPlan, Arc<CarrierVmCustody>) {
     fn structural_mapping(start: u64, ipa: u64) -> ProcessMappingDesc {
         const SIZE: usize = 0x20_0000;
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -10546,7 +10563,6 @@ fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVm
     }
 
     let later_ipa = root_ipa + 0x20_0000;
-    let transport = Arc::new(CarrierForeignMmTransport::new());
     let custody = Arc::clone(&transport.custody);
     let plan = ProcessSpecPlan {
         mappings: vec![
@@ -10857,7 +10873,8 @@ fn task_only_stale_generation_pooled_root_is_refused_and_rolls_back() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stub = ScopedStage2MapTestStub::enable();
     let root_ipa = 0x9a00_1600_0000u64;
-    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    // This witness destroys G1 and creates G2: it runs on its own custody.
+    let (mut plan, custody) = partial_structural_map_plan_in(root_ipa, isolated_test_transport());
     let g1_pool = custody.root_slot_pool().expect("G1 root slot pool");
     let g1_handle = g1_pool.allocate_slot().expect("G1 root slot");
     let g1_generation = g1_handle.vm_generation();
@@ -10927,7 +10944,8 @@ fn composition_rollback_after_generation_destroy_accepts_the_retired_owner() {
     let _stub = ScopedStage2MapTestStub::enable();
     const SIZE: usize = 0x20_0000;
     let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
-    let transport = Arc::new(CarrierForeignMmTransport::new());
+    // This witness destroys its VM: it runs on its own custody.
+    let transport = isolated_test_transport();
     let custody = Arc::clone(&transport.custody);
     let mut composition = crate::trap::ProcessStage2Composition::<
         Vec<crate::trap::HvpatchTaskMappingState>,

@@ -7365,7 +7365,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn retire_stage2_extent_refuses_reused_ipa_with_mismatched_host_owner() {
+    fn serial_host_retire_stage2_extent_refuses_reused_ipa_with_mismatched_host_owner() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
@@ -7728,7 +7728,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn failed_carrier_batch_rollback_retains_all_host_backings_until_vm_destroy() {
+    fn serial_host_failed_carrier_batch_rollback_retains_all_host_backings_until_vm_destroy() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g0) = live_custody();
@@ -8003,7 +8003,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn structural_retry_and_replay_serialize_terminal_finalization_under_directory_lock() {
+    fn serial_host_structural_retry_and_replay_serialize_terminal_finalization_under_directory_lock()
+     {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
@@ -8132,7 +8133,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn loop3_rebind_retains_pinned_predecessor_backing_until_last_unpin() {
+    fn serial_host_loop3_rebind_retains_pinned_predecessor_backing_until_last_unpin() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g1) = live_custody();
@@ -8244,7 +8245,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn pinned_abandoned_fixed_and_reserved_batch_records_drain_on_last_unpin_after_destroy() {
+    fn serial_host_pinned_abandoned_fixed_and_reserved_batch_records_drain_on_last_unpin_after_destroy()
+     {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g0) = live_custody();
@@ -8435,7 +8437,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn fork_builder_rollback_with_pinned_owner_retains_slot_until_last_unpin_and_settles_sibling() {
+    fn serial_host_fork_builder_rollback_with_pinned_owner_retains_slot_until_last_unpin_and_settles_sibling()
+     {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
@@ -8566,7 +8569,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn pinned_abandoned_batch_rollback_blocks_competing_replay_and_settles_on_last_unpin() {
+    fn serial_host_pinned_abandoned_batch_rollback_blocks_competing_replay_and_settles_on_last_unpin()
+     {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
         let (custody, g0) = live_custody();
@@ -9277,7 +9281,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn deferred_structural_last_unpin_unmap_refusal_routes_to_retry_and_releases_slot() {
+    fn serial_host_deferred_structural_last_unpin_unmap_refusal_routes_to_retry_and_releases_slot()
+    {
         const ARENA: usize = 2 * 1024 * 1024;
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
@@ -9378,7 +9383,8 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn deferred_structural_idle_retry_does_not_starve_later_owner_when_earlier_refuses() {
+    fn serial_host_deferred_structural_idle_retry_does_not_starve_later_owner_when_earlier_refuses()
+    {
         const ARENA: usize = 2 * 1024 * 1024;
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
@@ -9491,7 +9497,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn idle_structural_pinned_disposition_never_erases_concurrent_last_unpin_retry() {
+    fn serial_host_idle_structural_pinned_disposition_never_erases_concurrent_last_unpin_retry() {
         use carrick_aarch64::stage2::custody::Stage2HookPoint;
         use std::sync::{Arc, atomic::Ordering, mpsc};
         use std::time::Duration;
