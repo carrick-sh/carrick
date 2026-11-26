@@ -434,6 +434,39 @@ pub struct EventRingRecord {
 }
 
 impl PostMortem {
+    /// The zone sections of this capture, as `carrick debug zonedump` and a
+    /// bounded test child's deadline capture print them: the HVF zone
+    /// census, or the backend's physical census (x86 KVM) with its vCPUs and
+    /// what was unavailable. `None` when the capture carries no zone state
+    /// (no in-guest scheduler zone was installed).
+    pub fn zone_report(&self) -> Option<String> {
+        if self.zone_census.is_none() && self.physical.is_none() {
+            return None;
+        }
+        let mut out = format!("run: {}\n", self.run_id.as_deref().unwrap_or("-"));
+        if let Some(census) = &self.zone_census {
+            out.push_str(census);
+        }
+        if let Some(physical) = &self.physical {
+            out.push_str(&physical.zone_census);
+            for vcpu in &physical.vcpus {
+                out.push_str(&format!("vcpu: {vcpu}\n"));
+            }
+            for missing in &physical.unavailable {
+                out.push_str(&format!("unavailable: {missing}\n"));
+            }
+        }
+        for truncated in &self.truncated {
+            if truncated.section.contains("zone_census") {
+                out.push_str(&format!(
+                    "truncated: {} ({})\n",
+                    truncated.section, truncated.reason
+                ));
+            }
+        }
+        Some(out)
+    }
+
     /// Capture in process, under a deadline. Abort captures see a kernel that
     /// is already frozen (or about to be); explicit live captures are marked
     /// non-coherent. A section that cannot be taken is recorded in

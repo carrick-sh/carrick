@@ -24,12 +24,14 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
+use kvm_pool_fixture::bounded_child::{in_bounded_child, is_bounded_child, run_bounded_child};
 use kvm_pool_fixture::{
     physical_inventory, run_instrumented_pool_fixture, run_pool_fixture,
     try_run_instrumented_pool_fixture, witness_exec_retarget,
 };
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
     let mapped = 0x3_1000 + index * 0x1_0000;
@@ -1298,30 +1300,7 @@ fn serial_host_native_child_sleep_eintr_writes_a_cow_remainder() {
 
 fn instrumented_sleep_witness(test: &str, flags: &[&str]) {
     // Bounded in a child test process: a lost wake must fail, never hang CI.
-    const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "20"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                test,
-                "--include-ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded native sleep witness");
-        // The child must have run exactly this witness, not filtered it out.
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(20)) {
         return;
     }
     let elf = kvm_pool_fixture::assemble_fixture("native_child_sleep_witness.S", flags);
@@ -3932,24 +3911,8 @@ fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
 /// with per-member wait continuations, both block and each reaps its own child.
 #[test]
 fn production_two_threads_blocking_wait4_reap_distinct_children() {
-    const CHILD_ENV: &str = "CARRICK_WAIT4_TWO_THREADS_CHILD";
     const TEST_NAME: &str = "production_two_threads_blocking_wait4_reap_distinct_children";
-    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "20"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
-            .env(CHILD_ENV, TEST_NAME)
-            .output()
-            .expect("bounded x86 wait4 witness");
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded x86 wait4 witness failed: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(TEST_NAME, Duration::from_secs(20)) {
         return;
     }
 
@@ -4189,25 +4152,9 @@ die:
 /// releases the held fork; on a failed wait the worker releases it itself.
 #[test]
 fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
-    const CHILD_ENV: &str = "CARRICK_WAIT_BIRTH_CONTENTION_CHILD";
     const TEST_NAME: &str =
         "production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation";
-    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "30"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
-            .env(CHILD_ENV, TEST_NAME)
-            .output()
-            .expect("bounded x86 birth contention witness");
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded x86 birth contention witness failed: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(TEST_NAME, Duration::from_secs(30)) {
         return;
     }
     let elf = kvm_pool_fixture::assemble_fixture("native_wait_birth_contention.S", &[]);
@@ -4291,27 +4238,91 @@ fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
     );
 }
 
+/// Known answer for the bounded child harness (#3053): a child whose only
+/// thread parks for good in `FUTEX_WAIT` reaches its bound, and the parent's
+/// capture through the child's run-scoped debug endpoint names that park,
+/// with its saved syscall number, before the child is killed.
+#[test]
+fn bounded_child_captures_the_zone_of_a_child_parked_at_its_bound() {
+    let child = run_bounded_child(PARKED_CHILD, Duration::from_secs(10));
+    assert!(child.status.is_none(), "the parked child exited: {child}");
+    let Some(Ok(report)) = &child.capture else {
+        panic!("no zone capture at the bound: {child}");
+    };
+    assert!(
+        report.contains(&format!("run: {}\n", child.run_id)),
+        "the capture is not the child's run: {child}"
+    );
+    assert!(
+        report.contains("saved_nr=202 "),
+        "the census names no parked futex wait: {child}"
+    );
+    assert!(
+        child
+            .post_mortem
+            .as_ref()
+            .is_some_and(|path| path.is_file()),
+        "the post-mortem was not kept: {child}"
+    );
+}
+
+const PARKED_CHILD: &str = "bounded_child_parked_fixture";
+
+/// The child of the known answer above: its one thread waits forever on a
+/// private futex word nobody wakes. A no-op unless that harness runs it.
+#[test]
+fn bounded_child_parked_fixture() {
+    if !is_bounded_child(PARKED_CHILD) {
+        return;
+    }
+    let asm = r#"
+.global _start
+.text
+_start:
+    sub $16, %rsp
+    movl $0, (%rsp)
+1:
+    /* futex(&word, FUTEX_WAIT_PRIVATE, 0, NULL) */
+    mov %rsp, %rdi
+    mov $128, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    jmp 1b
+"#;
+    let dir = tempfile::tempdir().expect("tempdir for the parked child");
+    let src = dir.path().join("parked.S");
+    let out = dir.path().join("parked");
+    std::fs::write(&src, asm).expect("write parked.S");
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compile the parked child");
+    assert!(
+        compiled.status.success(),
+        "assemble failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let elf = std::fs::read(&out).expect("read the parked child ELF");
+    let outcome = run_pool_fixture(&elf, 64);
+    panic!("the parked child returned: {:?}", outcome.run);
+}
+
 /// Run one contention fixture in a bounded child test process: a lost wake
 /// must fail, never hang CI. Exit 7 is success; 100 + n is errno n.
 fn bounded_contention_witness(test: &str, fixture: &str, flags: &[&str], what: &str) {
-    const CHILD: &str = "CARRICK_CONTENTION_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "20"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded contention witness");
-        // The child must have run exactly this witness, not filtered it out.
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(20)) {
         return;
     }
     let elf = kvm_pool_fixture::assemble_fixture(fixture, flags);

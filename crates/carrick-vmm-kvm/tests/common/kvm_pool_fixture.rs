@@ -9,6 +9,10 @@ pub(crate) use physical_inventory::physical_inventory;
 #[allow(dead_code)]
 pub mod refusal_count;
 
+#[path = "bounded_child.rs"]
+#[allow(dead_code)]
+pub mod bounded_child;
+
 pub fn run_pool_fixture(
     elf: &[u8],
     max_exits: usize,
