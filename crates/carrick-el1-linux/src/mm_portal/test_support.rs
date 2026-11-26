@@ -28,6 +28,15 @@ impl Default for Region {
     }
 }
 impl Region {
+    /// The host alias of this fixture region's bootstrap metadata arena,
+    /// which both ISAs' fixtures carve at the EL1 region's offset.
+    pub fn bootstrap(&self) -> NonNull<u8> {
+        // SAFETY: the region spans the whole EL1 region, arena included.
+        unsafe {
+            self.ptr
+                .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+        }
+    }
     pub fn new() -> Self {
         // The exact carrier region size, zeroed and page-aligned.
         let pages =
@@ -287,7 +296,7 @@ pub fn x86_nodes(
 > {
     let mut nodes = carrick_core::mm::reservation::ResolvedReservationNodes::default();
     // SAFETY: the pins authenticate this retained region's metadata banks.
-    unsafe { nodes.refresh(x86_roots(region), &NoResolver(region), region.ptr) }.unwrap();
+    unsafe { nodes.refresh(x86_roots(region), &NoResolver(region), region.bootstrap()) }.unwrap();
     nodes
 }
 /// A production-admitted CPL0 root with live `Reservations` notifications.
@@ -433,7 +442,7 @@ fn admit_with<
 }
 pub fn nodes(region: &Region) -> ResolvedReservationNodes<NoPin> {
     let mut nodes = ResolvedReservationNodes::default();
-    unsafe { nodes.refresh(region.table(), &NoResolver(region), region.ptr) }.unwrap();
+    unsafe { nodes.refresh(region.table(), &NoResolver(region), region.bootstrap()) }.unwrap();
     nodes
 }
 pub fn residency() -> Box<FrameGrantResidencyTable> {

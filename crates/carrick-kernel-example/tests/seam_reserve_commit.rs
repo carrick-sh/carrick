@@ -10,7 +10,6 @@ struct Geometry;
 impl ReservationGeometry for Geometry {
     const RESERVATIONS_OFFSET: usize = 0;
     const ZONE_OFFSET: usize = 0x20000;
-    const REGION_BASE: u64 = 0;
     const BOOTSTRAP_BASE: u64 = 0;
     const BOOTSTRAP_SIZE: u64 = 0x100000;
     const USER_VA_END: u64 = 1 << 47;

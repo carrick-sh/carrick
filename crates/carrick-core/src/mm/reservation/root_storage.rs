@@ -74,18 +74,22 @@ impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGe
 impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGeometry>
     ResolvedReservationNodes<P, Policy, Geometry>
 {
-    /// Dynamic banks are resolved from exact grants. Bootstrap banks require
-    /// the same carrier-owned EL1 region as `table`; its mapping already owns
-    /// the table's lifetime and is never translated as guest user memory.
+    /// Dynamic banks are resolved from exact grants. Bootstrap banks live in
+    /// the carrier's bootstrap metadata arena (`Geometry::BOOTSTRAP_BASE`,
+    /// `Geometry::BOOTSTRAP_SIZE`): inside the EL1 region on AArch64, in its
+    /// own supervisor window on x86 CPL0. `bootstrap` is the host alias of
+    /// that arena's first byte; its mapping already owns the table's
+    /// lifetime and is never translated as guest user memory.
     ///
     /// # Safety
-    /// `region` must name this table's live carrier EL1 region host mapping and
-    /// remain mapped through every use of this resolved view.
+    /// `bootstrap` must alias this table's live carrier bootstrap metadata
+    /// arena, all `Geometry::BOOTSTRAP_SIZE` bytes of it, and remain mapped
+    /// through every use of this resolved view.
     pub unsafe fn refresh<R: MetadataExtentResolver<Pin = P>>(
         &mut self,
         table: &SharedReservations<Policy, Geometry>,
         resolver: &R,
-        region: core::ptr::NonNull<u8>,
+        bootstrap: core::ptr::NonNull<u8>,
     ) -> Result<(), Refusal> {
         if table.layout_hash.load(Ordering::Acquire)
             != SharedReservations::<Policy, Geometry>::LAYOUT_HASH
@@ -108,11 +112,19 @@ impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGe
                 {
                     return Err(Refusal::Stale);
                 }
-                let offset = usize::try_from(bank.guest_base - Geometry::REGION_BASE)
-                    .map_err(|_| Refusal::Invalid)?;
-                // SAFETY: caller owns this carrier's region; published bank
-                // construction checked containment in its enclosing extent.
-                (unsafe { region.as_ptr().add(offset).cast() }, None)
+                let offset = bank
+                    .guest_base
+                    .checked_sub(Geometry::BOOTSTRAP_BASE)
+                    .filter(|offset| {
+                        offset
+                            .checked_add(bytes as u64)
+                            .is_some_and(|end| end <= Geometry::BOOTSTRAP_SIZE)
+                    })
+                    .ok_or(Refusal::Stale)?;
+                let offset = usize::try_from(offset).map_err(|_| Refusal::Invalid)?;
+                // SAFETY: the caller aliases this carrier's whole bootstrap
+                // arena, and the bank lies inside it (checked above).
+                (unsafe { bootstrap.as_ptr().add(offset).cast() }, None)
             } else {
                 let extent = MetadataExtent::new(bank.extent_base, bank.extent_len, bank.token)
                     .ok_or(Refusal::Stale)?;
@@ -134,6 +146,12 @@ impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGe
         }
         self.table = table;
         Ok(())
+    }
+    /// How many published banks this view resolves. A root lock refuses a
+    /// view behind the table's [`SharedReservations::storage_generation`]
+    /// with `MetadataRequired`; refresh, then lock again.
+    pub fn bank_count(&self) -> u32 {
+        self.count
     }
 }
 impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGeometry> NodeBanks
