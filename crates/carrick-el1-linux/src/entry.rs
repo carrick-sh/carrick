@@ -107,6 +107,9 @@ pub unsafe extern "C" fn carrick_el1_syscall(
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     let mut owner_wait = None;
+    // This exception owns any host record its ring dispatch stages; its
+    // native exit consumes it.
+    let staged = carrick_el1_linux::dispatch::StagedRingRecord::open(frame_ref.slot as usize);
     let action =
         carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut owner_wait);
     let action = carrick_el1::fault::drain_before_el0_hw(frame_ref, action);
@@ -114,6 +117,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(
         frame_ref,
         action,
         owner_wait,
+        staged,
         counters_ref,
     );
     carrick_el1_linux::dispatch::seal_entry_exit(frame_ref, action).encode()

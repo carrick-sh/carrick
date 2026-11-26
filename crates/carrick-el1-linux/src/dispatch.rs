@@ -880,10 +880,13 @@ pub fn capture_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
+    staged: StagedRingRecord,
     counters: &Counters,
 ) -> Action {
+    // The exception's ring record goes with its exit: only the native
+    // host-file stage publishes it, and any other exit drops its owner.
     if matches!(action, Action::Forward | Action::ServedWithWork)
-        && let Some(owned) = arm_native_service_exit(frame, action, wait, counters)
+        && let Some(owned) = arm_native_service_exit(frame, action, wait, staged, counters)
     {
         return owned;
     }
@@ -1355,18 +1358,6 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace};
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
-    }
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    if let Some(record) = arm_ring_record::take(frame.slot as usize) {
-        return Some(
-            carrick_personality_linux::native_host_file::HostFileStage::Request {
-                record,
-                output: None,
-                resolves_path: false,
-                map: None,
-                chdir: false,
-            },
-        );
     }
     if frame.x[8] == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
         && origin == carrick_core_abi::service::ServiceOrigin::Descendant
@@ -1996,9 +1987,7 @@ fn arm_native_entry(
 }
 
 /// A host record the ring built for a native owner's current SVC (a
-/// readiness set's carrier sockets), kept per CPU slot from the ring's
-/// `Forward` until [`native_host_file_stage`] publishes it on the same
-/// exception. The slot's CPU owns its cell for the whole exception.
+/// readiness set's carrier sockets), owned by that exception (#1051).
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 mod arm_ring_record {
     use alloc::boxed::Box;
@@ -2008,29 +1997,85 @@ mod arm_ring_record {
 
     type Record = Box<[u8]>;
 
-    static STAGED: [AtomicPtr<Record>; carrick_el1_abi::EL1_STACK_SLOTS as usize] =
-        [const { AtomicPtr::new(core::ptr::null_mut()) };
-            carrick_el1_abi::EL1_STACK_SLOTS as usize];
+    const SLOTS: usize = carrick_el1_abi::EL1_STACK_SLOTS as usize;
 
-    pub(super) fn stage(slot: usize, record: Record) {
-        let Some(cell) = STAGED.get(slot) else {
-            super::invalid_completion(super::NativeInvariant::EntryBinding);
-        };
-        let staged = Box::into_raw(Box::new(record));
-        if !cell.swap(staged, Ordering::AcqRel).is_null() {
-            // A record is published on the exception that staged it.
-            super::invalid_completion(super::NativeInvariant::EntryBinding);
+    /// The cell the ring's `Forward` stages into, emptied only by its
+    /// slot's [`StagedRingRecord`]: every exception opens it empty.
+    static CELLS: [AtomicPtr<Record>; SLOTS] =
+        [const { AtomicPtr::new(core::ptr::null_mut()) }; SLOTS];
+
+    fn broken() -> ! {
+        super::invalid_completion(super::NativeInvariant::EntryBinding)
+    }
+
+    /// The owner of one SVC exception's ring record. The exception's entry
+    /// opens it before dispatch and its native exit consumes it:
+    /// [`Self::take`] hands the record to the host-file stage, which
+    /// publishes it. A record can never outlive the exception that staged
+    /// it or reach another call: dropping an owner whose record was never
+    /// taken is a broken invariant (its set's retained operation would have
+    /// lost its host half), and so is an exception that opens a cell an
+    /// earlier exception left full.
+    #[must_use]
+    pub struct StagedRingRecord {
+        slot: Option<usize>,
+    }
+
+    impl StagedRingRecord {
+        /// Open this slot's owner for the exception now entering.
+        pub fn open(slot: usize) -> Self {
+            let Some(cell) = CELLS.get(slot) else {
+                broken();
+            };
+            if !cell.load(Ordering::Acquire).is_null() {
+                broken();
+            }
+            Self { slot: Some(slot) }
+        }
+
+        /// An exit with no ring dispatch before it (a host work boundary):
+        /// it owns no record and opens no cell.
+        pub const fn none() -> Self {
+            Self { slot: None }
+        }
+
+        /// Consume the owner: the record its exception staged, if any.
+        pub fn take(mut self) -> Option<Record> {
+            take_cell(self.slot.take()?)
         }
     }
 
-    pub(super) fn take(slot: usize) -> Option<Record> {
-        let staged = STAGED
-            .get(slot)?
-            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+    impl Drop for StagedRingRecord {
+        fn drop(&mut self) {
+            let Some(slot) = self.slot.take() else {
+                return;
+            };
+            if take_cell(slot).is_some() {
+                broken();
+            }
+        }
+    }
+
+    fn take_cell(slot: usize) -> Option<Record> {
+        let staged = CELLS[slot].swap(core::ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: only `stage` stores a non-null pointer, from `Box::into_raw`.
         (!staged.is_null()).then(|| *unsafe { Box::from_raw(staged) })
     }
+
+    /// Stage the ring's record for this slot's open exception.
+    pub(super) fn stage(slot: usize, record: Record) {
+        let Some(cell) = CELLS.get(slot) else {
+            broken();
+        };
+        let staged = Box::into_raw(Box::new(record));
+        if !cell.swap(staged, Ordering::AcqRel).is_null() {
+            // One record per exception.
+            broken();
+        }
+    }
 }
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub use arm_ring_record::StagedRingRecord;
 
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
@@ -2040,6 +2085,7 @@ fn arm_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
+    staged: StagedRingRecord,
     counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
@@ -2079,6 +2125,17 @@ fn arm_native_service_exit(
         counters,
         || arm_thread_group_owner(zone, task, page),
         |frame| {
+            if let Some(record) = staged.take() {
+                return Some(
+                    carrick_personality_linux::native_host_file::HostFileStage::Request {
+                        record,
+                        output: None,
+                        resolves_path: false,
+                        map: None,
+                        chdir: false,
+                    },
+                );
+            }
             let venue = ipc::guest_venue(frame.slot as u32)?;
             let table = ipc::native_table(&venue, task)?;
             let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
