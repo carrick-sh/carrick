@@ -2898,15 +2898,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
             };
             let slot = slots.grant(usize::from(self.slot.raw()))?;
-            let mm = ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
-            // The slot's own selection names its page: a preparation that
-            // spans pages may select a later page than the one it starts on.
-            let (sequence, window) = slot.pending_fault_selection_for_mm(mm)?;
-            let address = if window.fault_page == address.raw() & !4095 {
-                address
-            } else {
-                UserVa::new(window.fault_page)
-            };
+            let mm = self.task.mm.key.load(Ordering::Acquire);
+            let (sequence, _) = slot.pending_fault_selection(mm, address.raw())?;
             Some((
                 carrick_guest_arch::FaultInfo {
                     address,

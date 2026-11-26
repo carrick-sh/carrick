@@ -354,9 +354,8 @@ pub fn cross_hvc_exec_cancel(record_gpa: u64, cpu: u64) -> Result<(), ()> {
 }
 
 /// Ask the stopped carrier to supply the COW page selected in this slot's
-/// portal record. The host authenticates that record against the live root.
-// `Err(())` is the carrier's single refusal; callers own its meaning.
-#[allow(clippy::result_unit_err)]
+/// portal record. The host authenticates that record against the live root
+/// and answers with the typed [`carrick_el1_abi::CowSupplyAnswer`].
 pub fn cross_hvc_cow_supply(address: u64, cpu: u64) -> carrick_el1_abi::CowSupplyAnswer {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
