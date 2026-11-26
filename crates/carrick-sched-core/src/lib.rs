@@ -283,8 +283,9 @@ pub const ZONE_BUCKETS: usize = 2;
 /// vCPU slots (one per syscall-mailbox slot).
 #[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_SLOTS: usize = 256;
+/// Two under loom: a migrating slot and an idle scan on another (#3053).
 #[cfg(all(test, feature = "loom"))]
-pub const ZONE_SLOTS: usize = 1;
+pub const ZONE_SLOTS: usize = 2;
 /// Words of a per-slot bitmap.
 pub const ZONE_SLOT_WORDS: usize = ZONE_SLOTS.div_ceil(64);
 
