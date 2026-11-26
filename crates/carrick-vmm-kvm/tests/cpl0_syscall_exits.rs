@@ -61,25 +61,11 @@ fn run_point(rounds: u32) -> Point {
 /// 1024 syscalls (fixed boot work cancels between scale points).
 #[test]
 fn serial_host_native_root_ring_syscalls_cost_no_vm_exit() {
-    const CHILD: &str = "CARRICK_SYSCALL_EXITS_WITNESS_CHILD";
     const TEST: &str = "serial_host_native_root_ring_syscalls_cost_no_vm_exit";
     // Bound the whole fixture in a child test process, so a lost wake fails
     // within the bound instead of hanging the lane.
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "120"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .output()
-            .expect("bounded syscall exit witness");
-        assert!(
-            output.status.success(),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !kvm_pool_fixture::bounded_child::in_bounded_child(TEST, std::time::Duration::from_secs(120))
+    {
         return;
     }
     let points: Vec<Point> = SCALE_POINTS

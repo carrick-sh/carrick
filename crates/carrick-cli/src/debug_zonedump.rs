@@ -52,39 +52,13 @@ fn read_input(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("read {}", path.display()))
 }
 
-/// The zone sections of one capture: the HVF zone census, or the
-/// backend's physical census (x86 KVM), with what was unavailable.
+/// The zone sections of one capture (`PostMortem::zone_report`).
 fn render_capture(capture: &carrick_kernel::kernel::debug::PostMortem) -> Result<String> {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "run: {}\n",
-        capture.run_id.as_deref().unwrap_or("-")
-    ));
-    if let Some(census) = &capture.zone_census {
-        out.push_str(census);
-    }
-    if let Some(physical) = &capture.physical {
-        out.push_str(&physical.zone_census);
-        for vcpu in &physical.vcpus {
-            out.push_str(&format!("vcpu: {vcpu}\n"));
-        }
-        for missing in &physical.unavailable {
-            out.push_str(&format!("unavailable: {missing}\n"));
-        }
-    }
-    for truncated in &capture.truncated {
-        if truncated.section.contains("zone_census") {
-            out.push_str(&format!(
-                "truncated: {} ({})\n",
-                truncated.section, truncated.reason
-            ));
-        }
-    }
-    anyhow::ensure!(
-        capture.zone_census.is_some() || capture.physical.is_some(),
-        "the capture carries no zone state (no in-guest scheduler zone was installed)"
-    );
-    Ok(out)
+    capture.zone_report().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the capture carries no zone state (no in-guest scheduler zone was installed)"
+        )
+    })
 }
 
 /// A heap value of `T` copied from `size_of::<T>()` bytes of `image` at

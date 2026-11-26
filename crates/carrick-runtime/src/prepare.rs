@@ -230,44 +230,32 @@ type PreparedKvmDebugServer = (
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn install_kvm_debug_server(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    scope: &carrick_kernel::kernel::CarrierScopeId,
 ) -> Option<PreparedKvmDebugServer> {
     let context = dispatcher.capture_one_task_context().ok()?;
-    let run_id = dispatcher
-        .container()
-        .launch()
-        .carrier_scope_id
-        .as_str()
-        .to_owned();
     let physical_debug = Arc::new(KvmPhysicalDebug::default());
     let provider: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
         Arc::clone(&physical_debug) as _;
     let server = carrick_kernel::kernel::KernelDebugServer::install(
         Arc::clone(context.kernel()),
-        &run_id,
+        scope.as_str(),
         Some(provider),
     )?;
     Some((server, physical_debug))
 }
 
+/// The run-scoped debug endpoint of a KVM pool entered without a prepared
+/// launch: the integration fixtures, whose dispatcher carries the shared
+/// reference-model stamp rather than a run identity. They publish under the
+/// scope a carrier takes (`CARRICK_RUN_ID`, else a random one), so
+/// `carrick debug zonedump --run-id` reaches a stamped test child exactly as
+/// it reaches a production run.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-pub fn run_prepared_kvm_pool(
-    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
-    root_context: carrick_kernel::kernel::KernelContext,
-    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
-    max_traps: usize,
-) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
-    let debug_server = install_kvm_debug_server(&dispatcher);
-    run_prepared_kvm_pool_with_debug(
-        machine,
-        root_context,
-        dispatcher,
-        max_traps,
-        debug_server,
-        #[cfg(feature = "kvm-pool-test-control")]
-        KvmPoolTestControl::default(),
-        None,
-    )
-    .map_err(|failure| failure.error)
+fn install_unprepared_kvm_debug_server(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) -> Result<Option<PreparedKvmDebugServer>, PreparedKvmPoolFailure> {
+    let scope = carrick_kernel::kernel::CarrierScopeId::from_process_env_or_random()?;
+    Ok(install_kvm_debug_server(dispatcher, &scope))
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
@@ -277,12 +265,13 @@ pub fn try_run_prepared_kvm_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    let debug_server = install_unprepared_kvm_debug_server(&dispatcher)?;
     run_prepared_kvm_pool_with_debug(
         machine,
         root_context,
         dispatcher,
         max_traps,
-        None,
+        debug_server,
         #[cfg(feature = "kvm-pool-test-control")]
         KvmPoolTestControl::default(),
         None,
@@ -305,12 +294,13 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
     idle_exits: usize,
     hook: KvmLoadedPreEntryHook,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    let debug_server = install_unprepared_kvm_debug_server(&dispatcher)?;
     run_prepared_kvm_pool_with_debug(
         machine,
         root_context,
         dispatcher,
         loaded_exits.max(idle_exits),
-        None,
+        debug_server,
         KvmPoolTestControl {
             loaded_pre_entry_hook: Some(hook),
             ..KvmPoolTestControl::default()
@@ -699,12 +689,13 @@ pub fn try_run_prepared_kvm_pool_with_test_control(
     max_traps: usize,
     test_control: KvmPoolTestControl,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    let debug_server = install_unprepared_kvm_debug_server(&dispatcher)?;
     run_prepared_kvm_pool_with_debug(
         machine,
         root_context,
         dispatcher,
         max_traps,
-        None,
+        debug_server,
         test_control,
         None,
     )
@@ -1922,7 +1913,10 @@ fn prepare_with_lease(
 
     #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     let kvm_debug = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
-        install_kvm_debug_server(&dispatcher)
+        install_kvm_debug_server(
+            &dispatcher,
+            &dispatcher.container().launch().carrier_scope_id,
+        )
     } else {
         None
     };

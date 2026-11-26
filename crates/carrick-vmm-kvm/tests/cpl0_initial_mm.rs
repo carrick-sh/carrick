@@ -7,10 +7,12 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
+use kvm_pool_fixture::bounded_child::{in_bounded_child, is_bounded_child};
 use kvm_pool_fixture::{
     ROOT_AFFINITY_ANY, physical_inventory, run_pool_fixture, run_pool_fixture_with,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Only CPU 0 (the loaded lane) may schedule the root and its inherited children.
 const ROOT_AFFINITY_LOADED: u64 = 1;
@@ -1434,23 +1436,7 @@ fn serial_host_native_root_and_child_clock_settime_and_settimeofday_are_unserved
 /// Returns the guest exit code inside the child process, for the caller's
 /// assertions, and `None` in the parent once that child passed.
 fn run_bounded_realtime_set_witness(test: &str, flags: &[&str]) -> Option<i32> {
-    const CHILD: &str = "CARRICK_SETTIME_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "15"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded native settime witness");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            stdout,
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(15)) {
         return None;
     }
     let elf = native_exit_fixture_with_flags("native_realtime_set.S", flags);
@@ -1550,23 +1536,7 @@ fn serial_host_native_cpu_clocks_read_the_named_task() {
 /// 8), then under carrick, bounded in a child test process so a lost wake
 /// fails instead of hanging CI.
 fn native_oracle_witness(test: &str, fixture: &str) {
-    const CHILD: &str = "CARRICK_CPUTIME_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "15"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded native oracle witness");
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(15)) {
         return;
     }
     let elf = native_exit_fixture_with_flags(fixture, &[]);
@@ -1663,30 +1633,7 @@ fn serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux() {
 #[test]
 fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
     const TEST: &str = "serial_host_native_child_readlink_exe_is_a_counted_refusal";
-    const CHILD: &str = "CARRICK_READLINK_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "10"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                TEST,
-                "--include-ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, TEST)
-            .output()
-            .expect("bounded native readlink witness");
-        // The child must have run exactly this witness, not filtered it out.
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(TEST, Duration::from_secs(10)) {
         return;
     }
     // Refusals count by native ordinal, forwards by canonical ordinal.
@@ -1734,30 +1681,7 @@ fn native_child_sleep_witness(test: &str, flags: &[&str]) {
 fn native_child_sleep_witness_with_exit(test: &str, fixture: &str, flags: &[&str], exit: i32) {
     // Bounded in a child test process like the entropy witness: a lost timer
     // wake must fail, never hang CI.
-    const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "10"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                test,
-                "--include-ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded native sleep witness");
-        // The child must have run exactly this witness, not filtered it out.
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(10)) {
         return;
     }
     let elf = native_exit_fixture_with_flags(fixture, flags);
@@ -1774,22 +1698,7 @@ fn native_child_entropy_witness(test: &str, flags: &[&str]) {
     // A parked guest need not consume the pool's exit budget. Bound the whole
     // fixture in a separate test process so a lost child wake cannot hang CI.
     // timeout owns that process group; KVM workers are threads in that process.
-    const CHILD: &str = "CARRICK_ENTROPY_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
-        let output = std::process::Command::new("timeout")
-            .args(["--kill-after=1", "10"])
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test)
-            .output()
-            .expect("bounded native entropy witness");
-        assert!(
-            output.status.success(),
-            "bounded child witness: {:?}\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if !in_bounded_child(test, Duration::from_secs(10)) {
         return;
     }
     let elf = native_exit_fixture_with_flags("native_child_entropy.S", flags);
@@ -7314,25 +7223,11 @@ fn serial_host_pipe_readers_beyond_the_pool_hold_no_capacity() {
 /// Run `test` in a separate `timeout`-bounded process: a parked guest need
 /// not consume the pool's exit budget, so a lost wake must not hang CI.
 fn bounded_witness(test: &str, witness: impl FnOnce()) {
-    const CHILD: &str = "CARRICK_REDIRECT_WITNESS_CHILD";
-    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+    if is_bounded_child(test) {
         witness();
         return;
     }
-    let output = std::process::Command::new("timeout")
-        .args(["--kill-after=1", "30"])
-        .arg(std::env::current_exe().expect("current test executable"))
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .env(CHILD, test)
-        .output()
-        .expect("bounded redirect witness");
-    assert!(
-        output.status.success(),
-        "bounded child witness: {:?}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    assert!(!in_bounded_child(test, Duration::from_secs(30)));
 }
 
 /// Production x86 dispatch with fd 1 redirected to a real host file (seeded
