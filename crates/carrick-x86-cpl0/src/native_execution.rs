@@ -54,6 +54,8 @@ pub fn schedule(slot: SlotId) -> ! {
         #[cfg(feature = "test-support")]
         crate::test_support::lower_injected_gate(source, slot);
         expire_timers(slot);
+        #[cfg(feature = "test-support")]
+        crate::test_support::order_after_idle_read(slot, current);
         // Drain any APIC timer or reschedule vector latched while IF was masked
         // on the outgoing thread before selecting and preparing the next one;
         // xAPIC IA32_TSC_DEADLINE latches IRR on expiry and WRMSR(0) does not
@@ -346,6 +348,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 carrick_el1::isa::x86::X86Backend.arm_timer(Some(Deadline(CounterTick::new(dl))));
         }
         if source.zone.enter_idle(slot, true) {
+            #[cfg(feature = "test-support")]
+            crate::test_support::order_before_idle_hlt(slot, current);
             unsafe {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
