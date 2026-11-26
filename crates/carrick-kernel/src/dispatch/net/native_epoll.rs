@@ -59,9 +59,71 @@ impl std::hash::Hash for Membership {
 struct Registration {
     key: Membership,
     item: EpollItemRef,
-    description: Arc<FileDescription>,
+    level: Level,
     watch: Watch,
     events: LinuxEpollEvents,
+    /// A readiness set member's own identity, when it is not a carrier
+    /// socket (whose `NativeNetFile` holds its source for its life).
+    _identity: Option<HostReadinessToken>,
+}
+
+/// One member of a readiness set's `ReadinessSetCtl` record, resolved from
+/// its host resource token: the readiness source it registers under and
+/// where its level comes from.
+pub(super) struct SetMember {
+    pub(super) source: HostReadinessSource,
+    pub(super) identity: Option<HostReadinessToken>,
+    pub(super) level: Level,
+    pub(super) entry: carrick_core_abi::host_file::ReadinessSetEntry,
+}
+
+/// Where a registration's Linux readiness comes from. A guest epoll's
+/// carrier socket is always a [`Level::Description`]; a readiness set's
+/// member is any host descriptor a `select` can name (#1051).
+pub(super) enum Level {
+    /// The description's own readiness: a carrier socket, or a host file,
+    /// pipe or terminal a venue opened or the run root left a child.
+    Description(Arc<FileDescription>),
+    /// A carrier stdio stream: its host descriptor's `poll(2)` answer, plus
+    /// the bits the stdio contract always reports (`always`, Linux poll
+    /// bits).
+    Stdio { host: OwnedFd, always: i16 },
+    /// A stdio stream the run captures: always writable, never readable.
+    Constant(LinuxEpollEvents),
+}
+
+impl Level {
+    fn sample(&self, events: LinuxEpollEvents) -> LinuxEpollEvents {
+        match self {
+            Self::Description(description) => description.readiness(events, NO_READINESS_CONTEXT),
+            Self::Stdio { host, always } => {
+                // Poll bits and epoll bits share their values (IN, PRI, OUT,
+                // ERR, HUP); the request is the low half of the epoll mask.
+                let requested = (events.bits() & 0xffff) as i16;
+                let revents =
+                    super::host_fd_poll_revents(host.as_raw_fd(), requested) | (always & requested);
+                LinuxEpollEvents::from_bits_retain(u32::from(revents as u16))
+            }
+            Self::Constant(level) => *level & events,
+        }
+    }
+
+    fn description(&self) -> Option<&Arc<FileDescription>> {
+        match self {
+            Self::Description(description) => Some(description),
+            _ => None,
+        }
+    }
+}
+
+/// What one `EPOLL_CTL_ADD` registers: a guest epoll's carrier socket, or
+/// a readiness set's member of any host kind.
+enum Added<'s> {
+    Socket(&'s NativeNetFile),
+    SetMember {
+        level: Level,
+        identity: Option<HostReadinessToken>,
+    },
 }
 
 struct Watch {
@@ -127,9 +189,7 @@ impl State {
         registration: &Registration,
         edge: bool,
     ) -> Option<carrick_el1_abi::ipc::IpcWake> {
-        let level = registration
-            .description
-            .readiness(registration.events, NO_READINESS_CONTEXT);
+        let level = registration.level.sample(registration.events);
         match owner.socket_epoll_region().and_then(|region| {
             region.epoll_publish_host_socket(
                 registration.key.epoll,
@@ -242,7 +302,54 @@ impl NativeSocketEpolls {
         events: LinuxEpollEvents,
     ) -> Result<Watch, LinuxErrno> {
         let host = duplicate_host_socket(description)?;
-        let zone = description.wait_queue().map(|queue| {
+        self.watch_sources(state, token, host, description.wait_queue(), events)
+    }
+
+    /// The watch of a readiness set's member: its host descriptor on the
+    /// carrier's multiplexer, its wait queue, or nothing when its readiness
+    /// never changes. A host that refuses to watch a descriptor with EPERM
+    /// (a regular file or directory, on Linux) is answering what poll(2)
+    /// says of such a file: always ready, so its sampled level is final.
+    /// A member whose readiness changes but that nothing can watch is not
+    /// served (ENOSYS).
+    fn watch_member(
+        self: &Arc<Self>,
+        state: &mut State,
+        token: u64,
+        level: &Level,
+        events: LinuxEpollEvents,
+    ) -> Result<Watch, LinuxErrno> {
+        let unwatched = Watch {
+            host: None,
+            _zone: None,
+        };
+        let (host, queue) = match level {
+            Level::Description(description) => {
+                if description.has_constant_readiness() {
+                    return Ok(unwatched);
+                }
+                (duplicate_host_fd(description)?, description.wait_queue())
+            }
+            Level::Stdio { host, .. } => (Some(host.try_clone().map_err(io_errno)?), None),
+            Level::Constant(_) => return Ok(unwatched),
+        };
+        let polls = host.is_some();
+        match self.watch_sources(state, token, host, queue, events) {
+            Err(LINUX_EPERM) if polls => Ok(unwatched),
+            Err(LINUX_EPERM) => Err(carrick_abi::LINUX_ENOSYS),
+            watched => watched,
+        }
+    }
+
+    fn watch_sources(
+        self: &Arc<Self>,
+        state: &mut State,
+        token: u64,
+        host: Option<OwnedFd>,
+        queue: Option<Arc<crate::kernel::wait_set::WaitQueue>>,
+        events: LinuxEpollEvents,
+    ) -> Result<Watch, LinuxErrno> {
+        let zone = queue.map(|queue| {
             let producer = Arc::downgrade(self);
             queue.enroll_callback(move |_| {
                 if let Some(producer) = producer.upgrade() {
@@ -302,7 +409,15 @@ impl NativeSocketEpolls {
             (LINUX_EPOLL_CTL_ADD, None) => {
                 let file_key =
                     (u64::from(file.index) << 32) | (file.generation & u64::from(u32::MAX));
-                Some(self.add(owner, &mut state, &region, key, socket, file_key, report)?)
+                Some(self.add(
+                    owner,
+                    &mut state,
+                    &region,
+                    key,
+                    Added::Socket(socket),
+                    file_key,
+                    report,
+                )?)
             }
             (LINUX_EPOLL_CTL_MOD, Some(old)) => {
                 let token = state.generation()?;
@@ -329,8 +444,9 @@ impl NativeSocketEpolls {
                         key,
                         item,
                         events,
-                        description,
+                        level: Level::Description(description),
                         watch,
+                        _identity: None,
                     },
                 );
                 Some(token)
@@ -369,7 +485,7 @@ impl NativeSocketEpolls {
         state: &mut State,
         region: &carrick_el1_abi::ipc::IpcRegion<'_>,
         key: Membership,
-        socket: &NativeNetFile,
+        member: Added,
         file_key: u64,
         report: EpollReport,
     ) -> Result<u64, LinuxErrno> {
@@ -381,8 +497,17 @@ impl NativeSocketEpolls {
             .map_err(|error| ctl_errno(error.into()))?;
         let events = LinuxEpollEvents::from_bits_retain(report.events);
         let token = state.generation()?;
-        let description = socket.description();
-        let watch = self.watch(state, token, &description, events)?;
+        let (level, identity, watch) = match member {
+            Added::Socket(socket) => {
+                let description = socket.description();
+                let watch = self.watch(state, token, &description, events)?;
+                (Level::Description(description), None, watch)
+            }
+            Added::SetMember { level, identity } => {
+                let watch = self.watch_member(state, token, &level, events)?;
+                (level, identity, watch)
+            }
+        };
         let item = match region.epoll_add_host_socket(
             key.epoll,
             key.number,
@@ -403,26 +528,23 @@ impl NativeSocketEpolls {
                 key,
                 item,
                 events,
-                description,
+                level,
                 watch,
+                _identity: identity,
             },
         );
         Ok(token)
     }
 
-    /// Register every carrier socket of a ring readiness set on its
-    /// transient epoll, all or nothing, then publish each one's initial
-    /// level as an edge. A failure retires the registrations this call made
-    /// and unlinks their items, so the set's epoll holds no partial host
-    /// half.
+    /// Register every host member of a ring readiness set on its transient
+    /// epoll, all or nothing, then publish each one's initial level as an
+    /// edge. A failure retires the registrations this call made and unlinks
+    /// their items, so the set's epoll holds no partial host half.
     fn register_set(
         self: &Arc<Self>,
         owner: &HostIpc,
         epoll: IpcObjectHandle,
-        sockets: &[(
-            &NativeNetFile,
-            carrick_core_abi::host_file::ReadinessSetEntry,
-        )],
+        members: Vec<SetMember>,
     ) -> Result<(), LinuxErrno> {
         let region = owner
             .socket_epoll_region()
@@ -430,24 +552,29 @@ impl NativeSocketEpolls {
         let mut state = self.state.lock();
         let mut added = Vec::new();
         added
-            .try_reserve_exact(sockets.len())
+            .try_reserve_exact(members.len())
             .map_err(|_| carrick_abi::LINUX_ENOMEM)?;
-        for (socket, entry) in sockets {
+        for member in members {
+            let entry = member.entry;
             let key = Membership {
                 epoll,
-                socket: socket.source(),
+                socket: member.source,
                 number: fd::Fd(entry.fd),
             };
             let report = EpollReport {
                 events: entry.events,
                 data: entry.data,
             };
+            let added_member = Added::SetMember {
+                level: member.level,
+                identity: member.identity,
+            };
             match self.add(
                 owner,
                 &mut state,
                 &region,
                 key,
-                socket,
+                added_member,
                 entry.file_key,
                 report,
             ) {
@@ -512,7 +639,10 @@ impl NativeSocketEpolls {
         let mut wakes = Vec::new();
         for token in tokens {
             let registration = &state.registrations[&token];
-            let replaced = !Arc::ptr_eq(&registration.description, &description);
+            let replaced = registration
+                .level
+                .description()
+                .is_none_or(|current| !Arc::ptr_eq(current, &description));
             let token = if replaced {
                 let events = registration.events;
                 let Ok(next) = state.generation() else {
@@ -525,7 +655,7 @@ impl NativeSocketEpolls {
                     Self::unwatch(&mut state, &watch);
                     continue;
                 };
-                registration.description = description.clone();
+                registration.level = Level::Description(description.clone());
                 registration.watch = watch;
                 state.insert(next, registration);
                 next
@@ -595,6 +725,25 @@ fn duplicate_host_socket(
         .ok_or(LINUX_EBADF)?
 }
 
+/// The host descriptor a readiness set watches for one member: a carrier
+/// socket's own, or the descriptor poll(2) of the description waits on (a
+/// host file, pipe or terminal). `None`: the host has no descriptor to
+/// watch (an in-memory object, which has a wait queue instead).
+fn duplicate_host_fd(description: &Arc<FileDescription>) -> Result<Option<OwnedFd>, LinuxErrno> {
+    if let Some(socket) = duplicate_host_socket(description)? {
+        return Ok(Some(socket));
+    }
+    let Some(host) = super::NetView::description_host_fd_for_poll(description) else {
+        return Ok(None);
+    };
+    // SAFETY: the caller's pin retains the description and its host fd
+    // until the clone completes.
+    unsafe { BorrowedFd::borrow_raw(host.get()) }
+        .try_clone_to_owned()
+        .map(Some)
+        .map_err(io_errno)
+}
+
 fn ctl_errno(error: EpollCtlError) -> LinuxErrno {
     use super::epoll_zone::{ZoneCtl, ZoneEpoll};
     if matches!(error, EpollCtlError::Ipc(IpcError::ZoneLimit)) {
@@ -654,21 +803,36 @@ impl super::SyscallDispatcher {
     }
 }
 
+/// The carrier's answer to a readiness set's `ReadinessSetCtl` record.
+pub(in crate::dispatch) enum SetCtl {
+    /// Every host member is registered and its initial level published.
+    Registered,
+    /// A Linux error, with nothing registered.
+    Errno(LinuxErrno),
+    /// A member whose readiness this venue cannot serve exactly: the whole
+    /// call is left unrouted (a counted ENOSYS), never answered wrong.
+    Unserved,
+}
+
 impl super::SyscallDispatcher {
-    /// A ring readiness set's carrier sockets
-    /// ([`carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl`]). Each
-    /// entry names its socket by the host resource token the ring pinned at
-    /// enrolment, so a descriptor number is never resolved again here. A
-    /// token retired since (its last descriptor closed) registers nothing:
-    /// its item never reports. A host resource that is not a carrier socket
-    /// (a host file or terminal) is not this set's to serve: ENOSYS, with
-    /// nothing registered.
+    /// A ring readiness set's host members
+    /// ([`carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl`]): one
+    /// owner serves every kind `select` can name, with Linux's semantics
+    /// per kind (#1051). A carrier socket, host file, pipe or terminal
+    /// reports its description's readiness and is watched on its host
+    /// descriptor or wait queue; a regular file is always readable and
+    /// writable; a stdio stream reports its host descriptor's `poll(2)`
+    /// answer under the stdio contract. Each entry names its resource by
+    /// the host resource token the ring pinned at enrolment, so a
+    /// descriptor number is never resolved again here. A token retired
+    /// since (its last descriptor closed) registers nothing: its item never
+    /// reports.
     pub(in crate::dispatch) fn serve_native_readiness_set_ctl(
         &self,
         owner: &Arc<HostIpc>,
         header: carrick_core_abi::host_file::HostFileHeader,
         input: &[u8],
-    ) -> Result<(), LinuxErrno> {
+    ) -> SetCtl {
         use carrick_core_abi::host_file::ReadinessSetEntry;
         use carrick_el1_abi::ipc::{HostResourceToken, RawIpcObject};
         let [raw_epoll, count, ..] = header.args;
@@ -676,31 +840,93 @@ impl super::SyscallDispatcher {
             index: raw_epoll as u32,
             generation: (raw_epoll >> 32) as u32,
         });
-        let entries = ReadinessSetEntry::decode_all(input, count).ok_or(LINUX_EINVAL)?;
-        let mut resources = Vec::new();
+        let Some(entries) = ReadinessSetEntry::decode_all(input, count) else {
+            return SetCtl::Errno(LINUX_EINVAL);
+        };
+        let mut members = Vec::new();
         for entry in entries {
-            let token = HostResourceToken::new(entry.token).ok_or(LINUX_EINVAL)?;
+            let Some(token) = HostResourceToken::new(entry.token) else {
+                return SetCtl::Errno(LINUX_EINVAL);
+            };
             let Some(resource) = owner.host_resource(token) else {
                 continue;
             };
-            if resource.downcast_ref::<NativeNetFile>().is_none() {
-                return Err(carrick_abi::LINUX_ENOSYS);
+            let member = match self.set_member(&resource, entry) {
+                Ok(member) => member,
+                Err(answer) => return answer,
+            };
+            if members.try_reserve(1).is_err() {
+                return SetCtl::Errno(carrick_abi::LINUX_ENOMEM);
             }
-            resources.push((resource, entry));
+            members.push(member);
         }
-        let sockets = resources
-            .iter()
-            .filter_map(|(resource, entry)| {
-                Some((resource.downcast_ref::<NativeNetFile>()?, *entry))
-            })
-            .collect::<Vec<_>>();
-        if sockets.is_empty() {
-            return Ok(());
+        if members.is_empty() {
+            return SetCtl::Registered;
         }
         let reactor = Arc::clone(self.kernel_binding.read().kernel().host_readiness());
-        owner
-            .native_socket_epolls(&reactor)?
-            .register_set(owner, epoll, &sockets)
+        let registered = owner
+            .native_socket_epolls(&reactor)
+            .and_then(|epolls| epolls.register_set(owner, epoll, members));
+        match registered {
+            Ok(()) => SetCtl::Registered,
+            Err(errno) if errno == carrick_abi::LINUX_ENOSYS => SetCtl::Unserved,
+            Err(errno) => SetCtl::Errno(errno),
+        }
+    }
+
+    /// Where one host member's readiness comes from, by its resource kind.
+    fn set_member(
+        &self,
+        resource: &crate::el1_ipc::HostResource,
+        entry: carrick_core_abi::host_file::ReadinessSetEntry,
+    ) -> Result<SetMember, SetCtl> {
+        use crate::kernel::objects::{ImplicitHostStdio, IpcPhysicalHold};
+        if let Some(socket) = resource.downcast_ref::<NativeNetFile>() {
+            return Ok(SetMember {
+                source: socket.source(),
+                identity: None,
+                level: Level::Description(socket.description()),
+                entry,
+            });
+        }
+        let level = if let Some(stdio) = resource.downcast_ref::<ImplicitHostStdio>() {
+            match self.stdio_readiness(stdio.fd.0) {
+                Some(super::super::fs::state::StdioReadiness::AlwaysWritable) => {
+                    Level::Constant(LinuxEpollEvents::OUT)
+                }
+                Some(super::super::fs::state::StdioReadiness::Host(host)) => {
+                    // SAFETY: the carrier's stdio descriptor lives for the run.
+                    let host = unsafe { BorrowedFd::borrow_raw(host.raw()) }
+                        .try_clone_to_owned()
+                        .map_err(|error| SetCtl::Errno(io_errno(error)))?;
+                    Level::Stdio {
+                        host,
+                        always: super::stdio_always_ready(stdio.fd.0, !0),
+                    }
+                }
+                None => return Err(SetCtl::Unserved),
+            }
+        } else if let Some(file) =
+            resource.downcast_ref::<super::super::native_files::NativeOpenFile>()
+        {
+            Level::Description(Arc::clone(file.description()))
+        } else if let Some(hold) = resource.downcast_ref::<IpcPhysicalHold>() {
+            let Some(lease) = hold.retain_io() else {
+                return Err(SetCtl::Unserved);
+            };
+            Level::Description(Arc::clone(lease.description()))
+        } else {
+            return Err(SetCtl::Unserved);
+        };
+        // Not a carrier socket: it registers under its own readiness
+        // identity, held as long as its registration.
+        let identity = HostReadinessToken::new();
+        Ok(SetMember {
+            source: identity.source(),
+            identity: Some(identity),
+            level,
+            entry,
+        })
     }
 }
 

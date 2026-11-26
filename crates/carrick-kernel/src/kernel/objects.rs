@@ -1609,6 +1609,12 @@ impl FileDescription {
         self.id
     }
 
+    /// Whether [`Self::readiness`] never changes: a regular description is
+    /// always readable and writable, so nothing has to watch it.
+    pub(crate) fn has_constant_readiness(&self) -> bool {
+        matches!(self.kind, FileDescriptionKind::Regular)
+    }
+
     pub fn is_epoll(&self) -> bool {
         match &self.kind {
             FileDescriptionKind::Concrete(backing) => backing.0.is_epoll(),

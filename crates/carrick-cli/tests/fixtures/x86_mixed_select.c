@@ -7,9 +7,16 @@
 // failure prints as `-errno`; the native run is the oracle. Each wait is
 // bounded (5 s), and the child tells the root when it is about to wait by
 // a byte on the socket, which never makes the child's own end readable.
+//
+// The root and the child also select over host descriptors of other kinds
+// (#1051 P0-1): a regular file (fd 10, always readable and writable) and
+// the run's stdio, alone and beside the in-zone pipe and the socket. A
+// readiness set serves every kind a select can name, with Linux's answer
+// per kind.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -48,6 +55,26 @@ static volatile sig_atomic_t delivered;
 static void on_usr1(int signal) {
     (void)signal;
     delivered = 1;
+}
+
+// One raw select(2) with a zero timeval over `nfds` descriptors: prints
+// the result and the descriptors left in each set.
+static void poll_sets(const char *name, int nfds, const int *reads, int nreads, const int *writes,
+                      int nwrites) {
+    fd_set r, w;
+    FD_ZERO(&r);
+    FD_ZERO(&w);
+    for (int i = 0; i < nreads; i++) FD_SET(reads[i], &r);
+    for (int i = 0; i < nwrites; i++) FD_SET(writes[i], &w);
+    struct timeval zero = {0, 0};
+    long ret = call(syscall(SYS_select, nfds, &r, &w, NULL, &zero));
+    printf("%s.%s %ld r=", who, name, ret);
+    for (int fd = 0; fd < nfds; fd++)
+        if (ret >= 0 && FD_ISSET(fd, &r)) printf("%d,", fd);
+    printf(" w=");
+    for (int fd = 0; fd < nfds; fd++)
+        if (ret >= 0 && FD_ISSET(fd, &w)) printf("%d,", fd);
+    printf("\n");
 }
 
 // One raw pselect6 over `nfds` descriptors with a read set, a write set,
@@ -112,29 +139,44 @@ static void child(void) {
     // time left.
     wait_sets("timeout", 4, both, 2, NULL, 0, 50, NULL);
 
-    // A pselect6 mask that blocks SIGUSR1: the root signals the child
-    // during the wait, then writes the pipe. The wait is not interrupted,
-    // and the signal is delivered once the old mask is back.
-    sigset_t block, none;
+    // The inherited regular file beside the pipe and the socket, neither
+    // ready: only the file answers, readable and writable.
+    const int with_file[] = {0, 3, 10};
+    poll_sets("file.mixed", 11, with_file, 3, with_file + 2, 1);
+
+    // A pselect6 mask that blocks SIGUSR1, which the thread's own mask
+    // does not: the root signals the child during the wait, then writes
+    // the pipe. Only the call's mask keeps the wait from being interrupted
+    // (EINTR, had it been ignored); the signal is delivered as the call
+    // returns, once the thread's mask is back.
+    sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
-    sigemptyset(&none);
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = on_usr1;
     value("sigaction", sigaction(SIGUSR1, &action, NULL));
-    value("block", sigprocmask(SIG_BLOCK, &block, NULL));
     tell(3, 'm');
     wait_sets("masked", 4, both, 2, NULL, 0, 5000, &block);
+    printf("%s.masked.delivered %d\n", who, (int)delivered);
     drain(0, "masked.read");
-    printf("%s.masked.delivered.before %d\n", who, (int)delivered);
-    value("unblock", sigprocmask(SIG_SETMASK, &none, NULL));
-    printf("%s.masked.delivered.after %d\n", who, (int)delivered);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argc;
     setvbuf(stdout, NULL, _IONBF, 0);
     who = "root";
+    // A regular file at fd 10 (this program's own image), and the run's
+    // stdio: the root's select over host descriptors alone.
+    int file = (int)call(syscall(SYS_open, argv[0], O_RDONLY));
+    value("file.open", file >= 0 ? 0 : file);
+    value("file.dup", syscall(SYS_dup2, file, 10) == 10 ? 0 : -1);
+    if (file != 10) close(file);
+    const int file_fd[] = {10};
+    poll_sets("file", 11, file_fd, 1, file_fd, 1);
+    const int out[] = {1};
+    poll_sets("stdout", 2, NULL, 0, out, 1);
+    poll_sets("file.stdout", 11, file_fd, 1, (const int[]){1, 10}, 2);
     int listener = (int)call(syscall(SYS_socket, AF_INET, SOCK_STREAM, 0));
     struct sockaddr_in address;
     memset(&address, 0, sizeof address);

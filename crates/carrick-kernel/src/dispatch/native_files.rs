@@ -110,6 +110,11 @@ pub struct NativeOpenFile {
 }
 
 impl NativeOpenFile {
+    /// The host description this native descriptor names.
+    pub(in crate::dispatch) fn description(&self) -> &Arc<crate::kernel::FileDescription> {
+        &self.description
+    }
+
     /// The native descriptor is a functional reference to the description,
     /// exactly as a host fd slot is: close effects and mapping rules follow.
     fn new(description: Arc<crate::kernel::FileDescription>) -> Self {
@@ -593,8 +598,9 @@ impl SyscallDispatcher {
             }
         } else if header.op == HostFileOp::ReadinessSetCtl {
             match self.serve_native_readiness_set_ctl(owner, header, view.input()) {
-                Ok(()) => Served::Reply(0, Vec::new()),
-                Err(errno) => Served::errno(errno),
+                super::net::native_epoll::SetCtl::Registered => Served::Reply(0, Vec::new()),
+                super::net::native_epoll::SetCtl::Errno(errno) => Served::errno(errno),
+                super::net::native_epoll::SetCtl::Unserved => Served::Refused,
             }
         } else if header.op == HostFileOp::NetSyscall {
             match self.serve_native_net_call(owner, table, header, view.input(), waiter) {
