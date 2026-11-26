@@ -197,7 +197,7 @@ fn destroy_returns_every_host_and_terminalizes_pinned_extents() {
     assert_eq!(gone.id, pinned);
     assert_eq!(core.create(), Ok(GenerationId(2)));
     core.commit_create().unwrap();
-    finish(core);
+    finish(*core);
 }
 
 #[test]
@@ -267,4 +267,79 @@ fn a_core_dropped_holding_anything_reaches_its_venue() {
         .expect_err("teardown refuses while a destroy is outstanding");
     core.finish_destroy(ticket, BackendResult::Done).unwrap();
     assert!(core.teardown().is_ok());
+}
+
+type GrantCore = CarrierCore<ExplorerVenue, &'static str, u32, u8>;
+
+fn grant_carrier() -> CarrierId {
+    // SAFETY: each test builds its own core.
+    unsafe { CarrierId::assume_unique(NonZeroU64::MIN) }
+}
+
+fn cow_demand(ipa: u64) -> CowDemand {
+    CowDemand {
+        page: 0x1000,
+        replacement: GpaExtent::new(ipa, 0x4000).unwrap(),
+    }
+}
+
+/// A completion settles only under its own MM's exclusion, by its exact
+/// incarnation, and exactly once; a retiring MM takes every grant it holds
+/// and leaves another MM's.
+#[test]
+fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
+    let (a, b) = (
+        MmKey::new(NonZeroU64::MIN),
+        MmKey::new(NonZeroU64::new(2).unwrap()),
+    );
+    let mut core = GrantCore::new(grant_carrier());
+    let (xa, xb) = (ExcludedMm::claimed(a), ExcludedMm::claimed(b));
+    for (excluded, ipa, payload) in [(&xa, 0x10_000, 1), (&xa, 0x20_000, 2), (&xb, 0x30_000, 3)] {
+        let ticket = core.supply_cow(excluded, cow_demand(ipa)).unwrap();
+        assert_eq!(
+            core.supply_cow(excluded, cow_demand(0x40_000)),
+            Err(MmRefusal::Refused(Refusal::InFlight)),
+            "one host edit of an MM at a time"
+        );
+        core.finish_supply_cow(ticket, Supplied::Published(payload))
+            .unwrap();
+    }
+    assert_eq!(
+        core.supply_cow(&xb, cow_demand(0x12_000)),
+        Err(MmRefusal::Refused(Refusal::Collision)),
+        "G1: replacement extents never overlap"
+    );
+    let proof = core.begin_settle(&xb).unwrap();
+    assert_eq!(
+        core.settle_cow(&proof, &1),
+        Err(Refusal::NotFound),
+        "another MM's grant"
+    );
+    assert_eq!(core.settle_cow(&proof, &3), Ok(3));
+    assert_eq!(
+        core.settle_cow(&proof, &3),
+        Err(Refusal::NotFound),
+        "settled once"
+    );
+    core.finish_settle(proof).unwrap();
+    let mut returned = core.retire_mm(a).unwrap();
+    returned.sort();
+    assert_eq!(returned, [1, 2]);
+    assert_eq!(core.grant_count(), 0);
+    assert!(core.teardown().is_ok());
+}
+
+/// V6 covers grants and editors: a core dropped with a provisioned grant is
+/// a broken invariant reported through its venue.
+#[test]
+fn a_core_dropped_holding_a_cow_grant_reaches_its_venue() {
+    let caught = std::panic::catch_unwind(|| {
+        let mut core = GrantCore::new(grant_carrier());
+        let excluded = ExcludedMm::claimed(MmKey::new(NonZeroU64::MIN));
+        let ticket = core.supply_cow(&excluded, cow_demand(0x10_000)).unwrap();
+        core.finish_supply_cow(ticket, Supplied::Published(1))
+            .unwrap();
+        drop(core);
+    });
+    assert!(caught.is_err(), "the venue must see the dropped grant");
 }
