@@ -1776,6 +1776,9 @@ enum PreparedScenario {
     /// Untouched grant, then a child write and a parent write while both
     /// processes stay live.
     UntouchedGrantWrites,
+    /// As [`Self::UntouchedGrantWrites`], with the child's first write
+    /// faulting while a fork of the child is published and pending.
+    UntouchedGrantWritesBesidePendingFork,
     ProtNoneAcrossFork,
     /// PROT_NONE across fork, then child `mprotect(RW)` and a child write.
     ProtNoneAcrossForkWritable,
@@ -1818,6 +1821,22 @@ fn native_inherited_prepared_writes_stay_private_to_each_live_process() {
         false,
         SupplyEnd::Resume,
         PreparedScenario::UntouchedGrantWrites,
+    );
+}
+
+/// #2923: a copy-on-write whose replacement grant is already ready in the
+/// pool needs no selection, the step a pending fork refuses. A fork
+/// published meanwhile still owns the faulting MM's leaves until its
+/// commit, so the fault's editor admission waits on the publication's
+/// release, and the leaf the fork selected is not repointed under it.
+#[test]
+fn native_cow_with_a_ready_grant_waits_out_a_pending_fork_publication() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::UntouchedGrantWritesBesidePendingFork,
     );
 }
 
@@ -1908,6 +1927,7 @@ fn composed_native_supply_with_prepared(
         PreparedScenario::None | PreparedScenario::ResidentTranslationRetry => {}
         PreparedScenario::UntouchedGrant
         | PreparedScenario::UntouchedGrantWrites
+        | PreparedScenario::UntouchedGrantWritesBesidePendingFork
         | PreparedScenario::CompetingValidPreparedReply => {
             // Untouched private anonymous stock has an output but is invalid.
             // Keep the non-identity IPA and Linux RW intent from the parent leaf.
@@ -2202,6 +2222,7 @@ fn composed_native_supply_with_prepared(
         PreparedScenario::None => {}
         PreparedScenario::UntouchedGrant
         | PreparedScenario::UntouchedGrantWrites
+        | PreparedScenario::UntouchedGrantWritesBesidePendingFork
         | PreparedScenario::ResidentTranslationRetry
         | PreparedScenario::CompetingValidPreparedReply => {
             frame.esr = 0x92000006;
@@ -2383,7 +2404,106 @@ fn composed_native_supply_with_prepared(
                 0,
                 "publication allocates and copies no backing"
             );
-            if prepared == PreparedScenario::UntouchedGrantWrites {
+            if matches!(
+                prepared,
+                PreparedScenario::UntouchedGrantWrites
+                    | PreparedScenario::UntouchedGrantWritesBesidePendingFork
+            ) {
+                if prepared == PreparedScenario::UntouchedGrantWritesBesidePendingFork {
+                    // A fork of the child is published and pending when
+                    // the child's write faults with its grant ready.
+                    let access =
+                        crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+                    let index = access.find(identity.mm).unwrap();
+                    let request = {
+                        let mut reservations = fixture
+                            .region
+                            .table()
+                            .lock_in(access, index.index(), handle.mm(), 7)
+                            .unwrap();
+                        let request = carrick_el1_abi::PortalForkRequest {
+                            operation: carrick_el1_abi::PortalOperation {
+                                carrier: portal.carrier().unwrap(),
+                                mm: handle.mm(),
+                                incarnation: NonZeroU64::new(reservations.incarnation().raw())
+                                    .unwrap(),
+                                sequence: reservations.next_transfer_sequence().unwrap(),
+                            },
+                            parent_generation: reservations.generation(),
+                            child_mm: ReservationMm::new(handle.mm().raw() + 1).unwrap(),
+                            child_tables: carrick_el1_abi::PortalForkTableArena::new(
+                                0x800000, 0x200000,
+                            )
+                            .unwrap(),
+                            parent_tables: carrick_el1_abi::PortalForkTableArena::new(
+                                0xa00000, 0x200000,
+                            )
+                            .unwrap(),
+                            kernel_control_ipa: 0xc00000,
+                        };
+                        reservations.begin_fork_publication(request).unwrap();
+                        request
+                    };
+                    if pool.ready(identity.mm).count() == 0 {
+                        pool.publish(identity.mm, 0xa000_0000, cow_backing(21))
+                            .unwrap();
+                    }
+                    let before = leaf(words, root, VA);
+                    let copies = memory.copies.get();
+                    frame.esr = 0x9200004f;
+                    frame.far = VA + 13;
+                    let pending = OwnerFaultSupply::new(portal).with_handle(handle);
+                    assert_eq!(
+                        carrick_el1::fault::dispatch_fault_with_prepared(
+                            &mut frame,
+                            &counters,
+                            core::slice::from_ref(&fixture.task),
+                            access,
+                            crate::cow_resolver::native_fault_supply(
+                                true,
+                                carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                                &pending,
+                            ),
+                            Some(carrick_el1::fault::PreparedFaultPath {
+                                residency,
+                                resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                                roots: Some(fixture.region.table()),
+                                file_slots: Some(portal),
+                            }),
+                            &mut resolver,
+                        ),
+                        carrick_el1_abi::Action::Forward,
+                        "a COW must not resolve while a fork of its MM is pending"
+                    );
+                    let OwnerFaultSupplyOutcome::Wait(wait) = pending.outcome() else {
+                        panic!(
+                            "the COW beside a pending fork lost its wait: {:?}",
+                            pending.outcome()
+                        );
+                    };
+                    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::PendingEdit);
+                    assert_eq!(wait.handle(), handle);
+                    assert_eq!(
+                        leaf(words, root, VA),
+                        before,
+                        "the pending fork's leaf was edited"
+                    );
+                    assert_eq!(memory.copies.get(), copies, "no copy under the fork");
+                    assert_eq!(
+                        pool.ready(identity.mm).count(),
+                        1,
+                        "the ready grant stays in the pool for the rerun"
+                    );
+                    let mut reservations = fixture
+                        .region
+                        .table()
+                        .lock_in(access, index.index(), handle.mm(), 7)
+                        .unwrap();
+                    reservations
+                        .finish_fork_publication(request.operation)
+                        .unwrap();
+                    reservations.clear_fork_origin();
+                }
                 // Both processes stay live: the child stores, then the
                 // parent's own first touch commits its inherited prepared
                 // leaf through the shared Publish executor and stores.
