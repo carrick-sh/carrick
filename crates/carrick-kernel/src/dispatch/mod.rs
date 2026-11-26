@@ -1531,6 +1531,16 @@ impl SyscallDispatcher {
         registration: &crate::kernel::ExecutorRegistration,
         operation: impl FnOnce() -> T,
     ) -> Result<T, DispatchError> {
+        // The host size door's registry is a leaf lock: a thread holding it
+        // must never lend its CPU and MM and then wait to reclaim them, or a
+        // borrower that needs the registry deadlocks against it (#2975 r36
+        // P0 2). A violation is a broken invariant, caught before any
+        // capacity is lent.
+        assert!(
+            !carrick_vfs::host_size::held_by_current_thread(),
+            "host wait entered while this thread holds the host size door's registry \
+             (the registry is a leaf lock: #2975 r36)"
+        );
         let lease = execution_lease.ok_or(DispatchError::MmExecutorExecutionLeaseUnavailable)?;
         let executor = mm_executor.ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
         self.validate_current_mm_executor(executor, kernel, lease)?;

@@ -16989,4 +16989,319 @@ mod window_size_door {
             assert_eq!(host_len, 8192);
         });
     }
+
+    const SYS_FALLOCATE: u64 = 47;
+    const FALLOC_KEEP_SIZE: u64 = carrick_abi::LINUX_FALLOC_FL_KEEP_SIZE;
+    const FALLOC_PUNCH_HOLE: u64 = carrick_abi::LINUX_FALLOC_FL_PUNCH_HOLE;
+    const FALLOC_COLLAPSE_RANGE: u64 = carrick_abi::LINUX_FALLOC_FL_COLLAPSE_RANGE;
+    const FALLOC_ZERO_RANGE: u64 = carrick_abi::LINUX_FALLOC_FL_ZERO_RANGE;
+    const FALLOC_INSERT_RANGE: u64 = carrick_abi::LINUX_FALLOC_FL_INSERT_RANGE;
+    const FALLOC_UNSHARE_RANGE: u64 = carrick_abi::LINUX_FALLOC_FL_UNSHARE_RANGE;
+
+    /// A rootfs file whose bytes count up, so any shift, zeroing or
+    /// truncation shows.
+    fn counting_file(run: &Run, path: &str, len: usize) -> std::path::PathBuf {
+        let host = run.rootfs_file(path, len);
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+        std::fs::write(&host, &bytes).unwrap();
+        host
+    }
+
+    fn counting_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    /// `actual` against `expected`, reporting the length and the first
+    /// differing offset rather than both buffers.
+    #[track_caller]
+    fn assert_bytes(actual: &[u8], expected: &[u8], what: &str) {
+        let first = actual.iter().zip(expected).position(|(a, e)| a != e);
+        assert!(
+            actual.len() == expected.len() && first.is_none(),
+            "{what}: len {} (expected {}), first difference at {first:?}",
+            actual.len(),
+            expected.len()
+        );
+    }
+
+    fn open_host_file(run: &mut Run, path: &str) -> u64 {
+        let DispatchOutcome::Returned { value } = run.open(path, LINUX_O_RDWR) else {
+            panic!("open {path}");
+        };
+        let file = run.dispatcher.open_file(value as i32).unwrap();
+        assert!(matches!(
+            &*crate::kernel::FileDescription::read_for_io(&file.description).unwrap(),
+            OpenDescription::HostFile { .. }
+        ));
+        value as u64
+    }
+
+    /// Review P0 1 (#2975 r36): `fallocate(FALLOC_FL_COLLAPSE_RANGE)` of a
+    /// host file no window maps. Red before: the hole-punch/collapse arm took
+    /// the registry's read lock for the discard, did not consume it for a
+    /// collapse, and fell into the growth arm, whose write lock on the same
+    /// thread never returns: the syscall deadlocked (and wedged every later
+    /// size change in the process). Now a collapse is a mode Carrick does not
+    /// serve: a counted ENOSYS, decided before any lock, with the file
+    /// unchanged.
+    #[test]
+    fn fallocate_collapse_range_of_an_unwindowed_host_file_answers_enosys_without_deadlock() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let host = counting_file(&run, "/plain", 16384);
+        let fd = open_host_file(&mut run, "/plain");
+        assert_eq!(
+            run.call(
+                SYS_FALLOCATE,
+                None,
+                [fd, FALLOC_COLLAPSE_RANGE, 0, 4096, 0, 0]
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_bytes(
+            &std::fs::read(&host).unwrap(),
+            &counting_bytes(16384),
+            "the file",
+        );
+        assert!(!carrick_vfs::host_size::held_by_current_thread());
+    }
+
+    /// Review P0 1 (#2975 r36): every `fallocate` mode Carrick cannot serve
+    /// exactly is a counted ENOSYS that changes nothing, on a windowed host
+    /// file and on one no window maps. Red before: `ZERO_RANGE` (with or
+    /// without `KEEP_SIZE`), `INSERT_RANGE` and `UNSHARE_RANGE` answered 0;
+    /// without `KEEP_SIZE` they extended the file, and none zeroed or shifted
+    /// a byte.
+    #[test]
+    fn unserved_fallocate_modes_answer_enosys_and_change_nothing() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let windowed = counting_file(&run, "/windowed", 16384);
+        let plain = counting_file(&run, "/plain", 16384);
+        let _pin = window(&run, &windowed);
+        let fds = [
+            (open_host_file(&mut run, "/windowed"), &windowed),
+            (open_host_file(&mut run, "/plain"), &plain),
+        ];
+        for (fd, host) in fds {
+            for mode in [
+                FALLOC_ZERO_RANGE,
+                FALLOC_ZERO_RANGE | FALLOC_KEEP_SIZE,
+                FALLOC_INSERT_RANGE,
+                FALLOC_UNSHARE_RANGE,
+                FALLOC_UNSHARE_RANGE | FALLOC_KEEP_SIZE,
+                FALLOC_PUNCH_HOLE,
+            ]
+            .into_iter()
+            .chain((fd == fds[0].0).then_some(FALLOC_COLLAPSE_RANGE))
+            {
+                assert_eq!(
+                    run.call(SYS_FALLOCATE, None, [fd, mode, 4096, 8192, 0, 0]),
+                    DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS),
+                    "mode {mode:#x} on {}",
+                    host.display()
+                );
+                assert_bytes(
+                    &std::fs::read(host).unwrap(),
+                    &counting_bytes(16384),
+                    &format!("mode {mode:#x} on {}", host.display()),
+                );
+            }
+        }
+    }
+
+    /// Review P0 1 (#2975 r36): `PUNCH_HOLE | KEEP_SIZE` of a host file is
+    /// served exactly: the range reads back as zeros and the size holds; on
+    /// a windowed file the door refuses it (ENOSYS) and nothing changes. Red
+    /// before on a Linux host: the punch was a silent no-op that answered 0.
+    #[test]
+    fn host_file_hole_punch_zeroes_the_range_and_a_window_fences_it() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let windowed = counting_file(&run, "/windowed", 16384);
+        let plain = counting_file(&run, "/plain", 16384);
+        let _pin = window(&run, &windowed);
+        let windowed_fd = open_host_file(&mut run, "/windowed");
+        let plain_fd = open_host_file(&mut run, "/plain");
+        let punch = FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE;
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [windowed_fd, punch, 4096, 8192, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_bytes(
+            &std::fs::read(&windowed).unwrap(),
+            &counting_bytes(16384),
+            "windowed",
+        );
+        // An unaligned range, running past the end of the file.
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [plain_fd, punch, 1000, 20000, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let mut expected = counting_bytes(16384);
+        expected[1000..].fill(0);
+        assert_bytes(
+            &std::fs::read(&plain).unwrap(),
+            &expected,
+            "the punched file",
+        );
+        assert!(!carrick_vfs::host_size::held_by_current_thread());
+    }
+
+    /// Review P0 1 (#2975 r36): a hole punch of a materialized copy of a
+    /// host file reaches the host file through the size door, then the
+    /// copy. Red before: only the copy was zeroed (no writeback), so the
+    /// host file kept its bytes, and on a windowed file the door was never
+    /// asked.
+    #[test]
+    fn materialized_hole_punch_rewrites_the_host_file_through_the_door() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let run = Run::new();
+        let install = |path: &str, host: &std::path::Path| {
+            let bytes = std::fs::read(host).unwrap();
+            let desc = OpenDescription::File {
+                path: path.to_string(),
+                contents: FileContents::dense(bytes.clone()),
+                offset: 0,
+                writable: true,
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(path),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: bytes.len(),
+                },
+                base: OpenDescriptionBase::new(0),
+            };
+            let DispatchOutcome::Returned { value } = run.dispatcher.install_fd(desc, 0) else {
+                panic!("install_fd {path}");
+            };
+            value as u64
+        };
+        let windowed = counting_file(&run, "/windowed", 8192);
+        let plain = counting_file(&run, "/plain", 8192);
+        let windowed_fd = install("/windowed", &windowed);
+        let plain_fd = install("/plain", &plain);
+        let _pin = window(&run, &windowed);
+        let mut run = run;
+        let punch = FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE;
+        let copy = |run: &Run, fd: u64| {
+            let file = run.dispatcher.open_file(fd as i32).unwrap();
+            let open = crate::kernel::FileDescription::read_for_io(&file.description).unwrap();
+            let OpenDescription::File { contents, .. } = &*open else {
+                panic!("materialized");
+            };
+            let mut bytes = vec![0u8; contents.len().unwrap() as usize];
+            contents.read_at(0, &mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [windowed_fd, punch, 1000, 2000, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_bytes(
+            &std::fs::read(&windowed).unwrap(),
+            &counting_bytes(8192),
+            "windowed host",
+        );
+        assert_bytes(
+            &copy(&run, windowed_fd),
+            &counting_bytes(8192),
+            "windowed copy",
+        );
+
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [plain_fd, punch, 1000, 2000, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let mut expected = counting_bytes(8192);
+        expected[1000..3000].fill(0);
+        assert_bytes(&std::fs::read(&plain).unwrap(), &expected, "the host file");
+        assert_bytes(&copy(&run, plain_fd), &expected, "the materialized copy");
+    }
+
+    /// Review P0 3 (#2975 r36): a read-only bind mount (`--volume
+    /// host:guest:ro`) changes nothing on the host. Red before: `O_RDONLY |
+    /// O_TRUNC` truncated the host file (through the size door's writable
+    /// reopen, and on a Linux host already through the plain host open), and
+    /// `O_CREAT` created a host file.
+    #[test]
+    fn a_read_only_bind_mount_never_truncates_or_creates_a_host_file() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        let mounted = tempfile::tempdir().unwrap();
+        let file = mounted.path().join("x");
+        std::fs::write(&file, b"keep these bytes").unwrap();
+        run.dispatcher.register_mount(
+            "/ro",
+            Box::new(carrick_vfs::BindVfs::new("/ro", mounted.path(), true)),
+        );
+        let o = |flags: u64| flags;
+        for (path, flags, expected) in [
+            (
+                "/ro/x",
+                o(carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_TRUNC),
+                carrick_abi::LINUX_EROFS,
+            ),
+            (
+                "/ro/x",
+                o(carrick_abi::LINUX_O_RDONLY
+                    | carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_TRUNC),
+                carrick_abi::LINUX_EROFS,
+            ),
+            (
+                "/ro/x",
+                o(carrick_abi::LINUX_O_WRONLY),
+                carrick_abi::LINUX_EROFS,
+            ),
+            (
+                "/ro/x",
+                o(carrick_abi::LINUX_O_RDONLY
+                    | carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_EXCL),
+                carrick_abi::LINUX_EEXIST,
+            ),
+            (
+                "/ro/new",
+                o(carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_CREAT),
+                carrick_abi::LINUX_EROFS,
+            ),
+            (
+                "/ro/new",
+                o(carrick_abi::LINUX_O_RDONLY
+                    | carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_EXCL),
+                carrick_abi::LINUX_EROFS,
+            ),
+        ] {
+            assert_eq!(
+                run.call(SYS_OPENAT, Some(path), [AT_FDCWD, PATH, flags, 0o644, 0, 0]),
+                DispatchOutcome::errno(expected),
+                "openat({path}, {flags:#o})"
+            );
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                b"keep these bytes",
+                "{path} {flags:#o}"
+            );
+            assert!(
+                !mounted.path().join("new").exists(),
+                "{path} {flags:#o} created a host file"
+            );
+        }
+        // An existing file opens read-only as named, `O_CREAT` or not.
+        for flags in [
+            o(carrick_abi::LINUX_O_RDONLY),
+            o(carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_CREAT),
+        ] {
+            assert!(
+                matches!(
+                    run.call(SYS_OPENAT, Some("/ro/x"), [AT_FDCWD, PATH, flags, 0o644, 0, 0]),
+                    DispatchOutcome::Returned { value } if value >= 0
+                ),
+                "{flags:#o}"
+            );
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep these bytes");
+    }
 }

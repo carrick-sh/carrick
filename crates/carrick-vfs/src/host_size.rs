@@ -17,12 +17,12 @@
 //!
 //! A change is a typed token: [`Resize`] and [`Discard`] are minted only by
 //! the admissions, and a resize is applied only by the door itself. [`admit_write`]
-//! and non-windowed checks hold `WINDOWED.read()`, while [`admit_resize`] upgrades
-//! to `WINDOWED.write()` when `fd` names a windowed (or unstatable) inode in a
+//! and non-windowed checks hold `lock_read()`, while [`admit_resize`] upgrades
+//! to `lock_write()` when `fd` names a windowed (or unstatable) inode in a
 //! non-empty registry (serializing concurrent resizes, [`record`], and in-flight
 //! [`admit_write`] regular-file writes). Normal host opens run unlocked; only the
 //! non-Linux empty-registry fallback and Linux's single-FD `EMFILE` empty-registry
-//! fallback hold `WINDOWED.read()` across the fallback `open(flags)` after `owned`
+//! fallback hold `lock_read()` across the fallback `open(flags)` after `owned`
 //! verified an unwindowed regular file so [`record`] cannot intervene.
 //!
 //! The registry is process-wide: a window slot is a host mapping of this
@@ -64,7 +64,7 @@ impl WindowRegistration {
 
 impl Drop for WindowRegistration {
     fn drop(&mut self) {
-        let mut registry = WINDOWED.write();
+        let mut registry = lock_write();
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
             registry.entry(self.identity)
         {
@@ -89,6 +89,92 @@ std::thread_local! {
     /// Changes this thread's door refused, so a caller can tell the door's
     /// `ENOSYS` from a layer's own ([`fenced_during`]).
     static REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether this thread holds the registry (either mode): the leaf rule's
+    /// mark ([`lock_read`], [`lock_write`], [`held_by_current_thread`]).
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread holds the window registry. A caller about to wait
+/// (lend its CPU for a host wait, park) checks this: the registry is a
+/// leaf, and a holder must never wait on a peer (see the module's lock
+/// order).
+pub fn held_by_current_thread() -> bool {
+    HELD.with(std::cell::Cell::get)
+}
+
+/// This thread's mark as the registry's holder. Minted before the lock is
+/// taken, so a re-entrant acquire panics instead of deadlocking; dropped
+/// after the lock is released.
+struct HeldMark(());
+
+impl HeldMark {
+    fn enter() -> Self {
+        HELD.with(|held| {
+            assert!(
+                !held.replace(true),
+                "host_size: the window registry was re-entered on the thread that holds it \
+                 (the registry is a leaf lock: #2975 r36)"
+            );
+        });
+        Self(())
+    }
+}
+
+impl Drop for HeldMark {
+    fn drop(&mut self) {
+        HELD.with(|held| held.set(false));
+    }
+}
+
+/// The registry, read-locked by this thread. Fields drop in order: the lock
+/// is released before the holder mark clears.
+struct ReadLocked {
+    guard: RwLockReadGuard<'static, Registry>,
+    _mark: HeldMark,
+}
+
+/// The registry, write-locked by this thread.
+struct WriteLocked {
+    guard: RwLockWriteGuard<'static, Registry>,
+    _mark: HeldMark,
+}
+
+impl std::ops::Deref for ReadLocked {
+    type Target = Registry;
+    fn deref(&self) -> &Registry {
+        &self.guard
+    }
+}
+
+impl std::ops::Deref for WriteLocked {
+    type Target = Registry;
+    fn deref(&self) -> &Registry {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriteLocked {
+    fn deref_mut(&mut self) -> &mut Registry {
+        &mut self.guard
+    }
+}
+
+/// The only way to read-lock the registry.
+fn lock_read() -> ReadLocked {
+    let mark = HeldMark::enter();
+    ReadLocked {
+        guard: WINDOWED.read(),
+        _mark: mark,
+    }
+}
+
+/// The only way to write-lock the registry.
+fn lock_write() -> WriteLocked {
+    let mark = HeldMark::enter();
+    WriteLocked {
+        guard: WINDOWED.write(),
+        _mark: mark,
+    }
 }
 
 /// Run `f`, and report whether the door refused a change on this thread
@@ -130,45 +216,45 @@ impl Fenced {
 
 #[allow(dead_code)]
 enum RegistryGuard<'a> {
-    Read(RwLockReadGuard<'a, Registry>),
-    Write(RwLockWriteGuard<'a, Registry>),
+    Read(ReadLocked, std::marker::PhantomData<&'a ()>),
+    Write(WriteLocked),
 }
 
 impl RegistryGuard<'_> {
     fn registry(&self) -> &Registry {
         match self {
-            Self::Read(guard) => guard,
+            Self::Read(guard, _) => guard,
             Self::Write(guard) => guard,
         }
     }
 }
 
-fn lock_window_write() -> RwLockWriteGuard<'static, Registry> {
+fn lock_window_write() -> WriteLocked {
     #[cfg(any(test, feature = "test-support"))]
     {
         test_resize_hook::pause_before_resize_lock();
         test_resize_hook::signal_before_resize_lock();
     }
-    let registry = WINDOWED.write();
+    let registry = lock_write();
     #[cfg(any(test, feature = "test-support"))]
     test_resize_hook::signal_after_resize_lock();
     registry
 }
 
 fn lock_for_resize(fd: RawFd) -> RegistryGuard<'static> {
-    let registry = WINDOWED.read();
+    let registry = lock_read();
     if !registry.is_empty() && is_windowed_or_unstatable(&registry, fd) {
         drop(registry);
         return RegistryGuard::Write(lock_window_write());
     }
-    RegistryGuard::Read(registry)
+    RegistryGuard::Read(registry, std::marker::PhantomData)
 }
 
 /// An admitted resize of one descriptor's file to one length. Only
-/// [`admit_resize`] mints one: it holds `WINDOWED.write()` when `fd` names a
+/// [`admit_resize`] mints one: it holds `lock_write()` when `fd` names a
 /// windowed (or unstatable) inode in a non-empty registry (so no concurrent
 /// resize, [`record`], or regular-file write can interleave between the EOF
-/// check and `ftruncate(2)`), or `WINDOWED.read()` otherwise. The door applies it itself
+/// check and `ftruncate(2)`), or `lock_read()` otherwise. The door applies it itself
 /// ([`Resize::apply`]): the admitted length on the admitted descriptor,
 /// nothing else.
 #[must_use = "an admitted resize does nothing until it is applied"]
@@ -180,22 +266,22 @@ pub struct Resize<'a> {
 
 /// Guard holding the window-registry read lock across a regular-file host
 /// write (`pwrite`/`write`/`writev`), so concurrent [`admit_resize`] on a
-/// windowed inode (`WINDOWED.write()`) cannot sample an older EOF before the
+/// windowed inode (`lock_write()`) cannot sample an older EOF before the
 /// write extends the file and `ftruncate(2)` back down afterward (#2975 P0 1).
 #[must_use = "write guard must stay live until the host write finishes"]
 pub struct WriteGuard {
-    _registry: RwLockReadGuard<'static, Registry>,
+    _registry: ReadLocked,
 }
 
 /// Hold the window-registry read lock across a regular-file host write on
 /// `fd`. Shared write guards do not contend with one another, while
-/// `WINDOWED.write()` writers ([`admit_resize`] on a windowed inode and
+/// `lock_write()` writers ([`admit_resize`] on a windowed inode and
 /// [`record`]) serialize cleanly with in-flight writes.
 pub fn admit_write(_fd: BorrowedFd<'_>) -> WriteGuard {
     #[cfg(any(test, feature = "test-support"))]
     test_resize_hook::signal_before_write_lock();
     let guard = WriteGuard {
-        _registry: WINDOWED.read(),
+        _registry: lock_read(),
     };
     #[cfg(any(test, feature = "test-support"))]
     test_resize_hook::signal_after_write_lock();
@@ -331,7 +417,7 @@ impl Resize<'_> {
 /// registry's read lock until it is applied.
 #[must_use = "an admitted discard does nothing until it is applied"]
 pub struct Discard<'a> {
-    _registry: RwLockReadGuard<'a, Registry>,
+    _registry: ReadLocked,
     fd: BorrowedFd<'a>,
 }
 
@@ -345,7 +431,7 @@ impl Discard<'_> {
 /// Admit a resize of the file `fd` names to `len` bytes: `Err(EFBIG)` for a
 /// length the host cannot represent, `Err(`[`Fenced::ERRNO`]`)` when
 /// fenced. Serializes concurrent resizes on any windowed inode under
-/// `WINDOWED.write()` across the EOF check and `ftruncate` (#2975 P0 1).
+/// `lock_write()` across the EOF check and `ftruncate` (#2975 P0 1).
 pub fn admit_resize(fd: BorrowedFd<'_>, len: u64) -> Result<Resize<'_>, libc::c_int> {
     let off = libc::off_t::try_from(len).map_err(|_| libc::EFBIG)?;
     let guard = lock_for_resize(fd.as_raw_fd());
@@ -390,7 +476,7 @@ pub fn extend_to(fd: BorrowedFd<'_>, min_len: u64) -> Result<bool, libc::c_int> 
 
 /// Admit a discard of the file `fd` names, or [`Fenced`].
 pub fn admit_discard(fd: BorrowedFd<'_>) -> Result<Discard<'_>, Fenced> {
-    let registry = WINDOWED.read();
+    let registry = lock_read();
     check(&registry, fd.as_raw_fd(), Change::Discard)?;
     Ok(Discard {
         _registry: registry,
@@ -634,11 +720,11 @@ enum EmptyRegistryFallback {
 }
 
 /// Reopen `flags` (where `flags & O_ACCMODE == O_RDONLY`) under an empty
-/// `WINDOWED.read()` guard without blocking on a FIFO: open with `O_NONBLOCK`,
-/// restore `O_NONBLOCK` if `S_IFREG`, and otherwise drop `WINDOWED.read()`
+/// `lock_read()` guard without blocking on a FIFO: open with `O_NONBLOCK`,
+/// restore `O_NONBLOCK` if `S_IFREG`, and otherwise drop `lock_read()`
 /// BEFORE running a blocking `!(O_TRUNC)` open (#2975 r33 P0 #3).
 fn open_empty_registry_fallback(
-    registry: RwLockReadGuard<'_, Registry>,
+    registry: ReadLocked,
     owned: OwnedFd,
     flags: libc::c_int,
     open: &mut dyn FnMut(libc::c_int) -> Result<OwnedFd, libc::c_int>,
@@ -703,7 +789,7 @@ fn truncate_opened_fd(
                     return Ok(owned);
                 }
                 Err(libc::EMFILE) => {
-                    let registry = WINDOWED.read();
+                    let registry = lock_read();
                     check(&registry, owned.as_raw_fd(), Change::Resize(0))
                         .map_err(|Fenced| Fenced::ERRNO)?;
                     if registry.is_empty() {
@@ -722,7 +808,7 @@ fn truncate_opened_fd(
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let registry = WINDOWED.read();
+            let registry = lock_read();
             if registry.is_empty() {
                 match open_empty_registry_fallback(registry, owned, flags, open)? {
                     EmptyRegistryFallback::Done(fd) => return Ok(fd),
@@ -793,7 +879,7 @@ pub fn record(fd: BorrowedFd<'_>) -> Option<WindowRegistration> {
     let stat = fstat(fd.as_raw_fd())?;
     let identity = identity_of(&stat);
     let birth = birth(fd.as_raw_fd(), &stat);
-    let mut registry = WINDOWED.write();
+    let mut registry = lock_write();
     match registry.entry(identity) {
         std::collections::hash_map::Entry::Occupied(mut entry) => {
             entry.get_mut().birth = birth;
@@ -808,12 +894,12 @@ pub fn record(fd: BorrowedFd<'_>) -> Option<WindowRegistration> {
 
 /// Whether a window of this process maps `identity`.
 pub fn maps(identity: InodeIdentity) -> bool {
-    WINDOWED.read().contains_key(&identity)
+    lock_read().contains_key(&identity)
 }
 
 /// Whether any window of this process was recorded.
 pub fn any_window() -> bool {
-    !WINDOWED.read().is_empty()
+    !lock_read().is_empty()
 }
 
 fn is_windowed_or_unstatable(registry: &Registry, fd: RawFd) -> bool {

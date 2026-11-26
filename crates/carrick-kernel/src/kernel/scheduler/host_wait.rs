@@ -340,6 +340,13 @@ impl Scheduler {
         lease: &'a ThreadExecutionLease,
         registration: &ExecutorRegistration,
     ) -> Result<HostWaitToken<'a>, SchedulerError> {
+        // The host size door's registry is a leaf: never lend a CPU while
+        // holding it (#2975 r36; `carrick_vfs::host_size` lock order).
+        assert!(
+            !carrick_vfs::host_size::held_by_current_thread(),
+            "host wait begun while this thread holds the host size door's registry \
+             (the registry is a leaf lock: #2975 r36)"
+        );
         let transition = self.generation_transition.lock();
         self.executors.authenticate(registration)?;
         let thread = self
