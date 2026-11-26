@@ -541,7 +541,7 @@ pub(super) fn map_resume<X: ForkStockCrossing>(
 pub(super) fn process_record_for_call(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     control: &ThreadControlSlot,
 ) -> Result<RecordId, NativeProcessError> {
@@ -554,7 +554,7 @@ pub(super) fn process_record_for_call(
     {
         return Ok(record);
     }
-    init_process_record(source, task, native, ttbr0, existing, control)
+    init_process_record(source, task, entry, ttbr0, existing, control)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -562,7 +562,7 @@ pub(super) fn process_record_for_call(
 fn init_process_record(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     host_record: Option<RecordId>,
     control: &ThreadControlSlot,
@@ -589,7 +589,7 @@ fn init_process_record(
     };
     // SAFETY: the current host lane owns its unpublished home record.
     unsafe {
-        *source.zone.record(record).ctx_mut() = Aarch64ParkedContext::from_parts(*native, address);
+        *source.zone.record(record).ctx_mut() = Aarch64ParkedContext::admitted_at(entry, address);
     }
     // Only the task's own published control slot names this home record.
     if task.owns_control_slot(control) {
@@ -604,16 +604,16 @@ fn init_process_record(
 pub fn admit_entry(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
     let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
-    let words = Aarch64ParkedContext::from_register(
-        *native,
+        admit_entry_runtime(source, task, entry, ttbr0, record, page, control)?;
+    let words = Aarch64ParkedContext::admitted(
+        entry,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
@@ -626,7 +626,7 @@ pub fn admit_entry(
 fn admit_entry_runtime(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     record: RecordId,
     page: &'static ThreadLifecyclePage,
@@ -671,8 +671,8 @@ fn admit_entry_runtime(
         };
         return Ok((runtime, address));
     }
-    let words = Aarch64ParkedContext::from_register(
-        *native,
+    let words = Aarch64ParkedContext::admitted(
+        entry,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
@@ -711,13 +711,15 @@ impl Drop for AdmissionHome {
 }
 
 /// The production ARM entry boundary, shared by the VM-free admission witness.
-/// The callback receives the exact native venue retained for this SVC.
+/// The callback receives the exact native venue retained for this SVC. The
+/// owner's words are `entry` bound to the admitted address, with the PC's
+/// syscall position the trapped frame carried (#2900).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
@@ -732,18 +734,18 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         >,
     ) -> R,
 ) -> Result<R, NativeProcessError> {
-    let record = process_record_for_call(source, task, native, ttbr0, control)?;
+    let record = process_record_for_call(source, task, entry, ttbr0, control)?;
     let _home = AdmissionHome {
         source,
         record: source.zone.record_ref(record),
     };
     let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+        admit_entry_runtime(source, task, entry, ttbr0, record, page, control)?;
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
         let mut process = {
-            let words = Box::new(Aarch64ParkedContext::from_register(
-                *native,
+            let words = Box::new(Aarch64ParkedContext::admitted(
+                entry,
                 ttbr0,
                 address.mm.raw().get(),
                 address.generation.raw().get(),
@@ -785,7 +787,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
 pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
@@ -807,7 +809,7 @@ where
     let delivered = with_process_entry(
         source,
         task,
-        native,
+        entry,
         ttbr0,
         page,
         control,

@@ -711,7 +711,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         let (result, phase) = crate::aarch64_process::with_process_entry(
             source,
             &fixture.task,
-            &saved.native,
+            Aarch64EntryContext::saved(&saved),
             succ_ttbr0,
             page_ref,
             control_ref,
@@ -901,7 +901,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             Some(&TaskLifecycleVenue),
             page_ref,
             control_ref,
-            &saved.native,
+            Aarch64EntryContext::saved(&saved),
             succ_ttbr0,
             &mut arm_service,
             |_| core::ptr::null_mut(),

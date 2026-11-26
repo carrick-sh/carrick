@@ -3,6 +3,7 @@
 use crate::ThreadCtx;
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa, SavedSyscallPc,
+    SavedSyscallPcWord,
 };
 use core::num::NonZeroU64;
 
@@ -39,7 +40,74 @@ const _: () = {
     assert!(core::mem::align_of::<Aarch64ParkedContext>() == 16);
 };
 
+/// A trapped thread's saved context, with where its PC sits relative to its
+/// `SVC`, as native admission receives it (#2900). Only a saved context
+/// makes one, so admission can bind it to an address space but never
+/// relabel the PC: a rerun already rewound onto its `SVC`, or an interrupt
+/// or fault's resume point, is parked exactly as its frame carried it. One
+/// pointer wide, so the context is never copied onto a small EL1 stack.
+#[derive(Clone, Copy, Debug)]
+pub struct Aarch64EntryContext<'a>(&'a Aarch64ParkedContext);
+
+impl<'a> Aarch64EntryContext<'a> {
+    /// The context `ThreadCpu::save` captured from the trapped frame. Its
+    /// position word is the frame's, verbatim; its address binding is not
+    /// read.
+    pub fn saved(saved: &'a Aarch64ParkedContext) -> Self {
+        Self(saved)
+    }
+
+    /// The architectural registers.
+    pub fn native(&self) -> &'a ThreadCtx {
+        &self.0.native
+    }
+
+    /// Where the PC sits, as stored.
+    pub fn position(&self) -> SavedSyscallPcWord {
+        self.0.saved_syscall_pc_word()
+    }
+}
+
 impl Aarch64ParkedContext {
+    /// A thread context saved at a trap whose PC sits at `position`, not
+    /// yet bound to an address space.
+    pub fn trapped(native: ThreadCtx, position: SavedSyscallPc) -> Self {
+        Self {
+            native,
+            saved_syscall_pc: position.word(),
+            ..Self::ZERO
+        }
+    }
+
+    /// Bind an admitted entry context to its root register, MM and
+    /// generation, keeping its PC's position.
+    pub fn admitted(
+        entry: Aarch64EntryContext<'_>,
+        register: u64,
+        mm: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            native: *entry.native(),
+            root: register,
+            mm,
+            generation,
+            saved_syscall_pc: entry.position().stored(),
+        }
+    }
+
+    /// Bind an admitted entry context to an exact address context, keeping
+    /// its PC's position.
+    pub fn admitted_at(entry: Aarch64EntryContext<'_>, address: AddressContext<RootGpa>) -> Self {
+        Self {
+            native: *entry.native(),
+            root: address.root.address().raw(),
+            mm: address.mm.raw().get(),
+            generation: address.generation.raw().get(),
+            saved_syscall_pc: entry.position().stored(),
+        }
+    }
+
     /// The exact root incarnation saved with this parked execution context.
     pub fn address_context(&self) -> Option<AddressContext<RootGpa>> {
         Some(AddressContext {

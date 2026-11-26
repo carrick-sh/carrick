@@ -104,7 +104,7 @@ pub mod occupancy;
 pub mod refusal;
 pub mod spaces;
 mod x86_context;
-pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
+pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64EntryContext, Aarch64ParkedContext};
 pub use carrick_guest_arch::{GuestIsa, SavedSyscallPc};
 pub use cpu_time::CpuTickPair;
 pub use process::{

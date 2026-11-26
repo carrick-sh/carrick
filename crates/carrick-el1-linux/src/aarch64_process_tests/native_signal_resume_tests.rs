@@ -503,7 +503,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
         with_process_entry(
             source,
             task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -661,7 +661,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
         crate::dispatch::arm_signal_user_return_entry(
             source,
             task,
-            &saved.native,
+            Aarch64EntryContext::saved(&saved),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -933,7 +933,7 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
         let old = with_process_entry(
             source,
             task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -1037,7 +1037,7 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
             with_process_entry(
                 source,
                 task,
-                &words.native,
+                Aarch64EntryContext::saved(&words),
                 ttbr0,
                 fixture.page,
                 fixture.control,
@@ -1121,7 +1121,7 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
         let action = crate::dispatch::arm_signal_user_return_entry(
             source,
             task,
-            &saved.native,
+            Aarch64EntryContext::saved(&saved),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -1419,7 +1419,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         with_process_entry(
             source,
             task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -1580,7 +1580,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                         crate::dispatch::arm_signal_user_return_entry(
                             sibling_source,
                             sibling_task,
-                            &peer_saved.native,
+                            Aarch64EntryContext::saved(&peer_saved),
                             ttbr0,
                             mapper_page,
                             peer_control,
@@ -1636,7 +1636,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                     crate::dispatch::arm_signal_user_return_entry(
                                         sibling_source,
                                         sibling_task,
-                                        &peer_saved.native,
+                                        Aarch64EntryContext::saved(&peer_saved),
                                         ttbr0,
                                         mapper_page,
                                         peer_control,
@@ -1754,7 +1754,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 with_process_entry(
                     source,
                     task,
-                    &words.native,
+                    Aarch64EntryContext::saved(&words),
                     ttbr0,
                     fixture.page,
                     fixture.control,
@@ -1790,7 +1790,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 let action = crate::dispatch::arm_signal_user_return_entry(
                     source,
                     task,
-                    &saved.native,
+                    Aarch64EntryContext::saved(&saved),
                     ttbr0,
                     fixture.page,
                     fixture.control,
@@ -1988,7 +1988,7 @@ fn arm_checkpoint_delivers_usr1(
         with_process_entry(
             source,
             task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             ttbr0,
             fixture.page,
             fixture.control,
@@ -2032,7 +2032,7 @@ fn arm_checkpoint_delivers_usr1(
     let resumed = with_process_entry(
         source,
         task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -2283,7 +2283,7 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
         with_process_entry(
             env.source,
             &env.fixture.task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             env.ttbr0,
             env.fixture.page,
             env.fixture.control,
@@ -2375,7 +2375,7 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
         Some(env.fixture),
         env.fixture.page,
         env.fixture.control,
-        &saved.native,
+        Aarch64EntryContext::saved(&saved),
         env.ttbr0,
         &mut env.service,
         |_| core::ptr::null_mut(),
@@ -2497,7 +2497,7 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
         with_process_entry(
             env.source,
             &env.fixture.task,
-            &native,
+            Aarch64EntryContext::saved(&after_svc(native)),
             env.ttbr0,
             env.fixture.page,
             env.fixture.control,
@@ -2642,7 +2642,7 @@ fn arm_irq_deferred_signal_copy_keeps_resume_label() {
         with_process_entry(
             env.source,
             &env.fixture.task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             env.ttbr0,
             env.fixture.page,
             env.fixture.control,
@@ -2785,7 +2785,7 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
         with_process_entry(
             env.source,
             &env.fixture.task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             env.ttbr0,
             env.fixture.page,
             env.fixture.control,
@@ -2867,7 +2867,7 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
         with_process_entry(
             env.source,
             &env.fixture.task,
-            &words.native,
+            Aarch64EntryContext::saved(&words),
             env.ttbr0,
             env.fixture.page,
             env.fixture.control,
@@ -2937,7 +2937,7 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
         Some(env.fixture),
         env.fixture.page,
         env.fixture.control,
-        &saved.native,
+        Aarch64EntryContext::saved(&saved),
         env.ttbr0,
         &mut env.service,
         |_| core::ptr::null_mut(),
