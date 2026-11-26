@@ -3428,18 +3428,20 @@ impl FileAuthorityCore {
             if !host.writable {
                 return Err(AuthorityError::BackingReadOnly);
             }
-            let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
-                std::os::fd::BorrowedFd::borrow_raw(host.fd.as_raw_fd())
-            });
-            let written = unsafe {
-                libc::pwrite(
-                    host.fd.as_raw_fd(),
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                    libc::off_t::try_from(description.offset.raw())
-                        .map_err(|_| AuthorityError::InvalidOffset)?,
-                )
-            };
+            let offset = libc::off_t::try_from(description.offset.raw())
+                .map_err(|_| AuthorityError::InvalidOffset)?;
+            // SAFETY: the backing owns `host.fd` for the call.
+            let written = carrick_vfs::host_size::write_admitted(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(host.fd.as_raw_fd()) },
+                |_| unsafe {
+                    libc::pwrite(
+                        host.fd.as_raw_fd(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        offset,
+                    )
+                },
+            );
             if written < 0 {
                 return Err(AuthorityError::HostIo(super::HostErrno::last()));
             }

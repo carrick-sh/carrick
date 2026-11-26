@@ -82,18 +82,22 @@ impl InodeWriteback {
                 first_error.get_or_insert(crate::host_to_linux_errno(errno));
             }
         }
-        let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
-            std::os::fd::BorrowedFd::borrow_raw(fd.raw())
-        });
         for page in &self.pages {
-            let written = unsafe {
-                libc::pwrite(
-                    fd.raw(),
-                    page.bytes.as_ptr().cast(),
-                    page.bytes.len(),
-                    page.offset as libc::off_t,
-                )
-            };
+            // Each page's host write goes through the size door alone: the
+            // sparse record and the inode notification below take their own
+            // locks, never under the registry (#2975 r36).
+            // SAFETY: `fd` stays open for the writeback.
+            let written = carrick_vfs::host_size::write_admitted(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.raw()) },
+                |_| unsafe {
+                    libc::pwrite(
+                        fd.raw(),
+                        page.bytes.as_ptr().cast(),
+                        page.bytes.len(),
+                        page.offset as libc::off_t,
+                    )
+                },
+            );
             if written < 0 {
                 first_error.get_or_insert(last_error());
             } else {

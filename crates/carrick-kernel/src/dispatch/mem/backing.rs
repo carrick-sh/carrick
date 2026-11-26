@@ -1686,9 +1686,6 @@ impl<'a> MemView<'a> {
         let Some((host_fd, offset)) = alloc.backing.shared_file_parts() else {
             return;
         };
-        let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
-            std::os::fd::BorrowedFd::borrow_raw(host_fd)
-        });
         let mut written = 0usize;
         while written < bytes.len() {
             let Ok(written_offset) = u64::try_from(written) else {
@@ -1700,14 +1697,19 @@ impl<'a> MemView<'a> {
             else {
                 break;
             };
-            let result = unsafe {
-                libc::pwrite(
-                    host_fd,
-                    bytes[written..].as_ptr().cast(),
-                    bytes.len() - written,
-                    file_offset,
-                )
-            };
+            // Each host write goes through the size door alone (#2975 r36).
+            // SAFETY: the shared backing keeps `host_fd` open.
+            let result = carrick_vfs::host_size::write_admitted(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) },
+                |_| unsafe {
+                    libc::pwrite(
+                        host_fd,
+                        bytes[written..].as_ptr().cast(),
+                        bytes.len() - written,
+                        file_offset,
+                    )
+                },
+            );
             if result > 0 {
                 let Ok(count) = usize::try_from(result) else {
                     break;

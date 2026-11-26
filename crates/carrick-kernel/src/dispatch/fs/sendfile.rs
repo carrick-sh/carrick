@@ -668,16 +668,14 @@ impl<'a> FsView<'a> {
                     },
                     None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 };
-                let _write_guard =
-                    carrick_vfs::host_size::admit_write(std::os::fd::AsFd::as_fd(&host_fd));
-                let n = unsafe {
+                let n = carrick_vfs::host_size::write_admitted(std::os::fd::AsFd::as_fd(&host_fd), |fd| unsafe {
                     libc::pwrite(
-                        host_fd.raw(),
+                        std::os::fd::AsRawFd::as_raw_fd(&fd),
                         bytes.as_ptr() as *const _,
                         bytes.len(),
                         out_off as libc::off_t,
                     )
-                };
+                });
                 match n.host_syscall_errno() {
                     Ok(value) => value as usize,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),

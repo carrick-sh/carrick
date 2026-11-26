@@ -16534,7 +16534,7 @@ mod window_size_door {
             );
             assert!(
                 b_after_rx.try_recv().is_err(),
-                "pwrite admit_write must not acquire WINDOWED read lock behind windowed resize (#2975 P0 1)"
+                "a pwrite through the door must not acquire WINDOWED read lock behind windowed resize (#2975 P0 1)"
             );
             let _ = proceed_guard.0.take().unwrap().send(());
             b_after_rx.recv().unwrap();
@@ -16630,7 +16630,7 @@ mod window_size_door {
             );
             assert!(
                 a_entered_rx.try_recv().is_err(),
-                "admitted ftruncate must not reach apply while set_file_contents holds admit_write"
+                "admitted ftruncate must not reach apply while set_file_contents holds its write admission"
             );
             let _ = b_proceed_guard.0.take().unwrap().send(());
             hb.join().unwrap();

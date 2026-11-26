@@ -3951,16 +3951,15 @@ mod serial_host {
                 .unwrap();
             let peer_file = unsafe { OwnedFd::from_raw_fd(raw_peer_fd) };
             {
-                let _write_guard = crate::host_size::admit_write(peer_file.as_fd());
                 let payload = [0x22u8; 4096];
-                let n = unsafe {
+                let n = crate::host_size::write_admitted(peer_file.as_fd(), |fd| unsafe {
                     libc::pwrite(
-                        peer_file.as_raw_fd(),
+                        fd.as_raw_fd(),
                         payload.as_ptr().cast(),
                         payload.len(),
                         12288,
                     )
-                };
+                });
                 assert_eq!(n, 4096);
             }
             let _ = proceed_guard.0.take().unwrap().send(());

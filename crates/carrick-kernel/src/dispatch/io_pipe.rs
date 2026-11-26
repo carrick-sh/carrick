@@ -1065,6 +1065,15 @@ fn write_host_pipe_payload(
                 hw.run_with_host_wait(&mut || {
                     n = write_fn();
                 })?;
+            } else if write_kind == HostWriteKind::RegularFile {
+                // A regular-file write goes through the host size door around
+                // the host call alone, never across a wait or another lock
+                // (the registry is a leaf, #2975 r36).
+                // SAFETY: the caller keeps `host_fd` open for the write.
+                n = carrick_vfs::host_size::write_admitted(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) },
+                    |_| write_fn(),
+                );
             } else {
                 n = write_fn();
             }

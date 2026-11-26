@@ -1050,17 +1050,18 @@ impl SyscallDispatcher {
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
                     return cqe_err(LINUX_EFAULT);
                 };
-                let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
-                    std::os::fd::BorrowedFd::borrow_raw(hfd.get())
-                });
-                let n = unsafe {
-                    libc::pwrite(
-                        hfd.get(),
-                        buf.as_ptr() as *const _,
-                        buf.len(),
-                        sqe.off as libc::off_t,
-                    )
-                };
+                // SAFETY: `hfd` stays open for this submission.
+                let n = carrick_vfs::host_size::write_admitted(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(hfd.get()) },
+                    |_| unsafe {
+                        libc::pwrite(
+                            hfd.get(),
+                            buf.as_ptr() as *const _,
+                            buf.len(),
+                            sqe.off as libc::off_t,
+                        )
+                    },
+                );
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
                     Err(e) => cqe_err(e),
@@ -1110,17 +1111,18 @@ impl SyscallDispatcher {
                 let Ok(buf) = gather_iovecs(memory, &iovs) else {
                     return cqe_err(LINUX_EFAULT);
                 };
-                let _write_guard = carrick_vfs::host_size::admit_write(unsafe {
-                    std::os::fd::BorrowedFd::borrow_raw(hfd.get())
-                });
-                let n = unsafe {
-                    libc::pwrite(
-                        hfd.get(),
-                        buf.as_ptr() as *const _,
-                        buf.len(),
-                        sqe.off as libc::off_t,
-                    )
-                };
+                // SAFETY: `hfd` stays open for this submission.
+                let n = carrick_vfs::host_size::write_admitted(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(hfd.get()) },
+                    |_| unsafe {
+                        libc::pwrite(
+                            hfd.get(),
+                            buf.as_ptr() as *const _,
+                            buf.len(),
+                            sqe.off as libc::off_t,
+                        )
+                    },
+                );
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
                     Err(e) => cqe_err(e),
