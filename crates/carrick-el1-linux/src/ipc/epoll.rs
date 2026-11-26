@@ -51,6 +51,7 @@
 //! queued after an empty harvest always moves the snapshot and the park
 //! reports `Changed`.
 
+use super::epoll_harvest::{Harvest, harvest};
 use super::{
     EL1_WAIT, Finish, IpcExecution, IpcRegion, IpcServed, IpcVenue, Parked, UserCopy,
     argument_word, finish, from_sched_token, leave, linux, mm_key, notify_operation_release,
@@ -65,107 +66,10 @@ use carrick_el1_abi::ipc::epoll::{EpollHarvest, EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
 use carrick_el1_abi::ipc::{
-    BackingToken, IpcBacking, IpcCounterDeadline, IpcError, IpcHandback, IpcObjectHandle,
-    IpcOpKind, IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
+    BackingToken, IpcBacking, IpcCounterDeadline, IpcHandback, IpcObjectHandle, IpcOpKind,
+    IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
 };
 use carrick_guest_arch::CounterTick;
-
-use carrick_sched_core::object_wait::ipc_release::{
-    IpcLockIndex, IpcLockRelease, IpcLockReleaseVenue,
-};
-use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitKey};
-
-struct EpollLockRelease<'a, C: carrick_el1_abi::EntryContext> {
-    index: IpcLockIndex,
-    venue: IpcLockReleaseVenue<'a, C>,
-}
-
-impl<C: carrick_el1_abi::EntryContext> IpcLockRelease for EpollLockRelease<'_, C> {
-    fn carrier(&self) -> core::num::NonZeroU64 {
-        self.venue.carrier
-    }
-
-    fn released(&self, index: IpcLockIndex) {
-        if self.index == index {
-            self.venue.released(index);
-        }
-    }
-}
-
-enum Harvest {
-    Ready(EpollHarvest),
-    WaitForRelease(IpcOperation, ObjectWaitKey, ObjectStateSnapshot),
-    Refused,
-}
-
-fn harvest<E: IpcExecution>(
-    sched: &E,
-    region: &IpcRegion<'_>,
-    epoll: IpcObjectHandle,
-    operation: IpcOperation,
-    reports: &mut [EpollReport],
-    taken: &mut [EpollItemRef],
-) -> Harvest {
-    use carrick_sched_core::refusal::{Attempt, ContentionSource, Refusal, ReleaseCause, Settled};
-    let carrier = region.operation_slot_generation();
-    let release = IpcLockIndex::object(epoll.index() as usize)
-        .filter(|_| region.epoll_needs_host_release(epoll))
-        .and_then(|index| {
-            let source = sched.zone().ipc_lock_release_source(index, carrier).ok()?;
-            Some((index, source))
-        });
-    let Some((index, source)) = release else {
-        return region
-            .epoll_harvest(epoll, reports, taken, &EL1_WAIT)
-            .map_or(Harvest::Refused, Harvest::Ready);
-    };
-    let adapter = EpollLockRelease {
-        index,
-        venue: IpcLockReleaseVenue {
-            zone: sched.zone(),
-            carrier,
-            waker: carrick_sched_core::Waker::El1 { slot: sched.slot() },
-            deliver: crate::sched::object_wait::deliver_host_completion,
-        },
-    };
-    let tracked = region
-        .with_lock_release(&adapter)
-        .unwrap_or_else(|_| invalid());
-    match source.contend(|| {
-        match tracked.lock_epoll(epoll, &carrick_sched_core::BoundedSpin(0)) {
-            Ok(guard) => Ok(guard),
-            Err(IpcError::Contended) if region.has_tracked_lock_holder(epoll) => {
-                Err(Attempt::Contended(ReleaseCause::Object))
-            }
-            Err(IpcError::Contended) => {
-                // The failed probe observed a racing release or a legacy
-                // holder. A legacy holder owes no release publication.
-                tracked
-                    .lock_epoll(epoll, &EL1_WAIT)
-                    .map_err(|error| Attempt::Settled(Settled::Guest(error)))
-            }
-            Err(error) => Err(Attempt::Settled(Settled::Guest(error))),
-        }
-    }) {
-        Ok(guard) => tracked
-            .epoll_harvest_locked(guard, reports, taken, &EL1_WAIT)
-            .map_or(Harvest::Refused, Harvest::Ready),
-        // SAFETY: the pinned syscall and the pre-probe revision are passed
-        // directly to its scheduler park below. A raced park returns the
-        // same operation for one immediate rerun. No guard crosses the park.
-        Err(Refusal::Contended(ticket)) => unsafe {
-            ticket.park_and_rerun(operation, |op, enrollment| {
-                Harvest::WaitForRelease(
-                    op,
-                    enrollment.key(),
-                    ObjectStateSnapshot::before_object_probe(enrollment.observed()),
-                )
-            })
-        },
-        Err(Refusal::Invariant(_)) => invalid(),
-        Err(Refusal::Guest(_)) => Harvest::Refused,
-    }
-}
 
 /// `epoll_pwait` on AArch64 (`epoll_wait` is not in its table).
 pub const SYS_EPOLL_PWAIT: usize = 22;

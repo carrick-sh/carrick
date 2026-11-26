@@ -152,6 +152,59 @@ pub enum HostFileOp {
     /// unplaced `mmap` failure (#2975 P0 3). Synchronous `HostFileCrossing`
     /// only (`args[0]` handle, `args[1]` generation).
     ReleaseWindow = 42,
+    /// Register a ring readiness set's carrier sockets on its transient
+    /// epoll (`select`/`pselect6` over in-zone and host descriptors,
+    /// #1051). The header `fd` is unused (`-1`); `args[0]` is the transient
+    /// epoll's raw object handle and `args[1]` the entry count. The input is
+    /// that many [`ReadinessSetEntry`] records, each naming its socket by the
+    /// host resource token the ring pinned at enrolment, never by a
+    /// descriptor number. The reply is 0, or a Linux errno with nothing
+    /// registered.
+    ReadinessSetCtl = 43,
+}
+
+/// One carrier socket of a [`HostFileOp::ReadinessSetCtl`] record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReadinessSetEntry {
+    /// The descriptor's host resource token (`IpcBacking::Host`).
+    pub token: u64,
+    /// The open file description's key, as the epoll item keys it.
+    pub file_key: u64,
+    /// The descriptor number the set reports.
+    pub fd: i32,
+    /// Requested epoll events (always edge-triggered).
+    pub events: u32,
+    /// The item's data word (the ring's `SetWord`).
+    pub data: u64,
+}
+
+impl ReadinessSetEntry {
+    pub const BYTES: usize = 32;
+
+    pub fn encode(&self) -> [u8; Self::BYTES] {
+        let mut bytes = [0u8; Self::BYTES];
+        bytes[0..8].copy_from_slice(&self.token.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.file_key.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.fd.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.events.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.data.to_le_bytes());
+        bytes
+    }
+
+    /// Decode exactly `count` entries from a record's input; `None` when
+    /// the input is not exactly that many entries.
+    pub fn decode_all(input: &[u8], count: u64) -> Option<impl Iterator<Item = Self> + '_> {
+        if (input.len() as u64) != count.checked_mul(Self::BYTES as u64)? {
+            return None;
+        }
+        Some(input.chunks_exact(Self::BYTES).map(|bytes| Self {
+            token: u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default()),
+            file_key: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default()),
+            fd: i32::from_le_bytes(bytes[16..20].try_into().unwrap_or_default()),
+            events: u32::from_le_bytes(bytes[20..24].try_into().unwrap_or_default()),
+            data: u64::from_le_bytes(bytes[24..32].try_into().unwrap_or_default()),
+        }))
+    }
 }
 
 /// A staged user-memory range of a [`HostFileOp::NetSyscall`] record.
@@ -799,6 +852,7 @@ impl HostFileOp {
             40 => Self::Ioctl,
             41 => Self::MapShared,
             42 => Self::ReleaseWindow,
+            43 => Self::ReadinessSetCtl,
             _ => return None,
         })
     }

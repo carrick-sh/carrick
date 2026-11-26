@@ -394,6 +394,10 @@ pub struct EpollHarvest {
     /// Items in the host's half when the harvest began (EL1 forwards a wait
     /// on a set with any).
     pub host_items: u32,
+    /// The scan stopped at its window (the output, or the carrier-socket
+    /// batch) rather than at an empty ready list: a caller that must see
+    /// every ready item scans again.
+    pub truncated: bool,
 }
 
 impl<'a> IpcRegion<'a> {
@@ -867,11 +871,14 @@ impl<'a> IpcRegion<'a> {
         Ok(false)
     }
 
-    /// Rewrite the `data` word of every zone item of `epoll` under its lock
-    /// (`update` returns the new word; returning the old one only reads).
-    /// A transient readiness set (poll-family over N descriptors) has no
-    /// guest descriptor, so no `EPOLL_CTL_MOD` races this: it keeps its
-    /// decided answer in the items it already owns.
+    /// Rewrite the `data` word of every item of `epoll`, carrier sockets
+    /// included, under its lock (`update` returns the new word; returning
+    /// the old one only reads). A transient readiness set (poll-family over
+    /// N descriptors) has no guest descriptor, so no `EPOLL_CTL_MOD` races
+    /// this: it keeps its decided answer in the items it already owns, so a
+    /// replayed answer keeps a carrier socket's classes too. The carrier
+    /// writes a socket item's `data` only at its ADD or MOD, never at a
+    /// readiness publication.
     pub fn epoll_update_data<W: LockWait>(
         &self,
         epoll: IpcObjectHandle,
@@ -881,10 +888,8 @@ impl<'a> IpcRegion<'a> {
         let mut guard = self.lock(epoll, wait)?;
         let mut cursor = guard.epoll_state()?.interest_head;
         while let Some(item) = self.item(cursor) {
-            if item.member_kind.load(Ordering::Relaxed) != EpollMember::HostSocket as u32 {
-                let data = item.data.load(Ordering::Relaxed);
-                item.data.store(update(data), Ordering::Relaxed);
-            }
+            let data = item.data.load(Ordering::Relaxed);
+            item.data.store(update(data), Ordering::Relaxed);
             cursor = item.interest_next.load(Ordering::Relaxed);
         }
         Ok(())
@@ -935,6 +940,7 @@ impl<'a> IpcRegion<'a> {
         state.harvest_epoch = state.harvest_epoch.wrapping_add(1).max(1);
         let epoch = state.harvest_epoch;
         let mut locked = Some(epoll_guard);
+        let mut truncated = false;
         while reported < limit {
             let mut guard = match locked.take() {
                 Some(guard) => guard,
@@ -965,6 +971,7 @@ impl<'a> IpcRegion<'a> {
                 // at the ring's report window so deduplication stays bounded
                 // even for a mixed set with another harvester.
                 if reported >= HOST_SOCKET_BATCH || taken[..reported].contains(&target) {
+                    truncated |= reported >= HOST_SOCKET_BATCH;
                     guard.prepend_ready(number);
                     locked = Some(guard);
                     break;
@@ -1023,6 +1030,7 @@ impl<'a> IpcRegion<'a> {
             }
             locked = Some(guard);
         }
+        truncated |= limit != 0 && reported == limit;
         // In-zone level items go back after the scan. Carrier sockets have
         // already been requeued under the guard used to report them.
         if reported > 0 {
@@ -1052,6 +1060,7 @@ impl<'a> IpcRegion<'a> {
         Ok(EpollHarvest {
             reported,
             host_items,
+            truncated,
         })
     }
 

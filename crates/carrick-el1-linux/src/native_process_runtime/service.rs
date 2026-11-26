@@ -378,6 +378,9 @@ enum HostFileContinuation<'a> {
     Publish(PendingHostFile<'a>),
     /// The call's answer.
     Returned(SyscallResult),
+    /// Run the call again: its ring owner kept an operation for the rerun
+    /// (a readiness set whose carrier sockets the record registered).
+    Rerun,
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
@@ -2121,6 +2124,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let Some(file) = pending.host_file.as_ref() else {
             return Ok(None);
         };
+        if file.operation == carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl {
+            // The readiness set kept its operation for this rerun. Once the
+            // carrier registered its sockets, the rerun takes it and
+            // harvests the whole set. Anything else retires it and answers:
+            // the carrier's errno (nothing registered), EINTR for a
+            // cancelled record, or a counted ENOSYS for a refused one.
+            let reply = carrick_core_abi::host_file::reply(&file.record).map(|reply| reply.result);
+            let answer = match (result, reply) {
+                (ServiceResult::Supplied, Some(result)) if result >= 0 => {
+                    return Ok(Some(HostFileContinuation::Rerun));
+                }
+                (ServiceResult::Supplied, Some(errno)) => errno,
+                (ServiceResult::Cancelled, _) => carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+                _ => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            };
+            self.retire_readiness_set()?;
+            return Ok(Some(HostFileContinuation::Returned(SyscallResult::new(
+                answer,
+            ))));
+        }
         if result == ServiceResult::Refused {
             return Ok((file.transfer.done() != 0).then(|| {
                 HostFileContinuation::Returned(
@@ -2570,6 +2593,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
             ServicePayload::Adapter => (ServicePayload::None, None, true),
+            // A readiness set's carrier record (#1051): the set's IPC
+            // operation stays retained on this record across the service,
+            // exactly as an adapter's does, and the service parks under it.
+            ServicePayload::HostFile(file)
+                if file.operation == carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl =>
+            {
+                if !self
+                    .source
+                    .zone
+                    .record(self.record.id)
+                    .has_adapter_operation()
+                {
+                    return Err(NativeProcessError::Stale);
+                }
+                (ServicePayload::HostFile(file), None, true)
+            }
             payload => (payload, None, false),
         };
         // Clock admission requires the retained operation and exact reply storage.
@@ -4644,6 +4683,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
 
+    /// Retire the readiness-set operation a `ReadinessSetCtl` record's call
+    /// kept for its rerun, when the record registered nothing.
+    #[inline(never)]
+    fn retire_readiness_set(&mut self) -> Result<(), NativeProcessError> {
+        let token = carrick_core::wait::take_object_operation(
+            self.source.zone,
+            self.source.slot,
+            self.source.zone.record(self.record.id).identity(),
+        )
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterResultOperationTake,
+            )
+        })?
+        .ok_or(NativeProcessError::Stale)?;
+        let (region, _) = self
+            .service
+            .exec_ipc_binding()
+            .ok_or(NativeProcessError::Stale)?;
+        crate::ipc::retire_native_operation(
+            &region,
+            self.source.zone,
+            self.source.slot,
+            self.current,
+            self.binding,
+            token,
+        )?;
+        Ok(())
+    }
+
     #[inline(never)]
     fn retire_adapter_result(
         &mut self,
@@ -4979,6 +5048,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return match next {
                 HostFileContinuation::Publish(file) => self.publish_pending_host_file(file),
                 HostFileContinuation::Returned(result) => Ok(NativeResume::Returned(result)),
+                HostFileContinuation::Rerun => Ok(NativeResume::RetrySyscall),
             };
         }
         let mut output = pending.copyout.take();

@@ -716,6 +716,8 @@ impl Drop for AdmissionHome {
 /// syscall position the trapped frame carried (#2900).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
+// The frame budget charges this boundary as its own retained frame.
+#[inline(never)]
 pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,

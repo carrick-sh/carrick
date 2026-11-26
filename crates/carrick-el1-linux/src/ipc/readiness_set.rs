@@ -25,23 +25,41 @@
 //! single-description protocol exactly; so does a full operation arena
 //! (`super::begin_readiness_operation`).
 //!
+//! A host-backed descriptor (a carrier socket) joins the same transient
+//! epoll as a carrier-socket item (#1051). The ring cannot register a host
+//! descriptor itself, so a set naming one admits its operation, retains
+//! it, and hands the carrier one `ReadinessSetCtl` record naming each such
+//! member by the host resource token pinned at enrolment. The carrier
+//! registers them through the one ADD body a guest `epoll_ctl` uses and
+//! publishes each one's initial level as an edge; the venue then reruns the
+//! call, which takes its retained operation ([`resume`]) and harvests the
+//! whole set once before it parks on the epoll's lane, as a zone-only set
+//! does. A carrier-held epoll lock is "not now": the harvest enrols on the
+//! holder's release and reruns (`super::epoll_harvest`).
+//!
 //! Scope: every selected descriptor must be a zone object an epoll can
-//! hold (pipe ends, eventfds, stream ends). A host-backed descriptor, a
-//! nested epoll, or a member already watched by
-//! [`carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS`] epolls leaves the call
-//! unrouted before any effect, as before; mixed host and zone sets are
-//! #1886's composition.
+//! hold (pipe ends, eventfds, stream ends) or a carrier socket, on a venue
+//! that publishes ring records ([`GuestDispatchFrame::accepts_ring_record`]).
+//! A host descriptor on any other venue, a nested epoll, a member already
+//! watched by [`carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS`] epolls, or
+//! a host half too large for one record leaves the call unrouted before
+//! any effect.
 
 extern crate alloc;
 
+use super::epoll_harvest::{Harvest, harvest};
 use super::{
     Begun, EL1_WAIT, IpcExecution, IpcServed, IpcVenue, Parked, PollOutput, SELECT_INTERESTS,
     SelectReady, UserCopy, begin_readiness_operation, finish, mm_key, native_select_output, park,
-    poll_result, release_pin, select_ready, snapshot, task_key,
+    park_key, poll_result, release_pin, retain_native_operation, select_ready, snapshot, task_key,
 };
 use crate::dispatch::GuestDispatchFrame;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollMember, EpollReport, events};
+use carrick_core_abi::host_file::ReadinessSetEntry;
+use carrick_el1_abi::ipc::epoll::{
+    EpollHarvest, EpollItemRef, EpollMember, EpollReport, IPC_EPOLL_ITEMS, events,
+};
 use carrick_el1_abi::ipc::fd::{
     AccessMode, Description, Error as FdError, Fd, StatusFlags, TableId,
 };
@@ -118,38 +136,117 @@ pub(super) fn names_set(region: &IpcRegion<'_>, op: &IpcOperation) -> bool {
     transient_epoll(region, op, EL1_WAIT).is_some()
 }
 
-/// Harvest the set once and translate the reports into select classes.
-/// The one probe both venues use; an empty answer means nothing is
-/// select-ready (reports without a class are dropped).
+/// Harvest the set and translate the reports into select classes. The one
+/// probe both venues use; an empty answer means nothing is select-ready
+/// (reports without a class are dropped).
 pub fn harvest_ready(
     region: &IpcRegion<'_>,
     epoll: IpcObjectHandle,
     wait: &impl LockWait,
 ) -> Result<Vec<SelectReady>, IpcError> {
     let items = region.epoll_zone_items(epoll, wait)? as usize;
+    collect_ready(items.max(1), items.saturating_add(1), |reports, taken| {
+        region.epoll_harvest(epoll, reports, taken, wait)
+    })
+}
+
+/// Scans the EL1 harvest allows a set: one window of
+/// [`EL1_HARVEST_WINDOW`] reports per window of the item arena, plus one
+/// scan that finds the list drained.
+const EL1_HARVEST_SCANS: usize = IPC_EPOLL_ITEMS.div_ceil(EL1_HARVEST_WINDOW) + 1;
+/// Reports one EL1 scan takes; a carrier-socket scan is capped at the
+/// same batch by the shared harvest.
+const EL1_HARVEST_WINDOW: usize = 32;
+
+/// Scan the set's ready list until a scan is not truncated (at most
+/// `scans` times), merging each scan's reports by descriptor (the OR of
+/// their classes). Each scan opens a new harvest epoch, so an edge
+/// republished between two scans reports its item twice; the merge keeps
+/// it one descriptor of the answer. A set larger than one window (more
+/// than 32 ready carrier sockets, condition A of #1051) is answered whole.
+pub(super) fn collect_ready<R: From<IpcError>>(
+    window: usize,
+    scans: usize,
+    mut scan: impl FnMut(&mut [EpollReport], &mut [EpollItemRef]) -> Result<EpollHarvest, R>,
+) -> Result<Vec<SelectReady>, R> {
     let mut reports = Vec::new();
     let mut taken = Vec::new();
-    let mut ready = Vec::new();
-    if reports.try_reserve_exact(items).is_err()
-        || taken.try_reserve_exact(items).is_err()
-        || ready.try_reserve_exact(items).is_err()
-    {
-        return Err(IpcError::NoObjects);
+    if reports.try_reserve_exact(window).is_err() || taken.try_reserve_exact(window).is_err() {
+        return Err(IpcError::NoObjects.into());
     }
-    reports.resize(items, EpollReport::default());
-    taken.resize(items, EpollItemRef::default());
-    let harvest = region.epoll_harvest(epoll, &mut reports, &mut taken, wait)?;
-    for report in &reports[..harvest.reported] {
-        let word = SetWord::from_raw(report.data);
-        let classes = select_ready(word.interest, report.events);
-        if classes != 0 {
-            ready.push(SelectReady {
-                fd: word.fd,
-                ready: classes,
-            });
+    reports.resize(window, EpollReport::default());
+    taken.resize(window, EpollItemRef::default());
+    let mut ready: Vec<SelectReady> = Vec::new();
+    for _ in 0..scans {
+        let harvest = match scan(&mut reports, &mut taken) {
+            Ok(harvest) => harvest,
+            // A later scan refused or contended: the reports already taken
+            // are the answer (select reports what was ready when it looked).
+            Err(_) if !ready.is_empty() => break,
+            Err(refused) => return Err(refused),
+        };
+        for report in &reports[..harvest.reported] {
+            let word = SetWord::from_raw(report.data);
+            let classes = select_ready(word.interest, report.events);
+            if classes == 0 {
+                continue;
+            }
+            match ready.iter_mut().find(|entry| entry.fd == word.fd) {
+                Some(entry) => entry.ready |= classes,
+                None => {
+                    if ready.try_reserve(1).is_err() {
+                        return Err(IpcError::NoObjects.into());
+                    }
+                    ready.push(SelectReady {
+                        fd: word.fd,
+                        ready: classes,
+                    });
+                }
+            }
+        }
+        if !harvest.truncated {
+            break;
         }
     }
     Ok(ready)
+}
+
+/// Why an EL1 harvest of a set did not answer.
+enum Unharvested {
+    /// The carrier holds the epoll lock: park on its release, then rerun.
+    WaitForRelease(
+        IpcOperation,
+        carrick_sched_core::object_wait::ObjectWaitKey,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
+    ),
+    Refused,
+}
+
+impl From<IpcError> for Unharvested {
+    fn from(_: IpcError) -> Self {
+        Self::Refused
+    }
+}
+
+/// The EL1 harvest of a set: through the tracked release once the set
+/// holds carrier sockets, so a carrier-held lock is "not now".
+fn harvest_in_ring<E: IpcExecution>(
+    sched: &E,
+    region: &IpcRegion<'_>,
+    epoll: IpcObjectHandle,
+    op: IpcOperation,
+) -> Result<Vec<SelectReady>, Unharvested> {
+    collect_ready(
+        EL1_HARVEST_WINDOW,
+        EL1_HARVEST_SCANS,
+        |reports, taken| match harvest(sched, region, epoll, op, reports, taken) {
+            Harvest::Ready(harvest) => Ok(harvest),
+            Harvest::WaitForRelease(op, key, observed) => {
+                Err(Unharvested::WaitForRelease(op, key, observed))
+            }
+            Harvest::Refused => Err(Unharvested::Refused),
+        },
+    )
 }
 
 /// Keep a decided answer in the set's own items (the host's copy-out may
@@ -236,7 +333,8 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
 ) -> IpcServed {
     let region = &venue.region;
     loop {
-        let (pin, epoll) = match build(sched, region, table, &call) {
+        let carrier = frame.accepts_ring_record();
+        let (pin, epoll, hosts) = match build(sched, region, table, &call, carrier) {
             Ok(built) => built,
             Err(Build::Errno(errno)) => return poll_result(frame, errno.guest_retval()),
             Err(Build::Unrouted) => return IpcServed::Forward,
@@ -254,6 +352,21 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
             deadline: call.deadline,
             ..IpcOperation::EMPTY
         };
+        if !hosts.is_empty() {
+            match stage_hosts(
+                sched,
+                frame,
+                venue,
+                user,
+                keep_sigmask,
+                op,
+                &hosts,
+                &mut call.sigmask,
+            ) {
+                Some(served) => return served,
+                None => continue,
+            }
+        }
         match wait(
             sched,
             frame,
@@ -303,13 +416,97 @@ pub(super) fn resume<E: IpcExecution, M: UserCopy>(
     })
 }
 
+/// A set with carrier sockets: admit its operation, then hand the carrier
+/// one `ReadinessSetCtl` record and keep the operation for the rerun. The
+/// venue publishes the record after this call's `Forward` and reruns the
+/// call once the carrier settles it; the rerun takes the retained
+/// operation ([`resume`]) and harvests the whole set once before it parks.
+/// `None`: a slot was released before the arena park; build again.
+#[allow(clippy::too_many_arguments)]
+fn stage_hosts<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+    keep_sigmask: &mut bool,
+    op: IpcOperation,
+    hosts: &[ReadinessSetEntry],
+    sigmask: &mut Option<u64>,
+) -> Option<IpcServed> {
+    let region = &venue.region;
+    let epoll = IpcObjectHandle::from_raw(op.object);
+    let record =
+        super::native_table(venue, sched.task()).and_then(|table| host_record(table, epoll, hosts));
+    let Some(record) = record else {
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
+        return Some(IpcServed::Forward);
+    };
+    // Armed before admission, as a parked set's is: the rerun's probe and
+    // park observe the temporary mask and never re-arm it.
+    if let Some(mask) = sigmask.take() {
+        if !user.arm_wait_sigmask(mask) {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+            return Some(IpcServed::Forward);
+        }
+        *keep_sigmask = true;
+    }
+    let token = match begin_readiness_operation(sched, frame, region, user, op, keep_sigmask) {
+        Begun::Operation(token) => token,
+        Begun::Served(served) => return Some(served),
+        Begun::Rerun => return None,
+    };
+    retain_native_operation(sched, token);
+    frame.stage_ring_record(record);
+    Some(IpcServed::Forward)
+}
+
+/// The `ReadinessSetCtl` record of a set's carrier sockets; `None` when the
+/// host half does not fit one record (left unrouted before any effect).
+fn host_record(
+    table: [u64; 3],
+    epoll: IpcObjectHandle,
+    hosts: &[ReadinessSetEntry],
+) -> Option<Box<[u8]>> {
+    use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp};
+    let bytes = hosts.len().checked_mul(ReadinessSetEntry::BYTES)?;
+    let len = host_file::record_len(bytes, 0)?;
+    let mut input = Vec::new();
+    input.try_reserve_exact(bytes).ok()?;
+    for host in hosts {
+        input.extend_from_slice(&host.encode());
+    }
+    let mut record = Vec::new();
+    record.try_reserve_exact(len).ok()?;
+    record.resize(len, 0);
+    let mut record = record.into_boxed_slice();
+    let raw = epoll.to_raw();
+    let header = HostFileHeader {
+        op: HostFileOp::ReadinessSetCtl,
+        table,
+        fd: -1,
+        flags: 0,
+        args: [
+            u64::from(raw.index) | (u64::from(raw.generation) << 32),
+            hosts.len() as u64,
+            0,
+            0,
+        ],
+    };
+    host_file::encode(&mut record, header, &input, 0).ok()?;
+    Some(record)
+}
+
 /// Make the transient epoll and enrol every selected descriptor on it.
+/// Host-backed members are returned for the carrier's record, and only
+/// when `carrier` (the venue publishes ring records); otherwise a host
+/// member leaves the call unrouted.
 fn build<E: IpcExecution>(
     sched: &mut E,
     region: &IpcRegion<'_>,
     table: TableId,
     call: &SetCall,
-) -> Result<(OfdPin, IpcObjectHandle), Build> {
+    carrier: bool,
+) -> Result<(OfdPin, IpcObjectHandle, Vec<ReadinessSetEntry>), Build> {
     let epoll = loop {
         let seen = region.object_count();
         match region.create_epoll(&EL1_WAIT) {
@@ -335,8 +532,8 @@ fn build<E: IpcExecution>(
             return Err(Build::Unrouted);
         }
     };
-    match enrol(sched, region, table, call, epoll) {
-        Ok(()) => Ok((pin, epoll)),
+    match enrol(sched, region, table, call, epoll, carrier) {
+        Ok(hosts) => Ok((pin, epoll, hosts)),
         Err(refused) => {
             // The description's final release destroys the epoll and
             // unlinks every item enrolled so far.
@@ -352,9 +549,11 @@ fn enrol<E: IpcExecution>(
     table: TableId,
     call: &SetCall,
     epoll: IpcObjectHandle,
-) -> Result<(), Build> {
+    carrier: bool,
+) -> Result<Vec<ReadinessSetEntry>, Build> {
+    let mut hosts = Vec::new();
     if call.sets.is_empty() {
-        return Ok(());
+        return Ok(hosts);
     }
     let authority = region.fd(EL1_WAIT);
     let words = call.layout.words as usize;
@@ -384,6 +583,27 @@ fn enrol<E: IpcExecution>(
             };
             let key = pin.key();
             let file_key = (u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX));
+            let word = SetWord {
+                fd,
+                interest,
+                ready: 0,
+            };
+            if let Some(IpcBacking::Host(token)) = IpcBacking::decode(description.backing) {
+                // The carrier registers it by the token pinned now, never by
+                // the number again.
+                release_pin(sched, pin, region);
+                if !carrier || hosts.try_reserve(1).is_err() {
+                    return Err(Build::Unrouted);
+                }
+                hosts.push(ReadinessSetEntry {
+                    token: token.get(),
+                    file_key,
+                    fd,
+                    events: select_events(interest),
+                    data: word.to_raw(),
+                });
+                continue;
+            }
             let added = IpcBacking::decode(description.backing)
                 .and_then(EpollMember::of_backing)
                 .map(|(member, kind)| {
@@ -394,12 +614,7 @@ fn enrol<E: IpcExecution>(
                         fd,
                         file_key,
                         select_events(interest),
-                        SetWord {
-                            fd,
-                            interest,
-                            ready: 0,
-                        }
-                        .to_raw(),
+                        word.to_raw(),
                         &EL1_WAIT,
                     )
                 });
@@ -413,7 +628,7 @@ fn enrol<E: IpcExecution>(
             }
         }
     }
-    Ok(())
+    Ok(hosts)
 }
 
 /// Probe and park until the set answers, its deadline passes or a signal
@@ -439,9 +654,44 @@ fn wait<E: IpcExecution, M: UserCopy>(
     loop {
         // Before the harvest: an item queued after it moves this snapshot.
         let snap = snapshot(sched, epoll, WaitFor::Readable);
-        let ready = match harvest_ready(region, epoll, &EL1_WAIT) {
+        let ready = match harvest_in_ring(sched, region, epoll, op) {
             Ok(ready) => ready,
-            Err(_) => {
+            // A carrier holds the set's lock: "not now". Park on its release
+            // with the retained operation, then harvest again.
+            Err(Unharvested::WaitForRelease(back, key, observed)) => {
+                let Some(admitted) = token.take() else {
+                    // Only a set holding carrier sockets contends with the
+                    // carrier, and its operation is admitted before any harvest.
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    );
+                };
+                match park_key(
+                    sched,
+                    frame,
+                    region,
+                    admitted,
+                    back,
+                    key,
+                    observed,
+                    None,
+                    Some(&mut || user.interrupt_pending_wait()),
+                ) {
+                    Parked::Done(served) => {
+                        *keep_sigmask = true;
+                        return Some(served);
+                    }
+                    Parked::Retry(retained) => {
+                        token = Some(retained);
+                        continue;
+                    }
+                    Parked::Refused(retained) => {
+                        finish(sched, retained, region);
+                        return Some(IpcServed::Forward);
+                    }
+                }
+            }
+            Err(Unharvested::Refused) => {
                 retire(sched, token, &op);
                 return Some(IpcServed::Forward);
             }

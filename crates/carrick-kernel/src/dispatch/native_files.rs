@@ -591,6 +591,11 @@ impl SyscallDispatcher {
                 Ok(()) => Served::Reply(0, Vec::new()),
                 Err(errno) => Served::errno(errno),
             }
+        } else if header.op == HostFileOp::ReadinessSetCtl {
+            match self.serve_native_readiness_set_ctl(owner, header, view.input()) {
+                Ok(()) => Served::Reply(0, Vec::new()),
+                Err(errno) => Served::errno(errno),
+            }
         } else if header.op == HostFileOp::NetSyscall {
             match self.serve_native_net_call(owner, table, header, view.input(), waiter) {
                 super::net::native::NetServed::Reply(result, output) => {
@@ -1218,7 +1223,8 @@ impl SyscallDispatcher {
             | HostFileOp::Fchownat
             | HostFileOp::NetSyscall
             | HostFileOp::EpollSocketCtl
-            | HostFileOp::ReleaseWindow => Served::Refused,
+            | HostFileOp::ReleaseWindow
+            | HostFileOp::ReadinessSetCtl => Served::Refused,
         }
     }
 
