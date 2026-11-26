@@ -458,7 +458,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Create an epoll object with an empty interest list. Host venue.
-    pub fn create_epoll<W: LockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
+    pub fn create_epoll<W: RegionLockWait>(&self, wait: &W) -> Result<IpcObjectHandle, IpcError> {
         let (index, record) = self.pop_object()?;
         let guard = self.lock_fresh(index, record, wait)?;
         record.epoll_link.store(0, Ordering::Relaxed);
@@ -469,7 +469,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Lock `epoll` and drain its lock-free stack into the ordered list.
     /// Acquire an epoll's ready-list lock for a harvest owned by this caller.
-    pub fn lock_epoll<W: LockWait>(
+    pub fn lock_epoll<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -486,7 +486,7 @@ impl<'a> IpcRegion<'a> {
     /// Returns the epoll's wake when the member is already ready (the
     /// caller delivers it after this returns).
     #[allow(clippy::too_many_arguments)]
-    pub fn epoll_add<W: LockWait>(
+    pub fn epoll_add<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         member: IpcObjectHandle,
@@ -554,7 +554,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Add a carrier socket's interest to the shared ready list. The carrier
     /// has enrolled its event source before calling this with its first sample.
-    pub fn epoll_add_host_socket<W: LockWait>(
+    pub fn epoll_add_host_socket<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         fd: fd::Fd,
@@ -585,7 +585,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Rearm a carrier socket interest, invalidating publications and copy
     /// receipts that still name the prior registration.
-    pub fn epoll_modify_host_socket<W: LockWait>(
+    pub fn epoll_modify_host_socket<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         target: EpollItemRef,
@@ -615,7 +615,7 @@ impl<'a> IpcRegion<'a> {
         ))
     }
 
-    pub fn epoll_delete_host_socket<W: LockWait>(
+    pub fn epoll_delete_host_socket<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         target: EpollItemRef,
@@ -632,7 +632,7 @@ impl<'a> IpcRegion<'a> {
     /// Refresh a host socket's level. Only a host event queues an ET item.
     /// A readiness sample after guest I/O can clear its level without
     /// reissuing an edge that a waiter already consumed.
-    pub fn epoll_publish_host_socket<W: LockWait>(
+    pub fn epoll_publish_host_socket<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         target: EpollItemRef,
@@ -661,7 +661,7 @@ impl<'a> IpcRegion<'a> {
     /// `EPOLL_CTL_MOD` of the zone item `(fd, file_key)`: new events and
     /// data, `EPOLLONESHOT` re-armed, readiness re-evaluated (Linux queues a
     /// modified item that is ready now).
-    pub fn epoll_modify<W: LockWait>(
+    pub fn epoll_modify<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         fd: i32,
@@ -710,7 +710,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// `EPOLL_CTL_DEL` of the zone item `(fd, file_key)`.
-    pub fn epoll_delete<W: LockWait>(
+    pub fn epoll_delete<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         fd: i32,
@@ -746,7 +746,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Remove every zone item of the open file `file_key` on `member` (its
     /// last descriptor closed). Locks the member, then each item's epoll.
-    pub fn epoll_detach_file<W: LockWait>(
+    pub fn epoll_detach_file<W: RegionLockWait>(
         &self,
         member: IpcObjectHandle,
         file_key: u64,
@@ -770,7 +770,7 @@ impl<'a> IpcRegion<'a> {
     /// refused by the lock policy (`Contended`) can be resumed by calling
     /// this again (an EL1 release hands it to the host). Never holds the
     /// epoll and a member lock together.
-    pub fn epoll_destroy<W: LockWait>(
+    pub fn epoll_destroy<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -827,7 +827,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Host bookkeeping: the number of items in the host's half of `epoll`
     /// (written by the host after each change of its interest map).
-    pub fn epoll_set_host_items<W: LockWait>(
+    pub fn epoll_set_host_items<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         count: u32,
@@ -839,7 +839,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Items in the zone half of `epoll` (a lock-held read).
-    pub fn epoll_zone_items<W: LockWait>(
+    pub fn epoll_zone_items<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -850,7 +850,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Whether `epoll` holds a zone item for fd number `fd` (any open
     /// file), for diagnostics and tests.
-    pub fn epoll_has_item_fd<W: LockWait>(
+    pub fn epoll_has_item_fd<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         fd: i32,
@@ -872,7 +872,7 @@ impl<'a> IpcRegion<'a> {
     /// A transient readiness set (poll-family over N descriptors) has no
     /// guest descriptor, so no `EPOLL_CTL_MOD` races this: it keeps its
     /// decided answer in the items it already owns.
-    pub fn epoll_update_data<W: LockWait>(
+    pub fn epoll_update_data<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -891,7 +891,7 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Items in the host's half of `epoll` (a lock-held read).
-    pub fn epoll_host_items<W: LockWait>(
+    pub fn epoll_host_items<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -904,7 +904,7 @@ impl<'a> IpcRegion<'a> {
     /// (`taken` receives each reported item, for [`Self::epoll_restore`]).
     /// The one routine both venues use. Holds the epoll's lock or one
     /// member's lock at a time, never both.
-    pub fn epoll_harvest<W: LockWait>(
+    pub fn epoll_harvest<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         out: &mut [EpollReport],
@@ -917,7 +917,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Continue a harvest after its caller probed the lock using a
     /// release-queue observation. No second acquisition for host items.
-    pub fn epoll_harvest_locked<W: LockWait>(
+    pub fn epoll_harvest_locked<W: RegionLockWait>(
         &self,
         mut epoll_guard: IpcObjectGuard<'a>,
         out: &mut [EpollReport],
@@ -1084,7 +1084,7 @@ impl<'a> IpcRegion<'a> {
     /// events buffer): queue every taken item again and re-arm one-shot
     /// items, so the next wait reports them (Linux re-queues on a failed
     /// copy).
-    pub fn epoll_restore<W: LockWait>(
+    pub fn epoll_restore<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         taken: &[EpollItemRef],
@@ -1107,7 +1107,7 @@ impl<'a> IpcRegion<'a> {
     /// anything (poll/select on the epoll fd, a parent epoll's readiness).
     /// Items whose member is no longer ready stay queued; the next harvest
     /// drops them.
-    pub fn epoll_ready_probe<W: LockWait>(
+    pub fn epoll_ready_probe<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         wait: &W,
@@ -1118,7 +1118,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Return a count only when the shared membership authority proves this
     /// is a zone-only set. Host-backed sets require their existing selector.
-    pub fn epoll_zone_only_ready_count<W: LockWait>(
+    pub fn epoll_zone_only_ready_count<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         limit: usize,
@@ -1138,7 +1138,7 @@ impl<'a> IpcRegion<'a> {
     /// This is a snapshot, not a reservation: concurrent member changes may
     /// invalidate it before harvest.
     /// A zero limit touches neither the object nor its members.
-    pub fn epoll_ready_count<W: LockWait>(
+    pub fn epoll_ready_count<W: RegionLockWait>(
         &self,
         epoll: IpcObjectHandle,
         limit: usize,
@@ -1463,7 +1463,7 @@ impl<'a> IpcObjectGuard<'a> {
     /// when `None`) from its epoll (taking that epoll's lock, member then
     /// epoll) and from this member. The caller frees the returned items
     /// after unlocking.
-    fn detach_member_items<W: LockWait>(
+    fn detach_member_items<W: RegionLockWait>(
         &self,
         file_key: Option<u64>,
         wait: &W,
@@ -1639,7 +1639,10 @@ impl<'a> IpcObjectGuard<'a> {
     /// Under this member's lock, when the member object is being freed:
     /// detach every remaining item (a description release the host did not
     /// see, e.g. a final unpin in EL1). Returns the items to free.
-    pub(super) fn detach_all_member_items<W: LockWait>(&self, wait: &W) -> Result<(), IpcError> {
+    pub(super) fn detach_all_member_items<W: RegionLockWait>(
+        &self,
+        wait: &W,
+    ) -> Result<(), IpcError> {
         let removed = self.detach_member_items(None, wait)?;
         for number in removed.iter() {
             self.region.free_item(number);

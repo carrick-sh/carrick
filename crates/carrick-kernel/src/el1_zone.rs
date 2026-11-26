@@ -25,7 +25,11 @@ use carrick_el1_abi::{
 
 /// The host waits for a bucket lock by spinning, then yielding. A holder is
 /// either a host thread in a short critical section or a vCPU inside EL1,
-/// which its executor always resumes to completion.
+/// which its executor resumes to completion while the executor pool runs.
+/// After the pool stops no vCPU resumes, so it is not a region wait (it does
+/// not implement `RegionLockWait`): an IPC region's object, table and
+/// storage locks take the owner's `el1_ipc::RegionWait`, which refuses
+/// then instead (#2955, #2988).
 pub struct HostLockWait;
 
 /// A carrier-scoped zone (the x86 CPL0 zone in its carrier's guest RAM).
@@ -501,6 +505,29 @@ impl LockWait for HostLockWait {
         true
     }
 }
+
+/// Tests' wait on a region they built without an executor pool (#2988):
+/// [`HostLockWait`]'s policy, admitted to region locks. Production host
+/// code has only its owner's stop-aware `RegionWait`.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy)]
+pub struct TestRegionWait;
+#[cfg(any(test, feature = "test-support"))]
+impl LockWait for TestRegionWait {
+    fn complete_object_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        complete_object_wake(zone, owned);
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        <HostLockWait as LockWait>::wait(&HostLockWait, attempt)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl carrick_el1_abi::ipc::RegionLockWait for TestRegionWait {}
 
 impl LockWait<carrick_el1_abi::Aarch64ParkedContext> for HostLockWait {
     fn complete_object_wake(

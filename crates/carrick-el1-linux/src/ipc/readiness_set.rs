@@ -41,6 +41,7 @@ use super::{
 };
 use crate::dispatch::GuestDispatchFrame;
 use alloc::vec::Vec;
+use carrick_el1_abi::ipc::RegionLockWait;
 use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollMember, EpollReport, events};
 use carrick_el1_abi::ipc::fd::{
     AccessMode, Description, Error as FdError, Fd, StatusFlags, TableId,
@@ -50,7 +51,6 @@ use carrick_el1_abi::ipc::{
     IpcBacking, IpcCounterDeadline, IpcError, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
     IpcRegion, IpcSelectOutput, IpcUserVa, OfdPin,
 };
-use carrick_sched_core::LockWait;
 use carrick_syscall_abi::LinuxErrno;
 
 /// One transient item's `data` word: the descriptor, the select classes it
@@ -95,7 +95,7 @@ const fn select_events(interest: i16) -> u32 {
 }
 
 /// The transient epoll a set operation's pinned description names.
-pub fn transient_epoll<W: LockWait>(
+pub fn transient_epoll<W: RegionLockWait>(
     region: &IpcRegion<'_>,
     op: &IpcOperation,
     wait: W,
@@ -124,7 +124,7 @@ pub(super) fn names_set(region: &IpcRegion<'_>, op: &IpcOperation) -> bool {
 pub fn harvest_ready(
     region: &IpcRegion<'_>,
     epoll: IpcObjectHandle,
-    wait: &impl LockWait,
+    wait: &impl RegionLockWait,
 ) -> Result<Vec<SelectReady>, IpcError> {
     let items = region.epoll_zone_items(epoll, wait)? as usize;
     let mut reports = Vec::new();
@@ -158,7 +158,7 @@ pub fn record_answer(
     region: &IpcRegion<'_>,
     epoll: IpcObjectHandle,
     ready: &[SelectReady],
-    wait: &impl LockWait,
+    wait: &impl RegionLockWait,
 ) -> Result<(), IpcError> {
     region.epoll_update_data(epoll, wait, |raw| {
         let word = SetWord::from_raw(raw);
@@ -178,7 +178,7 @@ pub fn record_answer(
 pub fn recorded_answer(
     region: &IpcRegion<'_>,
     epoll: IpcObjectHandle,
-    wait: &impl LockWait,
+    wait: &impl RegionLockWait,
 ) -> Result<Vec<SelectReady>, IpcError> {
     let mut ready = Vec::new();
     let mut refused = false;

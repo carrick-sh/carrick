@@ -18,6 +18,7 @@ impl LockWait for Spin {
         true
     }
 }
+impl RegionLockWait for Spin {}
 
 static IDENTITY: AtomicU64 = AtomicU64::new(0x9_0000);
 
@@ -489,6 +490,7 @@ fn ready_count_survives_cursor_replacement_between_batches() {
         resume: mpsc::Receiver<()>,
         paused: AtomicU32,
     }
+    impl RegionLockWait for PausedScan {}
     impl LockWait for PausedScan {
         fn wait(&self, _attempt: u32) -> bool {
             if self.paused.swap(1, Ordering::Relaxed) == 0 {

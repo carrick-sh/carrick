@@ -715,7 +715,7 @@ pub fn fork_native_namespace(
         let result = region
             .fork_descriptors(
                 carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
-                &carrick_sched_core::ShortLockSpin,
+                &crate::ipc::RingShortSpin,
                 |child| {
                     map.publish_owned(child_table, child.to_raw())
                         .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
@@ -871,7 +871,7 @@ pub fn poll_descriptor_limit(
     };
     venue
         .region
-        .fd(carrick_sched_core::ShortLockSpin)
+        .fd(crate::ipc::RingShortSpin)
         .limit(carrick_el1_abi::ipc::fd::TableId::from_raw(table))
         .ok()
 }
@@ -914,7 +914,7 @@ pub fn host_readiness_entries(
             };
             match venue
                 .region
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(crate::ipc::RingShortSpin)
                 .get(TableId::from_raw(table), Fd(entry.fd))
             {
                 Ok(description)
@@ -1018,7 +1018,7 @@ pub fn resolve_poll_with_host_readiness(
             };
             let backing = match venue
                 .region
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(crate::ipc::RingShortSpin)
                 .get(TableId::from_raw(table), Fd(entry.fd))
             {
                 Ok(description) => IpcBacking::decode(description.backing)?,
@@ -1037,7 +1037,7 @@ pub fn resolve_poll_with_host_readiness(
                 IpcBacking::Epoll { object } => Some(
                     if venue
                         .region
-                        .epoll_zone_only_ready_count(object, 1, &carrick_sched_core::ShortLockSpin)
+                        .epoll_zone_only_ready_count(object, 1, &crate::ipc::RingShortSpin)
                         .ok()??
                         .records()
                         != 0
@@ -1052,7 +1052,7 @@ pub fn resolve_poll_with_host_readiness(
                     Some(
                         venue
                             .region
-                            .lock(object, &carrick_sched_core::ShortLockSpin)
+                            .lock(object, &crate::ipc::RingShortSpin)
                             .ok()?
                             .member_level(member)
                             .ok()?,

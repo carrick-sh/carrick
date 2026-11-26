@@ -2453,6 +2453,146 @@ mod tests {
         );
     }
 
+    /// #2955 (#2988 confirming review P0): a native socket's final release
+    /// (`NativeNetFile::drop`, after the carrier's `release` of its backing)
+    /// deletes each of its zone-epoll registrations under that epoll's IPC
+    /// object lock. A ring section cut off when its vCPU stopped keeps that
+    /// lock forever, so once the executor pool has stopped the delete must
+    /// refuse, be counted, and let the release return; it spun at 100% CPU
+    /// before. Production entries throughout: the native child's `socket`
+    /// and `EPOLL_CTL_ADD` records, the ring's close, the carrier's release.
+    #[test]
+    fn serial_final_socket_release_quarantines_an_epoll_lock_a_stopped_vcpu_holds() {
+        // The region keeps the frozen lock: its teardown, and the reactor's,
+        // stay out of the test (a red run's unwind would block on them).
+        let fixture = std::mem::ManuallyDrop::new(fixture());
+        // The run's carrier reactor, which serves native socket epolls.
+        let kernel = Arc::clone(fixture.dispatcher.kernel_binding.read().kernel());
+        let service =
+            std::mem::ManuallyDrop::new(crate::kernel::continuation::CarrierWaitService::new(
+                Arc::new(crate::kernel::Scheduler::new(kernel)),
+            ));
+        service.serve_host_readiness();
+        let root = fixture.dispatcher.capture_one_task_context().unwrap();
+        let mut input = host_file::NetCaller {
+            task: root.task().key(),
+            ns_pid: std::num::NonZeroU32::new(7).unwrap(),
+            ids: host_file::AccessIds {
+                ruid: 0,
+                euid: 0,
+                suid: 0,
+                fsuid: 0,
+                rgid: 0,
+                egid: 0,
+                sgid: 0,
+                fsgid: 0,
+            },
+            cap_effective: 0,
+        }
+        .encode()
+        .to_vec();
+        let socket = host_file::NetCall::encode(
+            carrick_abi::syscall::nr::SOCKET.raw(),
+            [2, 2, 0, 0, 0, 0],
+            &[],
+            &[],
+        )
+        .unwrap();
+        input.extend_from_slice(&socket);
+        let output = host_file::NetCall::output_capacity(
+            host_file::NetCall::decode(&socket).unwrap().segments(),
+        );
+        let (sock, _) = fixture.result(
+            None,
+            record(
+                fixture.table,
+                HostFileOp::NetSyscall,
+                -1,
+                [0; 4],
+                &input,
+                output,
+            ),
+        );
+        assert!(sock >= 0, "a native UDP socket: {sock}");
+        // The ring's `epoll_create1`: a zone epoll record and its descriptor.
+        let region = fixture.owner.region();
+        let epoll = region
+            .create_epoll(&crate::el1_zone::TestRegionWait)
+            .unwrap();
+        region
+            .ensure_table_capacity(fixture.ring_fd(), 64, &crate::el1_zone::TestRegionWait)
+            .unwrap();
+        let epfd = region
+            .fd(crate::el1_zone::TestRegionWait)
+            .open(
+                fixture.ring_fd(),
+                fd::Fd(0),
+                fd::Description::new(
+                    carrick_el1_abi::ipc::IpcBacking::Epoll { object: epoll }.encode(),
+                    fd::AccessMode::ReadWrite,
+                    fd::StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap();
+        // `EPOLL_CTL_ADD` of the socket, as the ring forwards it.
+        let mut ctl = vec![0u8; host_file::record_len(0, 0).unwrap()];
+        host_file::encode(
+            &mut ctl,
+            HostFileHeader {
+                op: HostFileOp::EpollSocketCtl,
+                table: fixture.table,
+                fd: epfd.0,
+                flags: carrick_el1_abi::ipc::epoll::events::IN,
+                args: [carrick_abi::LINUX_EPOLL_CTL_ADD, sock as u64, 0x5eed, 0],
+            },
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.result(None, ctl).0,
+            0,
+            "EPOLL_CTL_ADD of the socket"
+        );
+        assert!(fixture.owner.existing_native_socket_epolls().is_some());
+        // The frozen holder: the epoll's object lock is taken and never
+        // released, as by a vCPU stopped inside the ring's epoll section.
+        std::mem::forget(
+            region
+                .lock(epoll, &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
+        // ExecutorPool::shutdown after joining every worker.
+        fixture.owner.stop_guest_execution();
+        let owner = Arc::clone(&fixture.owner);
+        let table = fixture.ring_fd();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The ring's close of the socket's last descriptor, then the
+            // carrier's release of its backing: the host resource's last
+            // reference drops here.
+            let released = owner
+                .region()
+                .fd(crate::el1_zone::TestRegionWait)
+                .close(table, fd::Fd(sock as i32))
+                .unwrap()
+                .expect("the socket's last descriptor");
+            owner.release(released.backing).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        // The bound only reports a spinning release; a quarantining one
+        // answers at once.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "the final socket release spins on an epoll lock a stopped vCPU holds"
+        );
+        // One step meets the held lock: the socket's epoll delete.
+        assert_eq!(fixture.owner.quarantined_teardowns(), 1);
+    }
+
     /// #2414, director ruling Q3: `read(2)`, `write(2)` and `fstat(2)` of a
     /// native socket reach the carrier as Read/Write/Fstat records, which
     /// carry no caller. Their handlers run under an identity that is never
@@ -3124,10 +3264,10 @@ mod tests {
             .install_ipc_for_test(Arc::clone(&fixture.owner));
         let region = fixture.owner.region();
         let mut storage = region
-            .provision_descriptors(256, &crate::el1_zone::HostLockWait)
+            .provision_descriptors(256, &crate::el1_zone::TestRegionWait)
             .unwrap();
         let child = region
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .fork(fixture.ring_fd(), &mut storage)
             .unwrap()
             .to_raw();
@@ -3802,7 +3942,7 @@ mod tests {
             assert_eq!(path_resize(&[b'x'; 256], 1), -36);
             assert_eq!(path_resize(b"missing", u64::MAX), -22);
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             if let Some(released) = ring.close(fixture.ring_fd(), fd::Fd(file as i32)).unwrap() {
                 fixture.owner.release(released.backing).unwrap();
             }
@@ -3922,9 +4062,9 @@ mod tests {
                     .description(),
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             let mut storage = region
-                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
                 .unwrap();
             let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap().to_raw();
             fixture.table = [child.authority, child.index, child.generation];
@@ -4033,9 +4173,9 @@ mod tests {
             0
         );
         let region = fixture.owner.region();
-        let ring = region.fd(crate::el1_zone::HostLockWait);
+        let ring = region.fd(crate::el1_zone::TestRegionWait);
         let mut storage = region
-            .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+            .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
             .unwrap();
         let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap().to_raw();
         fixture.table = [child.authority, child.index, child.generation];
@@ -4185,11 +4325,11 @@ mod tests {
                     .description(),
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             ring.dup2(fixture.ring_fd(), fd::Fd(opened as i32), fd::Fd(1))
                 .unwrap();
             let mut storage = region
-                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
                 .unwrap();
             let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap();
             let raw = child.to_raw();
@@ -4487,7 +4627,7 @@ mod tests {
         // dup2 from another thread would after the ring staged the set.
         let region = fixture.owner.region();
         if let Some(closed) = region
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .close(table, fd::Fd(3))
             .unwrap()
         {
@@ -4618,7 +4758,7 @@ mod tests {
                     .is_none()
             );
             let region = fixture.owner.region();
-            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let ring = region.fd(crate::el1_zone::TestRegionWait);
             let released = ring.close(table, fd::Fd(4)).unwrap().unwrap();
             fixture.owner.release(released.backing).unwrap();
         }
@@ -4669,7 +4809,7 @@ mod tests {
             generation: fixture.table[2],
         };
         let authority_fd = fixture.owner.region();
-        let authority_fd = authority_fd.fd(crate::el1_zone::HostLockWait);
+        let authority_fd = authority_fd.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(
             authority_fd.getfd(fd::TableId::from_raw(raw), fd::Fd(fd)),
             Ok(true),
@@ -5163,7 +5303,7 @@ mod tests {
             let fd = fixture.venue_open(&authority, b"/tmp/f", CREATE, 0o644);
             assert!(fd >= 0, "{upper:?}: create: {fd}");
             let ring = fixture.owner.region();
-            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let ring = ring.fd(crate::el1_zone::TestRegionWait);
             let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
             assert_eq!(access, fd::AccessMode::WriteOnly, "{upper:?}");
             assert_eq!(fixture.venue_write(fd, b"hello "), 6, "{upper:?}");
@@ -5185,7 +5325,7 @@ mod tests {
         let fd = fixture.venue_open(&authority, b"/dev/null", CREATE, 0o666);
         assert!(fd >= 0, "open /dev/null: {fd}");
         let ring = fixture.owner.region();
-        let ring = ring.fd(crate::el1_zone::HostLockWait);
+        let ring = ring.fd(crate::el1_zone::TestRegionWait);
         let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
         assert_eq!(access, fd::AccessMode::WriteOnly);
         assert_eq!(fixture.venue_write(fd, b"discarded"), 9);
@@ -5203,7 +5343,7 @@ mod tests {
             let fd = fixture.venue_open(&authority, b"/tmp/log", append, 0);
             assert!(fd >= 0, "{upper:?}: append open: {fd}");
             let ring = fixture.owner.region();
-            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let ring = ring.fd(crate::el1_zone::TestRegionWait);
             let (_, status) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
             assert!(status.append, "{upper:?}: F_GETFL reports O_APPEND");
             assert_eq!(fixture.venue_write(fd, b"de"), 2, "{upper:?}");
@@ -5891,7 +6031,7 @@ mod tests {
         let native = host_file::reply(&open).unwrap().result as i32;
         assert_eq!(native, 3, "the child's lowest free ring descriptor");
         let region = owner.region();
-        let ring = region.fd(crate::el1_zone::HostLockWait);
+        let ring = region.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(ring.getfd(table, fd::Fd(native)), Ok(false));
         assert_eq!(
             root_slots(&root_files),

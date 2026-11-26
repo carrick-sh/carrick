@@ -46,6 +46,7 @@ use carrick_el1::substrate::ipc::{
 #[cfg(test)]
 use carrick_el1_abi::TrapFrame;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
+use carrick_el1_abi::ipc::RegionLockWait;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
@@ -141,7 +142,7 @@ pub fn retire_namespace(
     task: &CurrentTask,
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
-    let authority = region.fd(carrick_sched_core::ShortLockSpin);
+    let authority = region.fd(crate::ipc::RingShortSpin);
     authority
         .retire_table(table, |_| false, |_| {})
         .map_err(IpcError::Fd)?;
@@ -446,7 +447,7 @@ impl IpcTables for GuestTables {
     }
 }
 
-const EL1_WAIT: ShortLockSpin = ShortLockSpin;
+const EL1_WAIT: RingShortSpin = RingShortSpin;
 
 /// `task`'s complete ring descriptor table, as the fd-core raw table words
 /// the native host-file venue names it by. `None` when no complete namespace
@@ -523,6 +524,7 @@ struct ObjectLockWait<'r, 'a> {
     region: &'r IpcRegion<'a>,
     object: IpcObjectHandle,
 }
+impl RegionLockWait for ObjectLockWait<'_, '_> {}
 impl LockWait for ObjectLockWait<'_, '_> {
     fn wait(&self, attempt: u32) -> bool {
         core::hint::spin_loop();
@@ -543,6 +545,20 @@ impl LockWait for Finish {
         true
     }
 }
+impl RegionLockWait for Finish {}
+
+/// The ring's short-section spin on a region lock. It runs on a vCPU, whose
+/// holder is another vCPU's ring section or a host thread, each of which
+/// finishes its section. Crate-private, so no host venue can name it for a
+/// region lock (#2988): the host carrier waits with its owner's
+/// stop-aware region wait instead.
+pub(crate) struct RingShortSpin;
+impl carrick_sched_core::ShortLockWait for RingShortSpin {
+    fn wait_short(&self, attempt: u32) {
+        carrick_sched_core::ShortLockWait::wait_short(&ShortLockSpin, attempt);
+    }
+}
+impl RegionLockWait for RingShortSpin {}
 
 /// Serve read(2)/write(2) on a pipe or eventfd, and epoll_pwait(2) on a
 /// zone epoll, in EL1.
@@ -3133,6 +3149,7 @@ mod tests {
     }
 
     struct HostWait;
+    impl RegionLockWait for HostWait {}
     impl<C: carrick_el1_abi::EntryContext> LockWait<C> for HostWait {
         fn wait(&self, _attempt: u32) -> bool {
             core::hint::spin_loop();

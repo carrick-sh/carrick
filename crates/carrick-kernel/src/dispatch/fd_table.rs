@@ -236,7 +236,7 @@ impl EventFdState {
     }
     pub(super) fn counter_value(&self) -> u64 {
         let region = self.owner.region();
-        match region.lock(self.object, &crate::el1_zone::HostLockWait) {
+        match region.lock(self.object, &self.owner.wait()) {
             Ok(mut guard) => guard.eventfd().map(|event| event.value()).unwrap_or(0),
             Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
             Err(_) => carrick_fatal!("ipc::eventfd", "invalid counter observation"),
@@ -263,7 +263,7 @@ impl EventFdState {
     pub(crate) fn read_with(&self, copy: impl FnOnce(u64) -> bool) -> Result<u64, LinuxErrno> {
         let region = self.owner.region();
         let mut guard = region
-            .lock(self.object, &crate::el1_zone::HostLockWait)
+            .lock(self.object, &self.owner.wait())
             .map_err(|_| carrick_abi::LINUX_EBADF)?;
         let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
         let before = event.value();
@@ -282,7 +282,7 @@ impl EventFdState {
     pub(crate) fn write_value(&self, value: u64) -> Result<(), LinuxErrno> {
         let region = self.owner.region();
         let mut guard = region
-            .lock(self.object, &crate::el1_zone::HostLockWait)
+            .lock(self.object, &self.owner.wait())
             .map_err(|_| carrick_abi::LINUX_EBADF)?;
         let event = guard.eventfd().map_err(|_| carrick_abi::LINUX_EBADF)?;
         let before = event.value();
@@ -4227,7 +4227,6 @@ mod tests {
 
     #[test]
     fn serial_host_el1_ipc_status_flags_share_one_description() {
-        use crate::el1_zone::HostLockWait;
         use carrick_abi::LINUX_O_NONBLOCK;
         use carrick_el1_abi::ipc::{EventMode, fd};
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
@@ -4249,7 +4248,7 @@ mod tests {
             .install(table, fd::Fd(0), false)
             .unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(
             host.common().status_flags() & carrick_abi::LINUX_O_ACCMODE,
             carrick_abi::LINUX_O_RDWR,
@@ -4310,7 +4309,6 @@ mod tests {
 
     #[test]
     fn serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close() {
-        use crate::el1_zone::HostLockWait;
         use carrick_el1_abi::ipc::{EventMode, IpcError, fd};
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
         let state = EventFdState::create(Arc::clone(&owner), 7, EventMode::Counter).unwrap();
@@ -4323,7 +4321,7 @@ mod tests {
             .install(table, fd::Fd(0), false)
             .expect("host description must install its shared identity");
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let (guest_pin, _) = authority.pin(table, fd::Fd(0)).unwrap();
         assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
         assert_eq!(authority.holds(&guest_pin).unwrap(), (0, 2));
@@ -4332,7 +4330,7 @@ mod tests {
         assert!(authority.pinned(&guest_pin).is_ok());
         assert_eq!(
             region
-                .lock(state.object, &HostLockWait)
+                .lock(state.object, &crate::el1_zone::TestRegionWait)
                 .unwrap()
                 .eventfd()
                 .unwrap()
@@ -4346,7 +4344,7 @@ mod tests {
             .expect("last pin owns release");
         owner.release(description.backing).unwrap();
         assert!(matches!(
-            region.lock(state.object, &HostLockWait),
+            region.lock(state.object, &crate::el1_zone::TestRegionWait),
             Err(IpcError::Stale)
         ));
         let extent = authority
@@ -4405,7 +4403,6 @@ mod tests {
 
     #[test]
     fn serial_host_el1_ipc_eventfd_mixed_subscriber_wakes_once() {
-        use crate::el1_zone::HostLockWait;
         use carrick_el1_abi::ipc::pipe::EventMode;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
@@ -4416,7 +4413,9 @@ mod tests {
             observed.fetch_add(1, Ordering::Relaxed);
         });
         let region = owner.region();
-        let mut guest = region.lock(state.object, &HostLockWait).unwrap();
+        let mut guest = region
+            .lock(state.object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guest.eventfd().unwrap().try_write(3);
         assert!(guest.publish(step.wake).host_owed);
         drop(guest);
@@ -4429,7 +4428,9 @@ mod tests {
         let observed = wakes.load(Ordering::Relaxed);
         state.write_value(7).unwrap();
         assert_eq!(wakes.load(Ordering::Relaxed), observed);
-        let mut guest = region.lock(state.object, &HostLockWait).unwrap();
+        let mut guest = region
+            .lock(state.object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         assert_eq!(guest.eventfd().unwrap().try_read().result, Ok(1));
         assert_eq!(guest.host_subscribers(), 0);
     }

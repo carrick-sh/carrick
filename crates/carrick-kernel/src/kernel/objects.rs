@@ -4888,7 +4888,7 @@ mod tests {
         table.replace_slot(fd::Fd(0), &slot).unwrap();
         table.replace(fd::Fd(1), &second, false).unwrap();
         let region = owner.region();
-        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         assert_eq!(authority.getfd(table.id(), fd::Fd(0)), Ok(true));
         let foreign = Arc::new(crate::el1_ipc::HostIpc::new(16384).unwrap());
         assert!(

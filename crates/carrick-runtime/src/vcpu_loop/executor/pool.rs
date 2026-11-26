@@ -1352,6 +1352,9 @@ where
                 .kernel()
                 .release_thread_birth_capacity_after_executors_stop();
         }
+        // No vCPU resumes a ring section either: a shared-region lock still
+        // held now was cut off, and teardown must not wait for it (#2955).
+        self.scheduler.kernel().stop_guest_execution();
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
         let (created, destroyed) = self.receipts.lifecycle_counts();

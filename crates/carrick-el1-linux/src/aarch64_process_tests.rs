@@ -12662,7 +12662,6 @@ fn serial_host_native_fork_two_children_inherit_the_complete_ipc_namespace() {
 fn serial_host_native_child_exit_never_spins_on_a_host_owned_pipe() {
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
     use carrick_kernel::el1_ipc::{HostIpc, HostTable};
-    use carrick_kernel::el1_zone::HostLockWait;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -12705,7 +12704,9 @@ fn serial_host_native_child_exit_never_spins_on_a_host_owned_pipe() {
     core::mem::forget(child);
 
     let region = owner.region();
-    let host_guard = region.lock(object, &HostLockWait).unwrap();
+    let host_guard = region
+        .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+        .unwrap();
     let task = CurrentTask::new();
     let (sent, received) = std::sync::mpsc::channel();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -12734,7 +12735,9 @@ fn serial_host_native_child_exit_never_spins_on_a_host_owned_pipe() {
     });
 
     assert_eq!(owner.drain_retired_tables().unwrap(), 1);
-    let mut guard = region.lock(object, &HostLockWait).unwrap();
+    let mut guard = region
+        .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+        .unwrap();
     let pipe = guard.pipe().unwrap();
     assert_eq!(pipe.references(End::Reader), 0);
     assert_eq!(pipe.references(End::Writer), 1);
@@ -12756,7 +12759,6 @@ fn serial_host_native_fork_children_outlive_restored_view_mapping() {
 fn native_child_resources(mapping_last: Option<bool>) {
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
     use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
-    use carrick_sched_core::ShortLockSpin;
     use std::sync::Arc;
 
     let fixture = Fixture::new(0x10000, asid(1));
@@ -12861,7 +12863,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
     });
     assert_ne!(children[0], children[1]);
     let ipc = owner.region();
-    let authority = ipc.fd(ShortLockSpin);
+    let authority = ipc.fd(carrick_kernel::el1_zone::TestRegionWait);
     // Both native children remain live while a new host capsule's OFD
     // admission refuses. Rollback must neither close their file nor leak a
     // resource token. These pressure pins have no physical backing.
@@ -12931,7 +12933,9 @@ fn native_child_resources(mapping_last: Option<bool>) {
     let (pin, _) = authority.pin(table.id(), fd::Fd(4)).unwrap();
     assert_eq!(authority.holds(&pin), Ok((3, 2)));
     assert!(authority.unpin(pin).unwrap().is_none());
-    let mut guard = ipc.lock(object, &ShortLockSpin).unwrap();
+    let mut guard = ipc
+        .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+        .unwrap();
     assert_eq!(guard.pipe().unwrap().references(End::Writer), 1);
     drop(guard);
     for child in children {
@@ -12980,7 +12984,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
         "retired native namespace remains published"
     );
     assert_eq!(
-        ipc.lock(object, &ShortLockSpin)
+        ipc.lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap()
             .pipe()
             .unwrap()
@@ -12995,7 +12999,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
         "the exit boundary must settle the revoked namespace before its parent observes EOF"
     );
     assert_eq!(
-        ipc.lock(object, &ShortLockSpin)
+        ipc.lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap()
             .pipe()
             .unwrap()
@@ -13004,7 +13008,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
         "EOF is due only after both child writer descriptions close"
     );
     assert_eq!(
-        ipc.lock(object, &ShortLockSpin)
+        ipc.lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap()
             .pipe()
             .unwrap()
@@ -13015,7 +13019,8 @@ fn native_child_resources(mapping_last: Option<bool>) {
     table.close(fd::Fd(3)).unwrap();
     drop(reader);
     assert!(
-        ipc.lock(object, &ShortLockSpin).is_err(),
+        ipc.lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+            .is_err(),
         "final pipe release leaked the object"
     );
     assert_eq!(owner.retained_host_resources(), 0);
@@ -14102,7 +14107,7 @@ fn native_descriptor_argument_witness(
     assert_eq!(
         owner
             .region()
-            .fd(carrick_kernel::el1_zone::HostLockWait)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .close_effects(table.id(), fd::Fd(5))
             .unwrap(),
         carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
@@ -14337,7 +14342,7 @@ fn native_descriptor_argument_witness(
             let holder = scope.spawn(move || {
                 let guard = owner
                     .region()
-                    .lock(object, &carrick_kernel::el1_zone::HostLockWait)
+                    .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
                     .unwrap();
                 send.send(()).unwrap();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -15892,14 +15897,14 @@ fn native_descriptor_argument_witness(
                 assert!(
                     owner
                         .region()
-                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .fd(carrick_kernel::el1_zone::TestRegionWait)
                         .getfd(child_table, fd::Fd(created))
                         .unwrap()
                 );
                 backings.push(
                     owner
                         .region()
-                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .fd(carrick_kernel::el1_zone::TestRegionWait)
                         .get(child_table, fd::Fd(created))
                         .unwrap()
                         .backing,
@@ -15907,7 +15912,7 @@ fn native_descriptor_argument_witness(
                 assert!(
                     owner
                         .region()
-                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .fd(carrick_kernel::el1_zone::TestRegionWait)
                         .get(table.id(), fd::Fd(created))
                         .is_err(),
                     "child creation must not publish in the parent table"
@@ -16032,7 +16037,7 @@ fn native_descriptor_argument_witness(
     assert_eq!(
         owner
             .region()
-            .fd(carrick_kernel::el1_zone::HostLockWait)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .close_effects(child0_table, fd::Fd(5))
             .unwrap(),
         carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
@@ -17618,7 +17623,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
                 };
                 let region = owner.region();
                 let (pin, _) = region
-                    .fd(carrick_sched_core::ShortLockSpin)
+                    .fd(carrick_kernel::el1_zone::TestRegionWait)
                     .pin(*table, Fd(0))
                     .unwrap();
                 let binding = process.binding();
@@ -17642,7 +17647,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
                 // Only the operation's pin now retains the endpoint.
                 assert!(
                     region
-                        .fd(carrick_sched_core::ShortLockSpin)
+                        .fd(carrick_kernel::el1_zone::TestRegionWait)
                         .close(*table, Fd(0))
                         .unwrap()
                         .is_none()
@@ -19313,12 +19318,14 @@ fn with_arm_process_host_files_on<R>(
                     .expect("a ring child owns its table"),
             );
             let region = owner.region();
-            let retired = match region.fd(carrick_sched_core::ShortLockSpin).dup2_filtered(
-                table,
-                carrick_el1_abi::ipc::fd::Fd(args[0] as i32),
-                carrick_el1_abi::ipc::fd::Fd(args[1] as i32),
-                crate::ipc::is_zone_releasable_backing,
-            ) {
+            let retired = match region
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
+                .dup2_filtered(
+                    table,
+                    carrick_el1_abi::ipc::fd::Fd(args[0] as i32),
+                    carrick_el1_abi::ipc::fd::Fd(args[1] as i32),
+                    crate::ipc::is_zone_releasable_backing,
+                ) {
                 Ok(retired) => retired,
                 Err(carrick_el1_abi::ipc::fd::Error::BadFd) => {
                     return (
@@ -22032,7 +22039,7 @@ fn serial_host_arm_close_releases_record_locks_of_the_file_it_retired() {
             // The sibling's dup2(m, n): X's description keeps `x_kept`,
             // and B's table holds no lock on X, so it owes nothing.
             let retired = region
-                .fd(carrick_sched_core::ShortLockSpin)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .dup2_filtered(
                     table,
                     carrick_el1_abi::ipc::fd::Fd(m as i32),
@@ -22100,7 +22107,7 @@ fn serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file() {
         let x_c = arm_open_lock_file(call, c, &x);
         crate::dispatch::close_retire_hold::set(move |region, table, fd| {
             assert_eq!(fd.0 as u64, n, "the hold runs in B's dup3 onto n");
-            let authority = region.fd(carrick_sched_core::ShortLockSpin);
+            let authority = region.fd(carrick_kernel::el1_zone::TestRegionWait);
             // The sibling's close(n): X stays open at `k`, and B's table
             // holds no lock on X yet, so the close owes nothing.
             let retired = authority
@@ -22116,7 +22123,7 @@ fn serial_host_arm_dup_releases_record_locks_only_of_a_displaced_file() {
                 .unwrap()
                 .expect("X is a stamped file");
             let locks = region
-                .file_locks(&carrick_sched_core::ShortLockSpin)
+                .file_locks(&carrick_kernel::el1_zone::TestRegionWait)
                 .unwrap();
             let taken = locks.table().set(
                 Lock {

@@ -24,7 +24,6 @@ use carrick_el1_abi::ipc::{IpcBacking, IpcObjectHandle, IpcWake, fd};
 use parking_lot::Mutex;
 
 use crate::el1_ipc::{HostDescription, HostDescriptionFlags, HostIpc};
-use crate::el1_zone::HostLockWait;
 use crate::linux_abi::LinuxEpollEvent;
 
 /// A zone epoll item's member: an IPC object side and the identity of the
@@ -141,7 +140,7 @@ impl ZoneEpoll {
         )) {
             Ok(lifetime) => lifetime,
             Err(_) => {
-                let _ = owner.region().epoll_destroy(object, &HostLockWait);
+                let _ = owner.region().epoll_destroy(object, &owner.wait());
                 return Err(ZoneEpollRefusal::Exhausted);
             }
         };
@@ -279,7 +278,7 @@ impl ZoneEpoll {
             member.file_key,
             events,
             data,
-            &HostLockWait,
+            &self.owner.wait(),
         );
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -292,7 +291,7 @@ impl ZoneEpoll {
             file_key,
             events,
             data,
-            &HostLockWait,
+            &self.owner.wait(),
         );
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -302,7 +301,7 @@ impl ZoneEpoll {
         let result = self
             .owner
             .region()
-            .epoll_delete(self.object, fd, file_key, &HostLockWait)
+            .epoll_delete(self.object, fd, file_key, &self.owner.wait())
             .map(|()| None);
         Self::ctl(result, |wake| self.deliver(wake))
     }
@@ -313,7 +312,7 @@ impl ZoneEpoll {
         let _ = self
             .owner
             .region()
-            .epoll_set_host_items(self.object, count, &HostLockWait);
+            .epoll_set_host_items(self.object, count, &self.owner.wait());
     }
 
     /// Harvest up to `max` zone reports (the shared routine EL1 uses).
@@ -323,7 +322,7 @@ impl ZoneEpoll {
         let harvest = self
             .owner
             .region()
-            .epoll_harvest(self.object, &mut out, &mut taken, &HostLockWait)
+            .epoll_harvest(self.object, &mut out, &mut taken, &self.owner.wait())
             .unwrap_or_else(|error| {
                 carrick_fatal::carrick_fatal!("epoll::zone", "zone harvest refused: {error:?}")
             });
@@ -359,14 +358,14 @@ impl ZoneEpoll {
         let _ = self
             .owner
             .region()
-            .epoll_restore(self.object, taken, &HostLockWait);
+            .epoll_restore(self.object, taken, &self.owner.wait());
     }
 
     /// Items in the zone half.
     pub(crate) fn zone_items(&self) -> usize {
         self.owner
             .region()
-            .epoll_zone_items(self.object, &HostLockWait)
+            .epoll_zone_items(self.object, &self.owner.wait())
             .map_or(0, |n| n as usize)
     }
 
@@ -375,7 +374,7 @@ impl ZoneEpoll {
     pub(crate) fn has_item_fd(&self, fd: i32) -> bool {
         self.owner
             .region()
-            .epoll_has_item_fd(self.object, fd, &HostLockWait)
+            .epoll_has_item_fd(self.object, fd, &crate::el1_zone::TestRegionWait)
             .unwrap_or(false)
     }
 
@@ -386,7 +385,7 @@ impl ZoneEpoll {
     ) -> Option<carrick_el1_abi::ipc::epoll::ZoneOnlyEpollReadyCount> {
         self.owner
             .region()
-            .epoll_zone_only_ready_count(self.object, limit, &HostLockWait)
+            .epoll_zone_only_ready_count(self.object, limit, &self.owner.wait())
             .ok()
             .flatten()
     }
@@ -395,18 +394,26 @@ impl ZoneEpoll {
     pub(crate) fn ready(&self) -> bool {
         self.owner
             .region()
-            .epoll_ready_probe(self.object, &HostLockWait)
+            .epoll_ready_probe(self.object, &self.owner.wait())
             .unwrap_or(false)
     }
 }
 
 /// Remove every zone item of a member's open file whose last descriptor
-/// closed (`man 7 epoll`).
+/// closed (`man 7 epoll`). The last close runs in the carrier-exit
+/// `FileTable` drop too, so it waits with the region's stop-aware wait: a
+/// member or epoll lock a stopped vCPU still holds is quarantined and
+/// counted, and the close goes on (#2955). Any other refusal leaves the
+/// items as before (a stale member has none).
 pub(crate) fn detach_member_file(member: &ZoneMember) {
-    let _ = member
-        .owner
-        .region()
-        .epoll_detach_file(member.object, member.file_key, &HostLockWait);
+    let owner = &member.owner;
+    if let Err(error) =
+        owner
+            .region()
+            .epoll_detach_file(member.object, member.file_key, &owner.wait())
+    {
+        let _ = owner.quarantine_cut_off(error.into());
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +483,68 @@ mod tests {
                 "all-zone pipe wait enrollment creates host readiness proxies"
             );
         }
+    }
+
+    /// #2955 (#2988 review P0): the carrier-exit `FileTable` drop releases
+    /// each descriptor's functional reference; the last one of a pipe end
+    /// detaches its open file from every zone epoll under the pipe's IPC
+    /// object lock before it closes the endpoint. A ring section cut off
+    /// when its vCPU stopped keeps that lock forever, so once the executor
+    /// pool has stopped the detach must refuse, be counted, and let the
+    /// drop return; it spun at 100% CPU before.
+    #[test]
+    fn serial_file_table_drop_quarantines_a_member_lock_a_stopped_vcpu_holds() {
+        use crate::dispatch::fd_table::{
+            OpenDescription, OpenDescriptionBase, kernel_file_description,
+        };
+        use crate::dispatch::fs::pipe::PipeInner;
+        use crate::kernel::ids::ObjectIdRegistry;
+        use crate::kernel::{FileSlotNumber, FileTable};
+        use std::sync::Arc;
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let table = FileTable::new(ids.file_table_id().unwrap());
+        let pipe = Arc::new(PipeInner::create(Arc::clone(&owner), 0, 4096).unwrap());
+        let description = kernel_file_description(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+                pipe: Arc::clone(&pipe),
+            })),
+            carrick_abi::LINUX_O_RDONLY,
+        );
+        description.retain_fd_ref();
+        table.install(FileSlotNumber::for_open_fd(3).unwrap(), description, false);
+        assert!(
+            pipe.zone_member(carrick_el1_abi::ipc::pipe::End::Reader)
+                .is_some(),
+            "the reader's last close detaches it from the zone epolls"
+        );
+        // The frozen holder: the pipe's object lock is taken and never
+        // released, as by a vCPU stopped inside the ring's pipe section.
+        std::mem::forget(
+            owner
+                .region()
+                .lock(pipe.ipc_object(), &crate::el1_zone::TestRegionWait)
+                .unwrap(),
+        );
+        // ExecutorPool::shutdown after joining every worker.
+        owner.stop_guest_execution();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(table);
+            done_tx.send(()).unwrap();
+        });
+        // The bound only reports a spinning drop; a quarantining one
+        // answers at once.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "FileTable drop spins on a member lock a stopped vCPU holds"
+        );
+        // Two steps meet the held lock: the epoll detach, then the
+        // endpoint description's own close (`HostDescription::drop`).
+        assert_eq!(owner.quarantined_teardowns(), 2);
     }
 
     #[test]

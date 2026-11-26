@@ -29,8 +29,9 @@ use carrick_el1_abi::ipc::{
 };
 pub use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 
-/// The host waits for the short sections other parties hold object and
-/// descriptor-table locks for (the zone's host lock policy).
+/// The host's wait on the zone's queue locks (the zone's host lock policy).
+/// It is not a region wait: object and descriptor-table locks take
+/// [`IpcHostServices::region_wait`] (#2988).
 pub use crate::el1_zone::HostLockWait as HostIpcWait;
 
 /// Host services for one completion owner: authenticate its mapping, retire
@@ -44,6 +45,13 @@ pub trait IpcHostServices {
     /// object's guest waiters on the advanced lanes, and its host
     /// subscribers when the publication owed them (`host_owed`).
     fn wake(&self, wake: IpcWake);
+    /// The wait for this owner's region locks (#2988): in production the
+    /// owner's stop-aware [`crate::el1_ipc::RegionWait`], which refuses once
+    /// no executor can resume a ring section that holds the lock.
+    type RegionWait<'a>: carrick_el1_abi::ipc::RegionLockWait + Copy
+    where
+        Self: 'a;
+    fn region_wait(&self) -> Self::RegionWait<'_>;
     /// The guest virtual counter now (an epoll wait's deadline is on it).
     fn counter(&self) -> CounterClock {
         CounterClock::host()
@@ -107,6 +115,10 @@ impl ZoneHostServices {
 }
 
 impl IpcHostServices for ZoneHostServices {
+    type RegionWait<'a> = crate::el1_ipc::RegionWait<'a>;
+    fn region_wait(&self) -> crate::el1_ipc::RegionWait<'_> {
+        self.owner.wait()
+    }
     fn operation_slot_released(&self, region: &IpcRegion<'_>) {
         if let Some(zone) = crate::el1_zone::zone() {
             zone.notify_ipc_operation_slot_release(
@@ -361,8 +373,12 @@ impl RetainedIpcOperation {
 
 impl Drop for RetainedIpcOperation {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            let _ = finish(&self.service.owner.region(), token, &self.service);
+        if let Some(token) = self.token.take()
+            && let Err(error) = finish(&self.service.owner.region(), token, &self.service)
+        {
+            // A carrier-exit drop meets a lock a stopped vCPU holds: the
+            // pin and backing it guards stay quarantined (#2955).
+            let _ = self.service.owner.quarantine_cut_off(error.into());
         }
     }
 }
@@ -452,9 +468,9 @@ pub fn finish(
     wake.validate_region(region)?;
     let op = region.finish_operation(token, || wake.operation_slot_released(region))?;
     if op.pin.authority != 0 {
-        let fd = region.fd(HostIpcWait);
+        let fd = region.fd(wake.region_wait());
         if let Some(description) = fd.unpin(OfdPin::from_raw(op.pin)).map_err(IpcError::Fd)? {
-            match region.release_backing(description.backing, &HostIpcWait)? {
+            match region.release_backing(description.backing, &wake.region_wait())? {
                 IpcReleased::Object {
                     wake: w,
                     freed: false,
@@ -530,7 +546,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
     // A multi-descriptor or empty-set select/poll pins a transient epoll:
     // its items are the set, the epoll's harvest is its probe, and they keep
     // the decided answer.
-    let set = readiness_set::transient_epoll(region, &op, HostIpcWait);
+    let set = readiness_set::transient_epoll(region, &op, wake.region_wait());
     let mut bytes = op.value.0.to_ne_bytes();
     let fd = i32::from_ne_bytes(bytes[..4].try_into().unwrap_or_default());
     if op.progress.len == 0 {
@@ -547,7 +563,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
         {
             (0, 0)
         } else if let Some(epoll) = set {
-            let answer = readiness_set::harvest_ready(region, epoll, &HostIpcWait)?;
+            let answer = readiness_set::harvest_ready(region, epoll, &wake.region_wait())?;
             if answer.is_empty() && pending {
                 return Ok(IpcHostOutcome::Blocked {
                     token,
@@ -558,7 +574,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
                     nr: op.nr,
                 });
             }
-            readiness_set::record_answer(region, epoll, &answer, &HostIpcWait)?;
+            readiness_set::record_answer(region, epoll, &answer, &wake.region_wait())?;
             let ready = answer
                 .iter()
                 .map(|entry| i64::from(entry.ready.count_ones()))
@@ -566,7 +582,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
             (0, ready)
         } else {
             let pin = OfdPin::from_raw(op.pin);
-            let description = region.fd(HostIpcWait).pinned(&pin);
+            let description = region.fd(wake.region_wait()).pinned(&pin);
             op.pin = pin.into_raw();
             let (object, member) = description.map_err(IpcError::Fd).and_then(|description| {
                 IpcBacking::decode(description.backing)
@@ -577,7 +593,7 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
                 return Err(IpcError::Corrupt);
             }
             let events = i16::from_ne_bytes([bytes[4], bytes[5]]);
-            let mut guard = region.lock(object, &HostIpcWait)?;
+            let mut guard = region.lock(object, &wake.region_wait())?;
             let level = guard.member_level(member)?;
             drop(guard);
             let revents = if select {
@@ -644,7 +660,9 @@ fn complete_readiness<M: carrick_guest_mem::CurrentMmMemory>(
     let mut offset = op.progress.written as usize;
     let mut window = Vec::new();
     let answer = match set {
-        Some(epoll) if select => readiness_set::recorded_answer(region, epoll, &HostIpcWait)?,
+        Some(epoll) if select => {
+            readiness_set::recorded_answer(region, epoll, &wake.region_wait())?
+        }
         Some(_) => Vec::new(),
         None => vec![SelectReady {
             fd,
@@ -929,7 +947,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     let object = IpcObjectHandle::from_raw(op.object);
     let nonblock = {
         let pin = OfdPin::from_raw(op.pin);
-        let flags = region.fd(HostIpcWait).pinned(&pin).map(|d| {
+        let flags = region.fd(wake.region_wait()).pinned(&pin).map(|d| {
             d.flags.nonblock
                 || op
                     .call
@@ -1034,7 +1052,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     }
     let mut vector_error = None;
     let (status, published) = {
-        let mut guard = region.lock(object, &HostIpcWait)?;
+        let mut guard = region.lock(object, &wake.region_wait())?;
         let mut copy = PrefixCopy::new(&mut user);
         let (status, wake_set) = if vectored {
             carrick_el1::substrate::ipc::transfer_with_io(

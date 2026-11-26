@@ -4753,6 +4753,7 @@ enum NativeDescriptorNamespace {
 pub(crate) static NATIVE_FD_CONTENTIONS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 struct NativeFdWait;
+impl carrick_el1_abi::ipc::RegionLockWait for NativeFdWait {}
 impl carrick_el1_abi::ipc::LockWait for NativeFdWait {
     fn wait(&self, _attempt: u32) -> bool {
         #[cfg(test)]

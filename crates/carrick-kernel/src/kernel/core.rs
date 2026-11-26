@@ -1434,6 +1434,14 @@ impl Kernel {
         *ipc = Some(Arc::clone(&owner));
         Ok(owner)
     }
+    /// Every executor that could run this kernel's guests has joined: ring
+    /// sections that still hold shared-region locks were cut off and never
+    /// release them. Host teardown quarantines what they guard (#2955).
+    pub fn stop_guest_execution(&self) {
+        if let Some(owner) = self.ipc.lock().as_ref() {
+            owner.stop_guest_execution();
+        }
+    }
     /// Give a kernel with no IPC authority yet a specific one (a zone with a
     /// small file-table limit).
     #[cfg(test)]

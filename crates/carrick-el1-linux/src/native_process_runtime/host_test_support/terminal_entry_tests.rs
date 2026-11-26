@@ -1331,7 +1331,7 @@ fn retained_pipe_read<C: ProcessContext>(
 
     let region = shared.region();
     let writer_release = region
-        .fd(carrick_sched_core::ShortLockSpin)
+        .fd(carrick_kernel::el1_zone::TestRegionWait)
         .close(table, fd::Fd(1))
         .unwrap()
         .unwrap();
@@ -1344,7 +1344,7 @@ fn retained_pipe_read<C: ProcessContext>(
     .unwrap();
 
     let (pin, _) = region
-        .fd(carrick_sched_core::ShortLockSpin)
+        .fd(carrick_kernel::el1_zone::TestRegionWait)
         .pin(table, fd::Fd(0))
         .unwrap();
     let raw_pin = pin.into_raw();
@@ -1363,7 +1363,7 @@ fn retained_pipe_read<C: ProcessContext>(
     let token = carrick_el1::substrate::ipc::to_sched_token(raw_ipc_token).unwrap();
     assert!(
         region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .close(table, fd::Fd(0))
             .unwrap()
             .is_none(),
@@ -1630,13 +1630,13 @@ fn terminal_close_with_retained_adapter_service_entry_for<
     assert!(
         region.observe(object).is_err()
             && region
-                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
                 .is_err(),
         "terminal settlement must release the final pipe endpoint OfdPin"
     );
     assert!(
         region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing,)
             .is_err(),
         "a second unpin of the retired OfdPin must fail"
@@ -2336,7 +2336,7 @@ fn closing_process_retires_object_parked_member_for<
     );
     assert!(
         region
-            .fd(carrick_sched_core::ShortLockSpin)
+            .fd(carrick_kernel::el1_zone::TestRegionWait)
             .unpin_filtered(pin, crate::ipc::is_zone_releasable_backing)
             .is_err(),
         "terminal settlement must release the operation's endpoint pin"

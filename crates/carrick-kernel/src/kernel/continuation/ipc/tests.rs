@@ -107,7 +107,7 @@ fn serial_host_el1_ipc_finish_releases_host_forwarding_token() {
         .unwrap();
     let region = owner.region();
     let pin = region
-        .fd(HostIpcWait)
+        .fd(crate::el1_zone::TestRegionWait)
         .create_pinned(Description::new(
             IpcBacking::Host(backing).encode(),
             AccessMode::ReadWrite,
@@ -183,7 +183,9 @@ fn serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority() {
     drop(dispatcher);
     let retained = weak.upgrade().expect("mapping retains IPC authority");
     let region = retained.region();
-    let mut guard = region.lock(object, &HostIpcWait).unwrap();
+    let mut guard = region
+        .lock(object, &crate::el1_zone::TestRegionWait)
+        .unwrap();
     assert_eq!(guard.eventfd().unwrap().try_read().result, Ok(7));
     drop(guard);
     retained
@@ -203,6 +205,10 @@ struct World {
 #[derive(Default)]
 struct Wakes(RefCell<Vec<(IpcObjectHandle, WakeSet)>>, Cell<usize>);
 impl IpcHostServices for Wakes {
+    type RegionWait<'a> = crate::el1_zone::TestRegionWait;
+    fn region_wait(&self) -> crate::el1_zone::TestRegionWait {
+        crate::el1_zone::TestRegionWait
+    }
     fn operation_slot_released(&self, _region: &IpcRegion<'_>) {
         self.1.set(self.1.get() + 1);
     }
@@ -255,9 +261,11 @@ fn world() -> World {
         next: Cell::new(0),
         table: TableId::from_raw(Default::default()),
     };
-    let mut extent = region.provision_descriptors(64, &HostIpcWait).unwrap();
+    let mut extent = region
+        .provision_descriptors(64, &crate::el1_zone::TestRegionWait)
+        .unwrap();
     let table = region
-        .fd(HostIpcWait)
+        .fd(crate::el1_zone::TestRegionWait)
         .create_table(1024, &mut extent)
         .unwrap();
     World { table, ..w }
@@ -270,17 +278,23 @@ impl World {
         at
     }
     fn pipe(&self) -> (Fd, Fd, IpcObjectHandle) {
-        let object = self.region.create_pipe(65536, &HostIpcWait).unwrap();
+        let object = self
+            .region
+            .create_pipe(65536, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         // The ring the host's first write provides.
         let mut storage = IpcPipeStorage {
             offset: self.bump(65536 + 16 * 8),
             ring_bytes: 65536,
             pages: 16,
         };
-        let mut guard = self.region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = self
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         assert_eq!(guard.provide_pipe_storage(&mut storage), Ok(true));
         drop(guard);
-        let fd = self.region.fd(HostIpcWait);
+        let fd = self.region.fd(crate::el1_zone::TestRegionWait);
         let open = |end, access| {
             fd.open(
                 self.table,
@@ -302,7 +316,11 @@ impl World {
     }
     /// An operation as the EL1 adapter records it at admission.
     fn operation(&self, fd: Fd, kind: IpcOpKind, len: u64, nr: u32) -> IpcOpToken {
-        let (pin, desc) = self.region.fd(HostIpcWait).pin(self.table, fd).unwrap();
+        let (pin, desc) = self
+            .region
+            .fd(crate::el1_zone::TestRegionWait)
+            .pin(self.table, fd)
+            .unwrap();
         let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(desc.backing) else {
             panic!("pipe");
         };
@@ -329,12 +347,15 @@ impl World {
     }
     fn holds(&self, fd: Fd) -> usize {
         self.region
-            .fd(HostIpcWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .refcount(self.table, fd)
             .unwrap()
     }
     fn unread(&self, object: IpcObjectHandle) -> usize {
-        let mut g = self.region.lock(object, &HostIpcWait).unwrap();
+        let mut g = self
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         g.pipe().unwrap().unread_bytes()
     }
 }
@@ -393,9 +414,16 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
         assert!(wakes.0.borrow().is_empty());
     }
     // Every pin was released: only the descriptor's own reference remains.
-    let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
-    assert_eq!(w.region.fd(HostIpcWait).holds(&pin), Ok((1, 1)));
-    let _ = w.region.fd(HostIpcWait).unpin(pin);
+    let (pin, _) = w
+        .region
+        .fd(crate::el1_zone::TestRegionWait)
+        .pin(w.table, r)
+        .unwrap();
+    assert_eq!(
+        w.region.fd(crate::el1_zone::TestRegionWait).holds(&pin),
+        Ok((1, 1))
+    );
+    let _ = w.region.fd(crate::el1_zone::TestRegionWait).unpin(pin);
 }
 
 /// A parked zone epoll wait owns no progress: a signal ends it with EINTR
@@ -441,9 +469,16 @@ fn el1_epoll_wait_interruption_is_eintr_and_continuation_restarts() {
     let outcome =
         complete_handback(&caller(), w.region, token, MM, &mut mem, None, &wakes).unwrap();
     assert_eq!(outcome, restart);
-    let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
-    assert_eq!(w.region.fd(HostIpcWait).holds(&pin), Ok((1, 1)));
-    let _ = w.region.fd(HostIpcWait).unpin(pin);
+    let (pin, _) = w
+        .region
+        .fd(crate::el1_zone::TestRegionWait)
+        .pin(w.table, r)
+        .unwrap();
+    assert_eq!(
+        w.region.fd(crate::el1_zone::TestRegionWait).holds(&pin),
+        Ok((1, 1))
+    );
+    let _ = w.region.fd(crate::el1_zone::TestRegionWait).unpin(pin);
 }
 
 /// Host services reading a model counter (1 tick = 1 ns) instead of the
@@ -453,6 +488,10 @@ struct Clocked {
     now: u64,
 }
 impl IpcHostServices for Clocked {
+    type RegionWait<'a> = crate::el1_zone::TestRegionWait;
+    fn region_wait(&self) -> crate::el1_zone::TestRegionWait {
+        crate::el1_zone::TestRegionWait
+    }
     fn operation_slot_released(&self, region: &IpcRegion<'_>) {
         self.wakes.operation_slot_released(region);
     }
@@ -564,13 +603,17 @@ fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
             })
         );
     }
-    let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
+    let (pin, _) = w
+        .region
+        .fd(crate::el1_zone::TestRegionWait)
+        .pin(w.table, r)
+        .unwrap();
     assert_eq!(
-        w.region.fd(HostIpcWait).holds(&pin),
+        w.region.fd(crate::el1_zone::TestRegionWait).holds(&pin),
         Ok((1, 1)),
         "every pin dropped"
     );
-    let _ = w.region.fd(HostIpcWait).unpin(pin);
+    let _ = w.region.fd(crate::el1_zone::TestRegionWait).unpin(pin);
 }
 
 #[test]
@@ -670,7 +713,10 @@ fn continue_pipe_write(vectored: bool) {
     }
     // EL1 wrote the first 1000 bytes, then handed the continuation back.
     {
-        let mut g = w.region.lock(object, &HostIpcWait).unwrap();
+        let mut g = w
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         g.pipe().unwrap().try_write(&source[..1000]);
     }
     w.hand_back(&token, IpcHandback::Continue, 1000, 0);
@@ -706,7 +752,10 @@ fn continue_pipe_write(vectored: bool) {
     // The reader drains; the continuation completes from its offset.
     let mut out = vec![0; progress as usize];
     {
-        let mut g = w.region.lock(object, &HostIpcWait).unwrap();
+        let mut g = w
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         g.pipe().unwrap().try_read(&mut out);
     }
     let outcome =
@@ -720,7 +769,10 @@ fn continue_pipe_write(vectored: bool) {
     );
     let mut rest = vec![0; source.len()];
     let n = {
-        let mut g = w.region.lock(object, &HostIpcWait).unwrap();
+        let mut g = w
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         g.pipe().unwrap().try_read(&mut rest).result.unwrap()
     };
     out.extend_from_slice(&rest[..n]);
@@ -735,7 +787,10 @@ fn el1_ipc_continue_rejects_a_stale_address_space_before_copying() {
     let w = world();
     let (r, _wfd, object) = w.pipe();
     {
-        let mut g = w.region.lock(object, &HostIpcWait).unwrap();
+        let mut g = w
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         g.pipe().unwrap().try_write(b"secret");
     }
     let token = w.operation(r, IpcOpKind::PipeRead, 16, 63);
@@ -787,7 +842,12 @@ fn el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer() {
     let (r, wfd, object) = w.pipe();
     let token = w.operation(r, IpcOpKind::PipeRead, 16, 63);
     // The reader's descriptor closes while its read is parked (exit).
-    assert_eq!(w.region.fd(HostIpcWait).close(w.table, r), Ok(None));
+    assert_eq!(
+        w.region
+            .fd(crate::el1_zone::TestRegionWait)
+            .close(w.table, r),
+        Ok(None)
+    );
     let wakes = Wakes::default();
     assert_eq!(
         interrupt(w.region, token, IpcCause::Control, &wakes).unwrap(),
@@ -807,7 +867,10 @@ fn el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer() {
             }
         )]
     );
-    let mut g = w.region.lock(object, &HostIpcWait).unwrap();
+    let mut g = w
+        .region
+        .lock(object, &crate::el1_zone::TestRegionWait)
+        .unwrap();
     assert_eq!(g.pipe().unwrap().references(End::Reader), 0);
     drop(g);
     let _ = wfd;
@@ -837,7 +900,9 @@ fn serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary() {
     // it cannot call the host subscription registry directly.
     {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(7);
         assert!(guard.publish(step.wake).host_owed);
     }
@@ -863,7 +928,9 @@ fn serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary() {
     // Leave an indexed wake behind, then retire and reuse its object slot.
     {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
     }
@@ -889,7 +956,9 @@ fn serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary() {
     );
     {
         let region = owner.region();
-        let mut guard = region.lock(replacement, &HostIpcWait).unwrap();
+        let mut guard = region
+            .lock(replacement, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
     }
@@ -951,7 +1020,9 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
     // publish under the object lock, then mark the slot's pending host work.
     let el1_write = || {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
         drop(guard);
@@ -1004,7 +1075,7 @@ fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
     });
     let region = owner.region();
     let pin = region
-        .fd(HostIpcWait)
+        .fd(crate::el1_zone::TestRegionWait)
         .create_pinned(Description::new(
             IpcBacking::EventFd { object }.encode(),
             AccessMode::ReadWrite,
@@ -1015,7 +1086,7 @@ fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
     let table = owner.create_table(1024, 64).unwrap();
     owner
         .region()
-        .fd(HostIpcWait)
+        .fd(crate::el1_zone::TestRegionWait)
         .install_pin(table, Fd(3), &pin, false)
         .unwrap();
     let token = region
@@ -1047,10 +1118,16 @@ fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
     );
     let delivered = wakes.load(Ordering::Relaxed);
     drop(subscriber);
-    let mut guard = region.lock(object, &HostIpcWait).unwrap();
+    let mut guard = region
+        .lock(object, &crate::el1_zone::TestRegionWait)
+        .unwrap();
     assert_eq!(guard.eventfd().unwrap().value(), 5);
     drop(guard);
-    let closed = region.fd(HostIpcWait).close(table, Fd(3)).unwrap().unwrap();
+    let closed = region
+        .fd(crate::el1_zone::TestRegionWait)
+        .close(table, Fd(3))
+        .unwrap()
+        .unwrap();
     owner.release(closed.backing).unwrap();
     assert_eq!(delivered, 1, "the host subscriber must be woken");
 }
@@ -1137,7 +1214,9 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
     // writer's served-with-work exit at its slot's host boundary.
     let el1_write = || {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(5);
         let published = guard.publish(step.wake);
         drop(guard);
@@ -1220,7 +1299,10 @@ fn el1_ipc_read_owner_refusal_keeps_bytes_until_destination_is_secured() {
     let w = world();
     let (r, writer, object) = w.pipe();
     {
-        let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+        let mut guard = w
+            .region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         guard.pipe().unwrap().try_write(b"retain");
     }
     let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
@@ -1255,7 +1337,13 @@ fn el1_ipc_read_owner_refusal_keeps_bytes_until_destination_is_secured() {
     let saved = w.region.operation(&token).unwrap();
     assert_eq!(saved.progress.written, 0);
     let pin = OfdPin::from_raw(saved.pin);
-    assert_eq!(w.region.fd(HostIpcWait).holds(&pin).unwrap(), (1, 1));
+    assert_eq!(
+        w.region
+            .fd(crate::el1_zone::TestRegionWait)
+            .holds(&pin)
+            .unwrap(),
+        (1, 1)
+    );
     let _ = pin.into_raw();
     let outcome = complete_handback(
         &caller(),
@@ -1283,12 +1371,12 @@ fn el1_ipc_read_owner_refusal_keeps_bytes_until_destination_is_secured() {
     );
     let description = w
         .region
-        .fd(HostIpcWait)
+        .fd(crate::el1_zone::TestRegionWait)
         .close(w.table, writer)
         .unwrap()
         .unwrap();
     w.region
-        .release_backing(description.backing, &HostIpcWait)
+        .release_backing(description.backing, &crate::el1_zone::TestRegionWait)
         .unwrap();
     let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
     w.hand_back(&token, IpcHandback::Continue, 0, 0);
@@ -1317,7 +1405,10 @@ fn el1_ipc_owner_copyout_fault_and_page_prefix_preserve_unread_bytes() {
         let w = world();
         let (reader, _writer, object) = w.pipe();
         {
-            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            let mut guard = w
+                .region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             guard.pipe().unwrap().try_write(b"abcdef");
         }
         let token = w.operation(reader, IpcOpKind::PipeRead, 6, 63);
@@ -1371,16 +1462,16 @@ fn el1_ipc_empty_owner_read_does_not_touch_invalid_destination() {
         if mode == 0 {
             let description = w
                 .region
-                .fd(HostIpcWait)
+                .fd(crate::el1_zone::TestRegionWait)
                 .close(w.table, writer)
                 .unwrap()
                 .unwrap();
             w.region
-                .release_backing(description.backing, &HostIpcWait)
+                .release_backing(description.backing, &crate::el1_zone::TestRegionWait)
                 .unwrap();
         } else if mode == 1 {
             w.region
-                .fd(HostIpcWait)
+                .fd(crate::el1_zone::TestRegionWait)
                 .setfl(
                     w.table,
                     reader,
@@ -1524,7 +1615,11 @@ fn poll_handback_retains_admission(cause: Option<IpcCause>) {
     assert_eq!(saved.object, op.object);
     assert_eq!(token.into_raw(), raw);
     // Close the admitted fd and install an unrelated pipe at that number.
-    let description = w.region.fd(HostIpcWait).close(w.table, reader).unwrap();
+    let description = w
+        .region
+        .fd(crate::el1_zone::TestRegionWait)
+        .close(w.table, reader)
+        .unwrap();
     assert!(
         description.is_none(),
         "the operation keeps its description alive"
@@ -1533,7 +1628,7 @@ fn poll_handback_retains_admission(cause: Option<IpcCause>) {
     assert_eq!(replacement, reader);
     // The original endpoint becomes ready after the numeric fd was reused.
     w.region
-        .lock(object, &HostIpcWait)
+        .lock(object, &crate::el1_zone::TestRegionWait)
         .unwrap()
         .pipe()
         .unwrap()
@@ -1701,7 +1796,7 @@ fn poll_completed_answer_survives_copyout_refusal(control: bool) {
     let w = world();
     let (reader, _, object) = w.pipe();
     w.region
-        .lock(object, &HostIpcWait)
+        .lock(object, &crate::el1_zone::TestRegionWait)
         .unwrap()
         .pipe()
         .unwrap()
@@ -1746,7 +1841,7 @@ fn poll_completed_answer_survives_copyout_refusal(control: bool) {
     assert_eq!(saved.result, 1);
     assert_eq!(saved.progress, WriteProgress::new(2));
     w.region
-        .lock(object, &HostIpcWait)
+        .lock(object, &crate::el1_zone::TestRegionWait)
         .unwrap()
         .pipe()
         .unwrap()
@@ -1780,7 +1875,7 @@ fn ppoll_handback_only_revents_requires_write_permission() {
     let w = world();
     let (reader, _, object) = w.pipe();
     w.region
-        .lock(object, &HostIpcWait)
+        .lock(object, &crate::el1_zone::TestRegionWait)
         .unwrap()
         .pipe()
         .unwrap()
@@ -1836,7 +1931,10 @@ fn el1_ipc_readv_handback_scatters_retained_headers_without_overwriting_them() {
             })
             .unwrap();
         {
-            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            let mut guard = w
+                .region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             guard.pipe().unwrap().try_write(&b"abcd"[prefix..]);
         }
         w.hand_back(&token, IpcHandback::Continue, prefix as u64, 0);
@@ -1889,7 +1987,10 @@ fn el1_ipc_readv_handback_prepares_the_actual_vector_destination() {
             })
             .unwrap();
         {
-            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            let mut guard = w
+                .region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             guard.pipe().unwrap().try_write(&b"abcd"[prefix..]);
         }
         w.hand_back(&token, IpcHandback::Continue, prefix as u64, 0);
@@ -1962,7 +2063,10 @@ fn el1_ipc_readv_handback_prepares_tiny_vectors_once_and_reads_them_atomically()
             .unwrap();
         let source: Vec<_> = (0..count).map(|n| (n % 251) as u8).collect();
         {
-            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            let mut guard = w
+                .region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(
                 guard.pipe().unwrap().try_write(&source).result.unwrap(),
                 count
@@ -2024,7 +2128,10 @@ fn el1_ipc_readv_handback_fault_preserves_only_the_secured_prefix() {
             })
             .unwrap();
         {
-            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            let mut guard = w
+                .region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             guard.pipe().unwrap().try_write(b"abcd");
         }
         w.hand_back(&token, IpcHandback::Continue, 0, 0);

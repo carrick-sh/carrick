@@ -1,4 +1,3 @@
-use crate::el1_zone::HostLockWait;
 use carrick_abi::*;
 use carrick_el1_abi::ipc::{IpcBacking, IpcObjectGuard, IpcObjectHandle, pipe as core_pipe};
 use carrick_guest_mem::CurrentMmMemory;
@@ -341,7 +340,7 @@ impl PipeInner {
     pub(crate) fn is_retired(&self) -> bool {
         self.owner
             .region()
-            .lock(self.object, &HostLockWait)
+            .lock(self.object, &crate::el1_zone::TestRegionWait)
             .is_err()
     }
     #[cfg(test)]
@@ -358,7 +357,7 @@ impl PipeInner {
     fn lock(&self) -> IpcObjectGuard<'_> {
         self.owner
             .region()
-            .lock(self.object, &HostLockWait)
+            .lock(self.object, &self.owner.wait())
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::pipe", "stale live pipe binding")
             })
@@ -396,7 +395,7 @@ impl PipeInner {
         // Epoll can retain an observation after the last functional endpoint
         // closes. Authenticate the incarnation without retaining it or reading
         // the successor's bytes after this directory slot is reused.
-        match self.owner.region().lock(self.object, &HostLockWait) {
+        match self.owner.region().lock(self.object, &self.owner.wait()) {
             Ok(mut guard) => Self::snapshot_locked(&mut guard).unread,
             Err(carrick_el1_abi::ipc::IpcError::Stale) => 0,
             Err(_) => carrick_fatal::carrick_fatal!("ipc::pipe", "invalid observation"),
@@ -592,7 +591,7 @@ impl PipeInner {
         let mut notified = readiness.lock();
         let region = owner.region();
         let snapshot = region
-            .lock(object, &HostLockWait)
+            .lock(object, &owner.wait())
             .ok()
             .map(|mut guard| Self::snapshot_locked(&mut guard));
         let read_ready = snapshot.is_none_or(|s| s.unread != 0 || s.writers == 0);
@@ -606,7 +605,7 @@ impl PipeInner {
             || self
                 .owner
                 .region()
-                .lock(self.object, &HostLockWait)
+                .lock(self.object, &self.owner.wait())
                 .ok()
                 .is_none_or(|guard| guard.host_subscribers() == 1);
         let ready = channel.get_or_init(make_readiness_pipe);
@@ -1319,7 +1318,7 @@ mod tests {
         pipe.install_endpoint_for_test(core_pipe::End::Writer, parent.id(), fd::Fd(1))
             .unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let children = core::array::from_fn::<_, 2, _>(|_| parent.fork().unwrap());
         let close = |table, fd| {
             if let Some(description) = authority.close(table, fd).unwrap() {
@@ -1353,7 +1352,7 @@ mod tests {
             let parent = owner.create_table(256, 256).unwrap();
             let peer = owner.create_table(256, 256).unwrap();
             let region = owner.region();
-            let authority = region.fd(HostLockWait);
+            let authority = region.fd(crate::el1_zone::TestRegionWait);
             let mut retained = 0;
             for index in 0..pairs {
                 let pipe = PipeInner::create(Arc::clone(&owner), index as u64, PIPE_BUF).unwrap();
@@ -1421,7 +1420,7 @@ mod tests {
         pipe.install_endpoint_for_test(core_pipe::End::Writer, table, fd::Fd(1))
             .unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         assert!(authority.getfl(table, fd::Fd(0)).unwrap().1.nonblock);
         assert!(!authority.getfl(table, fd::Fd(1)).unwrap().1.nonblock);
         authority
@@ -1574,7 +1573,7 @@ mod tests {
         pipe.install_endpoint_for_test(core_pipe::End::Writer, table, fd::Fd(0))
             .expect("pipe writer must install its shared description");
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let (pin, _) = authority.pin(table, fd::Fd(0)).unwrap();
         assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
         pipe.release_endpoint(core_pipe::End::Writer);
@@ -1587,7 +1586,9 @@ mod tests {
         {
             // A guest write after the host's first write gave the ring.
             pipe.ensure_ring().unwrap();
-            let mut guard = region.lock(pipe.object, &HostLockWait).unwrap();
+            let mut guard = region
+                .lock(pipe.object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(guard.pipe().unwrap().try_write(b"guest").result, Ok(5));
         }
         let mut bytes = [0; 5];
@@ -1650,7 +1651,7 @@ mod tests {
         // EL1 forwards a write to an unbacked pipe; the host gives the ring.
         assert_eq!(
             region
-                .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+                .lock(pipe.ipc_object(), &crate::el1_zone::TestRegionWait)
                 .unwrap()
                 .pipe()
                 .unwrap()
@@ -1660,7 +1661,7 @@ mod tests {
         );
         pipe.ensure_ring().unwrap();
         let mut guest = region
-            .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+            .lock(pipe.ipc_object(), &crate::el1_zone::TestRegionWait)
             .unwrap();
         assert_eq!(guest.pipe().unwrap().try_write(b"guest").result, Ok(5));
         drop(guest);
@@ -1677,7 +1678,7 @@ mod tests {
         assert_eq!(&bytes, b"guest");
         assert_eq!(pipe.write_bytes(b"host"), Ok(4));
         let mut guest = region
-            .lock(pipe.ipc_object(), &crate::el1_zone::HostLockWait)
+            .lock(pipe.ipc_object(), &crate::el1_zone::TestRegionWait)
             .unwrap();
         assert_eq!(guest.pipe().unwrap().try_read(&mut bytes).result, Ok(4));
         assert_eq!(&bytes[..4], b"host");

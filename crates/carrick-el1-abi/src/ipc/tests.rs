@@ -50,6 +50,7 @@ impl LockWait for Spin {
         true
     }
 }
+impl RegionLockWait for Spin {}
 const EL1: BoundedSpin = BoundedSpin(1024);
 
 // ---- fixture: zeroed directory + pool, published by the "host" ----

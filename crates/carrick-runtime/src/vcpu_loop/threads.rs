@@ -2031,10 +2031,7 @@ mod child_tid_owner_tests {
         {
             let region = owner.region();
             let mut pipe = region
-                .lock(
-                    object,
-                    &carrick_kernel::kernel::continuation::ipc::HostIpcWait,
-                )
+                .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
                 .unwrap();
             assert!(pipe.provide_ring_from_stock().unwrap());
             let written = pipe.pipe().unwrap().try_write(b"x");
@@ -2071,10 +2068,7 @@ mod child_tid_owner_tests {
         let mut byte = [0_u8; 1];
         let read = owner
             .region()
-            .lock(
-                object,
-                &carrick_kernel::kernel::continuation::ipc::HostIpcWait,
-            )
+            .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
             .unwrap()
             .pipe()
             .unwrap()

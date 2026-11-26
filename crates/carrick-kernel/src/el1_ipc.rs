@@ -350,7 +350,7 @@ impl Drop for HostSubscription {
         let _ = self
             .owner
             .region()
-            .unsubscribe_host(self.object, &HostLockWait);
+            .unsubscribe_host(self.object, &self.owner.wait());
     }
 }
 
@@ -409,7 +409,7 @@ impl HostDescriptionFlags {
             HostDescriptionState::Live(pin) => self
                 .owner
                 .region()
-                .fd(HostLockWait)
+                .fd(self.owner.wait())
                 .pinned(pin)
                 .unwrap_or_else(|_| {
                     carrick_fatal::carrick_fatal!("ipc::description", "invalid flag observation")
@@ -449,7 +449,7 @@ impl HostDescriptionFlags {
             return;
         };
         let region = self.owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(self.owner.wait());
         let result = (|| {
             if let Some(value) = value {
                 let mut flags = authority.pinned(pin)?.flags;
@@ -496,7 +496,7 @@ impl HostDescription {
         self.flags
             .owner
             .region()
-            .fd(HostLockWait)
+            .fd(self.flags.owner.wait())
             .install_pin(table, target, pin, cloexec)
     }
 }
@@ -508,32 +508,50 @@ impl Drop for HostDescription {
             let HostDescriptionState::Live(pin) = &*state else {
                 return;
             };
-            let region = self.flags.owner.region();
-            let authority = region.fd(HostLockWait);
-            let terminal = authority.pinned(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid closing description")
-            });
+            let owner = &self.flags.owner;
+            let region = owner.region();
+            let authority = region.fd(owner.wait());
+            // A lock a stopped vCPU still holds quarantines this close (#2955):
+            // the pin stays live and the description keeps its backing.
+            let terminal = match authority.pinned(pin) {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    if owner.quarantine_cut_off(error.into()).is_ok() {
+                        return;
+                    }
+                    carrick_fatal::carrick_fatal!("ipc::description", "invalid closing description")
+                }
+            };
             let HostDescriptionState::Live(pin) =
                 std::mem::replace(&mut *state, HostDescriptionState::Retired(terminal))
             else {
                 carrick_fatal::carrick_fatal!("ipc::description", "description retired twice")
             };
-            authority.unpin(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid owned description pin")
-            })
+            match authority.unpin(pin) {
+                Ok(description) => description,
+                Err(error) => {
+                    if owner.quarantine_cut_off(error.into()).is_ok() {
+                        return;
+                    }
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::description",
+                        "invalid owned description pin"
+                    )
+                }
+            }
         };
         // Backing release can call host readiness callbacks: leave the
         // description lock before delivering them.
         if let Some(description) = description {
-            self.flags
-                .owner
-                .release(description.backing)
-                .unwrap_or_else(|_| {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::description",
-                        "invalid final description backing"
-                    )
-                });
+            let owner = &self.flags.owner;
+            if let Err(error) = owner.release(description.backing)
+                && owner.quarantine_cut_off(error.into()).is_err()
+            {
+                carrick_fatal::carrick_fatal!(
+                    "ipc::description",
+                    "invalid final description backing"
+                );
+            }
         }
     }
 }
@@ -561,7 +579,73 @@ pub struct HostIpc {
     /// The deadlines of native members' poll waits (#231).
     poll_deadlines: crate::host_readiness::PollDeadlines,
     native_epolls: Mutex<Option<Arc<crate::dispatch::net::native_epoll::NativeSocketEpolls>>>,
+    /// Whether an executor can still run the ring over this region (#2955).
+    guest: GuestExecution,
 }
+
+/// Whether any vCPU can still run ring code over a region. A ring critical
+/// section holds a lock in the shared region; its holder releases it only if
+/// an executor resumes that vCPU. After the executor pool has joined every
+/// worker (or a worker died), none will: a lock still held then belongs to
+/// a section that was cut off and can never be released.
+#[derive(Debug, Default)]
+struct GuestExecution {
+    stopped: std::sync::atomic::AtomicBool,
+    /// Tables and extents left in place because a cut-off section held them.
+    quarantined: AtomicU64,
+}
+
+/// The host's wait on its own region's locks. While guests can run it is
+/// [`HostLockWait`]: the holder is a host thread or a vCPU that its executor
+/// resumes. Once guest execution has stopped, the first contention refuses
+/// (`Contended`), and the caller quarantines what the dead holder guards.
+#[derive(Clone, Copy)]
+pub struct RegionWait<'a>(&'a GuestExecution);
+
+impl carrick_el1_abi::LockWait for RegionWait<'_> {
+    fn complete_object_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        <HostLockWait as carrick_el1_abi::LockWait>::complete_object_wake(
+            &HostLockWait,
+            zone,
+            owned,
+        );
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        !self.0.stopped.load(Ordering::Acquire)
+            && <HostLockWait as carrick_el1_abi::LockWait>::wait(&HostLockWait, attempt)
+    }
+}
+
+/// The host carrier's only region wait (#2988): it refuses once guest
+/// execution has stopped, where the carrier's zone wait would spin forever.
+impl carrick_el1_abi::ipc::RegionLockWait for RegionWait<'_> {}
+
+impl carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext> for RegionWait<'_> {
+    fn complete_object_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        <HostLockWait as carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext>>::complete_object_wake(
+            &HostLockWait,
+            zone,
+            owned,
+        );
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        <Self as carrick_el1_abi::LockWait>::wait(self, attempt)
+    }
+}
+
 struct SocketEpollLockWait<'a>(&'a crate::el1_zone::CarrierZone);
 
 impl SocketEpollLockWait<'_> {
@@ -715,6 +799,7 @@ impl HostIpc {
             carrier_zone: std::sync::OnceLock::new(),
             poll_deadlines: crate::host_readiness::PollDeadlines::default(),
             native_epolls: Mutex::new(None),
+            guest: GuestExecution::default(),
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -832,7 +917,7 @@ impl HostIpc {
         self: &std::sync::Arc<Self>,
         object: IpcObjectHandle,
     ) -> Result<std::sync::Arc<HostSubscription>, IpcError> {
-        self.region().subscribe_host(object, &HostLockWait)?;
+        self.region().subscribe_host(object, &self.wait())?;
         Ok(std::sync::Arc::new(HostSubscription {
             owner: std::sync::Arc::clone(self),
             object,
@@ -865,7 +950,7 @@ impl HostIpc {
         // Authenticate and consume under the object lock: a recycled slot
         // cannot lose its successor's wake between generation check and swap.
         let region = self.region();
-        let Ok(mut guard) = region.lock(object, &HostLockWait) else {
+        let Ok(mut guard) = region.lock(object, &self.wait()) else {
             return false;
         };
         let Some(target) = target else {
@@ -926,6 +1011,45 @@ impl HostIpc {
         self.bytes.len
     }
 
+    /// This region's lock wait: [`HostLockWait`] until guest execution
+    /// stops, then a refusal at the first contention.
+    pub(crate) fn wait(&self) -> RegionWait<'_> {
+        RegionWait(&self.guest)
+    }
+
+    /// No executor can run ring code over this region again: the executor
+    /// pool has joined every worker. A ring section that still holds a lock
+    /// was cut off, so host waits refuse from here on (#2955).
+    pub fn stop_guest_execution(&self) {
+        self.guest.stopped.store(true, Ordering::Release);
+    }
+
+    /// Settle a teardown step that was refused. After guest execution has
+    /// stopped, a contended lock's holder can never release it: the step
+    /// leaves what that lock guards in place (it may be mid-update), counts
+    /// it, and teardown goes on. Any other refusal, or a contention while
+    /// guests can still run, stays the caller's error.
+    pub(crate) fn quarantine_cut_off(&self, error: AdmissionError) -> Result<(), AdmissionError> {
+        let contended = matches!(
+            error,
+            AdmissionError::Shared(IpcError::Contended | IpcError::Fd(fd::Error::Contended))
+        );
+        if contended && self.guest.stopped.load(Ordering::Acquire) {
+            self.guest.quarantined.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                ?error,
+                "IPC teardown left state held by a stopped vCPU in quarantine"
+            );
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// Teardown steps quarantined behind a lock a stopped vCPU held.
+    pub fn quarantined_teardowns(&self) -> u64 {
+        self.guest.quarantined.load(Ordering::Relaxed)
+    }
+
     /// A view cannot outlive the mappings it borrows.
     pub fn region(&self) -> IpcRegion<'_> {
         // SAFETY: only new() constructs an owner; it initialized both mappings.
@@ -956,7 +1080,7 @@ impl HostIpc {
             let mut bound_count = 0;
             for direction in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
                 let key = pipe_lane_key(object, direction);
-                let result = zone.bind_object_wait(key, &HostLockWait, &|owned| {
+                let result = zone.bind_object_wait(key, &self.wait(), &|owned| {
                     crate::el1_zone::complete_object_wake(owned.zone(), owned)
                 });
                 if let Err(error) = result {
@@ -965,7 +1089,7 @@ impl HostIpc {
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        zone.unbind_object_wait(key, &HostLockWait, &|owned| {
+                        zone.unbind_object_wait(key, &self.wait(), &|owned| {
                             crate::el1_zone::complete_object_wake(owned.zone(), owned)
                         })?;
                     }
@@ -984,7 +1108,7 @@ impl HostIpc {
             .enumerate()
         {
             let backing = carrick_el1_abi::ipc::IpcBacking::Pipe { object, end }.encode();
-            let released = region.release_backing(backing, &HostLockWait)?;
+            let released = region.release_backing(backing, &self.wait())?;
             if !matches!(released, carrick_el1_abi::ipc::IpcReleased::Object { freed, .. } if freed == (index == 1))
             {
                 return Err(IpcError::Corrupt);
@@ -1002,7 +1126,7 @@ impl HostIpc {
     }
     fn discard_unpublished_eventfd(&self, object: IpcObjectHandle) -> Result<(), IpcError> {
         let backing = carrick_el1_abi::ipc::IpcBacking::EventFd { object }.encode();
-        match self.region().release_backing(backing, &HostLockWait)? {
+        match self.region().release_backing(backing, &self.wait())? {
             carrick_el1_abi::ipc::IpcReleased::Object { freed: true, .. } => Ok(()),
             _ => Err(IpcError::Corrupt),
         }
@@ -1013,7 +1137,7 @@ impl HostIpc {
         pages: u64,
     ) -> Result<IpcPipeStorage, AdmissionError> {
         self.region()
-            .provision_pipe_storage(ring_bytes, pages, &HostLockWait)
+            .provision_pipe_storage(ring_bytes, pages, &self.wait())
             .map_err(|error| match error {
                 IpcError::Fd(fd::Error::NoMemory) => AdmissionError::NoMemory,
                 error => error.into(),
@@ -1064,7 +1188,7 @@ impl HostIpc {
     ) -> Result<(), AdmissionError> {
         if let Some(zone) = zone {
             for lane in PIPE_LANES[..bound].iter().rev() {
-                zone.unbind_object_wait(pipe_lane_key(object, *lane), &HostLockWait, &|owned| {
+                zone.unbind_object_wait(pipe_lane_key(object, *lane), &self.wait(), &|owned| {
                     crate::el1_zone::complete_object_wake(owned.zone(), owned)
                 })
                 .map_err(AdmissionError::ObjectWaitInvariant)?;
@@ -1089,7 +1213,7 @@ impl HostIpc {
         capacity: usize,
     ) -> Result<PipeCreation, AdmissionError> {
         self.top_up_ring_stock()?;
-        let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
+        let object = self.with_object(|region| region.create_pipe(capacity, &self.wait()))?;
         let Some(zone) = crate::el1_zone::zone() else {
             return Ok(PipeCreation::Created(object));
         };
@@ -1108,7 +1232,7 @@ impl HostIpc {
     #[cfg(any(test, feature = "test-support"))]
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
         self.top_up_ring_stock()?;
-        let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
+        let object = self.with_object(|region| region.create_pipe(capacity, &self.wait()))?;
         let Some(zone) = crate::el1_zone::zone() else {
             return Ok(object);
         };
@@ -1147,7 +1271,7 @@ impl HostIpc {
             return Ok(());
         };
         if let Err(mut ring) = region.stock_ring(ring) {
-            region.reclaim_pipe_storage(&mut ring, &HostLockWait)?;
+            region.reclaim_pipe_storage(&mut ring, &self.wait())?;
         }
         Ok(())
     }
@@ -1163,7 +1287,7 @@ impl HostIpc {
     ) -> Result<(), AdmissionError> {
         self.top_up_ring_stock()?;
         let region = self.region();
-        let mut guard = region.lock(object, &HostLockWait)?;
+        let mut guard = region.lock(object, &self.wait())?;
         guard
             .ensure_pipe_storage()
             .map(|_| ())
@@ -1179,7 +1303,7 @@ impl HostIpc {
         mode: pipe::EventMode,
     ) -> Result<IpcObjectHandle, AdmissionError> {
         let object =
-            self.with_object(|region| region.create_eventfd(initial, mode, &HostLockWait))?;
+            self.with_object(|region| region.create_eventfd(initial, mode, &self.wait()))?;
         if let Err(error) = self.bind_waits(object) {
             if let Err(rollback) = self.discard_unpublished_eventfd(object) {
                 return Err(AdmissionError::ObjectRollbackInvariant(rollback));
@@ -1192,9 +1316,9 @@ impl HostIpc {
     /// A zone epoll record ([`carrick_el1_abi::ipc::epoll`]) with an empty
     /// interest list. Its `Readable` wait key is bound like an object's.
     pub fn create_epoll(&self) -> Result<IpcObjectHandle, AdmissionError> {
-        let object = self.with_object(|region| region.create_epoll(&HostLockWait))?;
+        let object = self.with_object(|region| region.create_epoll(&self.wait()))?;
         if let Err(error) = self.bind_waits(object) {
-            if let Err(rollback) = self.region().epoll_destroy(object, &HostLockWait) {
+            if let Err(rollback) = self.region().epoll_destroy(object, &self.wait()) {
                 let error = AdmissionError::ObjectRollbackInvariant(rollback);
                 let _ = CreateError::from_admission(error);
                 return Err(error);
@@ -1218,7 +1342,7 @@ impl HostIpc {
         limit: usize,
     ) -> Result<usize, AdmissionError> {
         self.region()
-            .resize_pipe(object, requested, limit, &HostLockWait, |wake| {
+            .resize_pipe(object, requested, limit, &self.wait(), |wake| {
                 let mut delivery = self.object_wake_delivery();
                 delivery.collect(wake);
                 delivery.deliver();
@@ -1228,7 +1352,7 @@ impl HostIpc {
 
     fn provision_descriptors(&self, capacity: usize) -> Result<fd::Extent, AdmissionError> {
         self.region()
-            .provision_descriptors(capacity, &HostLockWait)
+            .provision_descriptors(capacity, &self.wait())
             .map_err(|error| match error {
                 fd::storage::StorageError::Exhausted | fd::storage::StorageError::Invalid => {
                     AdmissionError::NoMemory
@@ -1247,7 +1371,7 @@ impl HostIpc {
         let pin = loop {
             let region = self.region();
             let seen = region.ofd_count();
-            match region.fd(HostLockWait).create_pinned(description) {
+            match region.fd(self.wait()).create_pinned(description) {
                 Err(fd::Error::NeedsOfds) => self.grow_descriptions(seen)?,
                 result => break result?,
             }
@@ -1268,7 +1392,7 @@ impl HostIpc {
         table: fd::TableId,
         target: fd::Fd,
     ) -> Result<(HostDescription, fd::Description), fd::Error> {
-        let (pin, description) = self.region().fd(HostLockWait).pin(table, target)?;
+        let (pin, description) = self.region().fd(self.wait()).pin(table, target)?;
         Ok((
             HostDescription {
                 flags: std::sync::Arc::new(HostDescriptionFlags {
@@ -1288,7 +1412,7 @@ impl HostIpc {
         let mut storage = self.provision_descriptors(capacity)?;
         let result = self
             .region()
-            .fd(HostLockWait)
+            .fd(self.wait())
             .create_table(limit, &mut storage);
         if result.is_err() {
             self.reclaim_descriptors(storage)?;
@@ -1305,7 +1429,7 @@ impl HostIpc {
         let mut storage = self.provision_descriptors(capacity)?;
         let result = self
             .region()
-            .fd(HostLockWait)
+            .fd(self.wait())
             .grow_table(table, &mut storage);
         self.reclaim_descriptors(storage)?;
         result.map_err(Into::into)
@@ -1313,7 +1437,7 @@ impl HostIpc {
     /// Reclaim only an extent returned by this region's destroy/grow operation.
     pub(crate) fn reclaim_descriptors(&self, mut extent: fd::Extent) -> Result<(), AdmissionError> {
         self.region()
-            .reclaim_descriptors(&mut extent, &HostLockWait)
+            .reclaim_descriptors(&mut extent, &self.wait())
             .map_err(|error| {
                 AdmissionError::Shared(match error {
                     fd::storage::StorageError::Contended => IpcError::Contended,
@@ -1361,7 +1485,7 @@ impl HostIpc {
             let seen = self.region().ofd_count();
             // Stamped before any descriptor names it: every advisory lock
             // taken through the description finds its file.
-            let opened = self.region().fd(HostLockWait).open_identified(
+            let opened = self.region().fd(self.wait()).open_identified(
                 table,
                 fd::Fd(0),
                 fd::Description::new(backing, access, flags),
@@ -1398,7 +1522,7 @@ impl HostIpc {
         let index = IpcLockIndex::object(object.index() as usize).ok_or(IpcError::Corrupt)?;
         let identity = self.region().operation_slot_generation();
         let result = if let Some(zone) = crate::el1_zone::zone() {
-            zone.bind_ipc_lock_release(index, identity, &HostLockWait, &|owned| {
+            zone.bind_ipc_lock_release(index, identity, &self.wait(), &|owned| {
                 crate::el1_zone::complete_object_wake(zone, owned);
             })
         } else if let Some(carrier) = self.carrier_zone.get() {
@@ -1456,7 +1580,7 @@ impl HostIpc {
         serve: impl FnOnce(fd::OfdKey, fd::Description) -> R,
     ) -> Result<R, PinnedHostResourceError> {
         let region = self.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(self.wait());
         let (pin, description) = authority.pin(table, number).map_err(|error| match error {
             fd::Error::BadFd => PinnedHostResourceError::BadFd,
             _ => PinnedHostResourceError::Unavailable,
@@ -1506,7 +1630,7 @@ impl HostIpc {
     ) -> Result<(), PinnedHostResourceError> {
         self.with_host_resource_pin(table, number, |_, pin, _| {
             self.region()
-                .fd(HostLockWait)
+                .fd(self.wait())
                 .set_pinned_nonblock(pin, enable)
                 .map_err(|error| match error {
                     fd::Error::BadFd => PinnedHostResourceError::BadFd,
@@ -1526,7 +1650,7 @@ impl HostIpc {
         ) -> Result<R, PinnedHostResourceError>,
     ) -> Result<R, PinnedHostResourceError> {
         let region = self.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(self.wait());
         let (pin, description) = authority.pin(table, number).map_err(|error| match error {
             fd::Error::BadFd => PinnedHostResourceError::BadFd,
             _ => PinnedHostResourceError::Unavailable,
@@ -1642,10 +1766,10 @@ impl HostIpc {
         {
             epolls.forget_epoll(object);
         }
-        let released = self.region().release_backing(backing, &HostLockWait)?;
+        let released = self.region().release_backing(backing, &self.wait())?;
         if let IpcReleased::Object { wake, freed: false } = released {
             let region = self.region();
-            if let Ok(guard) = region.lock(wake.object, &HostLockWait) {
+            if let Ok(guard) = region.lock(wake.object, &self.wait()) {
                 let mut delivery = self.object_wake_delivery();
                 delivery.collect(wake);
                 drop(guard);
@@ -1682,10 +1806,10 @@ impl HostIpc {
     /// object: their calls rerun and probe once (#231).
     fn reap_file_locks(&self) -> Result<(), IpcError> {
         let region = self.region();
-        let Some(mut locks) = region.existing_file_locks(&HostLockWait)? else {
+        let Some(mut locks) = region.existing_file_locks(&self.wait())? else {
             return Ok(());
         };
-        if !locks.table().reap(&region.fd(HostLockWait)) {
+        if !locks.table().reap(&region.fd(self.wait())) {
             return Ok(());
         }
         let wake = locks.released();
@@ -1701,7 +1825,7 @@ impl HostIpc {
     /// (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
     pub fn drain_retired_ofds(&self) -> Result<usize, AdmissionError> {
         let region = self.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(self.wait());
         let mut count = 0;
         for _ in 0..region.ofd_count().max(1) {
             let Some(description) = authority.take_retired_ofd()? else {
@@ -1721,7 +1845,7 @@ impl HostIpc {
     pub fn drain_retired_tables(&self) -> Result<usize, AdmissionError> {
         self.drain_retired_ofds()?;
         let region = self.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(self.wait());
         let mut count = 0;
         for _ in 0..carrick_el1_abi::ipc::IPC_FD_TABLES {
             let Some(mut receipt) = authority.take_retired_table() else {
@@ -2053,7 +2177,7 @@ mod tests {
         let region = owner.region();
         let count = || {
             region
-                .lock(object, &HostLockWait)
+                .lock(object, &crate::el1_zone::TestRegionWait)
                 .unwrap()
                 .host_subscribers()
         };
@@ -2065,7 +2189,9 @@ mod tests {
         assert_eq!(count(), 1);
         drop(callback);
         assert_eq!(count(), 0);
-        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(!guard.publish(step.wake).host_owed);
         drop(guard);
@@ -2078,7 +2204,9 @@ mod tests {
     /// Publish one owed host wake on `object` (a host subscriber exists).
     fn publish_owed(owner: &HostIpc, object: IpcObjectHandle) {
         let region = owner.region();
-        let mut guard = region.lock(object, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(object, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
     }
@@ -2146,7 +2274,9 @@ mod tests {
                 .ensure_pipe_storage(object)
                 .expect("first write's ring");
             let region = owner.region();
-            let mut guard = region.lock(object, &HostLockWait).expect("object");
+            let mut guard = region
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .expect("object");
             assert_eq!(guard.pipe().unwrap().try_write(b"shared").result, Ok(6));
             drop(guard);
             let attached = unsafe {
@@ -2159,7 +2289,9 @@ mod tests {
             }
             .expect("second venue");
             let mut bytes = [0; 6];
-            let mut guard = attached.lock(object, &HostLockWait).unwrap();
+            let mut guard = attached
+                .lock(object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(guard.pipe().unwrap().try_read(&mut bytes).result, Ok(6));
             assert_eq!(&bytes, b"shared");
             drop(guard);
@@ -2169,7 +2301,7 @@ mod tests {
                     .unwrap();
             }
             assert!(matches!(
-                region.lock(object, &HostLockWait),
+                region.lock(object, &crate::el1_zone::TestRegionWait),
                 Err(IpcError::Stale)
             ));
         }
@@ -2184,7 +2316,7 @@ mod tests {
         let table = owner.create_table(4096, 4).unwrap();
         owner.ensure_capacity(table, 2048).unwrap();
         let region = owner.region();
-        let authority = region.fd(HostLockWait);
+        let authority = region.fd(crate::el1_zone::TestRegionWait);
         let object = owner.create_eventfd(7, pipe::EventMode::Counter).unwrap();
         let desc = fd::Description::new(
             IpcBacking::EventFd { object }.encode(),
@@ -2219,7 +2351,7 @@ mod tests {
         );
         assert!(owner.region().pipe_allocations() == 0);
         let region = owner.region();
-        let mut guard = region.lock(pipe, &HostLockWait).unwrap();
+        let mut guard = region.lock(pipe, &crate::el1_zone::TestRegionWait).unwrap();
         assert!(!guard.pipe().unwrap().is_backed());
         drop(guard);
         for end in [pipe::End::Reader, pipe::End::Writer] {
@@ -2258,7 +2390,9 @@ mod tests {
         owner.ensure_pipe_storage(second).unwrap();
         assert_eq!(allocated(), IPC_RING_STOCK + 2, "sized past a stock ring");
         let region = owner.region();
-        let mut guard = region.lock(second, &HostLockWait).unwrap();
+        let mut guard = region
+            .lock(second, &crate::el1_zone::TestRegionWait)
+            .unwrap();
         let mut ring = guard.pipe().unwrap();
         assert_eq!((ring.capacity(), ring.is_backed()), (1 << 20, true));
         assert_eq!(ring.try_write(&[7; 70_000]).result, Ok(70_000));
@@ -2285,7 +2419,9 @@ mod tests {
         let region = owner.region();
         for object in &pipes {
             // What EL1's first write does under the object lock.
-            let mut guard = region.lock(*object, &HostLockWait).unwrap();
+            let mut guard = region
+                .lock(*object, &crate::el1_zone::TestRegionWait)
+                .unwrap();
             assert_eq!(guard.provide_ring_from_stock(), Ok(true));
         }
         assert_eq!(owner.region().pipe_allocations(), 128, "one ring per pipe");

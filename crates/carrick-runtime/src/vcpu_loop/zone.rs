@@ -2473,7 +2473,11 @@ mod ipc_tests {
         let region = region();
         let zone = zone();
         let object = region
-            .create_eventfd(0, EventMode::Counter, &HostLockWait)
+            .create_eventfd(
+                0,
+                EventMode::Counter,
+                &carrick_kernel::el1_zone::TestRegionWait,
+            )
             .unwrap();
         let blocked = |token| host_ipc::IpcHostOutcome::Blocked {
             token,

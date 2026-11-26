@@ -5172,7 +5172,7 @@ fn native_child_close_replays_posix_lock_release_before_last_alias() {
     assert!(
         owner
             .region()
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .get(
                 fd::TableId::from_raw(map.lookup_owned(child_files.id().raw()).unwrap()),
                 fd::Fd(4),
@@ -5244,7 +5244,7 @@ fn watched_file_close_marks_ring_replay_and_emits_inotify_close() {
         .unwrap();
     assert_eq!(
         ipc.region()
-            .fd(crate::el1_zone::HostLockWait)
+            .fd(crate::el1_zone::TestRegionWait)
             .close_effects(table.id(), carrick_el1_abi::ipc::fd::Fd(file_fd as i32),)
             .unwrap(),
         carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE,

@@ -5332,12 +5332,11 @@ pub(crate) mod tests {
                 End, IpcBacking, IpcHandback, IpcMmKey, IpcOpKind, IpcOperation, IpcUserVa,
                 WriteProgress,
             };
-            use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
             let owner = root.kernel().ipc().unwrap();
             let object = owner.create_pipe(65536).unwrap();
             let region = owner.region();
             let pin = region
-                .fd(HostIpcWait)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .create_pinned(Description::new(
                     IpcBacking::Pipe {
                         object,
@@ -5350,11 +5349,13 @@ pub(crate) mod tests {
                 .unwrap();
             let table = owner.create_table(1024, 64).unwrap();
             region
-                .fd(HostIpcWait)
+                .fd(carrick_kernel::el1_zone::TestRegionWait)
                 .install_pin(table, Fd(3), &pin, false)
                 .unwrap();
             {
-                let mut guard = region.lock(object, &HostIpcWait).unwrap();
+                let mut guard = region
+                    .lock(object, &carrick_kernel::el1_zone::TestRegionWait)
+                    .unwrap();
                 guard.provide_ring_from_stock().unwrap();
                 assert_eq!(guard.pipe().unwrap().try_write(b"retain").result, Ok(6));
             }
@@ -5582,7 +5583,7 @@ pub(crate) mod tests {
                         assert_eq!(
                             owner
                                 .region()
-                                .lock(*object, &host_ipc::HostIpcWait)
+                                .lock(*object, &carrick_kernel::el1_zone::TestRegionWait)
                                 .unwrap()
                                 .pipe()
                                 .unwrap()
@@ -6375,25 +6376,30 @@ pub(crate) mod tests {
                         }
                     }
                     if let Some((owner, object, table, raw)) = &ipc {
-                        use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
                         let region = owner.region();
                         assert!(matches!(
                             region.operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(*raw)),
                             Err(carrick_el1_abi::ipc::IpcError::Stale)
                         ));
                         let (check_pin, _) = region
-                            .fd(HostIpcWait)
+                            .fd(carrick_kernel::el1_zone::TestRegionWait)
                             .pin(*table, carrick_el1_abi::ipc::fd::Fd(3))
                             .unwrap();
                         assert_eq!(
-                            region.fd(HostIpcWait).holds(&check_pin).unwrap(),
+                            region
+                                .fd(carrick_kernel::el1_zone::TestRegionWait)
+                                .holds(&check_pin)
+                                .unwrap(),
                             (1, 1),
                             "only the inspection pin remains"
                         );
-                        region.fd(HostIpcWait).unpin(check_pin).unwrap();
+                        region
+                            .fd(carrick_kernel::el1_zone::TestRegionWait)
+                            .unpin(check_pin)
+                            .unwrap();
                         assert_eq!(
                             region
-                                .lock(*object, &HostIpcWait)
+                                .lock(*object, &carrick_kernel::el1_zone::TestRegionWait)
                                 .unwrap()
                                 .pipe()
                                 .unwrap()
