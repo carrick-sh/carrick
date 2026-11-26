@@ -1342,7 +1342,25 @@ fn instrumented_sleep_witness(test: &str, flags: &[&str]) {
 /// completes rather than reporting EINTR.
 #[test]
 fn production_anonymous_caught_signal_returns_and_reexecutes() {
+    run_anonymous_caught_signal_probe(false);
+}
+
+/// #3043: the same caught signal, but its handler-frame copy finds the MM
+/// editor held again, as a sibling thread's edit holds it in Go. The
+/// interrupted munmap's operation is still on the record while the handler
+/// borrows execution. The deferred frame copy is "not now": it must park on
+/// the editor's release (the second counted park), then deliver the handler
+/// once, and munmap re-executes. Before the fix the park found the record's
+/// operation slot occupied, quarantined the service (`OwnerWaitParkRefused`)
+/// and the scheduler raised `fatal_boot` at its signal-return checkpoint.
+#[test]
+fn production_anonymous_caught_signal_frame_copy_parks_behind_retained_edit() {
+    run_anonymous_caught_signal_probe(true);
+}
+
+fn run_anonymous_caught_signal_probe(frame_held: bool) {
     const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
+    const INJECT_CAUGHT_SIGNAL_ON_PARK_FRAME_HELD: u64 = 0xffff_ffff_ffff_fe55;
     const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
     const IMAGE_BASE: u64 = 0x0040_00b0;
 
@@ -1425,7 +1443,12 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     failures.push(code.len());
     code.extend_from_slice(&0_i32.to_le_bytes());
 
-    append_mov(&mut code, &[0x48, 0xb8], INJECT_CAUGHT_SIGNAL_ON_PARK);
+    let inject = if frame_held {
+        INJECT_CAUGHT_SIGNAL_ON_PARK_FRAME_HELD
+    } else {
+        INJECT_CAUGHT_SIGNAL_ON_PARK
+    };
+    append_mov(&mut code, &[0x48, 0xb8], inject);
     code.extend_from_slice(&[0x0f, 0x05]);
     append_result_check(&mut code, &mut failures, 0);
     code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
@@ -1433,9 +1456,16 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     append_mov(&mut code, &[0x48, 0xb8], 11); // munmap
     code.extend_from_slice(&[0x0f, 0x05]);
     append_result_check(&mut code, &mut failures, 0);
+    // The handler ran exactly once (it counts in its own word).
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,handler count
+    let check_count_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8b, 0x00]); // mov rax,[rax]
+    append_result_check(&mut code, &mut failures, 1);
+    // The munmap's park, and with the frame held the frame copy's own park.
     append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
     code.extend_from_slice(&[0x0f, 0x05]);
-    append_result_check(&mut code, &mut failures, 1);
+    append_result_check(&mut code, &mut failures, if frame_held { 2 } else { 1 });
     append_mov(&mut code, &[0x48, 0xbf], 7);
     append_mov(&mut code, &[0x48, 0xb8], 231);
     code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
@@ -1449,12 +1479,22 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     }
 
     let handler = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,handler count
+    let handler_count_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xff, 0x00]); // inc qword ptr [rax]
     code.push(0xc3); // ret to the kernel-provided SA_RESTORER address
     let restorer = IMAGE_BASE + code.len() as u64;
     code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
     while code.len() % 8 != 0 {
         code.push(0x90);
     }
+    let handler_count = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code[check_count_pointer..check_count_pointer + 8]
+        .copy_from_slice(&handler_count.to_le_bytes());
+    code[handler_count_pointer..handler_count_pointer + 8]
+        .copy_from_slice(&handler_count.to_le_bytes());
     let action = IMAGE_BASE + code.len() as u64;
     code.extend_from_slice(&handler.to_le_bytes());
     code.extend_from_slice(&0x0c00_0000_u64.to_le_bytes()); // SA_RESTORER | SA_ONSTACK
@@ -1486,7 +1526,7 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     assert_eq!(
         outcome.run.exit_code,
         7,
-        "caught signal must replay munmap without EINTR: {}",
+        "frame_held={frame_held}: caught signal must deliver once and replay munmap without EINTR: {}",
         String::from_utf8_lossy(&outcome.run.stderr)
     );
     assert_eq!(outcome.run.terminating_signal, None);

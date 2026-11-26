@@ -44,6 +44,11 @@ mod test_support {
     pub const INJECT_WAIT_HANDBACK_CENSUS: u64 = 0xffff_ffff_ffff_fe15;
     pub const INJECT_METADATA_ON_REPROBE_ONCE: u64 = 0xffff_ffff_ffff_fe16;
     pub const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
+    /// As `INJECT_CAUGHT_SIGNAL_ON_PARK`, and the editor is held again once
+    /// the parked edit's holder releases: the caught signal's handler-frame
+    /// copy finds the editor held while the interrupted edit's operation is
+    /// still on the record, as a sibling thread's edit holds it (#3043).
+    pub const INJECT_CAUGHT_SIGNAL_ON_PARK_FRAME_HELD: u64 = 0xffff_ffff_ffff_fe55;
     /// The second native signal-clock read from now reports tick 0: a sleep
     /// woken at its deadline first sees the clock before it, and every later
     /// read is real again.
@@ -790,6 +795,8 @@ mod test_support {
         core::sync::atomic::AtomicBool::new(false);
     static CAUGHT_SIGNAL_ON_PARK: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    static FRAME_EDITOR_REHOLD: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     static SIGNAL_CLOCK_LAG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static OWNED_COPY_BUSY: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
@@ -901,6 +908,11 @@ mod test_support {
 
     pub fn take_caught_signal_on_park() -> bool {
         CAUGHT_SIGNAL_ON_PARK.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether the caught signal's frame copy must find the editor held again.
+    pub fn take_frame_editor_rehold() -> bool {
+        FRAME_EDITOR_REHOLD.swap(false, Ordering::AcqRel)
     }
 
     pub fn record_anonymous_wait_handback() {
@@ -1287,6 +1299,16 @@ mod test_support {
             ),
             INJECT_CAUGHT_SIGNAL_ON_PARK => {
                 if !CAUGHT_SIGNAL_ON_PARK.swap(true, Ordering::AcqRel)
+                    && carrick_sched_core::spaces::inject_editor_busy_once()
+                {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+            INJECT_CAUGHT_SIGNAL_ON_PARK_FRAME_HELD => {
+                if !CAUGHT_SIGNAL_ON_PARK.swap(true, Ordering::AcqRel)
+                    && !FRAME_EDITOR_REHOLD.swap(true, Ordering::AcqRel)
                     && carrick_sched_core::spaces::inject_editor_busy_once()
                 {
                     Some(0)
