@@ -6006,9 +6006,9 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// Per CPU: the owner-selected window this CPU's member is serving. The
     /// ring settles or withdraws it before the member can park.
     anonymous_pending: [Option<anonymous_owner::PendingPrepare>; 2],
-    /// Carrier-wide, owned by each grant's MM: the copy-on-write replacement
-    /// grants supplied to the pool and not yet settled (#2749).
-    cow_supplied: anonymous_owner::SuppliedCowGrants,
+    /// The carrier's memory-ownership core (#3061): its MMs, their editor
+    /// record, and the copy-on-write grants each MM owns (#2749).
+    mm_core: anonymous_owner::X86MmCore,
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     /// Refused or withdrawn backings settled while their MM's exclusion was
@@ -6046,6 +6046,18 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
 impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
     fn drop(&mut self) {
         self.birth_live.retire();
+        // The carrier's MMs end with it: their unsettled copy-on-write grants
+        // come back here (each was exposed to the guest, so its inventory
+        // keeps the extent through teardown). A host edit still open is a
+        // broken invariant.
+        match self.mm_core.retire_all_mms() {
+            Ok(grants) => drop(grants),
+            Err(_) => carrick_el1_linux::dispatch::invalid_completion(
+                carrick_el1_linux::dispatch::NativeInvariant::PhysicalCustody(
+                    carrick_el1_linux::dispatch::PhysicalCustodyInvariant::CoreDroppedHolding,
+                ),
+            ),
+        }
         // Unwind the inventory first. Its destructor only records a refused
         // retirement; this carrier observer chooses the existing fail-stop.
         drop(self.initial_inventory.take());
@@ -7482,7 +7494,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             exec_predecessors: exec_service::ExecPredecessorCustody::default(),
             root_exec_load: None,
             anonymous_pending: [None, None],
-            cow_supplied: Default::default(),
+            mm_core: anonymous_owner::new_mm_core(),
             native_backing_pending: std::collections::BTreeMap::new(),
             cancelled_backing_pending: Vec::new(),
             window_slots: std::collections::BTreeMap::new(),

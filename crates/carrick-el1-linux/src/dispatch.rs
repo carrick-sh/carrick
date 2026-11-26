@@ -3264,6 +3264,9 @@ pub enum PhysicalCustodyInvariant {
     ForkCustodyRefused,
     AffinityTopologyMissing,
     InventoryRollbackFailed,
+    /// The memory-ownership core was dropped holding a grant or an open
+    /// host edit (#3061, V6).
+    CoreDroppedHolding,
     NativeRunFailure(carrick_core_abi::NativeRunFailureReason),
 }
 
@@ -3277,6 +3280,7 @@ impl PhysicalCustodyInvariant {
                 "affinity carrier topology missing after venue admission"
             }
             Self::InventoryRollbackFailed => "unexposed physical inventory rollback failed",
+            Self::CoreDroppedHolding => "memory-ownership core dropped holding custody",
             Self::NativeRunFailure(reason) => reason.as_str(),
         }
     }
@@ -3334,6 +3338,7 @@ impl NativeInvariant {
                 PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
                 PhysicalCustodyInvariant::AffinityTopologyMissing => Fatal::AffinityTopologyMissing,
                 PhysicalCustodyInvariant::InventoryRollbackFailed
+                | PhysicalCustodyInvariant::CoreDroppedHolding
                 | PhysicalCustodyInvariant::NativeRunFailure(_) => Fatal::PhysicalCustody,
             },
             NativeInvariant::MissingNativeFrame => Fatal::MissingNativeFrame,
