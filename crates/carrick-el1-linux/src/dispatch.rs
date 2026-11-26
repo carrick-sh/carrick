@@ -134,15 +134,14 @@ pub trait GuestDispatchFrame: SyscallFrame {
         rewind_live_frame(frame);
     }
     /// The PC of this call's syscall instruction, where a parked operation
-    /// re-executes it: the saved return PC rewound by the same ISA length
-    /// [`Self::restart_syscall`] uses.
+    /// re-executes it: from the frame's own position, as
+    /// [`Self::restart_syscall`] rewinds it (#2900). `None` is a corrupt
+    /// position or an underflowing PC.
     fn operation_resume_pc(
         &self,
     ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
         carrick_el1::substrate::sched::object_wait::OperationResumePc::new(
-            self.arm_frame_ref()?
-                .elr
-                .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN),
+            carrick_guest_arch::SyscallReturnFrame::syscall_pc(self.arm_frame_ref()?)?,
         )
     }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
@@ -179,6 +178,36 @@ pub trait GuestDispatchFrame: SyscallFrame {
         _sig_mask: PollSignalMask,
     ) -> Option<i64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod operation_resume_pc_tests {
+    use super::GuestDispatchFrame;
+    use carrick_guest_arch::{SavedSyscallPc, SavedSyscallPcWord};
+
+    /// A parked operation re-executes its call's `SVC`, found from the
+    /// frame's own position as x86's is (#2900): a frame already on its
+    /// `SVC` is not moved back again, and a PC with no instruction before
+    /// it names none.
+    #[test]
+    fn arm_operation_resume_pc_reads_the_frame_position() {
+        let frame = |elr, position| carrick_el1_abi::TrapFrame {
+            elr,
+            syscall_position: SavedSyscallPcWord::new(position),
+            ..Default::default()
+        };
+        let pc =
+            |frame: &carrick_el1_abi::TrapFrame| frame.operation_resume_pc().map(|pc| pc.raw());
+        assert_eq!(
+            pc(&frame(0x4004, SavedSyscallPc::AfterSyscall)),
+            Some(0x4000)
+        );
+        assert_eq!(pc(&frame(0x4000, SavedSyscallPc::AtSyscall)), Some(0x4000));
+        assert_eq!(pc(&frame(0, SavedSyscallPc::AfterSyscall)), None);
+        let mut corrupt = frame(0x4004, SavedSyscallPc::AfterSyscall);
+        corrupt.syscall_position = SavedSyscallPcWord::from_stored(7);
+        assert_eq!(pc(&corrupt), None);
     }
 }
 
