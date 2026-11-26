@@ -10,7 +10,7 @@
 //! failure, so a hang arrives with its real values.
 
 use std::io::Read;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -102,6 +102,10 @@ pub fn run_bounded_child(test: &str, bound: Duration) -> BoundedChild {
         ])
         .env(CHILD, test)
         .env("CARRICK_RUN_ID", &run_id)
+        // Its own process group: a process the witness starts (a native
+        // oracle) inherits the output pipes, and the group kill below ends
+        // it with the child, so the readers always reach EOF.
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -112,11 +116,14 @@ pub fn run_bounded_child(test: &str, bound: Duration) -> BoundedChild {
 
     let mut capture = None;
     let mut post_mortem = None;
-    let status = match exited.recv_timeout(bound) {
-        Ok(()) => Some(child.wait().expect("reap bounded child")),
+    let reached_bound = match exited.recv_timeout(bound) {
+        Ok(observed) => {
+            observed.expect("observe the bounded child's exit");
+            false
+        }
         Err(_) => {
             // The child is unreaped (the notice never reaps), so its pid
-            // still names it: capture, then kill and reap it.
+            // still names it: capture it before the kill below.
             capture = Some(
                 carrick_kernel::kernel::debug::capture(&run_id)
                     .map_err(|error| error.to_string())
@@ -127,12 +134,17 @@ pub fn run_bounded_child(test: &str, bound: Duration) -> BoundedChild {
                             .ok_or_else(|| "the capture carries no zone state".to_owned())
                     }),
             );
-            child.kill().expect("kill bounded child");
-            let status = child.wait().expect("reap bounded child");
-            assert_eq!(status.signal(), Some(libc::SIGKILL));
-            None
+            true
         }
     };
+    // End the child's whole group, whether the child exited or reached its
+    // bound. The leader is still unreaped, so its pid, the group's id,
+    // cannot have been recycled.
+    // SAFETY: kill(2) on the group this function created.
+    let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    let status = child.wait().expect("reap bounded child");
+    // A child still running at its bound failed, however it ended after.
+    let status = (!reached_bound).then_some(status);
     BoundedChild {
         test: test.to_owned(),
         run_id,
@@ -155,10 +167,10 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String
 /// One message when `pid` exits, without reaping it (`WNOWAIT`), so the
 /// owner's `Child` stays the only reaper and its pid is never recycled under
 /// a later kill.
-fn exit_notice(pid: u32) -> mpsc::Receiver<()> {
+fn exit_notice(pid: u32) -> mpsc::Receiver<std::io::Result<()>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        loop {
+        let observed = loop {
             // SAFETY: waitid writes only the zeroed siginfo it is given.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let rc = unsafe {
@@ -169,12 +181,15 @@ fn exit_notice(pid: u32) -> mpsc::Receiver<()> {
                     libc::WEXITED | libc::WNOWAIT,
                 )
             };
-            if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                break;
+            if rc == 0 {
+                break Ok(());
             }
-        }
-        let _ = tx.send(());
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                break Err(error);
+            }
+        };
+        let _ = tx.send(observed);
     });
     rx
 }
