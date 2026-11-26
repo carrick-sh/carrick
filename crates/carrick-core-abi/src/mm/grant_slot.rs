@@ -10,6 +10,108 @@ use carrick_mmu_core::live_descriptor_words::GrantRefusalTrace;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PortalGrantWindow;
+
+/// Why [`PortalGrantSlot::supply_cow_selection`] supplied nothing. The slot
+/// holds no selection of the lane's after any of these.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum CowSupplyRefusal<E> {
+    /// Another selection occupies the lane's slot; nothing was published.
+    SlotOccupied,
+    /// The window is not a single-page replacement demand; nothing was
+    /// published. A caller bug, never contention.
+    Invalid,
+    /// The carrier supplied nothing and the lane withdrew its selection,
+    /// with the crossing's own refusal when it reported one. A crossing that
+    /// reports none met contention (the MM's editor held elsewhere).
+    Unserved(Option<E>),
+    /// The selection was neither supplied nor withdrawable by the lane.
+    Lost,
+}
+
+/// Why [`PortalGrantSlot::lease_cow_selection`] published nothing.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum CowLeaseRefusal {
+    /// Another selection occupies the lane's slot.
+    SlotOccupied,
+    /// The window is not a single-page replacement demand: a caller bug.
+    Invalid,
+}
+
+/// A lane's published copy-on-write selection, held across the carrier's
+/// crossing. [`Self::settle`] ends it exactly once, reporting whether the
+/// carrier took it or the lane withdrew it. Dropping it unsettled (an early
+/// return or an unwind) withdraws exactly this selection (reserved, so a
+/// successor is never consumed in its place).
+#[must_use = "dropping a COW selection lease withdraws the selection"]
+pub struct CowSelectionLease<'a> {
+    slot: &'a PortalGrantSlot,
+    window: PortalGrantWindow,
+}
+
+/// What became of a leased selection after the carrier's crossing. Every
+/// outcome consumes the lease, so the lane's slot is settled exactly once.
+#[must_use]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum CowSettlement {
+    /// The carrier took the exact selection.
+    Taken,
+    /// The carrier supplied nothing; the lane withdrew its exact selection.
+    Withdrawn,
+    /// The slot neither held this selection nor was empty: a broken
+    /// invariant, since the leasing lane exclusively owns its slot while it
+    /// holds the lease (another selection, or a reservation in progress).
+    /// Nothing is withdrawn.
+    Lost,
+}
+
+impl CowSelectionLease<'_> {
+    pub fn window(&self) -> PortalGrantWindow {
+        self.window
+    }
+    /// End the lease after the carrier's crossing returned. The withdrawal
+    /// itself is the test: an exact reserved take of this selection means the
+    /// carrier left it (`Withdrawn`); otherwise an empty slot means the
+    /// carrier took it (`Taken`), and anything else is `Lost`.
+    pub fn settle(self) -> CowSettlement {
+        let (slot, window) = (self.slot, self.window);
+        // The settlement below is the lease's one end; Drop must not run.
+        core::mem::forget(self);
+        if slot.take_cow_fault_selection(window) {
+            CowSettlement::Withdrawn
+        } else if slot.state.load(Ordering::Acquire) == 0 {
+            CowSettlement::Taken
+        } else {
+            CowSettlement::Lost
+        }
+    }
+}
+
+impl Drop for CowSelectionLease<'_> {
+    fn drop(&mut self) {
+        // Exact and reserved: a slot that no longer holds this selection is
+        // left as it is.
+        let _ = self.slot.take_cow_fault_selection(self.window);
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(zerocopy::FromZeros)]
 pub struct PortalGrantSlot {
@@ -103,10 +205,7 @@ impl PortalGrantSlot {
         window: PortalGrantWindow,
     ) -> bool {
         if request_generation == 0
-            || !window.valid()
-            || window.host_backing.is_some()
-            || window.range.len() != 4096
-            || window.range.start() != window.fault_page
+            || !Self::is_cow_demand(window)
             || self
                 .state
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -144,6 +243,17 @@ impl PortalGrantSlot {
             .or_else(|| self.pending_prepared_fault_selection(mm, address))
             .or_else(|| self.pending_fault_selection(mm, address))?;
         (generation == window.operation.sequence.get()).then_some(window.operation.sequence)
+    }
+    /// Read-only diagnostic view of this lane slot: its protocol state, the
+    /// stamped request generation and, when it decodes, the stamped window.
+    /// Grants no authority; a refused intake reports it with real values.
+    pub fn selection_snapshot(&self) -> (u64, u64, Option<PortalGrantWindow>) {
+        let state = self.state.load(Ordering::Acquire);
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let window = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }));
+        (state, generation, window)
     }
     /// Transfer only the selection stamped into the retained native request.
     pub(crate) fn take_native_fault_selection<
@@ -198,18 +308,91 @@ impl PortalGrantSlot {
         }))
     }
     /// Consume the exact demand only after its replacement loan is published.
-    /// The caller retains exact-MM exclusion across inspection and consumption.
+    /// Reservation (state 1) excludes publication and every other take while
+    /// the stamped generation and window are compared, so a same-MM/page
+    /// successor can never be consumed in this one's place.
     pub fn take_cow_fault_selection(&self, window: PortalGrantWindow) -> bool {
         if self
-            .pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
-            .map(|(_, selected)| selected)
-            != Some(window)
+            .state
+            .compare_exchange(4, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return false;
         }
+        let exact = self.fault_generation.load(Ordering::Relaxed)
+            == window.operation.sequence.get()
+            && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                self.window[i].load(Ordering::Relaxed)
+            })) == Some(window);
         self.state
-            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .store(if exact { 0 } else { 4 }, Ordering::Release);
+        exact
+    }
+    /// Publish `window` as this lane's copy-on-write demand and lease it to
+    /// the lane across the carrier's crossing. The lease is linear:
+    /// [`CowSelectionLease::settle`] ends it as taken or withdrawn, and
+    /// dropping it on any other path, an unwind included, withdraws exactly
+    /// this selection, so a selection the carrier did not serve is never left
+    /// for a later request on this CPU (#3040). The caller is the publishing
+    /// lane, which exclusively owns this slot while it holds the lease. A
+    /// valid demand that meets an occupied slot is `SlotOccupied`
+    /// (contention); only a window that is no single-page demand is
+    /// `Invalid`.
+    pub fn lease_cow_selection(
+        &self,
+        window: PortalGrantWindow,
+    ) -> Result<CowSelectionLease<'_>, CowLeaseRefusal> {
+        // Decided from the window alone, before the slot is touched: a valid
+        // demand that does not publish met an occupied slot, which is
+        // contention, never a caller bug.
+        if !Self::is_cow_demand(window) {
+            return Err(CowLeaseRefusal::Invalid);
+        }
+        if self.publish_cow_fault_selection(window.operation.sequence.get(), window) {
+            Ok(CowSelectionLease { slot: self, window })
+        } else {
+            Err(CowLeaseRefusal::SlotOccupied)
+        }
+    }
+    /// A single-page physical replacement demand: the only window a COW
+    /// selection may carry.
+    fn is_cow_demand(window: PortalGrantWindow) -> bool {
+        window.valid()
+            && window.host_backing.is_none()
+            && window.range.len() == 4096
+            && window.range.start() == window.fault_page
+    }
+    /// Lease the copy-on-write selection this lane already published for
+    /// `mm`'s page at `address` (an EL0 fault's selection), on the same
+    /// terms as [`Self::lease_cow_selection`].
+    pub fn adopt_cow_selection(&self, mm: u64, address: u64) -> Option<CowSelectionLease<'_>> {
+        let (generation, window) = self.pending_cow_fault_selection(mm, address)?;
+        (generation == window.operation.sequence.get())
+            .then_some(CowSelectionLease { slot: self, window })
+    }
+    /// Ask the carrier for `window`'s copy-on-write replacement through the
+    /// lane's synchronous supply crossing, leaving this slot empty on every
+    /// outcome (#3040): the lane leases its selection, crosses, and settles
+    /// the lease, which withdraws a supply the carrier did not take.
+    pub fn supply_cow_selection<E>(
+        &self,
+        window: PortalGrantWindow,
+        cross: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), CowSupplyRefusal<E>> {
+        let lease = self
+            .lease_cow_selection(window)
+            .map_err(|refusal| match refusal {
+                CowLeaseRefusal::SlotOccupied => CowSupplyRefusal::SlotOccupied,
+                CowLeaseRefusal::Invalid => CowSupplyRefusal::Invalid,
+            })?;
+        let crossed = cross();
+        match (lease.settle(), crossed) {
+            (CowSettlement::Taken, Ok(())) => Ok(()),
+            (CowSettlement::Withdrawn, crossed) => Err(CowSupplyRefusal::Unserved(crossed.err())),
+            // Taken while the crossing refused, or replaced under the lane:
+            // the slot no longer names this lane's request.
+            (CowSettlement::Taken | CowSettlement::Lost, _) => Err(CowSupplyRefusal::Lost),
+        }
     }
     pub fn fault_selection(
         &self,
@@ -511,6 +694,8 @@ pub trait GrantSlotVenue {
 // Keep these values fixed when moving the shared kernel implementation.
 #[cfg(test)]
 mod layout_manifest {
+    extern crate std;
+
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
 
@@ -554,6 +739,144 @@ mod layout_manifest {
         assert!(slot.publish_fault_selection(4, window));
         assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
         assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
+    }
+
+    /// #3040: a lane withdraws only the selection stamped for its own
+    /// request. A same-window selection stamped with another request
+    /// generation belongs to someone else and must stay published.
+    #[test]
+    fn cow_take_leaves_a_selection_stamped_for_another_request() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let slot = PortalGrantSlot::new();
+        let other = window.operation.sequence.get() + 1;
+        assert!(slot.publish_cow_fault_selection(other, window));
+        assert!(
+            !slot.take_cow_fault_selection(window),
+            "a take by window alone consumed another request's selection"
+        );
+        assert_eq!(
+            slot.pending_cow_fault_selection(77, 0x4000),
+            Some((other, window))
+        );
+    }
+
+    /// #3040: a leased COW selection ends only by the carrier's
+    /// exact take; every other end of the lease, an unwind included,
+    /// withdraws exactly that selection and leaves a successor alone.
+    #[test]
+    fn cow_selection_lease_is_withdrawn_unless_the_carrier_takes_it() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let (mm, page) = (window.operation.mm.raw(), window.fault_page);
+        let slot = PortalGrantSlot::new();
+        let idle = |slot: &PortalGrantSlot| slot.selection_snapshot().0 == 0;
+
+        // Dropped: withdrawn.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        assert_eq!(lease.window(), window);
+        assert_eq!(
+            slot.pending_cow_fault_selection(mm, page),
+            Some((window.operation.sequence.get(), window))
+        );
+        // The lane's slot holds one selection at a time.
+        assert!(matches!(
+            slot.lease_cow_selection(window),
+            Err(CowLeaseRefusal::SlotOccupied)
+        ));
+        drop(lease);
+        assert!(idle(&slot));
+
+        // Unwound through the crossing: withdrawn.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = slot.lease_cow_selection(window).unwrap();
+            panic!("crossing unwound");
+        }));
+        assert!(unwound.is_err());
+        assert!(idle(&slot));
+
+        // Unserved after the crossing: settling withdraws it.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        assert!(!idle(&slot));
+        assert_eq!(lease.settle(), CowSettlement::Withdrawn);
+        assert!(idle(&slot));
+
+        // A reservation in progress on the lane's slot when it settles is a
+        // broken invariant (the lane owns its slot while leased): Lost, and
+        // the settlement touches nothing, so the reserver's own outcome
+        // stands.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        slot.state.store(1, Ordering::Release);
+        assert_eq!(lease.settle(), CowSettlement::Lost);
+        assert_eq!(slot.selection_snapshot().0, 1);
+        slot.state.store(4, Ordering::Release);
+        assert!(slot.take_cow_fault_selection(window));
+        assert!(idle(&slot));
+
+        // Taken by the carrier: consumed, nothing to withdraw.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        assert!(slot.take_cow_fault_selection(window));
+        assert!(matches!(lease.settle(), CowSettlement::Taken));
+        assert!(idle(&slot));
+
+        // Replaced under the lane: lost, and the successor stays.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        assert!(slot.take_cow_fault_selection(window));
+        assert!(slot.publish_fault_selection(9, window));
+        assert!(matches!(lease.settle(), CowSettlement::Lost));
+        assert_eq!(slot.pending_fault_selection(mm, page), Some((9, window)));
+        assert!(slot.cancel_fault_selection(window, 9));
+
+        // A dropped lease never consumes a same-page successor of another
+        // generation.
+        let lease = slot.lease_cow_selection(window).unwrap();
+        assert!(slot.take_cow_fault_selection(window));
+        let mut successor = window;
+        successor.operation.sequence = core::num::NonZeroU64::new(5).unwrap();
+        assert!(slot.publish_cow_fault_selection(5, successor));
+        drop(lease);
+        assert_eq!(
+            slot.pending_cow_fault_selection(mm, page),
+            Some((5, successor))
+        );
+        assert!(slot.take_cow_fault_selection(successor));
+
+        // Adopting an EL0 fault's published selection: the same terms.
+        assert!(slot.publish_cow_fault_selection(window.operation.sequence.get(), window));
+        assert!(slot.adopt_cow_selection(mm + 1, page).is_none());
+        assert!(slot.adopt_cow_selection(mm, page + 4096).is_none());
+        drop(slot.adopt_cow_selection(mm, page + 3).unwrap());
+        assert!(idle(&slot));
+        // A selection stamped with another generation is not the lane's.
+        assert!(slot.publish_cow_fault_selection(window.operation.sequence.get() + 1, window));
+        assert!(slot.adopt_cow_selection(mm, page).is_none());
+        assert!(!slot.take_cow_fault_selection(window));
+        assert!(!idle(&slot));
+
+        // Not a single-page demand: nothing published.
+        let fresh = PortalGrantSlot::new();
+        let mut invalid = window;
+        invalid.fault_page += 4096;
+        assert!(matches!(
+            fresh.lease_cow_selection(invalid),
+            Err(CowLeaseRefusal::Invalid)
+        ));
+        assert!(idle(&fresh));
+        // The refusal is decided by the window, never by the slot's state:
+        // an invalid window against an occupied slot is still Invalid, and
+        // a valid one is contention.
+        assert!(fresh.publish_fault_selection(9, window));
+        assert!(matches!(
+            fresh.lease_cow_selection(invalid),
+            Err(CowLeaseRefusal::Invalid)
+        ));
+        assert!(matches!(
+            fresh.lease_cow_selection(window),
+            Err(CowLeaseRefusal::SlotOccupied)
+        ));
+        assert_eq!(fresh.pending_fault_selection(mm, page), Some((9, window)));
     }
 
     #[test]

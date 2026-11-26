@@ -1,0 +1,38 @@
+schema = "carrick.conformance-exemption.v1"
+base = "5ddf24076df514d5845570dfc4f007a14b05a4eb"
+head = "4468a134cd3b969d2f217fa0cde7ad5b270de237"
+contracts = [
+  "core.entry.completion",
+  "kernel.copyout.owner-refusal",
+  "kernel.el1.fault-entry",
+  "kernel.el1.ipc-two-process",
+  "kernel.el1.mm-exclusive-owner",
+  "kernel.el1.poll-select-owner",
+  "kernel.el1.signal-delivery-owner",
+  "kernel.el1.thread-lifecycle",
+  "kernel.futex.contention",
+  "kernel.memory.owner-wait",
+  "kernel.mm.private-file-fixed-replacement",
+  "kernel.native.entropy",
+  "kernel.native.host-file-venue",
+  "kernel.scheduler.runnable-progress",
+  "kernel.time.native-routing",
+  "kernel.vcpu.shutdown-entry",
+  "kernel.wait.child-rusage",
+  "kernel.wait.process-group",
+  "kernel.x86.file-region",
+  "process.exec.custody",
+  "process.exec.native-exe-link",
+  "process.native.arm-admission",
+  "process.native.short-lock",
+  "process.native.terminal-child",
+]
+paths = [
+  "crates/carrick-core-abi/src/mm/grant_slot.rs",
+  "crates/carrick-core-abi/src/service.rs",
+  "crates/carrick-el1-linux/src/aarch64_process.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime.rs",
+  "crates/carrick-x86-cpl0/src/linux_personality.rs",
+  "crates/carrick-x86-cpl0/src/native_process/user_copy.rs",
+]
+rationale = "#3040 changes one guest-visible mechanism, the copy-on-write supply of a kernel user copy and of x86's EL0 COW crossing, whose contract kernel.el1.fork-cow carries this PR's VM-free witnesses. The listed paths are bound to these other contracts only by file. The edits there are: (a) in core-abi, the neutral PortalGrantSlot lease (lease_cow_selection, adopt_cow_selection, supply_cow_selection, CowSelectionLease, CowSettlement, CowSupplyRefusal), a read-only selection_snapshot, and take_cow_fault_selection now comparing the stamped generation under reservation (every production publisher stamps generation equal to the window's sequence, so correct takes are unchanged); (b) the ARM and x86 supply_cow callers, x86 supply_user_fault's COW arm, and the shared NativeProcessError::from_cow_supply mapping; and (c) unit tests. No entry, completion, signal, wait, IPC, futex, entropy, host-file, file-region, exec, scheduler or admission path is touched, and no work unit changes: a supply still costs one crossing, and a refusal now withdraws one selection in place of leaving it published."

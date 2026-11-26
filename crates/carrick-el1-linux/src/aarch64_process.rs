@@ -69,6 +69,51 @@ fn native_user_write_preserves_nonfault_refusals() {
     }
 }
 
+/// #3040: both ISAs' `supply_cow` read a supply the same way, and the lane's
+/// slot is empty after each refusal, ready for the next lane's selection.
+/// Contention is "not now": Busy once, then the rerun is supplied.
+#[cfg(test)]
+#[test]
+fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
+    let window = carrick_core_abi::PortalGrantWindow::decode([
+        1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    let slot = carrick_el1_abi::PortalGrantSlot::new();
+    let supply = |cross: &dyn Fn() -> Result<(), NativeProcessError>| {
+        slot.supply_cow_selection(window, cross)
+            .map_err(NativeProcessError::from_cow_supply)
+    };
+    let carrier_takes = || {
+        assert!(slot.take_cow_fault_selection(window));
+        Ok(())
+    };
+    // ARM: HVF refused the crossing (no guest COW state). The refusal is
+    // kept, and the selection is withdrawn.
+    assert_eq!(
+        supply(&|| Err(NativeProcessError::Fault)),
+        Err(NativeProcessError::Fault)
+    );
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // x86: the carrier met the MM's editor held and supplied nothing.
+    assert_eq!(supply(&|| Ok(())), Err(NativeProcessError::Busy));
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // The carrier took it: supplied.
+    assert_eq!(supply(&carrier_takes), Ok(()));
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // Another lane's selection occupies the slot: Busy, nothing crossed, and
+    // the occupant is left alone. Once it is gone, the rerun is supplied.
+    assert!(slot.publish_fault_selection(9, window));
+    assert_eq!(
+        supply(&|| panic!("an occupied slot must not cross")),
+        Err(NativeProcessError::Busy)
+    );
+    assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((9, window)));
+    assert!(slot.cancel_fault_selection(window, 9));
+    assert_eq!(supply(&carrier_takes), Ok(()));
+    assert_eq!(slot.selection_snapshot().0, 0);
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct CurrentMmMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1495,15 +1540,18 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<(), Self::Error> {
-        let slot = self
-            .slots
+        let cpu = u64::from(self.slot.raw());
+        // A supply the carrier refused is withdrawn before this returns; a
+        // selection left published would be read by this CPU's next native
+        // service as its own (#3040).
+        self.slots
             .grant(usize::from(self.slot.raw()))
-            .ok_or(NativeProcessError::Stale)?;
-        if !slot.publish_cow_fault_selection(window.operation.sequence.get(), window) {
-            return Err(NativeProcessError::Busy);
-        }
-        self.crossing
-            .cross_cow_supply(UserVa::new(window.fault_page), u64::from(self.slot.raw()))
+            .ok_or(NativeProcessError::Stale)?
+            .supply_cow_selection(window, || {
+                self.crossing
+                    .cross_cow_supply(UserVa::new(window.fault_page), cpu)
+            })
+            .map_err(NativeProcessError::from_cow_supply)
     }
 
     fn supply_backing(
