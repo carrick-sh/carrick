@@ -455,8 +455,11 @@ mod tests {
                 assert!(cpu.syscall_continuation.is_none());
                 assert!(cpu.pending_resume_pc.is_none());
                 assert!(cpu.last_syscall_nr.is_none());
-                assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
-                assert_eq!(cpu.gprs, ctx.x);
+                assert_eq!(
+                    (cpu.trap_pc, cpu.trap_pstate),
+                    (ctx.native.pc, ctx.native.pstate)
+                );
+                assert_eq!(cpu.gprs, ctx.native.x);
                 assert_eq!(
                     (cpu.ttbr0, cpu.ttbr1),
                     ((1 << 48) | 0x10000, (1 << 48) | 0x10000),
@@ -568,8 +571,11 @@ mod tests {
             panic!("AArch64 fixture");
         };
         assert!(cpu.syscall_continuation.is_none());
-        assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
-        assert_eq!(cpu.gprs, ctx.x);
+        assert_eq!(
+            (cpu.trap_pc, cpu.trap_pstate),
+            (ctx.native.pc, ctx.native.pstate)
+        );
+        assert_eq!(cpu.gprs, ctx.native.x);
         assert_eq!(
             cpu.ttbr0, 0x4000,
             "resume the parked caller's published root"
