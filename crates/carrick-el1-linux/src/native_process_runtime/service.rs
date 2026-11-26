@@ -1246,30 +1246,48 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .is_none_or(|pending| pending.adapter)
     }
 
-    /// Only a retained IPC operation authorizes this refusal handback.
-    /// A native service token has its own pending row and is not an IPC pin.
-    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-    fn retains_ipc_operation(&self, exit: NativeServiceExit) -> bool {
-        matches!(exit, NativeServiceExit::CarrierWork)
-            && self.retains_adapter_under(&self.runtime.graph.lock())
+    /// Only a retained IPC operation authorizes this refusal handback. The
+    /// record, not the exit's shape, decides: whenever this record retains an
+    /// adapter operation (a ring call's carrier work, or a readiness set's
+    /// host record), the exit retains it with its IPC owner. A native service
+    /// token has its own pending row and is not an IPC pin.
+    fn retains_ipc_operation(&self) -> bool {
+        self.retains_adapter_under(&self.runtime.graph.lock())
     }
 
-    /// Fold the owned-IPC exit after preparation unwinds. Unadmitted bridges,
-    /// notably exec, retain their existing outcome until they own staged input.
-    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    /// Settle every native service exit, on every ISA, after preparation
+    /// unwinds. Contention is "not now" (#2306) by construction: the
+    /// result's error type, [`NativeFailure`], cannot carry it. A retained
+    /// IPC operation leaves with its owner through the service checkpoint,
+    /// which reselects its preparation; with nothing retained, the member
+    /// leaves through the owner checkpoint, whose next entry reruns the call
+    /// from its saved syscall.
     #[inline(never)]
     pub(crate) fn settle_service_exit(
         &mut self,
         result: Result<NativeResume, NativeProcessError>,
-        exit: NativeServiceExit,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
         // Preserve the owner of a refused operation. A later refusal while
         // folding a non-stale result belongs to settlement itself.
         if !matches!(&result, Err(NativeProcessError::Stale)) {
             self.service_phase = NativeServicePhase::Settlement;
         }
-        if !self.retains_ipc_operation(exit) {
-            return self.finish_service_handoff(result);
+        if !self.retains_ipc_operation() {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    return match error.failure() {
+                        Ok(failure) => Err(failure),
+                        Err(_) => self.yield_owner_checkpoint(OwnerEntry::Syscall),
+                    };
+                }
+            };
+            if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+                return Err(NativeFailure::ServiceQuarantined(
+                    NativeServiceQuarantine::HandoffAuthentication,
+                ));
+            }
+            return Ok(result);
         }
         let result = result.map_err(|error| match error {
             NativeProcessError::ForkRefused(refusal) => refusal.error(),
@@ -1279,13 +1297,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Ok(NativeResume::RetrySyscall) => self.yield_service_checkpoint()?,
             Ok(result) => result,
             Err(
-                NativeProcessError::Invalid
+                error @ (NativeProcessError::Invalid
                 | NativeProcessError::Stale
-                | NativeProcessError::Quarantined,
-            ) => return result,
-            Err(NativeProcessError::ServiceQuarantined(_)) => return result,
+                | NativeProcessError::Quarantined
+                | NativeProcessError::ServiceQuarantined(_)),
+            ) => {
+                return Err(error.failure().unwrap_or(NativeFailure::Invalid));
+            }
             // The wrapper was decoded above; another wrapper is a codec invariant.
-            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
+            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeFailure::Invalid),
             Err(
                 NativeProcessError::Busy
                 | NativeProcessError::Exhausted
@@ -1312,7 +1332,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // deferred preparation is not failed execution authentication.
             let result = self.yield_service_checkpoint()?;
             self.take_handoff_receipt()
-                .ok_or(NativeProcessError::ServiceQuarantined(
+                .ok_or(NativeFailure::ServiceQuarantined(
                     NativeServiceQuarantine::HandoffAuthentication,
                 ))?;
             return Ok(result);
@@ -1320,15 +1340,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(result)
     }
 
-    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    /// A retained operation's terminal failure answers its errno. Linux
+    /// restores a `pselect6`/`ppoll` temporary mask on every return but
+    /// EINTR, so a forwarded wait mask is disarmed with the answer.
     fn retire_adapter_failure(
         &mut self,
         failure: NativeFailure,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
         self.adapter_ready = None;
-        Ok(NativeResume::Returned(self.retire_adapter_result(
-            SyscallResult::new(failure.errno()),
-        )?))
+        let answer = self
+            .retire_adapter_result(SyscallResult::new(failure.errno()))
+            // Retirement refuses only with a broken invariant, never contention.
+            .map_err(|error| error.failure().unwrap_or(NativeFailure::Invalid))?;
+        if let Some(saved) = self.control.take_forwarded_wait_mask() {
+            self.control.init_blocked(saved);
+        }
+        Ok(NativeResume::Returned(answer))
     }
 
     /// Intake may capture backing, but never waits for another guest. The
@@ -1745,7 +1772,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         payload: Box<[u8]>,
         table: Option<[u64; 3]>,
         call: NativeServiceCall<'_>,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
         let result = if self.host_root_retains_filesystem() {
             match carrick_core_abi::service::ExecPayloadView::parse(&payload) {
                 Ok(view) if view.access().is_none() => self.publish_exec(payload, call),
@@ -1757,7 +1784,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.begin_exec_service(payload, table, call)
         };
         let result = self.drain_copyout(result);
-        self.finish_service_handoff(result)
+        self.settle_service_exit(result)
     }
     fn publish_exec(
         &mut self,
@@ -1947,14 +1974,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// host root retains its exact resource custody in the carrier.
     pub fn begin_host_file_call(
         &mut self,
-        mut record: Box<[u8]>,
+        record: Box<[u8]>,
         output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
         resolves_path: bool,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
         call: NativeServiceCall<'a>,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
         let result = if self.host_root_retains_filesystem() {
+            self.begin_root_host_file(record, output, map, chdir, call)
+        } else {
+            self.begin_host_file_service(record, output, resolves_path, map, chdir, call)
+        };
+        let result = self.drain_copyout(result);
+        self.settle_service_exit(result)
+    }
+
+    /// The initial host root's file call, under the resource custody the
+    /// carrier retains for it.
+    fn begin_root_host_file(
+        &mut self,
+        mut record: Box<[u8]>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        chdir: bool,
+        call: NativeServiceCall<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        {
             // The carrier retains the root's resource custody (#1714 option
             // A): it resolves paths with the root's filesystem authority and
             // stamps a write's `RLIMIT_FSIZE` from the root's own limits, so
@@ -1967,10 +2013,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // its host sockets or a socket call carries its call serial.
             let stamped = match self.stamp_net_caller(record) {
                 Ok(record) => record,
-                Err(resume) => {
-                    let result = self.drain_copyout(resume);
-                    return self.finish_service_handoff(result);
-                }
+                Err(resume) => return resume,
             };
             record = stamped;
             self.stamp_call_serial(&mut record)?;
@@ -1986,11 +2029,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             } else {
                 self.publish_host_file(record, output, map, chdir, call)
             }
-        } else {
-            self.begin_host_file_service(record, output, resolves_path, map, chdir, call)
-        };
-        let result = self.drain_copyout(result);
-        self.finish_service_handoff(result)
+        }
     }
 
     fn publish_host_file(
@@ -2208,11 +2247,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn begin_entropy_call(
         &mut self,
         args: NativeEntropyArgs,
-    ) -> Result<NativeResume, NativeProcessError> {
+    ) -> Result<NativeResume, NativeFailure> {
         let (address, capacity, flags, requested) = native_entropy_stage(args);
         let result = self.begin_entropy_service(address, capacity, flags, requested);
         let result = self.drain_copyout(result);
-        self.finish_service_handoff(result)
+        self.settle_service_exit(result)
     }
 
     /// Retain bounded entropy staging until this exact ticket settles. The

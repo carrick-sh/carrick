@@ -1829,14 +1829,6 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
         stage_prefix,
         service_wait,
     } = *begin;
-    let exit = if matches!(
-        operation,
-        Some(carrick_core_abi::service::ServiceOperation::CarrierWork { .. })
-    ) {
-        super::native_process_runtime::NativeServiceExit::CarrierWork
-    } else {
-        super::native_process_runtime::NativeServiceExit::Bridge
-    };
     let result =
         if let Some(payload) = exec_payload {
             if service_wait.is_some() {
@@ -1922,7 +1914,9 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                 ),
             )
         };
-    let result = process.settle_service_exit(result, exit);
+    let result = process
+        .settle_service_exit(result)
+        .map_err(super::native_process_runtime::NativeProcessError::from);
     (result, process.native_service_phase())
 }
 
@@ -3271,14 +3265,13 @@ fn native_service_invariant(
 /// The production service-exit failure boundary, also exercised by VM-free
 /// native-process witnesses without invoking the non-returning fatal transport.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(crate) fn native_service_completion(
-    result: Result<
-        super::native_process_runtime::NativeResume,
-        super::native_process_runtime::NativeProcessError,
-    >,
+pub(crate) fn native_service_completion<
+    E: Into<super::native_process_runtime::NativeProcessError>,
+>(
+    result: Result<super::native_process_runtime::NativeResume, E>,
     phase: super::native_process_runtime::NativeServicePhase,
 ) -> Result<super::native_process_runtime::NativeResume, NativeInvariant> {
-    result.map_err(|error| native_service_invariant_at(error, phase))
+    result.map_err(|error| native_service_invariant_at(error.into(), phase))
 }
 
 /// A stale dispatch identifies the last actual owner entered, rather than

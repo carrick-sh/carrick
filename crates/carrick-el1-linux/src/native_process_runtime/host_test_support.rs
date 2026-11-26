@@ -2648,8 +2648,8 @@ fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
         };
         assert!(
             matches!(
-                entry.settle_service_exit(result, NativeServiceExit::Bridge),
-                Err(NativeProcessError::ServiceQuarantined(reason)) if reason == expected
+                entry.settle_service_exit(result),
+                Err(NativeFailure::ServiceQuarantined(reason)) if reason == expected
             ),
             "duplicate custody must report its exact site (notice={occupied_notice})"
         );
@@ -2706,7 +2706,7 @@ fn native_service_suspended_member_cannot_admit_a_second_bridge() {
         },
         None,
     );
-    let settled = entry.settle_service_exit(result, NativeServiceExit::Bridge);
+    let settled = entry.settle_service_exit(result);
     let fatal = crate::dispatch::native_service_completion(settled, entry.native_service_phase())
         .err()
         .expect("a second bridge cannot own a suspended member");
@@ -2752,7 +2752,7 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
             None,
         );
         assert!(matches!(
-            entry.settle_service_exit(result, NativeServiceExit::CarrierWork),
+            entry.settle_service_exit(result),
             Ok(NativeResume::Left(None))
         ));
     }
@@ -9497,7 +9497,30 @@ enum AdapterRefusal {
     ExitDeferred,
     Transient(NativeProcessError),
     Invariant(NativeProcessError),
-    Bridge,
+    /// A readiness set's host record, staged while its set's operation is
+    /// retained, meets contention before publication (#1051).
+    HostFileBusy,
+}
+
+/// A `ReadinessSetCtl` record naming no members, as the ring stages one.
+#[cfg(test)]
+fn readiness_set_record() -> Box<[u8]> {
+    use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp};
+    let mut record = vec![0; host_file::record_len(0, 0).unwrap()].into_boxed_slice();
+    host_file::encode(
+        &mut record,
+        HostFileHeader {
+            op: HostFileOp::ReadinessSetCtl,
+            table: [0; 3],
+            fd: -1,
+            flags: 0,
+            args: [1, 0, 0, 0],
+        },
+        &[],
+        0,
+    )
+    .unwrap();
+    record
 }
 
 #[cfg(test)]
@@ -9615,27 +9638,19 @@ fn retained_ipc_supply_for<
             entry: OwnerEntry::Syscall,
             demand: carrick_core_abi::service::CarrierDemand::Work,
         };
-        if matches!(
-            refusal,
-            AdapterRefusal::Bridge | AdapterRefusal::Invariant(_)
-        ) {
-            let (error, operation) = match refusal {
-                AdapterRefusal::Bridge => (NativeProcessError::Busy, NativeServiceExit::Bridge),
-                AdapterRefusal::Invariant(error) => (error, NativeServiceExit::CarrierWork),
-                _ => unreachable!(),
-            };
-            assert!(
-                matches!(entry.settle_service_exit(Err(error), operation), Err(observed) if observed == error)
-            );
+        if let AdapterRefusal::Invariant(error) = refusal {
+            assert!(matches!(
+                entry.settle_service_exit(Err(error)),
+                Err(observed) if NativeProcessError::from(observed) == error
+            ));
             assert_eq!(entry.adapter_ready.as_ref().unwrap().identity, identity);
             assert!(entry.take_handoff_receipt().is_none());
         }
-        if !matches!(
-            refusal,
-            AdapterRefusal::None | AdapterRefusal::Bridge | AdapterRefusal::Invariant(_)
-        ) {
-            let admission_busy =
-                matches!(refusal, AdapterRefusal::Drain | AdapterRefusal::ExitBusy);
+        if !matches!(refusal, AdapterRefusal::None | AdapterRefusal::Invariant(_)) {
+            let admission_busy = matches!(
+                refusal,
+                AdapterRefusal::Drain | AdapterRefusal::ExitBusy | AdapterRefusal::HostFileBusy
+            );
             if admission_busy {
                 // The real member-wait check refuses admission once. The
                 // existing owner settles that wait before the next checkpoint.
@@ -9654,6 +9669,24 @@ fn retained_ipc_supply_for<
             if matches!(refusal, AdapterRefusal::Drain) {
                 entry.drain_owned_preparation();
                 assert!(entry.take_handoff_receipt().is_some());
+            } else if matches!(refusal, AdapterRefusal::HostFileBusy) {
+                // The production entry of a staged host record: contention
+                // before publication is "not now", and the set's retained
+                // operation leaves with its owner, never an errno or fatal.
+                let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+                let result = entry.begin_host_file_call(
+                    readiness_set_record(),
+                    None,
+                    false,
+                    None,
+                    false,
+                    NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(270), counters),
+                );
+                assert!(
+                    matches!(result, Ok(NativeResume::Left(None))),
+                    "pre-publication contention must leave through the owner checkpoint: {:?}",
+                    result.err()
+                );
             } else {
                 let result = match refusal {
                     AdapterRefusal::ExitBusy => entry.begin_service(work, None),
@@ -9665,9 +9698,7 @@ fn retained_ipc_supply_for<
                     assert!(matches!(result, Err(NativeProcessError::Busy)));
                 }
                 assert!(matches!(
-                    entry
-                        .settle_service_exit(result, NativeServiceExit::CarrierWork)
-                        .unwrap(),
+                    entry.settle_service_exit(result).unwrap(),
                     NativeResume::Left(None)
                 ));
             }
@@ -10106,9 +10137,7 @@ fn retained_ipc_terminal_close_for<
             },
             None,
         );
-        let settled = sibling_entry
-            .settle_service_exit(result, NativeServiceExit::CarrierWork)
-            .unwrap();
+        let settled = sibling_entry.settle_service_exit(result).unwrap();
         assert!(matches!(settled, NativeResume::Left(None)));
     }
     fixture.zone.release_space(sibling.slot);
@@ -10259,6 +10288,26 @@ fn native_service_exit_busy_retains_ipc_operation_and_pin() {
     );
 }
 
+/// #1051 (#3045 P0-5): Busy once, then success, for a readiness set's
+/// staged host record. The set's operation is retained when its record is
+/// staged, so admission contention before publication (a host holder's
+/// member wait) leaves through the owner checkpoint with that operation,
+/// and the rerun takes the same operation back.
+#[cfg(test)]
+#[test]
+fn native_service_exit_readiness_record_busy_retains_its_set_operation() {
+    retained_ipc_supply(true, false, true, AdapterRefusal::HostFileBusy);
+}
+
+#[cfg(test)]
+#[test]
+fn arm_native_service_exit_readiness_record_busy_retains_its_set_operation() {
+    retained_ipc_supply_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, true, false, true, AdapterRefusal::HostFileBusy);
+}
+
 #[cfg(test)]
 #[test]
 fn native_service_exit_deferred_preparation_is_not_quarantined() {
@@ -10290,14 +10339,6 @@ fn native_service_exit_refusal_policy_preserves_retry_and_authentication() {
 
 #[cfg(test)]
 #[test]
-fn native_service_exit_exec_bridge_keeps_its_existing_refusal() {
-    // Native exec's staged bridge has no CarrierWork operation. Even an IPC
-    // token cannot authorize retrying its already staged argv (follow-up #1116).
-    retained_ipc_supply(true, false, true, AdapterRefusal::Bridge);
-}
-
-#[cfg(test)]
-#[test]
 fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
     let fixture = native_exec_fixture();
     let mut service = fixture.service();
@@ -10316,14 +10357,10 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
         )
         .unwrap();
     assert!(matches!(
-        entry.settle_service_exit(Ok(NativeResume::Left(None)), NativeServiceExit::Bridge),
-        Err(NativeProcessError::ServiceQuarantined(
+        entry.settle_service_exit(Ok(NativeResume::Left(None))),
+        Err(NativeFailure::ServiceQuarantined(
             NativeServiceQuarantine::HandoffAuthentication
         ))
-    ));
-    assert!(matches!(
-        entry.settle_service_exit(Err(NativeProcessError::Busy), NativeServiceExit::Bridge),
-        Err(NativeProcessError::Busy)
     ));
 }
 

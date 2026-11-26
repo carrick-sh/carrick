@@ -6,7 +6,6 @@ fn terminal_close_with_retained_service_entry_for<
 >(
     make_words: fn(AddressContext<RootGpa>) -> C,
     operation: carrick_core_abi::service::ServiceOperation,
-    exit: NativeServiceExit,
 ) {
     use carrick_core_abi::service::ServiceOperation;
 
@@ -94,7 +93,7 @@ fn terminal_close_with_retained_service_entry_for<
         .unwrap();
     let result = member.begin_service(operation, None);
     let phase = member.native_service_phase();
-    let settled = member.settle_service_exit(result, exit);
+    let settled = member.settle_service_exit(result);
     let resumed = crate::dispatch::native_service_completion(settled, phase)
         .unwrap_or_else(|fatal| panic!("terminal service entry became {fatal:?}"));
     assert!(matches!(resumed, NativeResume::Left(None)));
@@ -196,7 +195,7 @@ fn terminal_close_with_signal_wait_irq_for<
         None,
     );
     let phase = member.native_service_phase();
-    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let settled = member.settle_service_exit(result);
     let resumed = crate::dispatch::native_service_completion(settled, phase)
         .unwrap_or_else(|fatal| panic!("terminal signal-wait IRQ entry became {fatal:?}"));
     assert!(matches!(resumed, NativeResume::Left(None)));
@@ -287,7 +286,7 @@ fn refused_carrier_work_resumes_for<
         None,
     );
     let phase = entry.native_service_phase();
-    let settled = entry.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let settled = entry.settle_service_exit(result);
     let resumed = crate::dispatch::native_service_completion(settled, phase)
         .unwrap_or_else(|fatal| panic!("refused completed CarrierWork became {fatal:?}"));
     on_service_doorbell(None);
@@ -311,7 +310,6 @@ fn arm_terminal_close_with_retained_service_accepts_mmap_entry() {
         carrick_core_abi::service::ServiceOperation::Crossing {
             ordinal: carrick_guest_arch::NativeOrdinal::new(222),
         },
-        NativeServiceExit::Bridge,
     );
 }
 
@@ -325,7 +323,6 @@ fn x86_terminal_close_with_retained_service_accepts_mmap_entry() {
         carrick_core_abi::service::ServiceOperation::Crossing {
             ordinal: carrick_guest_arch::NativeOrdinal::new(9),
         },
-        NativeServiceExit::Bridge,
     );
 }
 
@@ -343,7 +340,6 @@ fn arm_terminal_close_with_retained_service_accepts_irq_carrier_work() {
             entry: OwnerEntry::Exception,
             demand: carrick_core_abi::service::CarrierDemand::Work,
         },
-        NativeServiceExit::CarrierWork,
     );
 }
 
@@ -358,7 +354,6 @@ fn x86_terminal_close_with_retained_service_accepts_irq_carrier_work() {
             entry: OwnerEntry::Exception,
             demand: carrick_core_abi::service::CarrierDemand::Work,
         },
-        NativeServiceExit::CarrierWork,
     );
 }
 
@@ -431,7 +426,6 @@ fn busy_service_notice_parks_and_reruns_once_for<
 >(
     make_words: fn(AddressContext<RootGpa>) -> C,
     contender_operation: carrick_core_abi::service::ServiceOperation,
-    contender_exit: NativeServiceExit,
     expected_return: i64,
 ) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
@@ -471,7 +465,7 @@ fn busy_service_notice_parks_and_reruns_once_for<
             None,
         );
         let phase = holder.native_service_phase();
-        let settled = holder.settle_service_exit(result, NativeServiceExit::CarrierWork);
+        let settled = holder.settle_service_exit(result);
         let resumed = crate::dispatch::native_service_completion(settled, phase)
             .unwrap_or_else(|fatal| panic!("holder service entry became {fatal:?}"));
         assert!(matches!(resumed, NativeResume::Left(None)));
@@ -501,7 +495,7 @@ fn busy_service_notice_parks_and_reruns_once_for<
         ));
         let result = contender.begin_service(contender_operation, None);
         let phase = contender.native_service_phase();
-        let settled = contender.settle_service_exit(result, contender_exit);
+        let settled = contender.settle_service_exit(result);
         let resumed = crate::dispatch::native_service_completion(settled, phase)
             .unwrap_or_else(|fatal| panic!("contended service notice became {fatal:?}"));
         assert!(matches!(resumed, NativeResume::Left(None)));
@@ -707,7 +701,7 @@ fn busy_service_notice_releases_execution_capacity_for<
             None,
         );
         let phase = entry.native_service_phase();
-        let settled = entry.settle_service_exit(result, NativeServiceExit::CarrierWork);
+        let settled = entry.settle_service_exit(result);
         let resumed = crate::dispatch::native_service_completion(settled, phase)
             .unwrap_or_else(|fatal| panic!("process {index} contended notice became {fatal:?}"));
         assert!(matches!(resumed, NativeResume::Left(None)));
@@ -788,7 +782,6 @@ fn arm_busy_service_notice_parks_and_reruns_mmap_crossing_once() {
         carrick_core_abi::service::ServiceOperation::Crossing {
             ordinal: carrick_guest_arch::NativeOrdinal::new(222),
         },
-        NativeServiceExit::Bridge,
         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
     );
 }
@@ -803,7 +796,6 @@ fn x86_busy_service_notice_parks_and_reruns_mmap_crossing_once() {
         carrick_core_abi::service::ServiceOperation::Crossing {
             ordinal: carrick_guest_arch::NativeOrdinal::new(9),
         },
-        NativeServiceExit::Bridge,
         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
     );
 }
@@ -819,7 +811,6 @@ fn arm_busy_service_notice_parks_and_reruns_irq_carrier_work_once() {
             entry: OwnerEntry::Exception,
             demand: carrick_core_abi::service::CarrierDemand::Work,
         },
-        NativeServiceExit::CarrierWork,
         0,
     );
 }
@@ -835,7 +826,6 @@ fn x86_busy_service_notice_parks_and_reruns_irq_carrier_work_once() {
             entry: OwnerEntry::Exception,
             demand: carrick_core_abi::service::CarrierDemand::Work,
         },
-        NativeServiceExit::CarrierWork,
         0,
     );
 }
@@ -984,7 +974,7 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
             None,
         );
         let phase = child.native_service_phase();
-        let settled = child.settle_service_exit(result, NativeServiceExit::CarrierWork);
+        let settled = child.settle_service_exit(result);
         let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
         assert!(matches!(resumed, NativeResume::Left(None)));
     }
@@ -1136,7 +1126,7 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
                 None,
             );
             let phase = leader.native_service_phase();
-            let settled = leader.settle_service_exit(result, NativeServiceExit::Bridge);
+            let settled = leader.settle_service_exit(result);
             let resumed = crate::dispatch::native_service_completion(settled, phase).unwrap();
             assert!(matches!(resumed, NativeResume::Left(None)));
         }
@@ -1542,7 +1532,7 @@ fn terminal_close_with_retained_adapter_service_entry_for<
                 None,
             );
             let phase = member.native_service_phase();
-            let settled = member.settle_service_exit(result, NativeServiceExit::Bridge);
+            let settled = member.settle_service_exit(result);
             let resumed = crate::dispatch::native_service_completion(settled, phase)
                 .unwrap_or_else(|fatal| {
                     panic!("terminal retained-adapter mmap entry became {fatal:?}")
@@ -1559,7 +1549,7 @@ fn terminal_close_with_retained_adapter_service_entry_for<
                 None,
             );
             let phase = member.native_service_phase();
-            let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+            let settled = member.settle_service_exit(result);
             let resumed = crate::dispatch::native_service_completion(settled, phase)
                 .unwrap_or_else(|fatal| {
                     panic!("terminal retained-adapter IRQ entry became {fatal:?}")
@@ -1868,7 +1858,7 @@ fn terminal_close_with_retained_service_propagates_lifecycle_run_failure_for<
         None,
     );
     let phase = member.native_service_phase();
-    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let settled = member.settle_service_exit(result);
     let fatal = crate::dispatch::native_service_completion(settled, phase).err();
     let run_failure = member.take_run_failure();
     let receipt = member.take_handoff_receipt();
@@ -1999,7 +1989,7 @@ fn terminal_close_with_signal_wait_rejects_installed_adapter_operation_for<
         None,
     );
     let phase = member.native_service_phase();
-    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let settled = member.settle_service_exit(result);
     let fatal = crate::dispatch::native_service_completion(settled, phase).err();
     assert!(member.take_run_failure().is_none());
     assert!(member.take_handoff_receipt().is_none());
@@ -2132,7 +2122,7 @@ fn terminal_close_with_foreign_service_control_quarantines_at_member_guard_for<
         None,
     );
     let phase = member.native_service_phase();
-    let settled = member.settle_service_exit(result, NativeServiceExit::CarrierWork);
+    let settled = member.settle_service_exit(result);
     let fatal = crate::dispatch::native_service_completion(settled, phase).err();
     assert!(member.take_run_failure().is_none());
     assert!(member.take_handoff_receipt().is_none());

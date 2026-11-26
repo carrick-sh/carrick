@@ -441,3 +441,9 @@ test = "carrick_x86::cpl0_entry::tests::syscall_resume_pc_rewinds_rcx_by_the_sys
 reason = "#2900: NativeFrame now carries its syscall position, so the rewind test also asserts the label and that a second rewind keeps RCX on the SYSCALL; it was renamed for what it proves."
 replaced_by = "carrick_x86::cpl0_entry::tests::syscall_resume_pc_rewinds_rcx_by_the_syscall_length_once"
 pr = 2922
+
+[[retired]]
+test = "carrick_el1_linux::native_process_runtime::host_test_support::native_service_exit_exec_bridge_keeps_its_existing_refusal"
+reason = "#1051 (#3045 P0-5): a native service exit retains its IPC operation whenever its record retains an adapter operation, by construction from the record rather than the exit's shape, so the `NativeServiceExit::Bridge` classification and its 'a bridge keeps Busy' refusal row are gone; Busy with a retained operation yields through the service checkpoint (native_service_exit_busy_retains_ipc_operation_and_pin)."
+replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::native_service_exit_busy_retains_ipc_operation_and_pin"
+pr = 3045
