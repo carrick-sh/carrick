@@ -2365,6 +2365,15 @@ impl<'a> FsView<'a> {
 
         fn fallocate_syscall(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
             let request = Self::validate_fallocate(mode, offset, len)?;
+            if request.mode == FallocateMode::Unserved {
+                // A counted refusal: the compat report names the mode.
+                cx.reporter.record(crate::compat::CompatEvent::partial_syscall(
+                    47,
+                    "fallocate",
+                    cx.request.args,
+                    format!("fallocate mode {mode:#x} is not served (ENOSYS)"),
+                ));
+            }
             if is_stdio_fd(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
@@ -2536,6 +2545,27 @@ impl<'a> FsView<'a> {
                         if end <= start {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
+                        if let Some(backing) = contents.host_backed_fd() {
+                            // A host-backed copy (a memfd, an unlinked file
+                            // reopened by /proc/self/fd) is its own host
+                            // inode: punch it through the door on that
+                            // descriptor, never by rewriting a path (which
+                            // would recreate an unlinked name).
+                            // SAFETY: the description keeps `backing` open.
+                            let backing = unsafe { std::os::fd::BorrowedFd::borrow_raw(backing) };
+                            return Ok(
+                                match carrick_vfs::host_size::discard(backing, |fd| {
+                                    use std::os::fd::AsRawFd as _;
+                                    rw::zero_host_file_range(fd.as_raw_fd(), start, end - start)
+                                }) {
+                                    Ok(Ok(())) => DispatchOutcome::Returned { value: 0 },
+                                    Ok(Err(errno)) => DispatchOutcome::errno(errno),
+                                    Err(carrick_vfs::host_size::Fenced) => {
+                                        DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+                                    }
+                                },
+                            );
+                        }
                         if !is_anon_overlay_path(path) {
                             // A materialized copy of a host file: the host
                             // rewrite goes through the size door first, and only
@@ -2578,7 +2608,12 @@ impl<'a> FsView<'a> {
                     ServedFallocate::Preallocate => {}
                     ServedFallocate::Allocate => {
                         match carrick_vfs::host_size::extend_to(host_fd.as_fd(), new_size) {
-                            Ok(true) => this.invalidate_dentry_host_fd(host_fd.raw()),
+                            Ok(true) => {
+                                // The new tail is a hole until written.
+                                this.fs
+                                    .truncate_host_sparse_extents(host_fd.raw(), new_size);
+                                this.invalidate_dentry_host_fd(host_fd.raw());
+                            }
                             Ok(false) => {}
                             Err(errno) => {
                                 return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(

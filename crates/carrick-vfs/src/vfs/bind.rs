@@ -588,7 +588,12 @@ impl Vfs for BindVfs {
             }
         }
         if host.is_dir() {
-            if flags.trunc {
+            // `O_CREAT` names a file: an existing directory is `EEXIST`
+            // with `O_EXCL`, otherwise `EISDIR`, as with `O_TRUNC`.
+            if flags.create && flags.excl {
+                return Err(carrick_abi::LINUX_EEXIST);
+            }
+            if flags.trunc || flags.create {
                 return Err(LINUX_EISDIR);
             }
             let entries = self.readdir(path)?;
@@ -606,6 +611,26 @@ impl Vfs for BindVfs {
         // created one.
         if self.readonly && (flags.write || flags.trunc) {
             return Err(LINUX_EROFS);
+        }
+        if self.readonly && flags.create {
+            // Decide `O_CREAT` from the name alone, before any host open
+            // (an open could block on a FIFO, or fail for another reason
+            // first): an existing name is `EEXIST` with `O_EXCL`; a missing
+            // one (or a dangling symlink, which `O_CREAT` would follow) is
+            // `EROFS` when its directory exists, else that lookup's errno.
+            match std::fs::symlink_metadata(&host) {
+                Ok(_) if flags.excl => return Err(carrick_abi::LINUX_EEXIST),
+                Ok(_) if std::fs::metadata(&host).is_ok() => {}
+                Ok(_) => return Err(LINUX_EROFS),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return match host.parent().map(std::fs::metadata) {
+                        Some(Ok(parent)) if parent.is_dir() => Err(LINUX_EROFS),
+                        Some(Ok(_)) => Err(carrick_abi::LINUX_ENOTDIR),
+                        _ => Err(LINUX_ENOENT),
+                    };
+                }
+                Err(err) => return Err(map_io_error(err)),
+            }
         }
         // On a read-only mount the host open never creates: an existing file
         // opens as named (`O_EXCL` answers `EEXIST`), a missing one is
@@ -646,15 +671,8 @@ impl Vfs for BindVfs {
         // dangling symlinks to atomic `O_EXCL` leaf creation (`#2975` r33 P0 #1).
         let host_fd =
             crate::host_size::open_truncating_path(&host, host_flags, flags.mode as libc::c_uint)
-                .map_err(|errno| match errno {
-                libc::ENOENT if flags.create && self.readonly => LINUX_EROFS,
-                errno => host_to_linux_errno(errno),
-            })?;
-        if flags.create && flags.excl && self.readonly {
-            // The file exists (the open found it): `O_CREAT | O_EXCL` fails.
-            return Err(carrick_abi::LINUX_EEXIST);
-        }
-        let host_fd = host_fd.into_raw_fd();
+                .map_err(host_to_linux_errno)?
+                .into_raw_fd();
         if create && !existed_before_create {
             self.publish_namespace();
         }
@@ -664,7 +682,7 @@ impl Vfs for BindVfs {
         // — otherwise a 0-mode node (the dispatcher passes the guest's
         // umask-adjusted bits) would deny a later O_RDWR reopen (glibc sem_open's
         // SemLock._rebuild → EACCES under the multiprocessing forkserver).
-        if create && flags.mode != 0 {
+        if create && !existed_before_create && flags.mode != 0 {
             unsafe {
                 libc::fchmod(host_fd, (flags.mode & 0o7777) as libc::mode_t);
             }

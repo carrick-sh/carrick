@@ -4802,7 +4802,10 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 let iovcnt = i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                let mut n = 0;
+                // The host call's result and errno, read inside the host
+                // operation before the CPU is reclaimed (a reclaim makes host
+                // calls of its own).
+                let mut n: Result<isize, LinuxErrno> = Ok(0);
                 // The size door is taken inside the host operation, after
                 // the CPU and MM are lent and released before they are
                 // reclaimed: the registry is never held across the host-wait
@@ -4822,7 +4825,8 @@ impl<'a> FsView<'a> {
                                 )
                             }
                         },
-                    );
+                    )
+                    .host_syscall_errno();
                 };
                 // Retained HostRead owners stay live while the caller
                 // releases its execution capacity for the host syscall.
@@ -4834,7 +4838,7 @@ impl<'a> FsView<'a> {
                 };
                 restore_offset(saved_offset);
                 result?;
-                let n = n.host_syscall_errno()?;
+                let n = n?;
                 if n > 0 {
                     if let Some(old_len) = old_len {
                         punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;

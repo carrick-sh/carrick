@@ -2292,6 +2292,12 @@ impl HostFsBackend {
         if !matches!(host_errno, libc::EMFILE | libc::ENFILE) {
             return false;
         }
+        // The size door runs this open under its registry only in its
+        // `EMFILE` fallback; the registry is a leaf, so no cache lock is
+        // taken under it and the refusal stands (#2975 r36).
+        if crate::host_size::held_by_current_thread() {
+            return false;
+        }
         let mut cache = self.dir_cache.lock();
         let held = !cache.is_empty();
         cache.clear();
