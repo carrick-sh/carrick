@@ -5845,6 +5845,196 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn last_predecessor_pin_preserves_live_owner_after_successor_destroy() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let (ipa, len) = (0x7d00_3000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("structural backing");
+        let host = mapping.as_ptr() as usize;
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_test_mapped_without_backend();
+        let owner = super::StructuralBackingOwner::new_in(
+            &custody,
+            mapping,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("structural owner");
+        let old = owner.record_identity();
+        assert_eq!(old.vm_generation, g1);
+        let pin = custody.pin_stage2_record(old).expect("predecessor pin");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            host as *mut std::ffi::c_void,
+            ipa,
+            len,
+            perms,
+        );
+        super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa,
+                length: len as u64,
+                host_addr: host,
+                perms,
+                vm_generation: g2,
+            }],
+            false,
+            &mut |_, _| Ok(()),
+        )
+        .expect("rebind live owner");
+        let successor = owner.record_identity();
+        assert_ne!(successor.record_id, old.record_id);
+        assert!(custody.has_pinned_structural_predecessor(successor.record_id));
+        destroy_vm_with_custody_using(
+            &custody,
+            "G2",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G2");
+        assert!(!custody.is_structural_owner_retired(successor.record_id));
+        assert!(!custody.has_deferred_structural_logical_release(successor.record_id));
+        drop(pin);
+        assert!(custody.stage2_record_snapshot(old.record_id).is_none());
+        assert!(
+            custody
+                .stage2_record_snapshot(successor.record_id)
+                .is_some(),
+            "live successor record must survive G2 destroy and predecessor unpin"
+        );
+        assert_eq!(owner.record_identity(), successor);
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&successor.record_id)
+        );
+        assert!(super::alias_backing_is_live(host));
+        drop(owner);
+    }
+
+    #[test]
+    fn last_pin_preserves_live_pooled_root_across_destroy_and_new_pool() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let pool = custody.root_slot_pool().expect("G1 pool");
+        let handle = pool.allocate_slot().expect("G1 slot");
+        let ipa = handle.ipa();
+        let len = handle.len();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_pre_mapped_in(Some(g1));
+        let owner = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody,
+            handle,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("pooled structural owner");
+        let identity = owner.record_identity();
+        let pin = custody.pin_stage2_record(identity).expect("G1 pin");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        let pool2 = custody.root_slot_pool().expect("G2 pool");
+        assert!(
+            pool2.contains_ipa(ipa),
+            "G2 pool must cover the old fixed IPA"
+        );
+        assert!(!custody.is_structural_owner_retired(identity.record_id));
+        drop(pin);
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_some(),
+            "live pooled record must survive last unpin"
+        );
+        assert_eq!(owner.record_identity(), identity);
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id)
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn last_pin_retires_dead_pooled_owner_without_active_pool() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let pool = custody.root_slot_pool().expect("G1 pool");
+        let handle = pool.allocate_slot().expect("G1 slot");
+        let ipa = handle.ipa();
+        let len = handle.len();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_pre_mapped_in(Some(g1));
+        let owner = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody,
+            handle,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("pooled structural owner");
+        let identity = owner.record_identity();
+        let pin = custody.pin_stage2_record(identity).expect("G1 pin");
+        drop(owner);
+        assert!(custody.is_structural_owner_retired(identity.record_id));
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        assert!(!custody.is_pooled_ipa(ipa), "destroy removes active pool");
+        drop(pin);
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_none(),
+            "retired pooled record must drain without active pool"
+        );
+        assert!(
+            !custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id)
+        );
+    }
+
+    #[test]
     fn creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let source = concat!(
