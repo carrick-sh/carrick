@@ -10,7 +10,10 @@ workspace = true
 [dependencies]
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-abi = { path = "../carrick-abi" }
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-fatal.workspace = true
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hal = { path = "../carrick-hal" }

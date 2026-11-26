@@ -214,6 +214,157 @@ impl TransferPin for Box<dyn TransferPin> {
         (**self).atomic_compare_exchange_u32(request, expected, desired)
     }
 }
+/// The byte half every retained physical transfer pin shares: the exact
+/// request check, the bounded copy, and the aligned compare-exchange over
+/// the host bytes the pin retains. A backend's pin keeps the backing alive
+/// and adds only what a completed write must publish (code dirtiness,
+/// executable publication), so these rules exist once for every carrier.
+pub struct RetainedCopy {
+    carrier: NonZeroU64,
+    identity: PortalRetainedData,
+    selected: PortalSelectedData,
+    intent: PortalTransferIntent,
+    pointer: *mut u8,
+    len: usize,
+}
+
+/// Which way a [`RetainedCopy`] moves bytes.
+pub enum TransferBytes<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+impl TransferBytes<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Read(bytes) => bytes.len(),
+            Self::Write(bytes) => bytes.len(),
+        }
+    }
+}
+
+impl RetainedCopy {
+    /// # Safety
+    ///
+    /// `pointer` must address `len` bytes of host memory that stay mapped and
+    /// owned by the caller's pin for this value's whole life, and that no
+    /// other Rust reference aliases while a copy runs.
+    pub unsafe fn new(
+        carrier: NonZeroU64,
+        identity: PortalRetainedData,
+        selected: PortalSelectedData,
+        intent: PortalTransferIntent,
+        pointer: *mut u8,
+        len: usize,
+    ) -> Self {
+        Self {
+            carrier,
+            identity,
+            selected,
+            intent,
+            pointer,
+            len,
+        }
+    }
+
+    pub fn identity(&self) -> PortalRetainedData {
+        self.identity
+    }
+
+    pub fn selected(&self) -> PortalSelectedData {
+        self.selected
+    }
+
+    pub fn intent(&self) -> PortalTransferIntent {
+        self.intent
+    }
+
+    pub fn pointer(&self) -> *mut u8 {
+        self.pointer
+    }
+
+    /// Whether `request` names exactly this retention.
+    fn names(&self, request: &carrick_core_abi::PortalTransferRequest) -> bool {
+        request.operation.carrier == self.carrier
+            && request.retained == self.identity
+            && request.selected == self.selected
+            && request.intent == self.intent
+    }
+
+    /// Copy `bytes` in the direction they name, if the request is exactly
+    /// this retention's and fits it. A write needs a write intent. Returns
+    /// whether the bytes moved; the caller then publishes a completed write.
+    pub fn copy(
+        &mut self,
+        authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+        bytes: TransferBytes<'_>,
+    ) -> bool {
+        let len = bytes.len();
+        let request = authorization.request();
+        if !self.names(&request)
+            || request.range.len() > self.len as u64
+            || request.range.len() != len as u64
+            || (matches!(bytes, TransferBytes::Write(_)) && !self.intent.is_write())
+        {
+            return false;
+        }
+        // SAFETY: exact authorization, and the caller's pin retains this
+        // bounded interval (`new`). The typed buffer chooses the direction.
+        unsafe {
+            match bytes {
+                TransferBytes::Read(bytes) => {
+                    if len == core::mem::size_of::<u32>()
+                        && (self.pointer as usize).is_multiple_of(4)
+                    {
+                        let word = core::sync::atomic::AtomicU32::from_ptr(self.pointer.cast())
+                            .load(core::sync::atomic::Ordering::Acquire);
+                        bytes.copy_from_slice(&word.to_ne_bytes());
+                    } else {
+                        core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), len);
+                    }
+                }
+                TransferBytes::Write(bytes) => {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, len);
+                }
+            }
+        }
+        true
+    }
+
+    /// Compare-exchange the aligned word this write retention holds. Returns
+    /// the observed value, or `None` when the request isn't exactly this
+    /// retention's. The caller publishes the write when observed == expected.
+    pub fn compare_exchange_u32(
+        &mut self,
+        authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+        expected: u32,
+        desired: u32,
+    ) -> Option<u32> {
+        let request = authorization.request();
+        if !self.names(&request)
+            || !self.intent.is_write()
+            || request.range.len() != 4
+            || self.len < 4
+            || !(self.pointer as usize).is_multiple_of(4)
+        {
+            return None;
+        }
+        // SAFETY: exact authorization, and the caller's write pin retains
+        // this aligned word for the whole compare-exchange.
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(self.pointer.cast()) };
+        Some(
+            match word.compare_exchange(
+                expected,
+                desired,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(value) | Err(value) => value,
+            },
+        )
+    }
+}
+
 /// Retained physical ownership may move from synchronous preparation into
 /// a service ledger. Exclusion guards and executor loans stay at preparation.
 pub trait TransferGrant: Send {

@@ -21,8 +21,16 @@ use carrick_aarch64::mailbox::{
     classify_hvc_immediate,
 };
 use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
+use carrick_aarch64::user_transfer::{
+    ErasedPhysicalCustody, ErasedTransferCustody, RetainedCopy, TransferBytes, TransferCustody,
+    TransferPin, TransferPreparation, TransferTarget,
+};
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
+};
+use carrick_core::mm::own::{
+    BackendResult, CarrierCore, CarrierId, CoreVenue, GenerationId, GpaExtent, Holding,
+    MappingSpec, Pin as CorePin, PinRefusal, Retire,
 };
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE, EL1_IPC_BASE, EL1_IPC_POOL_BASE,
@@ -201,25 +209,64 @@ impl Drop for WindowBacking {
     }
 }
 
+/// What one soft stage-2 window's backend mapping owns in the carrier core:
+/// its host backing and its default permissions. The core keeps it until
+/// the window's unmap or the carrier's destroy, so the host memory outlives
+/// every pin taken inside it.
+struct WindowHost {
+    default_perms: MemPerms,
+    shared: bool,
+    _backing: WindowBacking,
+}
+
+// SAFETY: `WindowHost` owns an isolated `mmap` or caller-pinned shared window
+// accessed only through `ExclusiveStage2`'s Acquire/Release borrow guard.
+unsafe impl Send for WindowHost {}
+
+/// A copy of one installed window's geometry, read from the core.
+#[derive(Clone, Copy)]
 struct Stage2Window {
     start: u64,
     end: u64,
     host: NonNull<u8>,
     default_perms: MemPerms,
     shared: bool,
-    _backing: WindowBacking,
 }
 
-// SAFETY: `Stage2Window` owns an isolated `mmap` or caller-pinned shared window
-// accessed only through `ExclusiveStage2`'s Acquire/Release borrow guard.
-unsafe impl Send for Stage2Window {}
+/// The soft carrier's venue: a core dropped holding a mapping or a pin is a
+/// broken invariant, and ends the carrier.
+enum SoftCoreVenue {}
+
+impl CoreVenue for SoftCoreVenue {
+    fn dropped_holding(holding: Holding) -> ! {
+        carrick_fatal::carrick_fatal!(
+            "softcpu::stage2",
+            "soft carrier core dropped holding {holding:?}"
+        )
+    }
+}
+
+/// The soft carrier's records: every window is one backend mapping with one
+/// frame extent carved over it, so a transfer pins the core's extent.
+type SoftCore = CarrierCore<SoftCoreVenue, WindowHost, ()>;
+
+/// A carrier identity no other live soft core holds.
+fn next_soft_carrier() -> CarrierId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let raw = NEXT.fetch_add(1, Ordering::Relaxed);
+    let raw = NonZeroU64::new(raw).unwrap_or_else(|| {
+        carrick_fatal::carrick_fatal!("softcpu::stage2", "soft carrier identities wrapped")
+    });
+    // SAFETY: a process-wide monotonic counter, never reused.
+    unsafe { CarrierId::assume_unique(raw) }
+}
 
 /// Stage-2 GPA translation, permission enforcement, and `ExtentTable` code-page
 /// generation authority for the soft AArch64 VMM.
 pub struct SoftStage2 {
     geometry: MappingGeometry,
     extents: ExtentTable,
-    windows: BTreeMap<u64, Stage2Window>,
+    core: SoftCore,
     page_perms: BTreeMap<u64, MemPerms>,
     last_abort: Option<Stage2Abort>,
     _ipc_pin: Option<Arc<dyn IpcWindowBacking>>,
@@ -229,14 +276,40 @@ pub struct SoftStage2 {
     retained_metadata: BTreeMap<u64, Arc<dyn RetainedMetadataBacking>>,
 }
 
+impl Drop for SoftStage2 {
+    /// End the carrier's generation through the core: every window's host
+    /// backing comes back and drops here, before the retained metadata and
+    /// IPC backings the external windows borrow. A transfer pin still held
+    /// leaves a terminal extent, and the core's drop check ends the carrier.
+    fn drop(&mut self) {
+        let Ok((ticket, _destroy)) = self.core.begin_destroy() else {
+            return;
+        };
+        match self.core.finish_destroy(ticket, BackendResult::Done) {
+            Ok(destroyed) => drop(destroyed),
+            Err(refused) => carrick_fatal::carrick_fatal!(
+                "softcpu::stage2",
+                "soft destroy ticket refused at once: {:?}",
+                refused.reason
+            ),
+        }
+    }
+}
+
 impl SoftStage2 {
     pub fn new() -> Result<Self, TrapError> {
         let extents = ExtentTable::new()
             .map_err(|e| TrapError::Hypervisor(format!("soft stage-2 extent table: {e:?}")))?;
+        let mut core = SoftCore::new(next_soft_carrier());
+        // The soft VM has no backend object to create: its generation is live
+        // from the start, and ends with this stage 2.
+        core.create()
+            .and_then(|_| core.commit_create())
+            .map_err(|e| TrapError::Hypervisor(format!("soft carrier generation: {e:?}")))?;
         Ok(Self {
             geometry: MappingGeometry::probe(),
             extents,
-            windows: BTreeMap::new(),
+            core,
             page_perms: BTreeMap::new(),
             last_abort: None,
             _ipc_pin: None,
@@ -315,9 +388,16 @@ impl SoftStage2 {
         Ok(())
     }
 
-    fn window_for_range(&self, gpa: u64, len: usize) -> Option<&Stage2Window> {
+    fn window_for_range(&self, gpa: u64, len: usize) -> Option<Stage2Window> {
         let end = gpa.checked_add(u64::try_from(len).ok()?)?;
-        let (_, window) = self.windows.range(..=gpa).next_back()?;
+        let view = self.core.installed_at_or_below(gpa)?;
+        let window = Stage2Window {
+            start: view.extent.ipa(),
+            end: view.extent.end(),
+            host: NonNull::new(view.host_addr as *mut u8)?,
+            default_perms: view.host.default_perms,
+            shared: view.host.shared,
+        };
         if len == 0 {
             (gpa <= window.end).then_some(window)
         } else {
@@ -325,14 +405,14 @@ impl SoftStage2 {
         }
     }
 
-    fn perms_for_frame(&self, window: &Stage2Window, frame_gpa: u64) -> MemPerms {
+    fn perms_for_frame(&self, window: Stage2Window, frame_gpa: u64) -> MemPerms {
         self.page_perms
             .get(&frame_gpa)
             .copied()
             .unwrap_or(window.default_perms)
     }
 
-    fn check_no_overlap(&self, start: u64, end: u64) -> Result<(), TrapError> {
+    fn checked_window_extent(start: u64, end: u64) -> Result<GpaExtent, TrapError> {
         if !start.is_multiple_of(GUEST_PAGE_BYTES)
             || !end.is_multiple_of(GUEST_PAGE_BYTES)
             || end <= start
@@ -341,13 +421,48 @@ impl SoftStage2 {
                 "unaligned or empty stage-2 range {start:#x}..{end:#x}"
             )));
         }
-        if let Some((_, prev)) = self.windows.range(..end).next_back()
-            && prev.end > start
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "overlapping stage-2 window {start:#x}..{end:#x} vs {:#x}..{:#x}",
-                prev.start, prev.end
-            )));
+        GpaExtent::new(start, end - start).ok_or_else(|| {
+            TrapError::Hypervisor(format!("stage-2 range {start:#x}..{end:#x} overflows"))
+        })
+    }
+
+    /// Install one window in the carrier core: reserve its extent, map it
+    /// (the soft backend's map is the record itself, so it completes at
+    /// once), and carve one frame extent over it for transfer pins. A
+    /// refusal hands the host backing back, so a failed install unmaps it.
+    fn install_window(
+        &mut self,
+        extent: GpaExtent,
+        host: NonNull<u8>,
+        window: WindowHost,
+    ) -> Result<(), TrapError> {
+        let spec = MappingSpec {
+            extent,
+            host_addr: host.as_ptr() as usize,
+            host: window,
+        };
+        let (ticket, _map) = self.core.begin_map(spec).map_err(|refused| {
+            TrapError::Hypervisor(format!(
+                "soft stage-2 window {:#x}..{:#x} refused: {:?}",
+                extent.ipa(),
+                extent.end(),
+                refused.reason
+            ))
+        })?;
+        if let Err(refused) = self.core.finish_map(ticket, BackendResult::Done) {
+            carrick_fatal::carrick_fatal!(
+                "softcpu::stage2",
+                "soft map ticket refused at once: {:?}",
+                refused.reason
+            );
+        }
+        if let Err(refused) = self.core.carve(extent, ()) {
+            carrick_fatal::carrick_fatal!(
+                "softcpu::stage2",
+                "soft window {:#x} could not carve its own extent: {:?}",
+                extent.ipa(),
+                refused.reason
+            );
         }
         Ok(())
     }
@@ -358,17 +473,17 @@ impl SoftStage2 {
     pub fn allocate_free_gpa(&self, min_gpa: u64, limit_gpa: u64, len: u64) -> Option<u64> {
         let len = self.geometry.align_up_guest(len).filter(|v| *v > 0)?;
         let mut cursor = self.geometry.align_up_guest(min_gpa)?;
-        for window in self.windows.values() {
-            if window.end <= cursor {
+        for window in self.core.reserved_extents() {
+            if window.end() <= cursor {
                 continue;
             }
             if cursor
                 .checked_add(len)
-                .is_some_and(|end| end <= window.start && end <= limit_gpa)
+                .is_some_and(|end| end <= window.ipa() && end <= limit_gpa)
             {
                 return Some(cursor);
             }
-            cursor = self.geometry.align_up_guest(window.end)?;
+            cursor = self.geometry.align_up_guest(window.end())?;
             if cursor >= limit_gpa {
                 return None;
             }
@@ -395,7 +510,7 @@ impl SoftStage2 {
         let end = gpa
             .checked_add(guest_len)
             .ok_or_else(|| TrapError::Hypervisor("stage-2 GPA overflow".to_owned()))?;
-        self.check_no_overlap(gpa, end)?;
+        let extent = Self::checked_window_extent(gpa, end)?;
 
         let host_len_u64 = self
             .geometry
@@ -425,26 +540,117 @@ impl SoftStage2 {
         let base = NonNull::new(raw.cast::<u8>())
             .ok_or_else(|| TrapError::Hypervisor("mmap returned null".to_owned()))?;
         let backing = WindowBacking::OwnedMmap { base, mapped_len };
-        if !self
-            .extents
-            .install(ExtentRecord::new(FrameGpa::new(gpa), guest_len, OWNER))
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "ExtentTable refused stage-2 install at {gpa:#x}..{end:#x}"
-            )));
-        }
-        self.windows.insert(
-            gpa,
-            Stage2Window {
-                start: gpa,
-                end,
-                host: base,
+        self.install_window(
+            extent,
+            base,
+            WindowHost {
                 default_perms: perms,
                 shared,
                 _backing: backing,
             },
-        );
+        )?;
+        self.install_code_record(extent)?;
         Ok(base)
+    }
+
+    /// Register an installed window with the code-generation table; a
+    /// refusal removes the window again.
+    fn install_code_record(&mut self, extent: GpaExtent) -> Result<(), TrapError> {
+        if self.extents.install(ExtentRecord::new(
+            FrameGpa::new(extent.ipa()),
+            extent.len().get(),
+            OWNER,
+        )) {
+            return Ok(());
+        }
+        self.remove_window(extent)?;
+        Err(TrapError::Hypervisor(format!(
+            "ExtentTable refused stage-2 install at {:#x}..{:#x}",
+            extent.ipa(),
+            extent.end()
+        )))
+    }
+
+    /// Retire the window's frame extent and unmap it from the core, which
+    /// hands its host backing back to drop. A window pinned by a transfer
+    /// can't be removed: the soft carrier has one vCPU, and a pin lives only
+    /// inside one crossing's copy, so a pin across a removal is a broken
+    /// invariant.
+    fn remove_window(&mut self, extent: GpaExtent) -> Result<(), TrapError> {
+        let view = self
+            .core
+            .installed_at_or_below(extent.ipa())
+            .filter(|view| view.extent == extent)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!("no soft window at {:#x}", extent.ipa()))
+            })?;
+        let mapping = view.id;
+        if let Some(carved) = self.core.live_extent_at(extent.ipa()) {
+            match self.core.retire_extent(carved) {
+                Ok(Retire::Released(_)) => {}
+                Ok(Retire::Deferred) => carrick_fatal::carrick_fatal!(
+                    "softcpu::stage2",
+                    "soft window {:#x} removed while a transfer pins it",
+                    extent.ipa()
+                ),
+                Err(reason) => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "soft window extent retire refused: {reason:?}"
+                    )));
+                }
+            }
+        }
+        let (ticket, _unmap) = self.core.begin_unmap(mapping).map_err(|reason| {
+            TrapError::Hypervisor(format!("soft window unmap refused: {reason:?}"))
+        })?;
+        match self.core.finish_unmap(ticket, BackendResult::Done) {
+            Ok(host) => drop(host),
+            Err(refused) => carrick_fatal::carrick_fatal!(
+                "softcpu::stage2",
+                "soft unmap ticket refused at once: {:?}",
+                refused.reason
+            ),
+        }
+        Ok(())
+    }
+
+    /// Pin the frame extent holding `[ipa, ipa + len)` for one transfer.
+    fn pin_transfer(&mut self, ipa: u64, len: u64) -> Result<CorePin, PinRefusal> {
+        self.core.pin(ipa, len)
+    }
+
+    fn unpin_transfer(&mut self, pin: CorePin) {
+        match self.core.unpin(pin) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => carrick_fatal::carrick_fatal!(
+                "softcpu::stage2",
+                "a soft transfer pin outlived its window"
+            ),
+        }
+    }
+
+    fn generation(&self) -> GenerationId {
+        self.core.generation().0
+    }
+
+    /// Advance the code generation of every 4 KiB frame a transfer wrote
+    /// through its pin, as `write_gpa_bytes` does for host writes.
+    fn invalidate_transfer_write(&mut self, ipa: u64, len: u64) -> bool {
+        let Some(end) = ipa.checked_add(len).filter(|_| len > 0) else {
+            return false;
+        };
+        let mut frame = ipa & !(GUEST_PAGE_BYTES - 1);
+        while frame < end {
+            if self
+                .extents
+                .invalidate_host_written_page(FrameGpa::new(frame), OWNER)
+                .is_err()
+            {
+                return false;
+            }
+            frame += GUEST_PAGE_BYTES;
+        }
+        true
     }
 }
 
@@ -481,7 +687,7 @@ impl SoftStage2 {
         let end = gpa
             .checked_add(guest_len)
             .ok_or_else(|| TrapError::Hypervisor("file alias GPA overflow".to_owned()))?;
-        self.check_no_overlap(gpa, end)?;
+        let extent = Self::checked_window_extent(gpa, end)?;
 
         let host_len_u64 = self
             .geometry
@@ -547,26 +753,16 @@ impl SoftStage2 {
         let base = NonNull::new(raw.cast::<u8>())
             .ok_or_else(|| TrapError::Hypervisor("file mmap returned null".to_owned()))?;
         let backing = WindowBacking::OwnedMmap { base, mapped_len };
-        if !self
-            .extents
-            .install(ExtentRecord::new(FrameGpa::new(gpa), guest_len, OWNER))
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "ExtentTable refused file alias at {gpa:#x}..{end:#x}"
-            )));
-        }
-        self.windows.insert(
-            gpa,
-            Stage2Window {
-                start: gpa,
-                end,
-                host: base,
+        self.install_window(
+            extent,
+            base,
+            WindowHost {
                 default_perms: perms,
                 shared,
                 _backing: backing,
             },
-        );
-        Ok(())
+        )?;
+        self.install_code_record(extent)
     }
 
     /// Map caller-retained external host memory into stage-2 `[gpa, gpa + len)`.
@@ -593,27 +789,17 @@ impl SoftStage2 {
         let end = gpa
             .checked_add(guest_len)
             .ok_or_else(|| TrapError::Hypervisor("external stage-2 GPA overflow".to_owned()))?;
-        self.check_no_overlap(gpa, end)?;
-        if !self
-            .extents
-            .install(ExtentRecord::new(FrameGpa::new(gpa), guest_len, OWNER))
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "ExtentTable refused external stage-2 install at {gpa:#x}..{end:#x}"
-            )));
-        }
-        self.windows.insert(
-            gpa,
-            Stage2Window {
-                start: gpa,
-                end,
-                host,
+        let extent = Self::checked_window_extent(gpa, end)?;
+        self.install_window(
+            extent,
+            host,
+            WindowHost {
                 default_perms: perms,
                 shared,
                 _backing: WindowBacking::External,
             },
-        );
-        Ok(())
+        )?;
+        self.install_code_record(extent)
     }
 
     /// Update stage-2 permissions on 4 KiB logical frames in `[gpa, gpa + len)`.
@@ -656,7 +842,10 @@ impl SoftStage2 {
 
     /// Retire an exact stage-2 window starting at `gpa`.
     pub fn unmap_stage2(&mut self, gpa: u64, len: u64) -> Result<(), TrapError> {
-        let Some(window) = self.windows.get(&gpa) else {
+        let Some(window) = self
+            .window_for_range(gpa, 0)
+            .filter(|window| window.start == gpa)
+        else {
             return Err(TrapError::Hypervisor(format!(
                 "unmap_stage2: no window at {gpa:#x}"
             )));
@@ -689,8 +878,8 @@ impl SoftStage2 {
         for key in stale_keys {
             self.page_perms.remove(&key);
         }
-        self.windows.remove(&gpa);
-        Ok(())
+        let extent = Self::checked_window_extent(window.start, window.end)?;
+        self.remove_window(extent)
     }
 
     #[must_use]
@@ -1050,6 +1239,8 @@ impl SoftGuestMemory for SoftStage2 {
 /// and `SoftAarch64Vcpu` inside `Aarch64EngineCore` without `RawLock` debt.
 struct ExclusiveStage2 {
     borrowed: AtomicBool,
+    /// The carrier identity of the core inside, fixed for its life.
+    carrier: CarrierId,
     inner: UnsafeCell<SoftStage2>,
 }
 
@@ -1089,6 +1280,7 @@ impl ExclusiveStage2 {
     fn new(stage2: SoftStage2) -> Self {
         Self {
             borrowed: AtomicBool::new(false),
+            carrier: stage2.core.carrier(),
             inner: UnsafeCell::new(stage2),
         }
     }
@@ -2566,5 +2758,205 @@ where
 
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
         Arc::new(GenericVcpuRegistry::new())
+    }
+
+    /// The soft root's MM is portal-admitted through this custody (#2814).
+    fn owner_transfer_custody(&self) -> Option<Box<ErasedPhysicalCustody>> {
+        Some(Box::new(ErasedTransferCustody(SoftTransferCustody {
+            stage2: Arc::downgrade(&self.stage2),
+            carrier: self.stage2.carrier.raw(),
+        })))
+    }
+
+    /// Soft file windows are mapped whole when they are added, so no lazy
+    /// file grant is ever owed. One reaching here fails the run loudly; it
+    /// must never decline and turn a valid page into the fault's `SIGSEGV`.
+    fn prepare_owner_frame_grant(
+        &self,
+        _target: TransferTarget,
+        _window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<TransferPreparation, TrapError> {
+        Err(SoftTransferCustody::refuse("lazy file grants"))
+    }
+}
+
+/// The soft carrier's physical half of UserTransfer (#2814, #1236 step 1b).
+/// EL1 selects and authorizes the user VA; this resolves only its IPA, by
+/// pinning the carrier core's frame extent that holds it. The byte rules are
+/// the shared [`RetainedCopy`]'s.
+struct SoftTransferCustody {
+    stage2: Weak<ExclusiveStage2>,
+    carrier: NonZeroU64,
+}
+
+impl SoftTransferCustody {
+    fn refuse(what: &str) -> TrapError {
+        TrapError::Hypervisor(format!(
+            "the soft carrier does not serve {what} yet (#1236 step 1b)"
+        ))
+    }
+}
+
+impl TransferCustody for SoftTransferCustody {
+    type Pin = SoftRetainedUserData;
+
+    fn carrier(&self) -> NonZeroU64 {
+        self.carrier
+    }
+
+    /// Soft guest RAM is host-backed when its window is mapped, so an owner
+    /// grant is never needed to back it. One reaching here is a defect to
+    /// find, so it fails the run loudly rather than declining.
+    fn prepare(
+        &self,
+        _target: TransferTarget,
+        _window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<TransferPreparation, TrapError> {
+        Err(Self::refuse("owner grants"))
+    }
+
+    fn publish_executable(
+        &self,
+        _target: TransferTarget,
+        _request: carrick_core_abi::PortalExecutablePublication,
+    ) -> bool {
+        false
+    }
+
+    /// No copy-on-write state exists before the soft carrier can fork.
+    fn refill_cow(
+        &self,
+        _target: TransferTarget,
+        _window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    fn retain(
+        &self,
+        selected: carrick_el1_abi::PortalSelectedData,
+        len: usize,
+        intent: carrick_el1_abi::PortalTransferIntent,
+    ) -> Result<Option<Self::Pin>, TrapError> {
+        let invariant =
+            || TrapError::Hypervisor("soft UserTransfer custody invariant refused".to_owned());
+        if len == 0 || len > PAGE_BYTES_USIZE {
+            return Err(invariant());
+        }
+        let cell = self.stage2.upgrade().ok_or_else(invariant)?;
+        let mut stage2 = cell.try_borrow()?;
+        let pin = match stage2.pin_transfer(selected.ipa, len as u64) {
+            Ok(pin) => pin,
+            // Absent backing: the owner may select again.
+            Err(PinRefusal::NoLiveExtent) => return Ok(None),
+            // A known extent overrun, or an exhausted pin count, is permanent.
+            Err(reason) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "soft UserTransfer pin refused: {reason:?}"
+                )));
+            }
+        };
+        let identity = carrick_el1_abi::PortalRetainedData {
+            record: pin.extent().record(),
+            vm_generation: NonZeroU64::new(stage2.generation().0).ok_or_else(invariant)?,
+            owner: None,
+        };
+        let pointer = pin.host_addr() as *mut u8;
+        drop(stage2);
+        // SAFETY: the core pin keeps the frame extent, and with it the
+        // window's host backing, alive until `SoftRetainedUserData` drops.
+        let bytes =
+            unsafe { RetainedCopy::new(self.carrier, identity, selected, intent, pointer, len) };
+        Ok(Some(SoftRetainedUserData {
+            stage2: Arc::downgrade(&cell),
+            pin: Some(pin),
+            bytes,
+        }))
+    }
+}
+
+/// One soft transfer's retention: a core pin on the frame extent, and the
+/// shared byte rules over its host bytes.
+struct SoftRetainedUserData {
+    stage2: Weak<ExclusiveStage2>,
+    pin: Option<CorePin>,
+    bytes: RetainedCopy,
+}
+
+impl SoftRetainedUserData {
+    /// A completed write advances the written frames' code generations.
+    fn publish_completed_write(&self, len: usize) -> bool {
+        let Some(cell) = self.stage2.upgrade() else {
+            return false;
+        };
+        let Ok(mut stage2) = cell.try_borrow() else {
+            return false;
+        };
+        stage2.invalidate_transfer_write(self.bytes.selected().ipa, len as u64)
+    }
+}
+
+impl TransferPin for SoftRetainedUserData {
+    fn identity(&self) -> carrick_el1_abi::PortalRetainedData {
+        self.bytes.identity()
+    }
+
+    fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool {
+        if self.bytes.intent().is_write() {
+            self.copy_out(request, bytes)
+        } else {
+            self.bytes.copy(request, TransferBytes::Read(bytes))
+        }
+    }
+
+    fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool {
+        if !self.bytes.intent().is_write() || !self.bytes.copy(request, TransferBytes::Write(bytes))
+        {
+            return false;
+        }
+        if !self.publish_completed_write(bytes.len()) {
+            carrick_fatal::carrick_fatal!(
+                "softcpu::user_transfer",
+                "completed write publication failed"
+            );
+        }
+        true
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        request: carrick_el1_abi::PortalCopyRequest<'_>,
+        expected: u32,
+        desired: u32,
+    ) -> Option<u32> {
+        let observed = self
+            .bytes
+            .compare_exchange_u32(request, expected, desired)?;
+        if observed == expected && !self.publish_completed_write(4) {
+            return None;
+        }
+        Some(observed)
+    }
+}
+
+impl Drop for SoftRetainedUserData {
+    /// Return the core pin. The soft carrier has one vCPU, and a transfer
+    /// drops its pin between guest instructions, so the stage 2 is never
+    /// borrowed here; if it were, the pin would leak into a terminal extent
+    /// and the carrier's drop check would end it.
+    fn drop(&mut self) {
+        let Some(pin) = self.pin.take() else {
+            return;
+        };
+        let Some(cell) = self.stage2.upgrade() else {
+            return;
+        };
+        match cell.try_borrow() {
+            Ok(mut stage2) => stage2.unpin_transfer(pin),
+            Err(_) => carrick_fatal::carrick_fatal!(
+                "softcpu::user_transfer",
+                "a transfer pin dropped while the soft stage 2 was borrowed"
+            ),
+        }
     }
 }

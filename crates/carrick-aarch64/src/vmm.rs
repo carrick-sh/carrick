@@ -1522,13 +1522,16 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
 
     /// Retain physical backing for an exact owner-selected lazy file window.
+    ///
+    /// Every backend answers this itself. `Declined` refuses the fault, and
+    /// the guest then gets the fault's original signal, so a backend that
+    /// can't serve a valid lazy file page must fail loudly instead: a
+    /// default here once turned such pages into a wrong `SIGSEGV` (#1236).
     fn prepare_owner_frame_grant(
         &self,
-        _target: crate::user_transfer::TransferTarget,
-        _window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<crate::user_transfer::TransferPreparation, TrapError> {
-        Ok(crate::user_transfer::TransferPreparation::Declined)
-    }
+        target: crate::user_transfer::TransferTarget,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<crate::user_transfer::TransferPreparation, TrapError>;
 
     fn owner_transfer_custody(&self) -> Option<Box<crate::user_transfer::ErasedPhysicalCustody>> {
         None

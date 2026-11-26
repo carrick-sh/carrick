@@ -1,7 +1,7 @@
 //! Physical half of UserTransfer. EL1 selects and authorizes the user VA;
 //! this adapter resolves only its IPA through existing carrier directories.
 use super::*;
-use carrick_aarch64::user_transfer::{TransferCustody, TransferPin};
+use carrick_aarch64::user_transfer::{RetainedCopy, TransferBytes, TransferCustody, TransferPin};
 use carrick_el1_abi::{PortalRetainedData, PortalSelectedData, PortalTransferIntent};
 use core::num::NonZeroU64;
 use std::sync::Arc;
@@ -110,16 +110,7 @@ pub struct RetainedUserData {
     _mapping: Option<Arc<GlobalFrameSharedMapping>>,
     _metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
     _write: Option<Arc<carrick_aarch64::code_content::PendingContentWrite<OwnedCodeContent>>>,
-    carrier: NonZeroU64,
-    identity: PortalRetainedData,
-    selected: PortalSelectedData,
-    intent: PortalTransferIntent,
-    pointer: *mut u8,
-    len: usize,
-}
-enum TransferBytes<'a> {
-    Read(&'a mut [u8]),
-    Write(&'a [u8]),
+    bytes: RetainedCopy,
 }
 impl TransferPin for RetainedUserData {
     fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
@@ -129,14 +120,14 @@ impl TransferPin for RetainedUserData {
             .map(|write| carrick_guest_mem::OwnedMemoryWait(write.clone()))
     }
     fn identity(&self) -> PortalRetainedData {
-        self.identity
+        self.bytes.identity()
     }
     fn copy(
         &mut self,
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &mut [u8],
     ) -> bool {
-        if self.intent.is_write() {
+        if self.bytes.intent().is_write() {
             self.copy_out(authorization, bytes)
         } else {
             self.copy_bytes(authorization, TransferBytes::Read(bytes))
@@ -147,7 +138,7 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &[u8],
     ) -> bool {
-        if !self.intent.is_write() {
+        if !self.bytes.intent().is_write() {
             return false;
         }
         self.copy_bytes(authorization, TransferBytes::Write(bytes))
@@ -161,33 +152,11 @@ impl TransferPin for RetainedUserData {
         if self._write.as_ref().is_some_and(|write| !write.is_ready()) {
             return None;
         }
-        let request = authorization.request();
-        if request.operation.carrier != self.carrier
-            || request.retained != self.identity
-            || request.selected != self.selected
-            || request.intent != self.intent
-            || !self.intent.is_write()
-            || request.range.len() != 4
-            || self.len < 4
-            || !(self.pointer as usize).is_multiple_of(4)
-        {
+        let observed = self
+            .bytes
+            .compare_exchange_u32(authorization, expected, desired)?;
+        if observed == expected && !self.publish_completed_write(4) {
             return None;
-        }
-        // SAFETY: exact authorization, retained backing and write pin cover
-        // this aligned word for the whole compare-exchange.
-        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(self.pointer.cast::<u32>()) };
-        let observed = match word.compare_exchange(
-            expected,
-            desired,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(value) | Err(value) => value,
-        };
-        if observed == expected {
-            if !self.publish_completed_write(4) {
-                return None;
-            }
         }
         Some(observed)
     }
@@ -197,12 +166,17 @@ impl RetainedUserData {
         let Some(mapping) = self._mapping.as_ref() else {
             return false;
         };
-        let offset = self.pointer as usize - mapping.host_base() as usize;
+        let offset = self.bytes.pointer() as usize - mapping.host_base() as usize;
         mapping.code_content.mark_icache_dirty(offset, len);
-        if self.selected.executable {
+        if self.bytes.selected().executable {
             if self
                 .custody
-                .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
+                .publish_user_executable(
+                    self.bytes.selected().ipa,
+                    len as u64,
+                    |_, _| None,
+                    |_, _| None,
+                )
                 .is_err()
             {
                 return false;
@@ -222,38 +196,10 @@ impl RetainedUserData {
             TransferBytes::Read(bytes) => bytes.len(),
             TransferBytes::Write(bytes) => bytes.len(),
         };
-        let request = authorization.request();
-        if request.operation.carrier != self.carrier
-            || request.retained != self.identity
-            || request.selected != self.selected
-            || request.intent != self.intent
-            || request.range.len() > self.len as u64
-            || request.range.len() != len as u64
-        {
+        if !self.bytes.copy(authorization, bytes) {
             return false;
         }
-        // SAFETY: exact authorization, retained backing and pin cover this
-        // bounded interval. The typed buffer chooses the copy direction.
-        unsafe {
-            match bytes {
-                TransferBytes::Read(bytes) => {
-                    if len == core::mem::size_of::<u32>()
-                        && (self.pointer as usize).is_multiple_of(4)
-                    {
-                        let word =
-                            std::sync::atomic::AtomicU32::from_ptr(self.pointer.cast::<u32>())
-                                .load(std::sync::atomic::Ordering::Acquire);
-                        bytes.copy_from_slice(&word.to_ne_bytes());
-                    } else {
-                        core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), len)
-                    }
-                }
-                TransferBytes::Write(bytes) => {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, len)
-                }
-            }
-        }
-        if self.intent.is_write() {
+        if self.bytes.intent().is_write() {
             // A peer MM may have consumed admission dirtiness before this
             // memcpy. Publish the completed write, then await I2 completion.
             if !self.publish_completed_write(len) {
@@ -594,18 +540,17 @@ impl UserTransferCustody {
         } else {
             None
         };
+        // SAFETY: the record pin and the retained mapping or metadata keep
+        // `[pointer, pointer + len)` mapped for the returned value's life.
+        let bytes =
+            unsafe { RetainedCopy::new(self.carrier(), retained, selected, intent, pointer, len) };
         Ok(Some(RetainedUserData {
             _pin: pin,
             custody: self.custody.clone(),
             _mapping: mapping,
             _metadata: metadata,
             _write: write,
-            carrier: self.carrier(),
-            identity: retained,
-            selected,
-            intent,
-            pointer,
-            len,
+            bytes,
         }))
     }
 }
