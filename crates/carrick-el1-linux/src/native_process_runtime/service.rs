@@ -4715,6 +4715,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let reply = carrick_core_abi::host_file::reply(record).map(|reply| reply.result);
         let answer = match (result, reply) {
             (ServiceResult::Supplied, Some(registered)) if registered >= 0 => {
+                self.register_readiness_set()?;
                 return Ok(HostFileContinuation::Rerun);
             }
             (ServiceResult::Supplied, Some(errno)) => Ok(Some(errno)),
@@ -4745,6 +4746,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ))),
             Err(broken) => Err(NativeProcessError::ServiceQuarantined(broken)),
         }
+    }
+
+    /// The carrier registered a readiness set's host members: the operation
+    /// its call kept stops being owed, so the rerun harvests it whole (an
+    /// owed one is rebuilt from the call's entry instead).
+    #[inline(never)]
+    fn register_readiness_set(&mut self) -> Result<(), NativeProcessError> {
+        let identity = self.source.zone.record(self.record.id).identity();
+        let token =
+            carrick_core::wait::take_object_operation(self.source.zone, self.source.slot, identity)
+                .map_err(|_| {
+                    NativeProcessError::ServiceQuarantined(
+                        NativeServiceQuarantine::AdapterResultOperationTake,
+                    )
+                })?
+                .ok_or(NativeProcessError::Stale)?;
+        let (region, _) = self
+            .service
+            .exec_ipc_binding()
+            .ok_or(NativeProcessError::Stale)?;
+        let token = crate::ipc::register_native_set_hosts(&region, self.binding, token)?;
+        carrick_core::wait::restore_object_operation(
+            self.source.zone,
+            self.source.slot,
+            identity,
+            token,
+        )
+        .map_err(|_| {
+            NativeProcessError::ServiceQuarantined(
+                NativeServiceQuarantine::AdapterResultOperationTake,
+            )
+        })
     }
 
     /// Retire the readiness-set operation a `ReadinessSetCtl` record's call

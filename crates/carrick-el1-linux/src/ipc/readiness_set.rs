@@ -42,6 +42,14 @@
 //! does. A carrier-held epoll lock is "not now": the harvest enrols on the
 //! holder's release and reruns (`super::epoll_harvest`).
 //!
+//! The operation, not the record, owns the set: it is admitted
+//! [`SelectHosts::Owed`] and only the carrier's successful registration
+//! makes it `Registered`. A rerun that takes it still owed (the record never
+//! reached the carrier: a refusal before publication, or an ARM exit that
+//! replays the call first) retires the set whole and rebuilds it from the
+//! call's entry, keeping the armed mask and the call's deadline. So a set
+//! never harvests or parks without the host members it names.
+//!
 //! Scope: every selected descriptor must be a zone object an epoll can
 //! hold (pipe ends, eventfds, stream ends) or a host descriptor, on a venue
 //! that publishes ring records ([`GuestDispatchFrame::accepts_ring_record`]).
@@ -71,7 +79,7 @@ use carrick_el1_abi::ipc::fd::{
 use carrick_el1_abi::ipc::pipe::WaitFor;
 use carrick_el1_abi::ipc::{
     IpcBacking, IpcCounterDeadline, IpcError, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation,
-    IpcRegion, IpcSelectOutput, IpcUserVa, OfdPin,
+    IpcRegion, IpcSelectOutput, IpcUserVa, OfdPin, SelectHosts,
 };
 use carrick_sched_core::LockWait;
 use carrick_syscall_abi::LinuxErrno;
@@ -455,12 +463,19 @@ fn stage_hosts<E: IpcExecution, M: UserCopy>(
         }
         *keep_sigmask = true;
     }
+    // Owed until the carrier registers the record's members: a rerun that
+    // finds it still owed rebuilds the set rather than harvest without them.
+    let mut op = op;
+    op.select.hosts = SelectHosts::Owed;
     let token = match begin_readiness_operation(sched, frame, region, user, op, keep_sigmask) {
         Begun::Operation(token) => token,
         Begun::Served(served) => return Some(served),
         Begun::Rerun => return None,
     };
     retain_native_operation(sched, token);
+    // The retained operation owns whatever mask is armed: the entry's, or
+    // the one a replay (an arena park, an owed rebuild) armed before.
+    *keep_sigmask = true;
     frame.stage_ring_record(record);
     Some(IpcServed::Forward)
 }
