@@ -108,6 +108,13 @@ pub(super) fn release_injected_edit_wait(
         crate::native_process::inject_caught_signal_on_park(source, task);
     }
     publish_injected_release(source, task, cause);
+    // The woken member's handler-frame copy finds the editor held: its
+    // release follows that copy's own park, through this same function.
+    if crate::test_support::take_frame_editor_rehold()
+        && !carrick_sched_core::spaces::inject_editor_busy_once()
+    {
+        carrick_x86_carrier::entry::fatal_boot!();
+    }
 }
 
 /// Test images: the synthetic editor holder releases right after its
