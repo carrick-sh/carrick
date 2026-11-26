@@ -194,6 +194,9 @@ pub fn schedule(slot: SlotId) -> ! {
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))
                 {
                     carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
+                        if result.raw() as i64 == -14 {
+                            panic!("DIAG EFAULT resumed-returned");
+                        }
                         words.set_syscall_return(result.raw() as u64)
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
@@ -237,6 +240,9 @@ pub fn schedule(slot: SlotId) -> ! {
                             }
                             Some(_) => {
                                 if !metadata_resume && let Some(result) = selected.result {
+                                    if result as i64 == -14 {
+                                        panic!("DIAG EFAULT resumed-selected");
+                                    }
                                     words.set_syscall_return(result);
                                 }
                             }

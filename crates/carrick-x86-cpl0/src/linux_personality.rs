@@ -2060,6 +2060,14 @@ impl Personality for LinuxPersonality {
             migrate(slot);
         }
 
+        if matches!(route, CompletionRoute::Served | CompletionRoute::WithWork)
+            && frame.rax as i64 == -14
+        {
+            panic!(
+                "DIAG EFAULT served nr={} rdi={:#x} rsi={:#x} rdx={:#x} rip={:#x}",
+                call.native.raw(), frame.rdi, frame.rsi, frame.rdx, frame.rcx
+            );
+        }
         match route {
             CompletionRoute::Served => ControlFlow::Return(()),
             CompletionRoute::WithWork => {
