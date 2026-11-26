@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -112,6 +113,31 @@ static void drain(int fd, const char *name) {
 
 static void tell(int sock, char step) { (void)syscall(SYS_write, sock, &step, 1); }
 
+// Whether `pid` is asleep (state S in `/proc/<pid>/stat`), read until it
+// is; 1 once seen. The state is the child's own: it changes when the child
+// parks, so each read observes an event, not the passage of time. Bounded
+// so a broken stat fails the row (0) instead of hanging it.
+static long asleep(pid_t pid) {
+    char path[64], buf[256];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    for (long i = 0; i < 10000000; i++) {
+        int fd = (int)syscall(SYS_open, path, O_RDONLY);
+        if (fd < 0) return -errno;
+        long n = syscall(SYS_read, fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n <= 0) return -1;
+        buf[n] = 0;
+        const char *paren = strrchr(buf, ')');
+        if (paren && paren[1] == ' ' && paren[2] == 'S') return 1;
+        sched_yield();
+    }
+    return 0;
+}
+
+// Connections the forty-socket row adds beside fd 3.
+#define MANY 39
+static const struct sockaddr_in *peer_address;
+
 static void child(void) {
     static const int both[] = {0, 3}, sock[] = {3};
     // apt's own call: nothing to read, the connected socket is writable.
@@ -148,7 +174,10 @@ static void child(void) {
     // does not: the root signals the child during the wait, then writes
     // the pipe. Only the call's mask keeps the wait from being interrupted
     // (EINTR, had it been ignored); the signal is delivered as the call
-    // returns, once the thread's mask is back.
+    // returns, once the thread's mask is back. The root signals only once
+    // it has seen this child asleep (`/proc/<pid>/stat` state S) after the
+    // 'm' byte: nothing between that byte and the wait can sleep, so the
+    // signal arrives inside pselect6, never before it.
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
@@ -160,6 +189,27 @@ static void child(void) {
     wait_sets("masked", 4, both, 2, NULL, 0, 5000, &block);
     printf("%s.masked.delivered %d\n", who, (int)delivered);
     drain(0, "masked.read");
+
+    // Forty carrier sockets in one set (#1051): fd 3 and MANY more
+    // connections, every one writable at once; then, once the root has
+    // sent one byte on each of the MANY and said so on fd 3, every one of
+    // them is readable at once. Each answer is the whole set, never a
+    // partial wake, because each is asked only after its event.
+    int many[MANY + 1];
+    many[0] = 3;
+    tell(3, 'n');
+    for (int i = 1; i <= MANY; i++) {
+        many[i] = (int)call(syscall(SYS_socket, AF_INET, SOCK_STREAM, 0));
+        if (syscall(SYS_connect, many[i], peer_address, sizeof *peer_address) != 0) {
+            value("many.connect", -1);
+            return;
+        }
+    }
+    int nmany = many[MANY] + 1;
+    poll_sets("many.write", nmany, NULL, 0, many, MANY + 1);
+    char done;
+    value("many.done", syscall(SYS_read, 3, &done, 1));
+    poll_sets("many.read", nmany, many + 1, MANY, NULL, 0);
 }
 
 int main(int argc, char **argv) {
@@ -184,7 +234,7 @@ int main(int argc, char **argv) {
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     socklen_t size = sizeof address;
     value("bind", syscall(SYS_bind, listener, &address, sizeof address));
-    value("listen", syscall(SYS_listen, listener, 1));
+    value("listen", syscall(SYS_listen, listener, MANY + 1));
     value("getsockname", syscall(SYS_getsockname, listener, &address, &size));
     int pipe_fds[2];
     value("pipe", syscall(SYS_pipe2, pipe_fds, 0));
@@ -206,6 +256,7 @@ int main(int argc, char **argv) {
         } else {
             value("dup.socket", 0);
         }
+        peer_address = &address;
         child();
         _exit(0);
     }
@@ -226,9 +277,20 @@ int main(int argc, char **argv) {
             record("both.socket", syscall(SYS_write, peer, &byte, 1));
             break;
         case 'm':
+            record("masked.asleep", asleep(pid));
             record("kill", syscall(SYS_kill, pid, SIGUSR1));
             record("masked.pipe", syscall(SYS_write, pipe_fds[1], &byte, 1));
             break;
+        case 'n': {
+            long sent = 0;
+            for (int i = 0; i < MANY; i++) {
+                int conn = (int)syscall(SYS_accept4, listener, NULL, NULL, 0);
+                if (conn >= 0 && syscall(SYS_write, conn, &byte, 1) == 1) sent++;
+            }
+            record("many.sent", sent);
+            record("many.done", syscall(SYS_write, peer, &byte, 1));
+            break;
+        }
         }
     }
     int status = 0;
