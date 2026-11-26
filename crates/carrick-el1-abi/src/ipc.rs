@@ -905,6 +905,8 @@ pub struct IpcSelectOutput {
     pub sets: [IpcUserVa; 3],
     pub words: u32,
     pub timeval: bool,
+    /// Whether the set's carrier members are registered (#1051).
+    pub hosts: SelectHosts,
     pub ready: i16,
 }
 
@@ -913,8 +915,29 @@ impl IpcSelectOutput {
         sets: [IpcUserVa(0); 3],
         words: 0,
         timeval: false,
+        hosts: SelectHosts::None,
         ready: 0,
     };
+}
+
+/// The carrier half of a readiness set's operation (#1051). A set naming
+/// host descriptors is admitted [`SelectHosts::Owed`]: its
+/// `ReadinessSetCtl` record has not registered them yet. Only the carrier's
+/// successful registration makes it [`SelectHosts::Registered`]. A rerun
+/// that takes an operation still owed (its record never reached the
+/// carrier: a refusal before publication, or an exit that dropped it)
+/// retires the set whole and rebuilds it from the call's entry, so a set
+/// never harvests or parks without the host members it names.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SelectHosts {
+    /// No carrier members.
+    #[default]
+    None = 0,
+    /// Carrier members whose record has not registered them.
+    Owed = 1,
+    /// Carrier members the carrier registered on the set's epoll.
+    Registered = 2,
 }
 
 /// The owned, stack-independent state of one suspended pipe/eventfd

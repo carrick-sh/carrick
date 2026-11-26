@@ -1195,7 +1195,16 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 }
                 return poll_result(frame, result);
             }
-            if readiness_set::names_set(region, &op) {
+            if op.select.hosts == carrick_el1_abi::ipc::SelectHosts::Owed {
+                // The set's record never registered its carrier members (a
+                // refusal before publication dropped it, or the exit that
+                // would publish it replayed the call first). Retire the set
+                // whole and rebuild it from this entry as an accepted
+                // replay: the mask stays armed and the deadline is the
+                // call's, never reread.
+                finish(sched, token, region);
+                Some(Err(op.deadline))
+            } else if readiness_set::names_set(region, &op) {
                 return readiness_set::resume(
                     sched,
                     frame,
@@ -1206,8 +1215,9 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     token,
                     op,
                 );
+            } else {
+                Some(Ok((pollfd, op.deadline, token, op)))
             }
-            Some((pollfd, op.deadline, token, op))
         }
         Ok(None) => None,
     };
@@ -1215,18 +1225,27 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
     // A resumed or slot-wait-replayed call's mask is already armed; it never
     // reads sigmask or timeout from user memory again.
     let mut sigmask = None;
+    let (resumed, rebuilt) = match resumed {
+        Some(Ok(resumed)) => (Some(resumed), None),
+        Some(Err(deadline)) => (None, Some(deadline)),
+        None => (None, None),
+    };
     let (mut pollfd, deadline, mut retained) = if let Some((pollfd, deadline, token, op)) = resumed
     {
         (pollfd, deadline, Some((token, op)))
     } else {
-        let accepted = user.take_accepted_epoll_wait();
+        // An owed set's rebuild is an accepted replay of its own deadline.
+        let accepted = rebuilt.or_else(|| {
+            user.take_accepted_epoll_wait().map(|accepted| {
+                accepted
+                    .deadline
+                    .map_or(carrick_el1_abi::ipc::IpcCounterDeadline::NONE, |tick| {
+                        carrick_el1_abi::ipc::IpcCounterDeadline::at(tick.raw())
+                    })
+            })
+        });
         let mut pollfd = PollFd::default();
-        if let Some(accepted) = accepted {
-            let deadline = accepted
-                .deadline
-                .map_or(carrick_el1_abi::ipc::IpcCounterDeadline::NONE, |tick| {
-                    carrick_el1_abi::ipc::IpcCounterDeadline::at(tick.raw())
-                });
+        if let Some(deadline) = accepted {
             if user.interrupt_pending_wait() {
                 *keep_sigmask = true;
                 let result = LINUX_EINTR.guest_retval();
@@ -2880,6 +2899,42 @@ fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<
     }
 }
 
+/// Record that the carrier registered a readiness set's host members
+/// (#1051): the operation its `ReadinessSetCtl` record published is no
+/// longer owed, so the rerun that takes it harvests the whole set. Only an
+/// operation this exact task admitted owed can be registered.
+pub fn register_native_set_hosts(
+    region: &IpcRegion<'_>,
+    binding: carrick_el1_abi::ExecutionBinding,
+    operation: carrick_sched_core::object_wait::OperationToken,
+) -> Result<
+    carrick_sched_core::object_wait::OperationToken,
+    crate::native_process_runtime::NativeProcessError,
+> {
+    use crate::native_process_runtime::{NativeProcessError, NativeServiceQuarantine};
+    let token = from_sched_token(operation).ok_or(NativeProcessError::ServiceQuarantined(
+        NativeServiceQuarantine::IpcOperationToken,
+    ))?;
+    let mut op = region
+        .operation(&token)
+        .map_err(|_| NativeProcessError::Stale)?;
+    if op.task.0 != binding.task.raw()
+        || op.mm.0 != binding.mm.raw()
+        || op.select.hosts != carrick_el1_abi::ipc::SelectHosts::Owed
+    {
+        return Err(NativeProcessError::ServiceQuarantined(
+            NativeServiceQuarantine::IpcOperationBinding,
+        ));
+    }
+    op.select.hosts = carrick_el1_abi::ipc::SelectHosts::Registered;
+    region
+        .update_operation(&token, op)
+        .map_err(|_| NativeProcessError::Stale)?;
+    to_sched_token(token).map_err(|_| {
+        NativeProcessError::ServiceQuarantined(NativeServiceQuarantine::IpcOperationToken)
+    })
+}
+
 /// Retire the same IPC operation after refused backing preparation. The
 /// scheduler record authenticates its token; the arena authenticates its MM.
 pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
@@ -4443,6 +4498,131 @@ mod tests {
         for token in held {
             finish(&mut sched, token, w.region);
         }
+    }
+
+    /// #1051: a set naming a carrier member stages its `ReadinessSetCtl`
+    /// record and keeps its operation for the rerun. When that record never
+    /// reaches the carrier (a refusal before publication drops it), the
+    /// operation is still owed: the rerun through the production entry
+    /// retires the set whole and stages the record again, never harvesting
+    /// or parking without the host member. Once the carrier registered the
+    /// members, the rerun takes the operation and waits on the set.
+    #[test]
+    fn pselect6_owed_host_record_rebuilds_its_set_on_the_rerun() {
+        use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView};
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (r1, _w1, _) = w.pipe(a, BLOCK);
+        let token = carrick_el1_abi::ipc::HostResourceToken::new(77).unwrap();
+        let host = w
+            .host()
+            .open(
+                a,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Host(token).encode(),
+                    AccessMode::ReadWrite,
+                    BLOCK,
+                ),
+                false,
+            )
+            .unwrap()
+            .0;
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        let bits = (1u64 << r1) | (1u64 << host);
+        w.mem.write(MM, va, &bits.to_ne_bytes());
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            slot: u64::from(SLOT.raw()),
+            ..Default::default()
+        };
+        frame.x[0] = (r1.max(host) as u64) + 1;
+        frame.x[1] = va;
+        frame.x[8] = 72; // pselect6, no timeout, no mask
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let mut cpu = core::mem::take(&mut w.cpu);
+        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let pins = w.host().refcount(a, Fd(r1)).unwrap();
+        let native = |frame: &mut TrapFrame, owner: &mut NativeOwner<'_>, cpu: &mut FakeCpu| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_single_zone_ppoll(&mut sched, frame, &venue, owner, &mut None)
+        };
+        let staged = || {
+            let mut record = crate::dispatch::test_ring_record::take()?;
+            let view = HostFileRequestView::parse(&mut record).unwrap();
+            let header = view.header();
+            assert_eq!(header.op, HostFileOp::ReadinessSetCtl);
+            assert_eq!(header.args[1], 1, "the one carrier member");
+            Some(())
+        };
+        w.map.publish(w.a_tid, a.to_raw()).unwrap();
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
+        w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        let retained = || w.zone.record(record).has_adapter_operation();
+
+        crate::dispatch::test_ring_record::accept();
+        let before = frame;
+        assert_eq!(native(&mut frame, &mut owner, &mut cpu), IpcServed::Forward);
+        assert!(staged().is_some(), "the set stages its carrier record");
+        assert!(retained(), "and keeps its operation for the rerun");
+        assert_eq!(frame.x, before.x);
+
+        // The record is dropped before publication; the call reruns. Another
+        // thread would take the vCPU if the set parked.
+        w.queue(202, OTHER_MM, &syscall(SYS_READ, r1, va, 1, B_SVC), B_SVC);
+        let second = native(&mut frame, &mut owner, &mut cpu);
+        assert!(
+            staged().is_some(),
+            "an owed set must stage its carrier record again, not wait without it ({second:?})"
+        );
+        assert_eq!(second, IpcServed::Forward);
+        assert!(retained(), "the rebuilt set keeps one operation");
+        assert_eq!(
+            w.host().refcount(a, Fd(r1)),
+            Ok(pins),
+            "the owed set's pins were released whole"
+        );
+
+        // The carrier registers the members: the rerun waits on the set.
+        let identity = w.zone.record(record).identity();
+        let operation = carrick_core::wait::take_object_operation(&w.zone, SLOT, identity)
+            .unwrap()
+            .unwrap();
+        let operation = register_native_set_hosts(
+            w.region,
+            crate::common_entry::execution_binding(&w.task),
+            operation,
+        )
+        .unwrap();
+        carrick_core::wait::restore_object_operation(&w.zone, SLOT, identity, operation).unwrap();
+        let third = native(&mut frame, &mut owner, &mut cpu);
+        assert!(
+            staged().is_none(),
+            "a registered set publishes nothing again"
+        );
+        assert_eq!(third, SWITCHED, "it parks on the set");
+        assert!(retained(), "with its one operation");
     }
 
     /// #2588: a native child's blocking `pselect6` on a zone pipe that meets

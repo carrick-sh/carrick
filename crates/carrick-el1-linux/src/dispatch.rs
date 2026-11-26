@@ -252,13 +252,33 @@ impl GuestDispatchFrame for TrapFrame {
     }
     /// A native owner's SVC: its `Forward` reaches [`native_host_file_stage`],
     /// which publishes the retained record first.
+    ///
+    /// Owed host work under the strict allowlist turns an effect-free
+    /// `Forward` into the host replay boundary (`ServedWithWork`), which
+    /// settles that work and replays this SVC before any record publishes.
+    /// The set is then "not now": it stages nothing (its host members leave
+    /// the call unrouted, effect-free) and the replay builds it again.
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn accepts_ring_record(&self) -> bool {
-        (self.esr >> 26) & 0x3f == 0x15 && arm_native_entry(self).is_some()
+        (self.esr >> 26) & 0x3f == 0x15
+            && arm_native_entry(self).is_some_and(|(task, ..)| {
+                // SAFETY: ARM entry maps the ABI aperture for the lifetime of EL1.
+                let strict = unsafe { carrick_el1_abi::aperture_control() }.is_strict();
+                !(strict && task.linux.has_pending_host_work())
+            })
     }
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn stage_ring_record(&mut self, record: alloc::boxed::Box<[u8]>) {
         arm_ring_record::stage(self.slot as usize, record);
+    }
+    /// A host test stands in for the native venue that publishes the record.
+    #[cfg(test)]
+    fn accepts_ring_record(&self) -> bool {
+        test_ring_record::accepts()
+    }
+    #[cfg(test)]
+    fn stage_ring_record(&mut self, record: alloc::boxed::Box<[u8]>) {
+        test_ring_record::stage(record);
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
@@ -1984,6 +2004,41 @@ fn arm_native_entry(
     .then_some((task, slot, zone, page, control))
 }
 
+/// The venue double of a host test: whether the frame publishes ring
+/// records, and the record the ring staged for the current call.
+#[cfg(test)]
+pub(crate) mod test_ring_record {
+    extern crate alloc;
+    use alloc::boxed::Box;
+    use core::cell::RefCell;
+
+    std::thread_local! {
+        static CELL: RefCell<Option<Option<Box<[u8]>>>> = const { RefCell::new(None) };
+    }
+
+    /// Publish records on this thread's frames, with none staged.
+    pub(crate) fn accept() {
+        CELL.with(|cell| *cell.borrow_mut() = Some(None));
+    }
+
+    pub(super) fn accepts() -> bool {
+        CELL.with(|cell| matches!(*cell.borrow(), Some(None)))
+    }
+
+    pub(super) fn stage(record: Box<[u8]>) {
+        CELL.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            assert!(matches!(*cell, Some(None)), "one record per accepting call");
+            *cell = Some(Some(record));
+        });
+    }
+
+    /// The record staged since [`accept`], leaving the frame accepting.
+    pub(crate) fn take() -> Option<Box<[u8]>> {
+        CELL.with(|cell| cell.borrow_mut().as_mut().and_then(Option::take))
+    }
+}
+
 /// A host record the ring built for a native owner's current SVC (a
 /// readiness set's carrier sockets), owned by that exception (#1051).
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -2011,9 +2066,10 @@ mod arm_ring_record {
     /// [`Self::take`] hands the record to the host-file stage, which
     /// publishes it. A record can never outlive the exception that staged
     /// it or reach another call: dropping an owner whose record was never
-    /// taken is a broken invariant (its set's retained operation would have
-    /// lost its host half), and so is an exception that opens a cell an
-    /// earlier exception left full.
+    /// taken releases the record (its set's retained operation is still
+    /// `SelectHosts::Owed`, so the rerun that takes it rebuilds the set
+    /// whole), and an exception that opens a cell an earlier exception left
+    /// full is a broken invariant.
     #[must_use]
     pub struct StagedRingRecord {
         slot: Option<usize>,
@@ -2048,9 +2104,8 @@ mod arm_ring_record {
             let Some(slot) = self.slot.take() else {
                 return;
             };
-            if take_cell(slot).is_some() {
-                broken();
-            }
+            // Unpublished: the owed operation, not this record, owns the set.
+            drop(take_cell(slot));
         }
     }
 
