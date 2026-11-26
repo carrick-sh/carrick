@@ -1495,15 +1495,23 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<(), Self::Error> {
-        let slot = self
-            .slots
+        let cpu = u64::from(self.slot.raw());
+        // A supply the carrier refused is withdrawn before this returns; a
+        // selection left published would be read by this CPU's next native
+        // service as its own (#3040).
+        self.slots
             .grant(usize::from(self.slot.raw()))
-            .ok_or(NativeProcessError::Stale)?;
-        if !slot.publish_cow_fault_selection(window.operation.sequence.get(), window) {
-            return Err(NativeProcessError::Busy);
-        }
-        self.crossing
-            .cross_cow_supply(UserVa::new(window.fault_page), u64::from(self.slot.raw()))
+            .ok_or(NativeProcessError::Stale)?
+            .supply_cow_selection(window, || {
+                self.crossing
+                    .cross_cow_supply(UserVa::new(window.fault_page), cpu)
+            })
+            .map_err(|refusal| match refusal {
+                carrick_el1_abi::CowSupplyRefusal::SlotOccupied
+                | carrick_el1_abi::CowSupplyRefusal::Unserved(None) => NativeProcessError::Busy,
+                carrick_el1_abi::CowSupplyRefusal::Unserved(Some(error)) => error,
+                carrick_el1_abi::CowSupplyRefusal::Lost => NativeProcessError::Stale,
+            })
     }
 
     fn supply_backing(

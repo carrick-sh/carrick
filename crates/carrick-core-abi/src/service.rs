@@ -3388,6 +3388,67 @@ mod tests {
         }
     }
 
+    /// #3040: a lane's COW supply the carrier refused leaves no selection in
+    /// the lane's slot, so another MM's unselected fault delivered on that CPU
+    /// is still served. Before, ARM left the selection published and the next
+    /// intake on the CPU was refused (`native_service.rs:1514`).
+    #[test]
+    fn refused_cow_supply_leaves_the_lane_slot_for_the_next_request() {
+        let slot = crate::PortalGrantSlot::new();
+        let a = birth(1, 1);
+        let cow = supply_window(a);
+        // A refused crossing (ARM: HVF denied, e.g. no guest COW state).
+        assert_eq!(
+            slot.supply_cow_selection(cow, || Err::<(), u8>(7)),
+            Err(crate::CowSupplyRefusal::Unserved(Some(7)))
+        );
+        // A crossing that supplied nothing and refused nothing (x86: the
+        // MM's editor was held on the other CPU).
+        assert_eq!(
+            slot.supply_cow_selection(cow, || Ok::<(), u8>(())),
+            Err(crate::CowSupplyRefusal::Unserved(None))
+        );
+        // A crossing whose carrier took the exact selection supplied it.
+        assert_eq!(
+            slot.supply_cow_selection(cow, || {
+                assert!(slot.take_cow_fault_selection(cow));
+                Ok::<(), u8>(())
+            }),
+            Ok(())
+        );
+        // A carrier that took the selection but reported a refusal leaves
+        // nothing this lane may claim.
+        assert_eq!(
+            slot.supply_cow_selection(cow, || {
+                assert!(slot.take_cow_fault_selection(cow));
+                Err::<(), u8>(7)
+            }),
+            Err(crate::CowSupplyRefusal::Lost)
+        );
+        // An occupied slot publishes nothing and leaves the occupant.
+        let occupied = crate::PortalGrantSlot::new();
+        assert!(occupied.publish_fault_selection(5, cow));
+        assert_eq!(
+            occupied.supply_cow_selection(cow, || -> Result<(), u8> {
+                panic!("an occupied slot must not cross")
+            }),
+            Err(crate::CowSupplyRefusal::SlotOccupied)
+        );
+        assert_eq!(occupied.selection_snapshot().0, 3);
+
+        // The next request on this CPU, another MM's unselected fault, is
+        // served after every refusal above.
+        let cell = ServiceCell::new();
+        let b = birth(2, 1);
+        cell.bind(b).unwrap();
+        let request = cell
+            .publish(b, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let mut ticket = cell.claim(request).unwrap();
+        assert_eq!(ticket.take_fault_selection(&slot), Ok(None));
+        assert!(ticket.complete(false).is_ok());
+    }
+
     #[test]
     fn fault_supply_transfer_survives_lane_reuse_and_cancellation() {
         let slot = crate::PortalGrantSlot::new();

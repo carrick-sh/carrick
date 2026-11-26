@@ -10,6 +10,27 @@ use carrick_mmu_core::live_descriptor_words::GrantRefusalTrace;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PortalGrantWindow;
+
+/// Why [`PortalGrantSlot::supply_cow_selection`] supplied nothing. The slot
+/// holds no selection of the lane's after any of these.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum CowSupplyRefusal<E> {
+    /// Another selection occupies the lane's slot; nothing was published.
+    SlotOccupied,
+    /// The carrier supplied nothing and the lane withdrew its selection,
+    /// with the crossing's own refusal when it reported one. A crossing that
+    /// reports none met contention (the MM's editor held elsewhere).
+    Unserved(Option<E>),
+    /// The selection was neither supplied nor withdrawable by the lane.
+    Lost,
+}
+
 #[repr(C, align(64))]
 #[derive(zerocopy::FromZeros)]
 pub struct PortalGrantSlot {
@@ -221,6 +242,37 @@ impl PortalGrantSlot {
         self.state
             .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+    /// Ask the carrier for `window`'s copy-on-write replacement through the
+    /// lane's synchronous supply crossing, leaving this slot empty on every
+    /// outcome (#3040). The lane publishes its selection, crosses, and then
+    /// owns whatever the carrier did not take: a supply the carrier did not
+    /// serve is withdrawn here, never left for a later request on this CPU.
+    /// The caller is the publishing lane, which exclusively owns this slot
+    /// until the crossing returns.
+    pub fn supply_cow_selection<E>(
+        &self,
+        window: PortalGrantWindow,
+        cross: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), CowSupplyRefusal<E>> {
+        if !self.publish_cow_fault_selection(window.operation.sequence.get(), window) {
+            return Err(CowSupplyRefusal::SlotOccupied);
+        }
+        let crossed = cross();
+        match self.pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page) {
+            // The carrier took the exact selection: it supplied a grant.
+            None if crossed.is_ok() => Ok(()),
+            Some((_, unserved)) if unserved == window => {
+                if self.take_cow_fault_selection(unserved) {
+                    Err(CowSupplyRefusal::Unserved(crossed.err()))
+                } else {
+                    Err(CowSupplyRefusal::Lost)
+                }
+            }
+            // Taken while the crossing refused, or replaced under the lane:
+            // the slot no longer names this lane's request.
+            _ => Err(CowSupplyRefusal::Lost),
+        }
     }
     pub fn fault_selection(
         &self,

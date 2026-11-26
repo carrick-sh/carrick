@@ -76,37 +76,25 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<(), Self::Error> {
-        if !self
-            .slots
+        let cpu = carrick_guest_arch::CpuId::new(u32::from(self.slot.raw()));
+        self.slots
             .grant(usize::from(self.slot.raw()))
             .ok_or(NativeProcessError::Stale)?
-            .publish_cow_fault_selection(window.operation.sequence.get(), window)
-        {
-            return Err(NativeProcessError::Busy);
-        }
-        // The crossing names the selected page: a copy that spans pages
-        // may need its grant for a later page than the one it starts on.
-        carrick_x86_carrier::entry::cross_owner_grant(
-            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-            UserVa::new(window.fault_page),
-        );
-        // The carrier met this MM's editor held on the other CPU and
-        // supplied nothing: the selection is still this CPU's. Withdraw it;
-        // the copy is contended, not failed.
-        let slot = self
-            .slots
-            .grant(usize::from(self.slot.raw()))
-            .ok_or(NativeProcessError::Stale)?;
-        if let Some((_, unserved)) =
-            slot.pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
-        {
-            return Err(if slot.take_cow_fault_selection(unserved) {
-                NativeProcessError::Busy
-            } else {
-                NativeProcessError::Stale
-            });
-        }
-        Ok(())
+            .supply_cow_selection(window, || {
+                // The crossing names the selected page: a copy that spans
+                // pages may need its grant for a later page than the one it
+                // starts on.
+                carrick_x86_carrier::entry::cross_owner_grant(cpu, UserVa::new(window.fault_page));
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .map_err(|refusal| match refusal {
+                // The carrier met this MM's editor held on the other CPU and
+                // supplied nothing; the lane withdrew its selection. The copy
+                // is contended, not failed.
+                carrick_el1_abi::CowSupplyRefusal::SlotOccupied
+                | carrick_el1_abi::CowSupplyRefusal::Unserved(_) => NativeProcessError::Busy,
+                carrick_el1_abi::CowSupplyRefusal::Lost => NativeProcessError::Stale,
+            })
     }
     fn supply_backing(
         &mut self,
