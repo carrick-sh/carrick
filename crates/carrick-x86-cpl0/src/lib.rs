@@ -217,7 +217,7 @@ mod test_support {
     /// while the PC is that `SYSCALL` itself: RIP + 2 is the RCX the
     /// instruction saved (#2900). A rerun rewinds such a context into the
     /// instruction in front of its `SYSCALL`.
-    pub const INJECT_MISLABELLED_RESUME_CENSUS: u64 = 0xffff_ffff_ffff_fe48;
+    pub const INJECT_MISLABELLED_RESUME_CENSUS: u64 = 0xffff_ffff_ffff_fe4b;
     static MISLABELLED_RESUMES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
 

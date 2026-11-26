@@ -27,7 +27,7 @@
  *   0 every step matched Linux */
 #define INJECT_OWNED_COPY_BUSY_ONCE -485 /* 0x...fe1b */
 #define INJECT_EDITOR_BUSY_ONCE -495     /* 0x...fe11 */
-#define INJECT_MISLABELLED_RESUME_CENSUS -440 /* 0x...fe48 */
+#define INJECT_MISLABELLED_RESUME_CENSUS -437 /* 0x...fe4b */
 #ifndef ROUNDS
 #define ROUNDS 4
 #endif
