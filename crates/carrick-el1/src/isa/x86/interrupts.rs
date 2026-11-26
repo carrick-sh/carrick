@@ -241,4 +241,12 @@ pub mod hardware {
         }
         None
     }
+    /// # Safety
+    /// CPL0 reads the mapped local APIC Interrupt Request Register (IRR):
+    /// whether `vector` is accepted and not yet delivered on this CPU.
+    pub unsafe fn vector_requested(vector: u8) -> bool {
+        let offset = 0x200 + u64::from(vector / 32) * 0x10;
+        let word = unsafe { core::ptr::read_volatile((LAPIC_VA + offset) as *const u32) };
+        word & (1 << (vector % 32)) != 0
+    }
 }

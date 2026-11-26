@@ -4262,6 +4262,40 @@ fn production_leader_queued_behind_a_polling_worker_runs_when_its_slice_ends() {
     );
 }
 
+/// #3053 on x86 CPL0, deterministically: the peer CPU's production idle
+/// pass is stopped right after it read its conditions; this CPU arms the
+/// peer's scan hold (the condition, then its reschedule vector), and the
+/// peer goes on only once that vector is pending in its IRR. The vector is
+/// the hold's only wake. A pass that drained vectors after its reads
+/// consumed it and slept past the hold (exit 90); a pass that drains first
+/// still has it pending at HLT, and its next pass takes the hold. Exit 91:
+/// the ordered pass did not run, so nothing was proven.
+#[test]
+fn production_idle_pass_publication_after_its_read_still_wakes_it() {
+    bounded_contention_witness(
+        "production_idle_pass_publication_after_its_read_still_wakes_it",
+        "native_idle_peer_wake.S",
+        &["-DAFTER_IDLE_READ=1"],
+        "a scan hold published after the peer's idle read",
+    );
+}
+
+/// #3053 on x86 CPL0, deterministically: the peer CPU is stopped once its
+/// slot is published IdleWfi, right before HLT, and this CPU publishes host
+/// work on the peer's task with no vector, as the host does for a CPU
+/// stopped in a crossing. Only the durable word announces it. An idle path
+/// that sleeps without rechecking it never rings the host (exit 90); one
+/// that rechecks the durable wake words before HLT settles it.
+#[test]
+fn production_idle_host_work_published_before_hlt_is_settled() {
+    bounded_contention_witness(
+        "production_idle_host_work_published_before_hlt_is_settled",
+        "native_idle_peer_wake.S",
+        &["-DBEFORE_IDLE_HLT=1"],
+        "host work published on the peer before its HLT",
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is

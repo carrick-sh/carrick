@@ -167,6 +167,48 @@ mod test_support {
     static SCAN_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// The held slot, plus one (0: none).
     static SCAN_HOLD_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// Wake the peer CPU and stop its next idle pass right after the pass
+    /// has read its conditions (the scan hold above, timers), until this
+    /// CPU says it published (#3053). The peer's pass then goes on only
+    /// once the reschedule vector of that publication is pending in its
+    /// IRR: the publication lands exactly between the pass's read and the
+    /// rest of the pass, and its vector is the only wake it has.
+    pub const INJECT_ORDER_PEER_AFTER_IDLE_READ: u64 = 0xffff_ffff_ffff_fe5c;
+    /// Wake the peer CPU and stop it right after its idle slot is published
+    /// IdleWfi, before HLT, until this CPU says it published (#3053). This
+    /// CPU then publishes host work on the peer's task with no vector
+    /// ([`INJECT_MARK_PEER_HOST_WORK`]): only the durable word announces it.
+    pub const INJECT_ORDER_PEER_BEFORE_IDLE_HLT: u64 = 0xffff_ffff_ffff_fe56;
+    /// 1 once the armed peer is stopped at its ordering point, else 0.
+    pub const INJECT_ORDER_PEER_REACHED: u64 = 0xffff_ffff_ffff_fe57;
+    /// This CPU's publication is complete: the stopped peer goes on.
+    pub const INJECT_ORDER_PEER_PUBLISHED: u64 = 0xffff_ffff_ffff_fe58;
+    /// Ordered peer passes that went on after this CPU's publication (and,
+    /// after the idle read, with its reschedule vector pending in the IRR).
+    pub const INJECT_ORDER_PEER_CENSUS: u64 = 0xffff_ffff_ffff_fe59;
+    /// Publish host work on the stopped peer's task, sending no vector.
+    pub const INJECT_MARK_PEER_HOST_WORK: u64 = 0xffff_ffff_ffff_fe5a;
+    /// 1 while the stopped peer's task still has host work pending, else 0.
+    pub const INJECT_PEER_HOST_WORK_PENDING: u64 = 0xffff_ffff_ffff_fe5b;
+    const ORDER_AFTER_READ: u8 = 1;
+    const ORDER_BEFORE_HLT: u8 = 2;
+    const ORDER_ARMED: u8 = 1;
+    const ORDER_REACHED: u8 = 2;
+    const ORDER_PUBLISHED: u8 = 3;
+    /// Which ordering point is armed ([`ORDER_AFTER_READ`] or
+    /// [`ORDER_BEFORE_HLT`]), 0 for none.
+    static ORDER_POINT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// The ordered slot, plus one (0: none).
+    static ORDER_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static ORDER_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static ORDER_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The arming reschedule was sent: its vector is in the peer's IRR or
+    /// already taken, so the peer's pending-vector check sees it.
+    static ORDER_ARM_SENT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// The stopped peer's current task, published at its ordering point.
+    static ORDER_PEER_TASK: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
     /// The calling member's next user-memory preparation finds its space
     /// editor held, and the holder releases it before the member enrolls on
     /// the owner wait (#2416): the wait settles before its park.
@@ -532,6 +574,111 @@ mod test_support {
             core::hint::spin_loop();
         }
         SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
+    }
+
+    /// Called on each pass of the idle scheduler on `slot`, right after the
+    /// pass has read its conditions (#3053).
+    pub fn order_after_idle_read(
+        slot: carrick_sched_core::SlotId,
+        task: &'static carrick_el1_abi::CurrentTask,
+    ) {
+        order_peer(slot, task, ORDER_AFTER_READ);
+    }
+
+    /// Called once the idle scheduler on `slot` has published it IdleWfi,
+    /// right before it may execute HLT (#3053).
+    pub fn order_before_idle_hlt(
+        slot: carrick_sched_core::SlotId,
+        task: &'static carrick_el1_abi::CurrentTask,
+    ) {
+        order_peer(slot, task, ORDER_BEFORE_HLT);
+    }
+
+    /// Stop the armed slot at `point` until the other CPU has published,
+    /// once. No spin bound: only the publication ends the stop, and the
+    /// test's own bound fails a run that never publishes.
+    fn order_peer(
+        slot: carrick_sched_core::SlotId,
+        task: &'static carrick_el1_abi::CurrentTask,
+        point: u8,
+    ) {
+        if ORDER_POINT.load(Ordering::Acquire) != point
+            || ORDER_SLOT.load(Ordering::Acquire) != slot.raw() + 1
+            || ORDER_STATE.load(Ordering::Acquire) != ORDER_ARMED
+            || !ORDER_ARM_SENT.load(Ordering::Acquire)
+        {
+            return;
+        }
+        // Stop only at a pass that owes no wake already: a vector still
+        // pending here (the arming reschedule, a timer) would end the sleep
+        // under test by itself. Such a pass goes on; the next one stops.
+        // SAFETY: CPL0 on this CPU, with its local APIC mapped.
+        if [
+            carrick_el1::isa::x86::interrupts::TIMER_VECTOR,
+            carrick_el1::isa::x86::interrupts::KICK_VECTOR,
+            carrick_el1::isa::x86::interrupts::RESCHED_VECTOR,
+        ]
+        .into_iter()
+        .any(|vector| unsafe {
+            carrick_el1::isa::x86::interrupts::hardware::vector_requested(vector)
+        }) {
+            return;
+        }
+        ORDER_PEER_TASK.store(
+            task as *const carrick_el1_abi::CurrentTask as usize,
+            Ordering::Release,
+        );
+        if ORDER_STATE
+            .compare_exchange(
+                ORDER_ARMED,
+                ORDER_REACHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        while ORDER_STATE.load(Ordering::Acquire) != ORDER_PUBLISHED {
+            core::hint::spin_loop();
+        }
+        if point == ORDER_AFTER_READ {
+            // The publication's reschedule vector is the wake under test:
+            // go on only once it is accepted here and not yet delivered.
+            // SAFETY: CPL0 on this CPU, with its local APIC mapped.
+            while !unsafe {
+                carrick_el1::isa::x86::interrupts::hardware::vector_requested(
+                    carrick_el1::isa::x86::interrupts::RESCHED_VECTOR,
+                )
+            } {
+                core::hint::spin_loop();
+            }
+        }
+        ORDER_POINT.store(0, Ordering::Release);
+        ORDER_PASSES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn arm_peer_order(
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+        point: u8,
+    ) -> Option<u64> {
+        let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+        if ORDER_STATE.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        ORDER_SLOT.store(peer.raw() + 1, Ordering::Release);
+        ORDER_POINT.store(point, Ordering::Release);
+        ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
+        carrick_el1::isa::x86::interrupt::send_resched(peer)
+            .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
+        ORDER_ARM_SENT.store(true, Ordering::Release);
+        Some(0)
+    }
+
+    fn ordered_peer_task() -> Option<&'static carrick_el1_abi::CurrentTask> {
+        let address = ORDER_PEER_TASK.load(Ordering::Acquire);
+        // SAFETY: the peer published its retained current-task record.
+        (address != 0).then(|| unsafe { &*(address as *const carrick_el1_abi::CurrentTask) })
     }
 
     /// A fork MM acquisition an injected root hold can refuse.
@@ -1214,6 +1361,31 @@ mod test_support {
             INJECT_PEER_SCAN_HELD => {
                 Some(u64::from(SCAN_HOLD.load(Ordering::Acquire) >= SCAN_HELD))
             }
+            INJECT_ORDER_PEER_AFTER_IDLE_READ => arm_peer_order(binding, ORDER_AFTER_READ),
+            INJECT_ORDER_PEER_BEFORE_IDLE_HLT => arm_peer_order(binding, ORDER_BEFORE_HLT),
+            INJECT_ORDER_PEER_REACHED => Some(u64::from(
+                ORDER_STATE.load(Ordering::Acquire) >= ORDER_REACHED,
+            )),
+            INJECT_ORDER_PEER_PUBLISHED => ORDER_STATE
+                .compare_exchange(
+                    ORDER_REACHED,
+                    ORDER_PUBLISHED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+                .then_some(0),
+            INJECT_ORDER_PEER_CENSUS => Some(ORDER_PASSES.load(Ordering::Acquire)),
+            INJECT_MARK_PEER_HOST_WORK => {
+                if ORDER_STATE.load(Ordering::Acquire) != ORDER_REACHED {
+                    return None;
+                }
+                ordered_peer_task()?.linux.mark_pending_host_work();
+                Some(0)
+            }
+            INJECT_PEER_HOST_WORK_PENDING => Some(u64::from(
+                ordered_peer_task()?.linux.has_pending_host_work(),
+            )),
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
             INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE => EARLY_RELEASE_TASK
                 .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)
