@@ -10847,6 +10847,68 @@ fn task_only_unleased_owned_frame_leaves_no_stage2_map() {
     );
 }
 
+/// Exact generation admission: a root slot from G1's pool, offered to a
+/// composition running in G2 after G1's destroy, must be refused, and the
+/// G2 rows installed before it rolled back. Before the transaction the slot
+/// failed only at its own custody transfer, after the earlier rows were
+/// already mapped, and nothing rolled them back.
+#[test]
+fn task_only_stale_generation_pooled_root_is_refused_and_rolls_back() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let root_ipa = 0x9a00_1600_0000u64;
+    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    let g1_pool = custody.root_slot_pool().expect("G1 root slot pool");
+    let g1_handle = g1_pool.allocate_slot().expect("G1 root slot");
+    let g1_generation = g1_handle.vm_generation();
+    let (slot_ipa, slot_len) = (g1_handle.ipa(), g1_handle.len());
+    let slot_host = g1_handle.as_mut_ptr();
+    drop(g1_pool);
+    destroy_vm_with_custody(&custody, "stale pooled root witness G1").expect("destroy G1");
+    let g2 = custody.begin_create().expect("begin G2");
+    custody.commit_create(g2).expect("commit G2");
+    assert_ne!(g1_generation, Some(g2), "precondition: the slot is G1's");
+    let records_before = custody.stage2_record_identities();
+    plan.mappings.push(ProcessMappingDesc {
+        start: crate::memory::LINUX_PAGE_TABLES_BASE + 0x40_0000,
+        ipa: slot_ipa,
+        end: slot_ipa + slot_len as u64,
+        stage2_lease: Some(GlobalFrameStage2Lease::fixed(slot_ipa, slot_len as u64)),
+        host: ProcessMappingHost::PooledRootSlot { handle: g1_handle },
+        size: slot_len,
+        physical_ipa: slot_ipa,
+        physical_host_addr: slot_host,
+        physical_size: slot_len,
+        inventory_backing: InventoryBackingIdentity::Private(slot_ipa),
+        perms: carrick_hal::MemPerms::ReadWrite,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        inherited_frame: None,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(
+        result.is_err(),
+        "a G1 pooled root slot must not join a G2 composition"
+    );
+    drop(result);
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, 0x20_0000)
+            && !ScopedStage2MapTestStub::is_mapped(root_ipa + 0x20_0000, 0x20_0000),
+        "the stale slot's refusal must roll back the G2 rows installed before it"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|record| records_before.contains(record)),
+        "the stale slot's refusal must terminalize every new G2 record"
+    );
+}
+
 /// The destroy route: a composition in G1 has registered a global-frame
 /// owner when G1 is destroyed and the carrier exit finalizes (and removes)
 /// that owner. Rolling the composition back must accept that terminal state
