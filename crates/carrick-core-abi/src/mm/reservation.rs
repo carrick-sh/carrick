@@ -479,7 +479,8 @@ pub enum AnonymousHintVenue {
 pub trait ReservationGeometry {
     const RESERVATIONS_OFFSET: usize;
     const ZONE_OFFSET: usize;
-    const REGION_BASE: u64;
+    /// The guest address and size of the bootstrap metadata arena the
+    /// ring's allocator carves token-0 reservation banks from.
     const BOOTSTRAP_BASE: u64;
     const BOOTSTRAP_SIZE: u64;
     /// The exclusive end of this ISA's user virtual address space.

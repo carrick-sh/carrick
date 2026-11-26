@@ -122,10 +122,12 @@ impl HostReservationProvider for CarrierReservations {
         }
         let mut nodes = ResolvedReservationNodes::default();
         let region = self.access.region().map_err(|_| Refusal::Stale)?;
-        // SAFETY: the prepared view retains the same region owner and all
-        // resolved extent pins; refresh runs before taking any MM permit.
+        // SAFETY: the prepared view retains the same region owner (whose
+        // bootstrap metadata arena lies inside it) and all resolved extent
+        // pins; refresh runs before taking any MM permit.
         unsafe {
-            nodes.refresh(table, &*self.access, region)?;
+            let bootstrap = region.add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize);
+            nodes.refresh(table, &*self.access, bootstrap)?;
         }
         let view = Arc::new(Prepared {
             access: Arc::clone(&self.access),

@@ -12,7 +12,6 @@ pub struct NativeReservationGeometry;
 impl owner::ReservationGeometry for NativeReservationGeometry {
     const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
     const ZONE_OFFSET: usize = EL1_ZONE_OFFSET as usize;
-    const REGION_BASE: u64 = EL1_REGION_BASE;
     const BOOTSTRAP_BASE: u64 = EL1_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = EL1_BOOTSTRAP_METADATA_SIZE;
     const USER_VA_END: u64 = carrick_guest_arch::AARCH64_USER_VA_END;
@@ -33,7 +32,6 @@ pub struct X86Cpl0ReservationGeometry;
 impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
     const RESERVATIONS_OFFSET: usize = carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize;
     const ZONE_OFFSET: usize = carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize;
-    const REGION_BASE: u64 = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
     const BOOTSTRAP_BASE: u64 = carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE;
     const USER_VA_END: u64 = carrick_guest_arch::X86_64_USER_VA_END;
@@ -50,6 +48,14 @@ impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
 pub type X86Cpl0Reservations =
     owner::SharedReservations<LinuxReservationPolicy, X86Cpl0ReservationGeometry>;
 pub type X86Cpl0Zone = carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>;
+/// The x86 host's view of the CPL0 table's node banks. CPL0's allocator
+/// carves every bank from its bootstrap arena (it has no dynamic grants), so
+/// the view resolves token-0 banks only and refuses a dynamic one.
+pub type X86Cpl0ResolvedNodes = owner::ResolvedReservationNodes<
+    carrick_core_abi::mm::residency::NoDynamicResidencyPin,
+    LinuxReservationPolicy,
+    X86Cpl0ReservationGeometry,
+>;
 /// One locked root of the x86 CPL0 table, as its release venue hands it out.
 pub type X86Cpl0Root<'a> = owner::Reservations<
     'a,

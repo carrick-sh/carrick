@@ -43,6 +43,24 @@ impl Region {
                 .cast()
         }
     }
+    /// The tables as the Exec service reaches them. The fixture's bootstrap
+    /// arena is the region's EL1 one: it publishes no bank there.
+    fn tables(&self) -> X86ExecTables<'_> {
+        // SAFETY: the retained region spans the arena for the fixture's life.
+        unsafe {
+            X86ExecTables::new(
+                self.roots(),
+                self.zone(),
+                core::ptr::NonNull::new(
+                    self.0
+                        .as_ptr()
+                        .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+                        .cast_mut(),
+                )
+                .unwrap(),
+            )
+        }
+    }
     /// Publish the closed, unadmitted root of `successor`, as the ring does
     /// before it asks for an exec.
     fn publish_successor(&self, successor: u64) {
@@ -272,8 +290,7 @@ impl Fixture {
             &mut self.preparations,
             &mut self.stock,
             &mut self.frames,
-            self.region.roots(),
-            self.region.zone(),
+            self.region.tables(),
             wake,
             [9; 16],
         )
@@ -282,8 +299,7 @@ impl Fixture {
 
     fn root(&self) -> SuccessorRoot<'_> {
         SuccessorRoot {
-            roots: self.region.roots(),
-            zone: self.region.zone(),
+            tables: self.region.tables(),
             successor: ReservationMm::new(SUCCESSOR).unwrap(),
         }
     }
@@ -457,8 +473,7 @@ fn exec_service_stages_a_static_successor() {
         preparation,
         &mut fixture.stock,
         &mut fixture.frames,
-        fixture.region.roots(),
-        fixture.region.zone(),
+        fixture.region.tables(),
     )
     .unwrap();
     assert_eq!(fixture.stock.table_stock().len(), 16);
@@ -713,8 +728,7 @@ fn the_carrier_exit_drain_releases_every_row_and_reports_the_first_failure() {
         &mut fixture.preparations,
         &mut fixture.stock,
         &mut fixture.frames,
-        fixture.region.roots(),
-        fixture.region.zone(),
+        fixture.region.tables(),
         StockReleaseWake::new(|| {}),
         [9; 16],
     )
@@ -762,7 +776,7 @@ fn one_row_at_carrier_exit(fixture: &mut Fixture, sealed: bool) {
 
 fn drain_at_carrier_exit(fixture: &mut Fixture) -> Result<usize, TrapError> {
     release_x86_execs_at_carrier_exit(
-        Ok((fixture.region.roots(), fixture.region.zone())),
+        Ok(fixture.region.tables()),
         &mut fixture.preparations,
         &mut fixture.stock,
         &mut fixture.frames,

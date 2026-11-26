@@ -37,7 +37,7 @@ use carrick_el1::isa::x86_initial_mm::{
     InitialMmError, InitialStackSpec, build_initial_stack, image_frame_demand,
 };
 use carrick_el1::memory::reservations::{
-    NoRootWait, Refusal, X86Cpl0Root, X86Cpl0RootReleaseVenue,
+    NoRootWait, Refusal, X86Cpl0ResolvedNodes, X86Cpl0Root, X86Cpl0RootReleaseVenue,
 };
 use carrick_guest_arch::{ExecutionGeneration, TaskIdentity, TaskSerial};
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
@@ -442,21 +442,88 @@ pub enum X86ExecStage {
     Refused(LinuxErrno),
 }
 
+/// The carrier's CPL0 tables as the host Exec service reaches them: the
+/// reservation table, the zone, and the host alias of the bootstrap
+/// metadata arena CPL0 carves the table's node banks from. A host root
+/// lock sees a grown node pool only through a view resolved from that
+/// arena (#3046), so the three travel together.
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+pub struct X86ExecTables<'z> {
+    pub roots: &'z X86Cpl0Reservations,
+    pub zone: &'z X86Cpl0Zone,
+    bootstrap: core::ptr::NonNull<u8>,
+}
+
+impl<'z> X86ExecTables<'z> {
+    /// # Safety
+    /// `bootstrap` must alias the whole bootstrap metadata arena of the
+    /// carrier that owns `roots`, mapped for as long as `'z`.
+    pub unsafe fn new(
+        roots: &'z X86Cpl0Reservations,
+        zone: &'z X86Cpl0Zone,
+        bootstrap: core::ptr::NonNull<u8>,
+    ) -> Self {
+        Self {
+            roots,
+            zone,
+            bootstrap,
+        }
+    }
+
+    /// The node banks published now, resolved for one root lock.
+    fn nodes(&self, nodes: &mut X86Cpl0ResolvedNodes) -> Result<(), Refusal> {
+        // SAFETY: `new`'s contract: the arena alias is live for `'z`.
+        unsafe {
+            nodes.refresh(
+                self.roots,
+                &carrick_core_abi::mm::residency::NoDynamicResidencyResolver,
+                self.bootstrap,
+            )
+        }
+    }
+}
+
 /// The successor's closed reservation root: its rows are imported, or the
 /// import is aborted, with the root lock held only for that.
 struct SuccessorRoot<'z> {
-    roots: &'z X86Cpl0Reservations,
-    zone: &'z X86Cpl0Zone,
+    tables: X86ExecTables<'z>,
     successor: ReservationMm,
 }
 
 impl SuccessorRoot<'_> {
+    /// Hold the successor's root for `edit`, through a view of every node
+    /// bank published when the lock is taken. CPL0 publishes banks on its
+    /// own CPUs while this one is stopped, so a bank published after the
+    /// view resolved refuses the lock `MetadataRequired`: not now, never an
+    /// answer. Banks only grow (at most `BANKS`), so each rerun resolves a
+    /// newer generation, and `edit` runs once.
     fn locked<R>(
         &self,
         edit: impl FnOnce(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
-        let index = self
-            .zone
+        let mut edit = Some(edit);
+        let mut nodes = X86Cpl0ResolvedNodes::default();
+        loop {
+            self.tables.nodes(&mut nodes)?;
+            let resolved = nodes.bank_count();
+            match self.locked_with(&nodes, &mut edit) {
+                Err(Refusal::MetadataRequired)
+                    if edit.is_some() && self.tables.roots.storage_generation() > resolved => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn locked_with<R, E>(
+        &self,
+        nodes: &X86Cpl0ResolvedNodes,
+        edit: &mut Option<E>,
+    ) -> Result<R, Refusal>
+    where
+        E: FnOnce(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
+    {
+        let X86ExecTables { roots, zone, .. } = self.tables;
+        let index = zone
             .spaces
             .find(self.successor.raw())
             .ok_or(Refusal::Stale)?;
@@ -475,18 +542,19 @@ impl SuccessorRoot<'_> {
             }
         };
         let release = SpaceReleaseVenue {
-            zone: self.zone,
+            zone,
             waker: Waker::Host,
             deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                 &deliver,
             ),
         };
-        let result = X86Cpl0RootReleaseVenue::new(self.roots, release)?
-            .lock(index.index(), self.successor, &NoRootWait)
+        let result = X86Cpl0RootReleaseVenue::new(roots, release)?
+            .lock_resolved(index.index(), self.successor, nodes, &NoRootWait)
             .and_then(|mut model| {
                 if model.mm() != self.successor || model.is_admitted() {
                     return Err(Refusal::Stale);
                 }
+                let edit = edit.take().ok_or(Refusal::Invalid)?;
                 edit(&mut model)
             });
         if woke.get() {
@@ -546,8 +614,7 @@ pub fn stage_x86_exec<T, C, F, P, A>(
     preparations: &mut ExecPreparations<X86ExecPreparation<F::Data>, P, A>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
-    roots: &X86Cpl0Reservations,
-    zone: &X86Cpl0Zone,
+    tables: X86ExecTables<'_>,
     wake: StockReleaseWake,
     random: [u8; 16],
 ) -> Result<X86ExecStage, TrapError>
@@ -556,8 +623,7 @@ where
     F: X86ExecFrames,
 {
     let root = SuccessorRoot {
-        roots,
-        zone,
+        tables,
         successor: request.successor,
     };
     let demand = request.image.demand();
@@ -749,15 +815,14 @@ pub fn release_x86_exec<T, C, F>(
     preparation: X86ExecPreparation<F::Data>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
-    roots: &X86Cpl0Reservations,
-    zone: &X86Cpl0Zone,
+    tables: X86ExecTables<'_>,
 ) -> Result<X86ExecRequest, TrapError>
 where
     T: ChildAddressTags,
     F: X86ExecFrames,
 {
     let mut failures = ReleaseFailures::default();
-    let request = release_x86_exec_steps(preparation, stock, frames, roots, zone, &mut failures);
+    let request = release_x86_exec_steps(preparation, stock, frames, tables, &mut failures);
     failures.finish(request)
 }
 
@@ -765,8 +830,7 @@ fn release_x86_exec_steps<T, C, F>(
     preparation: X86ExecPreparation<F::Data>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
-    roots: &X86Cpl0Reservations,
-    zone: &X86Cpl0Zone,
+    exec_tables: X86ExecTables<'_>,
     failures: &mut ReleaseFailures,
 ) -> X86ExecRequest
 where
@@ -785,8 +849,7 @@ where
     failures.note(frames.release(build));
     failures.note(
         SuccessorRoot {
-            roots,
-            zone,
+            tables: exec_tables,
             successor: request.successor,
         }
         .abort()
@@ -848,7 +911,7 @@ where
 /// before any row is retired: a carrier without them keeps its rows, and the
 /// owner's census still names them unretired. Returns the rows retired.
 pub fn release_x86_execs_at_carrier_exit<T, C, F, P, A>(
-    tables: Result<(&X86Cpl0Reservations, &X86Cpl0Zone), TrapError>,
+    tables: Result<X86ExecTables<'_>, TrapError>,
     owner: &mut ExecPreparations<X86ExecPreparation<F::Data>, P, A>,
     stock: &mut ForkStock<T, C>,
     frames: &mut F,
@@ -857,7 +920,7 @@ where
     T: ChildAddressTags,
     F: X86ExecFrames,
 {
-    let (roots, zone) = tables?;
+    let tables = tables?;
     let retired = owner.retire_at_carrier_exit();
     let rows = retired.len();
     let mut failures = ReleaseFailures::default();
@@ -868,7 +931,7 @@ where
         if row.retirement.sealed {
             cancel_x86_exec_steps(preparation, stock, frames, &mut failures);
         } else {
-            release_x86_exec_steps(preparation, stock, frames, roots, zone, &mut failures);
+            release_x86_exec_steps(preparation, stock, frames, tables, &mut failures);
         }
     }
     failures.finish(rows)
@@ -1009,7 +1072,7 @@ fn carrier_exec_read<M: CarrierMemoryIo>(
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
-    fn exec_tables(ram: &GuestRam) -> Result<(&X86Cpl0Reservations, &X86Cpl0Zone), TrapError> {
+    fn exec_tables(ram: &GuestRam) -> Result<X86ExecTables<'_>, TrapError> {
         let roots = ram
             .host_ptr(
                 META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
@@ -1022,12 +1085,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 size_of::<X86Cpl0Zone>(),
             )
             .ok_or_else(|| fail("exec zone"))?;
+        let bootstrap = ram
+            .host_ptr(
+                ALLOCATOR_GPA,
+                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
+            )
+            .and_then(core::ptr::NonNull::new)
+            .ok_or_else(|| fail("exec bootstrap metadata arena"))?;
         // SAFETY: boot initialized both aligned records in the retained
-        // metadata window, which `ram` keeps alive.
+        // metadata window, and physical bootstrap backs CPL0's whole
+        // bootstrap metadata arena at `ALLOCATOR_GPA`; `ram` keeps both
+        // alive.
         Ok(unsafe {
-            (
+            X86ExecTables::new(
                 &*roots.cast::<X86Cpl0Reservations>(),
                 &*zone.cast::<X86Cpl0Zone>(),
+                bootstrap,
             )
         })
     }
@@ -1057,7 +1130,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Ok(X86ExecStage::Refused(errno));
         }
         let ram = Arc::clone(&self.ram);
-        let (roots, zone) = Self::exec_tables(&ram)?;
+        let tables = Self::exec_tables(&ram)?;
         let mut frames = CarrierExecFrames {
             vm: &mut self._vm,
             next: &mut self.anonymous_next_gpa,
@@ -1071,8 +1144,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             &mut self.exec_owner,
             &mut self.fork_stock,
             &mut frames,
-            roots,
-            zone,
+            tables,
             wake,
             random,
         )
@@ -1093,14 +1165,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Err(fail("exec successor not prepared"));
         };
         let ram = Arc::clone(&self.ram);
-        let (roots, zone) = Self::exec_tables(&ram)?;
+        let tables = Self::exec_tables(&ram)?;
         let mut frames = CarrierExecFrames {
             vm: &mut self._vm,
             next: &mut self.anonymous_next_gpa,
             inventory: &self.frame_inventory,
             rollback_fault: &self.initial_rollback_fault,
         };
-        release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)
+        release_x86_exec(preparation, &mut self.fork_stock, &mut frames, tables)
     }
 
     /// Retire every exec row the run left unadopted (#2799) and return what
@@ -1302,7 +1374,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     }
 
     fn exec_zone(&self) -> Result<&X86Cpl0Zone, TrapError> {
-        Ok(Self::exec_tables(&self.ram)?.1)
+        Ok(Self::exec_tables(&self.ram)?.zone)
     }
 
     /// Finish a claimed exec once the carrier's loader has run: a loader
@@ -2146,7 +2218,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         successor: ReservationMm,
     ) -> Result<NonZeroU64, TrapError> {
         let ram = Arc::clone(&self.0.ram);
-        let (roots, zone) = Cpl0HostCustody::<M>::exec_tables(&ram)?;
+        let tables = Cpl0HostCustody::<M>::exec_tables(&ram)?;
+        let X86ExecTables { roots, zone, .. } = tables;
         let layout = carrick_el1_linux::exec_successor::successor_layout()
             .map_err(|error| fail(format!("successor layout: {error:?}")))?;
         let index = zone
@@ -2165,14 +2238,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         roots
             .publish(index.index(), successor, layout)
             .map_err(|error| fail(format!("successor root: {error:?}")))?;
-        SuccessorRoot {
-            roots,
-            zone,
-            successor,
-        }
-        .locked(|model| Ok(NonZeroU64::new(model.incarnation().raw())))
-        .map_err(root_fault)?
-        .ok_or_else(|| fail("successor root generation"))
+        SuccessorRoot { tables, successor }
+            .locked(|model| Ok(NonZeroU64::new(model.incarnation().raw())))
+            .map_err(root_fault)?
+            .ok_or_else(|| fail("successor root generation"))
     }
 
     /// Claim an exec for `successor` as the ring's ticket would, on behalf
