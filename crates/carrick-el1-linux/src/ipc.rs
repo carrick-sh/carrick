@@ -1201,8 +1201,13 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                 // would publish it replayed the call first). Retire the set
                 // whole and rebuild it from this entry as an accepted
                 // replay: the mask stays armed and the deadline is the
-                // call's, never reread.
+                // call's, never reread. The rebuilt set owes only what its
+                // own build stages: a replacement naming no carrier member
+                // must not inherit the retired set's debt.
                 finish(sched, token, region);
+                if let Some(layout) = &mut select {
+                    layout.hosts = carrick_el1_abi::ipc::SelectHosts::None;
+                }
                 Some(Err(op.deadline))
             } else if readiness_set::names_set(region, &op) {
                 return readiness_set::resume(
@@ -4623,6 +4628,236 @@ mod tests {
         );
         assert_eq!(third, SWITCHED, "it parks on the set");
         assert!(retained(), "with its one operation");
+    }
+
+    /// The shared setup of an owed set: `pselect6` over an in-zone pipe and
+    /// a host descriptor whose first entry staged its carrier record and
+    /// kept its operation, still owed (the record was never registered).
+    /// `timeout` is the call's timespec address, or 0.
+    fn owed_select(
+        w: &World,
+        timeout: u64,
+    ) -> (TrapFrame, TableId, i32, u64, carrick_sched_core::RecordId) {
+        let a = w.table(w.a_tid);
+        let (r1, _w1, _) = w.pipe(a, BLOCK);
+        let token = carrick_el1_abi::ipc::HostResourceToken::new(77).unwrap();
+        let host = w
+            .host()
+            .open(
+                a,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Host(token).encode(),
+                    AccessMode::ReadWrite,
+                    BLOCK,
+                ),
+                false,
+            )
+            .unwrap()
+            .0;
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        let bits = (1u64 << r1) | (1u64 << host);
+        w.mem.write(MM, va, &bits.to_ne_bytes());
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            elr: A_SVC + 4,
+            slot: u64::from(SLOT.raw()),
+            ..Default::default()
+        };
+        frame.x[0] = (r1.max(host) as u64) + 1;
+        frame.x[1] = va;
+        frame.x[4] = timeout;
+        frame.x[8] = 72; // pselect6, no mask
+        w.map.publish(w.a_tid, a.to_raw()).unwrap();
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
+        w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        (frame, a, r1, va, record)
+    }
+
+    /// #1051 (#3045 pre-review P0 2): an owed set's rebuild owes only what
+    /// its own build stages. When the rerun's sets name only in-zone pipes,
+    /// the replacement parks on them with nothing owed, and its wake
+    /// harvests the set it accepted. Linux copies the sets once at entry:
+    /// another thread rewriting them while the call is blocked changes
+    /// nothing. A replacement that inherited the debt retired and rebuilt
+    /// itself on the wake, rereading the rewritten sets.
+    #[test]
+    fn pselect6_owed_set_rebuilt_over_zone_pipes_harvests_what_it_accepted() {
+        let mut w = world();
+        let (mut frame, a, r1, va, _record) = owed_select(&w, 0);
+        let (r2, w2, _) = w.pipe(a, BLOCK);
+        // B shares A's descriptor table (a CLONE_FILES child).
+        w.map.publish(202, a.to_raw()).unwrap();
+        let b_va = 0x50000;
+        w.mem.map(OTHER_MM, b_va, PAGE);
+        w.mem.write(OTHER_MM, b_va, b"x");
+        let mut cpu = core::mem::take(&mut w.cpu);
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let native = |frame: &mut TrapFrame,
+                      owner: &mut NativeOwner<'_>,
+                      cpu: &mut FakeCpu,
+                      out: &mut Option<PollOutput>| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_single_zone_ppoll(&mut sched, frame, &venue, owner, out)
+        };
+        crate::dispatch::test_ring_record::accept();
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut None),
+            IpcServed::Forward
+        );
+        assert!(crate::dispatch::test_ring_record::take().is_some());
+
+        // The record is dropped; before the rerun the sets name two in-zone
+        // pipes. B, which runs once A blocks, writes the second pipe.
+        let bits = (1u64 << r1) | (1u64 << r2);
+        w.mem.write(MM, va, &bits.to_ne_bytes());
+        frame.x[0] = (r1.max(r2) as u64) + 1;
+        let a_regs = frame.x;
+        let b_write = syscall(SYS_WRITE, w2, b_va, 1, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu, &mut None),
+            SWITCHED,
+            "A parks on the pipes and B runs"
+        );
+        assert!(
+            crate::dispatch::test_ring_record::take().is_none(),
+            "a set naming no carrier member stages no record"
+        );
+        // While A is blocked its sets are rewritten to the empty pipe only.
+        w.mem.write(MM, va, &(1u64 << r1).to_ne_bytes());
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        assert_eq!(frame.elr, B_SVC, "A waits, B runs");
+        let mut b = b_write;
+        assert_eq!(serve_ipc(&mut sched, &mut b, &venue, &mut user), RETURNED);
+        assert_eq!(b.x[0], 1, "B's write wakes A");
+        // B blocks on the empty pipe, handing the vCPU back to A.
+        let mut g = syscall(SYS_READ, r1, b_va, 1, B_SVC);
+        assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
+        assert_eq!(g.x, a_regs, "A replays its call");
+        reenter(&mut g, A_SVC);
+        let mut out = None;
+        let resumed = native(&mut g, &mut owner, &mut cpu, &mut out);
+        assert_eq!(
+            (resumed, g.x[0]),
+            (RETURNED, 1),
+            "the woken set reports the pipe it accepted"
+        );
+        let Some(PollOutput::Select { spans, result: 1 }) = out else {
+            panic!("expected the select's read set");
+        };
+        assert_eq!(
+            u64::from_ne_bytes(spans[0].1[..8].try_into().unwrap()),
+            1u64 << r2,
+            "the accepted set, never the rewritten one"
+        );
+    }
+
+    /// #1051 (#3045 pre-review P0 3): an owed set's rerun with a caught
+    /// signal pending (a cancelled carrier record reruns this way) answers
+    /// EINTR through the ring's interrupted-wait path: the remaining time is
+    /// written to the call's timeout, the fd sets are left alone, nothing is
+    /// staged again and the set is retired whole.
+    #[test]
+    fn pselect6_owed_set_interrupted_on_its_rerun_writes_its_remaining_timeout() {
+        let mut w = world();
+        let timeout = 0x30000;
+        w.mem.map(MM, timeout, PAGE);
+        let mut spec = [0u8; 16];
+        spec[..8].copy_from_slice(&5i64.to_ne_bytes());
+        w.mem.write(MM, timeout, &spec);
+        let (mut frame, a, r1, _va, record) = owed_select(&w, timeout);
+        let mut cpu = core::mem::take(&mut w.cpu);
+        let pins = w.host().refcount(a, Fd(r1)).unwrap();
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let mut owner = NativeOwner::new(&w, 0x90000, &mask);
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let mut native =
+            |frame: &mut TrapFrame, owner: &mut NativeOwner<'_>, out: &mut Option<PollOutput>| {
+                let mut sched = Sched {
+                    handoff: None,
+                    zone: &w.zone,
+                    slot: SLOT,
+                    task: &w.task,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                    counters: w.counters,
+                };
+                serve_single_zone_ppoll(&mut sched, frame, &venue, owner, out)
+            };
+        crate::dispatch::test_ring_record::accept();
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut None),
+            IpcServed::Forward
+        );
+        assert!(crate::dispatch::test_ring_record::take().is_some());
+        assert!(w.zone.record(record).has_adapter_operation());
+
+        owner.signal = true;
+        let mut out = None;
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut out),
+            IpcServed::Returned { switched: false }
+        );
+        let eintr = carrick_syscall_abi::LINUX_EINTR.guest_retval();
+        assert_eq!(frame.x[0], eintr as u64);
+        assert!(
+            crate::dispatch::test_ring_record::take().is_none(),
+            "an interrupted rerun stages nothing"
+        );
+        assert!(
+            !w.zone.record(record).has_adapter_operation(),
+            "the set is retired"
+        );
+        assert_eq!(w.host().refcount(a, Fd(r1)), Ok(pins), "its pins released");
+        let Some(PollOutput::Select { spans, result }) = out else {
+            panic!("an interrupted select writes its remaining timeout");
+        };
+        assert_eq!(result, eintr);
+        assert_eq!(spans.len(), 1, "only the timeout, never the fd sets");
+        assert_eq!(spans[0].0.raw(), timeout);
+        let seconds = i64::from_ne_bytes(spans[0].1[..8].try_into().unwrap());
+        assert!((0..=5).contains(&seconds), "remaining {seconds}s of 5s");
     }
 
     /// #2588: a native child's blocking `pselect6` on a zone pipe that meets
