@@ -17406,6 +17406,30 @@ mod window_size_door {
         assert_bytes(&read_all(&plain_pin), &expected, "the punched descriptor");
         assert!(!plain_host.exists(), "the unlinked name was recreated");
         assert!(!windowed_host.exists(), "the unlinked name was recreated");
+
+        // A resize of the same descriptions goes through their descriptors
+        // too: a shrink of the windowed one is fenced and changes nothing,
+        // the other resizes, and no name is ever recreated.
+        assert_eq!(
+            run.call(SYS_FTRUNCATE, None, [windowed_fd, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+        );
+        assert_bytes(&read_all(&windowed_pin), &counting_bytes(8192), "windowed");
+        assert_eq!(
+            run.call(SYS_FTRUNCATE, None, [plain_fd, 4096, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(plain_pin.metadata().unwrap().len(), 4096);
+        assert_eq!(
+            run.call(SYS_FALLOCATE, None, [plain_fd, 0, 0, 16384, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(plain_pin.metadata().unwrap().len(), 16384);
+        assert!(!plain_host.exists(), "a resize recreated the unlinked name");
+        assert!(
+            !windowed_host.exists(),
+            "a resize recreated the unlinked name"
+        );
     }
 
     /// #2975 r36 pre-review P1: `O_CREAT` of an existing file on a writable
