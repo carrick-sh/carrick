@@ -151,3 +151,80 @@ fn a_pin_and_a_retire_release_the_extent_exactly_once() {
         assert!(core.teardown().is_ok());
     });
 }
+
+type GrantCore = CarrierCore<ExplorerVenue, u8, u8, u8>;
+
+struct GrantShell {
+    core: Mutex<GrantCore>,
+}
+
+impl GrantShell {
+    fn with<T>(&self, transition: impl FnOnce(&mut GrantCore) -> T) -> T {
+        let mut core = self.core.lock().unwrap();
+        let out = transition(&mut core);
+        core.check_invariants().unwrap();
+        out
+    }
+}
+
+/// PR 1a: a guest member holds the MM's editor while the shell supplies a
+/// copy-on-write grant. The supply is "not now", changes nothing, and reruns
+/// after the guest's release; it is supplied exactly once, and the editor
+/// ends free.
+#[test]
+fn a_cow_supply_is_busy_once_then_supplied_after_the_guest_editor_releases() {
+    loom::model(|| {
+        let mm = MmKey::new(NonZeroU64::MIN);
+        let mut core = GrantCore::new(carrier());
+        assert!(core.guest_editor(mm, true));
+        let shell = Arc::new(GrantShell {
+            core: Mutex::new(core),
+        });
+        let guest = {
+            let shell = Arc::clone(&shell);
+            thread::spawn(move || shell.with(|core| assert!(core.guest_editor(mm, false))))
+        };
+        let supplier = {
+            let shell = Arc::clone(&shell);
+            thread::spawn(move || {
+                let excluded = ExcludedMm::claimed(mm);
+                let demand = CowDemand {
+                    page: 0x1000,
+                    replacement: extent(0x10_000, 0x4000),
+                };
+                let mut busy = 0;
+                loop {
+                    match shell.with(|core| core.supply_cow(&excluded, demand)) {
+                        Ok(ticket) => {
+                            shell.with(|core| {
+                                core.finish_supply_cow(ticket, Supplied::Published(7))
+                                    .unwrap()
+                            });
+                            return busy;
+                        }
+                        // A real shell enrols on the editor's release and
+                        // probes once; the model yields to the guest.
+                        Err(MmRefusal::NotNow(NotNow::EditorRelease(key))) => {
+                            assert_eq!(key, mm);
+                            busy += 1;
+                            thread::yield_now();
+                        }
+                        Err(other) => panic!("supply refused: {other:?}"),
+                    }
+                }
+            })
+        };
+        guest.join().unwrap();
+        let _busy = supplier.join().unwrap();
+        let mut core = Arc::try_unwrap(shell)
+            .ok()
+            .unwrap()
+            .core
+            .into_inner()
+            .unwrap();
+        assert_eq!(core.editor(mm), Some(MmEditor::Free));
+        assert_eq!(core.grant_count(), 1);
+        assert_eq!(core.retire_all_mms().unwrap(), [7]);
+        assert!(core.teardown().is_ok());
+    });
+}
