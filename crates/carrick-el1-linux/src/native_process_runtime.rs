@@ -1344,6 +1344,11 @@ pub(crate) struct PendingSignalDelivery {
     /// is the frame-failure verdict (`force_delivery_fault`), not another
     /// frame attempt (#3004).
     pub(crate) frame_refused: bool,
+    /// The operation the wait this signal interrupted left on its record
+    /// (an anonymous edit's or a metadata request's replay token), held here
+    /// while the deferred frame copy parks the record on its own service
+    /// token, and put back on the record when the delivery reruns (#3043).
+    pub(super) borrowed_operation: Option<carrick_sched_core::object_wait::OperationToken>,
 }
 impl PendingSignalDelivery {
     pub(crate) fn new(
@@ -1363,6 +1368,7 @@ impl PendingSignalDelivery {
             saved_mask,
             thread_blocked,
             frame_refused: false,
+            borrowed_operation: None,
         }
     }
 }
