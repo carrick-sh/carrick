@@ -588,7 +588,7 @@ pub fn signal_user_return(
             &mut X86SignalMachine::new(address),
         ) {
             if route != carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended {
-                fatal_boot!(route.name());
+                fatal_boot!(route);
             }
             suspended = true;
         }
@@ -676,7 +676,7 @@ pub fn signal_irq_return(
             &mut X86SignalMachine::new(runtime_address),
         ) {
             if route != carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended {
-                fatal_boot!(route.name());
+                fatal_boot!(route);
             }
             suspended = true;
         }

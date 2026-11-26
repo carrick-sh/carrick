@@ -18,7 +18,7 @@ macro_rules! x86_fatal_boot {
     // A typed verdict's name as the report's message, so the fatal says which
     // verdict reached the site (#3043).
     ($what:expr) => {
-        $crate::isa::x86::transport::fatal_boot_named(file!(), line!(), column!(), $what)
+        $crate::isa::x86::transport::fatal_boot_named(file!(), line!(), column!(), &$what)
     };
 }
 
@@ -104,15 +104,20 @@ pub fn fatal_boot_at(file: &'static str, line: u32, column: u32) -> ! {
     )
 }
 
-/// [`fatal_boot_at`] with the refused verdict's name as the message. Raise it
-/// with `x86_fatal_boot!(name)`.
+/// [`fatal_boot_at`] with the refused verdict as the message. Raise it with
+/// `x86_fatal_boot!(verdict)`.
 #[cold]
 #[inline(never)]
-pub fn fatal_boot_named(file: &'static str, line: u32, column: u32, what: &'static str) -> ! {
-    publish_fatal_report(
-        carrick_el1_abi::PanicReportKind::FatalSite,
-        &carrick_el1_abi::PanicReport::at_site(file, line, column, what),
-    )
+pub fn fatal_boot_named(
+    file: &'static str,
+    line: u32,
+    column: u32,
+    what: &dyn core::fmt::Display,
+) -> ! {
+    use core::fmt::Write;
+    let mut report = carrick_el1_abi::PanicReport::new(file, line, column);
+    let _ = write!(report.message_writer(), "{what}");
+    publish_fatal_report(carrick_el1_abi::PanicReportKind::FatalSite, &report)
 }
 
 /// Publish a ring panic or carrier fatal record through the fatal port, then

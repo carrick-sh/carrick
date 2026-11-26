@@ -51,8 +51,8 @@ pub enum SignalReturnRefusal {
     FrameCopy,
     /// Preparing the handler frame's range found a broken owner.
     FramePrepare,
-    /// Retaining the deferred delivery failed.
-    RetainDelivery,
+    /// Retaining the deferred delivery failed, with the owner's error.
+    RetainDelivery(NativeProcessError),
     /// Forcing SIGSEGV after a failed delivery failed.
     ForceSigsegv,
 }
@@ -99,7 +99,7 @@ impl SignalReturnRefusal {
             Self::NoHandler => "signal return refused: no_handler",
             Self::FrameCopy => "signal return refused: frame_copy",
             Self::FramePrepare => "signal return refused: frame_prepare",
-            Self::RetainDelivery => "signal return refused: retain_delivery",
+            Self::RetainDelivery(_) => "signal return refused: retain_delivery",
             Self::ForceSigsegv => "signal return refused: force_sigsegv",
         }
     }
@@ -121,6 +121,23 @@ impl SignalReturnRoute {
             Self::Suspended => CompletionRoute::Suspended,
             Self::Served => CompletionRoute::Served,
             Self::Refused(_) => CompletionRoute::InvalidCompletion,
+        }
+    }
+}
+
+/// The verdict's name, then any error it carries: a fatal report's message.
+impl core::fmt::Display for SignalReturnRoute {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The fatal report's message holds about 48 bytes: a carried error
+        // leads, so its variant survives the cut.
+        match self {
+            Self::Refused(SignalReturnRefusal::RetainDelivery(
+                NativeProcessError::ServiceQuarantined(quarantine),
+            )) => write!(f, "retain_delivery quarantined {quarantine:?}"),
+            Self::Refused(SignalReturnRefusal::RetainDelivery(error)) => {
+                write!(f, "retain_delivery {error:?}")
+            }
+            _ => f.write_str(self.name()),
         }
     }
 }
@@ -462,7 +479,9 @@ where
                     Err(NativeProcessError::GroupExitCustody) => {
                         return Some(machine.group_exit_custody(task));
                     }
-                    Err(_) => return Some(SignalReturnRoute::Refused(Refusal::RetainDelivery)),
+                    Err(error) => {
+                        return Some(SignalReturnRoute::Refused(Refusal::RetainDelivery(error)));
+                    }
                 }
             }
             Err(_) => {
