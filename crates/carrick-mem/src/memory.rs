@@ -5327,10 +5327,28 @@ fn write_el1_hook(
                 emit(bytes, &mut cursor, enc_cmp_w16_imm(6) | (1 << 5));
                 let ordinary_signal_branch = cursor;
                 emit(bytes, &mut cursor, 0);
+                // NativeOwnerCancel enters from the EL0 PC the vCPU stopped
+                // at, or a fault's: a resume point, never after an SVC (#2900).
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_movz_xn(17, FRAME_POSITION_AT_SYSCALL, 0),
+                );
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(17, 16, FRAME_POSITION_OFFSET),
+                );
                 emit(bytes, &mut cursor, enc_movz_w16(0xfffc) | 1);
                 let fatal_store_branch = cursor;
                 emit(bytes, &mut cursor, 0);
                 let ordinary_signal = cursor;
+                // The host checkpoints a forwarded SVC at its own return.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_str_xt_xn(31, 16, FRAME_POSITION_OFFSET),
+                );
                 emit(bytes, &mut cursor, enc_cmp_w16_imm(5) | (1 << 5)); // cmp w17, #5
                 let eligible_branch = cursor;
                 emit(bytes, &mut cursor, 0);
@@ -5367,12 +5385,6 @@ fn write_el1_hook(
                     enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
                 );
                 emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280));
-                // The host checkpoints a forwarded SVC at its own return.
-                emit(
-                    bytes,
-                    &mut cursor,
-                    enc_str_xt_xn(31, 16, FRAME_POSITION_OFFSET),
-                );
             } else {
                 emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
                 emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
@@ -9023,7 +9035,17 @@ mod syscall_mailbox_tests {
         let signal = words(EL0_SIGNAL_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET);
         let fault = words(EL0_FAULT_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET + 0x800);
         assert!(syscall.contains(&after) && !stores_at(&syscall));
-        assert!(signal.contains(&after) && !stores_at(&signal));
+        // A host signal checkpoint follows a forwarded SVC; a
+        // NativeOwnerCancel (syndrome 0xfffc) enters at a stopped EL0 PC or
+        // a fault's, its resume point.
+        assert!(signal.contains(&after));
+        let fatal_syndrome = enc_movz_w16(0xfffc) | 1;
+        assert!(
+            signal
+                .windows(3)
+                .any(|run| run[..2] == at && run[2] == fatal_syndrome),
+            "NativeOwnerCancel stores a resume point with its syndrome"
+        );
         assert!(stores_at(&irq) && !irq.contains(&after));
         assert!(stores_at(&fault) && !fault.contains(&after));
         assert_eq!(
