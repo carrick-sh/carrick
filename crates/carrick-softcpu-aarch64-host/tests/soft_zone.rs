@@ -39,6 +39,13 @@ const NR_SET_TID_ADDRESS: u16 = 96;
 const NR_GETTID: u16 = 178;
 const NR_PRLIMIT64: u16 = 261;
 const NR_RT_SIGACTION: u16 = 134;
+const NR_RT_SIGRETURN: u16 = 139;
+const NR_KILL: u16 = 129;
+const NR_GETPID: u16 = 172;
+/// `SA_RESTORER`: the handler returns through `sa_restorer`.
+const SA_RESTORER: u64 = 0x0400_0000;
+/// Where the caught handler stores the signal number it was given.
+const CAUGHT_OFFSET: u64 = 0xe0;
 const RLIMIT_STACK: u16 = 3;
 const SIGUSR1: u16 = 10;
 const SIG_IGN: u64 = 1;
@@ -124,6 +131,14 @@ const fn lsr(rd: u32, rn: u32, shift: u32) -> u32 {
 const fn ldr(rt: u32, rn: u32, offset: u32) -> u32 {
     0xf940_0000 | ((offset / 8) << 10) | (rn << 5) | rt
 }
+
+/// C6.2.333 STR (immediate, unsigned offset): `str xt, [xn, #offset]`.
+const fn str_imm(rt: u32, rn: u32, offset: u32) -> u32 {
+    0xf900_0000 | ((offset / 8) << 10) | (rn << 5) | rt
+}
+
+/// C6.2.254 RET: `ret` (to x30).
+const A64_RET: u32 = 0xd65f_03c0;
 
 /// A static ELF: one page of code at [`CODE_VA`], one RW page at [`DATA_VA`].
 fn build_elf(code_words: &[u32], data_init: &[(u64, &[u8])]) -> Vec<u8> {
@@ -628,4 +643,82 @@ fn soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver() {
         "no disposition reaches the host's table: {:?}",
         run.reply_census
     );
+}
+
+/// The soft root catches a signal it sends itself (#2814): it installs a
+/// `SIGUSR1` handler with `SA_RESTORER`, runs `kill(getpid(), SIGUSR1)`, the
+/// ring builds the handler's frame on the user stack, the handler stores the
+/// signal number it was given, and `rt_sigreturn` through the restorer
+/// resumes the interrupted `kill` with its result. Exits
+/// `(caught - SIGUSR1) + sigaction + kill`: 0 iff the handler was accepted,
+/// ran once with `SIGUSR1`, and both calls returned 0.
+///
+/// Red while the soft root's MM is not portal-admitted: the handler is
+/// refused `ENOSYS`, and the signal's default action ends the process.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn() {
+    let _carrier_lock = lock_soft_carrier_test();
+    const HANDLER_WORD: usize = 0x800 / 4;
+    const RESTORER_WORD: usize = 0xc00 / 4;
+    let mut action = [0u8; 32];
+    action[..8].copy_from_slice(&(CODE_VA + 0x800).to_le_bytes());
+    action[8..16].copy_from_slice(&SA_RESTORER.to_le_bytes());
+    action[16..24].copy_from_slice(&(CODE_VA + 0xc00).to_le_bytes());
+    let mut code = Vec::new();
+    code.push(movz(0, SIGUSR1, 0));
+    code.extend(mov32(1, DATA_VA + SIGACTION_OFFSET));
+    code.push(movz(2, 0, 0));
+    code.push(movz(3, 8, 0));
+    code.push(movz(8, NR_RT_SIGACTION, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    code.push(movz(8, NR_GETPID, 0));
+    code.push(A64_SVC_0);
+    code.push(movz(1, SIGUSR1, 0));
+    code.push(movz(8, NR_KILL, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(20, 0));
+    code.extend(mov32(9, DATA_VA + CAUGHT_OFFSET));
+    code.push(ldr(21, 9, 0));
+    code.push(sub_imm(0, 21, u32::from(SIGUSR1)));
+    code.push(add(0, 0, 19));
+    code.push(add(0, 0, 20));
+    exit_with_x0(&mut code);
+    assert!(code.len() <= HANDLER_WORD);
+    code.resize(HANDLER_WORD, A64_NOP);
+    // The handler: store x0 (the signal number), return to the restorer.
+    code.extend(mov32(9, DATA_VA + CAUGHT_OFFSET));
+    code.push(str_imm(0, 9, 0));
+    code.push(A64_RET);
+    code.resize(RESTORER_WORD, A64_NOP);
+    code.push(movz(8, NR_RT_SIGRETURN, 0));
+    code.push(A64_SVC_0);
+    let (run, _) = run(
+        &build_elf(&code, &[(SIGACTION_OFFSET, &action)]),
+        "/caught-sigusr1",
+        None,
+    );
+    let served = sample_el1_served(&run.engine);
+    println!(
+        "caught SIGUSR1: exit={} census={:?} served={served:?} counted_enosys={:?}",
+        run.exit_code, run.reply_census, run.counted_enosys
+    );
+    assert_eq!(
+        run.counted_enosys,
+        Vec::new(),
+        "the handler is accepted, not refused"
+    );
+    assert_eq!(
+        run.exit_code, 0,
+        "the handler ran with SIGUSR1 and kill and rt_sigaction returned 0"
+    );
+    for nr in [NR_RT_SIGACTION, NR_KILL, NR_RT_SIGRETURN] {
+        assert!(
+            served
+                .iter()
+                .any(|&(served_nr, _, count)| served_nr == u64::from(nr) && count == 1),
+            "syscall {nr} is served once in the ring: {served:?}"
+        );
+    }
 }
