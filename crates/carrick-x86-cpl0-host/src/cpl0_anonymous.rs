@@ -298,19 +298,49 @@ pub(super) struct SuppliedCow {
     handle: BackingHandle,
     grant: carrick_el1_abi::CowGrant,
 }
-impl carrick_hal::grant_ledger::PendingGrant for SuppliedCow {
-    type Grant = carrick_el1_abi::CowGrant;
-    fn grant(&self) -> &carrick_el1_abi::CowGrant {
+impl carrick_core::mm::own::GrantPayload for SuppliedCow {
+    type Key = carrick_el1_abi::CowGrant;
+    fn key(&self) -> &carrick_el1_abi::CowGrant {
         &self.grant
-    }
-    /// The replacement compound, in guest-physical space.
-    fn span(&self) -> (u64, u64) {
-        (self.grant.physical_ipa, carrick_el1_abi::COW_GRANT_SIZE)
     }
 }
 
-/// Every replacement grant this carrier supplied and has not settled.
-pub(super) type SuppliedCowGrants = carrick_hal::grant_ledger::PendingGrantLedger<SuppliedCow>;
+/// The carrier's memory-ownership core (#3061). PR 1a moves the MMs, their
+/// editor record and their copy-on-write grants into it; the backend
+/// mappings and extents stay in `CarrierMemory` until PR 1b.
+pub(super) type X86MmCore = carrick_core::mm::own::CarrierCore<X86CoreVenue, (), (), SuppliedCow>;
+
+/// The x86 carrier's answer to a broken core invariant: end the carrier.
+pub(super) struct X86CoreVenue;
+
+impl carrick_core::mm::own::CoreVenue for X86CoreVenue {
+    fn dropped_holding(_: carrick_core::mm::own::Holding) -> ! {
+        carrick_el1_linux::dispatch::invalid_completion(
+            carrick_el1_linux::dispatch::NativeInvariant::PhysicalCustody(
+                carrick_el1_linux::dispatch::PhysicalCustodyInvariant::CoreDroppedHolding,
+            ),
+        )
+    }
+}
+
+/// A fresh core for a new carrier, with a carrier identity never used before
+/// in this process.
+pub(super) fn new_mm_core() -> X86MmCore {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_CARRIER: AtomicU64 = AtomicU64::new(1);
+    let raw = NEXT_CARRIER.fetch_add(1, Ordering::Relaxed);
+    let raw = NonZeroU64::new(raw).unwrap_or(NonZeroU64::MAX);
+    // SAFETY: the counter is monotonic and never reused in this process, and
+    // a core never leaves its carrier's host custody.
+    X86MmCore::new(unsafe { carrick_core::mm::own::CarrierId::assume_unique(raw) })
+}
+
+/// The core's view of the guest exclusion the shell holds.
+fn core_excluded<'a>(
+    excluded: &'a carrick_el1_abi::ExcludedEditor<'_>,
+) -> Result<carrick_core::mm::own::ExcludedMm<'a>, TrapError> {
+    carrick_core::mm::own::ExcludedMm::of(excluded).ok_or_else(|| fail("owner COW null MM"))
+}
 
 /// Whether `receipt` is a well-formed user-write completion of exactly
 /// `grant`: one page, moved out of a compound other than the grant's, into
@@ -634,9 +664,9 @@ pub(super) enum ChildRelease<'a> {
     Retired {
         returns: &'a dyn carrick_el1_abi::RetiredReturns,
         zone: &'a X86Cpl0Zone,
-        /// The carrier's supplied copy-on-write grants: the retired MM's
-        /// leave with it (#2749).
-        supplied: &'a mut SuppliedCowGrants,
+        /// The carrier's core: the retired MM's copy-on-write grants leave
+        /// with it (#2749).
+        mms: &'a mut X86MmCore,
     },
     Unrun,
 }
@@ -692,35 +722,40 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
         .view()
         .ok_or_else(|| fail("cpl0 residency view unavailable"))?;
     let released = match release {
-        ChildRelease::Retired {
-            returns,
-            zone,
-            supplied,
-        } => match zone.spaces.unpublished(absence.mm().raw()) {
-            Some(absent) => {
-                // The retired MM's replacement grants, claimed or not, go
-                // with it: no member is left to claim one and no exclusion
-                // will settle one. Its inventory release below retires
-                // their frames with the rest of its mappings.
-                // SAFETY: retained aligned atomic-only kernel record
-                // initialized at boot.
-                let pool: &carrick_el1_abi::CowGrantPool = unsafe {
-                    memory.retained_record(FrameGpa::new(
-                        KERNEL_REGION_GPA + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET,
-                    ))
+        ChildRelease::Retired { returns, zone, mms } => {
+            match zone.spaces.unpublished(absence.mm().raw()) {
+                Some(absent) => {
+                    // The retired MM's replacement grants, claimed or not, go
+                    // with it: no member is left to claim one and no exclusion
+                    // will settle one. Its inventory release below retires
+                    // their frames with the rest of its mappings.
+                    // SAFETY: retained aligned atomic-only kernel record
+                    // initialized at boot.
+                    let pool: &carrick_el1_abi::CowGrantPool = unsafe {
+                        memory.retained_record(FrameGpa::new(
+                            KERNEL_REGION_GPA + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET,
+                        ))
+                    }
+                    .map_err(|error| fail(error.to_string()))?;
+                    pool.release_mm(&absent);
+                    let key = NonZeroU64::new(absent.key())
+                        .ok_or_else(|| fail("retired child null MM"))?;
+                    drop(
+                        mms.retire_mm(carrick_core::mm::own::MmKey::new(key))
+                            .map_err(|refusal| {
+                                fail(format!("retired child COW grants: {refusal:?}"))
+                            })?,
+                    );
+                    carrick_hal::fork_stock::release_child_mm(
+                        inventory,
+                        &residency_view,
+                        returns,
+                        &absent,
+                    )
                 }
-                .map_err(|error| fail(error.to_string()))?;
-                pool.release_mm(&absent);
-                drop(supplied.take_all(|grant| grant.grant.mm_key == absent.key()));
-                carrick_hal::fork_stock::release_child_mm(
-                    inventory,
-                    &residency_view,
-                    returns,
-                    &absent,
-                )
+                None => false,
             }
-            None => false,
-        },
+        }
         ChildRelease::Unrun => carrick_hal::fork_stock::release_unrun_child_mm(
             inventory,
             &residency_view,
@@ -1241,7 +1276,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let window = self.lifecycle_window();
         let inventory = Arc::clone(&self.frame_inventory);
         let memory = std::cell::RefCell::new(&mut self._vm);
-        let supplied = std::cell::RefCell::new(&mut self.cow_supplied);
+        let mms = std::cell::RefCell::new(&mut self.mm_core);
         let zero = [0u8; 4096];
         self.fork_stock
             .reclaim(
@@ -1263,7 +1298,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         ChildRelease::Retired {
                             returns,
                             zone,
-                            supplied: &mut supplied.borrow_mut(),
+                            mms: &mut mms.borrow_mut(),
                         },
                     )
                     .is_ok()
@@ -2229,6 +2264,59 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .checked_add(size)
                 .ok_or_else(|| fail("owner COW GPA exhausted"))?,
         );
+        // The core owns the grant from here: one supply transition for an
+        // EL0 write and a kernel user copy alike, under this exclusion.
+        let excluded = core_excluded(pause.proof())?;
+        let demand = carrick_core::mm::own::CowDemand {
+            page: window.fault_page,
+            replacement: carrick_core::mm::own::GpaExtent::new(physical, size)
+                .ok_or_else(|| fail("owner COW replacement extent"))?,
+        };
+        let ticket = self
+            .mm_core
+            .supply_cow(&excluded, demand)
+            .map_err(|refusal| fail(format!("owner COW supply refused: {refusal:?}")))?;
+        let supplied = self.publish_cow_supply(execution, gpa, physical, size, mm);
+        let outcome = match supplied {
+            Ok(cow) => carrick_core::mm::own::Supplied::Published(cow),
+            Err(error) => {
+                if self
+                    .mm_core
+                    .finish_supply_cow(ticket, carrick_core::mm::own::Supplied::Failed)
+                    .is_err()
+                {
+                    return Err(fail("owner COW supply ticket refused"));
+                }
+                return Err(error);
+            }
+        };
+        if self.mm_core.finish_supply_cow(ticket, outcome).is_err() {
+            return Err(fail("owner COW supply ticket refused"));
+        }
+        if !self
+            .grant_portal()?
+            .grant(index)
+            .ok_or_else(|| fail("owner COW slot"))?
+            .take_cow_fault_selection(window)
+        {
+            return Err(fail("owner COW demand changed during physical publication"));
+        }
+        #[cfg(feature = "test-support")]
+        editor_hold::supplied(mm);
+        drop(pause);
+        wake.finish()
+    }
+
+    /// Map one replacement compound and publish it to the MM's pool. A
+    /// failure leaves nothing exposed to the guest.
+    fn publish_cow_supply(
+        &mut self,
+        execution: GrantExecution,
+        gpa: FrameGpa,
+        physical: u64,
+        size: u64,
+        mm: NonZeroU64,
+    ) -> Result<SuppliedCow, TrapError> {
         let (mut inventory, _) = InitialInventory::stage(
             Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
@@ -2265,27 +2353,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // subsequent failure retain the extent through carrier teardown.
         inventory.expected = 1;
         inventory.guest_exposed = true;
-        // The MM owns the grant from here: whichever member claims it, for
-        // whichever page, its completion settles at the MM's next exclusion.
-        if !self.cow_supplied.insert(SuppliedCow {
+        // Whichever member claims it, for whichever page, its completion
+        // settles at the MM's next exclusion.
+        Ok(SuppliedCow {
             inventory,
             handle,
             grant,
-        }) {
-            return Err(fail("owner COW replacement supplied twice"));
-        }
-        if !self
-            .grant_portal()?
-            .grant(index)
-            .ok_or_else(|| fail("owner COW slot"))?
-            .take_cow_fault_selection(window)
-        {
-            return Err(fail("owner COW demand changed during physical publication"));
-        }
-        #[cfg(feature = "test-support")]
-        editor_hold::supplied(mm);
-        drop(pause);
-        wake.finish()
+        })
     }
 
     /// The CPL0 venue's COW step of every exclusion (#1482 P0-3): publish
@@ -2307,10 +2381,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let mut completions: Vec<_> = pool.completions(excluded).collect();
         carrick_el1_abi::order_cow_settlement(&mut completions);
-        for receipt in completions {
-            self.publish_cow_completion(excluded, receipt)?;
+        let proof = self
+            .mm_core
+            .begin_settle(&core_excluded(excluded)?)
+            .map_err(|refusal| fail(format!("owner COW settlement refused: {refusal:?}")))?;
+        let settled = completions
+            .into_iter()
+            .try_for_each(|receipt| self.publish_cow_completion(&proof, excluded, receipt));
+        if self.mm_core.finish_settle(proof).is_err() {
+            return Err(fail("owner COW settlement proof refused"));
         }
-        Ok(())
+        settled
     }
 
     /// A member's settlement crossing: it completed a copy-on-write, or saw
@@ -2353,6 +2434,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 
     fn publish_cow_completion(
         &mut self,
+        proof: &carrick_core::mm::own::SettleProof,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
         receipt: carrick_el1_abi::CowGrantCompletion,
     ) -> Result<(), TrapError> {
@@ -2361,7 +2443,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             ._vm
             .root(mm)
             .ok_or_else(|| fail("owner COW settlement root"))?;
-        let Some(mut supplied) = self.cow_supplied.take(&receipt.grant) else {
+        let Ok(mut supplied) = self.mm_core.settle_cow(proof, &receipt.grant) else {
             return Err(fail("owner COW completion names no supplied grant"));
         };
         if !exact_cow_receipt(supplied.grant, &receipt) {
