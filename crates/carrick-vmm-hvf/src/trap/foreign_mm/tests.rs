@@ -10782,6 +10782,121 @@ fn task_only_owner_shape_refusal_unmaps_the_in_flight_lease() {
     drop(borrowed);
 }
 
+/// A reusable global-frame row with owned backing but no lease is refused by
+/// the owner match; the refusal must leave no stage-2 map behind. Installing
+/// it first would leave a map no lease or owner can ever retire.
+#[test]
+fn task_only_unleased_owned_frame_leaves_no_stage2_map() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    const SIZE: usize = 0x20_0000;
+    let root_ipa = 0x9a00_1200_0000u64;
+    let frame_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
+    assert!(is_reusable_global_frame_extent(frame_ipa, SIZE as u64));
+    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    let records_before = custody.stage2_record_identities();
+    let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        SIZE,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .expect("allocate owned frame fixture");
+    let owned_addr = owned.as_ptr();
+    plan.mappings.push(ProcessMappingDesc {
+        start: frame_ipa,
+        ipa: frame_ipa,
+        end: frame_ipa + SIZE as u64,
+        stage2_lease: None,
+        host: ProcessMappingHost::Owned(owned),
+        size: SIZE,
+        physical_ipa: frame_ipa,
+        physical_host_addr: owned_addr,
+        physical_size: SIZE,
+        inventory_backing: InventoryBackingIdentity::Private(frame_ipa),
+        perms: carrick_hal::MemPerms::ReadWrite,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        inherited_frame: None,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(
+        matches!(result, Err(TrapError::Hypervisor(ref message)) if message.contains("has owned host backing without stage-2 lease")),
+        "the unleased owned frame must be refused: {:?}",
+        result.as_ref().err()
+    );
+    drop(result);
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(frame_ipa, SIZE),
+        "an unleased row must not leave its stage-2 map installed"
+    );
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, SIZE)
+            && !ScopedStage2MapTestStub::is_mapped(root_ipa + SIZE as u64, SIZE),
+        "the refusal must roll back the earlier structural mappings"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|record| records_before.contains(record)),
+        "the refusal must terminalize every new stage-2 record"
+    );
+}
+
+/// The destroy route: a composition in G1 has registered a global-frame
+/// owner when G1 is destroyed and the carrier exit finalizes (and removes)
+/// that owner. Rolling the composition back must accept that terminal state
+/// rather than fail-stop on an owner the destroy already retired.
+#[test]
+fn composition_rollback_after_generation_destroy_accepts_the_retired_owner() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    const SIZE: usize = 0x20_0000;
+    let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let custody = Arc::clone(&transport.custody);
+    let mut composition = crate::trap::ProcessStage2Composition::<
+        Vec<crate::trap::HvpatchTaskMappingState>,
+    >::begin(&custody, "destroy-route witness composition")
+    .expect("begin composition in G1");
+    let key = (
+        carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0xc0_0000,
+        SIZE as u64,
+    );
+    let backing = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        SIZE,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .expect("allocate global frame backing");
+    let mut lease = GlobalFrameStage2Lease::fixed(key.0, key.1);
+    let stage2_mapping = test_stage2_map(&custody, backing.as_ptr().cast(), key.0, SIZE, perms);
+    lease.mark_mapped(stage2_mapping);
+    let generation = register_global_frame_host_owner_in(&custody, lease, backing, perms)
+        .expect("register the composition's global owner");
+    composition
+        .registered_global_owners
+        .push((key.0, key.1, generation));
+
+    destroy_vm_with_custody(&custody, "destroy-route witness G1")
+        .expect("destroy G1 through exact custody");
+    finalize_carrier_exit_global_frame_owners_in(&custody)
+        .expect("finalize G1's terminal global owners");
+    assert!(
+        !custody.global_frame_host_owners.lock().contains_key(&key),
+        "precondition: the carrier exit removed the destroyed owner"
+    );
+
+    let rolled_back =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(composition)));
+    assert!(
+        rolled_back.is_ok(),
+        "rollback after G1's destroy must accept the destroy-retired owner, not fail-stop"
+    );
+}
+
 #[test]
 fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
