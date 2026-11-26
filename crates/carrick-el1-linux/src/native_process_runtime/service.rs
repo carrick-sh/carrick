@@ -1458,7 +1458,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 return Err(NativeProcessError::Stale);
             };
-            let retained = Box::new(PendingSignalDelivery::new(
+            let mut retained = Box::new(PendingSignalDelivery::new(
                 expected_host,
                 sig,
                 info.take(),
@@ -1466,55 +1466,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 saved_mask,
                 thread_blocked,
             ));
+            // A caught signal's handler borrows execution while the wait it
+            // interrupted keeps its replay operation on the record. The frame
+            // copy's park needs the record's operation slot for its own
+            // service token, so the retained delivery holds the borrowed one
+            // until it reruns. Custody moves under the graph lock that
+            // publishes the delivery: a sibling's close then drops both
+            // together. An adapter's operation (an IPC pin) is not borrowed:
+            // its owner retires it, so the park still refuses it.
+            let record = self.source.zone.record(self.record.id);
+            if record.has_object_operation() && !record.has_adapter_operation() {
+                match carrick_core::wait::take_object_operation(
+                    self.source.zone,
+                    self.source.slot,
+                    record.identity(),
+                ) {
+                    Ok(operation) => retained.borrowed_operation = operation,
+                    Err(_) => {
+                        drop(graph);
+                        if let SignalCopyDeferral::Supply { fault, sequence } = deferral {
+                            self.service.cancel_copyout_fault(fault.address, sequence);
+                        }
+                        return Err(NativeProcessError::Stale);
+                    }
+                }
+            }
             resources
                 .pending_signal_deliveries
                 .insert(self.record, retained);
-        }
-        // A caught signal's handler borrows execution while the wait it
-        // interrupted keeps its replay operation on the record. The frame
-        // copy's park needs the record's operation slot for its own service
-        // token, so the retained delivery holds the borrowed one until it
-        // reruns. An adapter's operation (an IPC pin) is not borrowed here:
-        // its owner retires it, so the park still refuses it.
-        let record = self.source.zone.record(self.record.id);
-        if record.has_object_operation() && !record.has_adapter_operation() {
-            let borrowed = carrick_core::wait::take_object_operation(
-                self.source.zone,
-                self.source.slot,
-                record.identity(),
-            );
-            let mut graph = self.runtime.graph.lock();
-            let retained = graph.owner.task_mut(self.key).ok().and_then(|task| {
-                task.native_mut()
-                    .resources_mut()
-                    .pending_signal_deliveries
-                    .get_mut(&self.record)
-            });
-            let held = match (borrowed, retained) {
-                (Ok(Some(operation)), Some(retained)) => {
-                    retained.borrowed_operation = Some(operation);
-                    true
-                }
-                (Ok(None), _) => true,
-                (Ok(Some(operation)), None) => {
-                    let _ = carrick_core::wait::restore_object_operation(
-                        self.source.zone,
-                        self.source.slot,
-                        record.identity(),
-                        operation,
-                    );
-                    false
-                }
-                (Err(_), _) => false,
-            };
-            drop(graph);
-            if !held {
-                let _ = self.take_pending_signal_delivery();
-                if let SignalCopyDeferral::Supply { fault, sequence } = deferral {
-                    self.service.cancel_copyout_fault(fault.address, sequence);
-                }
-                return Err(NativeProcessError::Stale);
-            }
         }
         let carrier_work = ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,
@@ -1546,7 +1525,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // retained delivery stays; leave through the owner
                 // checkpoint so the next entry rebuilds it under a fresh
                 // lease rather than looping inside this one.
-                if !matches!(self.begin_return_work()?, NativeResume::Left(_)) {
+                let left = match self.begin_return_work() {
+                    Ok(resume) => matches!(resume, NativeResume::Left(_)),
+                    Err(error) => {
+                        let _ = self.take_pending_signal_delivery();
+                        return Err(error);
+                    }
+                };
+                if !left {
                     let _ = self.take_pending_signal_delivery();
                     return Err(NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::SignalReturnWork,
