@@ -575,9 +575,10 @@ impl Vfs for BindVfs {
         if is_socket_marker(&host, flags.nofollow) {
             return Err(LINUX_ENXIO);
         }
-        let is_symlink = std::fs::symlink_metadata(&host)
-            .map(|m| m.is_symlink())
-            .unwrap_or(false);
+        // One lookup of the leaf itself, read by the symlink checks below and
+        // by a read-only mount's `O_CREAT` decision.
+        let leaf = std::fs::symlink_metadata(&host);
+        let is_symlink = leaf.as_ref().is_ok_and(|m| m.is_symlink());
 
         if is_symlink {
             if flags.create && flags.excl {
@@ -618,18 +619,20 @@ impl Vfs for BindVfs {
             // first): an existing name is `EEXIST` with `O_EXCL`; a missing
             // one (or a dangling symlink, which `O_CREAT` would follow) is
             // `EROFS` when its directory exists, else that lookup's errno.
-            match std::fs::symlink_metadata(&host) {
+            match &leaf {
                 Ok(_) if flags.excl => return Err(carrick_abi::LINUX_EEXIST),
-                Ok(_) if std::fs::metadata(&host).is_ok() => {}
+                Ok(_) if host.exists() => {}
                 Ok(_) => return Err(LINUX_EROFS),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return match host.parent().map(std::fs::metadata) {
-                        Some(Ok(parent)) if parent.is_dir() => Err(LINUX_EROFS),
-                        Some(Ok(_)) => Err(carrick_abi::LINUX_ENOTDIR),
+                    return match host.parent() {
+                        Some(parent) if parent.is_dir() => Err(LINUX_EROFS),
+                        Some(parent) if parent.exists() => Err(carrick_abi::LINUX_ENOTDIR),
                         _ => Err(LINUX_ENOENT),
                     };
                 }
-                Err(err) => return Err(map_io_error(err)),
+                Err(err) => {
+                    return Err(host_to_linux_errno(err.raw_os_error().unwrap_or(libc::EIO)));
+                }
             }
         }
         // On a read-only mount the host open never creates: an existing file
