@@ -3190,6 +3190,57 @@ fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::Fra
     inherited_frame.is_none()
 }
 
+/// The owner shapes a process composition publishes. Every shape the owner
+/// match refuses is refused here, before the row installs anything.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn validate_process_mapping_shape(mapping: &ProcessMappingDesc) -> Result<(), TrapError> {
+    let has_lease = mapping.stage2_lease.is_some();
+    if is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64) {
+        let refusal = match (&mapping.host, has_lease) {
+            (ProcessMappingHost::Owned(_), true) | (ProcessMappingHost::Borrowed { .. }, false) => {
+                return Ok(());
+            }
+            (ProcessMappingHost::Borrowed { .. }, true) => {
+                "has stage-2 lease without owned host backing"
+            }
+            (ProcessMappingHost::Owned(_), false) => "has owned host backing without stage-2 lease",
+            (ProcessMappingHost::PooledRootSlot { .. }, _) => "cannot have pooled root backing",
+        };
+        return Err(TrapError::Hypervisor(format!(
+            "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) {refusal}",
+            mapping.physical_ipa, mapping.physical_size
+        )));
+    }
+    match &mapping.host {
+        ProcessMappingHost::Owned(_) | ProcessMappingHost::PooledRootSlot { .. } if !has_lease => {
+            Err(TrapError::Hypervisor(format!(
+                "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                mapping.physical_ipa
+            )))
+        }
+        ProcessMappingHost::Borrowed {
+            structural_owner: None,
+            ..
+        } => Err(TrapError::Hypervisor(format!(
+            "borrowed structural mapping at IPA 0x{:x} lost its owner",
+            mapping.physical_ipa
+        ))),
+        ProcessMappingHost::Owned(_)
+        | ProcessMappingHost::PooledRootSlot { .. }
+        | ProcessMappingHost::Borrowed { .. } => Ok(()),
+    }
+}
+
+/// A structural (non-reusable) row whose owner this composition creates.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_mapping_needs_structural_epoch(mapping: &ProcessMappingDesc) -> bool {
+    !is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64)
+        && matches!(
+            mapping.host,
+            ProcessMappingHost::Owned(_) | ProcessMappingHost::PooledRootSlot { .. }
+        )
+}
+
 /// A fork child address space waiting for vCPU materialization on its owning
 /// host thread. Private mappings initially retain the parent's FrameId/global
 /// IPA and are read-only in each mm's independent stage-1 graph; the first
@@ -7092,6 +7143,8 @@ struct ProcessStage2Composition<R: ProcessCompositionRows> {
     structural_owners:
         std::collections::BTreeMap<(u64, usize), std::sync::Arc<StructuralBackingOwner>>,
     mm_root_stage2: Option<MmRootStage2Authority>,
+    /// Stage-2 maps installed for rows with no lease of their own.
+    unowned_mappings: Vec<carrick_aarch64::stage2::custody::Stage2Mapping>,
     rows: R,
     committed: bool,
 }
@@ -7119,6 +7172,7 @@ impl<R: ProcessCompositionRows> ProcessStage2Composition<R> {
             structural_identities: Vec::new(),
             structural_owners: std::collections::BTreeMap::new(),
             mm_root_stage2: None,
+            unowned_mappings: Vec::new(),
             rows: R::default(),
             committed: false,
         })
@@ -7162,6 +7216,9 @@ impl<R: ProcessCompositionRows> ProcessStage2Composition<R> {
 
     fn commit(mut self) -> CommittedProcessStage2<R> {
         self.committed = true;
+        // Published as before: a lease-less row's map belongs to the frame's
+        // registered owner, not to this composition.
+        drop(std::mem::take(&mut self.unowned_mappings));
         CommittedProcessStage2 {
             stage2_leases: std::mem::take(&mut self.stage2_leases),
             rows: std::mem::take(&mut self.rows),
@@ -7176,17 +7233,38 @@ impl<R: ProcessCompositionRows> Drop for ProcessStage2Composition<R> {
         if self.committed {
             return;
         }
+        let mut unmap_error = None;
+        for mapping in std::mem::take(&mut self.unowned_mappings) {
+            // A generation already gone took its mappings with it.
+            let Ok(mut stage2) = self.custody.stage2.stage2_in(mapping.generation()) else {
+                continue;
+            };
+            // SAFETY: this unpublished composition installed the extent; no
+            // guest CPU has run on it.
+            if let Err((mapping, rc)) = unsafe { stage2.unmap(mapping) } {
+                let (ipa, size) = (mapping.ipa(), mapping.size());
+                if let Some(returned) = stage2.keep_unretired(mapping, Box::new(())) {
+                    drop(returned);
+                }
+                unmap_error.get_or_insert(TrapError::Hypervisor(format!(
+                    "unpublished lease-less stage-2 map (0x{ipa:x}, 0x{size:x}) unmap failed: 0x{:x}",
+                    rc.raw()
+                )));
+            }
+        }
         let mut leases = std::mem::take(&mut self.stage2_leases);
         self.rows.take_stage2_leases(&mut leases);
         drop(std::mem::take(&mut self.rows));
         drop(self.mm_root_stage2.take());
-        if let Err(error) = rollback_partial_process_stage2_authorities(
+        let rollback = rollback_partial_process_stage2_authorities(
             &self.custody,
+            Some(self.vm_generation),
             &mut leases,
             &self.registered_global_owners,
             &self.structural_identities,
             std::mem::take(&mut self.structural_owners),
-        ) {
+        );
+        if let Some(error) = unmap_error.or(rollback.err()) {
             fail_stop_partial_process_stage2_rollback(self.context, &error);
         }
     }
@@ -7250,6 +7328,16 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
+            // Refuse every row the owner match below would refuse, and take
+            // the structural epoch, BEFORE this row installs anything: once
+            // its stage-2 map exists, only the owner constructors (which
+            // retire the lease with its backing on refusal) can fail.
+            validate_process_mapping_shape(&mapping)?;
+            let structural_epoch = if process_mapping_needs_structural_epoch(&mapping) {
+                Some(next_structural_epoch()?)
+            } else {
+                None
+            };
             if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
                 composition.admit_pooled_root(handle.vm_generation())?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
@@ -7295,11 +7383,15 @@ impl HvfVmState {
                         })
                     });
                 let stage2_mapping = map_result?;
-                if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_composition_mapped(
+                match mapping.stage2_lease.as_mut() {
+                    Some(lease) => lease.mark_composition_mapped(
                         &plan.carrier_foreign_mm_transport.custody,
                         stage2_mapping,
-                    );
+                    ),
+                    // A borrowed reusable frame row installs with no lease
+                    // of its own; the composition still unmaps it on
+                    // rollback.
+                    None => composition.unowned_mappings.push(stage2_mapping),
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
@@ -7364,13 +7456,17 @@ impl HvfVmState {
                 } else {
                     match mapping.host {
                         ProcessMappingHost::Owned(host) => {
-                            let epoch = next_structural_epoch()?;
-                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
-                                TrapError::Hypervisor(format!(
+                            // Both exist by `validate_process_mapping_shape`
+                            // and the epoch taken before the install. The
+                            // let-else drops an unmatched lease before `host`.
+                            let (Some(epoch), Some(lease)) =
+                                (structural_epoch, mapping.stage2_lease.take())
+                            else {
+                                return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
                                     mapping.physical_ipa
-                                ))
-                            })?;
+                                )));
+                            };
                             let owner = StructuralBackingOwner::new_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
@@ -7397,13 +7493,17 @@ impl HvfVmState {
                             )
                         }
                         ProcessMappingHost::PooledRootSlot { handle } => {
-                            let epoch = next_structural_epoch()?;
-                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
-                                TrapError::Hypervisor(format!(
+                            // Both exist by `validate_process_mapping_shape`
+                            // and the epoch taken before the install. The
+                            // let-else drops an unmatched lease before `host`.
+                            let (Some(epoch), Some(lease)) =
+                                (structural_epoch, mapping.stage2_lease.take())
+                            else {
+                                return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
                                     mapping.physical_ipa
-                                ))
-                            })?;
+                                )));
+                            };
                             let owner = StructuralBackingOwner::new_pooled_root_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 handle,
@@ -7534,8 +7634,6 @@ impl HvfVmState {
                 global_frame_owner_role: owner_role,
             });
         }
-        // Publication only in the generation every row was admitted in.
-        composition.ensure_publishable()?;
         let mut process_reservation = plan
             .frame_inventory
             .lock()
@@ -7640,6 +7738,17 @@ impl HvfVmState {
                     });
                 }
             }
+            // Publish only in the generation every row was admitted in.
+            if let Err(error) = composition.ensure_publishable() {
+                Self::rollback_unpublished_mappings(&mut inventory, &staged_inventory_mappings)
+                    .unwrap_or_else(|rollback_error| {
+                        carrick_fatal!(
+                            "hvpatch::frame_inventory",
+                            "rollback task-only child inventory: {rollback_error}"
+                        )
+                    });
+                return Err(error);
+            }
             inventory.initialized = true;
             process_commit = process_reservation.commit(());
         }
@@ -7716,6 +7825,16 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
+            // Refuse every row the owner match below would refuse, and take
+            // the structural epoch, BEFORE this row installs anything: once
+            // its stage-2 map exists, only the owner constructors (which
+            // retire the lease with its backing on refusal) can fail.
+            validate_process_mapping_shape(&mapping)?;
+            let structural_epoch = if process_mapping_needs_structural_epoch(&mapping) {
+                Some(next_structural_epoch()?)
+            } else {
+                None
+            };
             if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
                 composition.admit_pooled_root(handle.vm_generation())?;
                 if let Some(lease) = mapping.stage2_lease.as_mut() {
@@ -7761,11 +7880,15 @@ impl HvfVmState {
                         })
                     });
                 let stage2_mapping = map_result?;
-                if let Some(lease) = mapping.stage2_lease.as_mut() {
-                    lease.mark_composition_mapped(
+                match mapping.stage2_lease.as_mut() {
+                    Some(lease) => lease.mark_composition_mapped(
                         &plan.carrier_foreign_mm_transport.custody,
                         stage2_mapping,
-                    );
+                    ),
+                    // A borrowed reusable frame row installs with no lease
+                    // of its own; the composition still unmaps it on
+                    // rollback.
+                    None => composition.unowned_mappings.push(stage2_mapping),
                 }
             }
             let (host_mapping, structural_owner, stage2_lease, owner_generation) =
@@ -7815,13 +7938,17 @@ impl HvfVmState {
                 } else {
                     match mapping.host {
                         ProcessMappingHost::Owned(host) => {
-                            let epoch = next_structural_epoch()?;
-                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
-                                TrapError::Hypervisor(format!(
+                            // Both exist by `validate_process_mapping_shape`
+                            // and the epoch taken before the install. The
+                            // let-else drops an unmatched lease before `host`.
+                            let (Some(epoch), Some(lease)) =
+                                (structural_epoch, mapping.stage2_lease.take())
+                            else {
+                                return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
                                     mapping.physical_ipa
-                                ))
-                            })?;
+                                )));
+                            };
                             let owner = StructuralBackingOwner::new_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
@@ -7842,13 +7969,17 @@ impl HvfVmState {
                             (None, Some(owner), None, owner_generation)
                         }
                         ProcessMappingHost::PooledRootSlot { handle } => {
-                            let epoch = next_structural_epoch()?;
-                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
-                                TrapError::Hypervisor(format!(
+                            // Both exist by `validate_process_mapping_shape`
+                            // and the epoch taken before the install. The
+                            // let-else drops an unmatched lease before `host`.
+                            let (Some(epoch), Some(lease)) =
+                                (structural_epoch, mapping.stage2_lease.take())
+                            else {
+                                return Err(TrapError::Hypervisor(format!(
                                     "structural mapping at IPA 0x{:x} missing stage-2 lease",
                                     mapping.physical_ipa
-                                ))
-                            })?;
+                                )));
+                            };
                             let owner = StructuralBackingOwner::new_pooled_root_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 handle,
@@ -7951,8 +8082,6 @@ impl HvfVmState {
                 owner_generation,
             });
         }
-        // Publication only in the generation every row was admitted in.
-        composition.ensure_publishable()?;
         let mut process_reservation = plan
             .frame_inventory
             .lock()
@@ -8128,6 +8257,17 @@ impl HvfVmState {
                             length: mapping.length,
                         });
                     }
+                }
+                // Publish only in the generation every row was admitted in.
+                if let Err(error) = composition.ensure_publishable() {
+                    Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
+                        .unwrap_or_else(|rollback_error| {
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "rollback HVPatch child inventory staging: {rollback_error}"
+                            )
+                        });
+                    return Err(error);
                 }
                 inventory.initialized = true;
                 inventory.process_commit = Some(process_reservation.commit(()));

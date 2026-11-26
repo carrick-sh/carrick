@@ -3113,6 +3113,7 @@ mod carrier_vm_custody_tests {
 
         super::rollback_partial_process_stage2_authorities(
             &custody,
+            None,
             &mut [g1_lease],
             &[],
             &[],

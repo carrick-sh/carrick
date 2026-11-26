@@ -1238,6 +1238,7 @@ impl GlobalFrameStage2Lease {
     pub(crate) fn mark_mapped(&mut self, mapping: carrick_aarch64::stage2::custody::Stage2Mapping) {
         debug_assert_eq!(mapping.ipa(), self.base);
         debug_assert_eq!(mapping.size() as u64, self.length);
+        self.composition_custody = None;
         self.mapped = true;
         self.mapping = Some(mapping);
         self.pre_mapped_generation = None;
@@ -1247,6 +1248,7 @@ impl GlobalFrameStage2Lease {
         &mut self,
         generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     ) {
+        self.composition_custody = None;
         self.mapped = true;
         self.mapping = None;
         self.pre_mapped_generation = generation;
@@ -1389,6 +1391,7 @@ impl GlobalFrameStage2Lease {
             }
         }
 
+        self.composition_custody = None;
         if !self.active {
             drop(backing);
             drop(attached_keeper);
@@ -2702,6 +2705,7 @@ fn try_transfer_global_frame_stage2_lease_no_rollback(
     lease.pre_mapped_generation = None;
     lease.release_ipa = false;
     lease.backing_keeper = None;
+    lease.composition_custody = None;
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     {
         lease.drop_backing_audit = None;
@@ -3735,6 +3739,7 @@ fn retry_structural_backing_retirements_with(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn rollback_partial_process_stage2_authorities(
     custody: &CarrierVmCustody,
+    composition_generation: Option<carrick_core_abi::mm::custody::CarrierVmGeneration>,
     stage2_leases: &mut [GlobalFrameStage2Lease],
     registered_global_owners: &[(u64, u64, u64)],
     structural_identities: &[CarrierStage2RecordIdentity],
@@ -3752,7 +3757,16 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
     for &(ipa, length, generation) in registered_global_owners {
         let outcome =
             retire_global_frame_host_owner_if_generation_in(custody, ipa, length, generation);
-        if !outcome.is_retired() {
+        // Once the composition's VM generation is gone, its destroy and the
+        // carrier-exit finalization already retired (and may have removed or
+        // replaced) this owner: absence is then terminal, not deferred.
+        let terminalized_by_destroy = matches!(
+            outcome,
+            GlobalFrameRetirementOutcome::NotFound { .. }
+                | GlobalFrameRetirementOutcome::MismatchedGeneration { .. }
+        ) && composition_generation
+            .is_some_and(|generation| custody.stage2.stage2_in(generation).is_err());
+        if !outcome.is_retired() && !terminalized_by_destroy {
             rollback_error.get_or_insert_with(|| {
                 TrapError::Hypervisor(format!(
                     "partial process owner rollback deferred: {outcome:?}"

@@ -10711,10 +10711,11 @@ fn task_only_late_root_refusal_rolls_back_every_structural_owner() {
     );
 }
 
-/// A refusal after the failing row's own stage-2 map succeeded, but before
-/// its lease reached any owner, must unmap that in-flight lease too. The row
-/// is a reusable global frame with a lease but borrowed host backing, which
-/// the owner-shape match refuses only after the install.
+/// A reusable global frame with a lease but borrowed host backing has no
+/// owner shape. Before the transaction it was installed, then refused, and
+/// its mapped lease dropped in flight; now `validate_process_mapping_shape`
+/// refuses it before the install. Either way no map of it, or of the earlier
+/// structural rows, may survive the refusal.
 #[test]
 fn task_only_owner_shape_refusal_unmaps_the_in_flight_lease() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
