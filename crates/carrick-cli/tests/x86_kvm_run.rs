@@ -5,7 +5,7 @@
     target_arch = "x86_64",
     feature = "platform-linux"
 ))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
