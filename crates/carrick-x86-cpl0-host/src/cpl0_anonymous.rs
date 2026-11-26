@@ -220,6 +220,11 @@ pub(super) enum GrantBacking {
     Window,
 }
 
+struct BackingGrant {
+    op: WireOp,
+    backing: GrantBacking,
+}
+
 impl GrantBacking {
     /// The guest may now name this backing: keep it through teardown unless
     /// an exact receipt proves otherwise.
@@ -3056,10 +3061,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             execution,
             window,
             owner,
-            op,
-            GrantBacking::Private {
-                inventory: Box::new(inventory),
-                handle,
+            BackingGrant {
+                op,
+                backing: GrantBacking::Private {
+                    inventory: Box::new(inventory),
+                    handle,
+                },
             },
             reply,
             stock_observed,
@@ -3126,8 +3133,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             execution,
             window,
             owner,
-            op,
-            GrantBacking::Window,
+            BackingGrant {
+                op,
+                backing: GrantBacking::Window,
+            },
             reply,
             stock_observed,
         )
@@ -3140,11 +3149,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         execution: GrantExecution,
         window: PortalGrantWindow,
         owner: carrick_el1_abi::El1MmHandle,
-        op: WireOp,
-        mut backing: GrantBacking,
+        grant: BackingGrant,
         reply: &carrick_el1_abi::PortalGrantSlot,
         stock_observed: carrick_hal::fork_stock::StockRelease,
     ) -> Result<Result<BackingPreparation, PlanBusy>, TrapError> {
+        let BackingGrant { op, mut backing } = grant;
         let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();

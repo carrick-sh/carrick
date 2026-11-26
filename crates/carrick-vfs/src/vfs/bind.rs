@@ -588,6 +588,9 @@ impl Vfs for BindVfs {
             }
         }
         if host.is_dir() {
+            if flags.trunc {
+                return Err(LINUX_EISDIR);
+            }
             let entries = self.readdir(path)?;
             return Ok(VfsHandle::Directory {
                 path: path.to_owned(),

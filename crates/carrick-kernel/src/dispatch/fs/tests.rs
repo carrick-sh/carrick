@@ -16770,6 +16770,25 @@ mod window_size_door {
         assert_eq!(std::fs::metadata(&missing).unwrap().len(), 0);
     }
 
+    #[test]
+    fn open_truncating_directories_returns_eisdir() {
+        let _window_guard = carrick_vfs::host_size::test_resize_hook::lock_window_tests();
+        let mut run = Run::new();
+        std::fs::create_dir(run.scratch.path().join("existing_dir")).unwrap();
+        let mounted = tempfile::tempdir().unwrap();
+        std::fs::create_dir(mounted.path().join("existing_dir")).unwrap();
+        run.dispatcher.register_mount(
+            "/rw",
+            Box::new(carrick_vfs::BindVfs::new("/rw", mounted.path(), false)),
+        );
+
+        for path in ["/existing_dir", "/rw/existing_dir"] {
+            let flags = (carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_TRUNC) as u64;
+            let result = run.call(SYS_OPENAT, Some(path), [AT_FDCWD, PATH, flags, 0, 0, 0]);
+            assert_eq!(result, DispatchOutcome::errno(LINUX_EISDIR), "{path}");
+        }
+    }
+
     /// Codex r33 P0 4 (#2975): if a peer extends a windowed file beyond a
     /// growing `fallocate`'s target while `fallocate` waits for `WINDOWED`
     /// custody, `fallocate` must return `0` and preserve the longer EOF rather
@@ -16939,16 +16958,15 @@ mod window_size_door {
                     )
                     .unwrap()
             });
-            let saw_lock_hook = b_before_rx
-                .recv_timeout(std::time::Duration::from_millis(150))
-                .is_ok();
-            if saw_lock_hook {
-                assert!(
-                    b_after_rx.try_recv().is_err(),
-                    "pwrite64 on OpenDescription::File must wait behind materialized_resize"
-                );
-            }
+            b_before_rx
+                .recv()
+                .expect("pwrite64 must take materialized_resize lock");
+            assert!(
+                b_after_rx.try_recv().is_err(),
+                "pwrite64 on OpenDescription::File must wait behind materialized_resize"
+            );
             let _ = proceed_guard.0.take().unwrap().send(());
+            b_after_rx.recv().unwrap();
             let ra = ha.join().unwrap();
             let rb = hb.join().unwrap();
             assert_eq!(ra, DispatchOutcome::Returned { value: 0 });
@@ -16968,7 +16986,7 @@ mod window_size_door {
                 "host backing len != materialized copy len"
             );
             assert_eq!(metadata.size as u64, copy_len);
-            assert!(saw_lock_hook, "pwrite64 must take materialized_resize lock");
+            assert_eq!(host_len, 8192);
         });
     }
 }

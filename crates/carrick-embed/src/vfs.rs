@@ -901,6 +901,18 @@ impl Vfs for InMemoryFileVfs {
         }
     }
 
+    fn host_inode_identity(&self, path: &str) -> Option<carrick_vfs::InodeIdentity> {
+        let norm = normalize_path(path);
+        let nodes = self.nodes.read();
+        let resolved = Self::resolve_symlinks_locked(&nodes, &norm, 32).ok()?;
+        let InMemNode::HostFd { fd, .. } = nodes.get(&resolved)? else {
+            return None;
+        };
+        // SAFETY: the node owns this descriptor for the duration of the nodes read guard.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(*fd) };
+        carrick_vfs::host_size::identity(fd)
+    }
+
     fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         self.read_file_bytes(path)
     }
@@ -2180,6 +2192,54 @@ mod tests {
         assert_eq!(filtered.read_file("/data.txt").unwrap(), b"HELLO WORLD");
         let meta = filtered.lookup("/data.txt").unwrap();
         assert_eq!(meta.mode, 0o777);
+    }
+
+    mod serial_host {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn mounted_host_fd_truncate_recalls_delegated_inode_before_mutation() {
+            let region = carrick_test_support::TestEl1Region::zeroed();
+            carrick_kernel::el1_delegation::record_el1_region_host_ptr(region.as_ptr() as usize);
+            struct ClearRegion;
+            impl Drop for ClearRegion {
+                fn drop(&mut self) {
+                    carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
+                }
+            }
+            let _clear = ClearRegion;
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), b"abcdef").unwrap();
+            let vfs = InMemoryFileVfs::new();
+            vfs.add_host_file("/mount/file", file.as_file().as_raw_fd(), 6)
+                .unwrap();
+            let bytes =
+                carrick_kernel::el1_delegation::host_fd_recall_test_support::mounted_truncate_after_delegated_write(
+                    file.path(),
+                    Box::new(vfs),
+                    "/mount/file",
+                );
+            assert_eq!(
+                bytes, b"DI",
+                "mounted HostFd truncate must recall dirty delegated bytes before resizing"
+            );
+        }
+    }
+
+    #[test]
+    fn host_fd_mount_exposes_inode_for_truncate_recall() {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"before").unwrap();
+        let vfs = InMemoryFileVfs::new();
+        vfs.add_host_file("/mounted", file.as_file().as_raw_fd(), 6)
+            .unwrap();
+        let expected = carrick_vfs::host_size::identity(file.as_file().as_fd()).unwrap();
+        vfs.add_symlink("/alias", "/mounted").unwrap();
+        assert_eq!(vfs.host_inode_identity("/mounted"), Some(expected));
+        assert_eq!(vfs.host_inode_identity("/alias"), Some(expected));
     }
 
     #[test]

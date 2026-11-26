@@ -430,7 +430,7 @@ pub fn open_truncating_path(
     flags: libc::c_int,
     mode: libc::c_uint,
 ) -> Result<OwnedFd, libc::c_int> {
-    open_truncating_path_with(path, flags, mode, |_| {})
+    open_truncating_path_with(path, flags, mode, |_| {}, || {})
 }
 
 fn open_truncating_path_with(
@@ -438,6 +438,7 @@ fn open_truncating_path_with(
     flags: libc::c_int,
     mode: libc::c_uint,
     mut before_hop: impl FnMut(usize),
+    mut after_existence_probe: impl FnMut(),
 ) -> Result<OwnedFd, libc::c_int> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -469,63 +470,68 @@ fn open_truncating_path_with(
         before_hop(hop);
         match open_path_raw(libc::AT_FDCWD, &cur_c, flags | libc::O_EXCL, mode) {
             Ok(fd) => return Ok(fd),
-            Err(libc::EEXIST) => match open_path_raw(
-                libc::AT_FDCWD,
-                &cur_c,
-                flags & !(libc::O_CREAT | libc::O_TRUNC),
-                mode,
-            ) {
-                Ok(owned) => {
-                    return truncate_opened_fd(
-                        flags,
-                        owned,
-                        &mut |open_flags| open_path_raw(libc::AT_FDCWD, &cur_c, open_flags, mode),
-                        reopen_writable_self_fd,
-                    );
-                }
-                Err(libc::ENOENT) => match readlinkat_os(libc::AT_FDCWD, &cur_c) {
-                    Ok(target) => {
-                        let target_bytes = target.as_os_str().as_bytes();
-                        if target_bytes.is_empty() {
-                            return Err(libc::ENOENT);
-                        }
-                        let next_path = if target_bytes[0] == b'/' {
-                            std::path::PathBuf::from(&target)
-                        } else {
-                            cur_path
-                                .parent()
-                                .filter(|p| !p.as_os_str().is_empty())
-                                .map_or_else(
-                                    || std::path::PathBuf::from(&target),
-                                    |p| p.join(&target),
-                                )
-                        };
-                        let next_c = std::ffi::CString::new(next_path.as_os_str().as_bytes())
-                            .map_err(|_| libc::EINVAL)?;
-                        if target_bytes.ends_with(b"/") {
-                            let opened = open_path_raw(
-                                libc::AT_FDCWD,
-                                &next_c,
-                                flags & !libc::O_TRUNC,
-                                mode,
-                            )?;
-                            return truncate_opened_fd(
-                                flags,
-                                opened,
-                                &mut |open_flags| {
-                                    open_path_raw(libc::AT_FDCWD, &next_c, open_flags, mode)
-                                },
-                                reopen_writable_self_fd,
-                            );
-                        }
-                        cur_path = next_path;
-                        cur_c = next_c;
+            Err(libc::EEXIST) => {
+                after_existence_probe();
+                match open_path_raw(
+                    libc::AT_FDCWD,
+                    &cur_c,
+                    flags & !(libc::O_CREAT | libc::O_TRUNC),
+                    mode,
+                ) {
+                    Ok(owned) => {
+                        return truncate_opened_fd(
+                            flags,
+                            owned,
+                            &mut |open_flags| {
+                                open_path_raw(libc::AT_FDCWD, &cur_c, open_flags, mode)
+                            },
+                            reopen_writable_self_fd,
+                        );
                     }
-                    Err(libc::EINVAL) => continue,
+                    Err(libc::ENOENT) => match readlinkat_os(libc::AT_FDCWD, &cur_c) {
+                        Ok(target) => {
+                            let target_bytes = target.as_os_str().as_bytes();
+                            if target_bytes.is_empty() {
+                                return Err(libc::ENOENT);
+                            }
+                            let next_path = if target_bytes[0] == b'/' {
+                                std::path::PathBuf::from(&target)
+                            } else {
+                                cur_path
+                                    .parent()
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .map_or_else(
+                                        || std::path::PathBuf::from(&target),
+                                        |p| p.join(&target),
+                                    )
+                            };
+                            let next_c = std::ffi::CString::new(next_path.as_os_str().as_bytes())
+                                .map_err(|_| libc::EINVAL)?;
+                            if target_bytes.ends_with(b"/") {
+                                let opened = open_path_raw(
+                                    libc::AT_FDCWD,
+                                    &next_c,
+                                    flags & !libc::O_TRUNC,
+                                    mode,
+                                )?;
+                                return truncate_opened_fd(
+                                    flags,
+                                    opened,
+                                    &mut |open_flags| {
+                                        open_path_raw(libc::AT_FDCWD, &next_c, open_flags, mode)
+                                    },
+                                    reopen_writable_self_fd,
+                                );
+                            }
+                            cur_path = next_path;
+                            cur_c = next_c;
+                        }
+                        Err(libc::EINVAL | libc::ENOENT) => continue,
+                        Err(err) => return Err(err),
+                    },
                     Err(err) => return Err(err),
-                },
-                Err(err) => return Err(err),
-            },
+                }
+            }
             Err(err) => return Err(err),
         }
     }
@@ -674,7 +680,11 @@ fn truncate_opened_fd(
         let Some(stat) = fstat(owned.as_raw_fd()) else {
             return Err(last_errno());
         };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        let mode = stat.st_mode & libc::S_IFMT;
+        if mode == libc::S_IFDIR {
+            return Err(libc::EISDIR);
+        }
+        if mode != libc::S_IFREG {
             return Ok(owned);
         }
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
@@ -1324,10 +1334,35 @@ mod tests {
                     hop_swapped = true;
                 }
             },
+            || {},
         );
         assert!(hop_swapped);
         assert_eq!(hop_res.err(), Some(Fenced::ERRNO));
         assert_eq!(std::fs::read(&win_path).unwrap(), vec![b'W'; 4096]);
+    }
+
+    #[test]
+    fn creat_rdonly_trunc_recreates_file_unlinked_after_existence_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace");
+        std::fs::write(&path, b"old").unwrap();
+        let mut removed = false;
+        let fd = open_truncating_path_with(
+            &path,
+            libc::O_CREAT | libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+            0o644,
+            |_| {},
+            || {
+                if !removed {
+                    std::fs::remove_file(&path).unwrap();
+                    removed = true;
+                }
+            },
+        )
+        .expect("O_CREAT must create the missing path after concurrent unlink");
+        assert!(removed);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(fd);
     }
 
     #[test]
