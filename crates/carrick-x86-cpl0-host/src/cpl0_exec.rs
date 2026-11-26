@@ -494,33 +494,31 @@ impl SuccessorRoot<'_> {
     /// Hold the successor's root for `edit`, through a view of every node
     /// bank published when the lock is taken. CPL0 publishes banks on its
     /// own CPUs while this one is stopped, so a bank published after the
-    /// view resolved refuses the lock `MetadataRequired`: not now, never an
-    /// answer. Banks only grow (at most `BANKS`), so each rerun resolves a
-    /// newer generation, and `edit` runs once.
+    /// view resolved refuses the lock `MetadataRequired`, and so does an
+    /// `edit` that met the capacity the lock fixed while a newer bank was
+    /// published during it: not now, never an answer. `edit` leaves the
+    /// root as it found it when it refuses, so it reruns under a view of
+    /// the newer generation. Banks only grow (at most `BANKS`), so each
+    /// rerun resolves a newer generation, and the reruns are bounded.
     fn locked<R>(
         &self,
-        edit: impl FnOnce(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
+        mut edit: impl FnMut(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
-        let mut edit = Some(edit);
         let mut nodes = X86Cpl0ResolvedNodes::default();
         loop {
             self.tables.nodes(&mut nodes)?;
             let resolved = nodes.bank_count();
             match self.locked_with(&nodes, &mut edit) {
                 Err(Refusal::MetadataRequired)
-                    if edit.is_some() && self.tables.roots.storage_generation() > resolved => {}
+                    if self.tables.roots.storage_generation() > resolved => {}
                 result => return result,
             }
         }
     }
 
-    fn locked_with<R, E>(
-        &self,
-        nodes: &X86Cpl0ResolvedNodes,
-        edit: &mut Option<E>,
-    ) -> Result<R, Refusal>
+    fn locked_with<R, E>(&self, nodes: &X86Cpl0ResolvedNodes, edit: &mut E) -> Result<R, Refusal>
     where
-        E: FnOnce(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
+        E: FnMut(&mut X86Cpl0Root<'_>) -> Result<R, Refusal>,
     {
         let X86ExecTables { roots, zone, .. } = self.tables;
         let index = zone
@@ -554,7 +552,6 @@ impl SuccessorRoot<'_> {
                 if model.mm() != self.successor || model.is_admitted() {
                     return Err(Refusal::Stale);
                 }
-                let edit = edit.take().ok_or(Refusal::Invalid)?;
                 edit(&mut model)
             });
         if woke.get() {

@@ -225,10 +225,19 @@ impl SyscallDispatcher {
         let provider = authority
             .reservation_provider_for_publication()
             .ok_or(LINUX_ENOMEM)?;
-        let view = provider.prepare().map_err(|_| LINUX_ENOMEM)?;
-        let mut root = view
-            .lock(successor, &carrick_el1::memory::reservations::NoRootWait)
-            .map_err(|_| LINUX_ENOMEM)?;
+        // A view prepared before a bank published on another vCPU refuses
+        // the lock `MetadataRequired`: not now, never an answer (#3052). The
+        // provider prepares a view of the newer generation and the lock
+        // reruns; banks only grow (at most `BANKS`), so the reruns are
+        // bounded.
+        let mut view = provider.prepare().map_err(|_| LINUX_ENOMEM)?;
+        let mut root = loop {
+            match view.lock(successor, &carrick_el1::memory::reservations::NoRootWait) {
+                Err(carrick_el1::memory::reservations::Refusal::MetadataRequired) => {}
+                locked => break locked.map_err(|_| LINUX_ENOMEM)?,
+            }
+            view = provider.prepare().map_err(|_| LINUX_ENOMEM)?;
+        };
         if root.mm() != successor || root.is_admitted() {
             return Err(LINUX_ENOMEM);
         }

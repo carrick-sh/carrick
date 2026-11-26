@@ -21,14 +21,17 @@ use carrick_sched_core::{SpaceIndex, ZoneTables};
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
+use carrick_core::mm::reservation::ReservationMetadataAllocator;
 use carrick_core::mm::reservation::SharedReservations;
 use carrick_core_abi::PinnedMetadataExtent;
+use carrick_el1::memory::reservations::Refusal;
 
 /// The closed, never-installed root published for an exec successor. Dropping
 /// the token before `commit` retires the root and frees its space, so every
 /// refusal between preparation and adoption leaves the predecessor untouched.
-pub struct ClosedExecSuccessorSlot<'a, Pin, Policy, Geometry, Venue, B, C>
+pub struct ClosedExecSuccessorSlot<'a, Pin, Policy, Geometry, Venue, B, C, A>
 where
+    A: ReservationMetadataAllocator + Sync,
     Pin: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
@@ -45,12 +48,16 @@ where
     generation: NonZeroU64,
     armed: bool,
     mmu: B,
+    /// The ring's metadata allocator: the seal provisions a node bank
+    /// through it when the shared pool meets an unprovisioned bank ceiling.
+    metadata: &'a A,
     portal: PhantomData<fn() -> (Pin, Venue)>,
 }
 
-impl<'a, Pin, Policy, Geometry, Venue, B, C>
-    ClosedExecSuccessorSlot<'a, Pin, Policy, Geometry, Venue, B, C>
+impl<'a, Pin, Policy, Geometry, Venue, B, C, A>
+    ClosedExecSuccessorSlot<'a, Pin, Policy, Geometry, Venue, B, C, A>
 where
+    A: ReservationMetadataAllocator + Sync,
     Pin: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
@@ -63,9 +70,10 @@ where
     }
 }
 
-impl<Pin, Policy, Geometry, Venue, B, C> ExecSuccessorSlot
-    for ClosedExecSuccessorSlot<'_, Pin, Policy, Geometry, Venue, B, C>
+impl<Pin, Policy, Geometry, Venue, B, C, A> ExecSuccessorSlot
+    for ClosedExecSuccessorSlot<'_, Pin, Policy, Geometry, Venue, B, C, A>
 where
+    A: ReservationMetadataAllocator + Sync,
     Pin: PinnedMetadataExtent,
     Policy: ReservationPolicy + Send + Sync,
     Geometry: ReservationGeometry + Send + Sync,
@@ -83,14 +91,30 @@ where
 
     fn prepare_adoption(&self) -> Result<El1MmHandle, NativeProcessError> {
         let portal = self.portal();
-        let mut root = portal
-            .root_any(self.mm, self.worker)
-            .map_err(|_| NativeProcessError::Stale)?;
-        if root.incarnation().raw() != self.generation.get() {
-            return Err(NativeProcessError::Stale);
+        loop {
+            let mut root = portal
+                .root_any(self.mm, self.worker)
+                .map_err(|_| NativeProcessError::Stale)?;
+            if root.incarnation().raw() != self.generation.get() {
+                return Err(NativeProcessError::Stale);
+            }
+            match root.finish_import() {
+                Ok(()) => break,
+                // The seal's host reserve met a bank ceiling no one has
+                // provisioned yet: a capacity request, never an answer (it
+                // was a SIGKILL past the point of no return, #3052). The
+                // refused seal changed nothing; the ring provisions a bank
+                // with the root's guard released and seals again. A bank
+                // is published only past the capacity this lock saw, and
+                // banks only grow (at most `BANKS`), so the reruns are
+                // bounded; a pool that cannot grow is the allocator's
+                // genuine exhaustion.
+                Err(Refusal::MetadataRequired) => root
+                    .provision_metadata(self.metadata)
+                    .map_err(|_| NativeProcessError::Stale)?,
+                Err(_) => return Err(NativeProcessError::Stale),
+            }
         }
-        root.finish_import()
-            .map_err(|_| NativeProcessError::Stale)?;
         // SAFETY: this token owns the exact root just admitted above.
         Ok(unsafe { El1MmHandle::from_admitted_owner(self.carrier, self.mm, self.generation) })
     }
@@ -100,9 +124,10 @@ where
     }
 }
 
-impl<Pin, Policy, Geometry, Venue, B, C> Drop
-    for ClosedExecSuccessorSlot<'_, Pin, Policy, Geometry, Venue, B, C>
+impl<Pin, Policy, Geometry, Venue, B, C, A> Drop
+    for ClosedExecSuccessorSlot<'_, Pin, Policy, Geometry, Venue, B, C, A>
 where
+    A: ReservationMetadataAllocator + Sync,
     Pin: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
@@ -149,15 +174,17 @@ pub fn successor_layout() -> Result<Layout, NativeProcessError> {
 
 /// Publish the successor's closed space and root, armed for rollback. Nothing
 /// of the predecessor is touched: the slot is a new, unbound publication.
-pub fn prepare_closed_exec_successor_slot<'a, Pin, Policy, Geometry, Venue, B, C>(
+pub fn prepare_closed_exec_successor_slot<'a, Pin, Policy, Geometry, Venue, B, C, A>(
     zone: &'a ZoneTables<C>,
     roots: &'a SharedReservations<Policy, Geometry>,
     carrier: NonZeroU64,
     worker: u32,
     mm: ReservationMm,
     mmu: B,
+    metadata: &'a A,
 ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError>
 where
+    A: ReservationMetadataAllocator + Sync + 'a,
     Pin: PinnedMetadataExtent + 'a,
     Policy: ReservationPolicy + Send + Sync + 'a,
     Geometry: ReservationGeometry + Send + Sync + 'a,
@@ -199,6 +226,7 @@ where
         Venue,
         B,
         C,
+        A,
     > {
         zone,
         roots,
@@ -209,6 +237,7 @@ where
         generation,
         armed: true,
         mmu,
+        metadata,
         portal: PhantomData,
     }))
 }

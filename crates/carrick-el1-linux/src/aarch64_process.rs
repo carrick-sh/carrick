@@ -1792,6 +1792,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Aarch64Venue,
             Aarch64Mmu,
             Aarch64ParkedContext,
+            carrick_el1::alloc::MetadataStorage,
         >(
             self.zone,
             self.roots,
@@ -1799,6 +1800,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             self.worker(),
             mm,
             Aarch64Mmu,
+            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
         )
     }
     fn cancel_exec_successor(

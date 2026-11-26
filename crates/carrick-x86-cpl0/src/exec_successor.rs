@@ -160,6 +160,7 @@ where
             Venue,
             X86Mmu,
             ParkedContextWords,
+            carrick_el1::alloc::MetadataStorage,
         >(
             self.zone,
             self.roots,
@@ -167,6 +168,7 @@ where
             self.worker(),
             mm,
             X86Mmu,
+            &carrick_el1::alloc::GLOBAL_ALLOCATOR,
         )
     }
 
