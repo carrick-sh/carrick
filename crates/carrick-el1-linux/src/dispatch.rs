@@ -89,6 +89,20 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn stage_native_host_file(&mut self) -> bool {
         false
     }
+    /// Whether this venue publishes a record the ring built for the current
+    /// call ([`Self::stage_ring_record`]) after the call's `Forward`, and
+    /// reruns the call once the carrier settles it. Only a native owner's
+    /// venue does; a ring owner that keeps an operation for the rerun asks
+    /// first, before any effect.
+    fn accepts_ring_record(&self) -> bool {
+        false
+    }
+    /// Retain a host record the ring built for the current call. Called
+    /// only after [`Self::accepts_ring_record`] answered `true`; the venue
+    /// publishes it in place of staging the call itself.
+    fn stage_ring_record(&mut self, _record: alloc::boxed::Box<[u8]>) {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    }
     /// The stage just retained names no host request: the call stays with
     /// its ring owner.
     fn staged_for_ring_owner(&self) -> bool {
@@ -233,6 +247,16 @@ mod poll_timeout_tests {
 impl GuestDispatchFrame for TrapFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         carrick_guest_arch::NativeOrdinal::new(self.x[8])
+    }
+    /// A native owner's SVC: its `Forward` reaches [`native_host_file_stage`],
+    /// which publishes the retained record first.
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    fn accepts_ring_record(&self) -> bool {
+        (self.esr >> 26) & 0x3f == 0x15 && arm_native_entry(self).is_some()
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    fn stage_ring_record(&mut self, record: alloc::boxed::Box<[u8]>) {
+        arm_ring_record::stage(self.slot as usize, record);
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
@@ -1330,6 +1354,18 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
     }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if let Some(record) = arm_ring_record::take(frame.slot as usize) {
+        return Some(
+            carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output: None,
+                resolves_path: false,
+                map: None,
+                chdir: false,
+            },
+        );
+    }
     if frame.x[8] == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
         && origin == carrick_core_abi::service::ServiceOrigin::Descendant
         && matches!(
@@ -1932,6 +1968,74 @@ where
     )
 }
 
+/// The native owner of this exception's task, when its entry is owned:
+/// the task, its slot, the zone and its lifecycle page and control slot.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn arm_native_entry(
+    frame: &TrapFrame,
+) -> Option<(
+    &'static CurrentTask,
+    SlotId,
+    &'static ZoneTables,
+    &'static carrick_el1_abi::ThreadLifecyclePage,
+    &'static carrick_el1_abi::ThreadControlSlot,
+)> {
+    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
+    let slot = SlotId::from_index(frame.slot as usize)?;
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let (page, control) = task.lifecycle_refs()?;
+    let entry = if (frame.esr >> 26) & 0x3f == 0x15 {
+        carrick_sched_core::object_wait::OwnerEntry::Syscall
+    } else {
+        carrick_sched_core::object_wait::OwnerEntry::Exception
+    };
+    super::native_process_runtime::native_entry_owned(
+        carrick_el1_abi::BornInZoneSource { zone, slot },
+        task,
+        page,
+        control,
+        entry,
+    )
+    .then_some((task, slot, zone, page, control))
+}
+
+/// A host record the ring built for a native owner's current SVC (a
+/// readiness set's carrier sockets), kept per CPU slot from the ring's
+/// `Forward` until [`native_host_file_stage`] publishes it on the same
+/// exception. The slot's CPU owns its cell for the whole exception.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+mod arm_ring_record {
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicPtr, Ordering};
+
+    extern crate alloc;
+
+    type Record = Box<[u8]>;
+
+    static STAGED: [AtomicPtr<Record>; carrick_el1_abi::EL1_STACK_SLOTS as usize] =
+        [const { AtomicPtr::new(core::ptr::null_mut()) };
+            carrick_el1_abi::EL1_STACK_SLOTS as usize];
+
+    pub(super) fn stage(slot: usize, record: Record) {
+        let Some(cell) = STAGED.get(slot) else {
+            super::invalid_completion(super::NativeInvariant::EntryBinding);
+        };
+        let staged = Box::into_raw(Box::new(record));
+        if !cell.swap(staged, Ordering::AcqRel).is_null() {
+            // A record is published on the exception that staged it.
+            super::invalid_completion(super::NativeInvariant::EntryBinding);
+        }
+    }
+
+    pub(super) fn take(slot: usize) -> Option<Record> {
+        let staged = STAGED
+            .get(slot)?
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: only `stage` stores a non-null pointer, from `Box::into_raw`.
+        (!staged.is_null()).then(|| *unsafe { Box::from_raw(staged) })
+    }
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1943,24 +2047,7 @@ fn arm_native_service_exit(
     counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
-    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
-    let slot = SlotId::from_index(frame.slot as usize)?;
-    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    let (page, control) = task.lifecycle_refs()?;
-    let entry = if (frame.esr >> 26) & 0x3f == 0x15 {
-        carrick_sched_core::object_wait::OwnerEntry::Syscall
-    } else {
-        carrick_sched_core::object_wait::OwnerEntry::Exception
-    };
-    if !super::native_process_runtime::native_entry_owned(
-        carrick_el1_abi::BornInZoneSource { zone, slot },
-        task,
-        page,
-        control,
-        entry,
-    ) {
-        return None;
-    }
+    let (task, slot, zone, page, control) = arm_native_entry(frame)?;
     // A host-served root retains its exec and executable-link dispatcher.
     // Descendants use their own MM custody through the native services.
     if (frame.esr >> 26) & 0x3f == 0x15

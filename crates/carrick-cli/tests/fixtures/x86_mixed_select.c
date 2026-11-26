@@ -11,7 +11,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -104,8 +103,7 @@ static void child(void) {
     // Both ready before the call: the root writes the pipe, then sends on
     // the socket; once the socket is readable the pipe already is.
     tell(3, 'b');
-    struct pollfd ready = {3, POLLIN, 0};
-    value("both.poll", syscall(SYS_poll, &ready, 1, 5000));
+    wait_sets("both.ready", 4, sock, 1, NULL, 0, 5000, NULL);
     wait_sets("both", 4, both, 2, NULL, 0, 5000, NULL);
     drain(0, "both.read.pipe");
     drain(3, "both.read.socket");

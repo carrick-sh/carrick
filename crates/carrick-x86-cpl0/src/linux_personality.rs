@@ -226,6 +226,11 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     }
 
     fn stage_native_host_file(&mut self) -> bool {
+        // The ring owner already built this call's record (a readiness set's
+        // carrier sockets) and keeps its operation for the rerun.
+        if self.staged.is_some() {
+            return true;
+        }
         let Some(venue) = self.host_file else {
             return false;
         };
@@ -254,6 +259,22 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             self.staged,
             Some(carrick_personality_linux::native_host_file::HostFileStage::InRing)
         )
+    }
+
+    fn accepts_ring_record(&self) -> bool {
+        self.host_file.is_some() && self.staged.is_none()
+    }
+
+    fn stage_ring_record(&mut self, record: rust_alloc::boxed::Box<[u8]>) {
+        self.staged = Some(
+            carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output: None,
+                resolves_path: false,
+                map: None,
+                chdir: false,
+            },
+        );
     }
 
     fn release_host_object(

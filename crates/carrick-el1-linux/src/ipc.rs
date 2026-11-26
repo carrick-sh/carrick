@@ -85,6 +85,7 @@ mod epoll;
 pub use epoll::{SYS_EPOLL_PWAIT, SYS_EPOLL_PWAIT2};
 mod execution;
 pub use execution::{IpcExecution, NativeIpcExecution};
+mod epoll_harvest;
 mod file_lock;
 pub mod readiness_set;
 pub(crate) use file_lock::{LockCall, serve_file_lock};
@@ -738,11 +739,29 @@ const SELECT_INTERESTS: [i16; 3] = [
 enum SelectInterest {
     /// No set names a descriptor: served as an empty readiness set.
     None,
-    /// Exactly one descriptor: the single-description owner.
-    One(crate::file_table::PollFd),
+    /// Exactly one descriptor: the single-description owner, unless it is a
+    /// carrier socket (the readiness set serves that one, from the bitmaps).
+    One(crate::file_table::PollFd, alloc::vec::Vec<u64>),
     /// Several descriptors: the read, write and except bitmaps, `words`
     /// each, bits at or above `nfds` cleared.
     Many(alloc::vec::Vec<u64>),
+}
+
+/// Whether a one-descriptor select names a carrier socket the readiness set
+/// serves (#1051): the single-description owner waits on zone objects only.
+fn one_carrier_socket(
+    region: &IpcRegion<'_>,
+    table: TableId,
+    fd: i32,
+    frame: &impl crate::dispatch::GuestDispatchFrame,
+) -> bool {
+    frame.accepts_ring_record()
+        && region
+            .fd(EL1_WAIT)
+            .get(table, Fd(fd))
+            .ok()
+            .and_then(|description| IpcBacking::decode(description.backing))
+            .is_some_and(|backing| matches!(backing, IpcBacking::Host(_)))
 }
 
 fn read_select_interest(
@@ -800,7 +819,7 @@ fn read_select_interest(
     Ok(if pollfd.fd < 0 {
         SelectInterest::None
     } else if single {
-        SelectInterest::One(pollfd)
+        SelectInterest::One(pollfd, sets)
     } else {
         SelectInterest::Many(sets)
     })
@@ -1262,9 +1281,13 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     (arg0 as i32 as usize).min(capacity),
                     user,
                 ) {
-                    Ok(SelectInterest::One(decoded)) => {
-                        pollfd = decoded;
-                        None
+                    Ok(SelectInterest::One(decoded, sets)) => {
+                        if one_carrier_socket(region, table, decoded.fd, frame) {
+                            Some(sets)
+                        } else {
+                            pollfd = decoded;
+                            None
+                        }
                     }
                     Ok(SelectInterest::None) => Some(alloc::vec::Vec::new()),
                     Ok(SelectInterest::Many(sets)) => Some(sets),
@@ -1379,9 +1402,13 @@ fn serve_zone_readiness<E: IpcExecution, M: UserCopy>(
                     (arg0 as i32 as usize).min(capacity),
                     user,
                 ) {
-                    Ok(SelectInterest::One(decoded)) => {
-                        pollfd = decoded;
-                        None
+                    Ok(SelectInterest::One(decoded, sets)) => {
+                        if one_carrier_socket(region, table, decoded.fd, frame) {
+                            Some(sets)
+                        } else {
+                            pollfd = decoded;
+                            None
+                        }
                     }
                     Ok(SelectInterest::None) => Some(alloc::vec::Vec::new()),
                     Ok(SelectInterest::Many(sets)) => Some(sets),
@@ -5878,6 +5905,56 @@ mod tests {
         for (entry, fd) in ready.iter().zip(3..43) {
             assert_eq!((entry.fd, entry.ready), (fd, SELECT_INTERESTS[0]));
         }
+    }
+
+    /// #1051 condition A: an edge republished between two scans of one
+    /// answer reports its item twice (each scan opens a new epoch); the
+    /// answer keeps it one descriptor with the OR of its classes.
+    #[test]
+    fn readiness_set_merges_an_item_republished_between_scans() {
+        use carrick_el1_abi::ipc::epoll::events;
+        let w = world();
+        let epoll = w.region.create_epoll(&HostWait).unwrap();
+        let both = SELECT_INTERESTS[0] | SELECT_INTERESTS[1];
+        let mut republished = None;
+        for fd in 3..43 {
+            let item = set_host_socket(&w, epoll, fd, both, EPOLL_IN);
+            if fd == 5 {
+                republished = Some(item);
+            }
+        }
+        let item = republished.unwrap();
+        let mut scans = 0;
+        let mut ready =
+            readiness_set::collect_ready(32, 4, |reports, taken| -> Result<_, IpcError> {
+                scans += 1;
+                let harvest = w.region.epoll_harvest(epoll, reports, taken, &HostWait)?;
+                if scans == 1 {
+                    // fd 5 becomes writable too after the first scan took it.
+                    w.region
+                        .epoll_publish_host_socket(
+                            epoll,
+                            item,
+                            events::IN | events::OUT,
+                            true,
+                            &HostWait,
+                        )
+                        .unwrap();
+                }
+                Ok(harvest)
+            })
+            .unwrap();
+        assert!(scans >= 2, "the 32-report window truncated the first scan");
+        ready.sort_by_key(|entry| entry.fd);
+        assert_eq!(ready.len(), 40, "one entry per descriptor");
+        let five = ready.iter().find(|entry| entry.fd == 5).unwrap();
+        assert_eq!(five.ready, both, "the republished classes are merged");
+        assert!(
+            ready
+                .iter()
+                .filter(|entry| entry.fd != 5)
+                .all(|entry| entry.ready == SELECT_INTERESTS[0])
+        );
     }
 
     /// #1051 P0 1: a decided answer is recorded per item, carrier sockets
