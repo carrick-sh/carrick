@@ -195,7 +195,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 {
                     carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
                         if result.raw() as i64 == -14 {
-                            panic!("DIAG EFAULT resumed-returned");
+                            panic!("DR nr={} rip={:#x}", words.syscall_return(), words.user_rip());
                         }
                         words.set_syscall_return(result.raw() as u64)
                     }
@@ -241,7 +241,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             Some(_) => {
                                 if !metadata_resume && let Some(result) = selected.result {
                                     if result as i64 == -14 {
-                                        panic!("DIAG EFAULT resumed-selected");
+                                        panic!("DS nr={} rip={:#x}", words.syscall_return(), words.user_rip());
                                     }
                                     words.set_syscall_return(result);
                                 }

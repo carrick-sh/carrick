@@ -113,7 +113,7 @@ impl NativeForkRefusal {
             // The fork owner grows the table and answers `Busy` itself. This
             // cause survives only when that growth was refused for good.
             NativeForkCause::StockReservation(R::Residency) => E::Exhausted,
-            _ => panic!("DIAG fork refusal EFAULT {:?}", self),
+            _ => panic!("DF {:?} {:?}", self.stage, self.cause),
         }
     }
 }
