@@ -17,7 +17,7 @@
 //!   is owed only after its last pin returns.
 //! - **A table with records cannot be dropped silently.** [`Stage2RecordTable::teardown`]
 //!   returns every record (live, pinned or owing its unmap) to the owner;
-//!   dropping a non-empty table is a broken invariant and is fatal.
+//!   dropping a non-empty table is a broken invariant and panics.
 //!
 //! The table is plain data: its owner (the carrier's stage-2 custody) holds it
 //! under the custody lock, and drives the backend map and unmap around it.
@@ -226,7 +226,6 @@ static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 pub struct Stage2RecordTable<B> {
     table: u64,
     next_id: u64,
-    max_len: u64,
     /// Every record, keyed by base IPA. Extents never overlap.
     by_base: BTreeMap<u64, Entry<B>>,
     /// Record id to base IPA.
@@ -247,7 +246,6 @@ impl<B> Stage2RecordTable<B> {
         Self {
             table: NEXT_TABLE.fetch_add(1, Ordering::Relaxed),
             next_id: 1,
-            max_len: 0,
             by_base: BTreeMap::new(),
             ids: BTreeMap::new(),
             #[cfg(test)]
@@ -267,16 +265,14 @@ impl<B> Stage2RecordTable<B> {
     /// The one record whose extent could hold `ipa`: the greatest base at or
     /// below it. Records never overlap, so no other record can.
     fn candidate(&self, ipa: u64) -> Option<&Entry<B>> {
-        let floor = ipa.saturating_sub(self.max_len);
-        for (_, entry) in self.by_base.range(floor..=ipa) {
-            #[cfg(test)]
-            self.probes
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if entry.spec.extent.end() > ipa {
-                return Some(entry);
-            }
-        }
-        None
+        #[cfg(test)]
+        self.probes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.by_base
+            .range(..=ipa)
+            .next_back()
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.spec.extent.end() > ipa)
     }
 
     /// Register a record. A collision with any record, live or retiring, is
@@ -286,7 +282,17 @@ impl<B> Stage2RecordTable<B> {
         spec: Stage2RecordSpec<B>,
     ) -> Result<CarrierStage2RecordId, Stage2RegisterRefused<B>> {
         let extent = spec.extent;
-        self.max_len = self.max_len.max(extent.len().get());
+        // The record with the greatest base below `extent.end()` has the
+        // greatest end of all records starting before it; if it ends at or
+        // before `extent.ipa()`, nothing overlaps.
+        if let Some((_, existing)) = self.by_base.range(..extent.end()).next_back()
+            && existing.spec.extent.overlaps(extent)
+        {
+            return Err(Stage2RegisterRefused {
+                spec,
+                reason: Stage2RegisterRefusal::Collision(existing.id),
+            });
+        }
         let Some(next) = self.next_id.checked_add(1) else {
             return Err(Stage2RegisterRefused {
                 spec,
@@ -312,8 +318,9 @@ impl<B> Stage2RecordTable<B> {
     /// empty or overflowing range, a range no record covers, a range that
     /// runs past its record, or a retiring record.
     pub fn covering(&self, ipa: u64, len: u64) -> Option<Stage2Covering<'_, B>> {
+        let selected = Stage2Extent::new(ipa, len)?;
         let entry = self.candidate(ipa)?;
-        if ipa.saturating_add(len) > entry.spec.extent.end() {
+        if entry.state != RecordState::Live || !entry.spec.extent.contains(selected) {
             return None;
         }
         Some(Stage2Covering {
@@ -329,10 +336,10 @@ impl<B> Stage2RecordTable<B> {
     /// Pin the live record covering `[ipa, ipa + len)`. `None` exactly when
     /// [`Self::covering`] is `None`.
     pub fn pin(&mut self, ipa: u64, len: u64) -> Option<Stage2Pin> {
-        let selected = Stage2Extent::new(ipa, len.max(1))?;
+        let selected = Stage2Extent::new(ipa, len)?;
         let base = {
             let entry = self.candidate(ipa)?;
-            if ipa.saturating_add(len) > entry.spec.extent.end() {
+            if entry.state != RecordState::Live || !entry.spec.extent.contains(selected) {
                 return None;
             }
             entry.spec.extent.ipa()
@@ -448,7 +455,16 @@ impl<B> Stage2RecordTable<B> {
 }
 
 impl<B> Drop for Stage2RecordTable<B> {
+    /// Dropping a table that still holds records is a broken invariant: each
+    /// record names a backend mapping and a backing nobody would release.
+    /// It panics rather than leaking them silently (#3057's class); an
+    /// unwinding owner is already failing and isn't panicked twice.
     fn drop(&mut self) {
-        let _ = self.by_base.len();
+        if !self.by_base.is_empty() && !std::thread::panicking() {
+            panic!(
+                "stage-2 record table dropped with {} records; its owner must tear it down",
+                self.by_base.len()
+            );
+        }
     }
 }
