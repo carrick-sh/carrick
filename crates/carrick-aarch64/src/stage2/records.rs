@@ -100,6 +100,8 @@ pub struct Stage2RegisterRefused<B> {
 pub enum Stage2RegisterRefusal {
     /// A record (live or retiring) already holds part of the extent.
     Collision(CarrierStage2RecordId),
+    /// The host range `[host_addr, host_addr + len)` is null or overflows.
+    HostRange,
     /// The table has issued every record id.
     IdsExhausted,
 }
@@ -133,6 +135,21 @@ pub struct Stage2Covering<'a, B> {
     pub backing: &'a B,
 }
 
+/// Why [`Stage2RecordTable::pin`] refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage2PinRefusal {
+    /// The range is empty or its end overflows.
+    EmptyRange,
+    /// No live record holds the range's first address: none at all, or a
+    /// retiring one. The owner may select again.
+    NoLiveRecord,
+    /// A live record holds the first address but the range runs past its
+    /// end. Reselecting can't help.
+    Overruns(CarrierStage2RecordId),
+    /// The record's pin count is saturated.
+    PinsExhausted(CarrierStage2RecordId),
+}
+
 /// A pin on one live record. While it is outstanding, the record's unmap is
 /// not owed. Return it with [`Stage2RecordTable::unpin`].
 #[must_use = "a pin must be returned with Stage2RecordTable::unpin"]
@@ -143,11 +160,24 @@ pub struct Stage2Pin {
     base: u64,
     selected: Stage2Extent,
     host_addr: usize,
+    record_extent: Stage2Extent,
+    perms: MemPerms,
+    logical_owner: Option<CarrierLogicalOwner>,
 }
 
 impl Stage2Pin {
     pub fn record(&self) -> CarrierStage2RecordId {
         self.id
+    }
+    /// The whole pinned record's extent.
+    pub fn record_extent(&self) -> Stage2Extent {
+        self.record_extent
+    }
+    pub fn perms(&self) -> MemPerms {
+        self.perms
+    }
+    pub fn logical_owner(&self) -> Option<CarrierLogicalOwner> {
+        self.logical_owner
     }
     /// The pinned range, as requested.
     pub fn selected(&self) -> Stage2Extent {
@@ -197,9 +227,10 @@ pub enum Stage2RetireRefused {
 }
 
 /// A token was not minted by this table, or names a record it no longer
-/// holds in the state the token claims.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Stage2TokenRefused;
+/// holds in the state the token claims. The token comes back, so a caller
+/// that offered it to the wrong table can still return it to its own.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Stage2TokenRefused<T>(pub T);
 
 /// A record returned by [`Stage2RecordTable::teardown`].
 #[derive(Debug)]
@@ -265,14 +296,20 @@ impl<B> Stage2RecordTable<B> {
     /// The one record whose extent could hold `ipa`: the greatest base at or
     /// below it. Records never overlap, so no other record can.
     fn candidate(&self, ipa: u64) -> Option<&Entry<B>> {
+        self.by_base
+            .range(..=ipa)
+            .rev()
+            .inspect(|_| self.probed())
+            .next()
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.spec.extent.end() > ipa)
+    }
+
+    /// One index entry examined (test builds count it).
+    fn probed(&self) {
         #[cfg(test)]
         self.probes
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        self.by_base
-            .range(..=ipa)
-            .next_back()
-            .map(|(_, entry)| entry)
-            .filter(|entry| entry.spec.extent.end() > ipa)
     }
 
     /// Register a record. A collision with any record, live or retiring, is
@@ -282,6 +319,16 @@ impl<B> Stage2RecordTable<B> {
         spec: Stage2RecordSpec<B>,
     ) -> Result<CarrierStage2RecordId, Stage2RegisterRefused<B>> {
         let extent = spec.extent;
+        let host_fits = usize::try_from(extent.len().get())
+            .ok()
+            .and_then(|len| spec.host_addr.checked_add(len))
+            .is_some();
+        if spec.host_addr == 0 || !host_fits {
+            return Err(Stage2RegisterRefused {
+                spec,
+                reason: Stage2RegisterRefusal::HostRange,
+            });
+        }
         // The record with the greatest base below `extent.end()` has the
         // greatest end of all records starting before it; if it ends at or
         // before `extent.ipa()`, nothing overlaps.
@@ -333,39 +380,64 @@ impl<B> Stage2RecordTable<B> {
         })
     }
 
-    /// Pin the live record covering `[ipa, ipa + len)`. `None` exactly when
-    /// [`Self::covering`] is `None`.
-    pub fn pin(&mut self, ipa: u64, len: u64) -> Option<Stage2Pin> {
-        let selected = Stage2Extent::new(ipa, len)?;
-        let base = {
-            let entry = self.candidate(ipa)?;
-            if entry.state != RecordState::Live || !entry.spec.extent.contains(selected) {
-                return None;
-            }
-            entry.spec.extent.ipa()
-        };
-        let entry = self.by_base.get_mut(&base)?;
-        entry.pins = entry.pins.checked_add(1)?;
-        Some(Stage2Pin {
-            table: self.table,
+    /// Pin the live record covering `[ipa, ipa + len)`, in one index probe.
+    pub fn pin(&mut self, ipa: u64, len: u64) -> Result<Stage2Pin, Stage2PinRefusal> {
+        let selected = Stage2Extent::new(ipa, len).ok_or(Stage2PinRefusal::EmptyRange)?;
+        #[cfg(test)]
+        self.probed();
+        let table = self.table;
+        let (&base, entry) = self
+            .by_base
+            .range_mut(..=ipa)
+            .next_back()
+            .filter(|(_, entry)| entry.state == RecordState::Live && entry.spec.extent.end() > ipa)
+            .ok_or(Stage2PinRefusal::NoLiveRecord)?;
+        if !entry.spec.extent.contains(selected) {
+            return Err(Stage2PinRefusal::Overruns(entry.id));
+        }
+        // Registration proved `host_addr + extent.len()` fits, and the
+        // offset is inside the extent.
+        let host_addr = usize::try_from(ipa - base)
+            .ok()
+            .and_then(|offset| entry.spec.host_addr.checked_add(offset))
+            .ok_or(Stage2PinRefusal::Overruns(entry.id))?;
+        entry.pins = entry
+            .pins
+            .checked_add(1)
+            .ok_or(Stage2PinRefusal::PinsExhausted(entry.id))?;
+        Ok(Stage2Pin {
+            table,
             id: entry.id,
             base,
             selected,
-            host_addr: entry.spec.host_addr.wrapping_add((ipa - base) as usize),
+            host_addr,
+            record_extent: entry.spec.extent,
+            perms: entry.spec.perms,
+            logical_owner: entry.spec.logical_owner,
         })
+    }
+
+    /// The backing of the record a pin holds.
+    pub fn pinned_backing(&self, pin: &Stage2Pin) -> Option<&B> {
+        self.by_base
+            .get(&pin.base)
+            .filter(|entry| pin.table == self.table && entry.id == pin.id && entry.pins > 0)
+            .map(|entry| &entry.spec.backing)
     }
 
     /// Return a pin. When it was the last pin of a retiring record, the
     /// record's unmap is owed now and comes back.
-    pub fn unpin(&mut self, pin: Stage2Pin) -> Result<Option<Stage2Unmap>, Stage2TokenRefused> {
-        if pin.table != self.table {
-            return Err(Stage2TokenRefused);
-        }
-        let entry = self
+    pub fn unpin(
+        &mut self,
+        pin: Stage2Pin,
+    ) -> Result<Option<Stage2Unmap>, Stage2TokenRefused<Stage2Pin>> {
+        let Some(entry) = self
             .by_base
             .get_mut(&pin.base)
-            .filter(|entry| entry.id == pin.id && entry.pins > 0)
-            .ok_or(Stage2TokenRefused)?;
+            .filter(|entry| pin.table == self.table && entry.id == pin.id && entry.pins > 0)
+        else {
+            return Err(Stage2TokenRefused(pin));
+        };
         entry.pins -= 1;
         match entry.state {
             RecordState::Retiring {
@@ -415,21 +487,20 @@ impl<B> Stage2RecordTable<B> {
     pub fn finish_retire(
         &mut self,
         unmap: Stage2Unmap,
-    ) -> Result<Stage2RecordSpec<B>, Stage2TokenRefused> {
-        if unmap.table != self.table {
-            return Err(Stage2TokenRefused);
-        }
-        match self.by_base.get(&unmap.extent.ipa()) {
-            Some(entry)
-                if entry.id == unmap.id
-                    && entry.state == (RecordState::Retiring { unmap_issued: true }) => {}
-            _ => return Err(Stage2TokenRefused),
+    ) -> Result<Stage2RecordSpec<B>, Stage2TokenRefused<Stage2Unmap>> {
+        let owed = unmap.table == self.table
+            && self.by_base.get(&unmap.extent.ipa()).is_some_and(|entry| {
+                entry.id == unmap.id
+                    && entry.state == (RecordState::Retiring { unmap_issued: true })
+            });
+        if !owed {
+            return Err(Stage2TokenRefused(unmap));
         }
         self.ids.remove(&unmap.id);
-        self.by_base
-            .remove(&unmap.extent.ipa())
-            .map(|entry| entry.spec)
-            .ok_or(Stage2TokenRefused)
+        match self.by_base.remove(&unmap.extent.ipa()) {
+            Some(entry) => Ok(entry.spec),
+            None => Err(Stage2TokenRefused(unmap)),
+        }
     }
 
     /// Empty the table, returning every record to the owner, which must
@@ -457,9 +528,11 @@ impl<B> Stage2RecordTable<B> {
 impl<B> Drop for Stage2RecordTable<B> {
     /// Dropping a table that still holds records is a broken invariant: each
     /// record names a backend mapping and a backing nobody would release
-    /// (#3057's class). An unwinding owner is already failing.
+    /// (#3057's class), and dropping it would free backings the backend still
+    /// maps. That holds while unwinding too, so it aborts before any field
+    /// destructor runs.
     fn drop(&mut self) {
-        if !self.by_base.is_empty() && !std::thread::panicking() {
+        if !self.by_base.is_empty() {
             carrick_fatal::carrick_fatal!(
                 "aarch64::stage2_records",
                 "stage-2 record table dropped with {} records; its owner must tear it down",

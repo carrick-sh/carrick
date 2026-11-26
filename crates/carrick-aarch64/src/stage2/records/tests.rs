@@ -18,7 +18,7 @@ struct Lease(u32);
 fn spec(ipa: u64, len: u64, lease: u32) -> Stage2RecordSpec<Lease> {
     Stage2RecordSpec {
         extent: Stage2Extent::new(ipa, len).expect("test extent"),
-        host_addr: 0x7000_0000_0000 + ipa as usize,
+        host_addr: 0x7000_0000_0000usize.wrapping_add(ipa as usize),
         perms: RW,
         logical_owner: None,
         backing: Lease(lease),
@@ -113,7 +113,7 @@ fn an_empty_or_overflowing_range_covers_nothing() {
     table.register(spec(PAGE, PAGE, 1)).expect("record");
     assert!(table.covering(PAGE, 0).is_none());
     assert!(table.covering(PAGE + 0x80, 0).is_none());
-    assert!(table.pin(PAGE, 0).is_none());
+    assert_eq!(table.pin(PAGE, 0), Err(Stage2PinRefusal::EmptyRange));
     assert!(table.covering(u64::MAX, 2).is_none());
     assert!(Stage2Extent::new(PAGE, 0).is_none());
     assert!(Stage2Extent::new(u64::MAX - 1, 2).is_none());
@@ -131,7 +131,10 @@ fn a_range_that_runs_past_its_record_is_not_covered() {
         table.covering(PAGE - 1, 2).is_none(),
         "two adjacent records never cover one range together"
     );
-    assert!(table.pin(PAGE - 1, 2).is_none());
+    assert_eq!(
+        table.pin(PAGE - 1, 2),
+        Err(Stage2PinRefusal::Overruns(first))
+    );
     assert_eq!(table.teardown().len(), 2);
 }
 
@@ -177,6 +180,12 @@ fn a_pinned_record_owes_its_unmap_only_after_its_last_pin() {
     let first = table.pin(5 * PAGE + 0x800, 0x10).expect("pin inside");
     assert_eq!(first.record(), id);
     assert_eq!(
+        first.record_extent(),
+        Stage2Extent::new(4 * PAGE, 4 * PAGE).unwrap()
+    );
+    assert_eq!(first.perms(), RW);
+    assert_eq!(table.pinned_backing(&first), Some(&Lease(7)));
+    assert_eq!(
         first.host_addr(),
         0x7000_0000_0000 + 5 * PAGE as usize + 0x800
     );
@@ -195,8 +204,9 @@ fn a_pinned_record_owes_its_unmap_only_after_its_last_pin() {
         table.covering(4 * PAGE, PAGE).is_none(),
         "retiring is never found"
     );
-    assert!(
-        table.pin(4 * PAGE, PAGE).is_none(),
+    assert_eq!(
+        table.pin(4 * PAGE, PAGE),
+        Err(Stage2PinRefusal::NoLiveRecord),
         "retiring is never pinned"
     );
 
@@ -235,27 +245,105 @@ fn a_live_record_unpinned_stays_live() {
 }
 
 #[test]
-fn a_token_from_another_table_is_refused() {
+fn a_token_from_another_table_is_refused_and_comes_back() {
     let mut mine = Stage2RecordTable::new();
     let mut other = Stage2RecordTable::new();
     let id = mine.register(spec(0, PAGE, 1)).expect("mine");
-    other.register(spec(0, PAGE, 2)).expect("other, same IPA");
+    let other_id = other.register(spec(0, PAGE, 2)).expect("other, same IPA");
+    assert_eq!(id, other_id, "the same raw id in both tables");
 
     let pin = mine.pin(0, PAGE).expect("pin");
-    assert_eq!(other.unpin(pin), Err(Stage2TokenRefused));
+    assert_eq!(other.pinned_backing(&pin), None);
+    let Err(Stage2TokenRefused(pin)) = other.unpin(pin) else {
+        panic!("another table's pin must be refused");
+    };
+    assert_eq!(mine.begin_retire(id), Ok(Stage2Retire::DeferredPinned));
+    let mine_unmap = mine
+        .unpin(pin)
+        .expect("the refused pin still returns to its own table")
+        .expect("its last pin makes the unmap owed");
 
-    let unmap = expect_unmap(other.begin_retire(id).expect("same raw id in other"));
-    assert!(matches!(mine.finish_retire(unmap), Err(Stage2TokenRefused)));
-
-    let remnants = mine.teardown();
-    assert_eq!(remnants.len(), 1);
+    let other_unmap = expect_unmap(other.begin_retire(other_id).expect("retire"));
+    let Err(Stage2TokenRefused(other_unmap)) = mine.finish_retire(other_unmap) else {
+        panic!("another table's owed unmap must be refused");
+    };
     assert_eq!(
-        remnants[0].state,
-        Stage2RemnantState::Live { pins: 1 },
-        "the pin refused by the other table is still outstanding here"
+        other
+            .finish_retire(other_unmap)
+            .expect("its own table")
+            .backing,
+        Lease(2)
     );
-    let remnants = other.teardown();
-    assert_eq!(remnants[0].state, Stage2RemnantState::UnmapOwed);
+    assert_eq!(
+        mine.finish_retire(mine_unmap)
+            .expect("its own table")
+            .backing,
+        Lease(1)
+    );
+    assert!(mine.teardown().is_empty());
+    assert!(other.teardown().is_empty());
+}
+
+#[test]
+fn a_null_or_overflowing_host_range_is_refused_before_a_record_exists() {
+    let mut table = Stage2RecordTable::new();
+    for host_addr in [0, usize::MAX - PAGE as usize + 1] {
+        let mut wrapping = spec(0, 2 * PAGE, 1);
+        wrapping.host_addr = host_addr;
+        let refused = table.register(wrapping).expect_err("bad host range");
+        assert_eq!(refused.reason, Stage2RegisterRefusal::HostRange);
+        assert_eq!(refused.spec.backing, Lease(1));
+    }
+    assert!(table.is_empty());
+    let mut top = spec(0, PAGE, 2);
+    top.host_addr = usize::MAX - PAGE as usize;
+    table
+        .register(top)
+        .expect("a host range ending exactly at the top");
+    assert_eq!(
+        table.pin(0, PAGE).map(|pin| pin.host_addr()),
+        Ok(usize::MAX - PAGE as usize)
+    );
+    assert_eq!(table.teardown().len(), 1);
+}
+
+#[test]
+fn a_range_overflowing_past_the_top_record_is_refused() {
+    let mut table = Stage2RecordTable::new();
+    let top = table
+        .register(spec(u64::MAX - PAGE, PAGE, 1))
+        .expect("record ending at u64::MAX");
+    assert_eq!(table.covering(u64::MAX - 1, 1).unwrap().id, top);
+    assert!(table.covering(u64::MAX - 1, 2).is_none());
+    assert_eq!(
+        table.pin(u64::MAX - 1, 2),
+        Err(Stage2PinRefusal::EmptyRange)
+    );
+    assert_eq!(table.teardown().len(), 1);
+}
+
+#[test]
+fn a_record_at_the_same_base_is_refused_whatever_the_old_one_is_doing() {
+    let mut table = Stage2RecordTable::new();
+    let live = table.register(spec(0, PAGE, 1)).expect("live");
+    let pinned = table.register(spec(PAGE, PAGE, 2)).expect("to pin");
+    let owed = table.register(spec(2 * PAGE, PAGE, 3)).expect("to retire");
+    let pin = table.pin(PAGE, PAGE).expect("pin");
+    assert_eq!(table.begin_retire(pinned), Ok(Stage2Retire::DeferredPinned));
+    let unmap = expect_unmap(table.begin_retire(owed).expect("retire"));
+    for (base, holder) in [(0, live), (PAGE, pinned), (2 * PAGE, owed)] {
+        for len in [PAGE, 0x10] {
+            let refused = table
+                .register(spec(base, len, 9))
+                .expect_err("same base as a live, pinned-retiring or unmap-owed record");
+            assert_eq!(refused.reason, Stage2RegisterRefusal::Collision(holder));
+        }
+    }
+    assert_eq!(table.len(), 3);
+    let unmap_pinned = table.unpin(pin).expect("own pin").expect("owed now");
+    table.finish_retire(unmap_pinned).expect("finish");
+    table.finish_retire(unmap).expect("finish");
+    assert_eq!(table.teardown().len(), 1);
 }
 
 #[test]
