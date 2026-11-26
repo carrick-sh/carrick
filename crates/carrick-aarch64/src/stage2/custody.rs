@@ -559,6 +559,12 @@ impl<R> Stage2Custody<R> {
         }
     }
 
+    /// The records through exclusive access: no lock is taken, so an owner's
+    /// `Drop` can read them without any lock-order or re-entry check.
+    pub fn records_mut(&mut self) -> &mut R {
+        &mut self.state.get_mut().records
+    }
+
     fn lock_state(&self, operation: &'static str) -> HeldState<'_, R> {
         assert_no_inner_lock_held(operation);
         let custody = core::ptr::from_ref(self).addr();

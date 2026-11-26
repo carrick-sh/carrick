@@ -88,6 +88,17 @@ pub use metadata_grant::{
 // is parameterized over. `crate::trap::HvfTrapEngine` aliases the specialization.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf_aarch64_engine;
+
+/// The stage-2 teardown census's one assertion. libtest orders tests by
+/// name and `just test-hvf` runs this crate's lib with `RUST_TEST_THREADS=1`,
+/// so this module's name puts it after every other test of the lib.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod zzz_custody_census {
+    #[test]
+    fn no_stage2_record_outlives_its_test_or_custody() {
+        crate::trap::custody_census::assert_no_leak();
+    }
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use gic::{
     CarrierGicSnapshot, InterruptModel, VtimerProbeError, VtimerProbeReport, carrier_gic_snapshot,

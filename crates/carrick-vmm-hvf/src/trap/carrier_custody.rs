@@ -876,11 +876,12 @@ impl Default for CarrierVmCustody {
     }
 }
 
-/// Teardown census: no stage-2 record outlives its custody.
+/// Teardown census: a record that outlives its custody is collected for the
+/// census's last test. A drop never panics: it may run while unwinding.
 #[cfg(test)]
 impl Drop for CarrierVmCustody {
     fn drop(&mut self) {
-        super::custody_census::assert_custody_drop_leaves_no_record(&self.stage2.lock());
+        super::custody_census::collect_custody_drop_leaks(self.stage2.records_mut());
     }
 }
 

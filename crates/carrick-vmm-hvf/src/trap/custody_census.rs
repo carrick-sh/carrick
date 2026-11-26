@@ -4,18 +4,20 @@
 //! A record's owner removes it when the owner goes (production retirement,
 //! a lease's abandonment, a VM's destroy settlement). A record still present
 //! when its custody drops, or still present in the process-wide legacy test
-//! custody when the test thread that registered it exits, has no owner left:
+//! custody after the test that registered it finished, has no owner left:
 //! it leaks into every later lookup over its IPA (the wider non-live record
 //! that hid an import's live record, #3035 round 31).
 //!
 //! Every record is stamped at indexing with the registering test thread.
-//! - A dropped custody with any record left panics in the dropping test.
-//! - A libtest thread (named after its test) arms a thread-local whose
-//!   destructor runs when the test returns, before the next test starts
-//!   under `RUST_TEST_THREADS=1`. It reports any legacy-custody record that
-//!   thread registered and left behind, and the next test that takes the
-//!   legacy custody fails with the leaker's name and the records' real
-//!   values. The report is drained, so one leak fails one test.
+//! The census never panics where a panic could abort the run (a `Drop`, or
+//! the middle of an unrelated test that holds leases whose own drops
+//! assert): it only collects, and asserts once at a safe point.
+//! - A dropped custody with any record left adds them to the report.
+//! - One test, `zzz_custody_census`, runs after every other test of the lib
+//!   (libtest runs tests in name order, and the lib runs serially). It scans
+//!   the process-wide legacy custody for any record another test registered
+//!   (each named by its registering test thread), then fails once, listing
+//!   every leaker with its records' real values.
 use super::carrier_custody::{CarrierStage2RecordId, CarrierStage2Records};
 
 /// The registering thread of each live record of one custody.
@@ -26,11 +28,10 @@ pub(crate) struct RecordCensus {
 
 impl RecordCensus {
     pub(crate) fn stamp(&mut self, id: CarrierStage2RecordId) {
-        let thread = std::thread::current();
-        let name = thread.name().unwrap_or("<unnamed>").to_owned();
-        if is_test_thread(&name) {
-            TEARDOWN.with(|_| {});
-        }
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
         self.registered_by.insert(id, name);
     }
 
@@ -43,16 +44,10 @@ impl RecordCensus {
     }
 }
 
-/// libtest names each test's thread after the test's module path; helper
-/// threads a test spawns are unnamed or carry a plain name, and their
-/// records are the test's to settle, so only the test thread is checked.
-fn is_test_thread(name: &str) -> bool {
-    name.contains("::")
-}
-
 /// One line per record in `records` registered by a thread `select` admits.
-pub(crate) fn leaked_records(
+fn leaked_records(
     records: &CarrierStage2Records,
+    where_found: &str,
     select: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     records
@@ -62,7 +57,8 @@ pub(crate) fn leaked_records(
             let thread = records.census.registered_by(*id).unwrap_or("<unstamped>");
             select(thread).then(|| {
                 format!(
-                    "record {} registered by {thread}: {:?} (unmap in flight: {}, installed: {})",
+                    "{where_found}: record {} registered by {thread}: {:?} (unmap in flight: {}, \
+                     installed: {})",
                     id.0,
                     record.snapshot,
                     record.unmap_in_flight,
@@ -73,53 +69,39 @@ pub(crate) fn leaked_records(
         .collect()
 }
 
-/// Fail a custody's drop if any record outlives it.
-pub(crate) fn assert_custody_drop_leaves_no_record(records: &CarrierStage2Records) {
-    if std::thread::panicking() {
-        return;
+/// Every leak seen so far, deduplicated (a legacy leak can be seen by both
+/// its thread's teardown and the final scan).
+static REPORTED: parking_lot::Mutex<std::collections::BTreeSet<String>> =
+    parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
+/// Collect the records a dropping custody still holds. Never panics.
+pub(crate) fn collect_custody_drop_leaks(records: &CarrierStage2Records) {
+    let dropper = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_owned();
+    let leaked = leaked_records(records, &format!("custody dropped by {dropper}"), |_| true);
+    if !leaked.is_empty() {
+        REPORTED.lock().extend(leaked);
     }
-    let leaked = leaked_records(records, |_| true);
-    assert!(
-        leaked.is_empty(),
-        "custody census: {} stage-2 record(s) outlive their custody:\n{}",
-        leaked.len(),
-        leaked.join("\n")
-    );
 }
 
-static REPORTED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
-
-/// Fail the caller with every leak a finished test left in the legacy
-/// custody, then forget them: one leak fails one test.
-pub(crate) fn assert_no_reported_legacy_leak() {
+/// The census's one assertion, for the test that runs after every other:
+/// any record another test registered and left in the legacy custody, plus
+/// everything collected, fails it with the full list.
+pub(crate) fn assert_no_leak() {
+    let me = std::thread::current().name().map(str::to_owned);
+    if let Some(legacy) = super::legacy_test_carrier_vm_custody_if_created() {
+        let leaked = leaked_records(&legacy.stage2.lock(), "legacy custody", |stamp| {
+            Some(stamp) != me.as_deref()
+        });
+        REPORTED.lock().extend(leaked);
+    }
     let reported = std::mem::take(&mut *REPORTED.lock());
     assert!(
         reported.is_empty(),
-        "custody census: a finished test left {} stage-2 record(s) in the shared legacy \
-         test custody:\n{}",
+        "custody census: {} stage-2 record(s) outlived their test or custody:\n{}",
         reported.len(),
-        reported.join("\n")
+        reported.into_iter().collect::<Vec<_>>().join("\n")
     );
-}
-
-struct Teardown;
-
-impl Drop for Teardown {
-    fn drop(&mut self) {
-        let thread = std::thread::current();
-        let Some(name) = thread.name().map(str::to_owned) else {
-            return;
-        };
-        let Some(legacy) = super::legacy_test_carrier_vm_custody_if_created() else {
-            return;
-        };
-        let leaked = leaked_records(&legacy.stage2.lock(), |stamp| stamp == name);
-        if !leaked.is_empty() {
-            REPORTED.lock().extend(leaked);
-        }
-    }
-}
-
-thread_local! {
-    static TEARDOWN: Teardown = const { Teardown };
 }
