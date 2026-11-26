@@ -1326,6 +1326,46 @@ fn mounted_static_x86_shared_file_window_slot_budget_is_enforced() {
     );
 }
 
+/// #3046: a fork child execs after its live parent grew the shared
+/// reservation node pool past its bootstrap nodes. CPL0 published a node
+/// bank in its bootstrap arena; the host's successor import locked the
+/// child's new root with no view of that bank, the lock refused
+/// `MetadataRequired`, and the exec answered ENOMEM (exit 112). Go's build
+/// hit it as `fork/exec ...: cannot allocate memory`.
+#[test]
+fn mounted_static_x86_fork_child_execs_after_the_node_pool_grew() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exec-after-node-pool-growth");
+    compile_assembly_with_flags(
+        "x86_exec_after_node_pool_growth.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native exec-after-node-pool-growth oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"ok=1\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "exec-after-node-pool-growth", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "112 is an exec refused ENOMEM, 100 + errno another refusal, 96 a \
+         refused mapping, 95 a child that did not exit 0. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
