@@ -304,6 +304,10 @@ pub(crate) struct CarrierStage2Records {
     /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
     stage2_extent_index:
         std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<CarrierStage2RecordId>>,
+    /// The longest extent ever indexed: no indexed extent that starts below
+    /// `ipa - stage2_extent_index_max_len` can cover `ipa`, which bounds the
+    /// covering scan.
+    stage2_extent_index_max_len: u64,
     pub(crate) pinned_structural_predecessors: std::collections::BTreeMap<
         CarrierStage2RecordId,
         std::collections::BTreeSet<CarrierStage2RecordId>,
@@ -315,6 +319,7 @@ pub(crate) struct CarrierStage2Records {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierStage2Records {
     fn index_record(&mut self, id: CarrierStage2RecordId, ipa: u64, len: usize) {
+        self.stage2_extent_index_max_len = self.stage2_extent_index_max_len.max(len as u64);
         self.stage2_extent_index
             .entry((ipa, len as u64))
             .or_default()
@@ -339,30 +344,35 @@ impl CarrierStage2Records {
         removed
     }
 
+    /// The live record covering `[ipa, ipa + len)`: the nearest covering
+    /// extent first, newest record first. An extent that does not cover the
+    /// range, or whose records are not live (unmapped or terminalized), never
+    /// hides a live record of another extent that does cover it.
     pub(crate) fn record_covering(
         &self,
         ipa: u64,
         len: usize,
     ) -> Option<CarrierStage2RecordIdentity> {
-        let (&(base, length), ids) = self
-            .stage2_extent_index
-            .range(..=(ipa, u64::MAX))
-            .next_back()?;
         let end = ipa.checked_add(len as u64)?;
-        if end > base.checked_add(length)? {
-            return None;
-        }
-        ids.iter().rev().find_map(|id| {
-            let record = self.stage2_records.get(id)?;
-            let snapshot = record.snapshot;
-            (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
-                CarrierStage2RecordIdentity {
-                    record_id: *id,
-                    vm_generation: snapshot.vm_generation,
-                    logical_owner: snapshot.logical_owner,
-                },
-            )
-        })
+        let floor = ipa.saturating_sub(self.stage2_extent_index_max_len);
+        self.stage2_extent_index
+            .range((floor, 0)..=(ipa, u64::MAX))
+            .rev()
+            .filter(|&(&(base, length), _)| {
+                base.checked_add(length).is_some_and(|stop| end <= stop)
+            })
+            .find_map(|(_, ids)| {
+                ids.iter().rev().find_map(|id| {
+                    let snapshot = self.stage2_records.get(id)?.snapshot;
+                    (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
+                        CarrierStage2RecordIdentity {
+                            record_id: *id,
+                            vm_generation: snapshot.vm_generation,
+                            logical_owner: snapshot.logical_owner,
+                        },
+                    )
+                })
+            })
     }
 }
 
@@ -907,6 +917,7 @@ impl CarrierVmCustody {
                     installed: std::collections::BTreeMap::new(),
                     untracked_mappings: std::collections::BTreeMap::new(),
                     stage2_extent_index: std::collections::BTreeMap::new(),
+                    stage2_extent_index_max_len: 0,
                     pinned_structural_predecessors: std::collections::BTreeMap::new(),
                     pinned_structural_successor: std::collections::BTreeMap::new(),
                 },
