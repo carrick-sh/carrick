@@ -322,7 +322,11 @@
       "issue": 1338
     },
     {
-      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized_resize",
+      "owner": "carrick_vfs::host_size::HELD",
+      "issue": 1338
+    },
+    {
+      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized",
       "issue": 1338
     }
   ],
