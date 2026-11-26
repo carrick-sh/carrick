@@ -817,3 +817,55 @@ fn native_hold_races_driver_cpu_publication() {
         assert_eq!(zone.slot(SLOT).queued(), 1);
     });
 }
+
+/// #3053: a migration that finds no idle slot and an idle scan that starts
+/// meanwhile must see each other. `take_idle_work`'s contract: the peer
+/// queues a thread and then reads `idle_map`; the scan publishes its idle
+/// bit and then reads the run queues. A thread the migration unlinks while
+/// it looks for an idle slot is on no queue for that scan, so the scan may
+/// sleep past it when the migration then puts it back: the x86 leader-slice
+/// witness hung that way behind a held fork.
+#[test]
+fn migration_and_idle_scan_never_lose_the_queued_thread() {
+    model(|| {
+        let zone = zone();
+        let thief = SlotId::new(1);
+        for (slot, cpu) in [(SLOT, 0u32), (thief, 1u32)] {
+            zone.drive(slot, u64::from(slot.raw()) + 1);
+            zone.publish_slot(slot, 7, Some(cpu), 0);
+            let here = ExecutionSlot::zone(slot);
+            zone.occupancy.vacate_any(here);
+            assert!(zone.occupancy.replace(here, 0, 7));
+            zone.enter_guest(slot);
+        }
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 2,
+                serial: 20,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 0,
+            })
+            .unwrap();
+        assert!(zone.requeue_preempted(SLOT, record).is_queued());
+        let scan_zone = zone.clone();
+        let scanner = thread::spawn(move || {
+            if scan_zone.take_idle_work(thief).is_some() {
+                return false;
+            }
+            scan_zone.enter_idle(thief, true)
+        });
+        let mut effects = WakeEffects::default();
+        zone.migrate_queued(SLOT, &mut effects);
+        let sleeping = scanner.join().unwrap();
+        assert!(
+            !sleeping || effects.sgi_slots().any(|slot| slot == thief),
+            "the idle slot sleeps with no kick while {:?} waits on slot 0",
+            zone.record(record).claim()
+        );
+    });
+}
