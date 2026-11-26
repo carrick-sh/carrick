@@ -5823,6 +5823,90 @@ mod tests {
         assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 0);
     }
 
+    /// A readiness set's carrier-socket item, as the carrier links it for a
+    /// `ReadinessSetCtl` entry (#1051): edge-triggered, its data the set's
+    /// word, published ready at `level`.
+    fn set_host_socket(
+        w: &World,
+        epoll: IpcObjectHandle,
+        fd: i32,
+        interest: i16,
+        level: u32,
+    ) -> carrick_el1_abi::ipc::epoll::EpollItemRef {
+        use carrick_el1_abi::ipc::epoll::{EpollReport, events};
+        let word = readiness_set::SetWord {
+            fd,
+            interest,
+            ready: 0,
+        };
+        let mut requested = events::ET;
+        if interest & SELECT_INTERESTS[0] != 0 {
+            requested |= events::IN;
+        }
+        if interest & SELECT_INTERESTS[1] != 0 {
+            requested |= events::OUT;
+        }
+        w.region
+            .epoll_add_host_socket(
+                epoll,
+                Fd(fd),
+                0x1051_0000 + fd as u64,
+                EpollReport {
+                    events: requested,
+                    data: word.to_raw(),
+                },
+                level,
+                &HostWait,
+            )
+            .unwrap()
+            .0
+    }
+
+    /// #1051 condition A: a set holding more ready carrier sockets than one
+    /// harvest batch (32) is answered whole, every descriptor with its
+    /// classes. On main the set's one scan stopped at the batch: 32 of 40.
+    #[test]
+    fn readiness_set_answers_forty_ready_carrier_sockets() {
+        let w = world();
+        let epoll = w.region.create_epoll(&HostWait).unwrap();
+        for fd in 3..43 {
+            set_host_socket(&w, epoll, fd, SELECT_INTERESTS[0], EPOLL_IN);
+        }
+        let mut ready = readiness_set::harvest_ready(&w.region, epoll, &HostWait).unwrap();
+        ready.sort_by_key(|entry| entry.fd);
+        assert_eq!(ready.len(), 40, "every ready carrier socket answers");
+        for (entry, fd) in ready.iter().zip(3..43) {
+            assert_eq!((entry.fd, entry.ready), (fd, SELECT_INTERESTS[0]));
+        }
+    }
+
+    /// #1051 P0 1: a decided answer is recorded per item, carrier sockets
+    /// included, so a replay (a refused copy-out, or the host settlement
+    /// entry) renders the same count and the socket's bits. On main the
+    /// record skipped carrier items: the replay lost fd 3.
+    #[test]
+    fn readiness_set_replayed_answer_keeps_carrier_socket_bits() {
+        let w = world();
+        let epoll = w.region.create_epoll(&HostWait).unwrap();
+        set_host_socket(&w, epoll, 3, SELECT_INTERESTS[0], EPOLL_IN);
+        // Selected for writing, but not writable: never in the answer.
+        set_host_socket(&w, epoll, 4, SELECT_INTERESTS[1], EPOLL_IN);
+        let answer = readiness_set::harvest_ready(&w.region, epoll, &HostWait).unwrap();
+        assert_eq!(
+            answer,
+            [SelectReady {
+                fd: 3,
+                ready: SELECT_INTERESTS[0]
+            }]
+        );
+        readiness_set::record_answer(&w.region, epoll, &answer, &HostWait).unwrap();
+        let replayed = readiness_set::recorded_answer(&w.region, epoll, &HostWait).unwrap();
+        assert_eq!(
+            replayed, answer,
+            "the replay keeps the carrier socket's bits"
+        );
+    }
+
     /// A finite timeout with nothing ready parks in the guest; the slot's
     /// timer ends it at the deadline, and the re-entered call harvests once
     /// more and returns 0, never before the timeout, without the host.
