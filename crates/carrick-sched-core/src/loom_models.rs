@@ -827,7 +827,10 @@ fn native_hold_races_driver_cpu_publication() {
 /// witness hung that way behind a held fork.
 #[test]
 fn migration_and_idle_scan_never_lose_the_queued_thread() {
-    model(|| {
+    // Two preemptions reach the lost wake (the migration pops, the scan
+    // runs and sleeps, the migration puts back); a third leaves the
+    // exhaustive run past the loom timeout.
+    model_composed(|| {
         let zone = zone();
         let thief = SlotId::new(1);
         for (slot, cpu) in [(SLOT, 0u32), (thief, 1u32)] {

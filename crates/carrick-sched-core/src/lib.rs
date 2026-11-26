@@ -4938,9 +4938,45 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             } else if let Some(guard) = self.slot_lock(slot, &SpinForever) {
                 // Back at the tail: the order of the rest is kept.
                 self.push_locked(&guard, record, None);
+                drop(guard);
+                self.kick_idle_thieves(slot, rec, effects);
             }
         }
         moved
+    }
+
+    /// The queueing half of the idle scan's pair ([`Self::take_idle_work`])
+    /// for a thread `slot` put back on its own run queue after it was on no
+    /// run queue while it was being placed ([`Self::migrate_queued`]). An
+    /// idle scan that published its idle bit meanwhile read the run queues
+    /// without it and may sleep: with the thread queued again, read
+    /// `idle_map` and kick every idle slot that may take it, so its scan
+    /// runs again and steals it (#3053). Either this read sees the scan's
+    /// idle bit, or the scan's queue read sees the thread. A slot that may
+    /// take it and is idle now was not when the placement looked (or its
+    /// lock was busy), so these kicks come only from that window.
+    fn kick_idle_thieves(&self, slot: SlotId, rec: &ZoneRecord<C>, effects: &mut WakeEffects) {
+        if rec.home().is_some() || rec.is_cancelled() {
+            // No scan steals it ([`Self::steal_from`]).
+            return;
+        }
+        fence(Ordering::SeqCst);
+        for (word_index, word) in self.idle_map.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let Some(idle) = SlotId::from_index(word_index * 64 + bit) else {
+                    continue;
+                };
+                if idle != slot && self.accepts(idle, rec, false) {
+                    // Idle, so its queue is empty: an `IdleSpin` slot's
+                    // pending SGI ends its next WFI as an `IdleWfi` one's
+                    // ends this one.
+                    effects.push_sgi(idle);
+                }
+            }
+        }
     }
 
     fn timer_ticket_live(&self, ticket: timer_index::Ticket) -> bool {
@@ -5552,7 +5588,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     ///
     /// Publishing first closes the lost wake with a migrating or waking
     /// peer (#2306): the peer queues a thread, then reads `idle_map`
-    /// ([`Self::migrate_queued`], `find_idle`); this scan sets the slot's
+    /// ([`Self::migrate_queued`], `find_idle`; a migration that puts a
+    /// thread back reads it again, `kick_idle_thieves`); this scan sets the slot's
     /// idle bit, then reads the run queues. One side sees the other: either
     /// the peer placed the thread on this slot (whose [`Self::enter_idle`]
     /// then refuses to sleep), or this scan steals it. A slot that scanned
