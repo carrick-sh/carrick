@@ -4841,6 +4841,54 @@ fn production_fork_parks_on_a_held_parent_editor_and_forks_once_the_carrier_sett
     );
 }
 
+/// #2923: a sibling's copy-on-write that the carrier supplied before a fork
+/// selected its parent's frames resolves only after that fork commits. The
+/// fork selects the frame the sibling's leaf names, publishes the parent
+/// fork-pending, and the carrier then checks each inherited frame against
+/// the parent's live leaf. A sibling that repointed the leaf in between
+/// (its grant was ready in the pool, so it needed no selection that a
+/// pending fork refuses) killed the carrier with `selected source does not
+/// name retained storage`. Now the sibling's MM-editor admission sees the
+/// pending publication, waits on its release, and resolves after the
+/// commit: two live processes and two live threads, ordered on the fixture
+/// image's holds, and each child reads the value from before the write.
+#[test]
+fn production_sibling_cow_waits_out_a_fork_published_after_its_supply() {
+    // The guest orders every step on events and the holds have no time
+    // bound, so a regression can park the run forever. This reporting
+    // bound turns that hang into a failure with the step named. It changes
+    // no ordering.
+    const REPORT_HANG_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+    let elf = native_exit_fixture("native_fork_pending_cow_supply_repoint.S");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fork-pending-cow-supply-repoint".into())
+        .spawn(move || {
+            let _ = done_tx.send(
+                kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+                    .map_err(|failure| failure.error),
+            );
+        })
+        .expect("spawn the fixture run");
+    let outcome = match done_rx.recv_timeout(REPORT_HANG_AFTER) {
+        Ok(run) => run.expect("sibling COW supplied before a pending fork run"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the sibling COW beside a held fork never finished in {REPORT_HANG_AFTER:?}: \
+             it did not park on the fork's release, or the release never woke it \
+             (see native_fork_pending_cow_supply_repoint.S)"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the fixture run panicked before reporting an outcome")
+        }
+    };
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_fork_pending_cow_supply_repoint.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2217: a brk shrink retires its resident pages as an owed return. Before
 /// #1482 nothing on x86 settled it, so regrowing the break over those pages
 /// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
