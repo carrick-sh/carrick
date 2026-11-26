@@ -396,7 +396,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 lifecycle::guest_venue(),
                 page,
                 control,
-                &saved.native,
+                carrick_sched_core::Aarch64EntryContext::saved(&saved),
                 ttbr0,
                 &mut service,
                 cache_lookup,
@@ -491,7 +491,7 @@ pub(super) fn dispatch_arm_syscall_with_native_process<F, C, U, X>(
     lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     cache_lookup: F,
@@ -512,7 +512,7 @@ where
     super::aarch64_process::with_process_entry(
         source,
         service.task,
-        native,
+        entry,
         ttbr0,
         page,
         control,
@@ -1894,7 +1894,7 @@ where
     super::aarch64_process::with_process_entry(
         source,
         task,
-        &saved.native,
+        carrick_sched_core::Aarch64EntryContext::saved(&saved),
         ttbr0,
         page,
         control,
@@ -2119,7 +2119,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_with<
 >(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2172,7 +2172,7 @@ where
         super::aarch64_process::deliver_declined_fault_signal_with(
             source,
             task,
-            native,
+            entry,
             ttbr0,
             page,
             control,
@@ -2285,7 +2285,7 @@ fn declined_fault_admission_busy_once_then_success() {
 pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkStockCrossing, F>(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2307,7 +2307,7 @@ where
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
     arm_deliver_declined_fault_signal_with(
-        source, task, native, ttbr0, page, control, service, frame, owner_wait, deliver,
+        source, task, entry, ttbr0, page, control, service, frame, owner_wait, deliver,
     )
 }
 
@@ -2339,7 +2339,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
     let action = arm_deliver_declined_fault_signal(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
-        &saved.native,
+        carrick_sched_core::Aarch64EntryContext::saved(&saved),
         ttbr0,
         page,
         control,
@@ -2512,7 +2512,7 @@ where
     let (action, _) = arm_signal_user_return_admitted_entry(
         source,
         task,
-        &saved.native,
+        carrick_sched_core::Aarch64EntryContext::saved(&saved),
         ttbr0,
         page,
         control,
@@ -2624,7 +2624,7 @@ fn closing_member_record_on_cpu(
 pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockCrossing>(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2648,7 +2648,7 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
         return Ok(Action::Served);
     };
     let (action, terminal_owed) = arm_signal_user_return_admitted_entry(
-        source, task, native, ttbr0, page, control, service, deliver,
+        source, task, entry, ttbr0, page, control, service, deliver,
     )?;
     assert!(
         admission || !terminal_owed,
@@ -2664,7 +2664,7 @@ pub(super) fn arm_signal_user_return_admitted_entry<
 >(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
+    entry: carrick_sched_core::Aarch64EntryContext<'_>,
     ttbr0: u64,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2684,7 +2684,7 @@ pub(super) fn arm_signal_user_return_admitted_entry<
     let (delivered, terminal_owed) = super::aarch64_process::with_process_entry(
         source,
         task,
-        native,
+        entry,
         ttbr0,
         page,
         control,

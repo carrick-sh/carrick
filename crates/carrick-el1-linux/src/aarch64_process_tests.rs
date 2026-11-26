@@ -57,10 +57,18 @@ use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
 #[cfg(test)]
 use carrick_sched_core::RecordId;
 use carrick_sched_core::process::{TaskKey, TaskSerial};
+#[cfg(test)]
+use carrick_sched_core::{Aarch64EntryContext, SavedSyscallPc};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::{NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// `native` as the EL1 SVC hook saves it at a fresh trap: after its `SVC`.
+#[cfg(test)]
+fn after_svc(native: ThreadCtx) -> Aarch64ParkedContext {
+    Aarch64ParkedContext::trapped(native, SavedSyscallPc::AfterSyscall)
+}
 
 #[cfg(test)]
 mod exit_group_hang_tests;
@@ -1791,7 +1799,7 @@ impl Fixture {
                 slot: service.slot,
             },
             &self.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             ttbr0,
             self.page,
             control,
@@ -2249,7 +2257,7 @@ fn first_process_call_acquires_a_root_authenticated_home_record() {
     let record = process_record_for_call(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         fixture.control,
     )
@@ -2275,7 +2283,7 @@ fn host_home_process_call_seeds_an_unpublished_root_context() {
     let retained = process_record_for_call(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         fixture.control,
     )
@@ -5363,7 +5371,7 @@ fn arm_root_setup_enters_production_process_venue() {
                 Some(&*fixture),
                 fixture.page,
                 fixture.control,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -5675,7 +5683,7 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
                 Some(&*fixture),
                 fixture.page,
                 fixture.control,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -5743,7 +5751,7 @@ fn arm_sigprocmask_nonresident_input_is_not_efault() {
                 Some(&*fixture),
                 fixture.page,
                 fixture.control,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -6193,7 +6201,7 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     let record = process_record_for_call(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         fixture.control,
     )
@@ -6201,7 +6209,7 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     admit_entry(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         record,
         fixture.page,
@@ -6345,7 +6353,7 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         Some(&*fixture),
         fixture.page,
         control,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         &mut service,
         |_| core::ptr::null_mut(),
@@ -6459,7 +6467,7 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
         Some(&*fixture),
         fixture.page,
         control,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         &mut service,
         |_| core::ptr::null_mut(),
@@ -6551,7 +6559,7 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
         Some(fixture),
         fixture.page,
         control,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         fixture_ttbr0(fixture),
         service,
         |_| core::ptr::null_mut(),
@@ -6923,7 +6931,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     let retained = process_record_for_call(
         retained_source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         fixture_ttbr0(fixture),
         fixture.control,
     )
@@ -6944,7 +6952,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     let refused = super::dispatch::arm_deliver_declined_fault_signal_with(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         fixture_ttbr0(fixture),
         fixture.page,
         fixture.control,
@@ -6985,7 +6993,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
             super::dispatch::arm_deliver_declined_fault_signal_with(
                 source,
                 &fixture.task,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 fixture_ttbr0(fixture),
                 fixture.page,
                 fixture.control,
@@ -7079,7 +7087,7 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
         super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             fixture_ttbr0(fixture),
             fixture.page,
             fixture.control,
@@ -7157,7 +7165,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
         super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             fixture_ttbr0(fixture),
             fixture.page,
             fixture.control,
@@ -7199,7 +7207,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
         super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             fixture_ttbr0(fixture),
             fixture.page,
             fixture.control,
@@ -8014,7 +8022,7 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
                 slot: service.slot,
             },
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             ttbr0,
             page,
             entered,
@@ -12497,7 +12505,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         let record = process_record_for_call(
             source,
             &fixture.task,
-            &saved.native,
+            Aarch64EntryContext::saved(&saved),
             fixture_ttbr0(fixture),
             fixture.control,
         )
@@ -17152,7 +17160,7 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
                     slot: fixture.slot
                 },
                 &fixture.task,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 fixture_ttbr0(fixture),
                 fixture.page,
                 fixture.control,
@@ -17250,7 +17258,7 @@ fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
                     slot: fixture.slot
                 },
                 &fixture.task,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 fixture_ttbr0(fixture),
                 fixture.page,
                 fixture.control,
@@ -17356,7 +17364,7 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
                 slot: fixture.slot
             },
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             fixture_ttbr0(fixture),
             fixture.page,
             fixture.control,
@@ -17460,7 +17468,7 @@ fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
                     slot: fixture.slot
                 },
                 &fixture.task,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 fixture_ttbr0(fixture),
                 fixture.page,
                 control,
@@ -17510,7 +17518,7 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
                 slot: fixture.slot,
             },
             &fixture.task,
-            &ThreadCtx::ZERO,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
             fixture_ttbr0(fixture),
             fixture.page,
             fixture.control,
@@ -17673,7 +17681,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     let entered = with_process_entry(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         fixture.page,
         control,
@@ -18014,7 +18022,7 @@ fn futex_owner_wait_episode(
     let record = process_record_for_call(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         fixture_ttbr0(fixture),
         fixture.control,
     )
@@ -18728,7 +18736,7 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
     let (outcome, runtime) = with_process_entry(
         source,
         &fixture.task,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         fixture_ttbr0(fixture),
         fixture.page,
         fixture.control,
@@ -18855,7 +18863,7 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
             &mut frame, &counters, core::slice::from_ref(child_task), &[], &[], &[], &[],
             &cache, None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
             None, Some(&ChildLifecycle), child_task.lifecycle_refs().unwrap().0, child_control,
-            &ThreadCtx::ZERO, fixture.zone.spaces.grant(fixture.zone.spaces.find(child_binding.address.mm.raw().get()).unwrap(), child_binding.address.mm.raw().get()).unwrap().ttbr0,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)), fixture.zone.spaces.grant(fixture.zone.spaces.find(child_binding.address.mm.raw().get()).unwrap(), child_binding.address.mm.raw().get()).unwrap().ttbr0,
             &mut child_service, |_| core::ptr::null_mut(),
         ).unwrap();
         assert_eq!(frame.x[0], u64::from(child_pid), "child syscall {nr}");
@@ -19369,7 +19377,7 @@ fn with_arm_process_host_files_on<R>(
                 Some(fixture),
                 fixture.page,
                 fixture.control,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -24518,7 +24526,7 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
                 Some(fixture),
                 fixture.page,
                 fixture.control,
-                &ThreadCtx::ZERO,
+                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -24779,7 +24787,7 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
         Some(fixture),
         fixture.page,
         fixture.control,
-        &ThreadCtx::ZERO,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
         ttbr0,
         &mut service,
         |_| core::ptr::null_mut(),

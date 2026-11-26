@@ -1104,7 +1104,7 @@ fn arm_host_owned_sigsuspend_across_admission_home_drop_preserves_suspend_mask()
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1146,7 +1146,7 @@ fn arm_host_owned_sigsuspend_across_admission_home_drop_preserves_suspend_mask()
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1185,7 +1185,7 @@ fn arm_host_owned_sigsuspend_across_admission_home_drop_preserves_suspend_mask()
     let action = crate::dispatch::arm_signal_user_return_entry(
         source,
         &fixture.task,
-        &delivery_native,
+        Aarch64EntryContext::saved(&after_svc(delivery_native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1281,7 +1281,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         sib_control,
@@ -1309,7 +1309,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1341,7 +1341,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         sib_control,
@@ -1373,7 +1373,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     let action = crate::dispatch::arm_signal_user_return_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         sib_control,
@@ -1412,7 +1412,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     let leader_action = crate::dispatch::arm_signal_user_return_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1445,7 +1445,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1499,7 +1499,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     let action2 = crate::dispatch::arm_signal_user_return_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         sib_control,
@@ -1533,7 +1533,7 @@ fn arm_host_owned_member_without_zone_record_accepts_tgkill_and_delivers_on_reen
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -1598,7 +1598,7 @@ fn arm_host_owned_member_without_zone_record_does_not_sample_released_cpu_clock(
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         sib_control,
@@ -1621,7 +1621,7 @@ fn arm_host_owned_member_without_zone_record_does_not_sample_released_cpu_clock(
     crate::aarch64_process::with_process_entry(
         source,
         &fixture.task,
-        &native,
+        Aarch64EntryContext::saved(&after_svc(native)),
         ttbr0,
         fixture.page,
         fixture.control,
@@ -2140,7 +2140,7 @@ fn arm_pool_born_host_adopted_member_without_zone_record_accepts_tgkill_and_deli
     let action = crate::dispatch::arm_signal_user_return_entry(
         source,
         &fixture.task,
-        &delivery_native,
+        Aarch64EntryContext::saved(&after_svc(delivery_native)),
         ttbr0,
         fixture.page,
         sib_control,
