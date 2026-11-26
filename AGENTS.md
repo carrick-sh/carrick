@@ -88,11 +88,11 @@ Docker oracle. The scoreboard is the fast smoke check.
   (`carrick-personality-linux/src/crossing.rs`,
   `docs/design/arm-ring-first-flip.tsv`) are director-owned, and need an
   independent review and the signed gate.
-- **One lane.** A fix lands for ARM and x86, and for HVF and KVM, in the same
-  PR, through ISA-neutral crates. Per-arch code holds only ISA mechanics:
-  register frames, trap and IRQ entry, page-table formats. A gap in neutral
-  logic is a P0 for that PR. A true mechanic that can't follow yet becomes a
-  `seam` issue with the reason (owner, 2026-10-27 and 2026-11-08).
+- **One lane.** Logic lives in ISA-neutral crates. Per-arch code holds only
+  ISA mechanics: register frames, trap and IRQ entry, page-table formats. x86
+  may land first; the other ISA's compile fixes follow as a tracked `seam`
+  issue. A gap in neutral logic is a P0 for that PR. Ring-first and
+  correctness are unchanged (owner, 2026-11-26, #231 comment 7198282621).
 - **Fix in shared layers; move code, never copy it.** Ring ports go through the
   shared `no_std` `*-core` crates. Search before writing: a second
   implementation drifts.
