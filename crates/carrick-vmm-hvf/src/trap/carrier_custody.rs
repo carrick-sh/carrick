@@ -1200,12 +1200,41 @@ impl CarrierVmCustody {
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), Stage2CustodyError> {
-        let (drained_keepers, drained_ipas) = {
+        let (frame_pool, root_slot_pool, drained_keepers, drained_ipas) = {
             let mut state = self.stage2.lock();
-            self.drain_abandoned_carrier_lease_keepers_locked(&mut state, generation)
+            match state.lifecycle() {
+                Stage2Lifecycle::Gone(current) if current == generation => {}
+                Stage2Lifecycle::Gone(_)
+                | Stage2Lifecycle::Live(_)
+                | Stage2Lifecycle::Destroying(_) => {
+                    return Err(Stage2CustodyError::StaleGeneration);
+                }
+                Stage2Lifecycle::Vacant | Stage2Lifecycle::Creating(_) => {
+                    return Err(Stage2CustodyError::LifecycleConflict);
+                }
+            }
+            let frame_pool = std::mem::replace(
+                &mut *self.frame_pool.lock(),
+                CarrierFramePoolState::Uninitialized,
+            );
+            let root_slot_pool = std::mem::replace(
+                &mut *self.root_slot_pool.lock(),
+                CarrierRootSlotPoolState::Uninitialized,
+            );
+            if let CarrierFramePoolState::Active(pool) = &frame_pool {
+                pool.forget_backend_mapping();
+            }
+            if let CarrierRootSlotPoolState::Active(pool) = &root_slot_pool {
+                pool.forget_backend_mapping();
+            }
+            let (keepers, ipas) =
+                self.drain_abandoned_carrier_lease_keepers_locked(&mut state, generation);
+            (frame_pool, root_slot_pool, keepers, ipas)
         };
         let retired_ipc_backings = self.drain_ipc_backings_through(generation);
         drop(retired_ipc_backings);
+        drop(frame_pool);
+        drop(root_slot_pool);
         drop(drained_keepers);
         for (ipa, len) in drained_ipas {
             let _ = super::global_frame::release_retired_stage2_ipa(ipa, len);
@@ -1444,13 +1473,6 @@ impl CarrierVmCustody {
         if in_frame_pool {
             return true;
         }
-        match &*self.root_slot_pool.lock() {
-            CarrierRootSlotPoolState::Active(pool) => pool.contains_ipa(ipa),
-            CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => false,
-        }
-    }
-
-    fn is_active_root_slot_pool_ipa(&self, ipa: u64) -> bool {
         match &*self.root_slot_pool.lock() {
             CarrierRootSlotPoolState::Active(pool) => pool.contains_ipa(ipa),
             CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => false,
@@ -2375,11 +2397,7 @@ impl CarrierVmCustody {
                         state
                             .pinned_structural_predecessors
                             .remove(&successor.record_id);
-                        let retire_pending = state
-                            .stage2_records
-                            .get(&successor.record_id)
-                            .is_some_and(|succ| succ.snapshot.retirement_requested);
-                        successor_to_retire = Some((successor, retire_pending));
+                        successor_to_retire = Some(successor);
                     }
                 }
                 predecessor_keeper = self
@@ -2419,9 +2437,8 @@ impl CarrierVmCustody {
             )
         };
         drop(predecessor_keeper);
-        if let Some((successor, retire_pending)) = successor_to_retire {
-            if (retire_pending
-                || self.has_deferred_structural_logical_release(successor.record_id)
+        if let Some(successor) = successor_to_retire {
+            if (self.has_deferred_structural_logical_release(successor.record_id)
                 || self.is_structural_owner_retired(successor.record_id))
                 && super::retire_structural_stage2_record_at_safe_point(self, successor).is_err()
             {
@@ -2451,8 +2468,8 @@ impl CarrierVmCustody {
             } else {
                 self.request_global_frame_retirement_retry();
             }
-        } else if let RecordPinRelease::ReadyToRetire { ipa } = outcome {
-            if self.is_active_root_slot_pool_ipa(ipa) {
+        } else if let RecordPinRelease::ReadyToRetire { .. } = outcome {
+            if self.is_structural_owner_retired(identity.record_id) {
                 if super::retire_structural_stage2_record_at_safe_point(self, identity).is_err() {
                     self.enqueue_structural_retirement_retry(identity.record_id);
                 }
@@ -4993,6 +5010,91 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn failed_creating_vm_rebuilds_both_pools_for_successor() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = CarrierVmCustody::new();
+        let g1 = custody.begin_create().expect("begin G1");
+        let frames1 = custody.frame_pool().expect("G1 frame pool");
+        let roots1 = custody.root_slot_pool().expect("G1 root pool");
+        assert_eq!(frames1.vm_generation(), Some(g1));
+        assert_eq!(roots1.vm_generation(), Some(g1));
+        super::super::stage2_backend::script_next_stage2_destroy(
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        );
+        let result = super::destroy_vm_with_custody_target(
+            &custody,
+            "failed G1 creation",
+            super::CarrierVmDestroyTarget::Creating(g1),
+        );
+        super::super::stage2_backend::script_next_stage2_destroy_clear();
+        result.expect("production failed-creation cleanup");
+        let g2 = custody.begin_create().expect("begin G2");
+        let frames2 = custody.frame_pool().expect("G2 frame pool");
+        let roots2 = custody.root_slot_pool().expect("G2 root pool");
+        let observed = (
+            frames2.vm_generation(),
+            roots2.vm_generation(),
+            std::sync::Arc::ptr_eq(&frames1, &frames2),
+            std::sync::Arc::ptr_eq(&roots1, &roots2),
+        );
+        custody.commit_create(g2).expect("commit G2");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G2 cleanup",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G2");
+        drop((frames1, roots1, frames2, roots2));
+        assert_eq!(
+            observed,
+            (Some(g2), Some(g2), false, false),
+            "G2 must own freshly mapped pools"
+        );
+    }
+
+    #[test]
+    fn stale_failed_creation_cleanup_cannot_drain_or_reset_gone_generation() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let custody = CarrierVmCustody::new();
+        let g1 = custody.begin_create().expect("begin G1");
+        let frames = custody.frame_pool().expect("G1 frame pool");
+        let roots = custody.root_slot_pool().expect("G1 root pool");
+        custody.destroy_stage2_for_test(g1);
+        let before_keepers = custody.carrier_lease_keepers.lock().drained_through;
+        let before_ipc = custody.retained_ipc_backings.lock().drained_through;
+        let wrong = CarrierVmGeneration(g1.0 + 1);
+        let result = custody.abort_created_vm_after_raw_destroy(wrong);
+        let observed_keepers = custody.carrier_lease_keepers.lock().drained_through;
+        let observed_ipc = custody.retained_ipc_backings.lock().drained_through;
+        let observed_frames = matches!(&*custody.frame_pool.lock(), super::CarrierFramePoolState::Active(pool) if std::sync::Arc::ptr_eq(pool, &frames));
+        let observed_roots = matches!(&*custody.root_slot_pool.lock(), super::CarrierRootSlotPoolState::Active(pool) if std::sync::Arc::ptr_eq(pool, &roots));
+        custody
+            .abort_created_vm_after_raw_destroy(g1)
+            .expect("cleanup exact G1");
+        // Keep pre-fix fixture teardown from dropping mapped leases after
+        // raw destroy; the assertions below still observe the stale call.
+        frames.forget_backend_mapping();
+        roots.forget_backend_mapping();
+        drop((frames, roots));
+        assert!(result.is_err(), "wrong generation must be refused");
+        assert_eq!(
+            observed_keepers, before_keepers,
+            "stale cleanup must not advance keeper drain"
+        );
+        assert_eq!(
+            observed_ipc, before_ipc,
+            "stale cleanup must not advance IPC drain"
+        );
+        assert!(
+            observed_frames && observed_roots,
+            "stale cleanup must not change pools"
+        );
+    }
+
+    #[test]
     fn frame_pool_and_commit_destroy_concurrent_lock_order() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         use std::sync::Arc;
@@ -5841,6 +5943,196 @@ mod carrier_vm_custody_tests {
             custody
                 .stage2_record_snapshot(new_identity.record_id)
                 .is_some_and(|record| record.retirement_requested)
+        );
+    }
+
+    #[test]
+    fn last_predecessor_pin_preserves_live_owner_after_successor_destroy() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let (ipa, len) = (0x7d00_3000_0000, 0x4000);
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("structural backing");
+        let host = mapping.as_ptr() as usize;
+        let perms =
+            carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWriteExec);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_test_mapped_without_backend();
+        let owner = super::StructuralBackingOwner::new_in(
+            &custody,
+            mapping,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("structural owner");
+        let old = owner.record_identity();
+        assert_eq!(old.vm_generation, g1);
+        let pin = custody.pin_stage2_record(old).expect("predecessor pin");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        super::super::stage2_backend::test_stage2_map_untracked(
+            &custody,
+            host as *mut std::ffi::c_void,
+            ipa,
+            len,
+            perms,
+        );
+        super::reconcile_global_frame_owners_after_replay_in_using(
+            &custody,
+            &[super::GlobalFrameReplayExtent {
+                ipa,
+                length: len as u64,
+                host_addr: host,
+                perms,
+                vm_generation: g2,
+            }],
+            false,
+            &mut |_, _| Ok(()),
+        )
+        .expect("rebind live owner");
+        let successor = owner.record_identity();
+        assert_ne!(successor.record_id, old.record_id);
+        assert!(custody.has_pinned_structural_predecessor(successor.record_id));
+        destroy_vm_with_custody_using(
+            &custody,
+            "G2",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G2");
+        assert!(!custody.is_structural_owner_retired(successor.record_id));
+        assert!(!custody.has_deferred_structural_logical_release(successor.record_id));
+        drop(pin);
+        assert!(custody.stage2_record_snapshot(old.record_id).is_none());
+        assert!(
+            custody
+                .stage2_record_snapshot(successor.record_id)
+                .is_some(),
+            "live successor record must survive G2 destroy and predecessor unpin"
+        );
+        assert_eq!(owner.record_identity(), successor);
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&successor.record_id)
+        );
+        assert!(super::alias_backing_is_live(host));
+        drop(owner);
+    }
+
+    #[test]
+    fn last_pin_preserves_live_pooled_root_across_destroy_and_new_pool() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let pool = custody.root_slot_pool().expect("G1 pool");
+        let handle = pool.allocate_slot().expect("G1 slot");
+        let ipa = handle.ipa();
+        let len = handle.len();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_pre_mapped_in(Some(g1));
+        let owner = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody,
+            handle,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("pooled structural owner");
+        let identity = owner.record_identity();
+        let pin = custody.pin_stage2_record(identity).expect("G1 pin");
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        let g2 = custody.begin_create().expect("begin G2");
+        custody.commit_create(g2).expect("commit G2");
+        let pool2 = custody.root_slot_pool().expect("G2 pool");
+        assert!(
+            pool2.contains_ipa(ipa),
+            "G2 pool must cover the old fixed IPA"
+        );
+        assert!(!custody.is_structural_owner_retired(identity.record_id));
+        drop(pin);
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_some(),
+            "live pooled record must survive last unpin"
+        );
+        assert_eq!(owner.record_identity(), identity);
+        assert!(
+            custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id)
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn last_pin_retires_dead_pooled_owner_without_active_pool() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stub = super::super::stage2_backend::ScopedStage2MapTestStub::enable();
+        let (custody, g1) = live_custody();
+        let pool = custody.root_slot_pool().expect("G1 pool");
+        let handle = pool.allocate_slot().expect("G1 slot");
+        let ipa = handle.ipa();
+        let len = handle.len();
+        let perms = carrick_aarch64::stage2::stage2_perms_bits(carrick_hal::MemPerms::ReadWrite);
+        let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, len as u64);
+        lease.mark_pre_mapped_in(Some(g1));
+        let owner = super::StructuralBackingOwner::new_pooled_root_in(
+            &custody,
+            handle,
+            lease,
+            perms,
+            super::next_structural_epoch().unwrap(),
+            ipa,
+            len,
+        )
+        .expect("pooled structural owner");
+        let identity = owner.record_identity();
+        let pin = custody.pin_stage2_record(identity).expect("G1 pin");
+        drop(owner);
+        assert!(custody.is_structural_owner_retired(identity.record_id));
+        destroy_vm_with_custody_using(
+            &custody,
+            "G1",
+            carrick_aarch64::stage2::Stage2Status::SUCCESS,
+            || {},
+        )
+        .expect("destroy G1");
+        assert!(!custody.is_pooled_ipa(ipa), "destroy removes active pool");
+        drop(pin);
+        assert!(
+            custody.stage2_record_snapshot(identity.record_id).is_none(),
+            "retired pooled record must drain without active pool"
+        );
+        assert!(
+            !custody
+                .structural_backings
+                .lock()
+                .contains_key(&identity.record_id)
         );
     }
 

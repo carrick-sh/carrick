@@ -7080,6 +7080,13 @@ impl HvfVmState {
     fn prepare_task_only_plan(
         plan: ProcessSpecPlan,
     ) -> Result<(Vec<GlobalFrameStage2Lease>, HvpatchPreparedTaskAuthority), TrapError> {
+        // Authenticate one VM generation for the whole composition. A
+        // successor must not receive the remainder of this plan.
+        let vm_generation = plan
+            .carrier_foreign_mm_transport
+            .custody
+            .admitting_stage2("task-only stage-2 composition")?
+            .generation();
         let mut mapped = Vec::with_capacity(plan.mappings.len());
         let mut stage2_leases = Vec::with_capacity(plan.mappings.len());
         let mut structural_owners = std::collections::BTreeMap::new();
@@ -7122,40 +7129,43 @@ impl HvfVmState {
                     }
                 )
             {
-                let map_result = {
-                    let mut stage2 = plan
-                        .carrier_foreign_mm_transport
-                        .custody
-                        .admitting_stage2("task-only stage-2 map")?;
-                    unsafe {
-                        stage2_map(
-                            &mut stage2,
-                            mapping.physical_host_addr.cast(),
-                            mapping.physical_ipa,
-                            mapping.physical_size,
-                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                        )
-                    }
-                };
+                let map_result = plan
+                    .carrier_foreign_mm_transport
+                    .custody
+                    .admitting_stage2_in(vm_generation, "task-only stage-2 map")
+                    .and_then(|mut stage2| {
+                        let result = unsafe {
+                            stage2_map(
+                                &mut stage2,
+                                mapping.physical_host_addr.cast(),
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                            )
+                        };
+                        drop(stage2);
+                        result.map_err(|rc| {
+                            report_stage2_map_refusal(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                mapping.physical_host_addr as usize,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                                rc.raw(),
+                            );
+                            TrapError::ChildMapFailed {
+                                host_addr: mapping.physical_host_addr as u64,
+                                guest_start: mapping.physical_ipa,
+                                size: mapping.physical_size,
+                                code: rc.raw(),
+                            }
+                        })
+                    });
                 let stage2_mapping = match map_result {
                     Ok(stage2_mapping) => stage2_mapping,
-                    Err(rc) => {
+                    Err(error) => {
                         drop(mapping.stage2_lease.take());
                         drop(mapped);
-                        report_stage2_map_refusal(
-                            &plan.carrier_foreign_mm_transport.custody,
-                            mapping.physical_host_addr as usize,
-                            mapping.physical_ipa,
-                            mapping.physical_size,
-                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                            rc.raw(),
-                        );
-                        let error = TrapError::ChildMapFailed {
-                            host_addr: mapping.physical_host_addr as u64,
-                            guest_start: mapping.physical_ipa,
-                            size: mapping.physical_size,
-                            code: rc.raw(),
-                        };
                         drop(mm_root_stage2.take());
                         if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
                             &plan.carrier_foreign_mm_transport.custody,
@@ -7572,6 +7582,13 @@ impl HvfVmState {
         let (vm, plan) = spec.into_plan();
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
+        // Authenticate one VM generation for the whole composition. A
+        // successor must not receive the remainder of this plan.
+        let vm_generation = plan
+            .carrier_foreign_mm_transport
+            .custody
+            .admitting_stage2("full-VM stage-2 composition")?
+            .generation();
         let mut mapped = TaskMappingIndex::new();
         let mut structural_owners = std::collections::BTreeMap::new();
         let mut structural_identities = Vec::new();
@@ -7612,38 +7629,41 @@ impl HvfVmState {
                     }
                 )
             {
-                let map_result = {
-                    let mut stage2 = plan
-                        .carrier_foreign_mm_transport
-                        .custody
-                        .admitting_stage2("full-VM stage-2 map")?;
-                    unsafe {
-                        stage2_map(
-                            &mut stage2,
-                            mapping.physical_host_addr.cast(),
-                            mapping.physical_ipa,
-                            mapping.physical_size,
-                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                        )
-                    }
-                };
+                let map_result = plan
+                    .carrier_foreign_mm_transport
+                    .custody
+                    .admitting_stage2_in(vm_generation, "full-VM stage-2 map")
+                    .and_then(|mut stage2| {
+                        let result = unsafe {
+                            stage2_map(
+                                &mut stage2,
+                                mapping.physical_host_addr.cast(),
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                            )
+                        };
+                        drop(stage2);
+                        result.map_err(|rc| {
+                            report_stage2_map_refusal(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                mapping.physical_host_addr as usize,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                                carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
+                                rc.raw(),
+                            );
+                            TrapError::ChildMapFailed {
+                                host_addr: mapping.physical_host_addr as u64,
+                                guest_start: mapping.physical_ipa,
+                                size: mapping.physical_size,
+                                code: rc.raw(),
+                            }
+                        })
+                    });
                 let stage2_mapping = match map_result {
                     Ok(stage2_mapping) => stage2_mapping,
-                    Err(rc) => {
-                        report_stage2_map_refusal(
-                            &plan.carrier_foreign_mm_transport.custody,
-                            mapping.physical_host_addr as usize,
-                            mapping.physical_ipa,
-                            mapping.physical_size,
-                            carrick_aarch64::stage2::stage2_perms_bits(mapping.perms),
-                            rc.raw(),
-                        );
-                        let error = TrapError::ChildMapFailed {
-                            host_addr: mapping.physical_host_addr as u64,
-                            guest_start: mapping.physical_ipa,
-                            size: mapping.physical_size,
-                            code: rc.raw(),
-                        };
+                    Err(error) => {
                         drop(mapping.stage2_lease.take());
                         let mut prior_stage2_leases = mapped
                             .iter_mut()

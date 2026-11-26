@@ -702,7 +702,7 @@ impl NativeService {
                     .insert((ipa, generation), Arc::downgrade(&retained));
                 allocated.push((ipa, retained));
             }
-            let mut keep_alive: Vec<Arc<crate::fork_stock::NativeFrameBacking>> = allocated
+            let keep_alive: Vec<Arc<crate::fork_stock::NativeFrameBacking>> = allocated
                 .iter()
                 .map(|(_, backing)| Arc::clone(backing))
                 .collect();
@@ -773,22 +773,17 @@ impl NativeService {
                 }
                 Ok(Some(()))
             })();
+            // Drop outside fork_stock: handed-off grants retain their backing;
+            // only backings with no remaining owner are retired.
+            drop(keep_alive);
             match publish_result {
-                Ok(Some(())) => drop(keep_alive),
+                Ok(Some(())) => {}
                 Ok(None) => {
-                    for backing in keep_alive.drain(..) {
-                        let _ = backing.release_unused();
-                    }
                     drop(exclusion);
                     drop(source);
                     return self.refuse();
                 }
-                Err(error) => {
-                    for backing in keep_alive.drain(..) {
-                        let _ = backing.release_unused();
-                    }
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         let supplied = pool

@@ -10634,6 +10634,31 @@ fn task_only_partial_map_failure_retires_the_exact_structural_root() {
 }
 
 #[test]
+fn task_only_invalid_second_mapping_rolls_back_first_structural_owner() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let root_ipa = 0x9a00_0600_0000u64;
+    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    let before = custody.stage2_record_identities();
+    // The first mapping is installed; the second's semantic range escapes
+    // its physical extent before its own stage-2 admission.
+    plan.mappings[1].size = plan.mappings[1].physical_size + 1;
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(matches!(result, Err(TrapError::Hypervisor(_))));
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, 0x20_0000),
+        "invalid second mapping must roll back the first stage-2 mapping"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|id| before.contains(id)),
+        "invalid second mapping must retire the first structural owner"
+    );
+}
+
+#[test]
 fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let stage2_stub = ScopedStage2MapTestStub::enable();
