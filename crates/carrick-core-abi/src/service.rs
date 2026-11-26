@@ -3388,6 +3388,118 @@ mod tests {
         }
     }
 
+    /// #3040: a lane's COW supply the carrier refused leaves no selection in
+    /// the lane's slot, so another MM's unselected fault delivered on that CPU
+    /// is still served. Before, ARM left the selection published and the next
+    /// intake on the CPU was refused (`native_service.rs:1514`).
+    #[test]
+    fn refused_cow_supply_leaves_the_lane_slot_for_the_next_request() {
+        let a = birth(1, 1);
+        let cow = supply_window(a);
+        // Another MM's unselected fault, delivered on this CPU next.
+        let next_request_is_served = |slot: &crate::PortalGrantSlot| {
+            let cell = ServiceCell::new();
+            let b = birth(2, 1);
+            cell.bind(b).unwrap();
+            let request = cell
+                .publish(b, SnapshotGeneration::INITIAL, fault(), None)
+                .unwrap();
+            let mut ticket = cell.claim(request).unwrap();
+            let taken = ticket.take_fault_selection(slot);
+            assert!(ticket.complete(false).is_ok());
+            taken == Ok(None)
+        };
+        // The defect: a refused crossing that leaves the selection published
+        // makes the next request's intake Stale, the executor's death.
+        let leaked = crate::PortalGrantSlot::new();
+        assert!(leaked.publish_cow_fault_selection(1, cow));
+        assert!(!next_request_is_served(&leaked));
+
+        let slot = crate::PortalGrantSlot::new();
+        // A refused crossing (ARM: HVF denied, e.g. no guest COW state).
+        assert_eq!(
+            slot.supply_cow_selection(cow, || Err::<(), u8>(7)),
+            Err(crate::CowSupplyRefusal::Unserved(Some(7)))
+        );
+        assert!(next_request_is_served(&slot));
+        // A crossing that supplied nothing and refused nothing (x86: the
+        // MM's editor was held on the other CPU).
+        assert_eq!(
+            slot.supply_cow_selection(cow, || Ok::<(), u8>(())),
+            Err(crate::CowSupplyRefusal::Unserved(None))
+        );
+        assert!(next_request_is_served(&slot));
+        // A crossing whose carrier took the exact selection supplied it.
+        assert_eq!(
+            slot.supply_cow_selection(cow, || {
+                assert!(slot.take_cow_fault_selection(cow));
+                Ok::<(), u8>(())
+            }),
+            Ok(())
+        );
+        assert!(next_request_is_served(&slot));
+        // A carrier that took the selection but reported a refusal leaves
+        // nothing this lane may claim.
+        assert_eq!(
+            slot.supply_cow_selection(cow, || {
+                assert!(slot.take_cow_fault_selection(cow));
+                Err::<(), u8>(7)
+            }),
+            Err(crate::CowSupplyRefusal::Lost)
+        );
+        assert!(next_request_is_served(&slot));
+
+        // Replaced under the lane (taken, then another selection published):
+        // never reported as a supply, and the successor is left alone.
+        let mut successor = cow;
+        successor.operation.sequence = NonZeroU64::new(2).unwrap();
+        let replaced = crate::PortalGrantSlot::new();
+        assert_eq!(
+            replaced.supply_cow_selection(cow, || {
+                assert!(replaced.take_cow_fault_selection(cow));
+                assert!(replaced.publish_cow_fault_selection(2, successor));
+                Ok::<(), u8>(())
+            }),
+            Err(crate::CowSupplyRefusal::Lost)
+        );
+        assert_eq!(
+            replaced.pending_cow_fault_selection(a.mm.mm().raw(), cow.fault_page),
+            Some((2, successor))
+        );
+        let backing = crate::PortalGrantSlot::new();
+        assert_eq!(
+            backing.supply_cow_selection(cow, || {
+                assert!(backing.take_cow_fault_selection(cow));
+                assert!(backing.publish_fault_selection(2, successor));
+                Ok::<(), u8>(())
+            }),
+            Err(crate::CowSupplyRefusal::Lost)
+        );
+        assert_eq!(backing.selection_snapshot().0, 3);
+        // A same-page successor with another generation is not this lane's.
+        assert!(!replaced.take_cow_fault_selection(cow));
+
+        // An occupied slot publishes nothing and leaves the occupant; an
+        // invalid window publishes nothing and is not contention.
+        let occupied = crate::PortalGrantSlot::new();
+        assert!(occupied.publish_fault_selection(5, cow));
+        assert_eq!(
+            occupied.supply_cow_selection(cow, || -> Result<(), u8> {
+                panic!("an occupied slot must not cross")
+            }),
+            Err(crate::CowSupplyRefusal::SlotOccupied)
+        );
+        assert_eq!(occupied.selection_snapshot().0, 3);
+        let mut invalid = cow;
+        invalid.fault_page += 4096;
+        assert_eq!(
+            crate::PortalGrantSlot::new().supply_cow_selection(invalid, || -> Result<(), u8> {
+                panic!("an invalid window must not cross")
+            }),
+            Err(crate::CowSupplyRefusal::Invalid)
+        );
+    }
+
     #[test]
     fn fault_supply_transfer_survives_lane_reuse_and_cancellation() {
         let slot = crate::PortalGrantSlot::new();

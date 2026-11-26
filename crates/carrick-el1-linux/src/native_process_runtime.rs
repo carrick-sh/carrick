@@ -499,6 +499,24 @@ impl NativeProcessError {
         }
     }
 
+    /// The one reading of a lane's copy-on-write supply refusal, on both
+    /// ISAs (#3040). The slot holds none of the lane's selection after any of
+    /// them. A supply that refused nothing, or a slot another selection
+    /// occupies, is contention; a crossing's own refusal is kept.
+    pub fn from_cow_supply(
+        refusal: carrick_core_abi::CowSupplyRefusal<NativeProcessError>,
+    ) -> NativeProcessError {
+        use carrick_core_abi::CowSupplyRefusal;
+        match refusal {
+            CowSupplyRefusal::SlotOccupied | CowSupplyRefusal::Unserved(None) => {
+                NativeProcessError::Busy
+            }
+            CowSupplyRefusal::Unserved(Some(error)) => error,
+            CowSupplyRefusal::Invalid => NativeProcessError::Invalid,
+            CowSupplyRefusal::Lost => NativeProcessError::Stale,
+        }
+    }
+
     /// Separate owner contention from a refusal with a Linux answer.
     /// Contention is "not now": the caller parks on the owner's release or
     /// retains its syscall, and has no errno or run failure to report.
