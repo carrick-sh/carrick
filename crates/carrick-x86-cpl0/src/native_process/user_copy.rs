@@ -85,16 +85,12 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
                 // pages may need its grant for a later page than the one it
                 // starts on.
                 carrick_x86_carrier::entry::cross_owner_grant(cpu, UserVa::new(window.fault_page));
-                Ok::<(), core::convert::Infallible>(())
+                Ok::<(), NativeProcessError>(())
             })
-            .map_err(|refusal| match refusal {
-                // The carrier met this MM's editor held on the other CPU and
-                // supplied nothing; the lane withdrew its selection. The copy
-                // is contended, not failed.
-                carrick_el1_abi::CowSupplyRefusal::SlotOccupied
-                | carrick_el1_abi::CowSupplyRefusal::Unserved(_) => NativeProcessError::Busy,
-                carrick_el1_abi::CowSupplyRefusal::Lost => NativeProcessError::Stale,
-            })
+            // The carrier met this MM's editor held on the other CPU and
+            // supplied nothing; the lane withdrew its selection. The copy is
+            // contended, not failed.
+            .map_err(NativeProcessError::from_cow_supply)
     }
     fn supply_backing(
         &mut self,

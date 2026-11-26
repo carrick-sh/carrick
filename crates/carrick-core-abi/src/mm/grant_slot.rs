@@ -23,6 +23,9 @@ use super::PortalGrantWindow;
 pub enum CowSupplyRefusal<E> {
     /// Another selection occupies the lane's slot; nothing was published.
     SlotOccupied,
+    /// The window is not a single-page replacement demand; nothing was
+    /// published. A caller bug, never contention.
+    Invalid,
     /// The carrier supplied nothing and the lane withdrew its selection,
     /// with the crossing's own refusal when it reported one. A crossing that
     /// reports none met contention (the MM's editor held elsewhere).
@@ -230,18 +233,25 @@ impl PortalGrantSlot {
         }))
     }
     /// Consume the exact demand only after its replacement loan is published.
-    /// The caller retains exact-MM exclusion across inspection and consumption.
+    /// Reservation (state 1) excludes publication and every other take while
+    /// the stamped generation and window are compared, so a same-MM/page
+    /// successor can never be consumed in this one's place.
     pub fn take_cow_fault_selection(&self, window: PortalGrantWindow) -> bool {
         if self
-            .pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
-            .map(|(_, selected)| selected)
-            != Some(window)
+            .state
+            .compare_exchange(4, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return false;
         }
+        let exact = self.fault_generation.load(Ordering::Relaxed)
+            == window.operation.sequence.get()
+            && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                self.window[i].load(Ordering::Relaxed)
+            })) == Some(window);
         self.state
-            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .store(if exact { 0 } else { 4 }, Ordering::Release);
+        exact
     }
     /// Ask the carrier for `window`'s copy-on-write replacement through the
     /// lane's synchronous supply crossing, leaving this slot empty on every
@@ -256,19 +266,21 @@ impl PortalGrantSlot {
         cross: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), CowSupplyRefusal<E>> {
         if !self.publish_cow_fault_selection(window.operation.sequence.get(), window) {
-            return Err(CowSupplyRefusal::SlotOccupied);
+            return Err(if self.state.load(Ordering::Acquire) == 0 {
+                CowSupplyRefusal::Invalid
+            } else {
+                CowSupplyRefusal::SlotOccupied
+            });
         }
         let crossed = cross();
-        match self.pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page) {
-            // The carrier took the exact selection: it supplied a grant.
-            None if crossed.is_ok() => Ok(()),
-            Some((_, unserved)) if unserved == window => {
-                if self.take_cow_fault_selection(unserved) {
-                    Err(CowSupplyRefusal::Unserved(crossed.err()))
-                } else {
-                    Err(CowSupplyRefusal::Lost)
-                }
-            }
+        // The slot's own state decides, never a filtered view of it: only an
+        // empty slot after a crossing that refused nothing is a supply, and
+        // only this exact selection is the lane's to withdraw.
+        if self.take_cow_fault_selection(window) {
+            return Err(CowSupplyRefusal::Unserved(crossed.err()));
+        }
+        match (self.state.load(Ordering::Acquire), crossed) {
+            (0, Ok(())) => Ok(()),
             // Taken while the crossing refused, or replaced under the lane:
             // the slot no longer names this lane's request.
             _ => Err(CowSupplyRefusal::Lost),

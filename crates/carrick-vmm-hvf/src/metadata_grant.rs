@@ -2086,11 +2086,11 @@ fn service_native_cow_supply(
             "native COW supply denied: no pending selection for this MM and page");
         return Ok(denied);
     };
-    // Every denial below leaves the lane's selection published (#936).
+    // Every denial below leaves the lane to withdraw its selection (#3040).
     let deny = |reason: &'static str| {
         tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), mm, address,
             sequence = window.operation.sequence.get(), reason,
-            "native COW supply denied with the selection still published");
+            "native COW supply denied; the lane withdraws its selection");
         Ok(denied)
     };
     if slots.carrier() != Some(window.operation.carrier)

@@ -69,6 +69,46 @@ fn native_user_write_preserves_nonfault_refusals() {
     }
 }
 
+/// #3040: both ISAs' `supply_cow` read a refused supply the same way, and the
+/// lane's slot is empty after each, ready for the next lane's selection.
+#[cfg(test)]
+#[test]
+fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
+    let window = carrick_core_abi::PortalGrantWindow::decode([
+        1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+    ])
+    .unwrap();
+    let slot = carrick_el1_abi::PortalGrantSlot::new();
+    let supply = |cross: &dyn Fn() -> Result<(), NativeProcessError>| {
+        slot.supply_cow_selection(window, cross)
+            .map_err(NativeProcessError::from_cow_supply)
+    };
+    // ARM: HVF refused the crossing (no guest COW state).
+    assert_eq!(
+        supply(&|| Err(NativeProcessError::Fault)),
+        Err(NativeProcessError::Fault)
+    );
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // x86: the carrier met the MM's editor held and supplied nothing.
+    assert_eq!(supply(&|| Ok(())), Err(NativeProcessError::Busy));
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // The carrier took it: supplied.
+    assert_eq!(
+        supply(&|| {
+            assert!(slot.take_cow_fault_selection(window));
+            Ok(())
+        }),
+        Ok(())
+    );
+    assert_eq!(slot.selection_snapshot().0, 0);
+    // Another selection occupies the slot: contention, nothing crossed.
+    assert!(slot.publish_fault_selection(9, window));
+    assert_eq!(
+        supply(&|| panic!("an occupied slot must not cross")),
+        Err(NativeProcessError::Busy)
+    );
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct CurrentMmMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1506,12 +1546,7 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
                 self.crossing
                     .cross_cow_supply(UserVa::new(window.fault_page), cpu)
             })
-            .map_err(|refusal| match refusal {
-                carrick_el1_abi::CowSupplyRefusal::SlotOccupied
-                | carrick_el1_abi::CowSupplyRefusal::Unserved(None) => NativeProcessError::Busy,
-                carrick_el1_abi::CowSupplyRefusal::Unserved(Some(error)) => error,
-                carrick_el1_abi::CowSupplyRefusal::Lost => NativeProcessError::Stale,
-            })
+            .map_err(NativeProcessError::from_cow_supply)
     }
 
     fn supply_backing(

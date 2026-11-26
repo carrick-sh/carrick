@@ -1,3 +1,9 @@
+# #3040: a kernel copy's COW supply that the carrier refuses (or serves
+# nothing for) withdraws the lane's selection through the one neutral owner,
+# PortalGrantSlot::supply_cow_selection, on ARM and x86. Before, ARM left it
+# published and the next native service on that CPU was a carrier fatal.
+# Adds VM-free bindings; the signed arm64 go row is the production proof.
+# Semantics and budgets unchanged.
 # #2668/#2701: the shared owner selection takes its COW arm on whichever
 # translation reports the write refusal, including the one after it commits
 # an inherited prepared leaf; x86 resolves an executable armed leaf in ring.
@@ -94,6 +100,8 @@ vm_free = [
   "carrick-x86-cpl0-host::cpl0_boot::anonymous_owner::custody_tests::fork_residency_demand_counts_both_sides_and_admits_at_half_load (#2655: two rows per inherited page outside a grant window plus one per covering window; another MM's rows are not coverage; admission is exactly at half the table)",
   "carrick-core::mm::frames::fork_residency_growth_tests::{each_refused_fork_doubles_the_segments,partial_growth_reruns_and_no_growth_reports_the_refusal} (#2655: segments go 1, 2, 4, 8; a partial doubling reruns the fork, an empty one reports the allocator's refusal and succeeds once metadata is back)",
   "carrick-el1-abi::fork_stock::tests::residency_refusal_round_trips_as_its_own_reply (#2655: wire code 5 is distinct from the capacity EAGAIN reply)",
+  "carrick-core-abi::service::tests::refused_cow_supply_leaves_the_lane_slot_for_the_next_request (#3040: every refused or unserved supply leaves the lane slot empty and another MM's unselected fault on that CPU is served; a leaked selection makes it Stale)",
+  "carrick-el1-linux::aarch64_process::refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot (#3040: both ISAs read a refused supply the same way through NativeProcessError::from_cow_supply)",
 ]
 embed = [
   "carrick-embed::el1_sched::{el1_fork_cow_resolves_in_guest,el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes} (prepared-fork: inherited untouched page reads zero, PROT_NONE data survives, child writes remain private while parent stays live, parent write remains private while child stays live; new binding awaits signed acceptance)",
