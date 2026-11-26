@@ -176,6 +176,29 @@ mod test_support {
     /// the waiter's park already released it.
     pub const INJECT_RELEASE_HELD_FORK_COMMIT: u64 = 0xffff_ffff_ffff_fe33;
     static FORK_COMMIT_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// Arm, with [`INJECT_HOLD_NEXT_FORK_COMMIT`], the ordering of #2923: when
+    /// the held fork's publication is complete, a sibling held between its
+    /// copy-on-write supply ([`INJECT_HOLD_NEXT_COW_SUPPLY`]) is released,
+    /// so its resolution with the grant the carrier supplied before the
+    /// fork began runs while the fork is pending. The fork hold then ends
+    /// on a real event: the sibling parked on the publication's release
+    /// (see [`INJECT_REGISTER_FORK_COMMIT_WAITER`]), or the sibling's
+    /// copy-on-write completed under the pending fork. The supply hold then
+    /// has no spin bound: only the fork's hold releases it.
+    pub const INJECT_FORK_COMMIT_RELEASES_SUPPLY: u64 = 0xffff_ffff_ffff_fe48;
+    /// The calling member becomes the waiter whose park releases the held
+    /// fork commit, before it faults: unlike [`INJECT_FORK_COMMIT_HELD`] it
+    /// registers without polling, for a member that will be held in the ring.
+    pub const INJECT_REGISTER_FORK_COMMIT_WAITER: u64 = 0xffff_ffff_ffff_fe49;
+    /// What ended the held fork commit: 0 not yet, 1 the waiter's park, 2 a
+    /// sibling's copy-on-write completing while the fork was pending.
+    pub const INJECT_FORK_COMMIT_RELEASE_CAUSE: u64 = 0xffff_ffff_ffff_fe4a;
+    const RELEASED_BY_PARK: u8 = 1;
+    const RELEASED_BY_PEER_COW: u8 = 2;
+    static FORK_COMMIT_RELEASES_SUPPLY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static FORK_COMMIT_RELEASE_CAUSE: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0);
     /// Address of the armed member's current task, or 0.
     static EARLY_RELEASE_TASK: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -548,6 +571,19 @@ mod test_support {
     /// settlement crossing, on the faulting member's CPU. While held it
     /// acknowledges shootdowns, as a member away at its crossing does.
     pub fn hold_armed_cow_settle() {
+        // A sibling's copy-on-write completed while a fork is held pending:
+        // the contention the fork's publication owes it did not happen.
+        if FORK_COMMIT_HOLD
+            .compare_exchange(
+                BIRTH_HELD,
+                BIRTH_RELEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            FORK_COMMIT_RELEASE_CAUSE.store(RELEASED_BY_PEER_COW, Ordering::Release);
+        }
         hold_armed_cow(false);
     }
 
@@ -623,6 +659,17 @@ mod test_support {
         {
             return;
         }
+        if FORK_COMMIT_RELEASES_SUPPLY.swap(false, Ordering::AcqRel) {
+            // The sibling's supplied grant has been ready in the pool since
+            // before this fork began; its resolution now races the pending
+            // fork's custody, and nothing else.
+            let _ = COW_SETTLE_HOLD.compare_exchange(
+                BIRTH_HELD,
+                BIRTH_RELEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         let mut spins = 0_u64;
         while FORK_COMMIT_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
             spins += 1;
@@ -659,6 +706,7 @@ mod test_support {
                 )
                 .is_ok()
         {
+            FORK_COMMIT_RELEASE_CAUSE.store(RELEASED_BY_PARK, Ordering::Release);
             *FORK_COMMIT_WAITER.lock() = None;
         }
     }
@@ -1019,6 +1067,24 @@ mod test_support {
                 .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_FORK_COMMIT_RELEASES_SUPPLY => {
+                // The supply hold ends on the fork's event, never on a
+                // spin bound.
+                COW_HOLD_UNBOUNDED.store(true, Ordering::Release);
+                FORK_COMMIT_RELEASES_SUPPLY.store(true, Ordering::Release);
+                Some(0)
+            }
+            INJECT_REGISTER_FORK_COMMIT_WAITER => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                *FORK_COMMIT_WAITER.lock() = Some(zone.record_ref(zone.slot(slot).current()?));
+                Some(0)
+            }
+            INJECT_FORK_COMMIT_RELEASE_CAUSE => {
+                Some(u64::from(FORK_COMMIT_RELEASE_CAUSE.load(Ordering::Acquire)))
+            }
             INJECT_FORK_COMMIT_HELD => {
                 if FORK_COMMIT_HOLD.load(Ordering::Acquire) != BIRTH_HELD {
                     return Some(0);
