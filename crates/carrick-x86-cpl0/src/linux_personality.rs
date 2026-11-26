@@ -35,6 +35,56 @@ use core::sync::atomic::Ordering;
 
 use crate::{anonymous, native_execution, native_process};
 
+/// DIAGNOSTICS ONLY (never lands): turn a ring-served -ENOMEM into a fatal
+/// whose line names the x86 syscall number.
+#[inline(never)]
+pub fn diag_enomem(nr: u64, rax: u64) {
+    if rax as i64 != -12 {
+        return;
+    }
+    match nr {
+        56 => fatal_boot!(),  // clone
+        435 => fatal_boot!(), // clone3
+        58 => fatal_boot!(),  // vfork
+        57 => fatal_boot!(),  // fork
+        293 => fatal_boot!(), // pipe2
+        22 => fatal_boot!(),  // pipe
+        33 => fatal_boot!(),  // dup2
+        292 => fatal_boot!(), // dup3
+        32 => fatal_boot!(),  // dup
+        72 => fatal_boot!(),  // fcntl
+        59 => fatal_boot!(),  // execve
+        322 => fatal_boot!(), // execveat
+        436 => fatal_boot!(), // close_range
+        3 => fatal_boot!(),   // close
+        9 => {}               // mmap (Go probes arena hints)
+        11 => {}              // munmap
+        10 => {}              // mprotect
+        25 => {}              // mremap
+        61 => fatal_boot!(),  // wait4
+        247 => fatal_boot!(), // waitid
+        257 => fatal_boot!(), // openat
+        109 => fatal_boot!(), // setpgid
+        302 => fatal_boot!(), // prlimit64
+        14 => fatal_boot!(),  // rt_sigprocmask
+        13 => fatal_boot!(),  // rt_sigaction
+        _ => fatal_boot!(),
+    }
+}
+
+/// DIAGNOSTICS ONLY: a resumed syscall's -ENOMEM (host-served or parked).
+#[inline(never)]
+pub fn diag_enomem_resumed(site: u32, rax: u64) {
+    if rax as i64 != -12 {
+        return;
+    }
+    match site {
+        1 => fatal_boot!(), // schedule: NativeResume::Returned
+        2 => fatal_boot!(), // schedule: NoPending selected.result
+        _ => fatal_boot!(),
+    }
+}
+
 pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
     // SAFETY: current carrier CPU binding was installed by stopped bootstrap;
     // its supervisor mapping remains live until every guest CPU stops.
@@ -2055,6 +2105,9 @@ impl Personality for LinuxPersonality {
             migrate(slot);
         }
 
+        if matches!(route, CompletionRoute::Served | CompletionRoute::WithWork) {
+            diag_enomem(call.native.raw(), frame.rax);
+        }
         match route {
             CompletionRoute::Served => ControlFlow::Return(()),
             CompletionRoute::WithWork => {

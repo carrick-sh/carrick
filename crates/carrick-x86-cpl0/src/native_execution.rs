@@ -194,6 +194,7 @@ pub fn schedule(slot: SlotId) -> ! {
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))
                 {
                     carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
+                        crate::linux_personality::diag_enomem_resumed(1, result.raw() as u64);
                         words.set_syscall_return(result.raw() as u64)
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
@@ -237,6 +238,7 @@ pub fn schedule(slot: SlotId) -> ! {
                             }
                             Some(_) => {
                                 if !metadata_resume && let Some(result) = selected.result {
+                                    crate::linux_personality::diag_enomem_resumed(2, result);
                                     words.set_syscall_return(result);
                                 }
                             }

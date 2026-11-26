@@ -27,6 +27,7 @@
 //! only its owner's state, for that phase alone (#2192).
 use super::*;
 use carrick_abi::{LINUX_E2BIG, LINUX_ENOEXEC, LINUX_ENOMEM, LINUX_ENOSYS, LinuxErrno};
+const _: LinuxErrno = LINUX_ENOMEM; // DIAG
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecArgumentCharge, ExecBuildSource, ExecSuccessorBacking,
     ExecSuccessorEntry, ServiceOrigin,
@@ -574,7 +575,7 @@ where
     match imported {
         Ok(()) => {}
         Err(refusal @ (Refusal::Busy | Refusal::Stale)) => return Err(root_fault(refusal)),
-        Err(_) => return Ok(X86ExecStage::Refused(LINUX_ENOMEM)),
+        Err(refusal) => return Err(fail(format!("DIAG exec ENOMEM: successor import refused {refusal:?}"))),
     }
     let (bound, ()) = rooted.bind_zone(|| ());
     // Enrolled under the phase that refused, before its one probe, so the
@@ -610,7 +611,7 @@ where
         }
         Err(ExecTableShortage::Terminal) => {
             root.abort().map_err(root_fault)?;
-            return Ok(X86ExecStage::Refused(LINUX_ENOMEM));
+            return Err(fail(format!("DIAG exec ENOMEM: successor tables spent, demand={:?}", demand.tables)));
         }
         Err(ExecTableShortage::Service(error)) => {
             root.abort().map_err(root_fault)?;
