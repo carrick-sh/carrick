@@ -2189,9 +2189,9 @@ fn service_native_cow_supply(
         })?
         || usable();
     if !ready {
-        // No editor is held here: a sibling may have resolved the page since
-        // it was classified (progress), or the pool could take no grant now
-        // (contention). Neither is the guest's fault.
+        // No editor is held here, so a sibling may have resolved the page
+        // since it was classified: that is progress, and the lane's rerun
+        // reads the page as it stands.
         if crate::trap::guest_cow_fault_split(&state, address).is_none() {
             return if slot.take_cow_fault_selection(window) {
                 Ok(supplied)
@@ -2199,7 +2199,12 @@ fn service_native_cow_supply(
                 deny("selection take lost")
             };
         }
-        return Ok(not_now);
+        // The refill also answers "nothing" when no grant can ever be made
+        // (no frame, a full reservation, a saturated probe chain), so "not
+        // now" here could rerun forever. A root's grant shortage stays the
+        // refusal it was on main; telling the transient case apart is
+        // #3042's root follow-up.
+        return deny("no usable grant after refill");
     }
     if !slot.take_cow_fault_selection(window) {
         return deny("selection take lost");
