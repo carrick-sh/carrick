@@ -1048,13 +1048,13 @@ enum InlineService {
 /// The inline result of a shared `begin_*_call` owner (#2416). The owner is
 /// ISA-neutral; ARM's SVC user return accepts the same `RetrySyscall`
 /// (#2342), and the resumed checkpoint replays it in `native_execution`.
-/// The owner settles contention as "not now" itself (a retained operation
-/// leaves with its owner, anything else through the owner checkpoint), so a
-/// failure here is never contention (#2306): its type cannot carry it.
+/// The owner settles a retained operation's contention as "not now"
+/// itself; contention with nothing retained is still fatal here, as it is
+/// on ARM (a follow-up of #3045).
 fn inline_service(
     result: Result<
         carrick_el1_linux::native_process_runtime::NativeResume,
-        carrick_el1_linux::native_process_runtime::NativeFailure,
+        carrick_el1_linux::native_process_runtime::NativeProcessError,
     >,
 ) -> InlineService {
     use carrick_el1_linux::native_process_runtime::NativeResume;

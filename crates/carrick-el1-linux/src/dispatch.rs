@@ -1905,9 +1905,7 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                 ),
             )
         };
-    let result = process
-        .settle_service_exit(result)
-        .map_err(super::native_process_runtime::NativeProcessError::from);
+    let result = process.settle_service_exit(result);
     (result, process.native_service_phase())
 }
 
