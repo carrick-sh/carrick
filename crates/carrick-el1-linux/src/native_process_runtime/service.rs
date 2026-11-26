@@ -2083,24 +2083,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(None);
         };
         if file.operation == carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl {
-            // The readiness set kept its operation for this rerun. Once the
-            // carrier registered its sockets, the rerun takes it and
-            // harvests the whole set. Anything else retires it and answers:
-            // the carrier's errno (nothing registered), EINTR for a
-            // cancelled record, or a counted ENOSYS for a refused one.
-            let reply = carrick_core_abi::host_file::reply(&file.record).map(|reply| reply.result);
-            let answer = match (result, reply) {
-                (ServiceResult::Supplied, Some(result)) if result >= 0 => {
-                    return Ok(Some(HostFileContinuation::Rerun));
-                }
-                (ServiceResult::Supplied, Some(errno)) => errno,
-                (ServiceResult::Cancelled, _) => carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-                _ => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-            };
-            self.retire_readiness_set()?;
-            return Ok(Some(HostFileContinuation::Returned(SyscallResult::new(
-                answer,
-            ))));
+            return self.continue_readiness_set(result, &file.record).map(Some);
         }
         if result == ServiceResult::Refused {
             return Ok((file.transfer.done() != 0).then(|| {
@@ -4640,6 +4623,62 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
 
+    /// The one completion of a readiness set's `ReadinessSetCtl` record,
+    /// total over every service result (#1051). The set kept its operation
+    /// for this rerun: once the carrier registered its host members, the
+    /// rerun takes it and harvests the whole set. Anything else retires the
+    /// operation first, then answers:
+    /// - the carrier's errno (nothing registered), or a counted ENOSYS for a
+    ///   refused record (a member the venue cannot serve exactly): Linux
+    ///   restores a `pselect6` mask before any return but EINTR, so the
+    ///   temporary mask is disarmed here and no signal it unblocked is
+    ///   delivered on this return;
+    /// - EINTR for a cancelled record, with the temporary mask still armed
+    ///   for the signal checkpoint, as a parked set's interruption is;
+    /// - a broken service invariant (a backing fault, a failure, a wait or
+    ///   a reply-less supply, none of which this record can produce)
+    ///   quarantines the service.
+    #[inline(never)]
+    fn continue_readiness_set(
+        &mut self,
+        result: ServiceResult,
+        record: &[u8],
+    ) -> Result<HostFileContinuation<'a>, NativeProcessError> {
+        let reply = carrick_core_abi::host_file::reply(record).map(|reply| reply.result);
+        let answer = match (result, reply) {
+            (ServiceResult::Supplied, Some(registered)) if registered >= 0 => {
+                return Ok(HostFileContinuation::Rerun);
+            }
+            (ServiceResult::Supplied, Some(errno)) => Ok(Some(errno)),
+            (ServiceResult::Refused, _) => {
+                Ok(Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()))
+            }
+            (ServiceResult::Cancelled, _) => Ok(None),
+            (ServiceResult::Supplied, None) | (ServiceResult::Failed(_), _) => {
+                Err(NativeServiceQuarantine::UnexpectedFailureResult)
+            }
+            (ServiceResult::BackingFault, _) => {
+                Err(NativeServiceQuarantine::UnexpectedBackingFault)
+            }
+            (ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_), _) => {
+                Err(NativeServiceQuarantine::UnexpectedFailureResult)
+            }
+        };
+        self.retire_readiness_set()?;
+        match answer {
+            Ok(Some(errno)) => {
+                if let Some(saved) = self.control.take_forwarded_wait_mask() {
+                    self.control.init_blocked(saved);
+                }
+                Ok(HostFileContinuation::Returned(SyscallResult::new(errno)))
+            }
+            Ok(None) => Ok(HostFileContinuation::Returned(SyscallResult::new(
+                carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+            ))),
+            Err(broken) => Err(NativeProcessError::ServiceQuarantined(broken)),
+        }
+    }
+
     /// Retire the readiness-set operation a `ReadinessSetCtl` record's call
     /// kept for its rerun, when the record registered nothing.
     #[inline(never)]
@@ -4994,11 +5033,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 prefix.call,
             );
         }
+        // A readiness set's record completes through its own total
+        // continuation for every result; it never reaches the adapter's.
+        let readiness_set = pending.host_file.as_ref().is_some_and(|file| {
+            file.operation == carrick_core_abi::host_file::HostFileOp::ReadinessSetCtl
+        });
         if matches!(request.operation, ServiceOperation::HostFile { .. })
-            && matches!(
-                result,
-                ServiceResult::Supplied | ServiceResult::Cancelled | ServiceResult::Refused
-            )
+            && (readiness_set
+                || matches!(
+                    result,
+                    ServiceResult::Supplied | ServiceResult::Cancelled | ServiceResult::Refused
+                ))
             && let Some(next) = self.continue_host_file(&mut pending, result)?
         {
             self.release_service_claim(pending.claim)?;
