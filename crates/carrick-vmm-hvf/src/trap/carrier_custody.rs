@@ -5255,6 +5255,45 @@ mod carrier_vm_custody_tests {
         }
     }
 
+    /// The covering lookup that pins a selected guest byte (UserTransfer
+    /// retain) must find the live record over that byte. A wider record at
+    /// the same base that is not live (here an admitted, unmapped one), or a
+    /// nearer extent that ends before the byte, must not hide it: the full
+    /// lib run failed `transfer_external_copy_only_and_stale_source_precede_root_admission`
+    /// with the import's live record 294 present and the lookup at its IPA
+    /// returning None.
+    #[test]
+    fn a_non_live_or_non_covering_extent_never_hides_the_live_covering_record() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (custody, g1) = live_custody();
+        let mut wide_unmapped = stage2_spec(g1, 301);
+        wide_unmapped.len = 0x8000;
+        wide_unmapped.mapped = false;
+        wide_unmapped.backend_map_installed = false;
+        register_test_stage2_record(&custody, wide_unmapped).expect("register wide unmapped");
+        let live = register_test_stage2_record(&custody, stage2_spec(g1, 302))
+            .expect("register live record");
+        assert_eq!(
+            custody.stage2_record_covering(0x4000, 1),
+            Some(live),
+            "a wider non-live record at the same base hid the live record"
+        );
+
+        let mut outer = stage2_spec(g1, 303);
+        outer.ipa = 0x10_0000;
+        outer.len = 0x10_000;
+        let outer = register_test_stage2_record(&custody, outer).expect("register outer");
+        let mut inner = stage2_spec(g1, 304);
+        inner.ipa = 0x10_8000;
+        inner.len = 0x1000;
+        register_test_stage2_record(&custody, inner).expect("register inner");
+        assert_eq!(
+            custody.stage2_record_covering(0x10_9000, 1),
+            Some(outer),
+            "a nearer extent ending before the byte hid the outer record covering it"
+        );
+    }
+
     #[test]
     fn create_cleanup_retains_failed_vcpu_then_retries_terminal_finalization_only() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
