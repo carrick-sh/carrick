@@ -892,11 +892,19 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     );
     let slice = cpu.freq / 1000 * 2;
     assert_eq!(cpu.timer, Some(cpu.now + slice), "the slice timer is armed");
-    // A computes at EL0: its registers change, no syscall.
+    // A computes at EL0: its registers change, no syscall. The frame an
+    // IRQ then takes names A's next instruction as its resume point.
     frame.x[5] = 0x5555;
     frame.elr += 0x40;
+    frame.syscall_position =
+        carrick_guest_arch::SavedSyscallPcWord::new(carrick_sched_core::SavedSyscallPc::AtSyscall);
     let a_running = (frame, cpu.regs.clone());
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
+        // The EL1 IRQ hook stores a resume point in every frame it takes
+        // (#2900; pinned by `every_el1_hook_stores_its_entry_syscall_position`).
+        frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(
+            carrick_sched_core::SavedSyscallPc::AtSyscall,
+        );
         Sched {
             handoff: None,
             zone: &zone,

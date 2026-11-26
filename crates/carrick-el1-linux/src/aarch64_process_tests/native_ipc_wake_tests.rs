@@ -630,7 +630,17 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             // its saved SVC context, then model executing that SVC again.
             let context = unsafe { fixture.zone.record(child.record.id).ctx_mut() };
             crate::sched::ThreadCpu::load(&mut cpu, &mut frame, context);
+            assert_eq!(
+                (frame.elr, frame.syscall_position.get()),
+                (0x4000, Some(carrick_sched_core::SavedSyscallPc::AtSyscall)),
+                "the interrupted wait resumes on its SVC"
+            );
+            // Executing the SVC traps through the EL1 SVC hook, which stores
+            // "after its SVC" with the next PC (#2900).
             frame.elr += 4;
+            frame.syscall_position = carrick_guest_arch::SavedSyscallPcWord::new(
+                carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            );
             assert_eq!(frame.x[0], 3);
             assert_eq!(
                 frame.x[8],
