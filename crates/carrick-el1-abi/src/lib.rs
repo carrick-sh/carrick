@@ -668,7 +668,13 @@ pub const GRANT_OP_COW_SUPPLY: u64 = 6;
 /// The carrier's answer to a [`GRANT_OP_COW_SUPPLY`] crossing (#3042), one
 /// type on both sides of the wire. Contention is its own answer, never a
 /// refusal: the lane withdraws its selection and reruns "not now".
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum CowSupplyAnswer {
     /// The carrier published a usable replacement grant and took the
     /// lane's exact selection.
