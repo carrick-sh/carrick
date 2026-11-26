@@ -4656,6 +4656,77 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
     );
 }
 
+/// #3061 PR 1a: a copy-on-write supply's own exclusion of its MM can meet
+/// the MM's editor held. That is contention: nothing is supplied, the
+/// selection stays published, the member withdraws it, parks on the
+/// editor's release and reruns, and the rerun's supply is published for the
+/// same MM. The host seam holds a real maintenance borrow across the first
+/// COW supply's probe and releases it right after, so each run is "Busy
+/// once, then supplied", asserted positively through the seam's counters.
+/// Run in a child process: the seam is process-global.
+fn cow_supply_waits_out_a_held_editor(test: &str, fixture: &str, expected: i32, mem_mib: usize) {
+    use carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::{
+        EditorHoldSite, cow_supplied_after_editor_hold_for_test, editor_holds_for_test,
+        hold_editor_at_next_for_test,
+    };
+    const CHILD: &str = "CARRICK_3061_COW_EDITOR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let elf = native_exit_fixture(fixture);
+        hold_editor_at_next_for_test(EditorHoldSite::CowSupply);
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, mem_mib, ROOT_AFFINITY_ANY)
+            .expect("COW supply beside a held editor run");
+        assert_eq!(
+            editor_holds_for_test(EditorHoldSite::CowSupply),
+            1,
+            "the seam never held a COW supply's editor"
+        );
+        assert!(
+            cow_supplied_after_editor_hold_for_test() >= 1,
+            "no COW grant was supplied for the held MM after its editor's release"
+        );
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.terminating_signal),
+            (expected, None),
+            "COW supply beside a held editor (see {fixture}): {:?}",
+            outcome.run
+        );
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .expect("COW editor child");
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The first supply is the parent's user-mode store after the fork.
+#[test]
+fn production_fork_cow_store_waits_out_a_held_editor_then_is_supplied() {
+    cow_supply_waits_out_a_held_editor(
+        "production_fork_cow_store_waits_out_a_held_editor_then_is_supplied",
+        "native_fork_parent_copyout_then_store.S",
+        0,
+        256,
+    );
+}
+
+/// The first supplies are a fork child's kernel `read(2)` copies.
+#[test]
+fn production_fork_child_kernel_copy_waits_out_a_held_editor_then_is_supplied() {
+    cow_supply_waits_out_a_held_editor(
+        "production_fork_child_kernel_copy_waits_out_a_held_editor_then_is_supplied",
+        "native_fork_child_threads_read_cow.S",
+        7,
+        4096,
+    );
+}
+
 /// #3040: a native fork child's two live threads `read(2)` into one
 /// copy-on-write page at once, so the kernel's copy is the page's first write
 /// in the child, and the user-copy supply (`supply_cow_selection` on the

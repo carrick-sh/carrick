@@ -424,58 +424,122 @@ pub fn fail_carrier_resched_for_test() {
     FAIL_CARRIER_RESCHED.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// #2941 witness seam (test-support only): the next native backing plan's
-/// own exclusion of its MM finds the MM's editor held by a real maintenance
-/// borrow, admitted under the caller's outer exclusion as
-/// `try_begin_maintenance_edit` allows. The borrow is released through its
-/// production release right after that probe.
+/// Where [`editor_hold`] holds an MM's editor.
 #[cfg(feature = "test-support")]
-pub(super) mod plan_editor_hold {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorHoldSite {
+    /// #2941: a native first-touch backing plan's own exclusion.
+    BackingPlan,
+    /// #3061 PR 1a: a copy-on-write supply's exclusion, for an EL0 write or
+    /// a kernel user copy alike.
+    CowSupply,
+}
+
+/// Witness seam (test-support only): the next exclusion of an MM at the
+/// armed site finds the MM's editor held by a real borrow (a maintenance
+/// borrow under a plan's raised gate, an in-ring edit at a COW supply). The borrow is released
+/// through its production release right after that probe. For a COW supply
+/// the seam also counts the supplies that later succeed for the MM it held,
+/// so a witness can assert "Busy once, then supplied" positively.
+#[cfg(feature = "test-support")]
+pub(super) mod editor_hold {
+    use super::EditorHoldSite;
     use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
     use core::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    static HOLDS: AtomicU64 = AtomicU64::new(0);
+    struct Site {
+        armed: AtomicBool,
+        holds: AtomicU64,
+        /// The MM the last hold was taken on (0: none).
+        held_mm: AtomicU64,
+        supplied_after: AtomicU64,
+    }
+    const fn site() -> Site {
+        Site {
+            armed: AtomicBool::new(false),
+            holds: AtomicU64::new(0),
+            held_mm: AtomicU64::new(0),
+            supplied_after: AtomicU64::new(0),
+        }
+    }
+    static BACKING_PLAN: Site = site();
+    static COW_SUPPLY: Site = site();
+    fn of(at: EditorHoldSite) -> &'static Site {
+        match at {
+            EditorHoldSite::BackingPlan => &BACKING_PLAN,
+            EditorHoldSite::CowSupply => &COW_SUPPLY,
+        }
+    }
     /// The borrower: no member of the zone.
     const HOLDER: NonZeroU64 = NonZeroU64::MAX;
 
     pub(in super::super) fn take<'a>(
+        at: EditorHoldSite,
         venue: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
         mm: NonZeroU64,
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, carrick_sched_core::ParkedContextWords>>
     {
-        if !ARMED.swap(false, Ordering::AcqRel) {
+        let site = of(at);
+        if !site.armed.swap(false, Ordering::AcqRel) {
             return None;
         }
         let index = venue.zone.spaces.find(mm.get())?;
-        let editor = venue
-            .zone
-            .spaces
-            .try_begin_maintenance_edit(index, mm.get(), HOLDER, Some(venue))
-            .ok()?;
-        HOLDS.fetch_add(1, Ordering::AcqRel);
+        let spaces = &venue.zone.spaces;
+        let editor = match at {
+            // Under the plan caller's outer exclusion the gate is raised, so
+            // only a maintenance borrow is admitted there.
+            EditorHoldSite::BackingPlan => {
+                spaces.try_begin_maintenance_edit(index, mm.get(), HOLDER, Some(venue))
+            }
+            // A COW supply excludes from an open gate: the editor is held as
+            // a guest member's in-ring edit holds it.
+            EditorHoldSite::CowSupply => {
+                spaces.try_begin_edit_cause(index, mm.get(), HOLDER, Some(venue))
+            }
+        }
+        .ok()?;
+        site.held_mm.store(mm.get(), Ordering::Release);
+        site.holds.fetch_add(1, Ordering::AcqRel);
         Some(editor)
     }
-    pub(in super::super) fn arm() {
-        ARMED.store(true, Ordering::Release);
+    /// A COW supply for `mm` was published.
+    pub(in super::super) fn supplied(mm: NonZeroU64) {
+        let site = of(EditorHoldSite::CowSupply);
+        if site.held_mm.load(Ordering::Acquire) == mm.get() {
+            site.supplied_after.fetch_add(1, Ordering::AcqRel);
+        }
     }
-    pub(in super::super) fn holds() -> u64 {
-        HOLDS.load(Ordering::Acquire)
+    pub(in super::super) fn arm(at: EditorHoldSite) {
+        of(at).armed.store(true, Ordering::Release);
+    }
+    pub(in super::super) fn holds(at: EditorHoldSite) -> u64 {
+        of(at).holds.load(Ordering::Acquire)
+    }
+    pub(in super::super) fn supplied_after_hold() -> u64 {
+        of(EditorHoldSite::CowSupply)
+            .supplied_after
+            .load(Ordering::Acquire)
     }
 }
 
-/// Arm [`plan_editor_hold`] for the next native backing plan in this
-/// process (test-support only).
+/// Arm [`editor_hold`] for the next exclusion at `at` in this process
+/// (test-support only).
 #[cfg(feature = "test-support")]
-pub fn hold_editor_at_next_backing_plan_for_test() {
-    plan_editor_hold::arm();
+pub fn hold_editor_at_next_for_test(at: EditorHoldSite) {
+    editor_hold::arm(at);
 }
 
-/// Backing plans whose own exclusion met the armed maintenance borrow.
+/// Exclusions at `at` that met the armed maintenance borrow.
 #[cfg(feature = "test-support")]
-pub fn backing_plan_editor_holds_for_test() -> u64 {
-    plan_editor_hold::holds()
+pub fn editor_holds_for_test(at: EditorHoldSite) -> u64 {
+    editor_hold::holds(at)
+}
+
+/// COW supplies published for the MM whose supply editor the seam held.
+#[cfg(feature = "test-support")]
+pub fn cow_supplied_after_editor_hold_for_test() -> u64 {
+    editor_hold::supplied_after_hold()
 }
 
 /// The carrier-scoped zone host IPC releases wake into (#2031). The zone
@@ -2055,16 +2119,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         >| wake.deliver(zone, waker, owned);
         use carrick_mmu_core::x86::descriptor_txn::CowClass;
         use carrick_sched_core::spaces::notification::ExclusionRefusal;
-        let pause = match self.settled_pause(
-            SpaceReleaseVenue {
-                zone,
-                waker: Waker::Host,
-                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                    &delivery,
-                ),
-            },
-            window.operation.mm,
-        )? {
+        let venue = SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &delivery,
+            ),
+        };
+        #[cfg(feature = "test-support")]
+        let maintenance = editor_hold::take(EditorHoldSite::CowSupply, venue, mm);
+        let probe = self.settled_pause(venue, window.operation.mm);
+        // The seam's borrow ends through its own release, before this
+        // venue's wakes are finished.
+        #[cfg(feature = "test-support")]
+        drop(maintenance);
+        let pause = match probe? {
             Ok((pause, _)) => pause,
             // Another CPU holds this MM's editor: not now. Nothing is
             // supplied and the selection stays published, which tells its
@@ -2213,6 +2282,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner COW demand changed during physical publication"));
         }
+        #[cfg(feature = "test-support")]
+        editor_hold::supplied(mm);
         drop(pause);
         wake.finish()
     }
@@ -3191,7 +3262,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 ),
             };
             #[cfg(feature = "test-support")]
-            let maintenance = plan_editor_hold::take(venue, mm);
+            let maintenance = editor_hold::take(EditorHoldSite::BackingPlan, venue, mm);
             let probe = self.settled_pause(venue, window.operation.mm);
             // The seam's borrow ends through its own release, before this
             // venue's wakes are finished.

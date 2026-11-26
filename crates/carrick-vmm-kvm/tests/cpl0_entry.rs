@@ -5004,11 +5004,15 @@ fn two_live_threads_concurrent_root_first_touch_and_futex_complete() {
 fn root_first_touch_waits_out_an_editor_held_under_the_backing_plan() {
     const CHILD: &str = "CARRICK_2941_PLAN_EDITOR_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::hold_editor_at_next_backing_plan_for_test();
+        carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::hold_editor_at_next_for_test(
+            carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::EditorHoldSite::BackingPlan,
+        );
         let elf = compile_static_gas_witness(TWO_THREAD_ROOT_FIRST_TOUCH);
         let outcome = run_pool_fixture(&elf, 64);
         assert_eq!(
-            carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::backing_plan_editor_holds_for_test(),
+            carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::editor_holds_for_test(
+                carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::EditorHoldSite::BackingPlan,
+            ),
             1,
             "the seam never held a backing plan's editor"
         );
