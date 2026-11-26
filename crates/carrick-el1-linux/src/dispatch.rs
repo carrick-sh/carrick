@@ -220,16 +220,6 @@ impl GuestDispatchFrame for TrapFrame {
     fn arm_frame_ref(&self) -> Option<&TrapFrame> {
         Some(self)
     }
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    fn restore_signal_frame(
-        &mut self,
-        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<
-        carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
-    > {
-        super::arm_signal::restore_live_arm_signal_frame(self, copy_in)
-    }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
     }

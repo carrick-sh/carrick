@@ -1271,32 +1271,6 @@ impl<
         carrick_syscall_abi::LinuxErrno,
     > {
         let task_idx = self.frame.task_index();
-        #[cfg(test)]
-        if let Some(user) = &mut self.lifecycle_user {
-            struct Adapter<'u>(&'u mut (dyn crate::file::UserCopy + 'u));
-            impl carrick_personality_linux::lifecycle::UserCopy for Adapter<'_> {
-                fn copy_out(
-                    &mut self,
-                    dst: carrick_guest_arch::UserVa,
-                    src: &[u8],
-                ) -> carrick_core::user_copy::CopyOutcome {
-                    carrick_core::user_copy::CopyOutcome::from_completed(
-                        self.0.copy_out(dst.raw(), src),
-                    )
-                }
-                fn copy_in(
-                    &mut self,
-                    dst: &mut [u8],
-                    src: carrick_guest_arch::UserVa,
-                ) -> carrick_core::user_copy::CopyOutcome {
-                    carrick_core::user_copy::CopyOutcome::from_completed(
-                        self.0.copy_in(dst, src.raw()),
-                    )
-                }
-            }
-            let mut adapter = Adapter(*user);
-            return self.frame.restore_signal_frame(&mut adapter);
-        }
         let Some(task) = self.current_tasks.get(task_idx) else {
             return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT);
         };
@@ -1304,9 +1278,15 @@ impl<
             task,
             validator: &crate::file::HardwareValidator,
         });
-        #[cfg(test)]
-        if let (Some(zone), Some(arm_frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-            return crate::arm_signal::restore_live_arm_signal_frame_with_cpu(
+        // An ARM thread returns through its scheduler CPU, which holds the
+        // stack and FP/SIMD state its trap frame lacks: the vector's CPU in
+        // the image, a witness's CPU on the host, one path for both.
+        #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+        if let Some(arm_frame) = self.frame.arm_frame() {
+            let Some(zone) = self.zone.as_mut() else {
+                return Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS);
+            };
+            return crate::arm_signal::restore_live_arm_signal_frame(
                 zone.cpu, arm_frame, &mut copy,
             );
         }
