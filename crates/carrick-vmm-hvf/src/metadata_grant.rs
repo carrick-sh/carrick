@@ -2060,9 +2060,13 @@ fn service_native_cow_supply(
         return Ok(denied);
     };
     if claimed_cpu != u64::from(cpu.raw()) {
+        tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), claimed_cpu, address,
+            "native COW supply denied: claimed CPU mismatch");
         return Ok(denied);
     }
     let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+        tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), ttbr0, address,
+            "native COW supply denied: no stopped execution");
         return Ok(denied);
     };
     let Some(pointer) = region.record_ptr::<carrick_el1_abi::MmPortalSlots>(
@@ -2078,19 +2082,28 @@ fn service_native_cow_supply(
     };
     let mm = execution.binding.mm.raw();
     let Some((_, window)) = slot.pending_cow_fault_selection(mm, address) else {
+        tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), mm, address,
+            "native COW supply denied: no pending selection for this MM and page");
         return Ok(denied);
+    };
+    // Every denial below leaves the lane's selection published (#936).
+    let deny = |reason: &'static str| {
+        tracing::warn!(target: "carrick::cow_supply", cpu = cpu.raw(), mm, address,
+            sequence = window.operation.sequence.get(), reason,
+            "native COW supply denied with the selection still published");
+        Ok(denied)
     };
     if slots.carrier() != Some(window.operation.carrier)
         || window.operation.carrier != custody.transfer_carrier
         || window.fault_page != address & !4095
     {
-        return Ok(denied);
+        return deny("carrier or page mismatch");
     }
     let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
-        return Ok(denied);
+        return deny("no COW grant pool");
     };
     let Ok(Some(state)) = custody.guest_cow_state(mm) else {
-        return Ok(denied);
+        return deny("no guest COW state");
     };
     // A first write into an armed block is served only by a grant carrying
     // its split tables (#2276); an unarmed fault takes any ready grant.
@@ -2104,8 +2117,11 @@ fn service_native_cow_supply(
             candidate == mm && slots.carrier() == Some(window.operation.carrier)
         })?
         || usable();
-    if !supplied || !slot.take_cow_fault_selection(window) {
-        return Ok(denied);
+    if !supplied {
+        return deny("no usable grant after refill");
+    }
+    if !slot.take_cow_fault_selection(window) {
+        return deny("selection take lost");
     }
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
 }
