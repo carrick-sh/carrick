@@ -186,6 +186,8 @@ use carrick_aarch64::esr::{El0SysRegRead, decode_el0_sys64_read};
 use sysreg::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod carrier_custody;
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod custody_census;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod global_frame;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1005,9 +1007,24 @@ fn legacy_test_carrier_vm_custody() -> &'static CarrierVmCustody {
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+static LEGACY_TEST_CARRIER_VM_CUSTODY: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> =
+    std::sync::OnceLock::new();
+
+/// Every taker of the shared legacy custody first answers the teardown
+/// census for the tests that finished before it.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn legacy_test_carrier_vm_custody_arc() -> &'static std::sync::Arc<CarrierVmCustody> {
-    static CELL: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
+    custody_census::assert_no_reported_legacy_leak();
+    LEGACY_TEST_CARRIER_VM_CUSTODY
+        .get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
+}
+
+/// The legacy custody, without the census and without creating it.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn legacy_test_carrier_vm_custody_if_created() -> Option<&'static CarrierVmCustody> {
+    LEGACY_TEST_CARRIER_VM_CUSTODY
+        .get()
+        .map(|custody| custody.as_ref())
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

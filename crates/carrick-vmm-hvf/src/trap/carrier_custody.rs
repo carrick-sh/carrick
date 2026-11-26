@@ -314,6 +314,9 @@ pub(crate) struct CarrierStage2Records {
     >,
     pub(crate) pinned_structural_successor:
         std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2RecordIdentity>,
+    /// Test teardown census: the registering test of each live record.
+    #[cfg(test)]
+    pub(crate) census: super::custody_census::RecordCensus,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -324,6 +327,8 @@ impl CarrierStage2Records {
             .entry((ipa, len as u64))
             .or_default()
             .insert(id);
+        #[cfg(test)]
+        self.census.stamp(id);
     }
 
     pub(crate) fn remove_record(
@@ -332,6 +337,8 @@ impl CarrierStage2Records {
     ) -> Option<CarrierStage2Record> {
         let _ = self.installed.remove(&id);
         let removed = self.stage2_records.remove(&id);
+        #[cfg(test)]
+        self.census.forget(id);
         if let Some(record) = &removed {
             let key = (record.snapshot.ipa, record.snapshot.len as u64);
             if let Some(ids) = self.stage2_extent_index.get_mut(&key) {
@@ -869,6 +876,14 @@ impl Default for CarrierVmCustody {
     }
 }
 
+/// Teardown census: no stage-2 record outlives its custody.
+#[cfg(test)]
+impl Drop for CarrierVmCustody {
+    fn drop(&mut self) {
+        super::custody_census::assert_custody_drop_leaves_no_record(&self.stage2.lock());
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 impl CarrierVmCustody {
@@ -920,6 +935,8 @@ impl CarrierVmCustody {
                     stage2_extent_index_max_len: 0,
                     pinned_structural_predecessors: std::collections::BTreeMap::new(),
                     pinned_structural_successor: std::collections::BTreeMap::new(),
+                    #[cfg(test)]
+                    census: Default::default(),
                 },
             ),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
