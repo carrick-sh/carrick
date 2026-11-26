@@ -2480,6 +2480,9 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
 fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
     const SVC: u64 = 0x40_0000;
     const ARG0: u64 = 0x99;
+    // x1..x5: marker arguments that must survive the park and the rerun
+    // untouched, and never hold the call's own return PC (#2900).
+    const ARGS: [u64; 5] = [0x1111, 0x2222, 0x3333, 0x4444, 0x5555];
     let mut env = new_live_position_fixture();
     let usr1 = Signal::from_number(10).unwrap();
     let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
@@ -2487,6 +2490,7 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
     {
         let mut native = ThreadCtx::ZERO;
         native.x[0] = ARG0;
+        native.x[1..6].copy_from_slice(&ARGS);
         native.x[8] = 260; // SYS_wait4
         native.pc = SVC + 4;
         native.sp_el0 = sp_top.raw();
@@ -2561,6 +2565,7 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
         ..Default::default()
     };
     frame.x[8] = 260;
+    frame.x[1..6].copy_from_slice(&ARGS);
     // Dispatch rewinds the live frame onto the SVC before the return checkpoint;
     // the interrupted call answers EINTR for SA_RESTART inspection.
     crate::dispatch::GuestDispatchFrame::restart_syscall(&mut frame);
@@ -2612,6 +2617,14 @@ fn arm_live_rewound_frame_sa_restart_parked_and_resumed_rewinds_once() {
     let saved_x0 = { sigframe.rt.ucontext.uc_mcontext.regs[0] };
     assert_eq!(saved_pc, SVC, "SA_RESTART must rewind saved PC once");
     assert_eq!(saved_x0, ARG0, "SA_RESTART must restore original arg0");
+    let saved_args: [u64; 5] = core::array::from_fn(|i| {
+        let regs = { sigframe.rt.ucontext.uc_mcontext.regs };
+        regs[i + 1]
+    });
+    assert_eq!(
+        saved_args, ARGS,
+        "the rerun's x1..x5 survive the park and the deferred copy"
+    );
 }
 
 /// #2900 on ARM (live P0 IRQ resume PC): a deferred signal-frame copy on an EL0
