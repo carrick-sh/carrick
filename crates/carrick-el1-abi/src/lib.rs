@@ -704,6 +704,34 @@ impl CowSupplyAnswer {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn cow_supply_answer_round_trips_and_keeps_contention_off_the_error_range() {
+    for answer in [
+        CowSupplyAnswer::Supplied,
+        CowSupplyAnswer::NotNow,
+        CowSupplyAnswer::Refused,
+    ] {
+        assert_eq!(CowSupplyAnswer::from_status(answer.status()), answer);
+    }
+    // "Not now" is no metadata-grant refusal, and every unknown status is a
+    // refusal, never a supply or contention.
+    for refusal in [
+        METADATA_GRANT_ERR_DENIED,
+        METADATA_GRANT_ERR_INVALID,
+        METADATA_GRANT_ERR_NOT_FOUND,
+        METADATA_GRANT_ERR_OVERLAP,
+        METADATA_GRANT_ERR_ALIGNMENT,
+        u64::MAX,
+    ] {
+        assert_ne!(refusal, CowSupplyAnswer::NOT_NOW_STATUS);
+        assert_eq!(
+            CowSupplyAnswer::from_status(refusal),
+            CowSupplyAnswer::Refused
+        );
+    }
+}
 /// Runtime handback of a terminal child's unplaceable parent wait.
 pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
