@@ -15320,6 +15320,21 @@ fn exercise_retained_import(journal_case: u8) {
             .unwrap(),
     );
     assert_eq!(chunk.ipa, ready.physical_ipa);
+    // The selected byte must resolve to the import's own record, never to
+    // another record still indexed over the same IPA.
+    let covering = transport.custody.stage2_record_covering(chunk.ipa, 1);
+    assert_eq!(
+        covering,
+        Some(owner.record_identity),
+        "the import IPA 0x{:x} resolves to {:?} ({:?}), not the import's record {:?} ({:?})",
+        chunk.ipa,
+        covering,
+        covering.and_then(|identity| transport.custody.stage2_record_snapshot(identity.record_id)),
+        owner.record_identity,
+        transport
+            .custody
+            .stage2_record_snapshot(owner.record_identity.record_id),
+    );
     let mut bytes = [0; 4];
     super::super::user_transfer::tests::copy_bytes(
         &target,
