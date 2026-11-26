@@ -1376,6 +1376,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .native_mut()
             .resources_mut();
         let pending = resources.pending_signal_deliveries.remove(&self.record)?;
+        // A terminal cancellation outranks a delivery retained for its frame
+        // supply (#3018). Replaying it would skip the fatal signal's own
+        // selection and request again the supply the cancellation discards,
+        // on every checkpoint. The cause is never cleared once published, so
+        // the removal above is final.
+        if resources
+            .page
+            .process_exit_custody()
+            .cancellation()
+            .is_some_and(carrick_core::terminal::ProcessCancellation::is_terminal)
+        {
+            return None;
+        }
         if signal_record_exists(self.source.zone, self.record)
             && resources.members.iter().any(|member| {
                 member.record == self.record
@@ -4255,17 +4268,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let graph = self.runtime.graph.lock();
             graph.pending.has_exit(&self.key)
                 || graph.owner.task(self.key).is_ok_and(|row| {
-                    matches!(
-                        row.native()
-                            .resources()
-                            .page
-                            .process_exit_custody()
-                            .cancellation(),
-                        Some(
-                            carrick_core::terminal::ProcessCancellation::FatalSignal
-                                | carrick_core::terminal::ProcessCancellation::GroupExit
-                        )
-                    )
+                    row.native()
+                        .resources()
+                        .page
+                        .process_exit_custody()
+                        .cancellation()
+                        .is_some_and(carrick_core::terminal::ProcessCancellation::is_terminal)
                 })
         };
         if lost_race {
@@ -4702,13 +4710,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // original fatal signal remains authoritative after another
             // thread consumes the pending entry.
             let group_closing = self.runtime.graph.lock().pending.has_exit(&self.key)
-                || matches!(
-                    pending.claim.cancellation(),
-                    Some(
-                        carrick_core::terminal::ProcessCancellation::FatalSignal
-                            | carrick_core::terminal::ProcessCancellation::GroupExit
-                    )
-                );
+                || pending
+                    .claim
+                    .cancellation()
+                    .is_some_and(carrick_core::terminal::ProcessCancellation::is_terminal);
             let fatal = carrick_signal_core::policy::Signal::from_number(
                 pending
                     .exec_fatal_signal
