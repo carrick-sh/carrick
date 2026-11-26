@@ -5268,6 +5268,13 @@
     {
       "family": "global_carrier_infra",
       "operation": "global:thread_local",
+      "owner": "carrick_vfs::host_size::HELD",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "global_carrier_infra",
+      "operation": "global:thread_local",
       "owner": "carrick_vmm_hvf::syscall_mailbox::THREAD_MAILBOX_SLOT_CLAIMS_TOTAL",
       "lane": "hvf",
       "ceiling": 1
@@ -34080,7 +34087,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized_resize",
+      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized",
       "lane": "shared",
       "ceiling": 1
     },
