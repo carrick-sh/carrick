@@ -100,6 +100,8 @@ pub trait GuestDispatchFrame: SyscallFrame {
     /// Retain a host record the ring built for the current call. Called
     /// only after [`Self::accepts_ring_record`] answered `true`; the venue
     /// publishes it in place of staging the call itself.
+    // The venue retains the boxed record; the default has no venue.
+    #[allow(clippy::boxed_local)]
     fn stage_ring_record(&mut self, _record: alloc::boxed::Box<[u8]>) {
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
     }

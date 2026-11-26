@@ -213,9 +213,9 @@ pub(super) fn collect_ready<R: From<IpcError>>(
 
 /// Why an EL1 harvest of a set did not answer.
 enum Unharvested {
-    /// The carrier holds the epoll lock: park on its release, then rerun.
+    /// The carrier holds the epoll lock: park on its release, then rerun
+    /// (the harvest hands back the same operation it was given).
     WaitForRelease(
-        IpcOperation,
         carrick_sched_core::object_wait::ObjectWaitKey,
         carrick_sched_core::object_wait::ObjectStateSnapshot,
     ),
@@ -241,8 +241,8 @@ fn harvest_in_ring<E: IpcExecution>(
         EL1_HARVEST_SCANS,
         |reports, taken| match harvest(sched, region, epoll, op, reports, taken) {
             Harvest::Ready(harvest) => Ok(harvest),
-            Harvest::WaitForRelease(op, key, observed) => {
-                Err(Unharvested::WaitForRelease(op, key, observed))
+            Harvest::WaitForRelease(_, key, observed) => {
+                Err(Unharvested::WaitForRelease(key, observed))
             }
             Harvest::Refused => Err(Unharvested::Refused),
         },
@@ -658,7 +658,7 @@ fn wait<E: IpcExecution, M: UserCopy>(
             Ok(ready) => ready,
             // A carrier holds the set's lock: "not now". Park on its release
             // with the retained operation, then harvest again.
-            Err(Unharvested::WaitForRelease(back, key, observed)) => {
+            Err(Unharvested::WaitForRelease(key, observed)) => {
                 let Some(admitted) = token.take() else {
                     // Only a set holding carrier sockets contends with the
                     // carrier, and its operation is admitted before any harvest.
@@ -671,7 +671,7 @@ fn wait<E: IpcExecution, M: UserCopy>(
                     frame,
                     region,
                     admitted,
-                    back,
+                    op,
                     key,
                     observed,
                     None,
