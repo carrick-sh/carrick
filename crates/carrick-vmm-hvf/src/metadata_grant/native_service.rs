@@ -1401,27 +1401,6 @@ pub(super) fn supply_child_cow(
     drop(stock);
     Ok(Some(supplied))
 }
-/// A refused fault-selection intake, with the real values that decide which
-/// lane slot owned the request's selection (#936): the delivering CPU's slot
-/// and every other slot still holding a selection.
-#[track_caller]
-fn fault_selection_refused(
-    portal: &carrick_el1_abi::MmPortalSlots,
-    cpu: carrick_guest_arch::CpuId,
-    request: carrick_core_abi::service::ServiceRequest,
-    error: carrick_core_abi::service::ServiceError,
-) -> TrapError {
-    TrapError::Hypervisor(format!(
-        "native service custody mismatch at {}: fault selection refused ({error:?}) on cpu {} \
-         request identity={:?} operation={:?} fault_sequence={:?};{}",
-        core::panic::Location::caller(),
-        cpu.raw(),
-        request.identity,
-        request.operation,
-        request.fault_sequence,
-        portal.selection_report(cpu.raw() as usize),
-    ))
-}
 
 #[track_caller]
 fn stale() -> TrapError {
