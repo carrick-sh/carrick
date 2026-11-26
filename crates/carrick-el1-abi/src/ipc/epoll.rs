@@ -917,17 +917,26 @@ impl<'a> IpcRegion<'a> {
         wait: &W,
     ) -> Result<EpollHarvest, IpcError> {
         let guard = self.lock_epoll(epoll, wait)?;
-        self.epoll_harvest_locked(guard, out, taken, wait)
+        self.epoll_harvest_locked(guard, out, taken, wait, wait)
     }
 
     /// Continue a harvest after its caller probed the lock using a
     /// release-queue observation. No second acquisition for host items.
-    pub fn epoll_harvest_locked<W: LockWait>(
+    ///
+    /// `relock` is the policy of every later acquisition of the epoll's own
+    /// lock (after a member's level was read under the member's lock
+    /// alone). A relock it refuses as [`IpcError::Contended`] is "not now":
+    /// the harvest puts back every item it took and the one it held, and
+    /// answers `Contended` with no report, so its caller enrols on the
+    /// holder's release and harvests again from the start. Its other
+    /// errors end the scan as before.
+    pub fn epoll_harvest_locked<W: LockWait, R: LockWait>(
         &self,
         mut epoll_guard: IpcObjectGuard<'a>,
         out: &mut [EpollReport],
         taken: &mut [EpollItemRef],
         wait: &W,
+        relock: &R,
     ) -> Result<EpollHarvest, IpcError> {
         if !self.same_mapping(&epoll_guard.region) {
             return Err(IpcError::BadRegion);
@@ -944,8 +953,11 @@ impl<'a> IpcRegion<'a> {
         while reported < limit {
             let mut guard = match locked.take() {
                 Some(guard) => guard,
-                None => match self.lock_epoll(epoll, wait) {
+                None => match self.lock_epoll(epoll, relock) {
                     Ok(guard) => guard,
+                    Err(IpcError::Contended) => {
+                        return Err(self.harvest_not_now(epoll, &taken[..reported], None));
+                    }
                     Err(error) if reported == 0 => return Err(error),
                     Err(_) => break,
                 },
@@ -1011,8 +1023,11 @@ impl<'a> IpcRegion<'a> {
                     break;
                 }
             };
-            let guard = match self.lock_epoll(epoll, wait) {
+            let guard = match self.lock_epoll(epoll, relock) {
                 Ok(guard) => guard,
+                Err(IpcError::Contended) => {
+                    return Err(self.harvest_not_now(epoll, &taken[..reported], Some(target)));
+                }
                 Err(error) => {
                     self.requeue_unlocked(epoll, target);
                     if reported == 0 {
@@ -1036,7 +1051,12 @@ impl<'a> IpcRegion<'a> {
         if reported > 0 {
             let acquired = match locked {
                 Some(guard) => Ok(guard),
-                None => self.lock_epoll(epoll, wait),
+                None => match self.lock_epoll(epoll, relock) {
+                    Err(IpcError::Contended) => {
+                        return Err(self.harvest_not_now(epoll, &taken[..reported], None));
+                    }
+                    acquired => acquired,
+                },
             };
             let mut guard = acquired.ok();
             for target in &taken[..reported] {
@@ -1062,6 +1082,26 @@ impl<'a> IpcRegion<'a> {
             host_items,
             truncated,
         })
+    }
+
+    /// A harvest whose relock was refused as contended takes nothing: every
+    /// item it reported (and the one it held between its locks) goes back
+    /// on the lock-free ready stack, one-shot items re-armed, so the rerun
+    /// after the holder's release reports them again. Answers the
+    /// `Contended` the caller enrols on.
+    fn harvest_not_now(
+        &self,
+        epoll: IpcObjectHandle,
+        reported: &[EpollItemRef],
+        held: Option<EpollItemRef>,
+    ) -> IpcError {
+        for target in reported.iter().copied().chain(held) {
+            if let Some(item) = self.live_item(target) {
+                item.flags.fetch_and(!DISABLED, Ordering::AcqRel);
+            }
+            self.requeue_unlocked(epoll, target);
+        }
+        IpcError::Contended
     }
 
     /// Put a popped item back on `epoll`'s lock-free ready stack without
