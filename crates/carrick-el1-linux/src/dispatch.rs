@@ -1859,6 +1859,50 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
     (result, process.native_service_phase())
 }
 
+/// Admit the trapped thread for its service exit: save the exact frame the
+/// boundary left (a `ForwardOriginal` rerun already sits on its `SVC`; an
+/// interrupt or fault frame names its resume point) and enter its native
+/// owner, which may park that saved context for the carrier. Inlined: the
+/// EL1 frame budget charges `with_process_entry` under the service exit.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn arm_native_service_entry<C: sched::ThreadCpu, X, R>(
+    cpu: &mut C,
+    frame: &TrapFrame,
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    ttbr0: u64,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    begin: impl FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            super::aarch64_process::Mm,
+            carrick_el1_abi::Aarch64ParkedContext,
+            super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        >,
+    ) -> R,
+) -> Result<R, super::native_process_runtime::NativeProcessError>
+where
+    X: super::aarch64_process::ForkStockCrossing,
+{
+    let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    sched::ThreadCpu::save(cpu, frame, &mut saved);
+    super::aarch64_process::with_process_entry(
+        source,
+        task,
+        &saved.native,
+        ttbr0,
+        page,
+        control,
+        service,
+        begin,
+    )
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1965,14 +2009,13 @@ fn arm_native_service_exit(
         } else {
             None
         };
-    let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let (result, phase) = super::aarch64_process::with_process_entry(
+    let (result, phase) = arm_native_service_entry(
+        &mut sched::HardwareCpu,
+        frame,
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
-        &saved.native,
         carrick_el1::isa::aarch64::hardware_live_ttbr(),
         page,
         control,
