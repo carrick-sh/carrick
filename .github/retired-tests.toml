@@ -435,3 +435,9 @@ test = "carrick_xtask::ci_scaler::lane_tests::agents_need_a_standing_controller_
 reason = "#3016: non-standing (pilot) controllers were retired, so Lanes::select dropped its standing parameter and the test was renamed for what remains (agents need an agent site)."
 replaced_by = "carrick_xtask::ci_scaler::lane_tests::agents_need_an_agent_site"
 pr = 3016
+
+[[retired]]
+test = "carrick_x86::cpl0_entry::tests::syscall_resume_pc_rewinds_rcx_by_the_syscall_length"
+reason = "#2900: NativeFrame now carries its syscall position, so the rewind test also asserts the label and that a second rewind keeps RCX on the SYSCALL; it was renamed for what it proves."
+replaced_by = "carrick_x86::cpl0_entry::tests::syscall_resume_pc_rewinds_rcx_by_the_syscall_length_once"
+pr = 2922
