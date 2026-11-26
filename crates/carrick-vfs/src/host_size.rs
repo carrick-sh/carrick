@@ -9,7 +9,7 @@
 //!
 //! The fence keys on the **object the change is applied to**, never on a
 //! path looked up beside it: every host size change of a guest file is made
-//! through this module on the descriptor it mutates ([`admit_resize`],
+//! through this module on the descriptor it mutates (`admit_resize`,
 //! [`open_truncating`], [`discard`]), and the check `fstat`s
 //! that same descriptor. No second lookup can name a different inode, and a
 //! bind mount, a hard link, a rename or a `/proc/self/fd` reopen all reach
@@ -37,7 +37,7 @@
 //! the next change.
 //!
 //! The order is enforced, not documented only: every acquisition goes
-//! through [`lock_read`] / [`lock_write`], which mark this thread as the
+//! through `lock_read` / `lock_write`, which mark this thread as the
 //! holder and panic on a re-entrant acquire (that acquire would deadlock
 //! `parking_lot`'s write-preferring lock: a read then a write on one thread,
 //! or a read behind a queued writer). The host-wait handoff checks
@@ -123,7 +123,7 @@ std::thread_local! {
     /// `ENOSYS` from a layer's own ([`fenced_during`]).
     static REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Whether this thread holds the registry (either mode): the leaf rule's
-    /// mark ([`lock_read`], [`lock_write`], [`held_by_current_thread`]).
+    /// mark (`lock_read`, `lock_write`, [`held_by_current_thread`]).
     static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -284,7 +284,7 @@ fn lock_for_resize(fd: RawFd) -> RegistryGuard {
 }
 
 /// An admitted resize of one descriptor's file to one length, private to
-/// the door: only [`admit_resize`] mints one and only [`resize`] (and the
+/// the door: only `admit_resize` mints one and only [`resize`] (and the
 /// door's own `O_TRUNC`) applies it, at once. It holds `WINDOWED.write()`
 /// when `fd` names a windowed (or unstatable) inode in a non-empty registry
 /// (so no concurrent resize, [`record`], or regular-file write can
@@ -513,8 +513,8 @@ pub fn discard<R>(
     Ok(result)
 }
 
-/// `ftruncate(2)` of a guest file through the door: [`admit_resize`], then
-/// [`Resize::apply`]. The host errno on failure ([`Fenced::ERRNO`] when
+/// `ftruncate(2)` of a guest file through the door: `admit_resize`, then
+/// `Resize::apply`. The host errno on failure ([`Fenced::ERRNO`] when
 /// fenced).
 pub fn resize(fd: BorrowedFd<'_>, len: u64) -> Result<(), libc::c_int> {
     admit_resize(fd, len)?.apply()
