@@ -3,11 +3,12 @@
 //! (`super::readiness_set`).
 //!
 //! Once an epoll has hosted a carrier socket, the carrier's reactor takes
-//! the same epoll lock on every host event. A ring harvest then probes the
-//! lock once through the tracked release (`BoundedSpin(0)`): a carrier
-//! holder is "not now", so the call enrols on the holder's release, parks,
-//! and reruns the harvest once it is published. It never spins on a host
-//! thread and never answers an errno for contention.
+//! the same epoll lock on every host event. A ring harvest takes that lock,
+//! first and at every relock between member reads, under one policy: a
+//! carrier holder is "not now", so the harvest puts back everything it
+//! took, the call enrols on the holder's release, parks, and reruns the
+//! whole harvest once it is published. It never spins on a host thread and
+//! never answers an errno for contention.
 
 use super::{EL1_WAIT, IpcExecution, IpcRegion};
 use carrick_el1_abi::ipc::epoll::{EpollHarvest, EpollItemRef, EpollReport};
@@ -73,25 +74,21 @@ pub(super) fn harvest<E: IpcExecution>(
     let tracked = region
         .with_lock_release(&adapter)
         .unwrap_or_else(|_| invalid());
+    // One policy for the first acquisition and every relock: a carrier
+    // holder is "not now" (the harvest takes nothing and enrols on its
+    // release); an EL1 holder is a short critical section, waited out.
+    let not_now = CarrierNotNow { region, epoll };
+    let attempt = |error| match error {
+        IpcError::Contended => Attempt::Contended(ReleaseCause::Object),
+        error => Attempt::Settled(Settled::Guest(error)),
+    };
     match source.contend(|| {
-        match tracked.lock_epoll(epoll, &carrick_sched_core::BoundedSpin(0)) {
-            Ok(guard) => Ok(guard),
-            Err(IpcError::Contended) if region.has_tracked_lock_holder(epoll) => {
-                Err(Attempt::Contended(ReleaseCause::Object))
-            }
-            Err(IpcError::Contended) => {
-                // The failed probe observed a racing release or a legacy
-                // holder. A legacy holder owes no release publication.
-                tracked
-                    .lock_epoll(epoll, &EL1_WAIT)
-                    .map_err(|error| Attempt::Settled(Settled::Guest(error)))
-            }
-            Err(error) => Err(Attempt::Settled(Settled::Guest(error))),
-        }
+        let guard = tracked.lock_epoll(epoll, &not_now).map_err(attempt)?;
+        tracked
+            .epoll_harvest_locked(guard, reports, taken, &EL1_WAIT, &not_now)
+            .map_err(attempt)
     }) {
-        Ok(guard) => tracked
-            .epoll_harvest_locked(guard, reports, taken, &EL1_WAIT)
-            .map_or(Harvest::Refused, Harvest::Ready),
+        Ok(harvest) => Harvest::Ready(harvest),
         // SAFETY: the pinned syscall and the pre-probe revision are passed
         // directly to its scheduler park below. A raced park returns the
         // same operation for one immediate rerun. No guard crosses the park.
@@ -106,6 +103,24 @@ pub(super) fn harvest<E: IpcExecution>(
         },
         Err(Refusal::Invariant(_)) => invalid(),
         Err(Refusal::Guest(_)) => Harvest::Refused,
+    }
+}
+
+/// The epoll lock policy of a harvest that may meet the carrier: a
+/// tracked (carrier) holder publishes its release, so contention with it is
+/// refused at once; any other holder is an EL1 short critical section.
+struct CarrierNotNow<'r, 'a> {
+    region: &'r IpcRegion<'a>,
+    epoll: IpcObjectHandle,
+}
+
+impl carrick_sched_core::LockWait for CarrierNotNow<'_, '_> {
+    fn wait(&self, _attempt: u32) -> bool {
+        if self.region.has_tracked_lock_holder(self.epoll) {
+            return false;
+        }
+        core::hint::spin_loop();
+        true
     }
 }
 
