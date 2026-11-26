@@ -10515,6 +10515,23 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
 }
 
 fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVmCustody>) {
+    partial_structural_map_plan_in(root_ipa, Arc::new(CarrierForeignMmTransport::new()))
+}
+
+/// A transport over its own live carrier custody, for a witness that
+/// destroys or replaces its VM generation: the shared legacy test custody
+/// must stay live for every other test in the process.
+fn isolated_test_transport() -> Arc<CarrierForeignMmTransport> {
+    Arc::new(CarrierForeignMmTransport {
+        custody: Arc::new(CarrierVmCustody::new_live_fixture()),
+        ..CarrierForeignMmTransport::default()
+    })
+}
+
+fn partial_structural_map_plan_in(
+    root_ipa: u64,
+    transport: Arc<CarrierForeignMmTransport>,
+) -> (ProcessSpecPlan, Arc<CarrierVmCustody>) {
     fn structural_mapping(start: u64, ipa: u64) -> ProcessMappingDesc {
         const SIZE: usize = 0x20_0000;
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -10546,7 +10563,6 @@ fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVm
     }
 
     let later_ipa = root_ipa + 0x20_0000;
-    let transport = Arc::new(CarrierForeignMmTransport::new());
     let custody = Arc::clone(&transport.custody);
     let plan = ProcessSpecPlan {
         mappings: vec![
@@ -15135,4 +15151,75 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         next_alias.owner_generation,
     );
     assert!(next_wait.0.is_ready());
+}
+
+/// Exact generation admission: a root slot from G1's pool, offered to a
+/// composition running in G2 after G1's destroy, must be refused, and the
+/// G2 rows installed before it rolled back. Before the transaction the slot
+/// failed only at its own custody transfer, after the earlier rows were
+/// already mapped, and nothing rolled them back.
+#[test]
+fn task_only_stale_generation_pooled_root_is_refused_and_rolls_back() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let root_ipa = 0x9a00_1600_0000u64;
+    // This witness destroys G1 and creates G2: it runs on its own custody.
+    let (mut plan, custody) = partial_structural_map_plan_in(root_ipa, isolated_test_transport());
+    let g1_pool = custody.root_slot_pool().expect("G1 root slot pool");
+    let g1_handle = g1_pool.allocate_slot().expect("G1 root slot");
+    let g1_generation = g1_handle.vm_generation();
+    let (slot_ipa, slot_len) = (g1_handle.ipa(), g1_handle.len());
+    let slot_host = g1_handle.as_mut_ptr();
+    drop(g1_pool);
+    // The production destroy sequence, with the backend's raw destroy
+    // scripted: the unsigned unit binary holds no hypervisor VM.
+    destroy_vm_with_custody_using(
+        &custody,
+        "stale pooled root witness G1",
+        carrick_aarch64::stage2::Stage2Status::SUCCESS,
+        || {},
+    )
+    .expect("destroy G1");
+    let g2 = custody.begin_create().expect("begin G2");
+    custody.commit_create(g2).expect("commit G2");
+    assert_ne!(g1_generation, Some(g2), "precondition: the slot is G1's");
+    let records_before = custody.stage2_record_identities();
+    plan.mappings.push(ProcessMappingDesc {
+        start: crate::memory::LINUX_PAGE_TABLES_BASE + 0x40_0000,
+        ipa: slot_ipa,
+        end: slot_ipa + slot_len as u64,
+        stage2_lease: Some(GlobalFrameStage2Lease::fixed(slot_ipa, slot_len as u64)),
+        host: ProcessMappingHost::PooledRootSlot { handle: g1_handle },
+        size: slot_len,
+        physical_ipa: slot_ipa,
+        physical_host_addr: slot_host,
+        physical_size: slot_len,
+        inventory_backing: InventoryBackingIdentity::Private(slot_ipa),
+        perms: carrick_hal::MemPerms::ReadWrite,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        inherited_frame: None,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(
+        result.is_err(),
+        "a G1 pooled root slot must not join a G2 composition"
+    );
+    drop(result);
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, 0x20_0000)
+            && !ScopedStage2MapTestStub::is_mapped(root_ipa + 0x20_0000, 0x20_0000),
+        "the stale slot's refusal must roll back the G2 rows installed before it"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|record| records_before.contains(record)),
+        "the stale slot's refusal must terminalize every new G2 record"
+    );
 }
