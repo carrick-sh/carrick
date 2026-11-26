@@ -10658,6 +10658,130 @@ fn task_only_invalid_second_mapping_rolls_back_first_structural_owner() {
     );
 }
 
+/// A refusal after the second structural owner exists (the stage-1 root
+/// authority does not cover its slot) must roll back BOTH installed
+/// structural owners: the one already in the published mapping list and the
+/// one the failing iteration just created.
+#[test]
+fn task_only_late_root_refusal_rolls_back_every_structural_owner() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let root_ipa = 0x9a00_0a00_0000u64;
+    let later_ipa = root_ipa + 0x20_0000;
+    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    let records_before = custody.stage2_record_identities();
+    let structural_before = custody
+        .structural_backings
+        .lock()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    // The second row is the stage-1 root, but the slot is half its extent:
+    // MmRootStage2Authority::new refuses after both owners were created.
+    plan.mm_root_slot = (later_ipa, 0x10_0000);
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(
+        matches!(result, Err(TrapError::Hypervisor(ref message)) if message.contains("does not exactly cover root slot")),
+        "the late root refusal must propagate: {:?}",
+        result.as_ref().err()
+    );
+    drop(result);
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, 0x20_0000),
+        "late refusal must roll back the first structural stage-2 mapping"
+    );
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(later_ipa, 0x20_0000),
+        "late refusal must roll back the failing row's structural stage-2 mapping"
+    );
+    assert!(
+        custody
+            .structural_backings
+            .lock()
+            .keys()
+            .all(|record| structural_before.contains(record)),
+        "late refusal must not retain either new structural custody entry"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|record| records_before.contains(record)),
+        "late refusal must terminalize both new structural stage-2 records"
+    );
+}
+
+/// A refusal after the failing row's own stage-2 map succeeded, but before
+/// its lease reached any owner, must unmap that in-flight lease too. The row
+/// is a reusable global frame with a lease but borrowed host backing, which
+/// the owner-shape match refuses only after the install.
+#[test]
+fn task_only_owner_shape_refusal_unmaps_the_in_flight_lease() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stub = ScopedStage2MapTestStub::enable();
+    const SIZE: usize = 0x20_0000;
+    let root_ipa = 0x9a00_0e00_0000u64;
+    let frame_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+    assert!(crate::trap::is_reusable_global_frame_extent(
+        frame_ipa,
+        SIZE as u64
+    ));
+    let (mut plan, custody) = partial_structural_map_plan(root_ipa);
+    let records_before = custody.stage2_record_identities();
+    let borrowed = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        SIZE,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .expect("allocate borrowed frame fixture");
+    plan.mappings.push(ProcessMappingDesc {
+        start: frame_ipa,
+        ipa: frame_ipa,
+        end: frame_ipa + SIZE as u64,
+        stage2_lease: Some(GlobalFrameStage2Lease::fixed(frame_ipa, SIZE as u64)),
+        host: ProcessMappingHost::Borrowed {
+            pointer: borrowed.as_ptr(),
+            structural_owner: None,
+        },
+        size: SIZE,
+        physical_ipa: frame_ipa,
+        physical_host_addr: borrowed.as_ptr(),
+        physical_size: SIZE,
+        inventory_backing: InventoryBackingIdentity::Private(frame_ipa),
+        perms: carrick_hal::MemPerms::ReadWrite,
+        is_dynamic_alias: false,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        inherited_frame: None,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    });
+    let result = HvfVmState::prepare_task_only_plan_for_test(plan);
+    assert!(
+        matches!(result, Err(TrapError::Hypervisor(ref message)) if message.contains("has stage-2 lease without owned host backing")),
+        "the owner-shape refusal must propagate: {:?}",
+        result.as_ref().err()
+    );
+    drop(result);
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(frame_ipa, SIZE),
+        "owner-shape refusal must unmap the failing row's in-flight lease"
+    );
+    assert!(
+        !ScopedStage2MapTestStub::is_mapped(root_ipa, SIZE)
+            && !ScopedStage2MapTestStub::is_mapped(root_ipa + SIZE as u64, SIZE),
+        "owner-shape refusal must roll back the earlier structural mappings"
+    );
+    assert!(
+        custody
+            .stage2_record_identities()
+            .iter()
+            .all(|record| records_before.contains(record)),
+        "owner-shape refusal must terminalize every new stage-2 record"
+    );
+    drop(borrowed);
+}
+
 #[test]
 fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
