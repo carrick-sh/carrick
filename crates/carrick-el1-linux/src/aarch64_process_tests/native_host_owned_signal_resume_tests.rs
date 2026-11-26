@@ -844,7 +844,7 @@ fn arm_woken_sigsuspend_inline_carrier_ack_preserves_eintr() {
         );
         assert_eq!(
             route,
-            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+            Some(crate::signal_delivery::SignalReturnRoute::Suspended)
         );
     }
     crate::native_process_runtime::host_test_support::on_service_doorbell(None);
@@ -1825,7 +1825,7 @@ fn sigsuspend_refused_frame_supply_preserves_saved_mask_for_forced_sigsegv() {
         );
         assert_eq!(
             route,
-            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+            Some(crate::signal_delivery::SignalReturnRoute::Suspended)
         );
     }
     crate::native_process_runtime::host_test_support::on_service_doorbell(None);

@@ -2329,8 +2329,10 @@ impl MultiSlotEnv {
             fn group_exit_custody(
                 &self,
                 _: &CurrentTask,
-            ) -> carrick_personality_linux::dispatch::CompletionRoute {
-                carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+            ) -> crate::signal_delivery::SignalReturnRoute {
+                crate::signal_delivery::SignalReturnRoute::Refused(
+                    crate::signal_delivery::SignalReturnRefusal::GroupExitCustody,
+                )
             }
             fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
                 self.user_sp = sp;

@@ -184,7 +184,7 @@ pub fn schedule(slot: SlotId) -> ! {
                                 Ok(None)
                             }
                             Some(
-                                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                                carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended,
                             ) => Ok(Some(NativeResume::Left(entry.take_root_exit()))),
                             Some(_) => {
                                 Err(NativeFailure::Quarantined.run_failure_reason().at_caller())
@@ -274,10 +274,10 @@ pub fn schedule(slot: SlotId) -> ! {
                         &mut machine,
                     ) {
                         match route {
-                            carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
+                            carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended => {
                                 suspended = true
                             }
-                            _ => fatal_boot!(),
+                            refused => fatal_boot!(refused.name()),
                         }
                     }
                     words = context::context_words::from_native(

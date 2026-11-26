@@ -2746,7 +2746,7 @@ fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
         );
         Ok(match route {
             None => None,
-            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
+            Some(crate::signal_delivery::SignalReturnRoute::Suspended) => {
                 Some(NativeResume::Left(entry.take_root_exit()))
             }
             Some(_) => Some(NativeResume::Invalid),
@@ -2772,7 +2772,7 @@ fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
     );
     assert_eq!(
         route,
-        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended),
+        Some(crate::signal_delivery::SignalReturnRoute::Suspended),
         "SIGKILL's exit leaves through the terminal checkpoint"
     );
     assert!(

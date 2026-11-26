@@ -7702,38 +7702,39 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// switched record is already its executor's: it returns to user, and
     /// the host retires it at that executor's next host-work boundary. It
     /// never claims its free home record for the ring.
-    pub(crate) fn user_return_host_custody(
-        &mut self,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        use carrick_personality_linux::dispatch::CompletionRoute;
+    pub(crate) fn user_return_host_custody(&mut self) -> crate::signal_delivery::SignalReturnRoute {
+        use crate::signal_delivery::{SignalReturnRefusal, SignalReturnRoute};
         let lane = self.source.zone.slot(self.source.slot);
         match lane.current() {
             Some(current) if current == self.record.id => {
-                if self.yield_terminal_host_custody() {
-                    CompletionRoute::Suspended
-                } else {
-                    CompletionRoute::InvalidCompletion
+                match self.yield_terminal_host_custody() {
+                    Ok(()) => SignalReturnRoute::Suspended,
+                    Err(refusal) => {
+                        SignalReturnRoute::Refused(SignalReturnRefusal::HostCustodyYield(refusal))
+                    }
                 }
             }
             None if lane.host_record() == Some(self.record.id) => {
                 self.current.linux.mark_pending_host_work();
-                CompletionRoute::Served
+                SignalReturnRoute::Served
             }
-            _ => CompletionRoute::InvalidCompletion,
+            Some(_) => SignalReturnRoute::Refused(SignalReturnRefusal::HostCustodyOtherRecord),
+            None => SignalReturnRoute::Refused(SignalReturnRefusal::HostCustodyUnowned),
         }
     }
 
-    pub(crate) fn yield_terminal_host_custody(&mut self) -> bool {
-        self.handoff = carrick_core::entry::yield_current_to_host(
+    pub(crate) fn yield_terminal_host_custody(
+        &mut self,
+    ) -> Result<(), carrick_core::entry::HostYieldRefusal> {
+        let receipt = carrick_core::entry::yield_current_to_host(
             self.binding,
             self.source,
             self.record.id,
             &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-        );
-        if self.handoff.is_some() {
-            self.current.linux.mark_pending_host_work();
-        }
-        self.handoff.is_some()
+        )?;
+        self.handoff = Some(receipt);
+        self.current.linux.mark_pending_host_work();
+        Ok(())
     }
 
     fn pending_close_status(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
@@ -7981,7 +7982,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         match outcome {
             LifecycleOutcome::HostCustody => {
                 // An adopted host member retires on its exact host owner.
-                if !self.yield_terminal_host_custody() {
+                if self.yield_terminal_host_custody().is_err() {
                     return Err(NativeProcessError::ServiceQuarantined(
                         NativeServiceQuarantine::ClosingHostCustody,
                     ));
@@ -8323,7 +8324,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source,
                 self.record.id,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-            );
+            )
+            .ok();
             if self.take_handoff_receipt().is_none() {
                 return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
             }
@@ -8464,7 +8466,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     &|owned| {
                         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                     },
-                );
+                )
+                .ok();
                 if self.take_handoff_receipt().is_none() {
                     return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
                 }
