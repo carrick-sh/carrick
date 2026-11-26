@@ -30,7 +30,8 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         return None;
     }
     let resumed = sched.take_object_operation().ok().flatten();
-    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let resume =
+        OperationResumePc::new(carrick_guest_arch::SyscallReturnFrame::syscall_pc(frame)?)?;
     let rounded = |start: u64, len: u64| {
         let end = start.checked_add(len)?.checked_add(4095)? & !4095;
         ReservationRange::new(start & !4095, end)
@@ -171,7 +172,8 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
         .space_entry(NonZeroU64::new(mm.raw())?)?
         .live_notifications()
         .ok()?;
-    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let resume =
+        OperationResumePc::new(carrick_guest_arch::SyscallReturnFrame::syscall_pc(frame)?)?;
     let resumed = sched.take_object_operation().ok().flatten();
     let slot = sched.slot;
     let access = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
