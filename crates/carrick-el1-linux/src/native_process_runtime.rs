@@ -146,13 +146,6 @@ pub enum NativeResume {
     Left(Option<LinuxWaitStatus>),
     Invalid,
 }
-/// Classify the bridge without carrying its staged payload across refusal folding.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-#[derive(Clone, Copy)]
-pub(crate) enum NativeServiceExit {
-    Bridge,
-    CarrierWork,
-}
 /// Last native-service owner entered by this admitted dispatch. Diagnostic
 /// provenance only: it grants no binding, retry or completion authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

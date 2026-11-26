@@ -17587,7 +17587,7 @@ fn arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement() {
 
 #[cfg(test)]
 fn closed_gate_service_entry(retained_ipc: bool) {
-    use crate::native_process_runtime::{NativeResume, NativeServiceExit};
+    use crate::native_process_runtime::NativeResume;
     use carrick_core_abi::service::ServiceOperation;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
@@ -17730,14 +17730,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
                 }
             };
             let result = entry.begin_service(operation, None);
-            let result = entry.settle_service_exit(
-                result,
-                if retained_ipc {
-                    NativeServiceExit::CarrierWork
-                } else {
-                    NativeServiceExit::Bridge
-                },
-            );
+            let result = entry.settle_service_exit(result);
             crate::dispatch::native_service_completion(result, entry.native_service_phase())
                 .unwrap_or_else(|reason| panic!("service-exit fatal: {:?}", reason.fatal_reason()))
         },

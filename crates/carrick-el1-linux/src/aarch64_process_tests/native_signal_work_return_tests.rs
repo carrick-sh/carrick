@@ -359,14 +359,7 @@ fn resident_signal_work_return(
             );
         }
         let result = entry.begin_service(operation, None);
-        let result = entry.settle_service_exit(
-            result,
-            if crossing {
-                crate::native_process_runtime::NativeServiceExit::Bridge
-            } else {
-                crate::native_process_runtime::NativeServiceExit::CarrierWork
-            },
-        );
+        let result = entry.settle_service_exit(result);
         let result =
             crate::dispatch::native_service_completion(result, entry.native_service_phase())
                 .unwrap();
