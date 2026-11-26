@@ -1185,25 +1185,29 @@ fn supply_user_fault(
         // its grant to a sibling's copy-on-write, which made progress with
         // it, and asks again (#2749).
         OwnerFaultSupplyOutcome::CowSelected => loop {
+            let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
+                return UserFaultSupply::Unresolved(9);
+            };
+            // The lane leases the selection it published: only the carrier's
+            // exact take ends the lease; dropping it withdraws the selection.
+            let Some(lease) = grant_slot.adopt_cow_selection(mm_key, fault.address.raw()) else {
+                return UserFaultSupply::Unresolved(9);
+            };
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
-            let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
-                return UserFaultSupply::Unresolved(9);
-            };
-            // The carrier met this MM's editor held on the other CPU and
-            // supplied nothing: the selection is still this CPU's. Withdraw
-            // it and park on that editor's release.
-            if let Some((_, unserved)) =
-                grant_slot.pending_cow_fault_selection(mm_key, fault.address.raw())
-            {
-                if !grant_slot.take_cow_fault_selection(unserved) {
-                    return UserFaultSupply::Unresolved(9);
+            match lease.settle() {
+                carrick_el1_abi::CowSettlement::Taken => {}
+                // The carrier met this MM's editor held on the other CPU and
+                // supplied nothing. Dropping the lease withdraws the
+                // selection; park on that editor's release.
+                carrick_el1_abi::CowSettlement::Unserved(_) => {
+                    return UserFaultSupply::MmRelease(
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                    );
                 }
-                return UserFaultSupply::MmRelease(
-                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
-                );
+                carrick_el1_abi::CowSettlement::Lost => return UserFaultSupply::Unresolved(9),
             }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_supply();
