@@ -90,9 +90,9 @@ Docker oracle. The scoreboard is the fast smoke check.
   independent review and the signed gate.
 - **One lane.** Logic lives in ISA-neutral crates. Per-arch code holds only
   ISA mechanics: register frames, trap and IRQ entry, page-table formats. x86
-  may land first; the other ISA's compile fixes follow as a tracked `seam`
-  issue. A gap in neutral logic is a P0 for that PR. Ring-first and
-  correctness are unchanged (owner, 2026-11-26, #231 comment 7198282621).
+  may land first; the other ISA mostly follows as compile fixes, tracked as a
+  `seam` issue. A gap in neutral logic is a P0. Ring-first and correctness
+  are unchanged (owner, 2026-11-26, #231 comment 7198282621).
 - **Fix in shared layers; move code, never copy it.** Ring ports go through the
   shared `no_std` `*-core` crates. Search before writing: a second
   implementation drifts.
