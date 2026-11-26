@@ -272,6 +272,18 @@ impl GuestVmBackend for KvmAarch64Vmm {
 }
 
 impl Aarch64Vmm for KvmAarch64Vmm {
+    /// KVM AArch64 has no owner frame-grant custody: a lazy file grant
+    /// reaching it fails the run, never a declined fault and a wrong signal.
+    fn prepare_owner_frame_grant(
+        &self,
+        _target: carrick_aarch64::user_transfer::TransferTarget,
+        _window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
+        Err(TrapError::Hypervisor(
+            "KVM AArch64 does not serve lazy owner file grants".to_owned(),
+        ))
+    }
+
     /// KVM keeps no per-frame cleanliness: every executable publication
     /// invalidates its frame.
     fn publish_user_executable(
