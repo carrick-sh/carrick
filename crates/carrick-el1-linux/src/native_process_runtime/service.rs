@@ -1256,34 +1256,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     /// Settle every native service exit, on every ISA, after preparation
-    /// unwinds. Contention is "not now" (#2306) by construction: the
-    /// result's error type, [`NativeFailure`], cannot carry it. A retained
-    /// IPC operation leaves with its owner through the service checkpoint,
-    /// which reselects its preparation; with nothing retained, the member
-    /// leaves through the owner checkpoint, whose next entry reruns the call
-    /// from its saved syscall.
+    /// unwinds. A retained IPC operation leaves with its owner through the
+    /// service checkpoint on contention ("not now", #2306), which reselects
+    /// its preparation. With nothing retained the result is the exit's own,
+    /// unchanged: an owner checkpoint with no pending row resumes as
+    /// `NoPending` and would return to user space without running the call.
     #[inline(never)]
     pub(crate) fn settle_service_exit(
         &mut self,
         result: Result<NativeResume, NativeProcessError>,
-    ) -> Result<NativeResume, NativeFailure> {
+    ) -> Result<NativeResume, NativeProcessError> {
         // Preserve the owner of a refused operation. A later refusal while
         // folding a non-stale result belongs to settlement itself.
         if !matches!(&result, Err(NativeProcessError::Stale)) {
             self.service_phase = NativeServicePhase::Settlement;
         }
         if !self.retains_ipc_operation() {
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    return match error.failure() {
-                        Ok(failure) => Err(failure),
-                        Err(_) => self.yield_owner_checkpoint(OwnerEntry::Syscall),
-                    };
-                }
-            };
+            let result = result?;
             if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-                return Err(NativeFailure::ServiceQuarantined(
+                return Err(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::HandoffAuthentication,
                 ));
             }
@@ -1301,11 +1292,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | NativeProcessError::Stale
                 | NativeProcessError::Quarantined
                 | NativeProcessError::ServiceQuarantined(_)),
-            ) => {
-                return Err(error.failure().unwrap_or(NativeFailure::Invalid));
-            }
+            ) => return Err(error),
             // The wrapper was decoded above; another wrapper is a codec invariant.
-            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeFailure::Invalid),
+            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
             Err(
                 NativeProcessError::Busy
                 | NativeProcessError::Exhausted
@@ -1332,7 +1321,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // deferred preparation is not failed execution authentication.
             let result = self.yield_service_checkpoint()?;
             self.take_handoff_receipt()
-                .ok_or(NativeFailure::ServiceQuarantined(
+                .ok_or(NativeProcessError::ServiceQuarantined(
                     NativeServiceQuarantine::HandoffAuthentication,
                 ))?;
             return Ok(result);
@@ -1346,12 +1335,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn retire_adapter_failure(
         &mut self,
         failure: NativeFailure,
-    ) -> Result<NativeResume, NativeFailure> {
+    ) -> Result<NativeResume, NativeProcessError> {
         self.adapter_ready = None;
-        let answer = self
-            .retire_adapter_result(SyscallResult::new(failure.errno()))
-            // Retirement refuses only with a broken invariant, never contention.
-            .map_err(|error| error.failure().unwrap_or(NativeFailure::Invalid))?;
+        let answer = self.retire_adapter_result(SyscallResult::new(failure.errno()))?;
         if let Some(saved) = self.control.take_forwarded_wait_mask() {
             self.control.init_blocked(saved);
         }
@@ -1772,7 +1758,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         payload: Box<[u8]>,
         table: Option<[u64; 3]>,
         call: NativeServiceCall<'_>,
-    ) -> Result<NativeResume, NativeFailure> {
+    ) -> Result<NativeResume, NativeProcessError> {
         let result = if self.host_root_retains_filesystem() {
             match carrick_core_abi::service::ExecPayloadView::parse(&payload) {
                 Ok(view) if view.access().is_none() => self.publish_exec(payload, call),
@@ -1980,7 +1966,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
         call: NativeServiceCall<'a>,
-    ) -> Result<NativeResume, NativeFailure> {
+    ) -> Result<NativeResume, NativeProcessError> {
         let result = if self.host_root_retains_filesystem() {
             self.begin_root_host_file(record, output, map, chdir, call)
         } else {
@@ -2247,7 +2233,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn begin_entropy_call(
         &mut self,
         args: NativeEntropyArgs,
-    ) -> Result<NativeResume, NativeFailure> {
+    ) -> Result<NativeResume, NativeProcessError> {
         let (address, capacity, flags, requested) = native_entropy_stage(args);
         let result = self.begin_entropy_service(address, capacity, flags, requested);
         let result = self.drain_copyout(result);

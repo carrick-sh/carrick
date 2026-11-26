@@ -402,9 +402,7 @@ fn fork_child_service_ack(
                         Box::leak(Box::new(carrick_el1_abi::Counters::new())),
                     ),
                 );
-                entry
-                    .settle_service_exit(result)
-                    .map_err(super::super::native_process_runtime::NativeProcessError::from)
+                entry.settle_service_exit(result)
             } else {
                 let result = entry.begin_service(
                     carrick_core_abi::service::ServiceOperation::CarrierWork {

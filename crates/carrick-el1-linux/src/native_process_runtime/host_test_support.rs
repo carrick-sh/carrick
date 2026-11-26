@@ -2649,7 +2649,7 @@ fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
         assert!(
             matches!(
                 entry.settle_service_exit(result),
-                Err(NativeFailure::ServiceQuarantined(reason)) if reason == expected
+                Err(NativeProcessError::ServiceQuarantined(reason)) if reason == expected
             ),
             "duplicate custody must report its exact site (notice={occupied_notice})"
         );
@@ -9641,7 +9641,7 @@ fn retained_ipc_supply_for<
         if let AdapterRefusal::Invariant(error) = refusal {
             assert!(matches!(
                 entry.settle_service_exit(Err(error)),
-                Err(observed) if NativeProcessError::from(observed) == error
+                Err(observed) if observed == error
             ));
             assert_eq!(entry.adapter_ready.as_ref().unwrap().identity, identity);
             assert!(entry.take_handoff_receipt().is_none());
@@ -10358,9 +10358,15 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
         .unwrap();
     assert!(matches!(
         entry.settle_service_exit(Ok(NativeResume::Left(None))),
-        Err(NativeFailure::ServiceQuarantined(
+        Err(NativeProcessError::ServiceQuarantined(
             NativeServiceQuarantine::HandoffAuthentication
         ))
+    ));
+    // Nothing is retained: contention stays the exit's own result. An
+    // owner checkpoint here would resume as `NoPending` and skip the call.
+    assert!(matches!(
+        entry.settle_service_exit(Err(NativeProcessError::Busy)),
+        Err(NativeProcessError::Busy)
     ));
 }
 
