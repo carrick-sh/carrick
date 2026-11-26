@@ -4747,6 +4747,32 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
     );
 }
 
+/// #3042: a native fork child's two live threads `read(2)` into one
+/// copy-on-write page at once, so the kernel's copy is the page's first write
+/// in the child and the user-copy supply serves the fork child's own COW
+/// stock. Both reads land, the rest of the child's page is the parent's, and
+/// the parent's page is unchanged. The ARM half of this witness is the
+/// signed `cow_read_threads` case in `carrick-conformance-next`; x86's
+/// synchronous supply has served fork children since 0cb5d4db9, so this is
+/// the one-lane parity witness.
+#[test]
+fn production_fork_child_threads_read_into_one_copy_on_write_page() {
+    let elf = native_exit_fixture("native_fork_child_threads_read_cow.S");
+    assert_eq!(
+        native_oracle_status(&elf),
+        Some(7),
+        "native Linux oracle (see native_fork_child_threads_read_cow.S)"
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_ANY)
+        .expect("fork child threads read into one COW page run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "first step that differs from Linux (see native_fork_child_threads_read_cow.S): {:?}",
+        outcome.run
+    );
+}
+
 /// #2749: a copy-on-write replacement grant is the MM's, in its pool: any
 /// member of the MM may claim one that is ready. The x86 host kept each
 /// supplied grant as pending on the CPU that asked for it, for that CPU's
