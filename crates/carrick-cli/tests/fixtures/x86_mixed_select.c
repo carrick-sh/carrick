@@ -18,7 +18,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -78,6 +77,24 @@ static void poll_sets(const char *name, int nfds, const int *reads, int nreads, 
     printf("\n");
 }
 
+// One raw select(2) with a zero timeval: prints the result and how many of
+// the named descriptors are left in each set (descriptor numbers differ
+// between the oracle and a run, counts do not).
+static void count_sets(const char *name, int nfds, const int *reads, int nreads,
+                       const int *writes, int nwrites) {
+    fd_set r, w;
+    FD_ZERO(&r);
+    FD_ZERO(&w);
+    for (int i = 0; i < nreads; i++) FD_SET(reads[i], &r);
+    for (int i = 0; i < nwrites; i++) FD_SET(writes[i], &w);
+    struct timeval zero = {0, 0};
+    long ret = call(syscall(SYS_select, nfds, &r, &w, NULL, &zero));
+    int nr = 0, nw = 0;
+    for (int i = 0; ret >= 0 && i < nreads; i++) nr += FD_ISSET(reads[i], &r) != 0;
+    for (int i = 0; ret >= 0 && i < nwrites; i++) nw += FD_ISSET(writes[i], &w) != 0;
+    printf("%s.%s %ld r=%d/%d w=%d/%d\n", who, name, ret, nr, nreads, nw, nwrites);
+}
+
 // One raw pselect6 over `nfds` descriptors with a read set, a write set,
 // a timeout in milliseconds (-1: none) and an optional signal mask. Prints
 // the result and the descriptors left in each set.
@@ -112,27 +129,6 @@ static void drain(int fd, const char *name) {
 }
 
 static void tell(int sock, char step) { (void)syscall(SYS_write, sock, &step, 1); }
-
-// Whether `pid` is asleep (state S in `/proc/<pid>/stat`), read until it
-// is; 1 once seen. The state is the child's own: it changes when the child
-// parks, so each read observes an event, not the passage of time. Bounded
-// so a broken stat fails the row (0) instead of hanging it.
-static long asleep(pid_t pid) {
-    char path[64], buf[256];
-    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
-    for (long i = 0; i < 10000000; i++) {
-        int fd = (int)syscall(SYS_open, path, O_RDONLY);
-        if (fd < 0) return -errno;
-        long n = syscall(SYS_read, fd, buf, sizeof buf - 1);
-        close(fd);
-        if (n <= 0) return -1;
-        buf[n] = 0;
-        const char *paren = strrchr(buf, ')');
-        if (paren && paren[1] == ' ' && paren[2] == 'S') return 1;
-        sched_yield();
-    }
-    return 0;
-}
 
 // Connections the forty-socket row adds beside fd 3.
 #define MANY 39
@@ -170,25 +166,35 @@ static void child(void) {
     const int with_file[] = {0, 3, 10};
     poll_sets("file.mixed", 11, with_file, 3, with_file + 2, 1);
 
-    // A pselect6 mask that blocks SIGUSR1, which the thread's own mask
-    // does not: the root signals the child during the wait, then writes
-    // the pipe. Only the call's mask keeps the wait from being interrupted
-    // (EINTR, had it been ignored); the signal is delivered as the call
-    // returns, once the thread's mask is back. The root signals only once
-    // it has seen this child asleep (`/proc/<pid>/stat` state S) after the
-    // 'm' byte: nothing between that byte and the wait can sleep, so the
-    // signal arrives inside pselect6, never before it.
-    sigset_t block;
+    // The call's signal mask, ordered on events, never on timing: the
+    // thread blocks SIGUSR1, and the root signals the child and writes the
+    // pipe before it acknowledges the 'm' byte, so SIGUSR1 is pending
+    // before either call below. A pselect6 mask that also blocks it waits
+    // as if it were not there: the pipe answers, and nothing is delivered.
+    // Once the pipe is drained, an empty pselect6 mask unblocks it for the
+    // call alone: the call is interrupted (EINTR) and the handler runs
+    // inside it, and the thread's own mask is back on the return (SIGUSR1
+    // blocked again).
+    sigset_t block, none, now;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
+    sigemptyset(&none);
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = on_usr1;
     value("sigaction", sigaction(SIGUSR1, &action, NULL));
+    value("sigblock", sigprocmask(SIG_BLOCK, &block, NULL));
     tell(3, 'm');
+    char ack;
+    value("masked.ack", syscall(SYS_read, 3, &ack, 1));
     wait_sets("masked", 4, both, 2, NULL, 0, 5000, &block);
     printf("%s.masked.delivered %d\n", who, (int)delivered);
     drain(0, "masked.read");
+    // Nothing is ready now, so only the signal can end the next wait.
+    wait_sets("unmasked", 4, both, 2, NULL, 0, 5000, &none);
+    printf("%s.unmasked.delivered %d\n", who, (int)delivered);
+    value("sigmask.query", sigprocmask(SIG_BLOCK, NULL, &now));
+    printf("%s.unmasked.restored %d\n", who, sigismember(&now, SIGUSR1));
 
     // Forty carrier sockets in one set (#1051): fd 3 and MANY more
     // connections, every one writable at once; then, once the root has
@@ -206,10 +212,10 @@ static void child(void) {
         }
     }
     int nmany = many[MANY] + 1;
-    poll_sets("many.write", nmany, NULL, 0, many, MANY + 1);
+    count_sets("many.write", nmany, NULL, 0, many, MANY + 1);
     char done;
     value("many.done", syscall(SYS_read, 3, &done, 1));
-    poll_sets("many.read", nmany, many + 1, MANY, NULL, 0);
+    count_sets("many.read", nmany, many + 1, MANY, NULL, 0);
 }
 
 int main(int argc, char **argv) {
@@ -277,9 +283,9 @@ int main(int argc, char **argv) {
             record("both.socket", syscall(SYS_write, peer, &byte, 1));
             break;
         case 'm':
-            record("masked.asleep", asleep(pid));
             record("kill", syscall(SYS_kill, pid, SIGUSR1));
             record("masked.pipe", syscall(SYS_write, pipe_fds[1], &byte, 1));
+            record("masked.ack", syscall(SYS_write, peer, &byte, 1));
             break;
         case 'n': {
             long sent = 0;
