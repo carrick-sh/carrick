@@ -2714,42 +2714,51 @@ fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
             &mut resume_service,
         )
         .unwrap();
-    let resume = resumed.resume_checkpoint(|_| Ok(None));
-    assert!(
-        resume.is_ok(),
-        "the cancelled supply leaves through the owner checkpoint: {:?}",
-        resume.as_ref().err()
-    );
-    assert!(resumed.take_run_failure().is_none());
-    assert!(
-        slot.publish_fault_selection(4, next_window),
-        "cancelled supply must withdraw the unpublished selection"
-    );
-    assert!(!fixture.runtime.graph.lock().pending.has_exit(&member_key));
-
-    // The sibling's next production signal checkpoint. SIGKILL must win: the
+    // The carrier drains the host work SIGKILL's publication owed, then the
+    // lane resumes the member through its production checkpoint, with the
+    // ISA's signal checkpoint (the same closure shape as x86's
+    // `native_execution`). The cancelled supply is consumed (the selection is
+    // withdrawn), then the signal checkpoint runs. SIGKILL must win: the
     // retained SIGURG delivery is void, the fresh selection dequeues SIGKILL
     // and the group's exit is pending. Replaying the retained delivery
     // instead skips SIGKILL and re-enters the same frame supply, which the
     // cancellation discards again on every round.
-    assert!(resumed.signal_checkpoint_needed());
-    // The carrier drains the work SIGKILL's publication and the supply
-    // completion owed it, then re-enters the member's checkpoint.
     if let Some(doorbell) = sibling.task.linux.take_host_work_doorbell() {
         doorbell.settled();
     }
+    let mut route = None;
+    let mut checkpoint_ran = false;
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-    let mut machine = HostArmSignalMachine {
-        backend: HostArmBackend,
-    };
-    let route = crate::signal_delivery::deliver_signal_on_syscall_return(
-        sibling.task,
-        sibling.control,
-        &mut resumed,
-        &mut frame,
-        zerocopy::IntoBytes::as_bytes(&fp),
-        &mut machine,
+    let resume = resumed.resume_checkpoint(|entry| {
+        checkpoint_ran = true;
+        assert!(entry.signal_checkpoint_needed());
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let mut machine = HostArmSignalMachine {
+            backend: HostArmBackend,
+        };
+        route = crate::signal_delivery::deliver_signal_on_syscall_return(
+            sibling.task,
+            sibling.control,
+            entry,
+            &mut frame,
+            zerocopy::IntoBytes::as_bytes(&fp),
+            &mut machine,
+        );
+        Ok(match route {
+            None => None,
+            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
+                Some(NativeResume::Left(entry.take_root_exit()))
+            }
+            Some(_) => Some(NativeResume::Invalid),
+        })
+    });
+    assert!(
+        checkpoint_ran,
+        "the resumed member must reach its signal checkpoint"
+    );
+    assert!(
+        slot.publish_fault_selection(4, next_window),
+        "cancelled supply must withdraw the unpublished selection"
     );
     assert_ne!(
         frame.elr, 0x2000,
@@ -2761,6 +2770,17 @@ fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
          publish the group's exit, not replay the retained delivery and \
          re-request its frame supply: {route:?}"
     );
+    assert_eq!(
+        route,
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended),
+        "SIGKILL's exit leaves through the terminal checkpoint"
+    );
+    assert!(
+        matches!(resume, Ok(NativeResume::Left(None))),
+        "the dying member leaves its lane: {:?}",
+        resume.as_ref().err()
+    );
+    assert!(resumed.take_run_failure().is_none());
 }
 
 #[test]
