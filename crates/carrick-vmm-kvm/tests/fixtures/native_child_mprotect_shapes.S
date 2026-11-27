@@ -29,6 +29,8 @@
  *     range, then the read of page 0 must fault
  *   18 as 14 with no mprotect: munmap of the sparse range returns 0, and the
  *     read of page 2 (the second resident run, past the hole) then faults
+ *   19 as 14, then mprotect(PROT_READ|PROT_WRITE) over the whole range: pages
+ *     0, 1 (the hole) and 2 take a write and read it back, then munmap
  *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
  *     forks. The child widens it back to RW and writes it; the parent, after
  *     the child exits, still reads its own byte (99 if the child's write
@@ -81,7 +83,7 @@
 .global _start
 .text
 _start:
-#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18
+#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18 || CASE == 19
     jmp child               /* the run root itself, no fork */
 #endif
 #if CASE == 21
@@ -182,6 +184,18 @@ child:
     cmpb $0xa5, 8192(%r15)
     jne bad
     cmpb $0, 4096(%r15)     /* the hole reads zero */
+    jne bad
+#endif
+#if CASE == 19
+    MPROTECT %r15, $SPARSE_LEN, $3  /* widen back to RW over the sparse range */
+    movb $0x5a, (%r15)
+    movb $0x5a, 4096(%r15)
+    movb $0x5a, 8192(%r15)
+    cmpb $0x5a, (%r15)
+    jne bad
+    cmpb $0x5a, 4096(%r15)
+    jne bad
+    cmpb $0x5a, 8192(%r15)
     jne bad
 #endif
     mov %r15, %rdi          /* munmap(base, SPARSE_LEN) */
