@@ -190,6 +190,19 @@ impl ProductionMemberCpu for KvmMember<'_> {
     fn stopped(&self) -> Result<StoppedCpu, TrapError> {
         stopped_cpu(self.cpu)
     }
+    fn end_user_interrupt_shadow(&mut self) -> Result<(), TrapError> {
+        let mut events = self
+            .cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        events.interrupt.shadow = 0;
+        events.flags |= kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW;
+        self.cpu
+            .fd()
+            .set_vcpu_events(&events)
+            .map_err(|e| fail(format!("KVM_SET_VCPU_EVENTS end shadow: {e}")))
+    }
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError> {
         let lapic = self.cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
         let apic_id = u32::from_le_bytes([

@@ -129,6 +129,11 @@ impl ProductionMemberCpu for SoftCpuBackend {
         ))
     }
 
+    fn end_user_interrupt_shadow(&mut self) -> Result<(), TrapError> {
+        self.runner.machine_mut().context_mut().interrupt_shadow = false;
+        Ok(())
+    }
+
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError> {
         self.runner
             .machine_mut()

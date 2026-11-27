@@ -9520,8 +9520,8 @@ pub enum StoppedCpu {
     /// instruction runs, and a KICK queued behind it is taken no later than
     /// the IRET back to user mode.
     UserEventPending { event: PendingEvent, rip: u64 },
-    /// CPL3 in an STI or MOV SS interrupt shadow: the shadowed instruction
-    /// retires, then the CPU is interruptible and takes a queued KICK.
+    /// CPL3 in an STI or MOV SS interrupt shadow: left alone, the shadowed
+    /// user instruction retires before a queued KICK is taken.
     UserShadowed { rip: u64 },
     /// CPL3 with IF clear. Linux user code cannot mask interrupts here, so
     /// this is a broken invariant, not a stop to schedule around.
@@ -9561,6 +9561,12 @@ impl StoppedCpu {
 pub trait ProductionMemberCpu {
     /// Where the stopped CPU resumes.
     fn stopped(&self) -> Result<StoppedCpu, TrapError>;
+    /// End a stopped CPL3 CPU's interrupt shadow, so a queued KICK is taken
+    /// before the shadowed instruction. At CPL3 in long mode an interrupt
+    /// switches to the CPL0 stack and IRET restores SS:RSP exactly, so the
+    /// shadow guards nothing the user program can observe beyond the timing
+    /// of a debug trap deferred by MOV SS.
+    fn end_user_interrupt_shadow(&mut self) -> Result<(), TrapError>;
     /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
     /// reentry that follows.
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError>;
@@ -9570,6 +9576,12 @@ pub trait ProductionMemberCpu {
 /// Run one production CPU under the shared file-execution admission and the
 /// shootdown table's running/ack protocol. A CPU entering with shootdown
 /// debt is kicked so the ring settles that debt before user code resumes.
+///
+/// Debt at a stop is "not now", never a refusal: an editor's rendezvous does
+/// not wait for a stopped CPU, so the editor may already have returned and
+/// its old frames may be reused. Every stop class therefore reenters with the
+/// KICK ordered ahead of the next user instruction, and only a stop no
+/// production CPU can reach is fatal.
 pub fn run_production_member<C: ProductionMemberCpu>(
     cpu: &mut C,
     table: &ShootdownTable,
@@ -9601,15 +9613,20 @@ pub fn run_production_member<C: ProductionMemberCpu>(
     });
     if has_debt {
         match stop {
-            StoppedCpu::Kernel | StoppedCpu::UserInterruptible => {}
-            StoppedCpu::UserEventPending { .. } | StoppedCpu::UserShadowed { .. } => {
-                return Err(fail(format!(
-                    "shootdown debt requires interruptible CPL3 reentry: {stop:?}"
-                )));
-            }
+            // The ring takes the KICK at its next interruptible point, and
+            // settles debt itself before it touches user memory.
+            StoppedCpu::Kernel => {}
+            // The KICK is taken ahead of the next user instruction.
+            StoppedCpu::UserInterruptible => {}
+            // The event enters CPL0 first. The KICK waits in the local APIC
+            // behind it and is taken no later than the IRET to user mode.
+            StoppedCpu::UserEventPending { .. } => {}
+            // The shadowed user instruction would otherwise run on the stale
+            // translation; end the shadow so the KICK comes first.
+            StoppedCpu::UserShadowed { .. } => cpu.end_user_interrupt_shadow()?,
             StoppedCpu::UserInterruptsMasked { .. } | StoppedCpu::Unsupported { .. } => {
                 return Err(fail(format!(
-                    "shootdown debt on unsupported CPL reentry: {stop:?}"
+                    "shootdown debt at a stop no production CPU reaches: {stop:?}"
                 )));
             }
         }
