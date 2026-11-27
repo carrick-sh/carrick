@@ -197,7 +197,9 @@ impl ProductionMemberCpu for KvmMember<'_> {
             .get_vcpu_events()
             .map_err(|e| fail(e.to_string()))?;
         events.interrupt.shadow = 0;
-        events.flags |= kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW;
+        // Only the shadow is new: leave asynchronously updated NMI and SMI
+        // state, and the other optional fields, as KVM holds them.
+        events.flags = kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW;
         self.cpu
             .fd()
             .set_vcpu_events(&events)
@@ -1504,6 +1506,21 @@ impl Cpl0Carrier {
             .memory_mut()
             .write(FrameGpa::new(gpa), &[value])
             .map_err(|e| fail(e.to_string()))
+    }
+
+    /// Read an exact byte of a stopped fixture's retained backing.
+    pub fn fixture_read_backing_byte(&self, gpa: u64) -> Result<u8, TrapError> {
+        if !matches!(gpa, 0xd1_1000 | 0x4_0000 | 0x4_0008) {
+            return Err(fail("fixture byte outside admitted backing"));
+        }
+        let byte = self
+            .custody
+            .ram()
+            .host_ptr(gpa, 1)
+            .ok_or_else(|| fail("fixture byte outside backing"))?
+            .cast::<AtomicU8>();
+        // SAFETY: the retained RAM owns this byte; the fixture CPUs are stopped.
+        Ok(unsafe { &*byte }.load(Ordering::Acquire))
     }
 
     /// Queue the native KICK on a stopped CPL3 vCPU before its next KVM_RUN.
