@@ -459,6 +459,88 @@ fn prlimit_query(code: &mut Vec<u32>, resource: u16, old: u64) {
     code.push(mov(19, 0));
 }
 
+const NR_BRK: u16 = 214;
+
+/// C6.2.69 CMP (shifted register): `cmp xn, xm` (`xm` 31 is `xzr`).
+const fn cmp(rn: u32, rm: u32) -> u32 {
+    0xeb00_001f | (rm << 16) | (rn << 5)
+}
+
+/// C6.2.70 CSET: `cset xd, ne` (CSINC xd, xzr, xzr, eq).
+const fn cset_ne(rd: u32) -> u32 {
+    0x9a9f_07e0 | rd
+}
+
+/// Shift `bit` (0 or 1) into the low end of the x23 mismatch mask.
+fn push_mismatch(code: &mut Vec<u32>, bit: u32) {
+    code.push(add(23, 23, 23));
+    code.push(add(23, 23, bit));
+}
+
+/// The soft root's delegated break shrinks and grows again (#3118): its
+/// root decides each move, and the released page's bytes are scrubbed
+/// where they live, so the regrown page reads 0 as on Linux (brk(2)).
+/// The root grows its break 2 pages from `brk(0)`, dirties the second, shrinks
+/// it to 1 page, grows it back to 2 and loads the regrown page. Exits a
+/// mask: bit 3 the first growth, bit 2 the shrink, bit 1 the regrowth (each
+/// set iff it did not return the asked-for break), bit 0 the load (set iff
+/// it is not 0). 0 iff each move returned its break and the page reads 0.
+///
+/// Red while the soft carrier cannot scrub a delegated retirement: the
+/// shrink fails its backing maintenance and the run ends in a fatal.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_brk_shrink_scrubs_the_released_page_for_its_regrowth() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut code = Vec::new();
+    code.extend(mov32(10, 0x1000));
+    code.extend(mov32(11, 0x2000));
+    // x19 = brk(0)
+    code.push(movz(0, 0, 0));
+    code.push(movz(8, NR_BRK, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    code.push(add(12, 19, 10));
+    code.push(add(13, 19, 11));
+    // x20 = brk(x19 + 2 pages)
+    code.push(mov(0, 13));
+    code.push(movz(8, NR_BRK, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(20, 0));
+    // Dirty the second page, then x21 = brk(x19 + 1 page).
+    code.push(movz(9, 0x5a, 0));
+    code.push(str_imm(9, 12, 0));
+    code.push(mov(0, 12));
+    code.push(movz(8, NR_BRK, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(21, 0));
+    // x22 = brk(x19 + 2 pages); x24 = the regrown page's first word.
+    code.push(mov(0, 13));
+    code.push(movz(8, NR_BRK, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(22, 0));
+    code.push(ldr(24, 12, 0));
+    code.push(movz(23, 0, 0));
+    for (got, want) in [(20, 13), (21, 12), (22, 13), (24, 31)] {
+        code.push(cmp(got, want));
+        code.push(cset_ne(14));
+        push_mismatch(&mut code, 14);
+    }
+    code.push(mov(0, 23));
+    exit_with_x0(&mut code);
+    let (run, _) = run(&build_elf(&code, &[]), "/brk-shrink", None);
+    println!(
+        "brk shrink: exit={} fault={:?} census={:?} counted_enosys={:?}",
+        run.exit_code, run.terminating_fault, run.reply_census, run.counted_enosys
+    );
+    assert_eq!(run.terminating_fault, None, "every break page is served");
+    assert_eq!(run.counted_enosys, Vec::new(), "nothing is refused");
+    assert_eq!(
+        run.exit_code, 0,
+        "each break move returned its break and the regrown page reads 0"
+    );
+}
+
 /// The root's first call, `set_tid_address`, returns its own TID: the ring
 /// admits the root process owner and answers in the ring, and the TID it
 /// returns is positive and the one `gettid` reports. Exits
