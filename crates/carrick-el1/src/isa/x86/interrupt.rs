@@ -837,41 +837,100 @@ const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
 /// whose ICR is still busy is not left owed past this point, but waits
 /// for this CPU's own ICR to go idle (an ISA mechanic, how an x86 kernel
 /// sends an IPI: no software holder to enrol on, and a timer retry would
-/// be polling) and is then sent. An ICR busy past [`ICR_IDLE_BOUND_NS`] is
-/// a broken local APIC: fatal.
+/// be polling) and is then sent. An ICR that keeps failing past
+/// [`ICR_IDLE_BOUND_NS`] is a broken local APIC: fatal ([`IcrBound`]).
 pub fn deliver_owed_resched_before_user(site: UserReturn) {
-    // The bound runs from the first busy resend and restarts only when a
-    // resend makes progress: an APIC whose polls read idle while its sends
-    // stay busy still reaches it. It ends the run only on a fresh failure
-    // after it (this refused resend, or a busy poll), never on elapsed time
-    // alone: a vCPU the host descheduled past the bound finds its ICR
-    // recovered, and sends.
-    let mut since = None;
+    let mut bound = IcrBound::new(site);
     loop {
-        let resent = resend_owed();
-        if resent.progress {
+        let sent = bound.attempt(|| {
+            let resent = resend_owed();
             #[cfg(feature = "test-support")]
-            RESCHED_RESEND_SITE.store(site as u8, Ordering::Release);
-            since = None;
-        }
-        if resent.clear {
+            if resent.progress {
+                RESCHED_RESEND_SITE.store(site as u8, Ordering::Release);
+            }
+            Attempted {
+                done: resent.clear,
+                progress: resent.progress,
+            }
+        });
+        if sent {
             return;
         }
-        let start = *since.get_or_insert_with(read_tsc);
-        if icr_bound_passed(start) {
-            icr_never_accepted(site);
-        }
-        wait_icr_idle(start, site);
+        wait_icr_idle(&mut bound);
     }
 }
 
-/// Whether [`ICR_IDLE_BOUND_NS`] has passed since `start`.
-fn icr_bound_passed(start: u64) -> bool {
-    let Some(hz) = tsc_frequency() else {
-        super::fatal_entry_binding();
-    };
-    let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
-    u128::from(read_tsc().wrapping_sub(start)) > bound
+/// What one ICR operation of the last-chance wait did.
+struct Attempted {
+    /// It succeeded: nothing is owed any more, or the ICR read idle.
+    done: bool,
+    /// It sent at least one owed IPI.
+    progress: bool,
+}
+
+/// The last-chance wait's bound (#3083). It judges each ICR operation
+/// (a resend pass, an idle-ICR poll) only by the TSC read, ordered, right
+/// before that operation started, never by the time after it: a failure
+/// whose operation started inside the bound is retried however long the
+/// host then descheduled the vCPU, so only a fresh failure that started
+/// past the bound is a broken APIC. The bound runs from the first
+/// operation that failed and restarts only on progress: an APIC whose
+/// polls read idle while its sends stay busy still reaches it.
+struct IcrBound {
+    /// When the first failed operation since the last progress started.
+    since: Option<u64>,
+    /// [`ICR_IDLE_BOUND_NS`] in TSC ticks.
+    ticks: u128,
+    at: UserReturn,
+}
+
+impl IcrBound {
+    fn new(at: UserReturn) -> Self {
+        let Some(hz) = tsc_frequency() else {
+            super::fatal_entry_binding();
+        };
+        Self {
+            since: None,
+            ticks: u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000,
+            at,
+        }
+    }
+
+    /// Run one ICR operation: true when it succeeded. A failure of an
+    /// operation that started past the bound ends the run.
+    fn attempt(&mut self, op: impl FnOnce() -> Attempted) -> bool {
+        let started = read_tsc_ordered();
+        let Attempted { done, progress } = op();
+        if progress {
+            self.since = None;
+        }
+        if done {
+            return true;
+        }
+        let since = *self.since.get_or_insert(started);
+        if u128::from(started.wrapping_sub(since)) > self.ticks {
+            icr_never_accepted(self.at);
+        }
+        false
+    }
+}
+
+/// RDTSC ordered with the ICR operation after it: the LFENCE before waits
+/// for every earlier instruction to complete locally, and the one after
+/// keeps later instructions, the ICR access among them, from starting
+/// before the read (Intel SDM Vol. 2B, RDTSC). Not `nomem`: the compiler
+/// keeps memory accesses on their side too.
+fn read_tsc_ordered() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: LFENCE and RDTSC read this admitted CPU's monotonic counter
+    // only.
+    unsafe {
+        core::arch::asm!(
+            "lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi,
+            options(nostack, preserves_flags)
+        );
+    }
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// The local APIC broke the ICR handshake before the return to user `at`.
@@ -914,20 +973,15 @@ pub enum UserReturn {
     Interrupt = 4,
 }
 
-/// Wait for this CPU's own ICR to read idle. A poll that still reads busy
-/// once [`ICR_IDLE_BOUND_NS`] has passed since `start` (the first resend
-/// that sent nothing) is a broken local APIC, before the return to user
-/// `at`; a poll that reads idle returns, however late it ran.
-fn wait_icr_idle(start: u64, at: UserReturn) {
+/// Wait for this CPU's own ICR to read idle, each poll judged by
+/// `bound` ([`IcrBound::attempt`]).
+fn wait_icr_idle(bound: &mut IcrBound) {
     #[cfg(feature = "test-support")]
     injected_stall(ReschedStall::BeforePoll);
-    loop {
-        if !icr_poll_busy() {
-            return;
-        }
-        if icr_bound_passed(start) {
-            icr_never_accepted(at);
-        }
+    while !bound.attempt(|| Attempted {
+        done: !icr_poll_busy(),
+        progress: false,
+    }) {
         core::hint::spin_loop();
     }
 }
