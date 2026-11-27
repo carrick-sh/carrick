@@ -952,7 +952,7 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
-        let Some(zone) = &self.zone else {
+        let Some(zone) = &mut self.zone else {
             return false;
         };
         let Some(slot) = self.frame.slot() else {
@@ -961,6 +961,7 @@ impl<
         if zone.tables.live(record).is_none() {
             return false;
         }
+        let passes = carrick_sched_core::OwedPasses::new();
         self.handoff = retirement
             .retire_current(
                 carrick_core::entry::binding(&task.execution, &task.mm),
@@ -969,8 +970,13 @@ impl<
                     slot,
                 },
                 record.id,
+                &passes,
             )
             .ok();
+        // The retirement's releases owe idle scans their passes; this vCPU's
+        // scheduler sends them.
+        crate::dispatch::native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+            .send_owed_passes(passes);
         #[cfg(test)]
         if self.handoff.is_some() {
             let page_address =

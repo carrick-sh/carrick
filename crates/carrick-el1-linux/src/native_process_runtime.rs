@@ -920,6 +920,15 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         }
     }
     fn wake_effects(&mut self, effects: WakeEffects);
+    /// Send the idle-scan passes a lock-taking zone operation owed (#3083)
+    /// through [`Self::wake_effects`], the image's SGI or IPI venue.
+    fn send_owed_passes(&mut self, passes: carrick_sched_core::OwedPasses) {
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        if effects.sgi.iter().any(|word| *word != 0) {
+            self.wake_effects(effects);
+        }
+    }
     /// A guest drain opened ingress capacity for an owned host admission.
     fn request_ingress_producer_boundary(&mut self);
     /// Plain fork copies descriptors into a graph-issued table identity.
@@ -5777,7 +5786,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
         {
-            self.handoff = carrick_core::entry::retire_current(self.binding, self.source, record);
+            self.handoff = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed =
+                    carrick_core::entry::retire_current(self.binding, self.source, record, &passes);
+                self.service.send_owed_passes(passes);
+                owed
+            };
         }
         // No graph exit or MM retirement is claimed. Even if lane retirement
         // refuses, the authenticated carrier report stops this incomplete run.
@@ -6758,11 +6773,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 deadline,
             }),
         );
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             zone.cancel_timer_admission(self.record);
@@ -7116,11 +7137,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .pending
             .insert_child_wait(self.key, owner, continuation);
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
@@ -7163,7 +7190,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<(), NativeFailure> {
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
             .ok_or(NativeFailure::Stale)?;
-        let requeue = self.source.zone.requeue_preempted(self.source.slot, record);
+        let requeue = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if !requeue.is_queued() {
             return Err(NativeFailure::Quarantined);
         }
@@ -7380,11 +7415,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }),
         );
         drop(graph);
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             zone.cancel_timer_admission(self.record);
@@ -7762,12 +7803,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(crate) fn yield_terminal_host_custody(
         &mut self,
     ) -> Result<(), carrick_core::entry::HostYieldRefusal> {
-        let receipt = carrick_core::entry::yield_current_to_host(
-            self.binding,
-            self.source,
-            self.record.id,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-        )?;
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::yield_current_to_host(
+                self.binding,
+                self.source,
+                self.record.id,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        }?;
         self.handoff = Some(receipt);
         self.current.linux.mark_pending_host_work();
         Ok(())
@@ -7917,11 +7964,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // passes user-return gates that must not deliver a signal.
             graph.member_wait_state(self.record).raw_exit = true;
         }
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
@@ -8233,15 +8286,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(_) => return Err(NativeFailure::Quarantined),
         };
         self.service.vacate_terminal_space(self.source)?;
-        let receipt = custody
-            .retire_zone_current(
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = custody.retire_zone_current(
                 self.control,
                 &mut membership,
                 self.binding,
                 self.source,
                 self.record.id,
-            )
-            .map_err(|_| NativeFailure::Quarantined)?;
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .map_err(|_| NativeFailure::Quarantined)?;
         self.service.release_terminal_space(self.source);
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
@@ -8355,12 +8413,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unsafe {
                 *record.ctx_mut() = *self.words;
             }
-            self.handoff = carrick_core::entry::yield_current_to_host(
-                self.binding,
-                self.source,
-                self.record.id,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-            )
+            self.handoff = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::entry::yield_current_to_host(
+                    self.binding,
+                    self.source,
+                    self.record.id,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &passes,
+                );
+                self.service.send_owed_passes(passes);
+                owed
+            }
             .ok();
             if self.take_handoff_receipt().is_none() {
                 return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
@@ -8508,14 +8574,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // An adopted host member has no pool entry to retire in the
                 // ring. Its cancelled fault has completed, but its exact host
                 // terminal owner still owes Kernel thread retirement.
-                self.handoff = carrick_core::entry::yield_current_to_host(
-                    self.binding,
-                    self.source,
-                    self.record.id,
-                    &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    },
-                )
+                self.handoff = {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = carrick_core::entry::yield_current_to_host(
+                        self.binding,
+                        self.source,
+                        self.record.id,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
+                        &passes,
+                    );
+                    self.service.send_owed_passes(passes);
+                    owed
+                }
                 .ok();
                 if self.take_handoff_receipt().is_none() {
                     return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
@@ -8576,13 +8648,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // The host may still own this live member. Keep its installed
             // translation until the neutral owner licenses exact release;
             // then detach before the retirement receipt becomes visible.
-            match carrick_core::terminal::settle_losing_zone_current_before_release(
-                self.control,
-                self.binding,
-                self.source,
-                record,
-                || self.service.vacate_terminal_space(self.source),
-            )?
+            match {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::terminal::settle_losing_zone_current_before_release(
+                    self.control,
+                    self.binding,
+                    self.source,
+                    record,
+                    || self.service.vacate_terminal_space(self.source),
+                    &passes,
+                );
+                self.service.send_owed_passes(passes);
+                owed
+            }?
             .ok_or(NativeFailure::Quarantined)?
             {
                 carrick_core::terminal::LosingMemberSettlement::HostCustody => {
@@ -8617,8 +8695,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record).publish_owner_continuation(entry);
         }
         let sequence = carrick_el1_abi::EntryRecordGeneration(sequence);
-        let receipt = carrick_core::terminal::park_process_exit(start, &guard, sequence)
-            .ok_or(NativeFailure::Quarantined)?;
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::terminal::park_process_exit(start, &guard, sequence, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .ok_or(NativeFailure::Quarantined)?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -9300,8 +9383,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
             .ok_or(NativeFailure::Quarantined)?;
-        self.handoff =
-            settled.retire_caller_zone_current(self.control, self.binding, self.source, record);
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = settled.retire_caller_zone_current(
+                self.control,
+                self.binding,
+                self.source,
+                record,
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if self.handoff.is_none() {
             return Err(NativeFailure::Quarantined);
         }
@@ -9315,19 +9408,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .effects
             .cancel_members(|member| {
                 if member.zone.live(member.record).is_some() {
-                    let _ = member.zone.claim_for_host(
-                        member.record,
-                        None,
-                        Handback::Cancelled,
-                        &NativeBucketWait {
-                            lifetime: core::marker::PhantomData,
-                            #[cfg(test)]
-                            probe: self.publication_wait_probe,
-                        },
-                        &|owned| {
-                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        },
-                    );
+                    let _ = {
+                        let passes = carrick_sched_core::OwedPasses::new();
+                        let owed = member.zone.claim_for_host(
+                            member.record,
+                            None,
+                            Handback::Cancelled,
+                            &NativeBucketWait {
+                                lifetime: core::marker::PhantomData,
+                                #[cfg(test)]
+                                probe: self.publication_wait_probe,
+                            },
+                            &|owned| {
+                                crate::sched::object_wait::deliver_host_completion(
+                                    owned.zone(),
+                                    owned,
+                                )
+                            },
+                            &passes,
+                        );
+                        self.service.send_owed_passes(passes);
+                        owed
+                    };
                 }
             })
             .map_err(|_| NativeFailure::Quarantined)?;
@@ -10236,11 +10338,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         // The child's only owner is this queue entry: a refusal would leave
         // the published child on no run queue (#1100).
-        if !self
-            .source
-            .zone
-            .requeue_preempted(self.source.slot, record)
-            .is_queued()
+        if !{
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .is_queued()
         {
             unrow(self.runtime);
             return Err(NativeProcessError::ServiceQuarantined(
@@ -10699,10 +10806,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             }
             Err(_) => return BornEnqueue::Refused,
         }
-        let queued = self
-            .source
-            .zone
-            .requeue_preempted(self.source.slot, record.id);
+        let queued = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record.id, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if queued.is_queued() {
             self.service.wake_effects(WakeEffects {
                 queued_own: true,
@@ -10723,7 +10835,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         unsafe {
             *zone.record(record).ctx_mut() = self.words.with_syscall_return(0);
         }
-        let requeue = zone.requeue_preempted(slot, record);
+        let requeue = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = zone.requeue_preempted(slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         let Some(receipt) = carrick_core::entry::publish_handoff_yield(start, requeue) else {
             return Some(self.run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale));
         };
@@ -10766,9 +10883,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             self.run_failure = Some(error.run_failure_reason().at_caller());
             return false;
         }
-        self.handoff = retirement
-            .retire_current(self.binding, self.source, record.id)
-            .ok();
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = retirement.retire_current(self.binding, self.source, record.id, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .ok();
         if self.handoff.is_some() {
             self.service.release_terminal_space(self.source);
         }
