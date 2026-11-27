@@ -27,6 +27,12 @@ pub const PRIVATE: u64 = 1 << 52;
 pub const MAY_EXEC: u64 = 1 << 53;
 /// Invalid terminal retaining the old output until owner scrub settles it.
 pub const RETIRED: u64 = 1 << 8;
+/// A private leaf whose mapping is `PROT_NONE` (#2875). The entry is not
+/// present, so no CPL may reach the frame, but it keeps the frame and every
+/// other bit: a resident page stays resident (its bytes come back when the
+/// mapping is widened again) and a prepared page stays prepared. Only an
+/// owner `Protect` sets or clears it; a `Publish` never reveals it.
+pub const NO_ACCESS: u64 = 1 << 54;
 pub const NX: u64 = 1 << 63;
 pub const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
@@ -91,6 +97,12 @@ pub enum DescriptorOp {
         /// reservation owner proved mapped, or refuses the edit (#3073).
         absent: carrick_guest_arch::AbsentLeaves,
     },
+    /// mprotect(2) to `PROT_NONE` over private custody (#2875): every leaf
+    /// becomes [`NO_ACCESS`] and keeps its frame. `Protect` widens it back.
+    ProtectNone {
+        span: PageSpan,
+        absent: carrick_guest_arch::AbsentLeaves,
+    },
     ArmCow(PageSpan),
     CowRepoint {
         span: PageSpan,
@@ -132,6 +144,7 @@ impl DescriptorOp {
             Self::Retire(_) => 9,
             Self::ProtectWindow { .. } => 10,
             Self::UnmapWindow(_) => 11,
+            Self::ProtectNone { .. } => 12,
         }
     }
 
@@ -141,6 +154,7 @@ impl DescriptorOp {
             | Self::Map { span, .. }
             | Self::Publish { span, .. }
             | Self::Protect { span, .. }
+            | Self::ProtectNone { span, .. }
             | Self::ProtectWindow { span, .. }
             | Self::CowRepoint { span, .. }
             | Self::Coalesce { span, .. }
@@ -219,6 +233,18 @@ impl<'a> DescriptorTxn<'a> {
                     GuestAccess::Execute => Access::Execute,
                 },
             },
+            // PROT_NONE has its own leaf state on x86, not a permission set.
+            EditOperation::Protect {
+                permissions:
+                    EditPermissions {
+                        readable: false,
+                        writable: false,
+                        executable: false,
+                        ..
+                    },
+                absent,
+                ..
+            } => DescriptorOp::ProtectNone { span, absent },
             EditOperation::Protect {
                 permissions: requested,
                 ceiling,
@@ -497,6 +523,7 @@ const FLAGS: u64 = PRESENT
     | MAY_WRITE
     | PRIVATE
     | MAY_EXEC
+    | NO_ACCESS
     | NX;
 fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     if entry & !(ADDRESS | FLAGS) != 0 || (level == 0 && entry & HUGE != 0) {
@@ -510,8 +537,12 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     }
     if level < 3
         && entry & HUGE == 0
-        && entry & (PREPARED | COW | MAY_WRITE | RETIRED | PRIVATE | MAY_EXEC) != 0
+        && entry & (PREPARED | COW | MAY_WRITE | RETIRED | PRIVATE | MAY_EXEC | NO_ACCESS) != 0
     {
+        return Err(DescriptorRefusal::Malformed);
+    }
+    // A no-access leaf is private custody that no CPL can reach.
+    if entry & NO_ACCESS != 0 && entry & (PRESENT | PRIVATE | RETIRED | COW) != PRIVATE {
         return Err(DescriptorRefusal::Malformed);
     }
     Ok(())
@@ -547,6 +578,11 @@ pub fn split_terminal_descriptor(
 /// an armed leaf `MAY_WRITE` is current write intent, as on AArch64, and a
 /// widening takes [`crate::aarch64::cow_armed_protection`].
 pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
+    // A fork of a no-access page is not expressible here yet (#2875 slice
+    // B): refuse it rather than share its frame unarmed with the child.
+    if entry & NO_ACCESS != 0 {
+        return Err(DescriptorRefusal::PermissionDenied);
+    }
     if entry & (PRESENT | PREPARED) == 0 {
         return Err(DescriptorRefusal::MissingTable);
     }
@@ -663,6 +699,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                         absent: carrick_guest_arch::AbsentLeaves::Lazy,
                         ..
                     }
+                    | DescriptorOp::ProtectNone {
+                        absent: carrick_guest_arch::AbsentLeaves::Lazy,
+                        ..
+                    }
                     | DescriptorOp::ProtectWindow { .. }
             )
         {
@@ -675,6 +715,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             && remaining >= bytes
             && match self.txn.op {
                 DescriptorOp::Protect { .. }
+                | DescriptorOp::ProtectNone { .. }
                 | DescriptorOp::ProtectWindow { .. }
                 | DescriptorOp::ArmCow(_)
                 | DescriptorOp::Retire(_)
@@ -769,6 +810,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if entry & PREPARED == 0 || entry & PRESENT != 0 {
                     return Err(DescriptorRefusal::NotPrepared);
                 }
+                // A prepared page of a PROT_NONE mapping is never revealed.
+                if entry & NO_ACCESS != 0 {
+                    return Err(DescriptorRefusal::PermissionDenied);
+                }
                 if leaf_output(entry, level) != expected.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
@@ -791,7 +836,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 cow_ceiling,
                 ..
             } => {
-                if entry & (PRESENT | PREPARED) == 0 {
+                if entry & (PRESENT | PREPARED | NO_ACCESS) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
                 if entry & PRIVATE == 0 {
@@ -823,7 +868,31 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
                 let granted = if p.executable { MAY_EXEC } else { 0 };
-                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX)) | granted
+                // Widening a no-access leaf restores the state it kept: a
+                // resident page is present again with its bytes, and a
+                // prepared page waits for its first touch.
+                let revealed = if entry & NO_ACCESS == 0 {
+                    entry
+                } else if entry & PREPARED != 0 {
+                    entry & !NO_ACCESS
+                } else {
+                    (entry & !NO_ACCESS) | PRESENT
+                };
+                revealed & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX)) | granted
+            }
+            DescriptorOp::ProtectNone { .. } => {
+                if entry & (PRESENT | PREPARED | NO_ACCESS) == 0 {
+                    return Err(DescriptorRefusal::MissingTable);
+                }
+                if entry & PRIVATE == 0 {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
+                if entry & COW != 0 {
+                    return Err(DescriptorRefusal::CowArmed);
+                }
+                // The frame, the ceilings and the residency state stay; the
+                // hardware sees a not-present entry.
+                (entry & !(PRESENT | WRITE)) | NO_ACCESS
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
@@ -840,10 +909,13 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
             }
             DescriptorOp::Retire(_) => {
-                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 || entry & PRIVATE == 0 {
+                if entry & (PRESENT | PREPARED | NO_ACCESS) == 0
+                    || entry & USER == 0
+                    || entry & PRIVATE == 0
+                {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
-                (entry & !(PRESENT | PREPARED | COW)) | RETIRED
+                (entry & !(PRESENT | PREPARED | COW | NO_ACCESS)) | RETIRED
             }
             DescriptorOp::Unmap(_) => 0,
             // A window unlink drops only a host-mapped leaf (a shared file
@@ -982,6 +1054,7 @@ impl DescriptorTxn<'_> {
             } => (old.raw(), new.raw(), 0, Some(backing)),
             DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) => (0, 0, 0, None),
             DescriptorOp::ProtectWindow { permissions: p, .. } => (0, 0, permissions(p), None),
+            DescriptorOp::ProtectNone { .. } => (0, 0, NO_ACCESS, None),
             DescriptorOp::Retire(_) => (0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (size.bytes(), 0, 0, None),
         };

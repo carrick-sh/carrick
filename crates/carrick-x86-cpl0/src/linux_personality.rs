@@ -1188,13 +1188,9 @@ fn supply_user_fault(
     }
     use carrick_el1::fault::OwnerFaultSupplyOutcome;
     match supply.outcome() {
-        OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
+        OwnerFaultSupplyOutcome::PolicyDeclined(cause) => UserFaultSupply::Signal {
             signum: LINUX_SIGSEGV,
-            code: if fault.present {
-                LINUX_SEGV_ACCERR
-            } else {
-                LINUX_SEGV_MAPERR
-            },
+            code: segv_code(cause),
             address: fault.address,
         },
         OwnerFaultSupplyOutcome::Wait(wait) => UserFaultSupply::TypedRelease(wait),
@@ -1276,14 +1272,10 @@ fn supply_user_fault(
                 );
             }
             match supply.outcome() {
-                OwnerFaultSupplyOutcome::PolicyDeclined => {
+                OwnerFaultSupplyOutcome::PolicyDeclined(cause) => {
                     return UserFaultSupply::Signal {
                         signum: LINUX_SIGSEGV,
-                        code: if fault.present {
-                            LINUX_SEGV_ACCERR
-                        } else {
-                            LINUX_SEGV_MAPERR
-                        },
+                        code: segv_code(cause),
                         address: fault.address,
                     };
                 }
@@ -1303,6 +1295,16 @@ fn supply_user_fault(
             };
             serve_selected_window(binding, task, fault, grant_slot, residency, &words)
         }
+    }
+}
+
+/// The `si_code` of a fault the shared policy declined: the reservation
+/// owner's mapping decides it, not the hardware present bit (a `PROT_NONE`
+/// page is not present yet is `SEGV_ACCERR`, #2875).
+fn segv_code(cause: carrick_el1::fault::SegvCause) -> i32 {
+    match cause {
+        carrick_el1::fault::SegvCause::Access => LINUX_SEGV_ACCERR,
+        carrick_el1::fault::SegvCause::Unmapped => LINUX_SEGV_MAPERR,
     }
 }
 
