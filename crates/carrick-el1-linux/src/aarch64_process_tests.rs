@@ -19055,14 +19055,11 @@ fn serve_child_host_file(
                         task,
                         validator: &crate::file::HardwareValidator,
                     };
-                    carrick_personality_linux::native_host_file::complete(
-                        &record,
-                        output,
-                        &mut |address, bytes| {
+                    carrick_personality_linux::native_host_file::completion(&record, output)
+                        .deliver(&mut |address, bytes| {
                             crate::file::UserCopy::copy_out(&mut copy, address, bytes)
-                        },
-                    )
-                    .raw()
+                        })
+                        .raw()
                 }
                 Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             }

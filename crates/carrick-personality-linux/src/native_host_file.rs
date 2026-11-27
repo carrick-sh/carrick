@@ -2857,19 +2857,14 @@ fn stage_select(
     ))
 }
 
-/// Rewrite the caller's `fd_set`s from a served select's reply: each set
-/// whole, holding exactly the descriptors the reply reports in its class,
-/// as Linux rewrites them (all clear on a timeout).
-fn complete_select(
-    record: &[u8],
-    output: &[u8],
-    result: i64,
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> SyscallResult {
+/// The caller's `fd_set`s from a served select's reply: each set whole,
+/// holding exactly the descriptors the reply reports in its class, as Linux
+/// rewrites them (all clear on a timeout). `None` for a record whose input
+/// does not name its sets.
+fn select_spans(record: &[u8], output: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     use host_file::{POLLFD_BYTES, SELECT_CLASSES, SelectSets};
-    let Some((_, layout)) = host_file::replied_input(record).and_then(SelectSets::split) else {
-        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
-    };
+    let (_, layout) = host_file::replied_input(record).and_then(SelectSets::split)?;
+    let mut spans = Vec::new();
     for (address, class) in layout.sets.into_iter().zip(SELECT_CLASSES) {
         if address == 0 {
             continue;
@@ -2885,11 +2880,9 @@ fn complete_select(
                 *byte |= 1 << (fd % 8);
             }
         }
-        if !copy_out(address, &bitmap) {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
-        }
+        spans.push((address, bitmap));
     }
-    SyscallResult::new(result)
+    Some(spans)
 }
 
 /// A chdir lookup's reply area: `struct stat`, then at most `PATH_MAX` bytes
@@ -2981,62 +2974,146 @@ pub fn map_source(record: &[u8]) -> Result<host_file::MapSourceReply, SyscallRes
         .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO))
 }
 
-/// Map the carrier's reply to the syscall result, copying any output back
-/// through the ring's own user copy.
-pub fn complete(
-    record: &[u8],
-    output: Option<HostFileOutput>,
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> SyscallResult {
+/// A served record's answer and the bytes it owes the caller's memory.
+///
+/// The ring commits [`spans`](Self::spans) through its own copyout owner,
+/// which supplies a destination page that is not resident yet and parks on
+/// contention, as Linux faults a page in under a read's copy (#3050). A
+/// destination that is not the caller's writable memory answers
+/// [`fault_answer`](Self::fault_answer).
+#[derive(Debug, Eq, PartialEq)]
+pub struct HostFileCompletion {
+    /// The call's answer once every span is written.
+    pub result: SyscallResult,
+    /// Each destination and its bytes, in the order Linux writes them.
+    pub spans: Vec<(u64, Vec<u8>)>,
+    /// What a destination fault answers after `delivered` bytes landed.
+    pub on_fault: FaultAnswer,
+}
+
+/// What a completion answers when a destination is not the caller's
+/// writable memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultAnswer {
+    /// EFAULT, whatever already landed: one record (`read`'s buffer, a
+    /// `struct stat`, a socket's written extents, the `fd_set`s).
+    Efault,
+    /// The bytes already delivered, or EFAULT when none did: a vector read
+    /// scattered across iovecs, as Linux's `readv` answers a bad iovec.
+    Delivered,
+}
+
+impl HostFileCompletion {
+    fn answer(result: SyscallResult) -> Self {
+        Self {
+            result,
+            spans: Vec::new(),
+            on_fault: FaultAnswer::Efault,
+        }
+    }
+
+    fn errno(errno: LinuxErrno) -> Self {
+        Self::answer(SyscallResult::from_errno(errno))
+    }
+
+    /// The answer when a destination faults after `delivered` bytes.
+    pub fn fault_answer(&self, delivered: usize) -> SyscallResult {
+        match self.on_fault {
+            FaultAnswer::Delivered if delivered > 0 => SyscallResult::new(delivered as i64),
+            _ => SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+        }
+    }
+
+    /// Write every span through a copy that either lands all of a span or
+    /// none of it, and answer. Only a destination that never needs a supply
+    /// (a socket transfer's next range, which continues from this answer)
+    /// or a test buffer completes this way.
+    pub fn deliver(self, copy_out: &mut dyn FnMut(u64, &[u8]) -> bool) -> SyscallResult {
+        let mut delivered = 0;
+        for (address, bytes) in &self.spans {
+            if !copy_out(*address, bytes) {
+                return self.fault_answer(delivered);
+            }
+            delivered += bytes.len();
+        }
+        self.result
+    }
+}
+
+/// Map the carrier's reply to the syscall result and the output it owes the
+/// caller's memory. Nothing is written here: the ring owns the copy.
+pub fn completion(record: &[u8], output: Option<HostFileOutput>) -> HostFileCompletion {
+    let eio = HostFileCompletion::errno(carrick_syscall_abi::LINUX_EIO);
     let Some(reply) = host_file::reply(record) else {
-        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+        return eio;
     };
     if reply.result < 0 {
-        return SyscallResult::new(reply.result);
+        return HostFileCompletion::answer(SyscallResult::new(reply.result));
     }
-    if let Some(output) = output
-        && output.layout == OutputLayout::Net
-    {
-        return host_file::replied_input(record)
-            .and_then(|input| socket::complete(reply.result, input, reply.output, copy_out))
-            .unwrap_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
-    }
-    if output.is_some_and(|output| output.layout == OutputLayout::Select) {
-        return complete_select(record, reply.output, reply.result, copy_out);
-    }
-    if output.is_some_and(|output| output.layout == OutputLayout::Vector) {
-        let eio = SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
-        let Some(vectors) = host_file::replied_input(record) else {
-            return eio;
-        };
-        let mut bytes = reply.output;
-        for vector in vectors.chunks_exact(IOVEC_BYTES) {
-            let (address, len) = iovec_words(vector);
-            let len = (len as usize).min(bytes.len());
-            if len > 0 && !copy_out(address, &bytes[..len]) {
-                let delivered = reply.output.len() - bytes.len();
-                return if delivered == 0 {
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
-                } else {
-                    SyscallResult::new(delivered as i64)
-                };
+    let result = SyscallResult::new(reply.result);
+    let Some(output) = output else {
+        return HostFileCompletion::answer(result);
+    };
+    let spans = match output.layout {
+        OutputLayout::Net => {
+            let Some(spans) = host_file::replied_input(record)
+                .and_then(|input| socket::written_spans(input, reply.output))
+            else {
+                return eio;
+            };
+            spans
+        }
+        OutputLayout::Select => {
+            let Some(spans) = select_spans(record, reply.output) else {
+                return eio;
+            };
+            spans
+        }
+        OutputLayout::Vector => {
+            let Some(vectors) = host_file::replied_input(record) else {
+                return eio;
+            };
+            let mut spans = Vec::new();
+            let mut bytes = reply.output;
+            for vector in vectors.chunks_exact(IOVEC_BYTES) {
+                if bytes.is_empty() {
+                    break;
+                }
+                let (address, len) = iovec_words(vector);
+                let len = (len as usize).min(bytes.len());
+                if len > 0 {
+                    spans.push((address, bytes[..len].to_vec()));
+                }
+                bytes = &bytes[len..];
             }
-            bytes = &bytes[len..];
+            if !bytes.is_empty() {
+                return eio;
+            }
+            return HostFileCompletion {
+                result,
+                spans,
+                on_fault: FaultAnswer::Delivered,
+            };
+        }
+        OutputLayout::Bytes | OutputLayout::X8664Stat => {
+            let Some(bytes) = output.encode(reply.output) else {
+                return eio;
+            };
             if bytes.is_empty() {
-                return SyscallResult::new(reply.result);
+                Vec::new()
+            } else {
+                vec![(output.address, bytes.into_owned())]
             }
         }
-        return eio;
+    };
+    HostFileCompletion {
+        result,
+        spans: spans
+            .into_iter()
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .collect(),
+        on_fault: FaultAnswer::Efault,
     }
-    if let Some(output) = output {
-        let Some(bytes) = output.encode(reply.output) else {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
-        };
-        if !bytes.is_empty() && !copy_out(output.address, &bytes) {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
-        }
-    }
-    SyscallResult::new(reply.result)
 }
 
 /// Whether a served record's EPIPE owes its caller SIGPIPE (Linux's

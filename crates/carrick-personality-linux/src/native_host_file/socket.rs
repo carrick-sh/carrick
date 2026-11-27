@@ -671,22 +671,18 @@ pub(super) fn stage(
     })
 }
 
-/// Copy a served call's written extents back to the caller's memory, as its
-/// staged segment table (`input`) names them. `None` when the reply does not
-/// match its staged segments.
-pub(super) fn complete(
-    result: i64,
-    input: &[u8],
-    reply: &[u8],
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> Option<SyscallResult> {
+/// A served call's written extents and the caller's memory each lands in,
+/// as its staged segment table (`input`) names them. `None` when the reply
+/// does not match its staged segments.
+pub(super) fn written_spans(input: &[u8], reply: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     let call = staged_call(input)?;
-    for (address, bytes) in NetCall::decode_written(call.segments(), reply)?.1 {
-        if !bytes.is_empty() && !copy_out(address, bytes) {
-            return Some(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT));
-        }
-    }
-    Some(SyscallResult::new(result))
+    Some(
+        NetCall::decode_written(call.segments(), reply)?
+            .1
+            .into_iter()
+            .map(|(address, bytes)| (address, bytes.to_vec()))
+            .collect(),
+    )
 }
 
 /// The calling member of a socket call, from its own ring task row: its

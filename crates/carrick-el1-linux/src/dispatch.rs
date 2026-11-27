@@ -8791,15 +8791,12 @@ mod tests {
         let mut reply = pollfds;
         reply[22..24].copy_from_slice(&carrick_syscall_abi::LINUX_POLLHUP.to_le_bytes());
         view.reply(1, &reply).unwrap();
-        let result = carrick_personality_linux::native_host_file::complete(
-            &record,
-            Some(output),
-            &mut |address, bytes| {
+        let result = carrick_personality_linux::native_host_file::completion(&record, Some(output))
+            .deliver(&mut |address, bytes| {
                 assert_eq!(address, pollfds.as_ptr().addr() as u64);
                 pollfds.copy_from_slice(bytes);
                 true
-            },
-        );
+            });
         assert_eq!(result.raw(), 1, "readiness, not ENOSYS");
         assert_eq!(pollfds, reply);
 
