@@ -536,11 +536,39 @@ fn bound_apic_id(slot: CpuId) -> Result<interrupts::ApicId, ArchError> {
         .ok_or(ArchError::Unbound)
 }
 
+/// What became of a reschedule IPI [`send_resched`] was asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReschedSend {
+    /// The local APIC accepted the command.
+    Sent,
+    /// The local APIC was still sending this CPU's previous IPI (ICR
+    /// delivery status busy). That is contention, "not now": the IPI is
+    /// owed in this CPU's binding ([`CpuBinding::owed_resched`]) and sent
+    /// again at this CPU's next delivery point
+    /// ([`deliver_owed_resched`]). Nothing for the caller to do.
+    ///
+    /// [`CpuBinding::owed_resched`]: super::context::native::CpuBinding::owed_resched
+    Owed,
+}
+
 /// Send a scheduler reschedule using a slot-indexed published APIC route.
-pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<(), ArchError> {
+///
+/// A busy ICR never fails the send and is never spun on (#3083): the IPI
+/// is owed by this CPU and resent once at each of its delivery points.
+/// Only a broken invariant (no binding, no published route) is an error.
+pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<ReschedSend, ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
     let apic = bound_apic_id(CpuId::new(u32::from(slot.raw())))?;
+    // Older owed IPIs go first: this CPU's next send is a delivery point.
+    let _ = deliver_owed_resched();
     core::sync::atomic::fence(Ordering::SeqCst);
-    send_resched_ipi(apic).map_err(|_| ArchError::Busy)
+    match send_resched_ipi(apic) {
+        Ok(()) => Ok(ReschedSend::Sent),
+        Err(interrupts::IpiBusy) => {
+            owe_resched(binding, slot);
+            Ok(ReschedSend::Owed)
+        }
+    }
 }
 
 /// Owed reschedule IPIs this CPU resent, for the KVM witness's census.
@@ -580,6 +608,59 @@ fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy>
     // IPI; the stopped bootstrap retains the destination APIC until
     // retirement.
     unsafe { interrupts::hardware::send_resched(apic) }
+}
+
+fn owe_resched(binding: &super::context::native::CpuBinding, slot: carrick_sched_core::SlotId) {
+    let index = usize::from(slot.raw());
+    let Some(word) = binding.owed_resched.get(index / 64) else {
+        // A slot the published routes named is a zone slot: always in range.
+        super::fatal_entry_binding();
+    };
+    word.fetch_or(1 << (index % 64), Ordering::AcqRel);
+}
+
+/// Resend, once each, the reschedule IPIs this CPU owes ([`ReschedSend::Owed`]).
+/// Called at every delivery point of this CPU: its next reschedule send,
+/// each idle pass (before its reads, and before HLT), every return to user
+/// and every interrupt. True when none is owed any more; an IPI that finds
+/// the ICR busy again stays owed for the next point, never spun on.
+#[must_use]
+pub fn deliver_owed_resched() -> bool {
+    let Some(binding) = super::context::current_cpu_binding() else {
+        return true;
+    };
+    let mut clear = true;
+    for (word_index, word) in binding.owed_resched.iter().enumerate() {
+        let mut owed = word.swap(0, Ordering::AcqRel);
+        while owed != 0 {
+            let bit = owed.trailing_zeros() as usize;
+            let Some(slot) = u8::try_from(word_index * 64 + bit)
+                .ok()
+                .map(carrick_sched_core::SlotId::new)
+            else {
+                super::fatal_entry_binding();
+            };
+            let Ok(apic) = bound_apic_id(CpuId::new(u32::from(slot.raw()))) else {
+                // The route was published when the IPI was owed, and routes
+                // live until every vCPU retires.
+                super::fatal_entry_binding();
+            };
+            core::sync::atomic::fence(Ordering::SeqCst);
+            if send_resched_ipi(apic).is_err() {
+                // Still busy: keep this and the rest owed, in order.
+                word.fetch_or(owed, Ordering::AcqRel);
+                clear = false;
+                break;
+            }
+            #[cfg(feature = "test-support")]
+            OWED_RESCHED_RESENT.fetch_add(1, Ordering::AcqRel);
+            owed &= owed - 1;
+        }
+        if !clear {
+            break;
+        }
+    }
+    clear
 }
 
 /// Query the TSC frequency from architectural CPUID or the exact KVM binding.

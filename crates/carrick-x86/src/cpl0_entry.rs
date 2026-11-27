@@ -432,6 +432,11 @@ pub struct CpuBinding {
     /// the guest kernel never writes it, so the snapshot stays exact. Under
     /// SVM every `mov reg, cr4` is an intercepted VM exit (#2679).
     pub cr4_snapshot: AtomicU64,
+    /// Reschedule IPIs this CPU owes, one bit per target slot: each found
+    /// the ICR still sending this CPU's previous IPI (#3083). Contention,
+    /// never fatal: the sender resends each once at its next delivery point
+    /// (its next send, an idle pass, a return to user, an interrupt).
+    pub owed_resched: [AtomicU64; carrick_sched_core::ZONE_SLOT_WORDS],
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
