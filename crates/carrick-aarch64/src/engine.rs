@@ -3883,6 +3883,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.supports_lazy_anonymous_mmap()
     }
 
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        self.vm.private_file_venue()
+    }
+
     /// Borrow the backend's legacy mirror. Admitted roots have no mirror and
     /// authorize checked and raw copies through the same EL1 transfer venue.
     fn protections(&self) -> Option<LegacyProtectionRead<'_>> {
@@ -9559,6 +9563,9 @@ mod transfer_service_tests {
         }
         fn kick_handle(&self) -> Self::KickHandle {
             panic!("unused backend method")
+        }
+        fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+            carrick_guest_mem::PrivateFileVenue::OwnerGrant
         }
         fn prepare_owner_frame_grant(
             &self,
