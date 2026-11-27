@@ -4658,21 +4658,22 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
 
 /// #3061 PR 1a: a copy-on-write supply's own exclusion of its MM can meet
 /// the MM's editor held. That is "not now": nothing is supplied, the member
-/// withdraws its selection, parks on the editor's release (enrolled on the
-/// release source it sampled before the probe), and reruns, and the rerun's
-/// supply is published for the same demand. It never re-rings the carrier
-/// while that editor is held.
+/// withdraws its selection and parks on the editor's release (the wait it
+/// sampled before the crossing, #3100), and the rerun's supply is published
+/// for the same demand. It never re-rings the carrier while that editor is
+/// held.
 ///
-/// The host seam holds a real in-ring edit across exactly one demand's
-/// supply probe: the `nth` supply of one MM, here the single-threaded
+/// The host seam holds a real in-ring edit across `probes` consecutive
+/// supply probes of exactly one demand (two refusals in a row: the rerun
+/// after the first park meets the editor held again): the `nth` supply of one MM, here the single-threaded
 /// parent's, so no sibling can supply its page (the forked child is another
 /// MM and touches nothing before the parent's stores are done). The seam
 /// stays armed until it holds the editor, and records the demand (MM, page,
-/// member). The row asserts, for that exact demand: one hold, its own supply
+/// member). The row asserts, for that exact demand: `probes` holds, its own supply
 /// published after it, and no carrier work its member rang while it stayed
 /// unsupplied (a bare re-ring instead of the editor-release wait).
 /// Run in a child process: the seam is process-global.
-fn cow_supply_waits_out_a_held_editor(test: &str, nth: u64) {
+fn cow_supply_waits_out_a_held_editor(test: &str, nth: u64, probes: u64) {
     use carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::{
         EditorHoldSite, editor_holds_for_test, held_cow_demand_for_test,
         hold_editor_at_nth_cow_supply_for_test,
@@ -4681,14 +4682,14 @@ fn cow_supply_waits_out_a_held_editor(test: &str, nth: u64) {
     const FIXTURE: &str = "native_fork_parent_copyout_then_store.S";
     if std::env::var_os(CHILD).is_some() {
         let elf = native_exit_fixture(FIXTURE);
-        hold_editor_at_nth_cow_supply_for_test(nth);
+        hold_editor_at_nth_cow_supply_for_test(nth, probes);
         let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_ANY)
             .expect("COW supply beside a held editor run");
         let (supplied, rerung) = held_cow_demand_for_test();
         assert_eq!(
             editor_holds_for_test(EditorHoldSite::CowSupply),
-            1,
-            "the seam never held a COW supply's editor"
+            probes,
+            "the seam held the demand's editor a different number of times than armed"
         );
         assert_eq!(
             rerung, 0,
@@ -4721,22 +4722,36 @@ fn cow_supply_waits_out_a_held_editor(test: &str, nth: u64) {
 }
 
 /// The held demand is the parent's first supply after the fork: its
-/// user-mode store to page C.
+/// user-mode store to page C, refused twice.
 #[test]
 fn production_fork_cow_store_waits_out_a_held_editor_then_is_supplied() {
     cow_supply_waits_out_a_held_editor(
         "production_fork_cow_store_waits_out_a_held_editor_then_is_supplied",
         1,
+        2,
     );
 }
 
 /// The held demand is the parent's second supply after the fork: the
-/// kernel's `read(2)` copy into page A.
+/// kernel's `read(2)` copy into page A, refused twice, so the copy parks on
+/// the editor's release twice.
 #[test]
 fn production_fork_kernel_copy_waits_out_a_held_editor_then_is_supplied() {
     cow_supply_waits_out_a_held_editor(
         "production_fork_kernel_copy_waits_out_a_held_editor_then_is_supplied",
         2,
+        2,
+    );
+}
+
+/// The kernel copy's demand refused once: one park, then the rerun
+/// supplies it.
+#[test]
+fn production_fork_kernel_copy_waits_out_one_held_probe() {
+    cow_supply_waits_out_a_held_editor(
+        "production_fork_kernel_copy_waits_out_one_held_probe",
+        2,
+        1,
     );
 }
 
