@@ -1289,13 +1289,24 @@ impl ExclusiveStage2 {
 }
 
 /// One soft carrier's authority to map retained ABI storage into its EL1
-/// dynamic metadata aperture ([`RetainedMetadataMapper`]). It names its
-/// carrier weakly: once that stage 2 drops, every call fails `StaleOwner`.
+/// dynamic metadata aperture ([`RetainedMetadataMapper`]). It retains its
+/// carrier's stage 2, so the EL1 region it names (and every reference the
+/// reservation views and publication backing borrow from it) stays mapped
+/// for as long as this access lives, as HVF's carrier mappings do.
 #[derive(Clone)]
 pub struct SoftRetainedMetadata {
-    stage2: Weak<ExclusiveStage2>,
+    stage2: Arc<ExclusiveStage2>,
+    /// The EL1 region's host base, fixed for the stage 2's life: the region
+    /// is mapped when the carrier is built and unmapped only when it drops.
+    region: NonNull<u8>,
     carrier: CarrierId,
 }
+
+// SAFETY: `region` points into the EL1 region the retained `stage2` keeps
+// mapped; it is only handed out as a raw base, and every access through it
+// synchronizes through the ABI's atomics and locks.
+unsafe impl Send for SoftRetainedMetadata {}
+unsafe impl Sync for SoftRetainedMetadata {}
 
 /// One retained mapping in its exact soft carrier, by its grant identity.
 pub struct SoftRetainedExtent {
@@ -1306,34 +1317,23 @@ pub struct SoftRetainedExtent {
 impl RetainedMetadataMapper for SoftRetainedMetadata {
     type Extent = SoftRetainedExtent;
 
+    /// The retained region's base: no stage-2 borrow, so it never meets the
+    /// running vCPU's.
     fn region(&self) -> Result<NonNull<u8>, MetadataResolutionError> {
-        let stage2 = self
-            .stage2
-            .upgrade()
-            .ok_or(MetadataResolutionError::StaleOwner)?;
-        let stage2 = stage2
-            .try_borrow()
-            .map_err(|_| MetadataResolutionError::Busy)?;
-        stage2
-            .host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)
-            .and_then(NonNull::new)
-            .ok_or(MetadataResolutionError::StaleOwner)
+        Ok(self.region)
     }
 
     fn map_retained(
         &self,
         backing: Arc<dyn RetainedMetadataBacking>,
     ) -> Result<SoftRetainedExtent, MetadataResolutionError> {
-        let stage2 = self
+        let extent = self
             .stage2
-            .upgrade()
-            .ok_or(MetadataResolutionError::StaleOwner)?;
-        let extent = stage2
             .try_borrow()
             .map_err(|_| MetadataResolutionError::Busy)?
             .map_retained_metadata(backing)?;
         Ok(SoftRetainedExtent {
-            stage2: Arc::downgrade(&stage2),
+            stage2: Arc::downgrade(&self.stage2),
             extent,
         })
     }
@@ -1343,14 +1343,10 @@ impl MetadataExtentResolver for SoftRetainedMetadata {
     type Pin = SoftMetadataPin;
 
     fn pin(&self, extent: MetadataExtent) -> Result<SoftMetadataPin, MetadataResolutionError> {
-        let stage2 = self
-            .stage2
-            .upgrade()
-            .ok_or(MetadataResolutionError::StaleOwner)?;
-        let stage2 = stage2
+        self.stage2
             .try_borrow()
-            .map_err(|_| MetadataResolutionError::Busy)?;
-        stage2.pin_retained_metadata(extent)
+            .map_err(|_| MetadataResolutionError::Busy)?
+            .pin_retained_metadata(extent)
     }
 }
 
@@ -2214,13 +2210,20 @@ impl<X> SoftAarch64Vmm<X> {
         Ok(self.stage2.try_borrow()?.code_generation(frame))
     }
 
-    /// This carrier's retained-metadata mapping capability.
-    #[must_use]
-    pub fn retained_metadata(&self) -> SoftRetainedMetadata {
-        SoftRetainedMetadata {
-            stage2: Arc::downgrade(&self.stage2),
+    /// This carrier's retained-metadata mapping capability, retaining its
+    /// stage 2 and EL1 region.
+    pub fn retained_metadata(&self) -> Result<SoftRetainedMetadata, TrapError> {
+        let region = self
+            .stage2
+            .try_borrow()?
+            .host_ptr(EL1_REGION_BASE, EL1_REGION_SIZE as usize)
+            .and_then(NonNull::new)
+            .ok_or_else(|| TrapError::Hypervisor("soft carrier EL1 region is not mapped".into()))?;
+        Ok(SoftRetainedMetadata {
+            stage2: Arc::clone(&self.stage2),
+            region,
             carrier: self.stage2.carrier,
-        }
+        })
     }
 
     /// Issue this carrier's birth and MM source over its EL1 zone tables, the

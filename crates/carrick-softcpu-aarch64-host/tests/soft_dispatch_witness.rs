@@ -2847,3 +2847,47 @@ fn soft_carrier_releases_evicted_code_within_its_budget() {
         "code outlived the carrier"
     );
 }
+
+/// The soft carrier's reservation access retains its stage 2, so the EL1
+/// region its publication backing names stays mapped for as long as that
+/// backing lives, even after the run's engine drops: the shared
+/// `AddressSpaceBacking` contract, which HVF's carrier mappings keep. A
+/// weak reference let the region go with the engine while a publication
+/// mirror still held the backing.
+#[test]
+fn soft_reservation_backing_retains_the_carrier_region_past_its_engine() {
+    use carrick_kernel::dispatch::mem::el1_reservations::{
+        CarrierReservations, HostReservationProvider as _,
+    };
+    let _test_guard = lock_soft_carrier_test();
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let executor = SequenceHvc2Executor {
+        mailbox: Arc::clone(&mailbox),
+        calls: vec![(NR_EXIT_GROUP, [0; 6])],
+        returns: Arc::new(Mutex::new(Vec::new())),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/retained-region");
+    let run = run_single_process_with_executor_and_setup(&config, executor, |engine| {
+        install_hvc2_bridge(engine, &mailbox)
+    })
+    .expect("the root must run to exit on the production soft entry");
+    assert_eq!(run.exit_code, 0);
+    let carrier = run.engine.backend().carrier().raw();
+    let provider = CarrierReservations::new(
+        run.engine
+            .backend()
+            .retained_metadata()
+            .expect("retain the carrier's EL1 region"),
+    );
+    let backing = provider
+        .address_space_backing()
+        .expect("the live carrier has a publication backing");
+    drop(provider);
+    drop(run);
+    let region = backing
+        .region()
+        .expect("the backing still names its retained carrier region");
+    assert_eq!(region.carrier, carrier);
+}

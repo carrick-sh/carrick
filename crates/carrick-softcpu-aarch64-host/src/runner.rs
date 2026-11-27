@@ -959,8 +959,13 @@ where
         && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
     let reservation_root_admitted = {
         use carrick_kernel::dispatch::mem::el1_reservations::HostReservationProvider as _;
-        let provider = CarrierReservations::new(backend.retained_metadata());
-        let backing = provider.address_space_backing();
+        let provider = backend
+            .retained_metadata()
+            .ok()
+            .map(CarrierReservations::new);
+        let backing = provider
+            .as_ref()
+            .and_then(|provider| provider.address_space_backing());
         let space = backing.as_ref().and_then(|backing| backing.region());
         space.is_some_and(|space| {
             let index = space.zone.spaces.find(mm_key).map(|entry| entry.index());
@@ -1181,7 +1186,10 @@ where
         // it: without one, EL1 never admits the root and refuses its BIND.
         dispatcher
             .install_reservation_provider(Arc::new(CarrierReservations::new(
-                engine.backend().retained_metadata(),
+                engine
+                    .backend()
+                    .retained_metadata()
+                    .map_err(|e| format!("retain the soft carrier's EL1 region: {e:?}"))?,
             )))
             .map_err(|e| format!("install the soft carrier's reservation provider: {e:?}"))?;
         // EL1 admits the root against the zone's own PID namespace and
@@ -1263,7 +1271,12 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
-    let mappings = CarrierLifecycleMappings::new(engine.backend().retained_metadata());
+    let mappings = CarrierLifecycleMappings::new(
+        engine
+            .backend()
+            .retained_metadata()
+            .map_err(|e| format!("retain the soft carrier's EL1 region: {e:?}"))?,
+    );
     let control = root.thread().control_lease();
     if control.visible_tid().is_none() {
         let tid = carrick_kernel::namespace::pid::ns_visible_thread_tid(root.thread())
