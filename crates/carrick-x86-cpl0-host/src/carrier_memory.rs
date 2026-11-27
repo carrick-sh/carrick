@@ -2,7 +2,7 @@
 //! Dedicated bounded hardware slots project extents, never one slot per page/MM.
 //! This preparation has no public vCPU/run handle. The accepted N1 editor must
 //! enclose publication and physical rollback; M5 will bind execution admission.
-use crate::guest_ram::{GuestRam, WindowKind};
+use crate::guest_ram::{GuestRam, HostPlacement, WindowKind};
 use carrick_core::mm::own::{DrainContext, HoldError, MmKey, SlotHolds};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{AddressContext, FrameGpa, RootGpa};
@@ -160,6 +160,14 @@ pub struct BackingExtent {
 }
 impl BackingExtent {
     pub fn private(base: FrameGpa, len: usize) -> Result<Self, MemoryError> {
+        Self::private_placed(base, len, HostPlacement::Page)
+    }
+
+    fn private_placed(
+        base: FrameGpa,
+        len: usize,
+        placement: HostPlacement,
+    ) -> Result<Self, MemoryError> {
         if len == 0
             || !(len as u64).is_multiple_of(PAGE)
             || base.raw() & !ADDRESS != 0
@@ -171,7 +179,7 @@ impl BackingExtent {
             return Err(error("invalid carrier extent"));
         }
         let mut ram = GuestRam::new();
-        ram.add_window(base.raw(), len, WindowKind::Private)
+        ram.add_window_placed(base.raw(), len, WindowKind::Private, placement)
             .map_err(|e| error(e.to_string()))?;
         Ok(Self {
             storage: ExtentStorage::Ram(Arc::new(ram)),
@@ -179,6 +187,36 @@ impl BackingExtent {
             len,
         })
     }
+    /// Place and map one owner grant's window at the next free carrier GPA,
+    /// advancing `next` past it (#3105). A window that is a whole number of
+    /// 2 MiB large pages starts on a 2 MiB GPA boundary and gets a 2 MiB-
+    /// aligned host mapping advised for huge pages, so the hypervisor can
+    /// back it with one large stage-2 entry: the guest's first touches then
+    /// take one nested page fault per window, not one per 4 KiB page. Any
+    /// other window keeps page placement. GPA and host placement are chosen
+    /// together here, so neither can be aligned without the other.
+    pub fn owner_window(next: &mut FrameGpa, len: usize) -> Result<Self, MemoryError> {
+        let large = (len as u64).is_multiple_of(HostPlacement::LARGE_PAGE_BYTES);
+        let base = if large {
+            next.raw()
+                .checked_next_multiple_of(HostPlacement::LARGE_PAGE_BYTES)
+                .ok_or_else(|| error("owner grant GPA exhausted"))?
+        } else {
+            next.raw()
+        };
+        let end = base
+            .checked_add(len as u64)
+            .ok_or_else(|| error("owner grant GPA exhausted"))?;
+        let placement = if large {
+            HostPlacement::LargePage
+        } else {
+            HostPlacement::Page
+        };
+        let extent = Self::private_placed(FrameGpa::new(base), len, placement)?;
+        *next = FrameGpa::new(end);
+        Ok(extent)
+    }
+
     /// Retain the original IPC allocation without copying it or assuming
     /// ownership of its deallocator. The authority must retain stable writable
     /// pointers, as required by `IpcWindowBacking`'s carrier mapping contract.
