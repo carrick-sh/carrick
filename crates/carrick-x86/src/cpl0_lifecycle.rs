@@ -885,8 +885,24 @@ impl NativeLane<'_> {
         self.frame.rax = u64::from(count);
         self.lane.wakes += u64::from(count);
     }
+    /// Send the idle-scan passes a lock-taking zone operation owed (#3083)
+    /// through this lane's wake venue (its IPI route).
+    fn send_owed_passes(&mut self, passes: carrick_sched_core::OwedPasses) {
+        let (zone, slot) = (self.zone, self.lane.slot);
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        if effects.sgi.iter().any(|word| *word != 0) {
+            let before = WakerQueue::observe(zone, slot);
+            effects.apply(zone, slot, before, &mut self.wake_cpu());
+        }
+    }
     fn switch_next(&mut self) -> Option<carrick_core::Served> {
-        let switched = self.zone.switch_in_full(self.lane.slot)?;
+        let switched = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self.zone.switch_in_full(self.lane.slot, &passes);
+            self.send_owed_passes(passes);
+            owed
+        }?;
         let reference = self.zone.record_ref(switched.record);
         let index = self
             .lane
@@ -1190,7 +1206,14 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         );
     }
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
-        let queued = BornEnqueue::from(self.zone.requeue_preempted(self.lane.slot, record.id));
+        let queued = BornEnqueue::from({
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .zone
+                .requeue_preempted(self.lane.slot, record.id, &passes);
+            self.send_owed_passes(passes);
+            owed
+        });
         if queued == BornEnqueue::Queued {
             self.lane.births += 1;
         }
@@ -1231,16 +1254,21 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if self.zone.live(record).is_none() {
             return false;
         }
-        self.handoff = retirement
-            .retire_current(
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = retirement.retire_current(
                 carrick_core::entry::binding(&self.task.execution, &self.task.mm),
                 carrick_core_abi::BornInZoneSource {
                     zone: self.zone,
                     slot: self.lane.slot,
                 },
                 record.id,
-            )
-            .ok();
+                &passes,
+            );
+            self.send_owed_passes(passes);
+            owed
+        }
+        .ok();
         if self.handoff.is_some() {
             self.lane.retirements += 1;
             true
@@ -1695,11 +1723,17 @@ impl FutexVenue for NativeLane<'_> {
         }
         self.zone
             .set_deadline(record, wait.deadline.map_or(0, |deadline| deadline.raw()));
-        self.handoff = Some(carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_core_abi::EntryRecordGeneration(seq),
-        )?);
+        self.handoff = Some({
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_core_abi::EntryRecordGeneration(seq),
+                &passes,
+            );
+            self.send_owed_passes(passes);
+            owed
+        }?);
         self.zone.clear_current(self.lane.slot);
         drop(guard);
         self.switch_next()
