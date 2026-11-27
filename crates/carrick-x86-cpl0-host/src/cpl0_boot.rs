@@ -9495,7 +9495,13 @@ pub fn unexpected_boot_wake(
 
 /// An event a stopped CPU was delivering when it left the guest. The CPU
 /// finishes delivering it, into CPL0, before it runs any other instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum PendingEvent {
     /// An external or IPI vector, already accepted by the local APIC.
     Interrupt { vector: u8 },
@@ -9508,7 +9514,13 @@ pub enum PendingEvent {
 /// Where a stopped production CPU resumes, as its run admission reads it
 /// once before reentry. Each class has exactly one answer to shootdown debt,
 /// and every caller matches all of them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum StoppedCpu {
     /// CS.DPL 0. The ring takes a queued KICK at its next interruptible point.
     Kernel,
