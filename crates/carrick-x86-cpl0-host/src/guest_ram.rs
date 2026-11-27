@@ -31,7 +31,10 @@ const PAGE_BYTES: usize = 4096;
 pub enum HostPlacement {
     /// Any 4 KiB-aligned host address.
     Page,
-    /// A 2 MiB-aligned host address, advised for transparent huge pages.
+    /// A 2 MiB-aligned host address. The host's own transparent huge page
+    /// policy decides whether a large page backs it: no advice is given, so
+    /// a window never costs more host memory than the same touches would
+    /// cost a native process on that host (#3143).
     LargePage,
 }
 
@@ -119,9 +122,10 @@ impl GuestRam {
 
     /// Add a window whose host mapping has the given placement. A
     /// [`HostPlacement::LargePage`] window starts on a 2 MiB host boundary
-    /// and is advised for transparent huge pages, so a hypervisor that
-    /// backs a 2 MiB-aligned guest-physical range with it can map the range
-    /// with one large stage-2 entry instead of one entry per 4 KiB page.
+    /// so where the host's transparent huge page policy backs it with large
+    /// pages, a hypervisor that backs a 2 MiB-aligned guest-physical range
+    /// with it can map the range with one large stage-2 entry instead of one
+    /// entry per 4 KiB page.
     pub fn add_window_placed(
         &mut self,
         base: u64,
@@ -188,13 +192,6 @@ impl GuestRam {
             return Err(OsError::new(format!(
                 "guest_ram: trimming the aligned mapping for 0x{base:x}+{len}: {error}"
             )));
-        }
-        #[cfg(target_os = "linux")]
-        if placement == HostPlacement::LargePage {
-            // Advice only: a host without transparent huge pages keeps
-            // 4 KiB pages, which is correct and only slower.
-            // SAFETY: the kept range is the live mapping this window owns.
-            unsafe { libc::madvise(host as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
         }
         let host = host as *mut libc::c_void;
         self.windows
