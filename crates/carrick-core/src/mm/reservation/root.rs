@@ -24,7 +24,7 @@ mod stock;
 mod storage;
 pub use prepared::ClaimedPreparedCopy;
 pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions, StockPolicy};
-pub use storage::ResolvedReservationNodes;
+pub use storage::{NodeCapacity, ResolvedReservationNodes};
 
 pub use carrick_core_abi::AnonymousHintVenue;
 

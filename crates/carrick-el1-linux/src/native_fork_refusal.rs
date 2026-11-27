@@ -57,6 +57,11 @@ pub enum NativeForkCause {
     SiblingBirth {
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
     },
+    /// The child's reservation tree needed nodes the shared pool lacked,
+    /// and no node bank could be added: the `BANKS` table is full or the
+    /// metadata allocator had no extent (#3085). Linux's EAGAIN for a
+    /// fork that hits a resource limit.
+    NodeBanksFull,
 }
 
 impl From<MmError> for NativeForkCause {
@@ -82,39 +87,164 @@ pub struct NativeForkRefusal {
 }
 
 impl NativeForkRefusal {
+    /// The one encoding of a fork refusal, exhaustive over every cause
+    /// (#3085). A cause is contention ("not now": `Busy`, `OwnerWait`), a
+    /// Linux `fork(2)` errno (`Exhausted` is EAGAIN: a resource limit), or a
+    /// broken invariant (`Stale`, `Invalid`, `Quarantined`, `Unsupported`).
+    /// No cause answers EFAULT: Linux has none for `fork`.
     pub fn error(self) -> super::native_process_runtime::NativeProcessError {
         use super::native_process_runtime::NativeProcessError as E;
-        use carrick_el1_abi::ForkStockRefusal as R;
         match self.cause {
             NativeForkCause::Busy | NativeForkCause::SiblingBirth { .. } => E::Busy,
             // Today's EAGAIN answer, as a refusal rather than "not now".
             NativeForkCause::GateShut => E::Exhausted,
-            // Owner contention keeps its release to enrol on (#2306); it is
-            // never the fault answer of a refused owner operation.
-            NativeForkCause::Mm(MmError::Wait(wait)) => E::OwnerWait(wait),
-            NativeForkCause::Mm(MmError::Busy)
-            | NativeForkCause::Reservation(Refusal::Busy | Refusal::PreparedConflict)
-            | NativeForkCause::Fork(ForkError::Busy) => E::Busy,
-            // The parent changed while its editor was released for the
-            // stock crossing (#2890): the fork backs out and reruns from a
-            // fresh snapshot, never EFAULT.
-            NativeForkCause::Mm(MmError::ParentChanged)
-            | NativeForkCause::Fork(ForkError::ParentChanged) => E::Busy,
-            // The parent's guest COW completions wait for their carrier's
-            // settlement. Retained as carrier work, whose acknowledgement
-            // settles the requester's MM first (ARM); the x86 venue rings
-            // the settlement itself and returns its editor wait instead
-            // when it met that editor held (#2947).
-            NativeForkCause::Mm(MmError::CowUnsettled) => E::Busy,
-            NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
-            NativeForkCause::StockReservation(R::Stale) => E::Stale,
-            NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
-            NativeForkCause::StockReservation(R::Inventory) => E::Busy,
-            // The fork owner grows the table and answers `Busy` itself. This
-            // cause survives only when that growth was refused for good.
-            NativeForkCause::StockReservation(R::Residency) => E::Exhausted,
-            _ => E::Fault,
+            NativeForkCause::NodeBanksFull => E::Exhausted,
+            NativeForkCause::Mm(error) => mm_error(error),
+            NativeForkCause::Reservation(refusal) => reservation_error(refusal),
+            NativeForkCause::Fork(error) => fork_error(error),
+            NativeForkCause::StockReservation(refusal) => stock_error(refusal),
+            // A typed reply the crossing carried back is that refusal.
+            NativeForkCause::StockCrossing {
+                reply: Some(refusal),
+                ..
+            } => stock_error(refusal),
+            // The transport failed before a typed reply: the loan's carrier
+            // custody is unconfirmed.
+            NativeForkCause::StockCrossing { reply: None, .. } => E::Stale,
         }
+    }
+}
+
+fn mm_error(error: MmError) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    use carrick_mmu_core::aarch64::PageTableError;
+    match error {
+        // Owner contention keeps its release to enrol on (#2306); it is
+        // never the fault answer of a refused owner operation.
+        MmError::Wait(wait) => E::OwnerWait(wait),
+        MmError::Busy => E::Busy,
+        // The parent changed while its editor was released for the stock
+        // crossing (#2890): the fork backs out and reruns from a fresh
+        // snapshot, never EFAULT.
+        MmError::ParentChanged => E::Busy,
+        // The parent's guest COW completions wait for their carrier's
+        // settlement. Retained as carrier work, whose acknowledgement
+        // settles the requester's MM first (ARM); the x86 venue rings the
+        // settlement itself and returns its editor wait instead when it met
+        // that editor held (#2947).
+        MmError::CowUnsettled => E::Busy,
+        // A `MetadataRequired` at Publish is supplied a node bank and
+        // reruns ([`NodeBankDemand`]); one that reaches this encoding is
+        // capacity the fork could not add.
+        MmError::NoMemory | MmError::MetadataRequired => E::Exhausted,
+        MmError::Table(PageTableError::OutOfTables) => E::Exhausted,
+        MmError::Reservation(refusal) => reservation_error(refusal),
+        // A replaced parent (another incarnation) is stale custody.
+        MmError::Stale => E::Stale,
+        // The owner's own records disagree (a hole or a foreign table in
+        // the parent the census accepted): a broken invariant.
+        MmError::Invalid | MmError::Fault | MmError::Table(_) => E::Invalid,
+        MmError::UnsupportedExecutableCow => E::Unsupported,
+        // A rollback that could not restore the parent.
+        MmError::Core => E::Quarantined,
+    }
+}
+
+fn reservation_error(refusal: Refusal) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    match refusal {
+        Refusal::Busy | Refusal::PreparedConflict => E::Busy,
+        Refusal::Stale => E::Stale,
+        Refusal::MetadataRequired | Refusal::Limit => E::Exhausted,
+        Refusal::Invalid | Refusal::Collision | Refusal::Hole | Refusal::ForeignMapping => {
+            E::Invalid
+        }
+    }
+}
+
+fn fork_error(error: ForkError) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    use carrick_core::mm::fork::ForkOwnerRefusal as O;
+    match error {
+        ForkError::Busy | ForkError::ParentChanged => E::Busy,
+        ForkError::NoMemory | ForkError::MetadataRequired => E::Exhausted,
+        ForkError::OwnerRefusal(O::Limit) => E::Exhausted,
+        ForkError::Stale => E::Stale,
+        ForkError::Invalid
+        | ForkError::OwnerRefusal(O::Invalid | O::Collision | O::Hole | O::ForeignMapping) => {
+            E::Invalid
+        }
+        ForkError::Core => E::Quarantined,
+    }
+}
+
+fn stock_error(
+    refusal: carrick_el1_abi::ForkStockRefusal,
+) -> super::native_process_runtime::NativeProcessError {
+    use super::native_process_runtime::NativeProcessError as E;
+    use carrick_el1_abi::ForkStockRefusal as R;
+    match refusal {
+        R::Invalid => E::Invalid,
+        R::Stale => E::Stale,
+        R::Capacity => E::Exhausted,
+        R::Inventory => E::Busy,
+        // The fork owner grows the table and answers `Busy` itself. This
+        // cause survives only when that growth was refused for good.
+        R::Residency => E::Exhausted,
+    }
+}
+
+/// The publish step's refusal, before its loan is returned: either an
+/// ordinary refusal, or a demand for one more reservation node bank.
+#[must_use = "a node bank demand must be supplied after the fork's loan is returned"]
+pub enum PublishRefusal {
+    Refused(super::native_process_runtime::NativeProcessError),
+    NodeBank(NodeBankDemand),
+}
+
+/// The child's reservation tree needed more nodes than the shared pool
+/// held at `observed` (#3085). Not an errno: the venue returns its fork
+/// loan and releases every MM guard, then [`Self::supply`] adds one bank
+/// through the existing bank supply and the fork reruns against it. Each
+/// supply grows the pool, so reruns are bounded by the `BANKS` table.
+#[must_use = "a node bank demand must be supplied after the fork's loan is returned"]
+#[derive(Debug)]
+pub struct NodeBankDemand {
+    observed: carrick_core::mm::reservation::NodeCapacity,
+}
+
+impl NodeBankDemand {
+    /// Supply the bank, holding no MM editor, root guard or fork loan.
+    /// `Busy` reruns the fork (a bank was added, by this call or by a
+    /// concurrent supplier still publishing its bank); only a pool that can
+    /// take no more banks answers EAGAIN.
+    pub fn supply<
+        Policy: carrick_el1_abi::ReservationPolicy,
+        Geometry: carrick_el1_abi::ReservationGeometry,
+    >(
+        self,
+        roots: &carrick_core::mm::reservation::SharedReservations<Policy, Geometry>,
+        allocator: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+    ) -> super::native_process_runtime::NativeProcessError {
+        match roots.supply_node_bank(allocator, self.observed) {
+            Ok(()) | Err(Refusal::Busy) => super::native_process_runtime::NativeProcessError::Busy,
+            Err(Refusal::MetadataRequired) => {
+                refused(NativeForkStage::Publish, NativeForkCause::NodeBanksFull)
+            }
+            Err(refusal) => refused(NativeForkStage::Publish, refusal),
+        }
+    }
+}
+
+/// Classify a refused publish against the node capacity the venue sampled
+/// before it ([`carrick_core::mm::reservation::SharedReservations::node_capacity`]).
+pub fn refused_publish(
+    error: MmError,
+    observed: carrick_core::mm::reservation::NodeCapacity,
+) -> PublishRefusal {
+    match error {
+        MmError::MetadataRequired => PublishRefusal::NodeBank(NodeBankDemand { observed }),
+        error => PublishRefusal::Refused(refused(NativeForkStage::Publish, error)),
     }
 }
 
@@ -328,8 +458,184 @@ mod tests {
                 cause: NativeForkCause::Mm(MmError::Stale),
             }
             .error(),
-            NativeProcessError::Fault
+            NativeProcessError::Stale
         );
+    }
+
+    /// #3085: the encoding is exhaustive and no cause answers EFAULT, which
+    /// Linux never returns from `fork`. Capacity is EAGAIN; contention has
+    /// no errno; a broken invariant stays a typed native failure.
+    #[test]
+    fn no_fork_refusal_answers_efault() {
+        use carrick_core::mm::fork::ForkOwnerRefusal as O;
+        use carrick_el1_abi::ForkStockRefusal as R;
+        use carrick_mmu_core::aarch64::PageTableError;
+        let mut causes = std::vec![
+            NativeForkCause::Busy,
+            NativeForkCause::GateShut,
+            NativeForkCause::NodeBanksFull,
+            NativeForkCause::StockCrossing {
+                status: 1,
+                reply: None
+            },
+        ];
+        for mm in [
+            MmError::Fault,
+            MmError::UnsupportedExecutableCow,
+            MmError::Stale,
+            MmError::Busy,
+            MmError::ParentChanged,
+            MmError::CowUnsettled,
+            MmError::NoMemory,
+            MmError::MetadataRequired,
+            MmError::Invalid,
+            MmError::Core,
+            MmError::Table(PageTableError::OutOfTables),
+            MmError::Table(PageTableError::BadAddress),
+        ] {
+            causes.push(NativeForkCause::Mm(mm));
+        }
+        for refusal in [
+            Refusal::Busy,
+            Refusal::PreparedConflict,
+            Refusal::Stale,
+            Refusal::Invalid,
+            Refusal::Collision,
+            Refusal::Hole,
+            Refusal::ForeignMapping,
+            Refusal::Limit,
+            Refusal::MetadataRequired,
+        ] {
+            causes.push(NativeForkCause::Reservation(refusal));
+            causes.push(NativeForkCause::Mm(MmError::Reservation(refusal)));
+        }
+        for fork in [
+            ForkError::Invalid,
+            ForkError::NoMemory,
+            ForkError::Busy,
+            ForkError::Stale,
+            ForkError::ParentChanged,
+            ForkError::MetadataRequired,
+            ForkError::Core,
+            ForkError::OwnerRefusal(O::Invalid),
+            ForkError::OwnerRefusal(O::Collision),
+            ForkError::OwnerRefusal(O::Hole),
+            ForkError::OwnerRefusal(O::ForeignMapping),
+            ForkError::OwnerRefusal(O::Limit),
+        ] {
+            causes.push(NativeForkCause::Fork(fork));
+        }
+        for reply in [
+            R::Invalid,
+            R::Stale,
+            R::Capacity,
+            R::Inventory,
+            R::Residency,
+        ] {
+            causes.push(NativeForkCause::StockReservation(reply));
+            causes.push(NativeForkCause::StockCrossing {
+                status: 2,
+                reply: Some(reply),
+            });
+            // A crossing's typed reply is that stock refusal.
+            assert_eq!(
+                NativeForkRefusal {
+                    stage: NativeForkStage::StockCrossing,
+                    cause: NativeForkCause::StockCrossing {
+                        status: 2,
+                        reply: Some(reply)
+                    },
+                }
+                .error(),
+                NativeForkRefusal {
+                    stage: NativeForkStage::Reserve,
+                    cause: NativeForkCause::StockReservation(reply),
+                }
+                .error()
+            );
+        }
+        for cause in causes {
+            let error = NativeForkRefusal {
+                stage: NativeForkStage::Publish,
+                cause,
+            }
+            .error();
+            assert_ne!(error, NativeProcessError::Fault, "{cause:?}");
+            if let Ok(failure) = error.failure() {
+                assert_ne!(failure.errno(), -14, "{cause:?}");
+            }
+        }
+        // Capacity is EAGAIN.
+        for cause in [
+            NativeForkCause::NodeBanksFull,
+            NativeForkCause::Mm(MmError::MetadataRequired),
+            NativeForkCause::Mm(MmError::NoMemory),
+            NativeForkCause::Fork(ForkError::OwnerRefusal(O::Limit)),
+        ] {
+            assert_eq!(
+                refused(NativeForkStage::Publish, cause)
+                    .failure()
+                    .map(|failure| failure.errno()),
+                Ok(-11),
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// #3085: a publish refused `MetadataRequired` is a node bank demand,
+    /// never an errno; every other publish refusal keeps its stage and cause.
+    #[test]
+    fn a_publish_short_of_nodes_demands_a_bank() {
+        use carrick_el1::memory::reservations::SharedReservations;
+        // SAFETY: an all-zero table is the empty, unpublished table.
+        let table: std::boxed::Box<SharedReservations> = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>());
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr.cast())
+        };
+        let observed = table.node_capacity();
+        assert!(matches!(
+            refused_publish(MmError::MetadataRequired, observed),
+            PublishRefusal::NodeBank(_)
+        ));
+        let PublishRefusal::Refused(error) = refused_publish(MmError::ParentChanged, observed)
+        else {
+            panic!("a changed parent is no node demand")
+        };
+        assert_eq!(
+            error,
+            NativeProcessError::ForkRefused(NativeForkRefusal {
+                stage: NativeForkStage::Publish,
+                cause: NativeForkCause::Mm(MmError::ParentChanged),
+            })
+        );
+        // A full pool: the demand answers EAGAIN, typed, at Publish.
+        let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
+        else {
+            unreachable!()
+        };
+        let empty = carrick_el1::alloc::MetadataStorage::new();
+        let error = demand.supply(&table, &empty);
+        assert_eq!(
+            error,
+            NativeProcessError::ForkRefused(NativeForkRefusal {
+                stage: NativeForkStage::Publish,
+                cause: NativeForkCause::NodeBanksFull,
+            })
+        );
+        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-11));
+        // An allocator with an extent supplies the bank: the fork reruns.
+        let mut backing = std::vec![0u8; 2 * 1024 * 1024];
+        let allocator = carrick_el1::alloc::MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
+        else {
+            unreachable!()
+        };
+        assert_eq!(demand.supply(&table, &allocator), NativeProcessError::Busy);
+        assert_ne!(table.node_capacity(), observed);
     }
 
     #[test]
@@ -381,7 +687,12 @@ mod tests {
                 cause: NativeForkCause::Fork(ForkError::Core),
             })
         );
-        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-14));
+        // A census that found the owner's own records broken is quarantine,
+        // never EFAULT (#3085).
+        assert_eq!(
+            error.failure(),
+            Ok(super::super::native_process_runtime::NativeFailure::Quarantined)
+        );
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
     }
@@ -397,11 +708,10 @@ mod tests {
             ] {
                 assert_eq!(refused(stage, cause).failure(), Err(NativeContention::BUSY));
             }
+            // A broken owner record is an invariant failure, not EFAULT.
             assert_eq!(
-                refused(stage, MmError::Fault)
-                    .failure()
-                    .map(|failure| failure.errno()),
-                Ok(-14)
+                refused(stage, MmError::Fault).failure(),
+                Ok(super::super::native_process_runtime::NativeFailure::Invalid)
             );
         }
     }
