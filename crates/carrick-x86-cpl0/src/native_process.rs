@@ -716,14 +716,16 @@ fn grow_fork_residency() -> NativeProcessError {
         | Err(ResidencyGrowthRefusal::Metadata(
             carrick_core::mm::reservation::MetadataMiss::GrantPending,
         )) => NativeProcessError::Busy,
-        // `grow` waits out a racing append; this answer is a broken table.
-        Err(ResidencyGrowthRefusal::Publishing) => NativeProcessError::Invalid,
+        // `grow` waits out a racing append, and an extent its own
+        // allocator returned is valid: either answer is a broken table.
+        Err(ResidencyGrowthRefusal::Publishing | ResidencyGrowthRefusal::InvalidExtent) => {
+            NativeProcessError::Invalid
+        }
         Err(
             ResidencyGrowthRefusal::Metadata(
                 carrick_core::mm::reservation::MetadataMiss::Exhausted,
             )
-            | ResidencyGrowthRefusal::Full
-            | ResidencyGrowthRefusal::InvalidExtent,
+            | ResidencyGrowthRefusal::Full,
         ) => refused(
             NativeForkStage::Reserve,
             carrick_el1_linux::native_fork_refusal::NativeForkCause::StockReservation(

@@ -537,9 +537,16 @@ impl FrameGrantResidencyTable {
         }
 
         let layout = Layout::new::<ResidencySegment>();
-        let (ptr, extent) = allocator
+        let allocation = allocator
             .allocate_with_extent(layout)
-            .map_err(ResidencyGrowthRefusal::Metadata)?;
+            .map_err(ResidencyGrowthRefusal::Metadata);
+        let (ptr, extent) = match allocation {
+            Ok(allocation) => allocation,
+            // A peer's segment published while this allocation missed
+            // serves the caller as well as this one would have (#3085).
+            Err(_) if self.extension_count() > observed_extensions => return Ok(()),
+            Err(refusal) => return Err(refusal),
+        };
         let location = ResidencySegmentLocation {
             guest_base: ptr as u64,
             extent,

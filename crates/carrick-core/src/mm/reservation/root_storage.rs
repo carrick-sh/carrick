@@ -11,14 +11,26 @@ pub(super) const BANKS: usize = 256;
 /// `MetadataRequired` refusal ([`SharedReservations::node_capacity`]). Only
 /// the table mints it, so a bank supply always names the capacity it found
 /// too small.
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct NodeCapacity(u32);
 
 /// Why a node bank supply left the pool at the capacity it observed
 /// (#3085). There is no contention answer: a concurrent bank append is a
 /// short critical section the supply waits out, and a concurrent bank that
 /// grew the pool is success.
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum NodeBankShortfall {
     /// The `BANKS` table is full: the pool can never grow again.
     Full,
