@@ -1134,15 +1134,15 @@ where
             // stage-2 window, and `EL1_MM_PORTAL_OFFSET` is aligned inside it.
             let portal =
                 unsafe { &*((ptr + EL1_MM_PORTAL_OFFSET as usize) as *const MmPortalSlots) };
-            // Owner-memory waits, and the root's transfer custody, authenticate
-            // against this binding: it is the carrier's one identity, the one
-            // its stage-2 core was minted with.
+            // Owner-memory waits authenticate against this binding: it is the
+            // carrier's one identity, the one its stage-2 core was minted with.
             if !portal.bind_carrier(engine.backend().carrier().raw()) {
                 return Err("soft carrier MM portal is already bound".to_owned());
             }
-            // Only the MM portal owner writes signal frames here, so EL1
-            // accepts a caught handler only for an owner-admitted MM; the
-            // root is admitted through the soft transfer custody (#2814).
+            // The soft engine has no owner-transfer custody, so the root's
+            // MM opens on the legacy venue and only the owner could write a
+            // signal frame there: EL1 accepts a caught handler only for an
+            // owner-admitted MM (#2814 retires this).
             if !portal.publish_signal_frame_custody(SignalFrameCustody::AdmittedOwner) {
                 return Err("soft carrier signal-frame custody is already published".to_owned());
             }

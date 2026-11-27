@@ -21,16 +21,12 @@ use carrick_aarch64::mailbox::{
     classify_hvc_immediate,
 };
 use carrick_aarch64::staged_cpu::{RootBootFields, StagedCpu};
-use carrick_aarch64::user_transfer::{
-    ErasedPhysicalCustody, ErasedTransferCustody, RetainedCopy, TransferBytes, TransferCustody,
-    TransferPin, TransferPreparation, TransferTarget,
-};
+use carrick_aarch64::user_transfer::{TransferPreparation, TransferTarget};
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
 use carrick_core::mm::own::{
-    BackendResult, CarrierCore, CarrierId, CoreVenue, GenerationId, GpaExtent, Holding,
-    MappingSpec, Pin as CorePin, PinRefusal, Retire,
+    BackendResult, CarrierCore, CarrierId, CoreVenue, GpaExtent, Holding, MappingSpec,
 };
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE, EL1_IPC_BASE, EL1_IPC_POOL_BASE,
@@ -211,8 +207,7 @@ impl Drop for WindowBacking {
 
 /// What one soft stage-2 window's backend mapping owns in the carrier core:
 /// its host backing and its default permissions. The core keeps it until
-/// the window's unmap or the carrier's destroy, so the host memory outlives
-/// every pin taken inside it.
+/// the window's unmap or the carrier's destroy.
 struct WindowHost {
     default_perms: MemPerms,
     shared: bool,
@@ -234,15 +229,15 @@ struct Stage2Window {
 }
 
 /// The soft carrier's one answer to a broken invariant of its records: a
-/// core dropped holding something, a ticket the core refused at once, or a
-/// pin outliving its window. It ends the carrier (`carrick_fatal`).
+/// core dropped holding something, or a ticket the core refused at once.
+/// It ends the carrier (`carrick_fatal`).
 #[cold]
 fn soft_carrier_broken(what: core::fmt::Arguments<'_>) -> ! {
     carrick_fatal::carrick_fatal!("softcpu::carrier_core", "{what}")
 }
 
-/// The soft carrier's venue: a core dropped holding a mapping or a pin is a
-/// broken invariant, and ends the carrier.
+/// The soft carrier's venue: a core dropped holding a mapping is a broken
+/// invariant, and ends the carrier.
 enum SoftCoreVenue {}
 
 impl CoreVenue for SoftCoreVenue {
@@ -253,8 +248,9 @@ impl CoreVenue for SoftCoreVenue {
     }
 }
 
-/// The soft carrier's records: every window is one backend mapping with one
-/// frame extent carved over it, so a transfer pins the core's extent.
+/// The soft carrier's records: every window is one backend mapping. Frame
+/// extents carved over them come with the soft transfer custody (#2814,
+/// #3061 step 3).
 type SoftCore = CarrierCore<SoftCoreVenue, WindowHost, ()>;
 
 /// A carrier identity no other live soft core holds.
@@ -285,8 +281,7 @@ pub struct SoftStage2 {
 impl Drop for SoftStage2 {
     /// End the carrier's generation through the core: every window's host
     /// backing comes back and drops here, before the retained metadata and
-    /// IPC backings the external windows borrow. A transfer pin still held
-    /// leaves a terminal extent, and the core's drop check ends the carrier.
+    /// IPC backings the external windows borrow.
     fn drop(&mut self) {
         let Ok((ticket, _destroy)) = self.core.begin_destroy() else {
             return;
@@ -431,10 +426,10 @@ impl SoftStage2 {
         })
     }
 
-    /// Install one window in the carrier core: reserve its extent, map it
+    /// Install one window in the carrier core: reserve its extent and map it
     /// (the soft backend's map is the record itself, so it completes at
-    /// once), and carve one frame extent over it for transfer pins. A
-    /// refusal hands the host backing back, so a failed install unmaps it.
+    /// once). A refusal hands the host backing back, so a failed install
+    /// unmaps it.
     fn install_window(
         &mut self,
         extent: GpaExtent,
@@ -457,13 +452,6 @@ impl SoftStage2 {
         if let Err(refused) = self.core.finish_map(ticket, BackendResult::Done) {
             soft_carrier_broken(format_args!(
                 "soft map ticket refused at once: {:?}",
-                refused.reason
-            ));
-        }
-        if let Err(refused) = self.core.carve(extent, ()) {
-            soft_carrier_broken(format_args!(
-                "soft window {:#x} could not carve its own extent: {:?}",
-                extent.ipa(),
                 refused.reason
             ));
         }
@@ -574,11 +562,8 @@ impl SoftStage2 {
         )))
     }
 
-    /// Retire the window's frame extent and unmap it from the core, which
-    /// hands its host backing back to drop. A window pinned by a transfer
-    /// can't be removed: the soft carrier has one vCPU, and a pin lives only
-    /// inside one crossing's copy, so a pin across a removal is a broken
-    /// invariant.
+    /// Unmap the window from the core, which hands its host backing back to
+    /// drop.
     fn remove_window(&mut self, extent: GpaExtent) -> Result<(), TrapError> {
         let view = self
             .core
@@ -588,20 +573,6 @@ impl SoftStage2 {
                 TrapError::Hypervisor(format!("no soft window at {:#x}", extent.ipa()))
             })?;
         let mapping = view.id;
-        if let Some(carved) = self.core.live_extent_at(extent.ipa()) {
-            match self.core.retire_extent(carved) {
-                Ok(Retire::Released(_)) => {}
-                Ok(Retire::Deferred) => soft_carrier_broken(format_args!(
-                    "soft window {:#x} removed while a transfer pins it",
-                    extent.ipa()
-                )),
-                Err(reason) => {
-                    return Err(TrapError::Hypervisor(format!(
-                        "soft window extent retire refused: {reason:?}"
-                    )));
-                }
-            }
-        }
         let (ticket, _unmap) = self.core.begin_unmap(mapping).map_err(|reason| {
             TrapError::Hypervisor(format!("soft window unmap refused: {reason:?}"))
         })?;
@@ -613,44 +584,6 @@ impl SoftStage2 {
             )),
         }
         Ok(())
-    }
-
-    /// Pin the frame extent holding `[ipa, ipa + len)` for one transfer.
-    fn pin_transfer(&mut self, ipa: u64, len: u64) -> Result<CorePin, PinRefusal> {
-        self.core.pin(ipa, len)
-    }
-
-    fn unpin_transfer(&mut self, pin: CorePin) {
-        match self.core.unpin(pin) {
-            Ok(None) => {}
-            Ok(Some(_)) | Err(_) => {
-                soft_carrier_broken(format_args!("a soft transfer pin outlived its window"))
-            }
-        }
-    }
-
-    fn generation(&self) -> GenerationId {
-        self.core.generation().0
-    }
-
-    /// Advance the code generation of every 4 KiB frame a transfer wrote
-    /// through its pin, as `write_gpa_bytes` does for host writes.
-    fn invalidate_transfer_write(&mut self, ipa: u64, len: u64) -> bool {
-        let Some(end) = ipa.checked_add(len).filter(|_| len > 0) else {
-            return false;
-        };
-        let mut frame = ipa & !(GUEST_PAGE_BYTES - 1);
-        while frame < end {
-            if self
-                .extents
-                .invalidate_host_written_page(FrameGpa::new(frame), OWNER)
-                .is_err()
-            {
-                return false;
-            }
-            frame += GUEST_PAGE_BYTES;
-        }
-        true
     }
 }
 
@@ -2139,8 +2072,8 @@ where
 
 impl<X> SoftAarch64Vmm<X> {
     /// This carrier's one identity, minted once with its stage 2's core.
-    /// The MM portal binds to it and the transfer custody names it, so
-    /// nothing mints a second one for the same carrier.
+    /// The MM portal and the birth source bind to it, so nothing mints a
+    /// second one for the same carrier.
     #[must_use]
     pub fn carrier(&self) -> CarrierId {
         self.stage2.carrier
@@ -2767,14 +2700,6 @@ where
         Arc::new(GenericVcpuRegistry::new())
     }
 
-    /// The soft root's MM is portal-admitted through this custody (#2814).
-    fn owner_transfer_custody(&self) -> Option<Box<ErasedPhysicalCustody>> {
-        Some(Box::new(ErasedTransferCustody(SoftTransferCustody {
-            stage2: Arc::downgrade(&self.stage2),
-            carrier: self.carrier().raw(),
-        })))
-    }
-
     /// Soft file windows are mapped whole when they are added, so no lazy
     /// file grant is ever owed. One reaching here fails the run loudly; it
     /// must never decline and turn a valid page into the fault's `SIGSEGV`.
@@ -2783,183 +2708,8 @@ where
         _target: TransferTarget,
         _window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<TransferPreparation, TrapError> {
-        Err(SoftTransferCustody::refuse("lazy file grants"))
-    }
-}
-
-/// The soft carrier's physical half of UserTransfer (#2814, #1236 step 1b).
-/// EL1 selects and authorizes the user VA; this resolves only its IPA, by
-/// pinning the carrier core's frame extent that holds it. The byte rules are
-/// the shared [`RetainedCopy`]'s.
-struct SoftTransferCustody {
-    stage2: Weak<ExclusiveStage2>,
-    carrier: NonZeroU64,
-}
-
-impl SoftTransferCustody {
-    fn refuse(what: &str) -> TrapError {
-        TrapError::Hypervisor(format!(
-            "the soft carrier does not serve {what} yet (#1236 step 1b)"
+        Err(TrapError::Hypervisor(
+            "the soft carrier does not serve lazy owner file grants".to_owned(),
         ))
-    }
-}
-
-impl TransferCustody for SoftTransferCustody {
-    type Pin = SoftRetainedUserData;
-
-    fn carrier(&self) -> NonZeroU64 {
-        self.carrier
-    }
-
-    /// Soft guest RAM is host-backed when its window is mapped, so an owner
-    /// grant is never needed to back it. One reaching here is a defect to
-    /// find, so it fails the run loudly rather than declining.
-    fn prepare(
-        &self,
-        _target: TransferTarget,
-        _window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<TransferPreparation, TrapError> {
-        Err(Self::refuse("owner grants"))
-    }
-
-    fn publish_executable(
-        &self,
-        _target: TransferTarget,
-        _request: carrick_core_abi::PortalExecutablePublication,
-    ) -> bool {
-        false
-    }
-
-    /// No copy-on-write state exists before the soft carrier can fork.
-    fn refill_cow(
-        &self,
-        _target: TransferTarget,
-        _window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<bool, TrapError> {
-        Ok(false)
-    }
-
-    fn retain(
-        &self,
-        selected: carrick_el1_abi::PortalSelectedData,
-        len: usize,
-        intent: carrick_el1_abi::PortalTransferIntent,
-    ) -> Result<Option<Self::Pin>, TrapError> {
-        let invariant =
-            || TrapError::Hypervisor("soft UserTransfer custody invariant refused".to_owned());
-        if len == 0 || len > PAGE_BYTES_USIZE {
-            return Err(invariant());
-        }
-        let cell = self.stage2.upgrade().ok_or_else(invariant)?;
-        let mut stage2 = cell.try_borrow()?;
-        let pin = match stage2.pin_transfer(selected.ipa, len as u64) {
-            Ok(pin) => pin,
-            // Absent backing: the owner may select again.
-            Err(PinRefusal::NoLiveExtent) => return Ok(None),
-            // A known extent overrun, or an exhausted pin count, is permanent.
-            Err(reason) => {
-                return Err(TrapError::Hypervisor(format!(
-                    "soft UserTransfer pin refused: {reason:?}"
-                )));
-            }
-        };
-        let identity = carrick_el1_abi::PortalRetainedData {
-            record: pin.extent().record(),
-            vm_generation: NonZeroU64::new(stage2.generation().0).ok_or_else(invariant)?,
-            owner: None,
-        };
-        let pointer = pin.host_addr() as *mut u8;
-        drop(stage2);
-        // SAFETY: the core pin keeps the frame extent, and with it the
-        // window's host backing, alive until `SoftRetainedUserData` drops.
-        let bytes =
-            unsafe { RetainedCopy::new(self.carrier, identity, selected, intent, pointer, len) };
-        Ok(Some(SoftRetainedUserData {
-            stage2: Arc::downgrade(&cell),
-            pin: Some(pin),
-            bytes,
-        }))
-    }
-}
-
-/// One soft transfer's retention: a core pin on the frame extent, and the
-/// shared byte rules over its host bytes.
-struct SoftRetainedUserData {
-    stage2: Weak<ExclusiveStage2>,
-    pin: Option<CorePin>,
-    bytes: RetainedCopy,
-}
-
-impl SoftRetainedUserData {
-    /// A completed write advances the written frames' code generations.
-    fn publish_completed_write(&self, len: usize) -> bool {
-        let Some(cell) = self.stage2.upgrade() else {
-            return false;
-        };
-        let Ok(mut stage2) = cell.try_borrow() else {
-            return false;
-        };
-        stage2.invalidate_transfer_write(self.bytes.selected().ipa, len as u64)
-    }
-}
-
-impl TransferPin for SoftRetainedUserData {
-    fn identity(&self) -> carrick_el1_abi::PortalRetainedData {
-        self.bytes.identity()
-    }
-
-    fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool {
-        if self.bytes.intent().is_write() {
-            self.copy_out(request, bytes)
-        } else {
-            self.bytes.copy(request, TransferBytes::Read(bytes))
-        }
-    }
-
-    fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool {
-        if !self.bytes.intent().is_write() || !self.bytes.copy(request, TransferBytes::Write(bytes))
-        {
-            return false;
-        }
-        if !self.publish_completed_write(bytes.len()) {
-            soft_carrier_broken(format_args!("completed write publication failed"));
-        }
-        true
-    }
-
-    fn atomic_compare_exchange_u32(
-        &mut self,
-        request: carrick_el1_abi::PortalCopyRequest<'_>,
-        expected: u32,
-        desired: u32,
-    ) -> Option<u32> {
-        let observed = self
-            .bytes
-            .compare_exchange_u32(request, expected, desired)?;
-        if observed == expected && !self.publish_completed_write(4) {
-            return None;
-        }
-        Some(observed)
-    }
-}
-
-impl Drop for SoftRetainedUserData {
-    /// Return the core pin. The soft carrier has one vCPU, and a transfer
-    /// drops its pin between guest instructions, so the stage 2 is never
-    /// borrowed here; if it were, the pin would leak into a terminal extent
-    /// and the carrier's drop check would end it.
-    fn drop(&mut self) {
-        let Some(pin) = self.pin.take() else {
-            return;
-        };
-        let Some(cell) = self.stage2.upgrade() else {
-            return;
-        };
-        match cell.try_borrow() {
-            Ok(mut stage2) => stage2.unpin_transfer(pin),
-            Err(_) => soft_carrier_broken(format_args!(
-                "a transfer pin dropped while the soft stage 2 was borrowed"
-            )),
-        }
     }
 }
