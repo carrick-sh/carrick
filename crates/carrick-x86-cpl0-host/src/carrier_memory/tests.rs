@@ -408,3 +408,9 @@ fn window_slot_budget_bounds_windows_preserves_headroom_and_rolls_back() {
     let large = CarrierMemory::new(LargeSlotIo).unwrap();
     assert_eq!(large.available_window_slots(), MAX_WINDOW_SLOTS);
 }
+#[test]
+fn cow_settlement_accepts_a_replacement_a_sibling_protected_first() {
+    test_support::cow_settlement_accepts_a_replacement_a_sibling_protected_first(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}

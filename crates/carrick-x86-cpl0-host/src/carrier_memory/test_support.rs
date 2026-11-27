@@ -1973,3 +1973,141 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
     );
     assert!(!memory.is_quarantined());
 }
+
+/// #2875 (slice A review P0): the guest publishes a COW replacement before
+/// it crosses to settle it, so a sibling thread may edit that leaf first. A
+/// sibling's `mprotect(PROT_NONE)` leaves the replacement frame in a
+/// no-access leaf, and its `mprotect(PROT_READ)` leaves it present without
+/// hardware write. Both are owned states of the replacement, so the
+/// carrier's COW settlement must accept them rather than quarantine the
+/// carrier (the production `publish` of the guest's `CowRepoint`).
+pub fn cow_settlement_accepts_a_replacement_a_sibling_protected_first(_make: fn() -> MemoryTestIo) {
+    let span = PageSpan::new(0x4000, PAGE);
+    let read_only = Permissions {
+        writable: false,
+        executable: false,
+        user: true,
+    };
+    let siblings = [
+        DescriptorOp::ProtectNone {
+            span,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
+        },
+        DescriptorOp::Protect {
+            span,
+            permissions: read_only,
+            exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Leaf,
+            cow_ceiling: None,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
+        },
+    ];
+    for sibling in siblings {
+        let mut memory = CarrierMemory::new(_make()).unwrap();
+        memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
+        let context = AddressContext {
+            root: root(0x1000),
+            mm: MmGeneration::new(nz(1)),
+            generation: ContextGeneration::new(nz(1)),
+        };
+        memory.install_root(nz(1), context).unwrap();
+        let mut inventory = Inventory {
+            live: false,
+            fail_publish: false,
+            fail_commit: false,
+            fail_rollback: false,
+        };
+        let id = DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(1),
+        };
+        let tables = [root(0x2000), root(0x3000), root(0x4000)];
+        let run = |memory: &mut CarrierMemory<MemoryTestIo>,
+                   inventory: &mut Inventory,
+                   tables: &[RootGpa],
+                   op: DescriptorOp,
+                   publish: bool| {
+            let txn = DescriptorTxn {
+                id,
+                root: context.root,
+                tables,
+                op,
+            };
+            let receipt = execute_descriptor_txn(
+                &memory.words(),
+                &txn,
+                context.root,
+                &mut InlineJournal::new(),
+            );
+            let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt);
+            assert!(
+                publication.is_some(),
+                "guest edit {op:?} applies: {receipt:?}"
+            );
+            let publication = publication.unwrap();
+            if publish {
+                memory.publish(&txn, publication, inventory)
+            } else {
+                Ok(publication)
+            }
+        };
+        let old = backing(0x800000, PAGE as usize, 2);
+        let new = backing(0x900000, PAGE as usize, 3);
+        let (old_identity, new_identity) = (old.identity, new.identity);
+        memory.prepare(&[old], &mut inventory).unwrap();
+        let rw = Permissions {
+            writable: true,
+            ..read_only
+        };
+        let prepare = DescriptorOp::Prepare {
+            span,
+            output: FrameGpa::new(0x800000),
+            permissions: rw,
+            resident: span,
+            backing: old_identity,
+        };
+        run(&mut memory, &mut inventory, &tables, prepare, true).unwrap();
+        run(
+            &mut memory,
+            &mut inventory,
+            &[],
+            DescriptorOp::ArmCow(span),
+            true,
+        )
+        .unwrap();
+        memory.prepare(&[new], &mut inventory).unwrap();
+        let repoint = DescriptorOp::CowRepoint {
+            span,
+            old: FrameGpa::new(0x800000),
+            new: FrameGpa::new(0x900000),
+            backing: new_identity,
+        };
+        // The guest's COW store publishes the replacement in guest...
+        let publication = run(&mut memory, &mut inventory, &[], repoint, false).unwrap();
+        // ...a sibling edits it before the settlement crosses...
+        run(&mut memory, &mut inventory, &[], sibling, false).unwrap();
+        // ...and the settlement then publishes the guest's repoint.
+        let repoint_txn = DescriptorTxn {
+            id,
+            root: context.root,
+            tables: &[],
+            op: repoint,
+        };
+        let settled = memory.publish(&repoint_txn, publication, &mut inventory);
+        assert!(
+            settled.is_ok() && !memory.is_quarantined(),
+            "a sibling's {sibling:?} of the replacement is an owned state, not a broken \
+             invariant: {settled:?}"
+        );
+        let (leaf, _) = read_terminal_descriptor(
+            &memory.words(),
+            context.root,
+            carrick_guest_arch::UserVa::new(0x4000),
+        )
+        .unwrap();
+        assert_eq!(
+            leaf & (ADDRESS | COW),
+            0x900000,
+            "the replacement frame, unarmed"
+        );
+    }
+}
