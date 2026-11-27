@@ -175,14 +175,19 @@ impl GuestRam {
         let head = host - start;
         let tail = span - head - len;
         // SAFETY: both trims name parts of the mapping made just above that
-        // lie outside the kept `host..host + len`.
-        unsafe {
-            if head != 0 {
-                libc::munmap(mapped, head);
-            }
-            if tail != 0 {
-                libc::munmap((host + len) as *mut libc::c_void, tail);
-            }
+        // lie outside the kept `host..host + len`; on a failed trim the
+        // whole span this call mapped is released before the error returns.
+        let trimmed = unsafe {
+            (head == 0 || libc::munmap(mapped, head) == 0)
+                && (tail == 0 || libc::munmap((host + len) as *mut libc::c_void, tail) == 0)
+        };
+        if !trimmed {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: as above; unmapping an already-unmapped part is harmless.
+            unsafe { libc::munmap(mapped, span) };
+            return Err(OsError::new(format!(
+                "guest_ram: trimming the aligned mapping for 0x{base:x}+{len}: {error}"
+            )));
         }
         #[cfg(target_os = "linux")]
         if placement == HostPlacement::LargePage {

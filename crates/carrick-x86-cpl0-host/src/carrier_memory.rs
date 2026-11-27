@@ -2,7 +2,8 @@
 //! Dedicated bounded hardware slots project extents, never one slot per page/MM.
 //! This preparation has no public vCPU/run handle. The accepted N1 editor must
 //! enclose publication and physical rollback; M5 will bind execution admission.
-use crate::guest_ram::{GuestRam, HostPlacement, WindowKind};
+pub use crate::guest_ram::HostPlacement;
+use crate::guest_ram::{GuestRam, WindowKind};
 use carrick_core::mm::own::{DrainContext, HoldError, MmKey, SlotHolds};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{AddressContext, FrameGpa, RootGpa};
@@ -153,6 +154,16 @@ pub enum IpcWindowPart {
     Pool,
 }
 
+/// `CARRICK_X86_LARGE_WINDOWS=0` keeps every owner-grant window on page
+/// placement (#3105); anything else, or unset, places whole 2 MiB windows on
+/// large host pages.
+fn large_windows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_X86_LARGE_WINDOWS").is_none_or(|value| value != "0")
+    })
+}
+
 pub struct BackingExtent {
     storage: ExtentStorage,
     pub base: FrameGpa,
@@ -195,8 +206,12 @@ impl BackingExtent {
     /// take one nested page fault per window, not one per 4 KiB page. Any
     /// other window keeps page placement. GPA and host placement are chosen
     /// together here, so neither can be aligned without the other.
-    pub fn owner_window(next: &mut FrameGpa, len: usize) -> Result<Self, MemoryError> {
-        let large = (len as u64).is_multiple_of(HostPlacement::LARGE_PAGE_BYTES);
+    pub fn owner_window(
+        next: &mut FrameGpa,
+        len: usize,
+    ) -> Result<(Self, HostPlacement), MemoryError> {
+        let large =
+            large_windows_enabled() && (len as u64).is_multiple_of(HostPlacement::LARGE_PAGE_BYTES);
         let base = if large {
             next.raw()
                 .checked_next_multiple_of(HostPlacement::LARGE_PAGE_BYTES)
@@ -214,7 +229,7 @@ impl BackingExtent {
         };
         let extent = Self::private_placed(FrameGpa::new(base), len, placement)?;
         *next = FrameGpa::new(end);
-        Ok(extent)
+        Ok((extent, placement))
     }
 
     /// Retain the original IPC allocation without copying it or assuming
