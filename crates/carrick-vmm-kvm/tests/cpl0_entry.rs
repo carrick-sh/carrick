@@ -3306,6 +3306,23 @@ fn production_selected_grant_occupied_decline_replans_in_a_fork_child() {
     assert_eq!(outcome.run.terminating_signal, None);
 }
 
+/// #2766: a selected window the reservation root no longer authenticates
+/// (`StaleRoot`: a sibling thread unmapped or re-protected part of it between
+/// the selection and its serve) is a stale selection, not a refused access.
+/// The access reruns, reselects against the live mapping and completes; it
+/// never surfaces as `kernel fault policy refused: reason 0x9`.
+#[test]
+fn production_selected_grant_stale_selection_reruns_the_access() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_selected_grant_decline.S", &["-DSTALE"]);
+    let outcome = run_instrumented_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "a stale selection must rerun the access and publish it: {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
 /// #2579: a terminal descriptor refusal of an owner-selected publication is
 /// the typed unresolved fault (reason 9) for the faulting access at the #PF
 /// entry: no rerun or replan completes the access.

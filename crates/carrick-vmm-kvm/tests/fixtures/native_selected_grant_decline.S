@@ -8,12 +8,17 @@
  *               inherited pages keep their parent's data.
  *   -DTERMINAL  WrongMm: no rerun and no replan; the access never
  *               completes (exit 7 means it wrongly did).
+ *   -DSTALE     StaleRoot (#2766): the root no longer authenticates the
+ *               selected window, as after a sibling thread's munmap or
+ *               mprotect of part of it. The access reruns, its reselection
+ *               publishes, and the write lands.
  * Exit 7 is success; 90-99 name the failed step.
  */
 #define INJECT_GRANT_CAPACITY_REFUSAL_ONCE -432
 #define INJECT_GRANT_OCCUPIED_REFUSAL_ONCE -431
 #define INJECT_GRANT_TERMINAL_REFUSAL_ONCE -430
 #define INJECT_GRANT_REFUSAL_CENSUS -429
+#define INJECT_GRANT_STALE_REFUSAL_ONCE -436
 
 .global _start
 .text
@@ -116,8 +121,23 @@ child:
     movq $0x11, 0x101000(%r14)
     mov $7, %edi
     jmp die
+#elif defined(STALE)
+    mov $INJECT_GRANT_STALE_REFUSAL_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm
+    movq $0x11, 0x101000(%r14)
+    mov $INJECT_GRANT_REFUSAL_CENSUS, %rax
+    syscall
+    shr $32, %rax
+    cmp $1, %rax
+    jne fail_census
+    cmpq $0x11, 0x101000(%r14)
+    jne fail_value
+    mov $7, %edi
+    jmp die
 #else
-#error "define CAPACITY, INHERITED or TERMINAL"
+#error "define CAPACITY, INHERITED, TERMINAL or STALE"
 #endif
 
 fail_arena:  mov $90, %edi; jmp die
