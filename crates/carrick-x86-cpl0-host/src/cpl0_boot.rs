@@ -5639,6 +5639,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody._vm.peak_slot_count() as u64)
     }
 
+    /// The KVM memslots the carrier holds now (#3099).
+    pub fn live_memslots(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody._vm.slot_count() as u64)
+    }
+
     pub fn fork_admission_refusal(
         &self,
     ) -> Result<Option<carrick_hal::fork_stock::ForkAdmissionRefusal>, TrapError> {
