@@ -4657,37 +4657,52 @@ fn production_fork_parent_stores_after_a_kernel_copy_on_write() {
 }
 
 /// #3061 PR 1a: a copy-on-write supply's own exclusion of its MM can meet
-/// the MM's editor held. That is contention: nothing is supplied, the
-/// selection stays published, the member withdraws it, parks on the
-/// editor's release and reruns, and the rerun's supply is published for the
-/// same MM. The host seam holds a real maintenance borrow across the first
-/// COW supply's probe and releases it right after, so each run is "Busy
-/// once, then supplied", asserted positively through the seam's counters.
+/// the MM's editor held. That is "not now": nothing is supplied, the member
+/// withdraws its selection, parks on the editor's release (enrolled on the
+/// release source it sampled before the probe), and reruns, and the rerun's
+/// supply is published for the same demand. It never re-rings the carrier
+/// while that editor is held.
+///
+/// The host seam holds a real in-ring edit across exactly one demand's
+/// supply probe: the `nth` supply of one MM, here the single-threaded
+/// parent's, so no sibling can supply its page (the forked child is another
+/// MM and touches nothing before the parent's stores are done). The seam
+/// stays armed until it holds the editor, and records the demand (MM, page,
+/// member). The row asserts, for that exact demand: one hold, its own supply
+/// published after it, and no carrier work its member rang while it stayed
+/// unsupplied (a bare re-ring instead of the editor-release wait).
 /// Run in a child process: the seam is process-global.
-fn cow_supply_waits_out_a_held_editor(test: &str, fixture: &str, expected: i32, mem_mib: usize) {
+fn cow_supply_waits_out_a_held_editor(test: &str, nth: u64) {
     use carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::{
-        EditorHoldSite, cow_supplied_after_editor_hold_for_test, editor_holds_for_test,
-        hold_editor_at_next_for_test,
+        EditorHoldSite, editor_holds_for_test, held_cow_demand_for_test,
+        hold_editor_at_nth_cow_supply_for_test,
     };
     const CHILD: &str = "CARRICK_3061_COW_EDITOR_CHILD";
+    const FIXTURE: &str = "native_fork_parent_copyout_then_store.S";
     if std::env::var_os(CHILD).is_some() {
-        let elf = native_exit_fixture(fixture);
-        hold_editor_at_next_for_test(EditorHoldSite::CowSupply);
-        let outcome = try_run_pool_fixture_with_root_affinity(&elf, mem_mib, ROOT_AFFINITY_ANY)
+        let elf = native_exit_fixture(FIXTURE);
+        hold_editor_at_nth_cow_supply_for_test(nth);
+        let outcome = try_run_pool_fixture_with_root_affinity(&elf, 256, ROOT_AFFINITY_ANY)
             .expect("COW supply beside a held editor run");
+        let (supplied, rerung) = held_cow_demand_for_test();
         assert_eq!(
             editor_holds_for_test(EditorHoldSite::CowSupply),
             1,
             "the seam never held a COW supply's editor"
         );
-        assert!(
-            cow_supplied_after_editor_hold_for_test() >= 1,
-            "no COW grant was supplied for the held MM after its editor's release"
+        assert_eq!(
+            rerung, 0,
+            "the held demand's member re-rang carrier work {rerung} time(s) while the \
+             editor was held, instead of parking on the editor's release"
+        );
+        assert_eq!(
+            supplied, 1,
+            "the held demand itself was supplied {supplied} time(s) after its editor's release"
         );
         assert_eq!(
             (outcome.run.exit_code, outcome.run.terminating_signal),
-            (expected, None),
-            "COW supply beside a held editor (see {fixture}): {:?}",
+            (0, None),
+            "COW supply beside a held editor (see {FIXTURE}): {:?}",
             outcome.run
         );
         return;
@@ -4705,25 +4720,23 @@ fn cow_supply_waits_out_a_held_editor(test: &str, fixture: &str, expected: i32, 
     );
 }
 
-/// The first supply is the parent's user-mode store after the fork.
+/// The held demand is the parent's first supply after the fork: its
+/// user-mode store to page C.
 #[test]
 fn production_fork_cow_store_waits_out_a_held_editor_then_is_supplied() {
     cow_supply_waits_out_a_held_editor(
         "production_fork_cow_store_waits_out_a_held_editor_then_is_supplied",
-        "native_fork_parent_copyout_then_store.S",
-        0,
-        256,
+        1,
     );
 }
 
-/// The first supplies are a fork child's kernel `read(2)` copies.
+/// The held demand is the parent's second supply after the fork: the
+/// kernel's `read(2)` copy into page A.
 #[test]
-fn production_fork_child_kernel_copy_waits_out_a_held_editor_then_is_supplied() {
+fn production_fork_kernel_copy_waits_out_a_held_editor_then_is_supplied() {
     cow_supply_waits_out_a_held_editor(
-        "production_fork_child_kernel_copy_waits_out_a_held_editor_then_is_supplied",
-        "native_fork_child_threads_read_cow.S",
-        7,
-        4096,
+        "production_fork_kernel_copy_waits_out_a_held_editor_then_is_supplied",
+        2,
     );
 }
 
