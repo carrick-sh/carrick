@@ -123,6 +123,14 @@ impl CarrierId {
     pub const unsafe fn assume_unique(raw: NonZeroU64) -> Self {
         Self(raw)
     }
+    /// A carrier identity never issued before in this process, from the one
+    /// carrier allocator: a carrier shell's own VM identity is drawn from
+    /// it too (x86 `CarrierVmId`), so the core and its carrier share it.
+    pub fn allocate() -> Option<Self> {
+        static CARRIERS: carrick_sched_core::process::identity_allocator::SerialAllocator =
+            carrick_sched_core::process::identity_allocator::SerialAllocator::new();
+        CARRIERS.allocate().map(Self)
+    }
     pub const fn raw(self) -> NonZeroU64 {
         self.0
     }
