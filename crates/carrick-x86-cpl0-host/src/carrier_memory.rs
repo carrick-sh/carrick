@@ -160,7 +160,7 @@ pub enum IpcWindowPart {
 fn large_windows_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_X86_LARGE_WINDOWS").is_none_or(|value| value != "0")
+        ::std::env::var_os("CARRICK_X86_LARGE_WINDOWS").is_none_or(|value| value != "0")
     })
 }
 
@@ -201,9 +201,11 @@ impl BackingExtent {
     /// Place and map one owner grant's window at the next free carrier GPA,
     /// advancing `next` past it (#3105). A window that is a whole number of
     /// 2 MiB large pages starts on a 2 MiB GPA boundary and gets a 2 MiB-
-    /// aligned host mapping advised for huge pages, so the hypervisor can
-    /// back it with one large stage-2 entry: the guest's first touches then
-    /// take one nested page fault per window, not one per 4 KiB page. Any
+    /// aligned host mapping. Where the host's transparent huge page policy
+    /// backs that mapping with large pages, the hypervisor can back it with
+    /// one large stage-2 entry: the guest's first touches then take one
+    /// nested page fault per window, not one per 4 KiB page. No huge page
+    /// advice is given, so host memory follows the host's own policy. Any
     /// other window keeps page placement. GPA and host placement are chosen
     /// together here, so neither can be aligned without the other.
     pub fn owner_window(

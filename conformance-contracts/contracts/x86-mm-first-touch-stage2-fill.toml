@@ -4,7 +4,7 @@ title = "An x86 first touch of a large-page window costs no hypervisor fault per
 guest_surfaces = ["vmm:kvm", "fault:first-touch", "kernel:stage2-mmu", "syscall:mmap"]
 semantic_authority = [
   "Linux KVM API documentation (Documentation/virt/kvm/api.rst): KVM_GET_STATS_FD and its per-vCPU pf_taken counter",
-  "Linux transparent huge page documentation (Documentation/admin-guide/mm/transhuge.rst): MADV_HUGEPAGE on a 2 MiB-aligned anonymous mapping",
+  "Linux transparent huge page documentation (Documentation/admin-guide/mm/transhuge.rst): the `always` policy backs a 2 MiB-aligned anonymous range with a huge page on first touch",
   "native x86_64 Linux execution of the identical static fixture",
 ]
 fixture = "carrick-cli::x86_kvm_run::mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault_per_page (x86_threads_first_touch.c with -DLARGE_ALIGN, four CLONE_VM threads released together by a futex, PAGES fresh private anonymous pages each from a 2 MiB boundary)"
@@ -18,17 +18,20 @@ faults for 4,096 touches (bpftrace on kvm:kvm_page_fault, #3105), about
 7.6 us each nested. Populating the host pages first (MADV_POPULATE_WRITE)
 removed none of them: the fault is KVM's lazy stage-2 fill, not a host page
 fault-in. A window of whole 2 MiB pages is now placed on a 2 MiB GPA
-boundary with a 2 MiB-aligned host mapping advised for huge pages, chosen
-together by BackingExtent::owner_window, so the hypervisor maps it with one
-large entry. Smaller and partial windows keep page placement and their
+boundary with a 2 MiB-aligned host mapping, chosen together by
+BackingExtent::owner_window, so where the host's transparent huge page
+policy backs it with a huge page the hypervisor maps it with one large
+entry. No huge page advice is given: host memory follows the host's own
+policy, so a sparsely touched window never costs more host memory than the
+same touches cost a native process on that host (#3143). Smaller and partial windows keep page placement and their
 per-page cost; KVM_PRE_FAULT_MEMORY was measured as the alternative and hung
 multi-threaded runs (#3105), so it is not used. The run's stage-2 faults are
 therefore bounded by a constant as the touched pages grow. A run must also
 have made every touched page a private leaf and placed each thread's aligned
 heap as whole large-page windows (ExecutionWitness.large_page_windows), so a
 run that faulted nothing, or that never took the placement path, cannot
-pass; a host with transparent huge pages off is reported as a missing
-prerequisite. CARRICK_X86_LARGE_WINDOWS=0 keeps page placement.
+pass; a host whose transparent huge page policy is not `always` is
+reported as a missing prerequisite. CARRICK_X86_LARGE_WINDOWS=0 keeps page placement.
 """
 
 [bindings]

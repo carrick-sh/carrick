@@ -1901,14 +1901,16 @@ fn mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault
         })
         .expect("an affine host_stage2_faults budget");
     // The hypervisor maps a window with one large entry only when the host
-    // backs it with a huge page; a host with transparent huge pages off
-    // cannot show the effect, so say so rather than report a regression.
+    // backs it with a huge page. Carrick gives no huge page advice (host
+    // memory follows the host's policy, #3143), so only a host whose policy
+    // is `always` can show the effect: say so rather than report a
+    // regression.
     let thp =
         std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
     assert!(
-        !thp.contains("[never]"),
-        "prerequisite: this host has transparent huge pages off ({thp:?}); \
-         large-page windows cannot reduce stage-2 faults here"
+        thp.contains("[always]"),
+        "prerequisite: this host's transparent huge page policy is not `always` \
+         ({thp:?}); large-page windows cannot reduce stage-2 faults here"
     );
     let dir = tempfile::tempdir().unwrap();
     let mut observed = Vec::new();
