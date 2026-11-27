@@ -1176,6 +1176,14 @@ where
             }
         }
         aperture_scope.lifecycle = Some(publish_root_lifecycle(&engine, &root_ctx)?);
+        // The first load's `Bind` admission imports the root's reservation
+        // root through this carrier's provider, as an HVF binding installs
+        // it: without one, EL1 never admits the root and refuses its BIND.
+        dispatcher
+            .install_reservation_provider(Arc::new(CarrierReservations::new(
+                engine.backend().retained_metadata(),
+            )))
+            .map_err(|e| format!("install the soft carrier's reservation provider: {e:?}"))?;
         // EL1 admits the root against the zone's own PID namespace and
         // issuers: hand the kernel's births to them before the first entry,
         // as the HVF and x86 carriers bind theirs.
