@@ -123,6 +123,7 @@ pub fn protect_x86_window(
 
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
+const SYS_MREMAP: u64 = 216;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
 const SYS_MADVISE: u64 = carrick_personality_linux::crossing::nr::MADVISE.raw();
@@ -633,6 +634,14 @@ pub fn decide_reservation_syscall_for_origin<
             }
             Err(MadviseRefusal::Unrouted) => return ReservationDisposition::Forward,
         },
+        SYS_MREMAP => match decide_mremap(frame.arguments(), model, service_origin) {
+            Ok(decision) => Ok(decision),
+            Err(MremapLeave::Return(value)) => return ReservationDisposition::Return(value),
+            Err(MremapLeave::Forward) => return ReservationDisposition::Forward,
+            Err(MremapLeave::Unavailable(refusal)) => {
+                return ReservationDisposition::Unavailable(refusal);
+            }
+        },
         _ => return ReservationDisposition::Forward,
     };
     match result {
@@ -655,6 +664,94 @@ pub fn decide_reservation_syscall_for_origin<
             | Refusal::MetadataRequired),
         ) => ReservationDisposition::Unavailable(error),
     }
+}
+
+/// `mremap(2)` against the caller's admitted root (#3152). The shared Linux
+/// validator answers a malformed request first, then the same root policy
+/// the host venue uses (`ReservationRoot::mremap`) decides the shape:
+/// shrink (a `Retire` of the tail), in-place growth (a `Prepare` of the
+/// extension) or a `MREMAP_MAYMOVE` relocation (one `Move`).
+///
+/// Unrouted (the caller's counted refusal) until their owner lands:
+/// `MREMAP_FIXED`, `MREMAP_DONTUNMAP`, a zero `old_size`, growth of a
+/// locked node (`RLIMIT_MEMLOCK` is the host venue's) and growth of a
+/// private file node (its extension's bytes, #3141). A run root whose
+/// geometry keeps a host VMA venue (AArch64) keeps its host `mremap`.
+#[inline(never)]
+fn decide_mremap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    args: [u64; 6],
+    model: &mut ReservationModel<'_, G, C>,
+    service_origin: ServiceOrigin,
+) -> Result<reservations::Decision, MremapLeave> {
+    use carrick_el1_abi::{ReservationNodeFlags, ReservationRange};
+    use reservations::{MoveTarget, Refusal};
+    const EFAULT: i64 = 14;
+    if service_origin == ServiceOrigin::Initial
+        && matches!(G::ROOT_HINT_VENUE, AnonymousHintVenue::Host)
+    {
+        return Err(MremapLeave::Forward);
+    }
+    let request = carrick_personality_linux::mm::mremap::request(
+        PAGE_SIZE, args[0], args[1], args[2], args[3], args[4],
+    )
+    .map_err(|errno| MremapLeave::Return(-i64::from(errno.get())))?;
+    if request.move_fixed || request.dontunmap || request.old_size == 0 {
+        return Err(MremapLeave::Forward);
+    }
+    let source = request
+        .old_address
+        .checked_add(request.old_size)
+        .and_then(|end| ReservationRange::new(request.old_address, end))
+        .ok_or(MremapLeave::Forward)?;
+    let mut growth_owned_elsewhere = false;
+    if request.new_size > request.old_size {
+        let _ = model.observe_range(source, &mut |mapping| {
+            growth_owned_elsewhere |= mapping
+                .flags
+                .intersects(ReservationNodeFlags::LOCKED.union(ReservationNodeFlags::FILE));
+        });
+    }
+    if growth_owned_elsewhere {
+        return Err(MremapLeave::Forward);
+    }
+    let target = if request.may_move {
+        MoveTarget::MayMove
+    } else {
+        MoveTarget::InPlace
+    };
+    model
+        .mremap(source, request.new_size, target)
+        .map_err(|refusal| match refusal {
+            // mremap(2) EFAULT: the old range is not one mapping. Only the
+            // allocation layout is this root's to answer for; a source
+            // outside it is not proven unmapped.
+            Refusal::Hole => {
+                let layout = model.layout();
+                let within =
+                    |r: ReservationRange| r.start() <= source.start() && source.end() <= r.end();
+                if within(layout.heap) || within(layout.arena) {
+                    MremapLeave::Return(-EFAULT)
+                } else {
+                    MremapLeave::Forward
+                }
+            }
+            // Growth over a limit, or nothing in place and no room.
+            Refusal::Limit => MremapLeave::Return(-ENOMEM),
+            Refusal::Invalid => MremapLeave::Return(-EINVAL),
+            Refusal::ForeignMapping | Refusal::Collision => MremapLeave::Forward,
+            error @ (Refusal::Busy
+            | Refusal::PreparedConflict
+            | Refusal::Stale
+            | Refusal::MetadataRequired) => MremapLeave::Unavailable(error),
+        })
+}
+
+/// How [`decide_mremap`] leaves the call when no proposal is made: small,
+/// so the decoder's frame never carries a second pending syscall.
+enum MremapLeave {
+    Return(i64),
+    Forward,
+    Unavailable(reservations::Refusal),
 }
 
 /// One root mapping clipped to a `madvise` range, classified for the shared
@@ -2206,13 +2303,32 @@ fn serve_delegated_anonymous_attempt<
     let _editor_guard = editor_guard;
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
-    if request.operation == carrick_el1_abi::ReservationOperation::Move {
-        return refuse(pending, &mut model, Leave::RootDeclined);
-    }
     use carrick_el1_abi::ReservationOperation::{
-        ClearAttributes, Decommit, Discard, Prepare, Protect, Retire, SetAttributes,
+        ClearAttributes, Decommit, Discard, Move, Prepare, Protect, Retire, SetAttributes,
     };
-    let backing = if matches!(request.operation, SetAttributes | ClearAttributes) {
+    // An `mremap` relocation (#3152) moves no page here: moving a resident
+    // source is one custody transfer of its frames (#2611). A source with
+    // no terminal retires without a descriptor edit, so the relocation is
+    // the destination's fresh mapping, and the commit retires the source
+    // node with it.
+    let moving = request.operation == Move;
+    if moving {
+        let unbacked = request.source.is_some_and(|source| {
+            editor
+                .backing(
+                    carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                    carrick_guest_arch::UserVa::new(source.start()),
+                    carrick_guest_arch::GuestLen::new(source.len()),
+                )
+                .summary
+                == RangeBacking::Empty
+        });
+        if !unbacked {
+            return refuse(pending, &mut model, Leave::RootDeclined);
+        }
+    }
+    let operation = if moving { Prepare } else { request.operation };
+    let backing = if matches!(operation, SetAttributes | ClearAttributes) {
         // Attributes are a root metadata edit. The parent keeps its live
         // descriptors and residency.
         Stage1Backing::of(RangeBacking::Empty)
@@ -2223,7 +2339,7 @@ fn serve_delegated_anonymous_attempt<
             carrick_guest_arch::GuestLen::new(len),
         )
     };
-    if request.operation == Discard && backing.summary == RangeBacking::Empty {
+    if operation == Discard && backing.summary == RangeBacking::Empty {
         pending
             .cancel(&mut model)
             .expect("empty discard owns its reservation proposal");
@@ -2236,7 +2352,7 @@ fn serve_delegated_anonymous_attempt<
     // Any other host-owned leaf stays foreign.
     let backing = if backing.summary == RangeBacking::Foreign
         && backing.foreign == ForeignBacking::HostOwnedLeaf
-        && matches!(request.operation, Retire | Prepare | Protect)
+        && matches!(operation, Retire | Prepare | Protect)
     {
         let mut windows = [(0u64, 0u64); MAX_WINDOW_NODES];
         let mut count = 0usize;
@@ -2274,7 +2390,7 @@ fn serve_delegated_anonymous_attempt<
     // mapping and committed on first touch; any rest of the range has no
     // terminal and stays lazy. Anything else prepared is a replaced
     // mapping's backing and is retired as an owed return.
-    let adopts_stock = request.operation == Prepare
+    let adopts_stock = operation == Prepare
         && backing.summary == RangeBacking::Prepared
         && run.is_some_and(|(start, run_len)| {
             editor
@@ -2291,9 +2407,17 @@ fn serve_delegated_anonymous_attempt<
                 .is_ok()
                 && nodes == 0
         };
-    let owed_return = match (request.operation, backing.summary, run) {
+    let owed_return = match (operation, backing.summary, run) {
         (_, RangeBacking::Foreign, _) => {
             return refuse(pending, &mut model, backing.foreign.leave());
+        }
+        // A relocation's destination is a fresh mapping or nothing: a
+        // replaced mapping's backing there would be an owed return, which a
+        // `Move` commit does not journal.
+        (_, RangeBacking::Private | RangeBacking::Prepared | RangeBacking::Window, Some(_))
+            if moving && !adopts_stock =>
+        {
+            return refuse(pending, &mut model, Leave::RootDeclined);
         }
         // The root refused overlapping proposals while this retirement was
         // owed. Reaching Prepare means the host acknowledged its stage-2 and
@@ -2369,13 +2493,13 @@ fn serve_delegated_anonymous_attempt<
         // of a stock adoption alike (prepared leaves stay invalid).
         (Protect, RangeBacking::Private | RangeBacking::Prepared, Some((start, run_len)))
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
-            if request.operation == Protect || adopts_stock =>
+            if operation == Protect || adopts_stock =>
         {
             // An mprotect's request covers mapped VA only (the root refused an
             // unmapped page), and the root commits its protection for every
             // page, so a page with no descriptor is a lazy page (#3073). A
             // stock adoption has no such proof and stays exact.
-            let (cow_ceiling, absent) = if request.operation == Protect {
+            let (cow_ceiling, absent) = if operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
@@ -2495,7 +2619,7 @@ fn serve_delegated_anonymous_attempt<
 }
 
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
-/// anonymous `brk`/`mmap`/`munmap`/`mprotect`/`madvise` (`None`: the MM keeps the
+/// anonymous `brk`/`mmap`/`munmap`/`mremap`/`mprotect`/`madvise` (`None`: the MM keeps the
 /// paths it had before admission).
 pub fn delegated_anonymous_root<
     G: ReservationGeometry,
@@ -2511,7 +2635,7 @@ pub fn delegated_anonymous_root<
 )> {
     if !matches!(
         nr,
-        SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
+        SYS_BRK | SYS_MUNMAP | SYS_MREMAP | SYS_MMAP | SYS_MPROTECT | SYS_MADVISE
     ) {
         return None;
     }

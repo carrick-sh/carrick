@@ -1,5 +1,6 @@
 //! Linux reservation ownership, VMA interpretation and charges.
 pub mod madvise;
+pub mod mremap;
 mod reservation;
 use carrick_core_abi::*;
 
