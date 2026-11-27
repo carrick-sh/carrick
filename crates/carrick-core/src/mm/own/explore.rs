@@ -725,8 +725,8 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                             world.deferred[at] = true;
                         }
                         ReleaseOutcome::Broken(_) => {
-                            if life != Some(MmLife::Releasing) {
-                                return Err("a broken release did not keep the MM releasing".into());
+                            if life != Some(MmLife::Broken) {
+                                return Err("a broken release did not mark the MM broken".into());
                             }
                             world.ended = true;
                         }
@@ -822,13 +822,13 @@ fn reconcile_grants(world: &GrantWorld) -> Result<(), String> {
     if settling != usize::from(world.settle.is_some()) {
         return Err("a settle proof and the core disagree".into());
     }
-    // L3: one ticket per releasing MM (a broken one ended the world).
+    // L3: one ticket per releasing MM.
     let releasing = core
         .mms
         .values()
         .filter(|m| m.life == MmLife::Releasing)
         .count();
-    if releasing != world.releases.len() + usize::from(world.ended) {
+    if releasing != world.releases.len() {
         return Err("an outstanding release ticket and the core disagree".into());
     }
     Ok(())

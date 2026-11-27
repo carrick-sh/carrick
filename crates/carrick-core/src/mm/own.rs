@@ -1046,7 +1046,7 @@ pub enum Violation {
     GrantOutsideChunk,
     /// L1: an MM that is not live has an editor held.
     EditorAfterExit,
-    /// L2: a releasing MM still holds a grant or a chunk.
+    /// L2: a releasing or broken MM still holds a grant or a chunk.
     ReleasingHolds,
 }
 

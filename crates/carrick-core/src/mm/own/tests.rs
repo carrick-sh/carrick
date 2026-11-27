@@ -405,8 +405,8 @@ fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
 
 /// #3061 PR 1b: the release is two-phase and its outcome is typed. "Not
 /// now" leaves the MM exiting, to be released again; `Broken` comes back
-/// as the verdict and keeps the MM releasing (the venue ends the carrier);
-/// a ticket finishes once.
+/// as the verdict and marks the MM broken: never released again, retired
+/// only by the carrier's end; a ticket finishes once.
 #[test]
 fn a_release_outcome_is_typed_and_not_now_leaves_the_mm_releasable() {
     let a = MmKey::new(NonZeroU64::MIN);
@@ -438,12 +438,18 @@ fn a_release_outcome_is_typed_and_not_now_leaves_the_mm_releasable() {
     );
     let broken = ReleaseOutcome::Broken(BrokenRelease::at("test"));
     assert_eq!(core.finish_release(ticket, broken), Ok(broken));
-    assert_eq!(core.mm_life(a), Some(MmLife::Releasing));
-    assert!(
-        core.retire_all_mms().is_err(),
-        "a broken release leaves the carrier to end, not to retire"
+    assert_eq!(core.mm_life(a), Some(MmLife::Broken));
+    assert_eq!(
+        core.begin_release(a).map(|_| ()),
+        Err(MmRefusal::Refused(Refusal::InFlight)),
+        "a broken MM is never released again"
     );
-    core.forget_for_explorer();
+    assert_eq!(
+        core.retire_all_mms(),
+        Ok(vec![]),
+        "the carrier's end retires it"
+    );
+    assert!(core.teardown().is_ok());
 }
 
 /// #3099: grants are carved from the MM's chunk, so N supplies ask the

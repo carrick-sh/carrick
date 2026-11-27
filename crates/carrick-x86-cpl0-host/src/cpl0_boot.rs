@@ -3792,10 +3792,10 @@ mod forward_execution_tests {
     }
 
     /// #3132 confirming pre-review P0: a release that quarantines the
-    /// carrier ends the run from the fork quarantine drain. The stock's
-    /// release callback answers a bool, so without the drain's quarantine
-    /// check the broken invariant reads as an ordinary deferral: the drain
-    /// returns Ok and retries it forever while the guest keeps running.
+    /// carrier ends the run from the fork quarantine drain. The release
+    /// answers `ReleaseOutcome::Broken` (#3061 PR 1b), which the stock
+    /// returns as `BrokenRelease`, never an ordinary deferral the drain
+    /// would retry forever while the guest kept running.
     ///
     /// The retired child holds one private memslot; the injected failure of
     /// the memslot unregister inside `CarrierMemory::revoke`, reached only
@@ -3846,8 +3846,8 @@ mod forward_execution_tests {
         fixture.custody.0._vm.vm().clear_region_failure();
 
         // The release ran and quarantined the carrier: the injected
-        // unregister failed inside its revoke, and the stock deferred the
-        // child the callback refused.
+        // unregister failed inside its revoke. The child stays in the
+        // stock's quarantine, but as a broken release, not a deferral.
         assert!(
             fixture.custody.0._vm.is_quarantined(),
             "the child's release revoked its slot and the unregister failed"
@@ -3855,20 +3855,22 @@ mod forward_execution_tests {
         assert!(fixture.custody.0.fork_stock.is_quarantined(child));
         assert_eq!(
             fixture.custody.0.fork_stock.counters().reclaim_deferrals,
-            deferrals + 1,
-            "the release callback refused the child"
+            deferrals,
+            "a broken release is never counted as a deferral"
         );
+        let error = format!("{drained:?}");
         assert!(
-            drained.is_err(),
-            "a quarantined carrier must end the run, not defer the child: {drained:?}"
+            drained.is_err() && error.contains("broken invariant at carrier memory retire_child"),
+            "a quarantined carrier must end the run, not defer the child: {error}"
         );
     }
 
     /// #3132 confirming pre-review P0, the exec half: a release-permitted
     /// CHILD exec predecessor whose release quarantines the carrier ends the
     /// run from `settle_exec_predecessors` (a root predecessor has no
-    /// release callback). Without the check the receipt goes back to
-    /// `release_permitted` and the drain returns Ok.
+    /// release callback). The release answers `Broken`, which the stock
+    /// returns as `BrokenRelease` (#3061 PR 1b); read as a deferral, the
+    /// receipt would go back to `release_permitted` and the drain return Ok.
     #[test]
     fn exec_predecessor_drain_ends_the_run_when_a_child_release_quarantines() {
         use carrick_hal::fork_stock::ExecPredecessorForm;
@@ -3969,9 +3971,10 @@ mod forward_execution_tests {
             fixture.custody.0._vm.is_quarantined(),
             "the predecessor's release revoked its slot and the unregister failed"
         );
+        let error = format!("{settled:?}");
         assert!(
-            settled.is_err(),
-            "a quarantined carrier must end the run, not keep the receipt: {settled:?}"
+            settled.is_err() && error.contains("broken invariant at carrier memory retire_child"),
+            "a quarantined carrier must end the run, not keep the receipt: {error}"
         );
     }
 }

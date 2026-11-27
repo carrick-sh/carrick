@@ -12,12 +12,13 @@
 //!    shell unlocks and does the I/O.
 //! 2. [`CarrierCore::finish_release`] takes the ticket and the shell's
 //!    [`ReleaseOutcome`]: `Done` retires the record; `NotNow` returns it to
-//!    `Exiting`, to be released again when the wait fires; `Broken` leaves it
-//!    `Releasing` and hands the verdict back, and the venue ends the carrier.
+//!    `Exiting`, to be released again when the wait fires; `Broken` makes it
+//!    `Broken` and hands the verdict back, and the venue ends the carrier
+//!    (a broken MM is never released again; the carrier's end retires it).
 //!
 //! Invariants, checked by [`CarrierCore::check_invariants`]:
 //! - **L1** an MM that is not `Live` has a free editor;
-//! - **L2** a `Releasing` MM holds no grant and no chunk.
+//! - **L2** a `Releasing` or `Broken` MM holds no grant and no chunk.
 //!
 //! The explorer adds **L3**: the shell holds exactly one ticket per
 //! `Releasing` MM, and a `NotNow` leaves the MM releasable again.
@@ -40,6 +41,9 @@ pub enum MmLife {
     Exiting,
     /// A [`ReleaseTicket`] for it is out.
     Releasing,
+    /// Its release found a broken invariant: the carrier is ending, and only
+    /// its end ([`CarrierCore::retire_all_mms`]) retires the record.
+    Broken,
 }
 
 /// The release of one exiting MM is owed to the shell.
@@ -116,7 +120,7 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
         let record = self.mms.entry(mm).or_insert_with(MmRecord::admitted);
         match (record.life, record.editor) {
             (MmLife::Exiting, _) => Ok(()),
-            (MmLife::Releasing, _) => Err(MmRefusal::Refused(Refusal::InFlight)),
+            (MmLife::Releasing | MmLife::Broken, _) => Err(MmRefusal::Refused(Refusal::InFlight)),
             (MmLife::Live, MmEditor::Free) => {
                 if !mutated(M::EditsAfterExit) {
                     record.life = MmLife::Exiting;
@@ -143,7 +147,9 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
             MmLife::Exiting => {}
             MmLife::Live if mutated(M::ReleasesLive) => {}
             MmLife::Live => return Err(MmRefusal::Refused(Refusal::Live)),
-            MmLife::Releasing => return Err(MmRefusal::Refused(Refusal::InFlight)),
+            MmLife::Releasing | MmLife::Broken => {
+                return Err(MmRefusal::Refused(Refusal::InFlight));
+            }
         }
         record.life = MmLife::Releasing;
         record.chunk = None;
@@ -173,7 +179,7 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
 
     /// Phase 2: the shell's outcome for the release. `Done` retires the MM
     /// (its record leaves the core); `NotNow` returns it to `Exiting`;
-    /// `Broken` leaves it `Releasing`, and the venue ends the carrier. The
+    /// `Broken` makes it `Broken`, and the venue ends the carrier. The
     /// outcome comes back for the shell to act on.
     pub fn finish_release(
         &mut self,
@@ -209,7 +215,11 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
                 }
                 return Ok(ReleaseOutcome::NotNow(ReleaseWait::NextDrain));
             }
-            ReleaseOutcome::Broken(_) => {}
+            ReleaseOutcome::Broken(_) => {
+                if let Some(record) = self.mms.get_mut(&ticket.mm) {
+                    record.life = MmLife::Broken;
+                }
+            }
         }
         Ok(outcome)
     }
@@ -228,7 +238,7 @@ impl<V: CoreVenue, M_, B, G> CarrierCore<V, M_, B, G> {
             if record.life != MmLife::Live && record.editor != MmEditor::Free {
                 return Err(Violation::EditorAfterExit);
             }
-            if record.life == MmLife::Releasing
+            if matches!(record.life, MmLife::Releasing | MmLife::Broken)
                 && (record.chunk.is_some()
                     || self.grants.values().any(|g| g.mm == mm)
                     || self.chunks.values().any(|c| c.mm == mm))
