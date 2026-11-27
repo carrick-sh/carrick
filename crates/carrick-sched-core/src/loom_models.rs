@@ -67,7 +67,6 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(entry_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(idle_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(queued_map, core::array::from_fn(|_| AtomicU64::new(0)));
-        init!(scan_passes, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(held_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(completion_consumer, AtomicU32::new(0));
         init!(online_cpus, AtomicU64::new(0));
