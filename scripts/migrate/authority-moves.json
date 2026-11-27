@@ -328,6 +328,10 @@
     {
       "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized",
       "issue": 1338
+    },
+    {
+      "owner": "carrick_core::mm::own::CarrierId::allocate::CARRIERS",
+      "issue": 3061
     }
   ],
   "terminal_custody": []
