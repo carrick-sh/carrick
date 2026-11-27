@@ -159,10 +159,18 @@ impl IpcHostServices for ZoneHostServices {
                 }) else {
                     continue;
                 };
-                let _ = guard
-                    .notify_object_host(&mut |record| handed.push(record), &mut |placement| {
-                        placed.push(placement)
-                    });
+                let _ = {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = guard.notify_object_host(
+                        &mut |record| handed.push(record),
+                        &mut |placement| placed.push(placement),
+                        &passes,
+                    );
+                    (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
+                        passes,
+                    );
+                    owed
+                };
             }
             for placement in placed {
                 if placement.resched {
