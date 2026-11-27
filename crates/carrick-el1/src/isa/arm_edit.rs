@@ -62,6 +62,7 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
         EditOperation::Protect {
             permissions,
             ceiling,
+            absent,
         } if permissions.user => DescriptorOp::Protect(GuestPermissionEdit {
             va: span.va,
             len: span.len,
@@ -69,6 +70,7 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
             writable: permissions.writable,
             executable: permissions.executable,
             cow_ceiling: ceiling,
+            absent,
         }),
         EditOperation::Publish { expected, access } => DescriptorOp::Publish {
             span,
@@ -234,6 +236,7 @@ mod tests {
         let txn = lower_edit_intent(intent(EditOperation::Protect {
             permissions,
             ceiling: None,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
         }))
         .unwrap();
         assert_eq!(txn.root, SubstrateGpa(0x6000));
@@ -249,6 +252,7 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
             })
         );
     }

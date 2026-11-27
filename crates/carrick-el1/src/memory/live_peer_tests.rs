@@ -119,6 +119,7 @@ impl LiveTables {
                         user: true,
                     },
                     ceiling: edit.cow_ceiling,
+                    absent: edit.absent,
                 },
             );
         } else {

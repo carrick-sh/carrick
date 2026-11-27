@@ -428,6 +428,7 @@ fn guest_protect_refuses_host_map_leaf() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -470,7 +471,8 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
                 DescriptorOp::Protect {
                     span,
                     permissions,
-                    exec: ExecAuthority::Leaf
+                    exec: ExecAuthority::Leaf,
+                    absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &[]
             ),
@@ -512,6 +514,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_write,
                 exec: ExecAuthority::Mapping,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -529,6 +532,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_exec,
                 exec: ExecAuthority::Mapping,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -546,6 +550,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[]
             ),
@@ -582,6 +587,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -598,6 +604,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: writable,
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -637,6 +644,23 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
         writable: false,
         ..writable
     };
+    // A caller with no proof the range is mapped keeps the exact contract:
+    // the first page with no entry refuses the whole edit, and nothing moves.
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span: PageSpan::new(0x4000, 8 * PAGE),
+                permissions: readonly,
+                exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::MissingTable)
+    );
+    assert_eq!(*words.words.borrow(), before);
     assert!(matches!(
         apply(
             &words,
@@ -644,6 +668,7 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
                 span: PageSpan::new(0x4000, 8 * PAGE),
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Lazy,
             },
             &[]
         ),
@@ -1344,6 +1369,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
         ),
@@ -1399,6 +1425,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
     );
@@ -1588,7 +1615,8 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                 DescriptorOp::Protect {
                     span,
                     permissions,
-                    exec: ExecAuthority::Leaf
+                    exec: ExecAuthority::Leaf,
+                    absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &grants
             ),
@@ -1617,6 +1645,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     ..permissions
                 },
                 exec: ExecAuthority::Leaf,
+                absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[],
         );
@@ -1675,6 +1704,7 @@ fn failed_split_restores_all_512_children_and_parent() {
                         user: true
                     },
                     exec: ExecAuthority::Leaf,
+                    absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[root(0x4000)]
             ),
@@ -1768,6 +1798,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
     );

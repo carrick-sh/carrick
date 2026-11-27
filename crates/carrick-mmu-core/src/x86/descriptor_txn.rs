@@ -84,6 +84,9 @@ pub enum DescriptorOp {
         span: PageSpan,
         permissions: Permissions,
         exec: ExecAuthority,
+        /// Whether a page with no entry is a lazy page of a range its
+        /// reservation owner proved mapped, or refuses the edit (#3073).
+        absent: carrick_guest_arch::AbsentLeaves,
     },
     ArmCow(PageSpan),
     CowRepoint {
@@ -216,8 +219,10 @@ impl<'a> DescriptorTxn<'a> {
             EditOperation::Protect {
                 permissions: requested,
                 ceiling,
+                absent,
             } => DescriptorOp::Protect {
                 span,
+                absent,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
                 exec: if ceiling.is_some_and(|ceiling| ceiling.executable) {
                     ExecAuthority::Mapping
@@ -601,7 +606,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 DescriptorOp::Unmap(_)
                     | DescriptorOp::UnmapWindow(_)
                     | DescriptorOp::Retire(_)
-                    | DescriptorOp::Protect { .. }
+                    | DescriptorOp::Protect {
+                        absent: carrick_guest_arch::AbsentLeaves::Lazy,
+                        ..
+                    }
                     | DescriptorOp::ProtectWindow { .. }
             )
         {

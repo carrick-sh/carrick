@@ -683,6 +683,7 @@ impl DescriptorOp {
                             executable: w & 8 != 0,
                         }),
                     },
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }))
             }
             Self::KIND_RETIRE => Some(Self::Retire(PageSpan::new(payload[0], payload[1]))),
@@ -2053,7 +2054,12 @@ impl Executor<'_> {
         // An absent entry is a lazy page: a retirement owes nothing there,
         // and a protection change is the root model's metadata alone, which
         // the first touch maps from (mprotect(2) ignores residency, #3073).
-        if descriptor == 0 && matches!(self.op, DescriptorOp::Retire(_) | DescriptorOp::Protect(_))
+        if descriptor == 0
+            && match self.op {
+                DescriptorOp::Retire(_) => true,
+                DescriptorOp::Protect(edit) => edit.absent == crate::aarch64::AbsentLeaves::Lazy,
+                _ => false,
+            }
         {
             return Ok(0);
         }
@@ -3113,6 +3119,7 @@ mod tests {
                 writable: false,
                 executable: true,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             }),
             DescriptorOp::Protect(GuestPermissionEdit {
                 va: 0x6000,
@@ -3125,6 +3132,7 @@ mod tests {
                     writable: true,
                     executable: false,
                 }),
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             }),
             DescriptorOp::Retire(PageSpan::new(0x8000, 3 * PT_PAGE)),
             DescriptorOp::CowRepoint {
@@ -3715,6 +3723,7 @@ mod tests {
                     writable,
                     executable: false,
                     cow_ceiling: None,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 })
             };
             let setup = |writable: bool| {
@@ -3989,7 +3998,24 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Lazy,
             };
+            // A caller with no proof the range is mapped keeps the exact
+            // contract: the first absent entry refuses, and no leaf changes.
+            let exact = GuestPermissionEdit {
+                absent: crate::aarch64::AbsentLeaves::Refuse,
+                ..none
+            };
+            let resident = words.get(leaf_pa(VA));
+            assert!(matches!(
+                run(&words, DescriptorOp::Protect(exact), &TableGrants::NONE),
+                DescriptorOutcome::Refused(_)
+            ));
+            assert_eq!(
+                words.get(leaf_pa(VA)),
+                resident,
+                "the exact edit moved nothing"
+            );
             let outcome = applied(run(&words, DescriptorOp::Protect(none), &TableGrants::NONE));
             assert_eq!(outcome.pages, 8);
             for n in [0, 2, 3] {
@@ -4026,6 +4052,7 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             };
             applied(run(
                 &words,
@@ -4161,6 +4188,7 @@ mod tests {
                     writable: false,
                     executable: false,
                     cow_ceiling: rwx_ceiling,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4186,6 +4214,7 @@ mod tests {
                     writable: false,
                     executable: false,
                     cow_ceiling: rwx_ceiling,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4213,6 +4242,7 @@ mod tests {
                         writable: false,
                         executable: false,
                         cow_ceiling: none_ceiling,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4230,6 +4260,7 @@ mod tests {
                     writable: false,
                     executable: false,
                     cow_ceiling: ro_ceiling,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4252,6 +4283,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: ro_ceiling,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4274,6 +4306,7 @@ mod tests {
                             writable: true,
                             executable: false,
                         }),
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4289,6 +4322,7 @@ mod tests {
                         writable: false,
                         executable: true,
                         cow_ceiling: rwx_ceiling,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4306,6 +4340,7 @@ mod tests {
                     writable: true,
                     executable: false,
                     cow_ceiling: rwx_ceiling,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4319,6 +4354,7 @@ mod tests {
                     writable: true,
                     executable: true,
                     cow_ceiling: rwx_ceiling,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4406,6 +4442,7 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             };
             assert_eq!(
                 run(&words, DescriptorOp::Protect(edit), &TableGrants::NONE),
@@ -4523,6 +4560,7 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             };
             let outcome = run(&words, DescriptorOp::Protect(edit), &grants(&[8]));
             assert_eq!(
@@ -4735,6 +4773,7 @@ mod tests {
                     writable: false,
                     executable: false,
                     cow_ceiling: None,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 }),
                 &TableGrants::NONE,
             ));
@@ -5220,6 +5259,7 @@ mod tests {
                             writable: false,
                             executable: false,
                             cow_ceiling: None,
+                            absent: crate::aarch64::AbsentLeaves::Refuse,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5281,6 +5321,7 @@ mod tests {
                             writable: true,
                             executable: false,
                             cow_ceiling: None,
+                            absent: crate::aarch64::AbsentLeaves::Refuse,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5480,6 +5521,7 @@ mod tests {
                             writable: false,
                             executable: false,
                             cow_ceiling: None,
+                            absent: crate::aarch64::AbsentLeaves::Refuse,
                         },
                     )
                 },
@@ -5949,6 +5991,7 @@ mod carrick_owned_window_tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             }),
             DescriptorOp::Retire(span),
             DescriptorOp::CowRepoint {
