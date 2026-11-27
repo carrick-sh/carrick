@@ -377,8 +377,11 @@ mod tests {
             fn allocate_with_extent(
                 &self,
                 _layout: Layout,
-            ) -> Option<(*mut u8, ExtentGrantReceipt)> {
-                self.entries.borrow_mut().pop()
+            ) -> Result<(*mut u8, ExtentGrantReceipt), carrick_core_abi::MetadataMiss> {
+                self.entries
+                    .borrow_mut()
+                    .pop()
+                    .ok_or(carrick_core_abi::MetadataMiss::Exhausted)
             }
             fn deallocate(&self, _ptr: *mut u8, _layout: Layout) {}
         }

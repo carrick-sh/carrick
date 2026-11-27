@@ -58,10 +58,12 @@ pub enum NativeForkCause {
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
     },
     /// The child's reservation tree needed nodes the shared pool lacked,
-    /// and no node bank could be added: the `BANKS` table is full or the
-    /// metadata allocator had no extent (#3085). Linux's EAGAIN for a
-    /// fork that hits a resource limit.
-    NodeBanksFull,
+    /// and no node bank could be added (#3085): the `BANKS` table is full or
+    /// the metadata allocator is out of memory (Linux's ENOMEM for a fork
+    /// that cannot allocate its kernel structures), or the allocator's
+    /// receipt was broken. A grant in flight is never stored here: it is
+    /// "not now" ([`NodeBankDemand::supply`]).
+    NodeBank(carrick_core::mm::reservation::NodeBankShortfall),
 }
 
 impl From<MmError> for NativeForkCause {
@@ -89,16 +91,22 @@ pub struct NativeForkRefusal {
 impl NativeForkRefusal {
     /// The one encoding of a fork refusal, exhaustive over every cause
     /// (#3085). A cause is contention ("not now": `Busy`, `OwnerWait`), a
-    /// Linux `fork(2)` errno (`Exhausted` is EAGAIN: a resource limit), or a
-    /// broken invariant (`Stale`, `Invalid`, `Quarantined`, `Unsupported`).
-    /// No cause answers EFAULT: Linux has none for `fork`.
+    /// Linux `fork(2)` errno (`Exhausted` is EAGAIN: a resource limit;
+    /// `NoMemory` is ENOMEM: kernel memory), or a broken invariant (`Stale`,
+    /// `Invalid`, `Quarantined`, `Unsupported`). No cause answers EFAULT:
+    /// Linux has none for `fork`.
     pub fn error(self) -> super::native_process_runtime::NativeProcessError {
         use super::native_process_runtime::NativeProcessError as E;
+        use carrick_core::mm::reservation::{MetadataMiss, NodeBankShortfall as S};
         match self.cause {
             NativeForkCause::Busy | NativeForkCause::SiblingBirth { .. } => E::Busy,
             // Today's EAGAIN answer, as a refusal rather than "not now".
             NativeForkCause::GateShut => E::Exhausted,
-            NativeForkCause::NodeBanksFull => E::Exhausted,
+            NativeForkCause::NodeBank(S::Full | S::Metadata(MetadataMiss::Exhausted)) => {
+                E::NoMemory
+            }
+            NativeForkCause::NodeBank(S::Metadata(MetadataMiss::GrantPending)) => E::Busy,
+            NativeForkCause::NodeBank(S::Invalid) => E::Invalid,
             NativeForkCause::Mm(error) => mm_error(error),
             NativeForkCause::Reservation(refusal) => reservation_error(refusal),
             NativeForkCause::Fork(error) => fork_error(error),
@@ -135,9 +143,9 @@ fn mm_error(error: MmError) -> super::native_process_runtime::NativeProcessError
         MmError::CowUnsettled => E::Busy,
         // A `MetadataRequired` at Publish is supplied a node bank and
         // reruns ([`NodeBankDemand`]); one that reaches this encoding is
-        // capacity the fork could not add.
-        MmError::NoMemory | MmError::MetadataRequired => E::Exhausted,
-        MmError::Table(PageTableError::OutOfTables) => E::Exhausted,
+        // kernel memory the fork could not add: ENOMEM, as `fork(2)`.
+        MmError::NoMemory | MmError::MetadataRequired => E::NoMemory,
+        MmError::Table(PageTableError::OutOfTables) => E::NoMemory,
         MmError::Reservation(refusal) => reservation_error(refusal),
         // A replaced parent (another incarnation) is stale custody.
         MmError::Stale => E::Stale,
@@ -155,7 +163,8 @@ fn reservation_error(refusal: Refusal) -> super::native_process_runtime::NativeP
     match refusal {
         Refusal::Busy | Refusal::PreparedConflict => E::Busy,
         Refusal::Stale => E::Stale,
-        Refusal::MetadataRequired | Refusal::Limit => E::Exhausted,
+        Refusal::MetadataRequired => E::NoMemory,
+        Refusal::Limit => E::Exhausted,
         Refusal::Invalid | Refusal::Collision | Refusal::Hole | Refusal::ForeignMapping => {
             E::Invalid
         }
@@ -167,7 +176,7 @@ fn fork_error(error: ForkError) -> super::native_process_runtime::NativeProcessE
     use carrick_core::mm::fork::ForkOwnerRefusal as O;
     match error {
         ForkError::Busy | ForkError::ParentChanged => E::Busy,
-        ForkError::NoMemory | ForkError::MetadataRequired => E::Exhausted,
+        ForkError::NoMemory | ForkError::MetadataRequired => E::NoMemory,
         ForkError::OwnerRefusal(O::Limit) => E::Exhausted,
         ForkError::Stale => E::Stale,
         ForkError::Invalid
@@ -189,8 +198,9 @@ fn stock_error(
         R::Capacity => E::Exhausted,
         R::Inventory => E::Busy,
         // The fork owner grows the table and answers `Busy` itself. This
-        // cause survives only when that growth was refused for good.
-        R::Residency => E::Exhausted,
+        // cause survives only when that growth was refused for good: the
+        // directory is full or the allocator is out of memory.
+        R::Residency => E::NoMemory,
     }
 }
 
@@ -206,7 +216,9 @@ pub enum PublishRefusal {
 /// held at `observed` (#3085). Not an errno: the venue returns its fork
 /// loan and releases every MM guard, then [`Self::supply`] adds one bank
 /// through the existing bank supply and the fork reruns against it. Each
-/// supply grows the pool, so reruns are bounded by the `BANKS` table.
+/// rerun follows either a pool that grew past `observed` or a metadata
+/// grant served at the fork's own boundary, so reruns are bounded by the
+/// `BANKS` table and the grants the carrier gives.
 #[must_use = "a node bank demand must be supplied after the fork's loan is returned"]
 #[derive(Debug)]
 pub struct NodeBankDemand {
@@ -215,9 +227,11 @@ pub struct NodeBankDemand {
 
 impl NodeBankDemand {
     /// Supply the bank, holding no MM editor, root guard or fork loan.
-    /// `Busy` reruns the fork (a bank was added, by this call or by a
-    /// concurrent supplier still publishing its bank); only a pool that can
-    /// take no more banks answers EAGAIN.
+    /// `Busy` retains the fork as carrier work and reruns it once (#2306):
+    /// the pool grew past `observed` (this call's bank or a peer's), or the
+    /// allocator posted a metadata grant and marked this boundary as owing
+    /// it, so the carrier serves the grant before the rerun. Only memory no
+    /// bank can come from answers ENOMEM.
     pub fn supply<
         Policy: carrick_el1_abi::ReservationPolicy,
         Geometry: carrick_el1_abi::ReservationGeometry,
@@ -226,12 +240,15 @@ impl NodeBankDemand {
         roots: &carrick_core::mm::reservation::SharedReservations<Policy, Geometry>,
         allocator: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
     ) -> super::native_process_runtime::NativeProcessError {
+        use carrick_core::mm::reservation::{MetadataMiss, NodeBankShortfall};
         match roots.supply_node_bank(allocator, self.observed) {
-            Ok(()) | Err(Refusal::Busy) => super::native_process_runtime::NativeProcessError::Busy,
-            Err(Refusal::MetadataRequired) => {
-                refused(NativeForkStage::Publish, NativeForkCause::NodeBanksFull)
+            Ok(()) | Err(NodeBankShortfall::Metadata(MetadataMiss::GrantPending)) => {
+                super::native_process_runtime::NativeProcessError::Busy
             }
-            Err(refusal) => refused(NativeForkStage::Publish, refusal),
+            Err(shortfall) => refused(
+                NativeForkStage::Publish,
+                NativeForkCause::NodeBank(shortfall),
+            ),
         }
     }
 }
@@ -468,12 +485,16 @@ mod tests {
     #[test]
     fn no_fork_refusal_answers_efault() {
         use carrick_core::mm::fork::ForkOwnerRefusal as O;
+        use carrick_core::mm::reservation::{MetadataMiss, NodeBankShortfall as S};
         use carrick_el1_abi::ForkStockRefusal as R;
         use carrick_mmu_core::aarch64::PageTableError;
         let mut causes = std::vec![
             NativeForkCause::Busy,
             NativeForkCause::GateShut,
-            NativeForkCause::NodeBanksFull,
+            NativeForkCause::NodeBank(S::Full),
+            NativeForkCause::NodeBank(S::Metadata(MetadataMiss::Exhausted)),
+            NativeForkCause::NodeBank(S::Metadata(MetadataMiss::GrantPending)),
+            NativeForkCause::NodeBank(S::Invalid),
             NativeForkCause::StockCrossing {
                 status: 1,
                 reply: None
@@ -565,20 +586,62 @@ mod tests {
                 assert_ne!(failure.errno(), -14, "{cause:?}");
             }
         }
-        // Capacity is EAGAIN.
-        for cause in [
-            NativeForkCause::NodeBanksFull,
-            NativeForkCause::Mm(MmError::MetadataRequired),
-            NativeForkCause::Mm(MmError::NoMemory),
-            NativeForkCause::Fork(ForkError::OwnerRefusal(O::Limit)),
+        // A resource limit is EAGAIN; kernel memory the fork could not
+        // allocate is ENOMEM, as `fork(2)` documents.
+        for (cause, errno) in [
+            (NativeForkCause::GateShut, -11),
+            (
+                NativeForkCause::Fork(ForkError::OwnerRefusal(O::Limit)),
+                -11,
+            ),
+            (NativeForkCause::NodeBank(S::Full), -12),
+            (
+                NativeForkCause::NodeBank(S::Metadata(MetadataMiss::Exhausted)),
+                -12,
+            ),
+            (NativeForkCause::Mm(MmError::MetadataRequired), -12),
+            (NativeForkCause::Mm(MmError::NoMemory), -12),
+            (
+                NativeForkCause::Mm(MmError::Table(PageTableError::OutOfTables)),
+                -12,
+            ),
+            (NativeForkCause::Fork(ForkError::NoMemory), -12),
+            (NativeForkCause::StockReservation(R::Residency), -12),
         ] {
             assert_eq!(
                 refused(NativeForkStage::Publish, cause)
                     .failure()
                     .map(|failure| failure.errno()),
-                Ok(-11),
+                Ok(errno),
                 "{cause:?}"
             );
+        }
+        // A grant in flight is "not now", never an errno.
+        assert_eq!(
+            refused(
+                NativeForkStage::Publish,
+                NativeForkCause::NodeBank(S::Metadata(MetadataMiss::GrantPending))
+            )
+            .failure(),
+            Err(NativeContention::BUSY)
+        );
+    }
+
+    /// An allocator whose every miss is a grant in flight for this boundary.
+    struct GrantInFlight;
+    // SAFETY: it never allocates.
+    unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for GrantInFlight {
+        fn allocate_with_extent(
+            &self,
+            _: core::alloc::Layout,
+        ) -> Result<
+            (*mut u8, carrick_core_abi::ExtentGrantReceipt),
+            carrick_core::mm::reservation::MetadataMiss,
+        > {
+            Err(carrick_core::mm::reservation::MetadataMiss::GrantPending)
+        }
+        fn deallocate(&self, _: *mut u8, _: core::alloc::Layout) {
+            unreachable!("nothing was allocated")
         }
     }
 
@@ -586,6 +649,7 @@ mod tests {
     /// never an errno; every other publish refusal keeps its stage and cause.
     #[test]
     fn a_publish_short_of_nodes_demands_a_bank() {
+        use carrick_core::mm::reservation::{MetadataMiss, NodeBankShortfall};
         use carrick_el1::memory::reservations::SharedReservations;
         // SAFETY: an all-zero table is the empty, unpublished table.
         let table: std::boxed::Box<SharedReservations> = unsafe {
@@ -609,7 +673,18 @@ mod tests {
                 cause: NativeForkCause::Mm(MmError::ParentChanged),
             })
         );
-        // A full pool: the demand answers EAGAIN, typed, at Publish.
+        // A grant in flight for this boundary: "not now", the fork is
+        // retained as carrier work and reruns once the grant is served.
+        let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
+        else {
+            unreachable!()
+        };
+        let error = demand.supply(&table, &GrantInFlight);
+        assert_eq!(error, NativeProcessError::Busy);
+        assert_eq!(error.failure(), Err(NativeContention::BUSY));
+        assert_eq!(table.node_capacity(), observed);
+        // Memory no grant can add: the demand answers ENOMEM, typed, at
+        // Publish.
         let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
         else {
             unreachable!()
@@ -620,10 +695,12 @@ mod tests {
             error,
             NativeProcessError::ForkRefused(NativeForkRefusal {
                 stage: NativeForkStage::Publish,
-                cause: NativeForkCause::NodeBanksFull,
+                cause: NativeForkCause::NodeBank(NodeBankShortfall::Metadata(
+                    MetadataMiss::Exhausted
+                )),
             })
         );
-        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-11));
+        assert_eq!(error.failure().map(|failure| failure.errno()), Ok(-12));
         // An allocator with an extent supplies the bank: the fork reruns.
         let mut backing = std::vec![0u8; 2 * 1024 * 1024];
         let allocator = carrick_el1::alloc::MetadataStorage::new();
@@ -765,7 +842,7 @@ mod tests {
             (R::Stale, NativeProcessError::Stale),
             (R::Capacity, NativeProcessError::Exhausted),
             (R::Inventory, NativeProcessError::Busy),
-            (R::Residency, NativeProcessError::Exhausted),
+            (R::Residency, NativeProcessError::NoMemory),
         ] {
             let diagnostic = refused(
                 NativeForkStage::Reserve,

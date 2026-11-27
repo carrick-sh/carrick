@@ -44,8 +44,8 @@ unsafe impl Sync for ReservationNode {}
 pub mod prepared;
 
 pub use carrick_core_abi::{
-    Charges, Mapping, ReservationGeometry, ReservationMetadataAllocator, ReservationNodeData,
-    ReservationPolicy,
+    Charges, Mapping, MetadataMiss, ReservationGeometry, ReservationMetadataAllocator,
+    ReservationNodeData, ReservationPolicy,
 };
 
 pub mod root;

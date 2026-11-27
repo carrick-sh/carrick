@@ -453,11 +453,16 @@ pub struct ResidencyStorage {
 }
 
 /// The operation must release its MM editor before asking the carrier
-/// allocator to grow. Allocation pressure and a racing publisher are
-/// distinct from a permanently full directory.
+/// allocator to grow. Allocation pressure is distinct from a permanently
+/// full directory. [`FrameGrantResidencyTable::grow`] never answers
+/// `Publishing`: a racing append is a short critical section it waits out
+/// (#3085). `Publishing` names only a grant serve that found the owner's
+/// metadata wait unready.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidencyGrowthRefusal {
-    MetadataRequired,
+    /// The allocator had no extent: a grant is in flight for this
+    /// requester's boundary, or memory is exhausted.
+    Metadata(crate::MetadataMiss),
     Publishing,
     Full,
     InvalidExtent,
@@ -534,7 +539,7 @@ impl FrameGrantResidencyTable {
         let layout = Layout::new::<ResidencySegment>();
         let (ptr, extent) = allocator
             .allocate_with_extent(layout)
-            .ok_or(ResidencyGrowthRefusal::MetadataRequired)?;
+            .map_err(ResidencyGrowthRefusal::Metadata)?;
         let location = ResidencySegmentLocation {
             guest_base: ptr as u64,
             extent,
@@ -573,10 +578,21 @@ impl FrameGrantResidencyTable {
         // Initialization happens before publication and outside the append lock.
         unsafe { ResidencySegment::init_in_place(address as *mut ResidencySegment) };
         let directory = &self.storage.directory;
-        directory
+        // The append window below never blocks, allocates or takes another
+        // lock, so a racing appender is waited out, never refused: the
+        // decision after it is one read of `count` under the window (#3085).
+        let mut attempt = 0;
+        while directory
             .publishing
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| ResidencyGrowthRefusal::Publishing)?;
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            carrick_sched_core::ShortLockWait::wait_short(
+                &carrick_sched_core::ShortLockSpin,
+                attempt,
+            );
+            attempt = attempt.wrapping_add(1);
+        }
         let installed = directory.count.load(Ordering::Relaxed) as usize == expected;
         if installed {
             directory.entries[expected].write(location);
@@ -2282,17 +2298,17 @@ mod tests {
             fn allocate_with_extent(
                 &self,
                 layout: Layout,
-            ) -> Option<(*mut u8, ExtentGrantReceipt)> {
+            ) -> Result<(*mut u8, ExtentGrantReceipt), crate::MetadataMiss> {
                 if self.refuse.replace(false) {
-                    return None;
+                    return Err(crate::MetadataMiss::Exhausted);
                 }
                 // SAFETY: layout is for a nonempty, aligned residency segment.
                 let ptr = unsafe { std::alloc::alloc(layout) };
                 if ptr.is_null() {
-                    return None;
+                    return Err(crate::MetadataMiss::Exhausted);
                 }
                 self.allocations.borrow_mut().push((ptr, layout));
-                Some((
+                Ok((
                     ptr,
                     ExtentGrantReceipt {
                         base_va: ptr as u64,
@@ -2345,7 +2361,9 @@ mod tests {
         let observed = table.extension_count();
         assert_eq!(
             table.grow(&allocator, observed),
-            Err(ResidencyGrowthRefusal::MetadataRequired)
+            Err(ResidencyGrowthRefusal::Metadata(
+                crate::MetadataMiss::Exhausted
+            ))
         );
         assert_eq!(table.extension_count(), observed);
         assert_eq!(table.observed_slots_used(), FRAME_GRANT_RESIDENCY_SLOTS);
