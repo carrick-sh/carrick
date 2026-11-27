@@ -603,6 +603,9 @@ pub enum ReschedStall {
     /// Right after the `n`th send that found the ICR busy (counting from
     /// the arming, first sends and resends alike).
     AfterBusySend(u32),
+    /// Right before the `n`th send of the armed CPU, whatever it finds
+    /// (counting from the arming, first sends and resends alike).
+    BeforeSend(u32),
 }
 
 #[cfg(feature = "test-support")]
@@ -612,8 +615,61 @@ impl ReschedStall {
             Self::BeforePoll => 1,
             Self::AfterBusyPoll => 2,
             Self::AfterBusySend(n) => 3 | u64::from(n) << 8,
+            Self::BeforeSend(n) => 4 | u64::from(n) << 8,
         }
     }
+}
+/// Sends of the armed CPU since boot, for [`ReschedStall::BeforeSend`].
+#[cfg(feature = "test-support")]
+static RESCHED_SENDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The armed CPU's next sends, one bit each from the lowest (1: the send
+/// finds the ICR busy), above a marker bit; 0 or 1: none left. Used in
+/// place of the busy count while nonzero.
+#[cfg(feature = "test-support")]
+static RESCHED_SEND_PATTERN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The armed CPU's first injected busy send also owes its own slot, as
+/// a self-kick ([`carrick_sched_core::WakeMechanics::arm_slice_timer`])
+/// that found the ICR busy would: two destinations owed at once.
+#[cfg(feature = "test-support")]
+static RESCHED_OWE_SELF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The two-destination witness (#3129 P0 1): the armed CPU's next send
+/// finds the ICR busy and owes its own slot besides the target's, so the
+/// next resend pass sends two. The pass's first send is accepted after a
+/// stall past the bound, and its second finds the ICR busy (with that
+/// fresh IPI); one poll then reads busy, the next idle. A send judged by a
+/// clock read before the pass charges the fresh IPI for the stall. False
+/// when an injection is still armed.
+#[cfg(feature = "test-support")]
+pub fn inject_resched_two_owed_stalled() -> bool {
+    let first = RESCHED_SENDS.load(Ordering::Acquire);
+    // busy (the first send), accepted (after the stall), busy; marker.
+    if !inject_resched_busy(0, 1, Some(ReschedStall::BeforeSend(first + 2))) {
+        return false;
+    }
+    RESCHED_OWE_SELF.store(true, Ordering::Release);
+    RESCHED_SEND_PATTERN.store(0b1101, Ordering::Release);
+    true
+}
+
+/// Take the armed CPU's next send result from the pattern: `Some(busy)`
+/// while one is left.
+#[cfg(feature = "test-support")]
+fn patterned_busy() -> Option<bool> {
+    if !injection_armed_here() {
+        return None;
+    }
+    let mut busy = None;
+    let _ = RESCHED_SEND_PATTERN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| {
+        if p <= 1 {
+            busy = None;
+            return None;
+        }
+        busy = Some(p & 1 == 1);
+        Some(if p >> 1 == 1 { 0 } else { p >> 1 })
+    });
+    busy
 }
 /// The [`UserReturn`] of the last resend at a return to user, for the census.
 #[cfg(feature = "test-support")]
@@ -647,6 +703,9 @@ pub fn inject_resched_busy(sends: u32, polls: u32, stall: Option<ReschedStall>) 
         || RESCHED_POLL_BUSY_LEFT.load(Ordering::Acquire) != 0
         || RESCHED_STALL.load(Ordering::Acquire) != 0
     {
+        return false;
+    }
+    if RESCHED_SEND_PATTERN.load(Ordering::Acquire) > 1 {
         return false;
     }
     let stall = stall.map_or(0, |stall| match stall {
@@ -699,7 +758,18 @@ fn injected_busy(left: &core::sync::atomic::AtomicU32) -> bool {
 
 fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy> {
     #[cfg(feature = "test-support")]
-    if injected_busy(&RESCHED_SEND_BUSY_LEFT) {
+    if injection_armed_here() {
+        let sends = RESCHED_SENDS.fetch_add(1, Ordering::AcqRel) + 1;
+        injected_stall(ReschedStall::BeforeSend(sends));
+    }
+    #[cfg(feature = "test-support")]
+    if patterned_busy().unwrap_or_else(|| injected_busy(&RESCHED_SEND_BUSY_LEFT)) {
+        if RESCHED_OWE_SELF.swap(false, Ordering::AcqRel)
+            && let Some(binding) = super::context::current_cpu_binding()
+            && let Ok(own) = u8::try_from(binding.cpu_slot)
+        {
+            owe_resched(binding, carrick_sched_core::SlotId::new(own));
+        }
         let count = RESCHED_BUSY_INJECTED.fetch_add(1, Ordering::AcqRel) + 1;
         injected_stall(ReschedStall::AfterBusySend(count as u32));
         return Err(interrupts::IpiBusy);
@@ -726,6 +796,7 @@ fn icr_poll_busy() -> bool {
     if !busy && injection_armed_here() && RESCHED_POLL_SAW_BUSY.swap(false, Ordering::AcqRel) {
         RESCHED_ICR_WAITS.fetch_add(1, Ordering::AcqRel);
         RESCHED_SEND_BUSY_LEFT.store(0, Ordering::Release);
+        RESCHED_SEND_PATTERN.store(0, Ordering::Release);
     }
     busy
 }

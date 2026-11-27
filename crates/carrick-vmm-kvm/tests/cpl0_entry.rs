@@ -4562,6 +4562,51 @@ fn production_resched_ipi_never_accepted_at_the_last_return_is_fatal() {
     );
 }
 
+/// #3129 P0 1 on x86 CPL0: the last-return witness with two owed
+/// destinations, the peer and this CPU's own slot (a self-kick that found
+/// the ICR busy; the pool has two vCPUs, so the sender's own slot is the
+/// second destination). The return's resend pass sends the first after a
+/// stall past the bound (a host descheduling the vCPU), and the second
+/// finds the ICR busy with that fresh IPI. That busy result started after
+/// an accepted send: judged by a clock read before the pass, the next busy
+/// poll takes a false `ApicFault`. Exit 93: the census is not two busy
+/// sends, two resends, one transition and one stall at the syscall's own
+/// return.
+#[test]
+fn production_resched_ipi_two_owed_busy_after_a_stalled_accepted_send_is_not_fatal() {
+    bounded_contention_witness(
+        "production_resched_ipi_two_owed_busy_after_a_stalled_accepted_send_is_not_fatal",
+        "native_idle_peer_wake.S",
+        &["-DTWO_OWED_STALLED=1"],
+        "two owed IPIs, the second busy after a stalled accepted send",
+    );
+}
+
+/// #3129 P0 2 on x86 CPL0: a reschedule owed when the sender's task parks,
+/// so its next delivery point is the idle pass and no return to user comes
+/// after it, with an ICR that stays busy. The idle sender must not spin
+/// outside HLT forever: its bound holds across idle passes, and the run
+/// ends with the sited fatal at the idle pass. An unbounded idle resend
+/// runs past the child's bound.
+#[test]
+fn production_resched_ipi_owed_by_an_idle_sender_with_a_stuck_icr_is_fatal() {
+    const TEST_NAME: &str =
+        "production_resched_ipi_owed_by_an_idle_sender_with_a_stuck_icr_is_fatal";
+    if !in_bounded_child(TEST_NAME, Duration::from_secs(20)) {
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_idle_peer_wake.S", &["-DIDLE_OWED=1"]);
+    let Err(failure) = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 128) else {
+        panic!("an idle sender whose ICR never goes idle must end the run");
+    };
+    let message = format!("{failure:?}");
+    assert!(
+        message.contains("CPL0 fatal exit at src/isa/x86/interrupt.rs:")
+            && message.contains("ApicFault::IcrNeverAccepted at Idle"),
+        "expected the idle pass's bounded ICR fatal, got {message}"
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is
