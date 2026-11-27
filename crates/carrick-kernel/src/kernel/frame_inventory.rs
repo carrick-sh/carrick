@@ -14,8 +14,8 @@ use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
     FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin,
     FrameInventoryProvenance, FrameInventoryReceiptOwner, FrameInventoryReservation,
-    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId, MappingGeneration,
-    MappingId, MemPerms,
+    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId,
+    MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId, MemPerms,
 };
 use parking_lot::Mutex;
 
@@ -638,9 +638,9 @@ impl FrameInventoryAuthority {
         Ok(())
     }
 
-    /// Unmap every published mapping of `mm` in one batch, retiring each
-    /// frame whose last mapping that unmap removes; frames another MM still
-    /// maps stay live. Used when a fork child's memory leaves quarantine.
+    /// Unmap every published mapping of `mm`, in as few batches as the
+    /// bounded event capacity admits, retiring each frame whose last mapping
+    /// that unmap removes; frames another MM still maps stay live. Used when a fork child's memory leaves quarantine.
     /// Returns the number of mappings unmapped; the receipt must prove the
     /// MM empty at the produced revision.
     ///
@@ -668,35 +668,39 @@ impl FrameInventoryAuthority {
                 .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
                 .collect()
         };
-        let events = rows
-            .len()
-            .checked_mul(2)
-            .ok_or(FrameInventoryRetireMmError::Capacity)?;
-        let capacity = FrameEventCapacity::for_event_count(events)
-            .map_err(FrameInventoryReserveError::from)?;
-        let mut reservation = self.reserve(ids, 0, 0, capacity)?;
-        let transaction = reservation.transaction();
-        for &(mapping, frame, live) in &rows {
-            // Unmap publishes the mapping's next generation.
-            let generation = live
-                .raw()
-                .checked_add(1)
-                .and_then(NonZeroU64::new)
-                .map(MappingGeneration::from_backend_counter)
-                .ok_or(FrameInventoryRetireMmError::Capacity)?;
-            reservation.push(FrameInventoryEvent::UnmapMapping {
-                transaction,
-                mapping,
-                generation,
-            })?;
-            reservation.push(FrameInventoryEvent::RetireFrameIfLastUnmap {
-                transaction,
-                frame,
-                generation,
-            })?;
+        // Two events per row, in batches the bounded event capacity admits:
+        // publication never bounds an MM's row count, so one batch for the
+        // whole MM would refuse a valid large MM. Nothing maps into the
+        // excluded MM between batches; the last one proves it empty.
+        let mut empty = false;
+        for batch in rows.chunks(MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2) {
+            let capacity = FrameEventCapacity::for_event_count(batch.len() * 2)
+                .map_err(FrameInventoryReserveError::from)?;
+            let mut reservation = self.reserve(ids, 0, 0, capacity)?;
+            let transaction = reservation.transaction();
+            for &(mapping, frame, live) in batch {
+                // Unmap publishes the mapping's next generation.
+                let generation = live
+                    .raw()
+                    .checked_add(1)
+                    .and_then(NonZeroU64::new)
+                    .map(MappingGeneration::from_backend_counter)
+                    .ok_or(FrameInventoryRetireMmError::Capacity)?;
+                reservation.push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping,
+                    generation,
+                })?;
+                reservation.push(FrameInventoryEvent::RetireFrameIfLastUnmap {
+                    transaction,
+                    frame,
+                    generation,
+                })?;
+            }
+            let (_, receipt) = self.apply_retirement_with_receipt(mm, reservation.commit(()))?;
+            empty = receipt.mm_empty_at_revision();
         }
-        let (_, receipt) = self.apply_retirement_with_receipt(mm, reservation.commit(()))?;
-        if !receipt.mm_empty_at_revision() {
+        if !empty {
             return Err(FrameInventoryRetireMmError::NotEmpty);
         }
         Ok(rows.len())
@@ -3334,6 +3338,50 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// #3061: an MM with more rows than one retirement batch admits (two
+    /// events a row) retires whole through the HAL entry the shared release
+    /// calls. Publication never bounds an MM's rows, so a refusal here would
+    /// end the run for a valid large fork child.
+    #[test]
+    fn retire_mm_crosses_the_batch_limit_through_the_hal_entry() {
+        use std::sync::Arc;
+
+        const ROWS: usize = MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
+        const PER_PUBLISH: usize = MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2;
+        let native = carrick_hal::MmGeneration::new(NonZeroU64::new(302).expect("nonzero"));
+        let owner = FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+            native_mm: native,
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let mut published = 0;
+        while published < ROWS {
+            let rows = (ROWS - published).min(PER_PUBLISH);
+            let capacity = FrameEventCapacity::for_event_count(rows * 2).expect("capacity");
+            let mut reservation = authority
+                .reserve(&ids, rows, rows, capacity)
+                .expect("reservation");
+            let transaction = reservation.transaction();
+            for row in 0..rows {
+                let frame = reservation.claim_frame().expect("frame");
+                let mapping = reservation.claim_mapping().expect("mapping");
+                let gpa = 0x1000 * (published + row + 1) as u64;
+                prepare_publish(&mut reservation, transaction, frame, mapping, gpa, 0x1000);
+            }
+            authority
+                .apply(owner, reservation.commit(()))
+                .expect("publish");
+            published += rows;
+        }
+        const { assert!(ROWS * 2 > MAX_FRAME_INVENTORY_EVENTS_PER_BATCH) };
+
+        let projection = authority.physical_projection(Arc::clone(&ids));
+        assert_eq!(projection.retire_mm(native), Ok(ROWS));
+        assert!(authority.snapshot_for_mm(owner).mappings.is_empty());
+        assert_eq!(projection.retire_mm(native), Ok(0));
     }
 
     #[test]
