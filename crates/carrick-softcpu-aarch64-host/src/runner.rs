@@ -872,8 +872,8 @@ pub struct SoftRootPublication {
     pub page_serves_ring: bool,
     /// The carrier the MM portal at `EL1_MM_PORTAL_BASE` is bound to.
     pub portal_carrier: Option<NonZeroU64>,
-    /// The carrier's own identity, the one its stage-2 core and transfer
-    /// custody hold. The portal must be bound to exactly this.
+    /// The carrier's own identity, the one its stage-2 core was minted
+    /// with. The portal must be bound to exactly this.
     pub carrier: NonZeroU64,
     /// The published owner-memory wait venue is this region's zone and portal.
     pub portal_is_owner_wait_venue: bool,

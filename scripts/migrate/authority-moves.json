@@ -328,6 +328,10 @@
     {
       "owner": "carrick_kernel::dispatch::fs::FsView<'a>::apply_materialized",
       "issue": 1338
+    },
+    {
+      "owner": "carrick_softcpu_aarch64_host::facade::soft_carrier_broken",
+      "issue": 3061
     }
   ],
   "terminal_custody": []
