@@ -31,7 +31,7 @@
  *     read of page 2 (the second resident run, past the hole) then faults
  *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
  *     forks. The child widens it back to RW and writes it; the parent, after
- *     the child exits, still reads its own byte (92 if the child's write
+ *     the child exits, still reads its own byte (99 if the child's write
  *     reached it)
  * The parent propagates the child's exit status. */
 
@@ -122,9 +122,13 @@ _start:
     syscall
     test %eax, %eax
     js harness
-#if CASE == 9 || CASE == 21
+#if CASE == 9
     cmpb $0xa5, (%r14)      /* the child's write stayed in the child */
     jne bad
+#elif CASE == 21
+    cmpb $0xa5, (%r14)      /* the child's write stayed in the child */
+    mov $99, %edi
+    jne exit
 #endif
     mov status(%rip), %edi
     test $127, %edi
